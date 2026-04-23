@@ -1,6 +1,7 @@
 import AppKit
-import Combine
 import Foundation
+
+private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
 @MainActor
 final class TerminalWorkspace: ObservableObject {
@@ -8,28 +9,9 @@ final class TerminalWorkspace: ObservableObject {
     @Published var selectedSessionID: UUID?
 
     init() {
-        sessions = [
-            TerminalSession.sample(
-                title: "Build",
-                subtitle: "cargo watch · target/debug",
-                tint: NSColor(calibratedRed: 0.52, green: 0.89, blue: 0.60, alpha: 1),
-                seed: .build
-            ),
-            TerminalSession.sample(
-                title: "Logs",
-                subtitle: "observability · local stream",
-                tint: NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.32, alpha: 1),
-                seed: .logs
-            ),
-            TerminalSession.sample(
-                title: "SSH",
-                subtitle: "ops-east-1 · libghostty host",
-                tint: NSColor(calibratedRed: 0.42, green: 0.73, blue: 0.98, alpha: 1),
-                seed: .ssh
-            )
-        ]
-
-        selectedSessionID = sessions.first?.id
+        let firstSession = Self.makeSession(index: 1)
+        sessions = [firstSession]
+        selectedSessionID = firstSession.id
     }
 
     var selectedSession: TerminalSession? {
@@ -42,17 +24,9 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func addSession() {
-        let index = sessions.count + 1
-        let tint = Self.palette[(index - 1) % Self.palette.count]
-        let newSession = TerminalSession.sample(
-            title: "Tab \(index)",
-            subtitle: "prototype · interactive buffer",
-            tint: tint,
-            seed: .prototype(index)
-        )
-
-        sessions.append(newSession)
-        selectedSessionID = newSession.id
+        let session = Self.makeSession(index: sessions.count + 1)
+        sessions.append(session)
+        selectedSessionID = session.id
     }
 
     func close(_ session: TerminalSession) {
@@ -60,6 +34,7 @@ final class TerminalWorkspace: ObservableObject {
 
         let removedIndex = sessions.firstIndex(where: { $0.id == session.id })
         sessions.removeAll(where: { $0.id == session.id })
+        session.stop()
 
         guard selectedSessionID == session.id else { return }
 
@@ -70,12 +45,24 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
-    func burstSelectedSession() {
-        selectedSession?.appendBurst(count: 1_000)
+    func interruptSelectedSession() {
+        selectedSession?.sendInterrupt()
     }
 
-    func clearSelectedSession() {
-        selectedSession?.clear()
+    func restartSelectedSession() {
+        selectedSession?.restart()
+    }
+
+    func clearSelectedSessionScrollback() {
+        selectedSession?.clearScrollback()
+    }
+
+    private static func makeSession(index: Int) -> TerminalSession {
+        TerminalSession(
+            title: "Shell \(index)",
+            subtitle: "\(ShellProcessController.defaultShellName) login shell",
+            tint: palette[(index - 1) % palette.count]
+        )
     }
 
     private static let palette: [NSColor] = [
@@ -89,11 +76,24 @@ final class TerminalWorkspace: ObservableObject {
 
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable {
-    enum Seed {
-        case build
-        case logs
-        case ssh
-        case prototype(Int)
+    enum SessionState: Equatable {
+        case launching
+        case live
+        case exited(Int32)
+        case failed(String)
+
+        var label: String {
+            switch self {
+            case .launching:
+                "launching"
+            case .live:
+                "live"
+            case .exited(let status):
+                "exit \(status)"
+            case .failed:
+                "failed"
+            }
+        }
     }
 
     let id = UUID()
@@ -104,150 +104,173 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     @Published private(set) var revision = 0
 
-    private var lines: [String]
+    private(set) var state: SessionState = .launching
+    private var buffer: TerminalTextBuffer
+    private var shellProcess: ShellProcessController?
+    private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
 
     init(
         title: String,
         subtitle: String,
         tint: NSColor,
         maxScrollback: Int? = nil,
-        initialLines: [String] = []
+        launchShell: Bool = true
     ) {
         self.title = title
         self.subtitle = subtitle
         self.tint = tint
         self.maxScrollback = maxScrollback
-        self.lines = initialLines
+        self.buffer = TerminalTextBuffer(maxScrollback: maxScrollback)
+
+        if launchShell {
+            startShell()
+        } else {
+            state = .exited(0)
+        }
     }
 
     var lineCount: Int {
-        max(lines.count, 1)
+        buffer.lineCount
     }
 
     var statusLine: String {
-        if let maxScrollback {
-            "\(min(lines.count, maxScrollback))/\(maxScrollback) lines"
-        } else {
-            "\(lines.count) lines · unlimited"
+        "\(state.label) · \(lineSummary)"
+    }
+
+    var acceptsInput: Bool {
+        if case .live = state {
+            return true
         }
+
+        return false
     }
 
     func snapshot(range: Range<Int>) -> [String] {
-        guard !lines.isEmpty else { return [""] }
-
-        let lower = max(0, min(range.lowerBound, lines.count))
-        let upper = max(lower, min(range.upperBound, lines.count))
-        return Array(lines[lower..<upper])
+        buffer.snapshot(range: range)
     }
 
-    func runMockCommand(_ command: String) {
-        append([
+    func sendCommandLine(_ command: String) {
+        send(text: command + "\n")
+    }
+
+    func send(text: String) {
+        guard acceptsInput else { return }
+        if inputDebugEnabled {
+            fputs("[send text] \(text.debugDescription)\n", stderr)
+        }
+        shellProcess?.write(text)
+    }
+
+    func send(data: Data) {
+        guard acceptsInput else { return }
+        if inputDebugEnabled {
+            let rendered = data.map { String(format: "%02x", $0) }.joined(separator: " ")
+            fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
+        }
+        shellProcess?.write(data)
+    }
+
+    func sendInterrupt() {
+        send(data: Data([0x03]))
+    }
+
+    func clearScrollback() {
+        buffer.clear()
+        bumpRevision()
+    }
+
+    func restart() {
+        stop()
+        clearScrollback()
+        startShell()
+    }
+
+    func stop() {
+        shellProcess?.terminate()
+        shellProcess = nil
+    }
+
+    func resize(columns: Int, rows: Int) {
+        let nextSize = TerminalViewportSize(columns: columns, rows: rows)
+        guard nextSize.columns > 0, nextSize.rows > 0, nextSize != viewportSize else { return }
+
+        viewportSize = nextSize
+        shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
+    }
+
+    func ingestTestingData(_ data: Data) {
+        buffer.ingest(data)
+        bumpRevision()
+    }
+
+    private func startShell() {
+        state = .launching
+        bumpRevision()
+
+        do {
+            shellProcess = try ShellProcessController(
+                configuration: .init(
+                    shellPath: ShellProcessController.defaultShellPath,
+                    workingDirectory: NSHomeDirectory(),
+                    term: "xterm-256color",
+                    initialSize: viewportSize
+                ),
+                onData: { [weak self] data in
+                    DispatchQueue.main.async {
+                        self?.receiveOutput(data)
+                    }
+                },
+                onExit: { [weak self] status in
+                    DispatchQueue.main.async {
+                        self?.handleProcessExit(status: status)
+                    }
+                }
+            )
+
+            state = .live
+            bumpRevision()
+        } catch {
+            state = .failed(error.localizedDescription)
+            buffer.appendPlainLines([
+                "launch failed: \(error.localizedDescription)"
+            ])
+            bumpRevision()
+        }
+    }
+
+    private func receiveOutput(_ data: Data) {
+        buffer.ingest(data)
+        if inputDebugEnabled {
+            let tailStart = max(0, buffer.lineCount - 4)
+            let tail = buffer.snapshot(range: tailStart..<buffer.lineCount)
+            fputs("[buffer tail] \(tail.map(\.debugDescription).joined(separator: " | "))\n", stderr)
+        }
+        if case .launching = state {
+            state = .live
+        }
+        bumpRevision()
+    }
+
+    private func handleProcessExit(status: Int32) {
+        shellProcess = nil
+        state = .exited(status)
+        buffer.appendPlainLines([
             "",
-            "$ \(command)"
+            "[shell exited with status \(status)]"
         ])
+        bumpRevision()
+    }
 
-        switch command {
-        case "pwd":
-            append(["/opt/cherry/\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"])
-        case "ls":
-            append(["Cargo.toml  Package.swift  Sources  Tests  benches  docs"])
-        case "clear":
-            clear()
-        case "burst":
-            appendBurst(count: 1_000)
-        case "top":
-            appendBurst(count: 48, prefix: "core")
-        case "bench":
-            append([
-                "benchmarking visible-row renderer...",
-                "  draw pass median: 1.8 ms",
-                "  scrollback policy: unlimited",
-                "  visible rows only: enabled"
-            ])
-        default:
-            append([
-                "mock-shell: executed `\(command)`",
-                "  this prototype keeps the UI native and reserves the terminal surface for a future libghostty bridge"
-            ])
+    private var lineSummary: String {
+        let visibleLineCount = max(buffer.storedLineCount, 1)
+        if let maxScrollback {
+            return "\(min(visibleLineCount, maxScrollback))/\(maxScrollback) lines"
+        } else {
+            return "\(visibleLineCount) lines · unlimited"
         }
     }
 
-    func appendBurst(count: Int, prefix: String = "render") {
-        let start = lines.count
-        let formatter = Date.FormatStyle()
-            .hour(.twoDigits(amPM: .omitted))
-            .minute(.twoDigits)
-            .second(.twoDigits)
-
-        let burst = (0..<count).map { offset in
-            let lineNumber = start + offset + 1
-            let tick = lineNumber.formatted(.number.grouping(.never))
-            let latency = Double.random(in: 0.28...2.04).formatted(.number.precision(.fractionLength(2)))
-            let timestamp = Date().formatted(formatter)
-            return "[\(timestamp)] \(prefix)#\(tick) visibleRows=58 frame=\(latency)ms"
-        }
-
-        append(burst)
-    }
-
-    func clear() {
-        lines.removeAll(keepingCapacity: true)
+    private func bumpRevision() {
         revision &+= 1
-    }
-
-    func append(_ newLines: [String]) {
-        guard !newLines.isEmpty else { return }
-
-        lines.append(contentsOf: newLines)
-        if let maxScrollback, lines.count > maxScrollback {
-            lines.removeFirst(lines.count - maxScrollback)
-        }
-        revision &+= 1
-    }
-
-    static func sample(title: String, subtitle: String, tint: NSColor, seed: Seed) -> TerminalSession {
-        let session = TerminalSession(title: title, subtitle: subtitle, tint: tint)
-        session.seed(with: seed)
-        return session
-    }
-
-    private func seed(with seed: Seed) {
-        switch seed {
-        case .build:
-            append([
-                "ghostty-prototype booting",
-                "renderer = AppKitCanvas",
-                "tabs = left rail",
-                "",
-                "$ cargo watch -x run",
-                "[watch] compiling ui-shell",
-                "[watch] linked native preview in 1.2s",
-                "[watch] scrollback policy set to unlimited"
-            ])
-
-            appendBurst(count: 180, prefix: "build")
-        case .logs:
-            append([
-                "stream attached: observability/local",
-                "sampling paint and layout work on every scroll delta",
-                "goal: sidebar tabs without paying for SwiftUI text rows"
-            ])
-
-            appendBurst(count: 260, prefix: "logs")
-        case .ssh:
-            append([
-                "Connected to ops-east-1",
-                "Last login: Thu Apr 23 15:38:02 on ttys004",
-                "$ tmux attach -t ghostty",
-                "nvim app/session.zig"
-            ])
-
-            appendBurst(count: 120, prefix: "ssh")
-        case .prototype(let index):
-            append([
-                "prototype tab \(index) created",
-                "use `burst`, `bench`, `ls`, `pwd`, or `clear` in the command bar"
-            ])
-        }
     }
 }

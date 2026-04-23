@@ -6,7 +6,14 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
 
 - Uses SwiftUI for the window chrome and tab rail.
 - Uses an AppKit-backed terminal canvas for the scrollable surface so it only draws visible rows.
+- Each tab now owns a live PTY-backed shell.
 - Defaults to unlimited scrollback while still rendering only visible rows.
+
+## Current State
+
+- Works with a real login shell and real command output.
+- Supports direct typing if you click the terminal surface, plus the command bar at the bottom.
+- Does not yet implement a full VT renderer, so TUIs such as `vim`, `top`, or `less` will still render imperfectly until `libghostty` is wired in.
 
 ## Run
 
@@ -17,6 +24,7 @@ swift run
 Inside the prototype:
 
 - Use the left rail to switch tabs.
-- Use `New Tab` or `Cmd-T` to create another session.
-- Use `Burst 1,000` or `Cmd-B` to stress the renderer.
-- Use the command bar with `pwd`, `ls`, `bench`, `burst`, `top`, or `clear`.
+- Use `New Tab` or `Cmd-T` to create another shell session.
+- Click inside the terminal to type directly, or use the command bar at the bottom.
+- Use `Ctrl-C` in the toolbar to interrupt the active shell.
+- Use `Restart` to relaunch a shell after `exit`.

@@ -189,16 +189,21 @@ private struct TerminalSceneView: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .foregroundStyle(.secondary)
 
-                Button("Burst 1,000") {
-                    session.appendBurst(count: 1_000)
+                Button("Ctrl-C") {
+                    session.sendInterrupt()
+                }
+                .disabled(!session.acceptsInput)
+
+                Button("Restart") {
+                    session.restart()
                 }
 
                 Button("New Tab") {
                     workspace.addSession()
                 }
 
-                Button("Clear") {
-                    session.clear()
+                Button("Clear Scrollback") {
+                    session.clearScrollback()
                 }
             }
             .padding(.horizontal, 20)
@@ -217,13 +222,17 @@ private struct TerminalSceneView: View {
                     .font(.system(size: 14, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color(nsColor: session.tint))
 
-                TextField("Run a mock shell command", text: $draftCommand)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13, weight: .medium, design: .monospaced))
-                    .onSubmit(runCommand)
+                CommandInputField(
+                    text: $draftCommand,
+                    placeholder: "Send a command to the live shell",
+                    isEnabled: session.acceptsInput,
+                    onSubmit: runCommand
+                )
+                .frame(height: 30)
 
                 Button("Send", action: runCommand)
                     .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(!session.acceptsInput)
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
@@ -245,10 +254,7 @@ private struct TerminalSceneView: View {
     }
 
     private func runCommand() {
-        let trimmed = draftCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        session.runMockCommand(trimmed)
+        session.sendCommandLine(draftCommand)
         draftCommand = ""
     }
 }

@@ -1,7 +1,29 @@
+import AppKit
 import SwiftUI
+
+final class CherryAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            sender.windows.first?.makeKeyAndOrderFront(nil)
+        }
+
+        sender.activate(ignoringOtherApps: true)
+        return true
+    }
+}
 
 @main
 struct CherryApp: App {
+    @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var workspace = TerminalWorkspace()
 
     var body: some Scene {
@@ -17,13 +39,18 @@ struct CherryApp: App {
                 }
                 .keyboardShortcut("t")
 
-                Button("Burst 1,000 Lines") {
-                    workspace.burstSelectedSession()
+                Button("Interrupt Active Tab") {
+                    workspace.interruptSelectedSession()
                 }
-                .keyboardShortcut("b")
+                .keyboardShortcut("c", modifiers: [.control])
 
-                Button("Clear Active Tab") {
-                    workspace.clearSelectedSession()
+                Button("Restart Active Tab") {
+                    workspace.restartSelectedSession()
+                }
+                .keyboardShortcut("r")
+
+                Button("Clear Scrollback") {
+                    workspace.clearSelectedSessionScrollback()
                 }
                 .keyboardShortcut("k")
             }

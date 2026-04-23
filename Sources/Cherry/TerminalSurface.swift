@@ -528,7 +528,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         let maxColumn = max(viewportColumns, session?.lineLength(at: row) ?? 0)
         let column = max(0, min(roundedColumn, maxColumn))
 
-        return TerminalGridPoint(row: row, column: column)
+        return session?.gridPoint(row: row, column: column) ?? TerminalGridPoint(row: row, column: column)
     }
 
     private func rounding(for event: NSEvent, from anchor: TerminalGridPoint) -> SelectionColumnRounding {

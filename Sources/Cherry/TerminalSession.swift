@@ -105,7 +105,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var revision = 0
 
     private(set) var state: SessionState = .launching
-    private var buffer: TerminalTextBuffer
+    private var buffer: any TerminalBuffering
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
@@ -115,13 +115,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         subtitle: String,
         tint: NSColor,
         maxScrollback: Int? = nil,
+        buffer: (any TerminalBuffering)? = nil,
         launchShell: Bool = true
     ) {
         self.title = title
         self.subtitle = subtitle
         self.tint = tint
         self.maxScrollback = maxScrollback
-        self.buffer = TerminalTextBuffer(maxScrollback: maxScrollback)
+        self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
 
         if launchShell {
             startShell()
@@ -156,6 +157,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func lineLength(at row: Int) -> Int {
         buffer.lineLength(at: row)
+    }
+
+    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
+        buffer.gridPoint(row: row, column: column)
     }
 
     func selectedText(in selection: TerminalSelectionRange) -> String {
@@ -209,7 +214,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard nextSize.columns > 0, nextSize.rows > 0, nextSize != viewportSize else { return }
 
         viewportSize = nextSize
+        buffer.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
+        revision &+= 1
     }
 
     func ingestTestingData(_ data: Data) {

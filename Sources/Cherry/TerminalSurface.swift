@@ -197,10 +197,12 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let defaultTextColor = NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.92, alpha: 1)
     private let regularFont = TerminalFontPalette.regular(size: 13.5)
     private let boldFont = TerminalFontPalette.semibold(size: 13.5)
+    private let selectionDragThreshold: CGFloat = 3
     private lazy var cellWidth = TerminalFontPalette.cellWidth(for: regularFont)
     private var isFocused = false
     private var selection: TerminalSelectionRange?
     private var selectionAnchor: TerminalGridPoint?
+    private var selectionMouseDownPoint: NSPoint?
     private var isSelecting = false
     private var markedText = NSMutableAttributedString()
     private var keyTextAccumulator: [String]?
@@ -463,13 +465,25 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         let anchor = gridPoint(for: event, rounding: .down)
         selectionAnchor = anchor
+        selectionMouseDownPoint = convert(event.locationInWindow, from: nil)
         selection = nil
-        isSelecting = true
+        isSelecting = false
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard isSelecting, let selectionAnchor else { return }
+        guard let selectionAnchor,
+              let selectionMouseDownPoint else {
+            return
+        }
+
+        let location = convert(event.locationInWindow, from: nil)
+        if !isSelecting {
+            guard location.distance(to: selectionMouseDownPoint) >= selectionDragThreshold else {
+                return
+            }
+            isSelecting = true
+        }
 
         autoscroll(with: event)
         let extent = gridPoint(for: event, rounding: rounding(for: event, from: selectionAnchor))
@@ -481,6 +495,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     override func mouseUp(with event: NSEvent) {
         defer {
             selectionAnchor = nil
+            selectionMouseDownPoint = nil
             isSelecting = false
         }
 
@@ -938,5 +953,11 @@ private extension TerminalANSIColor {
         guard (232...255).contains(index) else { return nil }
         let value = CGFloat((index - 232) * 10 + 8) / 255
         return NSColor(calibratedWhite: value, alpha: 1)
+    }
+}
+
+private extension NSPoint {
+    func distance(to other: NSPoint) -> CGFloat {
+        hypot(x - other.x, y - other.y)
     }
 }

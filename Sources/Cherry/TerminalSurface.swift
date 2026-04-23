@@ -5,6 +5,8 @@ import SwiftUI
 private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
 enum TerminalInputEncoder {
+    private static let maximumScrollStepsPerEvent = 12
+
     static func commandSequence(for selector: Selector) -> Data? {
         switch selector {
         case #selector(NSResponder.insertNewline(_:)):
@@ -41,6 +43,126 @@ enum TerminalInputEncoder {
             return nil
         }
     }
+
+    static func alternateScreenScrollSequence(
+        deltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool,
+        lineHeight: CGFloat,
+        remainder: inout CGFloat
+    ) -> Data? {
+        let steps = scrollStepCount(
+            deltaY: deltaY,
+            hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
+            lineHeight: lineHeight,
+            remainder: &remainder
+        )
+        guard steps != 0 else { return nil }
+
+        let sequence = steps > 0 ? "\u{1B}[A" : "\u{1B}[B"
+        return Data(String(repeating: sequence, count: abs(steps)).utf8)
+    }
+
+    static func mouseWheelSequence(
+        deltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool,
+        lineHeight: CGFloat,
+        column: Int,
+        row: Int,
+        mouseState: TerminalMouseState,
+        remainder: inout CGFloat
+    ) -> Data? {
+        let steps = scrollStepCount(
+            deltaY: deltaY,
+            hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
+            lineHeight: lineHeight,
+            remainder: &remainder
+        )
+        guard steps != 0 else { return nil }
+
+        let button = steps > 0 ? 64 : 65
+        var data = Data()
+        for _ in 0..<abs(steps) {
+            if mouseState.usesSGREncoding {
+                data.append(Data("\u{1B}[<\(button);\(column);\(row)M".utf8))
+            } else if let legacySequence = legacyMouseWheelSequence(button: button, column: column, row: row) {
+                data.append(legacySequence)
+            }
+        }
+
+        return data.isEmpty ? nil : data
+    }
+
+    static func mousePosition(
+        documentLocation: NSPoint,
+        visibleOrigin: NSPoint,
+        viewportSize: TerminalViewportSize,
+        sideInset: CGFloat,
+        topInset: CGFloat,
+        cellWidth: CGFloat,
+        lineHeight: CGFloat
+    ) -> (column: Int, row: Int) {
+        let visibleLocation = NSPoint(
+            x: documentLocation.x - visibleOrigin.x,
+            y: documentLocation.y - visibleOrigin.y
+        )
+        let rawColumn = Int(floor((visibleLocation.x - sideInset) / cellWidth)) + 1
+        let rawRow = Int(floor((visibleLocation.y - topInset) / lineHeight)) + 1
+
+        return (
+            column: min(max(rawColumn, 1), viewportSize.columns),
+            row: min(max(rawRow, 1), viewportSize.rows)
+        )
+    }
+
+    static func clampedViewportOffset(
+        currentOffset: CGFloat,
+        deltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool,
+        lineHeight: CGFloat,
+        documentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat {
+        let maximumOffset = max(0, documentHeight - viewportHeight)
+        let scrollDelta = hasPreciseScrollingDeltas
+            ? deltaY
+            : deltaY * lineHeight
+        let proposedOffset = currentOffset - scrollDelta
+        return min(max(proposedOffset, 0), maximumOffset)
+    }
+
+    private static func scrollStepCount(
+        deltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool,
+        lineHeight: CGFloat,
+        remainder: inout CGFloat
+    ) -> Int {
+        guard deltaY != 0 else { return 0 }
+
+        let rawSteps: Int
+        if hasPreciseScrollingDeltas {
+            let scrollUnit = max(1, lineHeight)
+            remainder += deltaY / scrollUnit
+            rawSteps = Int(remainder.rounded(.towardZero))
+            remainder -= CGFloat(rawSteps)
+        } else {
+            rawSteps = Int(deltaY.rounded(.awayFromZero))
+        }
+
+        return min(max(rawSteps, -maximumScrollStepsPerEvent), maximumScrollStepsPerEvent)
+    }
+
+    private static func legacyMouseWheelSequence(button: Int, column: Int, row: Int) -> Data? {
+        guard (1...223).contains(column), (1...223).contains(row) else { return nil }
+
+        return Data([
+            0x1B,
+            UInt8(ascii: "["),
+            UInt8(ascii: "M"),
+            UInt8(button + 32),
+            UInt8(column + 32),
+            UInt8(row + 32)
+        ])
+    }
 }
 
 struct TerminalSurfaceView: NSViewRepresentable {
@@ -58,9 +180,12 @@ struct TerminalSurfaceView: NSViewRepresentable {
 }
 
 final class TerminalScrollView: NSScrollView {
+    private static let bottomPinTolerance: CGFloat = 1
+
     private let canvasView = TerminalCanvasView(frame: .zero)
     private var revisionObserver: AnyCancellable?
     private weak var activeSession: TerminalSession?
+    private var terminalScrollRemainder: CGFloat = 0
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -74,6 +199,9 @@ final class TerminalScrollView: NSScrollView {
         hasHorizontalScroller = false
         autohidesScrollers = true
         scrollerStyle = .overlay
+        verticalScrollElasticity = .none
+        horizontalScrollElasticity = .none
+        usesPredominantAxisScrolling = true
         documentView = canvasView
     }
 
@@ -142,6 +270,45 @@ final class TerminalScrollView: NSScrollView {
         }
     }
 
+    override func scrollWheel(with event: NSEvent) {
+        resetTerminalScrollRemainderIfNeeded(for: event)
+
+        guard let activeSession else {
+            scrollDocument(with: event)
+            return
+        }
+
+        if activeSession.acceptsInput, activeSession.mouseState.trackingMode.isEnabled {
+            let mousePosition = canvasView.terminalMousePosition(for: event)
+            if let sequence = TerminalInputEncoder.mouseWheelSequence(
+                deltaY: event.scrollingDeltaY,
+                hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+                lineHeight: canvasView.terminalLineHeight,
+                column: mousePosition.column,
+                row: mousePosition.row,
+                mouseState: activeSession.mouseState,
+                remainder: &terminalScrollRemainder
+            ) {
+                activeSession.send(data: sequence)
+            }
+            return
+        }
+
+        if activeSession.acceptsInput, shouldRouteWheelToCursorKeys(for: activeSession) {
+            if let sequence = TerminalInputEncoder.alternateScreenScrollSequence(
+                deltaY: event.scrollingDeltaY,
+                hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+                lineHeight: canvasView.terminalLineHeight,
+                remainder: &terminalScrollRemainder
+            ) {
+                activeSession.send(data: sequence)
+            }
+            return
+        }
+
+        scrollDocument(with: event)
+    }
+
     @objc func copy(_ sender: Any?) {
         if canvasView.copySelectionToPasteboard() {
             return
@@ -164,7 +331,7 @@ final class TerminalScrollView: NSScrollView {
     }
 
     private var isPinnedToBottom: Bool {
-        abs(contentView.bounds.maxY - canvasView.frame.height) < 40
+        abs(contentView.bounds.maxY - canvasView.frame.height) <= Self.bottomPinTolerance
     }
 
     private func scrollToBottom() {
@@ -173,10 +340,38 @@ final class TerminalScrollView: NSScrollView {
         reflectScrolledClipView(contentView)
     }
 
+    private func scrollDocument(with event: NSEvent) {
+        let currentOrigin = contentView.bounds.origin
+        let nextY = TerminalInputEncoder.clampedViewportOffset(
+            currentOffset: currentOrigin.y,
+            deltaY: event.scrollingDeltaY,
+            hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+            lineHeight: canvasView.terminalLineHeight,
+            documentHeight: canvasView.frame.height,
+            viewportHeight: contentSize.height
+        )
+        guard nextY != currentOrigin.y else { return }
+
+        contentView.scroll(to: NSPoint(x: currentOrigin.x, y: nextY))
+        reflectScrolledClipView(contentView)
+    }
+
     private func focusScrollViewIfPossible() {
         guard let window else { return }
         guard activeSession?.acceptsInput == true else { return }
         _ = window.makeFirstResponder(self)
+    }
+
+    private func resetTerminalScrollRemainderIfNeeded(for event: NSEvent) {
+        if event.phase == .ended || event.phase == .cancelled ||
+            event.momentumPhase == .ended || event.momentumPhase == .cancelled {
+            terminalScrollRemainder = 0
+        }
+    }
+
+    private func shouldRouteWheelToCursorKeys(for session: TerminalSession) -> Bool {
+        guard session.mouseState.alternateScrollMode else { return false }
+        return session.usesAlternateScreen
     }
 }
 
@@ -193,7 +388,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let topInset: CGFloat = 24
     private let bottomInset: CGFloat = 28
     private let sideInset: CGFloat = 22
-    private let backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.09, alpha: 1)
+    private let backgroundColor = NSColor(calibratedRed: 0.07, green: 0.065, blue: 0.09, alpha: 1)
     private let defaultTextColor = NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.92, alpha: 1)
     private let regularFont = TerminalFontPalette.regular(size: 13.5)
     private let boldFont = TerminalFontPalette.semibold(size: 13.5)
@@ -235,6 +430,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         topInset + bottomInset + (CGFloat(session.lineCount) * lineHeight)
     }
 
+    var terminalLineHeight: CGFloat {
+        lineHeight
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
@@ -260,6 +459,21 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         return TerminalViewportSize(columns: columns, rows: rows)
     }
 
+    func terminalMousePosition(for event: NSEvent) -> (column: Int, row: Int) {
+        let location = convert(event.locationInWindow, from: nil)
+        let scrollView = enclosingScrollView
+        let visibleOrigin = scrollView?.contentView.bounds.origin ?? .zero
+        return TerminalInputEncoder.mousePosition(
+            documentLocation: location,
+            visibleOrigin: visibleOrigin,
+            viewportSize: viewportSize(for: scrollView?.contentSize ?? bounds.size),
+            sideInset: sideInset,
+            topInset: topInset,
+            cellWidth: cellWidth,
+            lineHeight: lineHeight
+        )
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         backgroundColor.setFill()
         dirtyRect.fill()
@@ -273,9 +487,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         guard endingRow > startingRow else { return }
 
+        let visibleLines = session.styledSnapshot(range: startingRow..<endingRow)
+        drawBackgrounds(for: visibleLines, startingAt: startingRow)
         drawSelection(in: startingRow..<endingRow)
 
-        let visibleLines = session.styledSnapshot(range: startingRow..<endingRow)
         for (offset, line) in visibleLines.enumerated() {
             let row = startingRow + offset
             let point = NSPoint(x: sideInset, y: topInset + (CGFloat(row) * lineHeight))
@@ -318,6 +533,30 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
     }
 
+    private func drawBackgrounds(for lines: [TerminalRenderedLine], startingAt startingRow: Int) {
+        for (offset, line) in lines.enumerated() {
+            let row = startingRow + offset
+            var column = 0
+
+            for run in line.runs {
+                let width = run.text.count
+                defer { column += width }
+                guard width > 0,
+                      let background = resolvedBackgroundColor(for: run.style) else {
+                    continue
+                }
+
+                background.setFill()
+                NSRect(
+                    x: sideInset + (CGFloat(column) * cellWidth),
+                    y: topInset + (CGFloat(row) * lineHeight),
+                    width: CGFloat(width) * cellWidth,
+                    height: lineHeight
+                ).fill()
+            }
+        }
+    }
+
     private func attributedLine(for line: TerminalRenderedLine) -> NSAttributedString {
         let attributed = NSMutableAttributedString()
         for run in line.runs {
@@ -336,11 +575,16 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     }
 
     private func resolvedForegroundColor(for style: TerminalTextStyle) -> NSColor {
-        let baseColor = switch style.foreground {
-        case .none:
-            defaultTextColor
-        case .some(let color):
-            color.resolve() ?? defaultTextColor
+        let baseColor: NSColor
+        if style.isInverse {
+            baseColor = style.background?.resolve() ?? backgroundColor
+        } else {
+            baseColor = switch style.foreground {
+            case .none:
+                defaultTextColor
+            case .some(let color):
+                color.resolve() ?? defaultTextColor
+            }
         }
 
         if style.isDim {
@@ -348,6 +592,14 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
 
         return baseColor
+    }
+
+    private func resolvedBackgroundColor(for style: TerminalTextStyle) -> NSColor? {
+        if style.isInverse {
+            return style.foreground?.resolve() ?? defaultTextColor
+        }
+
+        return style.background?.resolve()
     }
 
     private func drawTerminalCursor(

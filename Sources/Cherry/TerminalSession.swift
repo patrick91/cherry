@@ -139,6 +139,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         buffer.cursorState
     }
 
+    var usesAlternateScreen: Bool {
+        buffer.usesAlternateScreen
+    }
+
+    var mouseState: TerminalMouseState {
+        buffer.mouseState
+    }
+
     var statusLine: String {
         "\(state.label) · \(lineSummary)"
     }

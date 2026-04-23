@@ -8,8 +8,14 @@ enum TerminalANSIColor: Equatable {
 
 struct TerminalTextStyle: Equatable {
     var foreground: TerminalANSIColor? = nil
+    var background: TerminalANSIColor? = nil
     var isBold = false
     var isDim = false
+    var isInverse = false
+
+    var paintsBackground: Bool {
+        background != nil || isInverse
+    }
 }
 
 struct TerminalTextRun: Equatable {
@@ -36,6 +42,24 @@ struct TerminalCursorState: Equatable {
     let column: Int
     let shape: TerminalCursorShape
     let isVisible: Bool
+}
+
+enum TerminalMouseTrackingMode: Equatable {
+    case disabled
+    case normal
+    case buttonEvent
+    case anyEvent
+
+    var isEnabled: Bool {
+        self != .disabled
+    }
+}
+
+struct TerminalMouseState: Equatable {
+    var trackingMode = TerminalMouseTrackingMode.disabled
+    var usesSGREncoding = false
+    var alternateScrollMode = true
+    var sendsFocusEvents = false
 }
 
 struct TerminalBufferLineID: Equatable, Hashable, Comparable {
@@ -212,6 +236,14 @@ private struct TerminalPageGrid: Equatable {
         pages[pages.count - 1].lines.append(TerminalBufferLine(id: makeLineID(), cells: cells))
     }
 
+    mutating func insertLine(_ cells: [TerminalCell] = [], at row: Int) {
+        let newLine = TerminalBufferLine(id: makeLineID(), cells: cells)
+        let clampedRow = max(0, min(row, lineCount))
+        var lines = (0..<lineCount).compactMap { line(at: $0) }
+        lines.insert(newLine, at: clampedRow)
+        rebuild(from: lines)
+    }
+
     mutating func appendLines(_ lines: [[TerminalCell]]) {
         for line in lines {
             appendLine(line)
@@ -355,6 +387,8 @@ protocol TerminalBuffering {
     var lineCount: Int { get }
     var storedLineCount: Int { get }
     var cursorState: TerminalCursorState { get }
+    var usesAlternateScreen: Bool { get }
+    var mouseState: TerminalMouseState { get }
 
     func snapshot(range: Range<Int>) -> [String]
     func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine]
@@ -403,6 +437,9 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var cursorColumn = 0
     private var cursorShape = TerminalCursorShape.block
     private var isCursorVisible = true
+    private var scrollRegionTop: Int?
+    private var scrollRegionBottom: Int?
+    private var currentMouseState = TerminalMouseState()
     private var parserState: ParserState = .ground
     private var controlBuffer: [UInt8] = []
     private var pendingText: [UInt8] = []
@@ -426,6 +463,43 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         }
     }
 
+    private var screenRows: Int {
+        max(1, currentViewportSize.rows)
+    }
+
+    private var screenTopRow: Int {
+        isUsingAlternateScreen ? 0 : max(0, activeGrid.lineCount - screenRows)
+    }
+
+    private var screenBottomRow: Int {
+        screenTopRow + screenRows - 1
+    }
+
+    private var hasExplicitScrollRegion: Bool {
+        scrollRegionTop != nil || scrollRegionBottom != nil
+    }
+
+    private var isScrollRegionActive: Bool {
+        isUsingAlternateScreen || hasExplicitScrollRegion
+    }
+
+    private var relativeScrollRegion: (top: Int, bottom: Int) {
+        let maximumRow = screenRows - 1
+        let top = min(max(scrollRegionTop ?? 0, 0), maximumRow)
+        let bottom = min(max(scrollRegionBottom ?? maximumRow, 0), maximumRow)
+        guard top < bottom else { return (0, maximumRow) }
+        return (top, bottom)
+    }
+
+    private var absoluteScrollRegion: (top: Int, bottom: Int) {
+        let relativeRegion = relativeScrollRegion
+        let screenTop = screenTopRow
+        return (
+            top: screenTop + relativeRegion.top,
+            bottom: screenTop + relativeRegion.bottom
+        )
+    }
+
     var lineCount: Int {
         let minimumLineCount = isUsingAlternateScreen ? currentViewportSize.rows : 1
         return max(activeGrid.lineCount, minimumLineCount)
@@ -442,6 +516,14 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             shape: cursorShape,
             isVisible: isCursorVisible
         )
+    }
+
+    var usesAlternateScreen: Bool {
+        isUsingAlternateScreen
+    }
+
+    var mouseState: TerminalMouseState {
+        currentMouseState
     }
 
     func snapshot(range: Range<Int>) -> [String] {
@@ -473,6 +555,9 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         cursorColumn = 0
         cursorShape = .block
         isCursorVisible = true
+        scrollRegionTop = nil
+        scrollRegionBottom = nil
+        currentMouseState = TerminalMouseState()
         parserState = .ground
         controlBuffer.removeAll(keepingCapacity: true)
         pendingText.removeAll(keepingCapacity: true)
@@ -493,6 +578,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
     mutating func resize(to viewportSize: TerminalViewportSize) {
         currentViewportSize = Self.normalizedViewportSize(viewportSize)
+        normalizeScrollRegion()
         trimIfNeeded()
         clampCursor()
     }
@@ -578,6 +664,9 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         case UInt8(ascii: "8"):
             restoreCursorState()
             parserState = .ground
+        case UInt8(ascii: "M"):
+            reverseIndex()
+            parserState = .ground
         default:
             parserState = .ground
         }
@@ -645,6 +734,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         switch Character(UnicodeScalar(finalByte)) {
         case "m":
             applySGR(parameters)
+        case "c":
+            handleDeviceAttributes(rawPayload: rawPayload, responses: &responses)
         case "n":
             handleDeviceStatusReport(parameter(at: 0, default: 0), viewportSize: viewportSize, responses: &responses)
         case "h", "l":
@@ -657,9 +748,15 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         case "s":
             saveCursorState()
         case "u":
-            restoreCursorState()
+            handleCursorRestoreOrKeyboardProtocol(rawPayload: rawPayload, responses: &responses)
         case "q":
             applyCursorShape(parameter(at: 0, default: 0))
+        case "r":
+            setScrollRegion(
+                rawPayload: rawPayload,
+                top: parameter(at: 0, default: 1),
+                bottom: parameter(at: 1, default: screenRows)
+            )
         case "A":
             moveCursorRow(by: -parameter(at: 0, default: 1))
         case "B":
@@ -688,6 +785,28 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             eraseCharacters(parameter(at: 0, default: 1))
         default:
             return
+        }
+    }
+
+    private func handleDeviceAttributes(rawPayload: String, responses: inout [Data]) {
+        if rawPayload.first == ">" {
+            responses.append(Data("\u{1B}[>0;0;0c".utf8))
+            return
+        }
+
+        if rawPayload.isEmpty || rawPayload == "0" {
+            responses.append(Data("\u{1B}[?1;2c".utf8))
+        }
+    }
+
+    private mutating func handleCursorRestoreOrKeyboardProtocol(rawPayload: String, responses: inout [Data]) {
+        switch rawPayload.first {
+        case "?":
+            responses.append(Data("\u{1B}[?0u".utf8))
+        case ">", "<", "=":
+            return
+        default:
+            restoreCursorState()
         }
     }
 
@@ -733,6 +852,20 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 }
             case 25:
                 isCursorVisible = isSet
+            case 1000:
+                currentMouseState.trackingMode = isSet ? .normal : .disabled
+            case 1002:
+                currentMouseState.trackingMode = isSet ? .buttonEvent : .disabled
+            case 1003:
+                currentMouseState.trackingMode = isSet ? .anyEvent : .disabled
+            case 1006:
+                currentMouseState.usesSGREncoding = isSet
+            case 1007:
+                currentMouseState.alternateScrollMode = isSet
+            case 1004:
+                currentMouseState.sendsFocusEvents = isSet
+            case 2004, 2026:
+                continue
             default:
                 continue
             }
@@ -746,6 +879,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         currentViewportSize = Self.normalizedViewportSize(viewportSize)
         isUsingAlternateScreen = true
+        scrollRegionTop = nil
+        scrollRegionBottom = nil
         alternateGrid.removeAll(keepingCapacity: true)
         alternateGrid.appendLine()
         cursorRow = 0
@@ -758,6 +893,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         alternateGrid.removeAll(keepingCapacity: true)
         isUsingAlternateScreen = false
+        scrollRegionTop = nil
+        scrollRegionBottom = nil
 
         if restoreCursor {
             restoreCursorState()
@@ -793,6 +930,40 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         }
     }
 
+    private mutating func setScrollRegion(rawPayload: String, top: Int, bottom: Int) {
+        if rawPayload.isEmpty {
+            scrollRegionTop = nil
+            scrollRegionBottom = nil
+            moveCursor(toRow: 0, column: 0)
+            return
+        }
+
+        let maximumRow = screenRows - 1
+        let normalizedTop = min(max(top - 1, 0), maximumRow)
+        let normalizedBottom = min(max(bottom - 1, 0), maximumRow)
+        guard normalizedTop < normalizedBottom else { return }
+
+        scrollRegionTop = normalizedTop
+        scrollRegionBottom = normalizedBottom
+        moveCursor(toRow: 0, column: 0)
+    }
+
+    private mutating func normalizeScrollRegion() {
+        guard hasExplicitScrollRegion else { return }
+
+        let maximumRow = screenRows - 1
+        let normalizedTop = min(max(scrollRegionTop ?? 0, 0), maximumRow)
+        let normalizedBottom = min(max(scrollRegionBottom ?? maximumRow, 0), maximumRow)
+        guard normalizedTop < normalizedBottom else {
+            scrollRegionTop = nil
+            scrollRegionBottom = nil
+            return
+        }
+
+        scrollRegionTop = normalizedTop
+        scrollRegionBottom = normalizedBottom
+    }
+
     private mutating func applySGR(_ parameters: [Int?]) {
         let codes = parameters.isEmpty ? [0] : parameters.map { $0 ?? 0 }
         var index = 0
@@ -809,12 +980,22 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             case 22:
                 currentStyle.isBold = false
                 currentStyle.isDim = false
+            case 7:
+                currentStyle.isInverse = true
+            case 27:
+                currentStyle.isInverse = false
             case 30...37:
                 currentStyle.foreground = .ansi16(code - 30)
+            case 40...47:
+                currentStyle.background = .ansi16(code - 40)
             case 39:
                 currentStyle.foreground = nil
+            case 49:
+                currentStyle.background = nil
             case 90...97:
                 currentStyle.foreground = .ansi16(code - 90 + 8)
+            case 100...107:
+                currentStyle.background = .ansi16(code - 100 + 8)
             case 38:
                 index = applyExtendedColor(from: codes, startingAt: index, isForeground: true)
             case 48:
@@ -837,6 +1018,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             guard codes.indices.contains(valueIndex) else { return index }
             if isForeground {
                 currentStyle.foreground = .palette256(codes[valueIndex])
+            } else {
+                currentStyle.background = .palette256(codes[valueIndex])
             }
             return valueIndex
         case 2:
@@ -854,6 +1037,12 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                     UInt8(clamping: codes[greenIndex]),
                     UInt8(clamping: codes[blueIndex])
                 )
+            } else {
+                currentStyle.background = .rgb(
+                    UInt8(clamping: codes[redIndex]),
+                    UInt8(clamping: codes[greenIndex]),
+                    UInt8(clamping: codes[blueIndex])
+                )
             }
             return blueIndex
         default:
@@ -862,60 +1051,84 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     }
 
     private mutating func eraseInDisplay(mode: Int) {
-        guard !activeGrid.isEmpty else { return }
         ensureCursorLine()
 
         switch mode {
         case 1:
-            if cursorRow > 0 {
-                for index in 0..<cursorRow {
-                    activeGrid.setCells([], at: index)
-                    activeGrid.setSoftWrapped(false, at: index)
-                }
-            }
+            clearRows(in: screenTopRow..<cursorRow, ensureStorage: false)
             eraseInLine(mode: 1)
         case 2:
+            clearRows(in: screenTopRow..<(screenBottomRow + 1), ensureStorage: isUsingAlternateScreen)
+        case 3:
             activeGrid.removeAll(keepingCapacity: true)
             activeGrid.appendLine()
             cursorRow = 0
             cursorColumn = 0
         default:
             eraseInLine(mode: 0)
-            if cursorRow + 1 < activeGrid.lineCount {
-                activeGrid.removeRows(in: (cursorRow + 1)..<activeGrid.lineCount)
-            }
+            clearRows(in: (cursorRow + 1)..<(screenBottomRow + 1), ensureStorage: false)
         }
     }
 
     private mutating func eraseInLine(mode: Int) {
-        guard !activeGrid.isEmpty else { return }
         ensureCursorLine()
 
         var cells = activeGrid.cells(at: cursorRow)
+        let columns = max(1, currentViewportSize.columns)
         switch mode {
         case 1:
-            let upperBound = min(cursorColumn + 1, cells.count)
+            let upperBound = currentStyle.paintsBackground
+                ? min(cursorColumn + 1, columns)
+                : min(cursorColumn + 1, cells.count)
+            ensureCellsExist(upTo: upperBound, in: &cells)
             if upperBound > 0 {
                 for index in 0..<upperBound {
                     cells[index] = TerminalCell(character: " ", style: currentStyle)
                 }
             }
         case 2:
-            cells.removeAll(keepingCapacity: true)
+            if currentStyle.paintsBackground {
+                cells = blankCells(count: columns)
+            } else {
+                cells.removeAll(keepingCapacity: true)
+            }
             activeGrid.setSoftWrapped(false, at: cursorRow)
-            cursorColumn = 0
         default:
-            guard cursorColumn < cells.count else {
+            let upperBound = currentStyle.paintsBackground ? columns : cells.count
+            guard cursorColumn < upperBound else {
                 activeGrid.setCells(cells, at: cursorRow)
                 return
             }
 
-            for index in cursorColumn..<cells.count {
+            ensureCellsExist(upTo: upperBound, in: &cells)
+            for index in cursorColumn..<upperBound {
                 cells[index] = TerminalCell(character: " ", style: currentStyle)
             }
         }
 
         activeGrid.setCells(cells, at: cursorRow)
+    }
+
+    private mutating func clearRows(in range: Range<Int>, ensureStorage: Bool) {
+        guard !range.isEmpty else { return }
+
+        let lowerBound = max(0, range.lowerBound)
+        let upperBound: Int
+        if ensureStorage {
+            upperBound = max(lowerBound, range.upperBound)
+            if upperBound > lowerBound {
+                activeGrid.ensureLine(at: upperBound - 1)
+            }
+        } else {
+            upperBound = min(max(lowerBound, range.upperBound), activeGrid.lineCount)
+        }
+        guard lowerBound < upperBound else { return }
+
+        for row in lowerBound..<upperBound {
+            let cells = currentStyle.paintsBackground ? blankCells(count: currentViewportSize.columns) : []
+            activeGrid.setCells(cells, at: row)
+            activeGrid.setSoftWrapped(false, at: row)
+        }
     }
 
     private mutating func deleteCharacters(_ count: Int) {
@@ -935,13 +1148,25 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         ensureCursorLine()
 
         var cells = activeGrid.cells(at: cursorRow)
-        guard cursorColumn < cells.count else { return }
+        let upperBound = currentStyle.paintsBackground
+            ? min(cursorColumn + count, max(1, currentViewportSize.columns))
+            : min(cursorColumn + count, cells.count)
+        guard cursorColumn < upperBound else { return }
 
-        let upperBound = min(cursorColumn + count, cells.count)
+        ensureCellsExist(upTo: upperBound, in: &cells)
         for index in cursorColumn..<upperBound {
             cells[index] = TerminalCell(character: " ", style: currentStyle)
         }
         activeGrid.setCells(cells, at: cursorRow)
+    }
+
+    private func blankCells(count: Int) -> [TerminalCell] {
+        Array(repeating: TerminalCell(character: " ", style: currentStyle), count: max(0, count))
+    }
+
+    private func ensureCellsExist(upTo count: Int, in cells: inout [TerminalCell]) {
+        guard count > cells.count else { return }
+        cells.append(contentsOf: blankCells(count: count - cells.count))
     }
 
     private mutating func flushPendingText(preservingIncompleteUTF8: Bool = false) {
@@ -990,20 +1215,21 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
     private mutating func appendNewLine() {
         ensureCursorLine()
-        cursorRow += 1
 
-        if isUsingAlternateScreen {
-            let rows = max(1, currentViewportSize.rows)
-            if cursorRow >= rows {
-                activeGrid.trimPrefix(cursorRow - rows + 1)
-                activeGrid.ensureLine(at: rows - 1)
-                cursorRow = rows - 1
+        if isScrollRegionActive {
+            let scrollRegion = absoluteScrollRegion
+            activeGrid.ensureLine(at: scrollRegion.bottom)
+            if cursorRow >= scrollRegion.bottom {
+                cursorRow = scrollRegionUp(top: scrollRegion.top, bottom: scrollRegion.bottom)
             } else {
-                activeGrid.ensureLine(at: cursorRow)
+                cursorRow = min(cursorRow + 1, screenBottomRow)
+                ensureCursorLine()
             }
             cursorColumn = 0
             return
         }
+
+        cursorRow += 1
 
         if cursorRow == activeGrid.lineCount {
             activeGrid.appendLine()
@@ -1012,19 +1238,15 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     }
 
     private mutating func moveCursorRow(by delta: Int) {
-        var nextRow = max(0, cursorRow + delta)
-        if isUsingAlternateScreen {
-            nextRow = min(nextRow, max(0, currentViewportSize.rows - 1))
-        }
-        cursorRow = nextRow
+        let top = screenTopRow
+        let bottom = screenBottomRow
+        cursorRow = min(max(cursorRow + delta, top), bottom)
         ensureCursorLine()
     }
 
     private mutating func moveCursor(toRow row: Int, column: Int) {
-        cursorRow = max(0, row)
-        if isUsingAlternateScreen {
-            cursorRow = min(cursorRow, max(0, currentViewportSize.rows - 1))
-        }
+        let top = screenTopRow
+        cursorRow = min(max(top + max(0, row), top), screenBottomRow)
         ensureCursorLine()
         cursorColumn = max(0, column)
     }
@@ -1034,6 +1256,47 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             cursorRow = min(max(cursorRow, 0), max(0, currentViewportSize.rows - 1))
         }
         activeGrid.ensureLine(at: cursorRow)
+    }
+
+    private mutating func reverseIndex() {
+        ensureCursorLine()
+
+        if isScrollRegionActive {
+            let scrollRegion = absoluteScrollRegion
+            activeGrid.ensureLine(at: scrollRegion.bottom)
+            if cursorRow <= scrollRegion.top {
+                scrollRegionDown(top: scrollRegion.top, bottom: scrollRegion.bottom)
+                cursorRow = scrollRegion.top
+            } else {
+                cursorRow = max(cursorRow - 1, screenTopRow)
+            }
+            return
+        }
+
+        cursorRow = max(cursorRow - 1, screenTopRow)
+    }
+
+    private mutating func scrollRegionUp(top: Int, bottom: Int) -> Int {
+        guard top < bottom else { return cursorRow }
+
+        activeGrid.ensureLine(at: bottom)
+        if !isUsingAlternateScreen, top == screenTopRow {
+            activeGrid.ensureLine(at: screenBottomRow)
+            activeGrid.insertLine(at: bottom + 1)
+            return bottom + 1
+        }
+
+        activeGrid.removeRows(in: top..<(top + 1))
+        activeGrid.insertLine(at: bottom)
+        return bottom
+    }
+
+    private mutating func scrollRegionDown(top: Int, bottom: Int) {
+        guard top < bottom else { return }
+
+        activeGrid.ensureLine(at: bottom)
+        activeGrid.removeRows(in: bottom..<(bottom + 1))
+        activeGrid.insertLine(at: top)
     }
 
     private mutating func clampCursor() {
@@ -1092,7 +1355,6 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         let rows = max(1, viewportSize.rows)
         let columns = max(1, viewportSize.columns)
-        let screenTopRow = isUsingAlternateScreen ? 0 : max(0, activeGrid.lineCount - rows)
         let row = min(rows, max(1, cursorRow - screenTopRow + 1))
         let column = min(columns, max(1, cursorColumn + 1))
 

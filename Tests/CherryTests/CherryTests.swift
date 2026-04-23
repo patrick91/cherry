@@ -38,6 +38,34 @@ import Testing
     #expect(styled[0].runs[1] == TerminalTextRun(text: " world", style: TerminalTextStyle()))
 }
 
+@Test func ansiBackgroundColorIsPreserved() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.ingest(Data("\u{1B}[48;5;236mhello\u{1B}[49m world".utf8))
+
+    let styled = buffer.styledSnapshot(range: 0..<buffer.lineCount)
+
+    #expect(styled[0].runs[0] == TerminalTextRun(
+        text: "hello",
+        style: TerminalTextStyle(background: .palette256(236))
+    ))
+    #expect(styled[0].runs[1] == TerminalTextRun(text: " world", style: TerminalTextStyle()))
+}
+
+@Test func eraseLineUsesCurrentBackgroundStyle() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    let viewportSize = TerminalViewportSize(columns: 8, rows: 3)
+
+    buffer.ingest(Data("\u{1B}[48;5;236m\u{1B}[KX".utf8), viewportSize: viewportSize)
+
+    #expect(buffer.lineLength(at: 0) == 8)
+    #expect(buffer.styledSnapshot(range: 0..<1)[0].runs == [
+        TerminalTextRun(
+            text: "X       ",
+            style: TerminalTextStyle(background: .palette256(236))
+        )
+    ])
+}
+
 @Test func carriageReturnRewritesTheCurrentLine() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.ingest(Data("loading".utf8))
@@ -107,6 +135,25 @@ import Testing
     #expect(responses == [Data("\u{1B}[2;3R".utf8)])
 }
 
+@Test func deviceAttributesAndKeyboardProtocolQueriesRespond() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    let startupProbe =
+        "\u{1B}[?2004h" +
+        "\u{1B}[>7u" +
+        "\u{1B}[?1004h" +
+        "\u{1B}[?u" +
+        "\u{1B}[c" +
+        "\u{1B}[>c"
+    let responses = buffer.ingest(Data(startupProbe.utf8))
+
+    #expect(responses == [
+        Data("\u{1B}[?0u".utf8),
+        Data("\u{1B}[?1;2c".utf8),
+        Data("\u{1B}[>0;0;0c".utf8)
+    ])
+}
+
 @Test func cursorStateTracksWritesAndMovement() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.ingest(Data("abc\u{1B}[D".utf8), viewportSize: TerminalViewportSize(columns: 10, rows: 5))
@@ -125,6 +172,106 @@ import Testing
 
     buffer.ingest(Data("\u{1B}[2 q".utf8))
     #expect(buffer.cursorState.shape == .block)
+}
+
+@Test func terminalTracksMouseAndAlternateScrollModes() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[?1049h\u{1B}[?1000h\u{1B}[?1006h\u{1B}[?1007l\u{1B}[?1004h".utf8))
+
+    #expect(buffer.usesAlternateScreen)
+    #expect(buffer.mouseState == TerminalMouseState(
+        trackingMode: .normal,
+        usesSGREncoding: true,
+        alternateScrollMode: false,
+        sendsFocusEvents: true
+    ))
+}
+
+@Test func alternateScreenScrollWheelProducesCursorKeys() async throws {
+    var remainder: CGFloat = 0
+
+    let sequence = TerminalInputEncoder.alternateScreenScrollSequence(
+        deltaY: 20,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        remainder: &remainder
+    )
+
+    #expect(sequence == Data("\u{1B}[A".utf8))
+}
+
+@Test func preciseScrollAccumulatesByFullTerminalCell() async throws {
+    var remainder: CGFloat = 0
+
+    let firstSequence = TerminalInputEncoder.alternateScreenScrollSequence(
+        deltaY: 10,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        remainder: &remainder
+    )
+    let secondSequence = TerminalInputEncoder.alternateScreenScrollSequence(
+        deltaY: 10,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        remainder: &remainder
+    )
+
+    #expect(firstSequence == nil)
+    #expect(secondSequence == Data("\u{1B}[A".utf8))
+}
+
+@Test func sgrMouseWheelProducesTerminalMouseEvents() async throws {
+    var remainder: CGFloat = 0
+
+    let sequence = TerminalInputEncoder.mouseWheelSequence(
+        deltaY: -20,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        column: 5,
+        row: 3,
+        mouseState: TerminalMouseState(trackingMode: .normal, usesSGREncoding: true),
+        remainder: &remainder
+    )
+
+    #expect(sequence == Data("\u{1B}[<65;5;3M".utf8))
+}
+
+@Test func terminalMousePositionUsesVisibleViewportCoordinates() async throws {
+    let position = TerminalInputEncoder.mousePosition(
+        documentLocation: NSPoint(x: 22 + 4.5 * 8, y: 900 + 24 + 2.5 * 20),
+        visibleOrigin: NSPoint(x: 0, y: 900),
+        viewportSize: TerminalViewportSize(columns: 80, rows: 24),
+        sideInset: 22,
+        topInset: 24,
+        cellWidth: 8,
+        lineHeight: 20
+    )
+
+    #expect(position.column == 5)
+    #expect(position.row == 3)
+}
+
+@Test func viewportScrollOffsetClampsAtDocumentEdges() async throws {
+    let contentHeight: CGFloat = 1_000
+    let viewportHeight: CGFloat = 400
+
+    #expect(TerminalInputEncoder.clampedViewportOffset(
+        currentOffset: 4,
+        deltaY: 20,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        documentHeight: contentHeight,
+        viewportHeight: viewportHeight
+    ) == 0)
+    #expect(TerminalInputEncoder.clampedViewportOffset(
+        currentOffset: 590,
+        deltaY: -20,
+        hasPreciseScrollingDeltas: true,
+        lineHeight: 20,
+        documentHeight: contentHeight,
+        viewportHeight: viewportHeight
+    ) == 600)
 }
 
 @Test func terminalEnterSendsCarriageReturn() async throws {
@@ -188,6 +335,53 @@ import Testing
 
     #expect(buffer.lineCount == 3)
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["b", "c", "d"])
+}
+
+@Test func screenRelativeCursorAddressingPreservesScrollback() async throws {
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 3)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.appendPlainLines(["old-0", "old-1", "screen-0", "screen-1", "screen-2"])
+
+    buffer.ingest(Data("\u{1B}[1;1HX".utf8), viewportSize: viewportSize)
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == [
+        "old-0",
+        "old-1",
+        "Xcreen-0",
+        "screen-1",
+        "screen-2"
+    ])
+}
+
+@Test func scrollRegionScrollsOnlyRegion() async throws {
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 4)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.appendPlainLines(["top", "one", "two", "bottom"])
+
+    buffer.ingest(Data("\u{1B}[2;3r\u{1B}[3;1H\r\n".utf8), viewportSize: viewportSize)
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["top", "two", "", "bottom"])
+}
+
+@Test func topAnchoredPrimaryScrollRegionPreservesScrollback() async throws {
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 4)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.appendPlainLines(["one", "two", "three", "status"])
+
+    buffer.ingest(Data("\u{1B}[1;3r\u{1B}[3;1H\r\n".utf8), viewportSize: viewportSize)
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["one", "two", "three", "", "status"])
+    #expect(buffer.cursorState.row == 3)
+}
+
+@Test func reverseIndexScrollsOnlyRegion() async throws {
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 4)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.appendPlainLines(["top", "one", "two", "bottom"])
+
+    buffer.ingest(Data("\u{1B}[2;3r\u{1B}[2;1H\u{1B}M".utf8), viewportSize: viewportSize)
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["top", "", "one", "bottom"])
 }
 
 @Test func cursorUpAndEraseDisplayAllowPromptRepaint() async throws {

@@ -25,6 +25,34 @@ struct TerminalRenderedLine: Equatable {
     }
 }
 
+struct TerminalGridPoint: Equatable, Comparable {
+    let row: Int
+    let column: Int
+
+    static func < (lhs: TerminalGridPoint, rhs: TerminalGridPoint) -> Bool {
+        if lhs.row != rhs.row {
+            return lhs.row < rhs.row
+        }
+
+        return lhs.column < rhs.column
+    }
+}
+
+struct TerminalSelectionRange: Equatable {
+    let anchor: TerminalGridPoint
+    let extent: TerminalGridPoint
+
+    var isEmpty: Bool {
+        anchor == extent
+    }
+
+    var normalized: (start: TerminalGridPoint, end: TerminalGridPoint) {
+        anchor <= extent
+            ? (anchor, extent)
+            : (extent, anchor)
+    }
+}
+
 private struct TerminalCell: Equatable {
     let character: Character
     let style: TerminalTextStyle
@@ -72,6 +100,47 @@ struct TerminalTextBuffer {
         let lower = max(0, min(range.lowerBound, lines.count))
         let upper = max(lower, min(range.upperBound, lines.count))
         return lines[lower..<upper].map(Self.renderedLine(from:))
+    }
+
+    func lineLength(at row: Int) -> Int {
+        guard lines.indices.contains(row) else { return 0 }
+        return lines[row].count
+    }
+
+    func selectedText(in selection: TerminalSelectionRange) -> String {
+        guard !selection.isEmpty, !lines.isEmpty else { return "" }
+
+        let normalized = selection.normalized
+        let startRow = max(0, min(normalized.start.row, lines.count - 1))
+        let endRow = max(0, min(normalized.end.row, lines.count - 1))
+        guard startRow <= endRow else { return "" }
+
+        var selectedLines: [String] = []
+        selectedLines.reserveCapacity(endRow - startRow + 1)
+
+        for row in startRow...endRow {
+            let cells = lines[row]
+            let startColumn: Int
+            let endColumn: Int
+
+            if row == startRow, row == endRow {
+                startColumn = normalized.start.column
+                endColumn = normalized.end.column
+            } else if row == startRow {
+                startColumn = normalized.start.column
+                endColumn = cells.count
+            } else if row == endRow {
+                startColumn = 0
+                endColumn = normalized.end.column
+            } else {
+                startColumn = 0
+                endColumn = cells.count
+            }
+
+            selectedLines.append(Self.text(from: cells, startColumn: startColumn, endColumn: endColumn))
+        }
+
+        return selectedLines.joined(separator: "\n")
     }
 
     mutating func clear() {
@@ -535,6 +604,13 @@ struct TerminalTextBuffer {
 
     private static func plainLine(from text: String) -> [TerminalCell] {
         text.map { TerminalCell(character: $0, style: TerminalTextStyle()) }
+    }
+
+    private static func text(from cells: [TerminalCell], startColumn: Int, endColumn: Int) -> String {
+        let lower = max(0, min(startColumn, cells.count))
+        let upper = max(lower, min(endColumn, cells.count))
+        guard lower < upper else { return "" }
+        return cells[lower..<upper].map(\.character).map(String.init).joined()
     }
 
     private mutating func cursorPositionReport(viewportSize: TerminalViewportSize) -> Data {

@@ -154,6 +154,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         buffer.styledSnapshot(range: range)
     }
 
+    func lineLength(at row: Int) -> Int {
+        buffer.lineLength(at: row)
+    }
+
+    func selectedText(in selection: TerminalSelectionRange) -> String {
+        buffer.selectedText(in: selection)
+    }
+
     func sendCommandLine(_ command: String) {
         send(text: command + "\r")
     }

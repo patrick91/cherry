@@ -86,6 +86,7 @@ final class TerminalScrollView: NSScrollView {
         if activeSession !== session {
             activeSession = session
             canvasView.session = session
+            canvasView.clearSelection()
             canvasView.sendInput = { [weak session] data in
                 session?.send(data: data)
             }
@@ -141,6 +142,12 @@ final class TerminalScrollView: NSScrollView {
         }
     }
 
+    @objc func copy(_ sender: Any?) {
+        if canvasView.copySelectionToPasteboard() {
+            return
+        }
+    }
+
     private func syncDocumentFrame(scrollToBottomIfPinned: Bool) {
         guard let activeSession else { return }
 
@@ -191,6 +198,9 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let boldFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .semibold)
     private lazy var cellWidth = max(7.8, "W".size(withAttributes: [.font: regularFont]).width)
     private var isFocused = false
+    private var selection: TerminalSelectionRange?
+    private var selectionAnchor: TerminalGridPoint?
+    private var isSelecting = false
     private var markedText = NSMutableAttributedString()
     private var keyTextAccumulator: [String]?
     private var handledCommand = false
@@ -250,6 +260,8 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         guard endingRow > startingRow else { return }
 
+        drawSelection(in: startingRow..<endingRow)
+
         let visibleLines = session.styledSnapshot(range: startingRow..<endingRow)
         for (offset, line) in visibleLines.enumerated() {
             let row = startingRow + offset
@@ -266,6 +278,25 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         let stripColor = session?.tint ?? NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.32, alpha: 1)
         stripColor.withAlphaComponent(isFocused ? 0.95 : 0.45).setFill()
         path.fill()
+    }
+
+    private func drawSelection(in visibleRows: Range<Int>) {
+        guard let selection, !selection.isEmpty else { return }
+
+        let columns = viewportSize(for: enclosingScrollView?.contentSize ?? bounds.size).columns
+        let fillColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(isFocused ? 0.42 : 0.28)
+        fillColor.setFill()
+
+        for row in visibleRows {
+            guard let columnsRange = selectionColumns(for: row, viewportColumns: columns) else { continue }
+            let rect = NSRect(
+                x: sideInset + (CGFloat(columnsRange.lowerBound) * cellWidth),
+                y: topInset + (CGFloat(row) * lineHeight),
+                width: max(cellWidth, CGFloat(columnsRange.count) * cellWidth),
+                height: lineHeight
+            )
+            rect.fill()
+        }
     }
 
     private func attributedLine(for line: TerminalRenderedLine) -> NSAttributedString {
@@ -308,6 +339,34 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             _ = window.makeFirstResponder(self)
         }
 
+        let anchor = gridPoint(for: event, rounding: .down)
+        selectionAnchor = anchor
+        selection = nil
+        isSelecting = true
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isSelecting, let selectionAnchor else { return }
+
+        autoscroll(with: event)
+        let extent = gridPoint(for: event, rounding: rounding(for: event, from: selectionAnchor))
+        let nextSelection = TerminalSelectionRange(anchor: selectionAnchor, extent: extent)
+        selection = nextSelection.isEmpty ? nil : nextSelection
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            selectionAnchor = nil
+            isSelecting = false
+        }
+
+        guard isSelecting, let selectionAnchor else { return }
+
+        let extent = gridPoint(for: event, rounding: rounding(for: event, from: selectionAnchor))
+        let nextSelection = TerminalSelectionRange(anchor: selectionAnchor, extent: extent)
+        selection = nextSelection.isEmpty ? nil : nextSelection
         needsDisplay = true
     }
 
@@ -343,8 +402,38 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         needsDisplay = true
     }
 
+    func clearSelection() {
+        guard selection != nil else { return }
+        selection = nil
+        needsDisplay = true
+    }
+
+    @discardableResult
+    func copySelectionToPasteboard() -> Bool {
+        guard let selectedText = selectedTextForCopy(), !selectedText.isEmpty else {
+            return false
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(selectedText, forType: .string)
+        return true
+    }
+
+    @objc func copy(_ sender: Any?) {
+        _ = copySelectionToPasteboard()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .iBeam)
+    }
+
     @discardableResult
     func handleKeyDown(_ event: NSEvent) -> Bool {
+        if isCopyShortcut(event), copySelectionToPasteboard() {
+            return true
+        }
+
         guard session?.acceptsInput == true else {
             return false
         }
@@ -363,6 +452,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         interpretKeyEvents([event])
 
         if let accumulator = keyTextAccumulator, !accumulator.isEmpty {
+            clearSelection()
             for text in accumulator {
                 sendInput?(Data(text.utf8))
             }
@@ -374,11 +464,97 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
 
         if let encoded = encodedInput(for: event) {
+            clearSelection()
             sendInput?(encoded)
             return true
         }
 
         return false
+    }
+
+    private enum SelectionColumnRounding {
+        case down
+        case up
+    }
+
+    private func selectedTextForCopy() -> String? {
+        guard let selection, !selection.isEmpty else { return nil }
+        return session?.selectedText(in: selection)
+    }
+
+    private func selectionColumns(for row: Int, viewportColumns: Int) -> Range<Int>? {
+        guard let selection, !selection.isEmpty else { return nil }
+
+        let normalized = selection.normalized
+        guard row >= normalized.start.row, row <= normalized.end.row else { return nil }
+
+        let lower: Int
+        let upper: Int
+        if normalized.start.row == normalized.end.row {
+            lower = normalized.start.column
+            upper = normalized.end.column
+        } else if row == normalized.start.row {
+            lower = normalized.start.column
+            upper = viewportColumns
+        } else if row == normalized.end.row {
+            lower = 0
+            upper = normalized.end.column
+        } else {
+            lower = 0
+            upper = viewportColumns
+        }
+
+        let visualColumns = max(viewportColumns, session?.lineLength(at: row) ?? 0, 1)
+        let clampedLower = max(0, min(lower, visualColumns))
+        let clampedUpper = max(clampedLower, min(upper, visualColumns))
+        guard clampedUpper > clampedLower else { return nil }
+        return clampedLower..<clampedUpper
+    }
+
+    private func gridPoint(for event: NSEvent, rounding: SelectionColumnRounding) -> TerminalGridPoint {
+        let location = convert(event.locationInWindow, from: nil)
+        let rawRow = Int(floor((location.y - topInset) / lineHeight))
+        let maxRow = max(0, (session?.lineCount ?? 1) - 1)
+        let row = max(0, min(rawRow, maxRow))
+
+        let rawColumn = (location.x - sideInset) / cellWidth
+        let roundedColumn = switch rounding {
+        case .down:
+            Int(floor(rawColumn))
+        case .up:
+            Int(ceil(rawColumn))
+        }
+        let viewportColumns = viewportSize(for: enclosingScrollView?.contentSize ?? bounds.size).columns
+        let maxColumn = max(viewportColumns, session?.lineLength(at: row) ?? 0)
+        let column = max(0, min(roundedColumn, maxColumn))
+
+        return TerminalGridPoint(row: row, column: column)
+    }
+
+    private func rounding(for event: NSEvent, from anchor: TerminalGridPoint) -> SelectionColumnRounding {
+        let location = convert(event.locationInWindow, from: nil)
+        let row = Int(floor((location.y - topInset) / lineHeight))
+        if row > anchor.row {
+            return .up
+        }
+        if row < anchor.row {
+            return .down
+        }
+
+        let rawColumn = (location.x - sideInset) / cellWidth
+        return rawColumn >= CGFloat(anchor.column) ? .up : .down
+    }
+
+    private func isCopyShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command),
+              !modifiers.contains(.control),
+              !modifiers.contains(.option),
+              event.charactersIgnoringModifiers?.lowercased() == "c" else {
+            return false
+        }
+
+        return true
     }
 
     override func keyUp(with event: NSEvent) {
@@ -445,6 +621,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
         if let sequence = commandSequence(for: selector) {
             handledCommand = true
+            clearSelection()
             sendInput?(sequence)
         }
     }
@@ -474,6 +651,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             accumulator.append(text)
             keyTextAccumulator = accumulator
         } else {
+            clearSelection()
             sendInput?(Data(text.utf8))
         }
     }

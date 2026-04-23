@@ -54,6 +54,28 @@ import Testing
     #expect(enter == Data("\r".utf8))
 }
 
+@Test func selectedTextSpansRows() async throws {
+    var buffer = TerminalTextBuffer(maxScrollback: nil)
+    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
+    let selection = TerminalSelectionRange(
+        anchor: TerminalGridPoint(row: 0, column: 2),
+        extent: TerminalGridPoint(row: 2, column: 4)
+    )
+
+    #expect(buffer.selectedText(in: selection) == "pha\nbravo\nchar")
+}
+
+@Test func selectedTextHandlesReverseSelection() async throws {
+    var buffer = TerminalTextBuffer(maxScrollback: nil)
+    buffer.ingest(Data("alpha\r\nbravo".utf8))
+    let selection = TerminalSelectionRange(
+        anchor: TerminalGridPoint(row: 1, column: 3),
+        extent: TerminalGridPoint(row: 0, column: 1)
+    )
+
+    #expect(buffer.selectedText(in: selection) == "lpha\nbra")
+}
+
 @Test func cursorUpAndEraseDisplayAllowPromptRepaint() async throws {
     var buffer = TerminalTextBuffer(maxScrollback: nil)
     buffer.ingest(Data("top line\r\n> a".utf8))

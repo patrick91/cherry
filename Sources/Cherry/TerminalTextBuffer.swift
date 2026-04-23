@@ -446,6 +446,10 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var escapedStringPendingST = false
     private var currentStyle = TerminalTextStyle()
 
+    private static let defaultForegroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (219, 227, 235)
+    private static let defaultBackgroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (18, 17, 23)
+    private static let maximumOSCBytes = 8_192
+
     init(maxScrollback: Int?) {
         self.maxScrollback = maxScrollback
     }
@@ -614,7 +618,9 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             processEscape(byte)
         case .csi:
             processCSI(byte, viewportSize: viewportSize, responses: &responses)
-        case .osc, .ignoredString:
+        case .osc:
+            processOSC(byte, responses: &responses)
+        case .ignoredString:
             processIgnoredString(byte)
         }
     }
@@ -708,6 +714,66 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         }
     }
 
+    private mutating func processOSC(_ byte: UInt8, responses: inout [Data]) {
+        if escapedStringPendingST {
+            escapedStringPendingST = false
+            if byte == UInt8(ascii: "\\") {
+                finishOSC(responses: &responses)
+                return
+            }
+
+            appendOSCByte(0x1B)
+        }
+
+        if byte == 0x07 {
+            finishOSC(responses: &responses)
+        } else if byte == 0x1B {
+            escapedStringPendingST = true
+        } else {
+            appendOSCByte(byte)
+        }
+    }
+
+    private mutating func appendOSCByte(_ byte: UInt8) {
+        guard controlBuffer.count < Self.maximumOSCBytes else { return }
+        controlBuffer.append(byte)
+    }
+
+    private mutating func finishOSC(responses: inout [Data]) {
+        let rawPayload = String(decoding: controlBuffer, as: UTF8.self)
+        handleOSC(rawPayload: rawPayload, responses: &responses)
+
+        controlBuffer.removeAll(keepingCapacity: true)
+        escapedStringPendingST = false
+        parserState = .ground
+    }
+
+    private func handleOSC(rawPayload: String, responses: inout [Data]) {
+        let fields = rawPayload.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+        guard fields.count >= 2, fields[1] == "?" else { return }
+
+        switch fields[0] {
+        case "10":
+            responses.append(Self.oscColorResponse(code: "10", color: Self.defaultForegroundColor))
+        case "11":
+            responses.append(Self.oscColorResponse(code: "11", color: Self.defaultBackgroundColor))
+        default:
+            break
+        }
+    }
+
+    private static func oscColorResponse(
+        code: String,
+        color: (red: UInt8, green: UInt8, blue: UInt8)
+    ) -> Data {
+        let payload = "\u{1B}]\(code);rgb:\(hex16(color.red))/\(hex16(color.green))/\(hex16(color.blue))\u{07}"
+        return Data(payload.utf8)
+    }
+
+    private static func hex16(_ value: UInt8) -> String {
+        String(format: "%04x", UInt16(value) * 257)
+    }
+
     private mutating func handleCSI(
         finalByte: UInt8,
         payload: [UInt8],
@@ -733,7 +799,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         switch Character(UnicodeScalar(finalByte)) {
         case "m":
-            applySGR(parameters)
+            applySGR(Self.sgrParameters(from: rawPayload))
         case "c":
             handleDeviceAttributes(rawPayload: rawPayload, responses: &responses)
         case "n":
@@ -962,6 +1028,55 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         scrollRegionTop = normalizedTop
         scrollRegionBottom = normalizedBottom
+    }
+
+    private static func sgrParameters(from rawPayload: String) -> [Int?] {
+        guard !rawPayload.isEmpty else { return [] }
+
+        var values: [Int?] = []
+        var separators: [Character?] = []
+        var segment = ""
+
+        func appendSegment(separator: Character?) {
+            let digits = segment.filter(\.isNumber)
+            values.append(digits.isEmpty ? nil : Int(digits))
+            separators.append(separator)
+            segment.removeAll(keepingCapacity: true)
+        }
+
+        for character in rawPayload {
+            if character == ";" || character == ":" {
+                appendSegment(separator: character)
+            } else {
+                segment.append(character)
+            }
+        }
+        appendSegment(separator: nil)
+
+        var normalized: [Int?] = []
+        var index = 0
+
+        while index < values.count {
+            let value = values[index]
+            normalized.append(value)
+
+            if (value == 38 || value == 48),
+               separators[index] == ":",
+               values.indices.contains(index + 1),
+               values[index + 1] == 2 {
+                index += 1
+                normalized.append(values[index])
+
+                if separators[index] == ":",
+                   values.count - (index + 1) >= 4 {
+                    index += 1
+                }
+            }
+
+            index += 1
+        }
+
+        return normalized
     }
 
     private mutating func applySGR(_ parameters: [Int?]) {

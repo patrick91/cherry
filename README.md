@@ -28,3 +28,27 @@ Inside the prototype:
 - Click inside the terminal to type directly, or use the command bar at the bottom.
 - Use `Ctrl-C` in the toolbar to interrupt the active shell.
 - Use `Restart` to relaunch a shell after `exit`.
+
+## Rendering Debug
+
+Run the terminal fixture inside Cherry and Ghostty side by side:
+
+```bash
+Scripts/terminal-hell-test
+```
+
+The most useful panels for background rendering bugs are `256-color and truecolor full-row backgrounds`, `Reset boundaries and inverse video`, and `Codex-style prompt paint`.
+
+To capture the actual PTY stream while reproducing a rendering bug:
+
+```bash
+CHERRY_TRACE_PTY_DIR=/tmp/cherry-traces swift run
+```
+
+Then inspect the latest trace for palette queries and background SGR:
+
+```bash
+Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
+```
+
+Raw traces can include terminal output and prompt text, so treat them like logs.

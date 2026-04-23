@@ -2,6 +2,67 @@ import AppKit
 import Foundation
 
 private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
+private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
+
+private final class TerminalTraceRecorder {
+    let outputURL: URL
+
+    private let outputHandle: FileHandle
+
+    init?(sessionID: UUID, title: String) {
+        guard let ptyTraceDirectory, !ptyTraceDirectory.isEmpty else { return nil }
+
+        let directoryPath = NSString(string: ptyTraceDirectory).expandingTildeInPath
+        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        } catch {
+            fputs("[pty trace] failed to create \(directoryURL.path): \(error.localizedDescription)\n", stderr)
+            return nil
+        }
+
+        let filename = "\(Self.timestamp())-\(Self.safeFilename(title))-\(sessionID.uuidString.prefix(8)).pty"
+        outputURL = directoryURL.appendingPathComponent(filename)
+
+        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
+
+        do {
+            outputHandle = try FileHandle(forWritingTo: outputURL)
+        } catch {
+            fputs("[pty trace] failed to open \(outputURL.path): \(error.localizedDescription)\n", stderr)
+            return nil
+        }
+
+        fputs("[pty trace] writing raw PTY output to \(outputURL.path)\n", stderr)
+    }
+
+    deinit {
+        try? outputHandle.close()
+    }
+
+    func recordOutput(_ data: Data) {
+        guard !data.isEmpty else { return }
+        try? outputHandle.write(contentsOf: data)
+    }
+
+    private static func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    private static func safeFilename(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics
+        let sanitized = value.unicodeScalars
+            .map { allowed.contains($0) ? String($0) : "-" }
+            .joined()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+
+        return sanitized.isEmpty ? "session" : sanitized
+    }
+}
 
 @MainActor
 final class TerminalWorkspace: ObservableObject {
@@ -109,6 +170,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
+    private var traceRecorder: TerminalTraceRecorder?
 
     init(
         title: String,
@@ -123,6 +185,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.tint = tint
         self.maxScrollback = maxScrollback
         self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
+        self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
 
         if launchShell {
             startShell()
@@ -277,6 +340,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func receiveOutput(_ data: Data, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
 
+        traceRecorder?.recordOutput(data)
         let responses = buffer.ingest(data, viewportSize: viewportSize)
         for response in responses {
             shellProcess?.write(response)

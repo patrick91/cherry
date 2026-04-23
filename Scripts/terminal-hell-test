@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ESC=$'\033'
+CSI="${ESC}["
+OSC="${ESC}]"
+BEL=$'\a'
+
+cols="${COLUMNS:-$(tput cols 2>/dev/null || printf 80)}"
+rows="${LINES:-$(tput lines 2>/dev/null || printf 24)}"
+if ! [[ "$cols" =~ ^[0-9]+$ ]]; then cols=80; fi
+if ! [[ "$rows" =~ ^[0-9]+$ ]]; then rows=24; fi
+if (( cols < 40 )); then cols=40; fi
+if (( rows < 12 )); then rows=12; fi
+
+pause_enabled=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-pause)
+            pause_enabled=0
+            ;;
+        -h|--help)
+            cat <<'USAGE'
+Usage: Scripts/terminal-hell-test [--no-pause]
+
+Emits deterministic ANSI output for checking terminal rendering:
+background colors, erase-with-background, inverse video, scroll regions,
+focus/mouse modes, cursor shape, Unicode, and private-use glyphs.
+USAGE
+            exit 0
+            ;;
+        *)
+            printf 'Unknown argument: %s\n' "$arg" >&2
+            exit 2
+            ;;
+    esac
+done
+
+cleanup() {
+    printf '%s0m%s?25h%s?1000l%s?1002l%s?1003l%s?1004l%s?1006l%s?1007h%s0 q' \
+        "$CSI" "$CSI" "$CSI" "$CSI" "$CSI" "$CSI" "$CSI" "$CSI" "$CSI"
+}
+trap cleanup EXIT
+
+pause() {
+    if (( pause_enabled )); then
+        printf '\n%s2mPress Return for the next panel...%s0m' "$CSI" "$CSI"
+        IFS= read -r _
+    else
+        printf '\n'
+    fi
+}
+
+reset_screen() {
+    printf '%s0m%s?25h%s2J%sH' "$CSI" "$CSI" "$CSI" "$CSI"
+}
+
+title() {
+    printf '\n%s1;38;5;81m== %s ==%s0m\n' "$CSI" "$1" "$CSI"
+}
+
+full_row() {
+    local sgr="$1"
+    local label="$2"
+    printf '%s%sm%-*s%s0m\n' "$CSI" "$sgr" "$cols" "$label" "$CSI"
+}
+
+color_chip() {
+    local sgr="$1"
+    local label="$2"
+    printf '%s%sm %-12s %s0m' "$CSI" "$sgr" "$label" "$CSI"
+}
+
+reset_screen
+printf '%s0;Cherry terminal hell test%s' "$OSC" "$BEL"
+title "Baseline"
+printf 'Viewport: %s columns x %s rows\n' "$cols" "$rows"
+printf 'Expected: no rubber-band scroll, no synthetic focus row, and backgrounds stop exactly at reset boundaries.\n'
+printf 'Run in Ghostty beside Cherry for a visual diff.\n'
+pause
+
+reset_screen
+title "ANSI 16 background chips"
+for code in 40 41 42 43 44 45 46 47; do
+    color_chip "${code};97" "bg ${code}"
+done
+printf '\n'
+for code in 100 101 102 103 104 105 106 107; do
+    color_chip "${code};30" "bg ${code}"
+done
+printf '\n'
+printf '%s0mPlain text after reset should have the default terminal background.\n' "$CSI"
+pause
+
+reset_screen
+title "256-color and truecolor full-row backgrounds"
+full_row '48;5;236;38;5;250' '48;5;236 Codex-like prompt gray, padded through full terminal width'
+full_row '48:5:236;38:5:250' '48:5:236 colon SGR palette background, common in modern TUI output'
+full_row '48;5;238;38;5;252' '48;5;238 neighboring gray, should be visibly distinct'
+full_row '48;2;49;48;55;38;2;235;235;241' '48;2;49;48;55 truecolor row, close to Codex/Ghostty gray'
+full_row '48:2::49:48:55;38:2::235:235:241' '48:2::49:48:55 colon truecolor row with empty color-space field'
+full_row '48;2;18;26;33;38;2;210;230;240' '48;2 dark blue-green row, should not look like the app background'
+printf '\n%s48;5;236;38;5;250mCSI K fill starts here:%sK%s0m\n' "$CSI" "$CSI" "$CSI"
+printf '%s48;5;236;38;5;250mCSI X ten cells ->%s10X<- after erased cells%s0m\n' "$CSI" "$CSI" "$CSI"
+printf 'Expected: CSI K fills the rest of its row with bg 236; CSI X paints ten bg cells.\n'
+pause
+
+reset_screen
+title "Reset boundaries and inverse video"
+printf '%s48;5;236;38;5;250m bg 236 segment %s0m plain segment %s48;5;236m second bg segment %s0m plain\n' "$CSI" "$CSI" "$CSI" "$CSI"
+printf '%s7m inverse default %s27m normal %s48;5;236;38;5;250m bg normal %s7m inverse on styled bg %s0m\n' "$CSI" "$CSI" "$CSI" "$CSI" "$CSI"
+printf '%s2mDim text%s0m, %s1mbold text%s0m, %s3 qbar cursor requested%s0 q\n' "$CSI" "$CSI" "$CSI" "$CSI" "$CSI" "$CSI"
+pause
+
+reset_screen
+title "Codex-style prompt paint"
+printf 'The gray row below should be emitted entirely by ANSI background color, not focus tracking.\n\n'
+prompt_glyph="$(printf '\xe2\x80\xba')"
+middle_dot="$(printf '\xc2\xb7')"
+full_row '48;5;236;38;5;250' "${prompt_glyph} Find and fix a bug in @filename"
+printf '  %s2mgpt-5.5 xhigh fast %s ~/github/patrick91/cherry%s0m\n' "$CSI" "$middle_dot" "$CSI"
+printf '\n%s?1004hFocus event mode enabled for a moment: this line should not cause any new background row.%s?1004l\n' "$CSI" "$CSI"
+pause
+
+reset_screen
+title "Unicode, private-use, and wide-ish cells"
+branch_glyph="$(printf '\xee\x82\xa0')"
+file_glyph="$(printf '\xef\x85\x9b')"
+printf 'Nerd/private-use glyphs: %s main  %s README.md\n' "$branch_glyph" "$file_glyph"
+printf 'Combining-ish samples: cafe\xcc\x81, box chars: \xe2\x94\x8c\xe2\x94\x80\xe2\x94\xac\xe2\x94\x80\xe2\x94\x90 \xe2\x94\x82 \xe2\x94\x82 \xe2\x94\x94\xe2\x94\x80\xe2\x94\xb4\xe2\x94\x80\xe2\x94\x98\n'
+printf 'Emoji sanity: \xf0\x9f\x98\x80 \xe2\x9a\x99 \xe2\x9c\x93\n'
+printf 'Expected: no replacement diamonds for split/private-use glyphs; alignment may still be a future renderer issue.\n'
+pause
+
+reset_screen
+title "Primary-screen scrollback and top-anchored scroll region"
+printf 'Rows above this panel should remain in scrollback after the region scrolls.\n'
+printf '%s1;8r' "$CSI"
+for i in $(seq 1 14); do
+    printf '%s8;1H%s48;5;236;38;5;250m region item %02d %s0m\r\n' "$CSI" "$CSI" "$i" "$CSI"
+done
+printf '%sr%s10;1HScroll region reset. Use normal scrollback: earlier rows should still be reachable.\n' "$CSI" "$CSI"
+pause
+
+reset_screen
+title "Alternate screen, mouse, and focus modes"
+printf 'Entering alternate screen. Wheel in this panel can legitimately route as cursor/mouse events.\n'
+printf '%s?1049h%s2J%sH' "$CSI" "$CSI" "$CSI"
+printf 'Alternate screen active\n\n'
+printf '%s?1000h%s?1006hMouse reporting + SGR enabled. Wheel events should be consumed by the app under test.\n' "$CSI" "$CSI"
+printf '%s?1004hFocus reports enabled. There should still be no synthetic focused-row background.\n' "$CSI"
+printf '%s48;5;236;38;5;250m alt-screen Codex-like row %s0m\n' "$CSI" "$CSI"
+pause
+printf '%s?1004l%s?1006l%s?1000l%s?1049l' "$CSI" "$CSI" "$CSI" "$CSI"
+
+reset_screen
+title "Done"
+printf 'Terminal hell test complete. Compare any off-looking panel with Ghostty.\n'
+printf 'Most relevant panels for the Codex background issue: 256-color, Reset boundaries, Codex-style prompt paint.\n'

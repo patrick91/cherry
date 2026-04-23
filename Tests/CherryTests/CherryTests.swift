@@ -51,6 +51,40 @@ import Testing
     #expect(styled[0].runs[1] == TerminalTextRun(text: " world", style: TerminalTextStyle()))
 }
 
+@Test func colonSeparatedBackgroundColorIsPreserved() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.ingest(Data("\u{1B}[48:5:236;38:5:250mhello\u{1B}[0m".utf8))
+
+    let styled = buffer.styledSnapshot(range: 0..<buffer.lineCount)
+
+    #expect(styled[0].runs == [
+        TerminalTextRun(
+            text: "hello",
+            style: TerminalTextStyle(foreground: .palette256(250), background: .palette256(236))
+        )
+    ])
+}
+
+@Test func colonSeparatedTruecolorBackgroundIgnoresColorSpace() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.ingest(Data("\u{1B}[48:2::49:48:55mempty\u{1B}[0m ".utf8))
+    buffer.ingest(Data("\u{1B}[48:2:0:49:48:55mzero\u{1B}[0m".utf8))
+
+    let styled = buffer.styledSnapshot(range: 0..<buffer.lineCount)
+
+    #expect(styled[0].runs == [
+        TerminalTextRun(
+            text: "empty",
+            style: TerminalTextStyle(background: .rgb(49, 48, 55))
+        ),
+        TerminalTextRun(text: " ", style: TerminalTextStyle()),
+        TerminalTextRun(
+            text: "zero",
+            style: TerminalTextStyle(background: .rgb(49, 48, 55))
+        )
+    ])
+}
+
 @Test func eraseLineUsesCurrentBackgroundStyle() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     let viewportSize = TerminalViewportSize(columns: 8, rows: 3)
@@ -133,6 +167,17 @@ import Testing
     let responses = buffer.ingest(Data("\u{1B}[6n".utf8), viewportSize: viewportSize)
 
     #expect(responses == [Data("\u{1B}[2;3R".utf8)])
+}
+
+@Test func terminalPaletteQueriesRespondWithDefaultColors() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    let responses = buffer.ingest(Data("\u{1B}]10;?\u{07}\u{1B}]11;?\u{1B}\\".utf8))
+
+    #expect(responses == [
+        Data("\u{1B}]10;rgb:dbdb/e3e3/ebeb\u{07}".utf8),
+        Data("\u{1B}]11;rgb:1212/1111/1717\u{07}".utf8)
+    ])
 }
 
 @Test func deviceAttributesAndKeyboardProtocolQueriesRespond() async throws {

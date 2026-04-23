@@ -107,6 +107,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var state: SessionState = .launching
     private var buffer: TerminalTextBuffer
     private var shellProcess: ShellProcessController?
+    private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
 
     init(
@@ -190,6 +191,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func stop() {
+        activeLaunchID = nil
         shellProcess?.terminate()
         shellProcess = nil
     }
@@ -208,6 +210,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func startShell() {
+        let launchID = UUID()
+        activeLaunchID = launchID
         state = .launching
         bumpRevision()
 
@@ -221,12 +225,12 @@ final class TerminalSession: ObservableObject, Identifiable {
                 ),
                 onData: { [weak self] data in
                     DispatchQueue.main.async {
-                        self?.receiveOutput(data)
+                        self?.receiveOutput(data, launchID: launchID)
                     }
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {
-                        self?.handleProcessExit(status: status)
+                        self?.handleProcessExit(status: status, launchID: launchID)
                     }
                 }
             )
@@ -234,6 +238,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             state = .live
             bumpRevision()
         } catch {
+            activeLaunchID = nil
             state = .failed(error.localizedDescription)
             buffer.appendPlainLines([
                 "launch failed: \(error.localizedDescription)"
@@ -242,7 +247,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func receiveOutput(_ data: Data) {
+    private func receiveOutput(_ data: Data, launchID: UUID) {
+        guard activeLaunchID == launchID else { return }
+
         buffer.ingest(data)
         if inputDebugEnabled {
             let tailStart = max(0, buffer.lineCount - 4)
@@ -255,7 +262,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
-    private func handleProcessExit(status: Int32) {
+    private func handleProcessExit(status: Int32, launchID: UUID) {
+        guard activeLaunchID == launchID else { return }
+
+        activeLaunchID = nil
         shellProcess = nil
         state = .exited(status)
         buffer.appendPlainLines([

@@ -22,19 +22,27 @@ struct CommandInputField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: CommandPromptTextField, context: Context) {
+        context.coordinator.update(text: $text, onSubmit: onSubmit)
+
         if nsView.stringValue != text {
             nsView.stringValue = text
         }
 
         nsView.placeholderString = placeholder
         nsView.isEnabled = isEnabled
+        nsView.submitAction = onSubmit
     }
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         private var text: Binding<String>
-        private let onSubmit: () -> Void
+        private var onSubmit: () -> Void
 
         init(text: Binding<String>, onSubmit: @escaping () -> Void) {
+            self.text = text
+            self.onSubmit = onSubmit
+        }
+
+        func update(text: Binding<String>, onSubmit: @escaping () -> Void) {
             self.text = text
             self.onSubmit = onSubmit
         }

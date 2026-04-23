@@ -29,6 +29,14 @@ import Testing
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["ready"])
 }
 
+@Test func splitUTF8ScalarSurvivesReadBoundary() async throws {
+    var buffer = TerminalTextBuffer(maxScrollback: nil)
+    buffer.ingest(Data([0xC3]))
+    buffer.ingest(Data([0xA9]))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["é"])
+}
+
 @Test func cursorUpAndEraseDisplayAllowPromptRepaint() async throws {
     var buffer = TerminalTextBuffer(maxScrollback: nil)
     buffer.ingest(Data("top line\r\n> a".utf8))

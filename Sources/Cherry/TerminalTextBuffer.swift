@@ -105,7 +105,7 @@ struct TerminalTextBuffer {
             process(byte)
         }
 
-        flushPendingText()
+        flushPendingText(preservingIncompleteUTF8: true)
         trimIfNeeded()
         clampCursor()
     }
@@ -400,11 +400,16 @@ struct TerminalTextBuffer {
         lines[cursorRow] = cells
     }
 
-    private mutating func flushPendingText() {
+    private mutating func flushPendingText(preservingIncompleteUTF8: Bool = false) {
         guard !pendingText.isEmpty else { return }
 
-        let text = String(decoding: pendingText, as: UTF8.self)
-        pendingText.removeAll(keepingCapacity: true)
+        let flushCount = preservingIncompleteUTF8
+            ? Self.completeUTF8PrefixLength(in: pendingText)
+            : pendingText.count
+        guard flushCount > 0 else { return }
+
+        let text = String(decoding: pendingText.prefix(flushCount), as: UTF8.self)
+        pendingText.removeSubrange(0..<flushCount)
         writeText(text)
     }
 
@@ -492,6 +497,44 @@ struct TerminalTextBuffer {
 
     private static func plainLine(from text: String) -> [TerminalCell] {
         text.map { TerminalCell(character: $0, style: TerminalTextStyle()) }
+    }
+
+    private static func completeUTF8PrefixLength(in bytes: [UInt8]) -> Int {
+        var index = 0
+
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte < 0x80 {
+                index += 1
+                continue
+            }
+
+            let expectedLength: Int
+            switch byte {
+            case 0xC2...0xDF:
+                expectedLength = 2
+            case 0xE0...0xEF:
+                expectedLength = 3
+            case 0xF0...0xF4:
+                expectedLength = 4
+            default:
+                index += 1
+                continue
+            }
+
+            guard index + expectedLength <= bytes.count else {
+                break
+            }
+
+            let continuationRange = (index + 1)..<(index + expectedLength)
+            let hasContinuationBytes = continuationRange.allSatisfy { continuationIndex in
+                (bytes[continuationIndex] & 0xC0) == 0x80
+            }
+
+            index += hasContinuationBytes ? expectedLength : 1
+        }
+
+        return index
     }
 
     private static func renderedLine(from cells: [TerminalCell]) -> TerminalRenderedLine {

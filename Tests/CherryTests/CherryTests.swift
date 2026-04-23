@@ -82,6 +82,26 @@ import Testing
     #expect(responses == [Data("\u{1B}[2;3R".utf8)])
 }
 
+@Test func cursorStateTracksWritesAndMovement() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    buffer.ingest(Data("abc\u{1B}[D".utf8), viewportSize: TerminalViewportSize(columns: 10, rows: 5))
+
+    #expect(buffer.cursorState == TerminalCursorState(row: 0, column: 2, shape: .block, isVisible: true))
+}
+
+@Test func cursorShapeAndVisibilityFollowControlSequences() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[5 q\u{1B}[?25l".utf8))
+    #expect(buffer.cursorState == TerminalCursorState(row: 0, column: 0, shape: .bar, isVisible: false))
+
+    buffer.ingest(Data("\u{1B}[4 q\u{1B}[?25h".utf8))
+    #expect(buffer.cursorState == TerminalCursorState(row: 0, column: 0, shape: .underline, isVisible: true))
+
+    buffer.ingest(Data("\u{1B}[2 q".utf8))
+    #expect(buffer.cursorState.shape == .block)
+}
+
 @Test func terminalEnterSendsCarriageReturn() async throws {
     let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
 

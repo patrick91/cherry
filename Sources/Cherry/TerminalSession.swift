@@ -135,6 +135,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         buffer.lineCount
     }
 
+    var cursorState: TerminalCursorState {
+        buffer.cursorState
+    }
+
     var statusLine: String {
         "\(state.label) · \(lineSummary)"
     }

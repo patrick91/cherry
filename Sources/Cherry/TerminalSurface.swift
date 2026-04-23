@@ -154,6 +154,7 @@ final class TerminalScrollView: NSScrollView {
         let wasPinnedToBottom = isPinnedToBottom
         let targetHeight = max(contentSize.height, canvasView.preferredHeight(for: activeSession))
         canvasView.frame = NSRect(x: 0, y: 0, width: max(contentSize.width, 1), height: targetHeight)
+        canvasView.resetCursorBlink()
         canvasView.needsDisplay = true
         let viewport = canvasView.viewportSize(for: contentSize)
         activeSession.resize(columns: viewport.columns, rows: viewport.rows)
@@ -204,7 +205,9 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private var markedText = NSMutableAttributedString()
     private var keyTextAccumulator: [String]?
     private var handledCommand = false
+    private var isCursorBlinkVisible = true
     nonisolated(unsafe) private var eventMonitor: Any?
+    nonisolated(unsafe) private var cursorBlinkTimer: Timer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -223,6 +226,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
         }
+        cursorBlinkTimer?.invalidate()
     }
 
     func preferredHeight(for session: TerminalSession) -> CGFloat {
@@ -231,6 +235,13 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+
+        if window == nil {
+            stopCursorBlink()
+            return
+        }
+
+        startCursorBlink()
 
         DispatchQueue.main.async { [weak self] in
             self?.focusSurfaceIfPossible()
@@ -268,6 +279,12 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             let point = NSPoint(x: sideInset, y: topInset + (CGFloat(row) * lineHeight))
             attributedLine(for: line).draw(at: point)
         }
+
+        drawTerminalCursor(
+            session.cursorState,
+            visibleRows: startingRow..<endingRow,
+            visibleLines: visibleLines
+        )
     }
 
     private func drawFocusStrip(in dirtyRect: NSRect) {
@@ -331,6 +348,111 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         return baseColor
     }
 
+    private func drawTerminalCursor(
+        _ cursor: TerminalCursorState,
+        visibleRows: Range<Int>,
+        visibleLines: [TerminalRenderedLine]
+    ) {
+        guard cursor.isVisible,
+              visibleRows.contains(cursor.row),
+              !isSelecting else {
+            return
+        }
+
+        if isFocused, !isCursorBlinkVisible {
+            return
+        }
+
+        let viewportColumns = viewportSize(for: enclosingScrollView?.contentSize ?? bounds.size).columns
+        let column = max(0, min(cursor.column, max(0, viewportColumns - 1)))
+        let rect = cursorRect(row: cursor.row, column: column)
+        let cursorColor = terminalCursorColor()
+
+        switch cursor.shape {
+        case .block:
+            drawBlockCursor(
+                rect: rect,
+                color: cursorColor,
+                line: visibleLines[cursor.row - visibleRows.lowerBound],
+                column: column
+            )
+        case .bar:
+            drawBarCursor(rect: rect, color: cursorColor)
+        case .underline:
+            drawUnderlineCursor(rect: rect, color: cursorColor)
+        }
+    }
+
+    private func cursorRect(row: Int, column: Int) -> NSRect {
+        NSRect(
+            x: sideInset + (CGFloat(column) * cellWidth),
+            y: topInset + (CGFloat(row) * lineHeight),
+            width: cellWidth,
+            height: lineHeight
+        ).integral
+    }
+
+    private func terminalCursorColor() -> NSColor {
+        let tint = session?.tint ?? NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.32, alpha: 1)
+        return isFocused ? tint.withAlphaComponent(0.96) : defaultTextColor.withAlphaComponent(0.65)
+    }
+
+    private func drawBlockCursor(rect: NSRect, color: NSColor, line: TerminalRenderedLine, column: Int) {
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 1.5), xRadius: 2.5, yRadius: 2.5)
+
+        if isFocused {
+            color.setFill()
+            path.fill()
+            drawCursorCharacter(from: line, column: column, at: rect.origin)
+        } else {
+            color.setStroke()
+            path.lineWidth = 1.25
+            path.stroke()
+        }
+    }
+
+    private func drawBarCursor(rect: NSRect, color: NSColor) {
+        color.setFill()
+        let width: CGFloat = isFocused ? 2.25 : 1.5
+        NSRect(x: rect.minX, y: rect.minY + 1.5, width: width, height: rect.height - 3).fill()
+    }
+
+    private func drawUnderlineCursor(rect: NSRect, color: NSColor) {
+        color.setFill()
+        let height: CGFloat = isFocused ? 2.25 : 1.5
+        NSRect(x: rect.minX, y: rect.maxY - height - 2, width: rect.width, height: height).fill()
+    }
+
+    private func drawCursorCharacter(from line: TerminalRenderedLine, column: Int, at origin: NSPoint) {
+        let cell = cursorCell(in: line, column: column)
+        guard let character = cell.character else { return }
+
+        let style = cell.style ?? TerminalTextStyle()
+        NSAttributedString(
+            string: String(character),
+            attributes: [
+                .font: style.isBold ? boldFont : regularFont,
+                .foregroundColor: backgroundColor
+            ]
+        ).draw(at: origin)
+    }
+
+    private func cursorCell(in line: TerminalRenderedLine, column: Int) -> (character: Character?, style: TerminalTextStyle?) {
+        guard column >= 0 else { return (nil, nil) }
+
+        var remaining = column
+        for run in line.runs {
+            for character in run.text {
+                if remaining == 0 {
+                    return (character, run.style)
+                }
+                remaining -= 1
+            }
+        }
+
+        return (nil, nil)
+    }
+
     override func mouseDown(with event: NSEvent) {
         if let window {
             if !window.isKeyWindow {
@@ -374,6 +496,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         let result = super.becomeFirstResponder()
         if result {
             isFocused = true
+            resetCursorBlink()
             needsDisplay = true
         }
 
@@ -384,6 +507,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         let result = super.resignFirstResponder()
         if result {
             isFocused = false
+            resetCursorBlink()
             needsDisplay = true
         }
 
@@ -399,6 +523,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     func setFocused(_ focused: Bool) {
         guard isFocused != focused else { return }
         isFocused = focused
+        resetCursorBlink()
         needsDisplay = true
     }
 
@@ -441,6 +566,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         if terminalInputDebugEnabled {
             fputs("[keyDown] chars=\(String(describing: event.characters)) charsIgnoringMods=\(String(describing: event.charactersIgnoringModifiers)) keyCode=\(event.keyCode) mods=\(event.modifierFlags.rawValue)\n", stderr)
         }
+        resetCursorBlink()
 
         keyTextAccumulator = []
         handledCommand = false
@@ -710,6 +836,29 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         guard let window else { return }
         guard session?.acceptsInput == true else { return }
         _ = window.makeFirstResponder(preferredFirstResponder)
+    }
+
+    func resetCursorBlink() {
+        isCursorBlinkVisible = true
+        needsDisplay = true
+    }
+
+    private func startCursorBlink() {
+        guard cursorBlinkTimer == nil else { return }
+
+        cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: 0.55, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isCursorBlinkVisible.toggle()
+                self.needsDisplay = true
+            }
+        }
+    }
+
+    private func stopCursorBlink() {
+        cursorBlinkTimer?.invalidate()
+        cursorBlinkTimer = nil
+        isCursorBlinkVisible = true
     }
 
     private func handleLocalMouseDown(_ event: NSEvent) -> NSEvent? {

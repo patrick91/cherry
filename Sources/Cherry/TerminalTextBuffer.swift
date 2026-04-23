@@ -25,6 +25,19 @@ struct TerminalRenderedLine: Equatable {
     }
 }
 
+enum TerminalCursorShape: Equatable {
+    case block
+    case bar
+    case underline
+}
+
+struct TerminalCursorState: Equatable {
+    let row: Int
+    let column: Int
+    let shape: TerminalCursorShape
+    let isVisible: Bool
+}
+
 struct TerminalBufferLineID: Equatable, Hashable, Comparable {
     let rawValue: UInt64
 
@@ -341,6 +354,7 @@ private struct TerminalPageGrid: Equatable {
 protocol TerminalBuffering {
     var lineCount: Int { get }
     var storedLineCount: Int { get }
+    var cursorState: TerminalCursorState { get }
 
     func snapshot(range: Range<Int>) -> [String]
     func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine]
@@ -387,6 +401,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var savedCursorState: ScreenState?
     private var cursorRow = 0
     private var cursorColumn = 0
+    private var cursorShape = TerminalCursorShape.block
+    private var isCursorVisible = true
     private var parserState: ParserState = .ground
     private var controlBuffer: [UInt8] = []
     private var pendingText: [UInt8] = []
@@ -419,6 +435,15 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         lineCount
     }
 
+    var cursorState: TerminalCursorState {
+        TerminalCursorState(
+            row: cursorRow,
+            column: cursorColumn,
+            shape: cursorShape,
+            isVisible: isCursorVisible
+        )
+    }
+
     func snapshot(range: Range<Int>) -> [String] {
         styledSnapshot(range: range).map(\.plainText)
     }
@@ -446,6 +471,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         savedCursorState = nil
         cursorRow = 0
         cursorColumn = 0
+        cursorShape = .block
+        isCursorVisible = true
         parserState = .ground
         controlBuffer.removeAll(keepingCapacity: true)
         pendingText.removeAll(keepingCapacity: true)
@@ -632,7 +659,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         case "u":
             restoreCursorState()
         case "q":
-            return
+            applyCursorShape(parameter(at: 0, default: 0))
         case "A":
             moveCursorRow(by: -parameter(at: 0, default: 1))
         case "B":
@@ -704,6 +731,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 } else {
                     exitAlternateScreen(restoreCursor: true)
                 }
+            case 25:
+                isCursorVisible = isSet
             default:
                 continue
             }
@@ -751,6 +780,17 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         cursorColumn = savedCursorState.cursorColumn
         currentStyle = savedCursorState.style
         clampCursor()
+    }
+
+    private mutating func applyCursorShape(_ code: Int) {
+        cursorShape = switch code {
+        case 3, 4:
+            .underline
+        case 5, 6:
+            .bar
+        default:
+            .block
+        }
     }
 
     private mutating func applySGR(_ parameters: [Int?]) {

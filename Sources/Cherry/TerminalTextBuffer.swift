@@ -1,5 +1,35 @@
 import Foundation
 
+enum TerminalANSIColor: Equatable {
+    case ansi16(Int)
+    case palette256(Int)
+    case rgb(UInt8, UInt8, UInt8)
+}
+
+struct TerminalTextStyle: Equatable {
+    var foreground: TerminalANSIColor? = nil
+    var isBold = false
+    var isDim = false
+}
+
+struct TerminalTextRun: Equatable {
+    let text: String
+    let style: TerminalTextStyle
+}
+
+struct TerminalRenderedLine: Equatable {
+    let runs: [TerminalTextRun]
+
+    var plainText: String {
+        runs.map(\.text).joined()
+    }
+}
+
+private struct TerminalCell: Equatable {
+    let character: Character
+    let style: TerminalTextStyle
+}
+
 struct TerminalTextBuffer {
     private enum ParserState {
         case ground
@@ -11,13 +41,14 @@ struct TerminalTextBuffer {
 
     private let maxScrollback: Int?
 
-    private var lines: [String] = []
+    private var lines: [[TerminalCell]] = []
     private var cursorRow = 0
     private var cursorColumn = 0
     private var parserState: ParserState = .ground
     private var controlBuffer: [UInt8] = []
     private var pendingText: [UInt8] = []
     private var escapedStringPendingST = false
+    private var currentStyle = TerminalTextStyle()
 
     init(maxScrollback: Int?) {
         self.maxScrollback = maxScrollback
@@ -32,11 +63,15 @@ struct TerminalTextBuffer {
     }
 
     mutating func snapshot(range: Range<Int>) -> [String] {
-        guard !lines.isEmpty else { return [""] }
+        styledSnapshot(range: range).map(\.plainText)
+    }
+
+    mutating func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
+        guard !lines.isEmpty else { return [TerminalRenderedLine(runs: [])] }
 
         let lower = max(0, min(range.lowerBound, lines.count))
         let upper = max(lower, min(range.upperBound, lines.count))
-        return Array(lines[lower..<upper])
+        return lines[lower..<upper].map(Self.renderedLine(from:))
     }
 
     mutating func clear() {
@@ -47,6 +82,7 @@ struct TerminalTextBuffer {
         controlBuffer.removeAll(keepingCapacity: true)
         pendingText.removeAll(keepingCapacity: true)
         escapedStringPendingST = false
+        currentStyle = TerminalTextStyle()
     }
 
     mutating func appendPlainLines(_ newLines: [String]) {
@@ -54,9 +90,9 @@ struct TerminalTextBuffer {
 
         flushPendingText()
         if lines.isEmpty {
-            lines = newLines
+            lines = newLines.map(Self.plainLine(from:))
         } else {
-            lines.append(contentsOf: newLines)
+            lines.append(contentsOf: newLines.map(Self.plainLine(from:)))
         }
 
         cursorRow = max(0, lines.count - 1)
@@ -181,7 +217,9 @@ struct TerminalTextBuffer {
         }
 
         switch Character(UnicodeScalar(finalByte)) {
-        case "m", "h", "l", "s", "u", "n", "q":
+        case "m":
+            applySGR(parameters)
+        case "h", "l", "s", "u", "n", "q":
             return
         case "A":
             moveCursorRow(by: -parameter(at: 0, default: 1))
@@ -214,6 +252,74 @@ struct TerminalTextBuffer {
         }
     }
 
+    private mutating func applySGR(_ parameters: [Int?]) {
+        let codes = parameters.isEmpty ? [0] : parameters.map { $0 ?? 0 }
+        var index = 0
+
+        while index < codes.count {
+            let code = codes[index]
+            switch code {
+            case 0:
+                currentStyle = TerminalTextStyle()
+            case 1:
+                currentStyle.isBold = true
+            case 2:
+                currentStyle.isDim = true
+            case 22:
+                currentStyle.isBold = false
+                currentStyle.isDim = false
+            case 30...37:
+                currentStyle.foreground = .ansi16(code - 30)
+            case 39:
+                currentStyle.foreground = nil
+            case 90...97:
+                currentStyle.foreground = .ansi16(code - 90 + 8)
+            case 38:
+                index = applyExtendedColor(from: codes, startingAt: index, isForeground: true)
+            case 48:
+                index = applyExtendedColor(from: codes, startingAt: index, isForeground: false)
+            default:
+                break
+            }
+
+            index += 1
+        }
+    }
+
+    private mutating func applyExtendedColor(from codes: [Int], startingAt index: Int, isForeground: Bool) -> Int {
+        let next = index + 1
+        guard codes.indices.contains(next) else { return index }
+
+        switch codes[next] {
+        case 5:
+            let valueIndex = next + 1
+            guard codes.indices.contains(valueIndex) else { return index }
+            if isForeground {
+                currentStyle.foreground = .palette256(codes[valueIndex])
+            }
+            return valueIndex
+        case 2:
+            let redIndex = next + 1
+            let greenIndex = next + 2
+            let blueIndex = next + 3
+            guard codes.indices.contains(redIndex),
+                  codes.indices.contains(greenIndex),
+                  codes.indices.contains(blueIndex) else {
+                return index
+            }
+            if isForeground {
+                currentStyle.foreground = .rgb(
+                    UInt8(clamping: codes[redIndex]),
+                    UInt8(clamping: codes[greenIndex]),
+                    UInt8(clamping: codes[blueIndex])
+                )
+            }
+            return blueIndex
+        default:
+            return index
+        }
+    }
+
     private mutating func eraseInDisplay(mode: Int) {
         guard !lines.isEmpty else { return }
         ensureCursorLine()
@@ -222,12 +328,12 @@ struct TerminalTextBuffer {
         case 1:
             if cursorRow > 0 {
                 for index in 0..<cursorRow {
-                    lines[index] = ""
+                    lines[index] = []
                 }
             }
             eraseInLine(mode: 1)
         case 2:
-            lines = [""]
+            lines = [[]]
             cursorRow = 0
             cursorColumn = 0
         default:
@@ -242,56 +348,56 @@ struct TerminalTextBuffer {
         guard !lines.isEmpty else { return }
         ensureCursorLine()
 
-        var characters = Array(lines[cursorRow])
+        var cells = lines[cursorRow]
         switch mode {
         case 1:
-            let upperBound = min(cursorColumn + 1, characters.count)
+            let upperBound = min(cursorColumn + 1, cells.count)
             if upperBound > 0 {
                 for index in 0..<upperBound {
-                    characters[index] = " "
+                    cells[index] = TerminalCell(character: " ", style: currentStyle)
                 }
             }
         case 2:
-            characters.removeAll(keepingCapacity: true)
+            cells.removeAll(keepingCapacity: true)
             cursorColumn = 0
         default:
-            guard cursorColumn < characters.count else {
-                lines[cursorRow] = String(characters)
+            guard cursorColumn < cells.count else {
+                lines[cursorRow] = cells
                 return
             }
 
-            for index in cursorColumn..<characters.count {
-                characters[index] = " "
+            for index in cursorColumn..<cells.count {
+                cells[index] = TerminalCell(character: " ", style: currentStyle)
             }
         }
 
-        lines[cursorRow] = String(characters)
+        lines[cursorRow] = cells
     }
 
     private mutating func deleteCharacters(_ count: Int) {
         guard !lines.isEmpty, count > 0 else { return }
         ensureCursorLine()
 
-        var characters = Array(lines[cursorRow])
-        guard cursorColumn < characters.count else { return }
+        var cells = lines[cursorRow]
+        guard cursorColumn < cells.count else { return }
 
-        let upperBound = min(cursorColumn + count, characters.count)
-        characters.removeSubrange(cursorColumn..<upperBound)
-        lines[cursorRow] = String(characters)
+        let upperBound = min(cursorColumn + count, cells.count)
+        cells.removeSubrange(cursorColumn..<upperBound)
+        lines[cursorRow] = cells
     }
 
     private mutating func eraseCharacters(_ count: Int) {
         guard !lines.isEmpty, count > 0 else { return }
         ensureCursorLine()
 
-        var characters = Array(lines[cursorRow])
-        guard cursorColumn < characters.count else { return }
+        var cells = lines[cursorRow]
+        guard cursorColumn < cells.count else { return }
 
-        let upperBound = min(cursorColumn + count, characters.count)
+        let upperBound = min(cursorColumn + count, cells.count)
         for index in cursorColumn..<upperBound {
-            characters[index] = " "
+            cells[index] = TerminalCell(character: " ", style: currentStyle)
         }
-        lines[cursorRow] = String(characters)
+        lines[cursorRow] = cells
     }
 
     private mutating func flushPendingText() {
@@ -306,7 +412,7 @@ struct TerminalTextBuffer {
         ensureCursorLine()
 
         if cursorColumn == lines[cursorRow].count {
-            lines[cursorRow].append(text)
+            lines[cursorRow].append(contentsOf: text.map { TerminalCell(character: $0, style: currentStyle) })
             cursorColumn += text.count
             return
         }
@@ -319,18 +425,19 @@ struct TerminalTextBuffer {
     private mutating func writeCharacter(_ character: Character) {
         ensureCursorLine()
 
-        var characters = Array(lines[cursorRow])
-        if cursorColumn > characters.count {
-            characters.append(contentsOf: repeatElement(" ", count: cursorColumn - characters.count))
+        var cells = lines[cursorRow]
+        if cursorColumn > cells.count {
+            cells.append(contentsOf: repeatElement(TerminalCell(character: " ", style: currentStyle), count: cursorColumn - cells.count))
         }
 
-        if cursorColumn == characters.count {
-            characters.append(character)
+        let cell = TerminalCell(character: character, style: currentStyle)
+        if cursorColumn == cells.count {
+            cells.append(cell)
         } else {
-            characters[cursorColumn] = character
+            cells[cursorColumn] = cell
         }
 
-        lines[cursorRow] = String(characters)
+        lines[cursorRow] = cells
         cursorColumn += 1
     }
 
@@ -338,7 +445,7 @@ struct TerminalTextBuffer {
         ensureCursorLine()
         cursorRow += 1
         if cursorRow == lines.count {
-            lines.append("")
+            lines.append([])
         }
         cursorColumn = 0
     }
@@ -357,11 +464,11 @@ struct TerminalTextBuffer {
 
     private mutating func ensureCursorLine() {
         if lines.isEmpty {
-            lines = [""]
+            lines = [[]]
         }
 
         if cursorRow >= lines.count {
-            lines.append(contentsOf: repeatElement("", count: cursorRow - lines.count + 1))
+            lines.append(contentsOf: repeatElement([], count: cursorRow - lines.count + 1))
         }
     }
 
@@ -381,5 +488,31 @@ struct TerminalTextBuffer {
         let removedCount = lines.count - maxScrollback
         lines.removeFirst(removedCount)
         cursorRow = max(0, cursorRow - removedCount)
+    }
+
+    private static func plainLine(from text: String) -> [TerminalCell] {
+        text.map { TerminalCell(character: $0, style: TerminalTextStyle()) }
+    }
+
+    private static func renderedLine(from cells: [TerminalCell]) -> TerminalRenderedLine {
+        guard !cells.isEmpty else { return TerminalRenderedLine(runs: []) }
+
+        var runs: [TerminalTextRun] = []
+        var currentStyle = cells[0].style
+        var buffer = String(cells[0].character)
+
+        for cell in cells.dropFirst() {
+            if cell.style == currentStyle {
+                buffer.append(cell.character)
+                continue
+            }
+
+            runs.append(TerminalTextRun(text: buffer, style: currentStyle))
+            currentStyle = cell.style
+            buffer = String(cell.character)
+        }
+
+        runs.append(TerminalTextRun(text: buffer, style: currentStyle))
+        return TerminalRenderedLine(runs: runs)
     }
 }

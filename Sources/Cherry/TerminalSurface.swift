@@ -146,14 +146,11 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let topInset: CGFloat = 24
     private let bottomInset: CGFloat = 28
     private let sideInset: CGFloat = 22
-    private let backgroundColor = NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)
-    private let gridColor = NSColor.white.withAlphaComponent(0.035)
-    private let defaultTextColor = NSColor(calibratedRed: 0.83, green: 0.86, blue: 0.90, alpha: 1)
-    private let dimTextColor = NSColor(calibratedRed: 0.63, green: 0.67, blue: 0.72, alpha: 1)
-    private let errorTextColor = NSColor(calibratedRed: 0.98, green: 0.52, blue: 0.48, alpha: 1)
-    private let promptTextColor = NSColor(calibratedRed: 0.52, green: 0.89, blue: 0.60, alpha: 1)
-    private let font = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular)
-    private lazy var cellWidth = max(7.8, "W".size(withAttributes: [.font: font]).width)
+    private let backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.09, alpha: 1)
+    private let defaultTextColor = NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.92, alpha: 1)
+    private let regularFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular)
+    private let boldFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .semibold)
+    private lazy var cellWidth = max(7.8, "W".size(withAttributes: [.font: regularFont]).width)
     private var isFocused = false
     private var markedText = NSMutableAttributedString()
     private var keyTextAccumulator: [String]?
@@ -205,7 +202,6 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         backgroundColor.setFill()
         dirtyRect.fill()
 
-        drawGrid(in: dirtyRect)
         drawFocusStrip(in: dirtyRect)
 
         guard let session else { return }
@@ -215,28 +211,12 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         guard endingRow > startingRow else { return }
 
-        let visibleLines = session.snapshot(range: startingRow..<endingRow)
+        let visibleLines = session.styledSnapshot(range: startingRow..<endingRow)
         for (offset, line) in visibleLines.enumerated() {
             let row = startingRow + offset
             let point = NSPoint(x: sideInset, y: topInset + (CGFloat(row) * lineHeight))
-            line.draw(at: point, withAttributes: textAttributes(for: line))
+            attributedLine(for: line).draw(at: point)
         }
-    }
-
-    private func drawGrid(in dirtyRect: NSRect) {
-        let path = NSBezierPath()
-        let firstLine = Int(floor((dirtyRect.minY - topInset) / lineHeight))
-        let lastLine = Int(ceil((dirtyRect.maxY - topInset) / lineHeight))
-
-        for row in max(firstLine, 0)...max(lastLine, 0) {
-            let y = topInset + CGFloat(row) * lineHeight + 15
-            path.move(to: NSPoint(x: sideInset, y: y))
-            path.line(to: NSPoint(x: bounds.width - sideInset, y: y))
-        }
-
-        gridColor.setStroke()
-        path.lineWidth = 1
-        path.stroke()
     }
 
     private func drawFocusStrip(in dirtyRect: NSRect) {
@@ -249,24 +229,36 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         path.fill()
     }
 
-    private func textAttributes(for line: String) -> [NSAttributedString.Key: Any] {
-        let color: NSColor
-        if line.hasPrefix("$") {
-            color = promptTextColor
-        } else if line.localizedCaseInsensitiveContains("error") {
-            color = errorTextColor
-        } else if line.isEmpty {
-            color = dimTextColor
-        } else if line.hasPrefix("[watch]") || line.hasPrefix("[") {
-            color = dimTextColor
-        } else {
-            color = defaultTextColor
+    private func attributedLine(for line: TerminalRenderedLine) -> NSAttributedString {
+        let attributed = NSMutableAttributedString()
+        for run in line.runs {
+            attributed.append(
+                NSAttributedString(
+                    string: run.text,
+                    attributes: [
+                        .font: run.style.isBold ? boldFont : regularFont,
+                        .foregroundColor: resolvedForegroundColor(for: run.style)
+                    ]
+                )
+            )
         }
 
-        return [
-            .font: font,
-            .foregroundColor: color
-        ]
+        return attributed
+    }
+
+    private func resolvedForegroundColor(for style: TerminalTextStyle) -> NSColor {
+        let baseColor = switch style.foreground {
+        case .none:
+            defaultTextColor
+        case .some(let color):
+            color.resolve() ?? defaultTextColor
+        }
+
+        if style.isDim {
+            return baseColor.withAlphaComponent(0.72)
+        }
+
+        return baseColor
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -553,5 +545,65 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
     private var preferredFirstResponder: NSResponder {
         enclosingScrollView ?? self
+    }
+}
+
+private extension TerminalANSIColor {
+    func resolve() -> NSColor? {
+        switch self {
+        case .ansi16(let index):
+            switch index {
+            case 0: return NSColor(calibratedRed: 0.23, green: 0.27, blue: 0.31, alpha: 1)
+            case 1: return NSColor(calibratedRed: 0.92, green: 0.37, blue: 0.37, alpha: 1)
+            case 2: return NSColor(calibratedRed: 0.58, green: 0.87, blue: 0.54, alpha: 1)
+            case 3: return NSColor(calibratedRed: 0.91, green: 0.78, blue: 0.43, alpha: 1)
+            case 4: return NSColor(calibratedRed: 0.45, green: 0.68, blue: 0.95, alpha: 1)
+            case 5: return NSColor(calibratedRed: 0.84, green: 0.59, blue: 0.95, alpha: 1)
+            case 6: return NSColor(calibratedRed: 0.43, green: 0.82, blue: 0.86, alpha: 1)
+            case 7: return NSColor(calibratedRed: 0.79, green: 0.82, blue: 0.86, alpha: 1)
+            case 8: return NSColor(calibratedRed: 0.38, green: 0.43, blue: 0.48, alpha: 1)
+            case 9: return NSColor(calibratedRed: 0.98, green: 0.51, blue: 0.50, alpha: 1)
+            case 10: return NSColor(calibratedRed: 0.67, green: 0.95, blue: 0.62, alpha: 1)
+            case 11: return NSColor(calibratedRed: 0.98, green: 0.87, blue: 0.52, alpha: 1)
+            case 12: return NSColor(calibratedRed: 0.58, green: 0.80, blue: 0.99, alpha: 1)
+            case 13: return NSColor(calibratedRed: 0.92, green: 0.69, blue: 0.99, alpha: 1)
+            case 14: return NSColor(calibratedRed: 0.57, green: 0.93, blue: 0.95, alpha: 1)
+            case 15: return NSColor(calibratedRed: 0.94, green: 0.96, blue: 0.98, alpha: 1)
+            default: return nil
+            }
+        case .palette256(let index):
+            return Self.xterm256Color(index)
+        case .rgb(let red, let green, let blue):
+            return NSColor(
+                calibratedRed: CGFloat(red) / 255,
+                green: CGFloat(green) / 255,
+                blue: CGFloat(blue) / 255,
+                alpha: 1
+            )
+        }
+    }
+
+    private static func xterm256Color(_ index: Int) -> NSColor? {
+        if index < 16 {
+            return TerminalANSIColor.ansi16(index).resolve()
+        }
+
+        if (16...231).contains(index) {
+            let adjusted = index - 16
+            let red = adjusted / 36
+            let green = (adjusted / 6) % 6
+            let blue = adjusted % 6
+            let levels: [CGFloat] = [0, 95.0 / 255.0, 135.0 / 255.0, 175.0 / 255.0, 215.0 / 255.0, 1]
+            return NSColor(
+                calibratedRed: levels[red],
+                green: levels[green],
+                blue: levels[blue],
+                alpha: 1
+            )
+        }
+
+        guard (232...255).contains(index) else { return nil }
+        let value = CGFloat((index - 232) * 10 + 8) / 255
+        return NSColor(calibratedWhite: value, alpha: 1)
     }
 }

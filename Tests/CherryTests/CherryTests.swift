@@ -9,11 +9,16 @@ import Testing
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["two", "three", "four"])
 }
 
-@Test func ansiSequencesAreIgnored() async throws {
+@Test func ansiForegroundColorIsPreserved() async throws {
     var buffer = TerminalTextBuffer(maxScrollback: nil)
     buffer.ingest(Data("\u{1B}[32mhello\u{1B}[0m world".utf8))
 
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["hello world"])
+    let styled = buffer.styledSnapshot(range: 0..<buffer.lineCount)
+    #expect(styled.count == 1)
+    #expect(styled[0].runs.count == 2)
+    #expect(styled[0].runs[0] == TerminalTextRun(text: "hello", style: TerminalTextStyle(foreground: .ansi16(2))))
+    #expect(styled[0].runs[1] == TerminalTextRun(text: " world", style: TerminalTextStyle()))
 }
 
 @Test func carriageReturnRewritesTheCurrentLine() async throws {

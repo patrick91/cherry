@@ -149,6 +149,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         buffer.snapshot(range: range)
     }
 
+    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
+        buffer.styledSnapshot(range: range)
+    }
+
     func sendCommandLine(_ command: String) {
         send(text: command + "\n")
     }

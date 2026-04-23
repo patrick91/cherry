@@ -54,6 +54,31 @@ import Testing
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["é"])
 }
 
+@Test func nerdFontPrivateUseGlyphsSurviveBuffering() async throws {
+    let branchGlyph = String(UnicodeScalar(0xE0A0)!)
+    let fileGlyph = String(UnicodeScalar(0xF15B)!)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\(branchGlyph) main \(fileGlyph) README.md".utf8))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["\(branchGlyph) main \(fileGlyph) README.md"])
+}
+
+@Test func nerdFontFamiliesPreferMonoFonts() async throws {
+    let families = [
+        "Example Nerd Font",
+        "JetBrainsMono Nerd Font Mono",
+        "Apple Symbols",
+        "CaskaydiaCove Nerd Font Mono"
+    ]
+
+    #expect(TerminalFontPalette.preferredNerdFontFamilies(from: families) == [
+        "JetBrainsMono Nerd Font Mono",
+        "CaskaydiaCove Nerd Font Mono",
+        "Example Nerd Font"
+    ])
+}
+
 @Test func outputSoftWrapsAtViewportWidth() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.ingest(Data("abcdef".utf8), viewportSize: TerminalViewportSize(columns: 3, rows: 10))

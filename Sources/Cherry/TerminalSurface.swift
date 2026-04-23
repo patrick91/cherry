@@ -195,9 +195,9 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let sideInset: CGFloat = 22
     private let backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.09, alpha: 1)
     private let defaultTextColor = NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.92, alpha: 1)
-    private let regularFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular)
-    private let boldFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .semibold)
-    private lazy var cellWidth = max(7.8, "W".size(withAttributes: [.font: regularFont]).width)
+    private let regularFont = TerminalFontPalette.regular(size: 13.5)
+    private let boldFont = TerminalFontPalette.semibold(size: 13.5)
+    private lazy var cellWidth = TerminalFontPalette.cellWidth(for: regularFont)
     private var isFocused = false
     private var selection: TerminalSelectionRange?
     private var selectionAnchor: TerminalGridPoint?

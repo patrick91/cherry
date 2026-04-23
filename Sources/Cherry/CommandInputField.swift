@@ -80,7 +80,7 @@ final class CommandPromptTextField: NSTextField {
         bezelStyle = .roundedBezel
         drawsBackground = true
         backgroundColor = .textBackgroundColor
-        font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        font = TerminalFontPalette.medium(size: 13)
         focusRingType = .default
         lineBreakMode = .byTruncatingTail
     }

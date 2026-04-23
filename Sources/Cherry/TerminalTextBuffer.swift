@@ -100,24 +100,36 @@ struct TerminalTextBuffer {
         trimIfNeeded()
     }
 
-    mutating func ingest(_ data: Data) {
+    @discardableResult
+    mutating func ingest(
+        _ data: Data,
+        viewportSize: TerminalViewportSize = TerminalViewportSize(columns: 120, rows: 32)
+    ) -> [Data] {
+        var responses: [Data] = []
+
         for byte in data {
-            process(byte)
+            process(byte, viewportSize: viewportSize, responses: &responses)
         }
 
         flushPendingText(preservingIncompleteUTF8: true)
         trimIfNeeded()
         clampCursor()
+
+        return responses
     }
 
-    private mutating func process(_ byte: UInt8) {
+    private mutating func process(
+        _ byte: UInt8,
+        viewportSize: TerminalViewportSize,
+        responses: inout [Data]
+    ) {
         switch parserState {
         case .ground:
             processGround(byte)
         case .escape:
             processEscape(byte)
         case .csi:
-            processCSI(byte)
+            processCSI(byte, viewportSize: viewportSize, responses: &responses)
         case .osc, .ignoredString:
             processIgnoredString(byte)
         }
@@ -167,14 +179,18 @@ struct TerminalTextBuffer {
         }
     }
 
-    private mutating func processCSI(_ byte: UInt8) {
+    private mutating func processCSI(
+        _ byte: UInt8,
+        viewportSize: TerminalViewportSize,
+        responses: inout [Data]
+    ) {
         controlBuffer.append(byte)
 
         guard (0x40...0x7E).contains(byte) else { return }
 
         let finalByte = byte
         let payload = Array(controlBuffer.dropLast())
-        handleCSI(finalByte: finalByte, payload: payload)
+        handleCSI(finalByte: finalByte, payload: payload, viewportSize: viewportSize, responses: &responses)
 
         controlBuffer.removeAll(keepingCapacity: true)
         parserState = .ground
@@ -199,7 +215,12 @@ struct TerminalTextBuffer {
         }
     }
 
-    private mutating func handleCSI(finalByte: UInt8, payload: [UInt8]) {
+    private mutating func handleCSI(
+        finalByte: UInt8,
+        payload: [UInt8],
+        viewportSize: TerminalViewportSize,
+        responses: inout [Data]
+    ) {
         let rawPayload = String(decoding: payload, as: UTF8.self)
         let parameters = rawPayload
             .split(separator: ";", omittingEmptySubsequences: false)
@@ -219,7 +240,9 @@ struct TerminalTextBuffer {
         switch Character(UnicodeScalar(finalByte)) {
         case "m":
             applySGR(parameters)
-        case "h", "l", "s", "u", "n", "q":
+        case "n":
+            handleDeviceStatusReport(parameter(at: 0, default: 0), viewportSize: viewportSize, responses: &responses)
+        case "h", "l", "s", "u", "q":
             return
         case "A":
             moveCursorRow(by: -parameter(at: 0, default: 1))
@@ -247,6 +270,21 @@ struct TerminalTextBuffer {
             deleteCharacters(parameter(at: 0, default: 1))
         case "X":
             eraseCharacters(parameter(at: 0, default: 1))
+        default:
+            return
+        }
+    }
+
+    private mutating func handleDeviceStatusReport(
+        _ code: Int,
+        viewportSize: TerminalViewportSize,
+        responses: inout [Data]
+    ) {
+        switch code {
+        case 5:
+            responses.append(Data("\u{1B}[0n".utf8))
+        case 6:
+            responses.append(cursorPositionReport(viewportSize: viewportSize))
         default:
             return
         }
@@ -497,6 +535,18 @@ struct TerminalTextBuffer {
 
     private static func plainLine(from text: String) -> [TerminalCell] {
         text.map { TerminalCell(character: $0, style: TerminalTextStyle()) }
+    }
+
+    private mutating func cursorPositionReport(viewportSize: TerminalViewportSize) -> Data {
+        ensureCursorLine()
+
+        let rows = max(1, viewportSize.rows)
+        let columns = max(1, viewportSize.columns)
+        let screenTopRow = max(0, lines.count - rows)
+        let row = min(rows, max(1, cursorRow - screenTopRow + 1))
+        let column = min(columns, max(1, cursorColumn + 1))
+
+        return Data("\u{1B}[\(row);\(column)R".utf8)
     }
 
     private static func completeUTF8PrefixLength(in bytes: [UInt8]) -> Int {

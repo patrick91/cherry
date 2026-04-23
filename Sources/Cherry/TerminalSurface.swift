@@ -4,6 +4,45 @@ import SwiftUI
 
 private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
+enum TerminalInputEncoder {
+    static func commandSequence(for selector: Selector) -> Data? {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            return Data("\r".utf8)
+        case #selector(NSResponder.insertTab(_:)):
+            return Data("\t".utf8)
+        case #selector(NSResponder.cancelOperation(_:)):
+            return Data([0x03])
+        case #selector(NSResponder.deleteBackward(_:)):
+            return Data([0x7F])
+        case #selector(NSResponder.deleteForward(_:)):
+            return Data("\u{1B}[3~".utf8)
+        case #selector(NSResponder.moveLeft(_:)):
+            return Data("\u{1B}[D".utf8)
+        case #selector(NSResponder.moveRight(_:)):
+            return Data("\u{1B}[C".utf8)
+        case #selector(NSResponder.moveUp(_:)):
+            return Data("\u{1B}[A".utf8)
+        case #selector(NSResponder.moveDown(_:)):
+            return Data("\u{1B}[B".utf8)
+        case #selector(NSResponder.moveToBeginningOfLine(_:)):
+            return Data([0x01])
+        case #selector(NSResponder.moveToEndOfLine(_:)):
+            return Data([0x05])
+        case #selector(NSResponder.moveWordLeft(_:)):
+            return Data("\u{1B}b".utf8)
+        case #selector(NSResponder.moveWordRight(_:)):
+            return Data("\u{1B}f".utf8)
+        case #selector(NSResponder.pageUp(_:)):
+            return Data("\u{1B}[5~".utf8)
+        case #selector(NSResponder.pageDown(_:)):
+            return Data("\u{1B}[6~".utf8)
+        default:
+            return nil
+        }
+    }
+}
+
 struct TerminalSurfaceView: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
 
@@ -411,40 +450,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     }
 
     private func commandSequence(for selector: Selector) -> Data? {
-        switch selector {
-        case #selector(insertNewline(_:)):
-            return Data("\n".utf8)
-        case #selector(insertTab(_:)):
-            return Data("\t".utf8)
-        case #selector(cancelOperation(_:)):
-            return Data([0x03])
-        case #selector(deleteBackward(_:)):
-            return Data([0x7F])
-        case #selector(deleteForward(_:)):
-            return Data("\u{1B}[3~".utf8)
-        case #selector(moveLeft(_:)):
-            return Data("\u{1B}[D".utf8)
-        case #selector(moveRight(_:)):
-            return Data("\u{1B}[C".utf8)
-        case #selector(moveUp(_:)):
-            return Data("\u{1B}[A".utf8)
-        case #selector(moveDown(_:)):
-            return Data("\u{1B}[B".utf8)
-        case #selector(moveToBeginningOfLine(_:)):
-            return Data([0x01])
-        case #selector(moveToEndOfLine(_:)):
-            return Data([0x05])
-        case #selector(moveWordLeft(_:)):
-            return Data("\u{1B}b".utf8)
-        case #selector(moveWordRight(_:)):
-            return Data("\u{1B}f".utf8)
-        case #selector(pageUp(_:)):
-            return Data("\u{1B}[5~".utf8)
-        case #selector(pageDown(_:)):
-            return Data("\u{1B}[6~".utf8)
-        default:
-            return nil
-        }
+        TerminalInputEncoder.commandSequence(for: selector)
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {

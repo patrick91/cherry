@@ -155,7 +155,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func sendCommandLine(_ command: String) {
-        send(text: command + "\n")
+        send(text: command + "\r")
     }
 
     func send(text: String) {
@@ -250,7 +250,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func receiveOutput(_ data: Data, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
 
-        buffer.ingest(data)
+        let responses = buffer.ingest(data, viewportSize: viewportSize)
+        for response in responses {
+            shellProcess?.write(response)
+        }
         if inputDebugEnabled {
             let tailStart = max(0, buffer.lineCount - 4)
             let tail = buffer.snapshot(range: tailStart..<buffer.lineCount)

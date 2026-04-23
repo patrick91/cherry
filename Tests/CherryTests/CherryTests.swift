@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import Cherry
@@ -35,6 +36,22 @@ import Testing
     buffer.ingest(Data([0xA9]))
 
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["é"])
+}
+
+@Test func cursorPositionReportRespondsToDeviceStatusRequest() async throws {
+    var buffer = TerminalTextBuffer(maxScrollback: nil)
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 5)
+    buffer.ingest(Data("abc\r\nxy".utf8), viewportSize: viewportSize)
+
+    let responses = buffer.ingest(Data("\u{1B}[6n".utf8), viewportSize: viewportSize)
+
+    #expect(responses == [Data("\u{1B}[2;3R".utf8)])
+}
+
+@Test func terminalEnterSendsCarriageReturn() async throws {
+    let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
+
+    #expect(enter == Data("\r".utf8))
 }
 
 @Test func cursorUpAndEraseDisplayAllowPromptRepaint() async throws {

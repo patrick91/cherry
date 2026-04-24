@@ -29,7 +29,7 @@ struct ContentView: View {
         .ignoresSafeArea(.all, edges: .top)
         .background(AppShellBackground())
         .background(WindowConfigurator())
-        .frame(minWidth: 1_020, minHeight: 640)
+        .frame(minWidth: 320, minHeight: 460)
     }
 }
 

@@ -39,6 +39,16 @@ struct CherryApp: App {
                 }
                 .keyboardShortcut("t")
 
+                Button("Previous Tab") {
+                    workspace.selectPreviousSession()
+                }
+                .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+
+                Button("Next Tab") {
+                    workspace.selectNextSession()
+                }
+                .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+
                 Button("Interrupt Active Tab") {
                     workspace.interruptSelectedSession()
                 }

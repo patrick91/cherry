@@ -182,9 +182,16 @@ struct TerminalSurfaceView: NSViewRepresentable {
 final class TerminalScrollView: NSScrollView {
     private static let bottomPinTolerance: CGFloat = 1
 
+    private struct SessionViewportState {
+        var offsetY: CGFloat
+        var isFollowingOutput: Bool
+    }
+
     private let canvasView = TerminalCanvasView(frame: .zero)
     private var revisionObserver: AnyCancellable?
     private weak var activeSession: TerminalSession?
+    private var viewportStates: [UUID: SessionViewportState] = [:]
+    private var pendingRestoredOffsetY: CGFloat?
     private var terminalScrollRemainder: CGFloat = 0
     private var isFollowingOutput = true
 
@@ -213,8 +220,12 @@ final class TerminalScrollView: NSScrollView {
 
     func configure(with session: TerminalSession) {
         if activeSession !== session {
+            saveViewportStateForActiveSession()
+
             activeSession = session
-            isFollowingOutput = true
+            let restoredState = viewportStates[session.id]
+            isFollowingOutput = restoredState?.isFollowingOutput ?? true
+            pendingRestoredOffsetY = restoredState?.offsetY
             canvasView.session = session
             canvasView.clearSelection()
             canvasView.sendInput = { [weak session] data in
@@ -334,9 +345,14 @@ final class TerminalScrollView: NSScrollView {
         let viewport = canvasView.viewportSize(for: contentSize)
         activeSession.resize(columns: viewport.columns, rows: viewport.rows)
 
-        guard shouldFollowOutput else { return }
-        isFollowingOutput = true
-        scrollToBottom()
+        if shouldFollowOutput {
+            isFollowingOutput = true
+            pendingRestoredOffsetY = nil
+            scrollToBottom()
+        } else if let pendingRestoredOffsetY {
+            self.pendingRestoredOffsetY = nil
+            scrollToOffsetY(pendingRestoredOffsetY)
+        }
     }
 
     private var isPinnedToBottom: Bool {
@@ -347,6 +363,15 @@ final class TerminalScrollView: NSScrollView {
         let origin = NSPoint(x: 0, y: max(0, canvasView.frame.height - contentSize.height))
         contentView.scroll(to: origin)
         reflectScrolledClipView(contentView)
+        saveViewportStateForActiveSession()
+    }
+
+    private func scrollToOffsetY(_ offsetY: CGFloat) {
+        let maximumOffset = max(0, canvasView.frame.height - contentSize.height)
+        let origin = NSPoint(x: 0, y: min(max(offsetY, 0), maximumOffset))
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+        saveViewportStateForActiveSession()
     }
 
     @discardableResult
@@ -364,7 +389,17 @@ final class TerminalScrollView: NSScrollView {
 
         contentView.scroll(to: NSPoint(x: currentOrigin.x, y: nextY))
         reflectScrolledClipView(contentView)
+        saveViewportStateForActiveSession()
         return true
+    }
+
+    private func saveViewportStateForActiveSession() {
+        guard let activeSession else { return }
+
+        viewportStates[activeSession.id] = SessionViewportState(
+            offsetY: contentView.bounds.origin.y,
+            isFollowingOutput: isFollowingOutput
+        )
     }
 
     private func focusScrollViewIfPossible() {

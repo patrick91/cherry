@@ -156,55 +156,50 @@ private struct SidebarTabsView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    SidebarNavigationRow(
-                        title: "Live Sessions",
-                        systemImage: "rectangle.stack",
-                        tint: .primary,
-                        isSelected: true
+                VStack(alignment: .leading, spacing: 12) {
+                    SidebarToolbar(
+                        sessionCount: workspace.sessions.count,
+                        onNewTab: workspace.addSession
                     )
 
-                    Divider()
-                        .padding(.vertical, 8)
-
-                    Button {
-                        workspace.addSession()
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 19, weight: .regular))
-                                .frame(width: 24, height: 24)
-
-                            Text("New Tab")
-                                .font(.system(size: 16, weight: .medium))
-                        }
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                    }
-                    .buttonStyle(.plain)
-
-                    ForEach(workspace.sessions) { session in
-                        SidebarTabRow(
-                            session: session,
-                            isSelected: workspace.selectedSessionID == session.id,
-                            onSelect: { workspace.select(session) },
-                            onClose: { workspace.close(session) }
+                    if let selectedSession = workspace.selectedSession {
+                        ActiveSessionPanel(
+                            session: selectedSession,
+                            onInterrupt: workspace.interruptSelectedSession,
+                            onRestart: workspace.restartSelectedSession,
+                            onClear: workspace.clearSelectedSessionScrollback
                         )
-                        .contextMenu {
-                            Button("Restart") {
-                                session.restart()
-                            }
+                    }
 
-                            Button("Clear Scrollback") {
-                                session.clearScrollback()
-                            }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Sessions")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 4)
 
-                            Divider()
+                        ForEach(workspace.sessions) { session in
+                            SidebarTabRow(
+                                session: session,
+                                isSelected: workspace.selectedSessionID == session.id,
+                                onSelect: { workspace.select(session) },
+                                onClose: { workspace.close(session) }
+                            )
+                            .contextMenu {
+                                Button("Restart") {
+                                    session.restart()
+                                }
 
-                            Button("Close", role: .destructive) {
-                                workspace.close(session)
+                                Button("Clear Scrollback") {
+                                    session.clearScrollback()
+                                }
+
+                                Divider()
+
+                                Button("Close", role: .destructive) {
+                                    workspace.close(session)
+                                }
                             }
                         }
                     }
@@ -220,36 +215,101 @@ private struct SidebarTabsView: View {
     }
 }
 
-private struct SidebarNavigationRow: View {
-    let title: String
-    let systemImage: String
-    let tint: Color
-    let isSelected: Bool
+private struct SidebarToolbar: View {
+    let sessionCount: Int
+    let onNewTab: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: systemImage)
-                .font(.system(size: 17, weight: .medium))
-                .frame(width: 24, height: 24)
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Shells")
+                    .font(.system(size: 21, weight: .semibold))
 
-            Text(title)
-                .font(.system(size: 16, weight: .semibold))
+                Text("\(sessionCount) active \(sessionCount == 1 ? "session" : "sessions")")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
 
             Spacer()
+
+            Button(action: onNewTab) {
+                Image(systemName: "plus")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 30, height: 30)
+            }
+            .buttonStyle(.plain)
+            .background {
+                Circle()
+                    .fill(Color.white.opacity(0.42))
+            }
+            .help("New tab")
         }
-        .foregroundStyle(tint)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(rowBackground)
+    }
+}
+
+private struct ActiveSessionPanel: View {
+    @ObservedObject var session: TerminalSession
+    let onInterrupt: () -> Void
+    let onRestart: () -> Void
+    let onClear: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                TerminalGlyphIcon(tint: Color(nsColor: session.tint), isSelected: true)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(session.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .lineLimit(1)
+
+                    Text(session.statusLine)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            HStack(spacing: 8) {
+                SidebarActionButton("Interrupt", systemImage: "bolt.slash", action: onInterrupt)
+                SidebarActionButton("Restart", systemImage: "arrow.clockwise", action: onRestart)
+                SidebarActionButton("Clear", systemImage: "eraser", action: onClear)
+            }
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.48))
+        }
+    }
+}
+
+private struct SidebarActionButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    init(_ title: String, systemImage: String, action: @escaping () -> Void) {
+        self.title = title
+        self.systemImage = systemImage
+        self.action = action
     }
 
-    @ViewBuilder
-    private var rowBackground: some View {
-        if isSelected {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.46))
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .labelStyle(.iconOnly)
+                .frame(maxWidth: .infinity)
+                .frame(height: 28)
         }
+        .buttonStyle(.plain)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.56))
+        }
+        .help(title)
     }
 }
 
@@ -282,10 +342,7 @@ private struct SidebarTabRow: View {
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 12) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(Color(nsColor: session.tint))
-                    .frame(width: 24, height: 24)
+                TerminalGlyphIcon(tint: Color(nsColor: session.tint), isSelected: isSelected)
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(session.title)
@@ -326,6 +383,22 @@ private struct SidebarTabRow: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color.white.opacity(0.34))
         }
+    }
+}
+
+private struct TerminalGlyphIcon: View {
+    let tint: Color
+    let isSelected: Bool
+
+    var body: some View {
+        Image(systemName: "terminal")
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(tint)
+            .frame(width: 24, height: 24)
+            .background {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(tint.opacity(isSelected ? 0.95 : 0.72), lineWidth: 1.5)
+            }
     }
 }
 

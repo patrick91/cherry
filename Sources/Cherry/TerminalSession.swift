@@ -309,6 +309,14 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    func selectPreviousSession() {
+        selectSession(offset: -1)
+    }
+
+    func selectNextSession() {
+        selectSession(offset: 1)
+    }
+
     func interruptSelectedSession() {
         selectedSession?.sendInterrupt()
     }
@@ -319,6 +327,17 @@ final class TerminalWorkspace: ObservableObject {
 
     func clearSelectedSessionScrollback() {
         selectedSession?.clearScrollback()
+    }
+
+    private func selectSession(offset: Int) {
+        guard !sessions.isEmpty else { return }
+
+        let currentIndex = selectedSession
+            .flatMap { selectedSession in
+                sessions.firstIndex(where: { $0.id == selectedSession.id })
+            } ?? 0
+        let nextIndex = (currentIndex + offset + sessions.count) % sessions.count
+        selectedSessionID = sessions[nextIndex].id
     }
 
     private static func makeSession(index: Int) -> TerminalSession {

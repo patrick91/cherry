@@ -397,9 +397,9 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     var sendInterrupt: (() -> Void)?
 
     private let lineHeight: CGFloat = 20
-    private let topInset: CGFloat = 0
+    private let topInset: CGFloat = 10
     private let bottomInset: CGFloat = 28
-    private let sideInset: CGFloat = 22
+    private let sideInset: CGFloat = 14
     private let backgroundColor = NSColor(calibratedRed: 0.07, green: 0.065, blue: 0.09, alpha: 1)
     private let defaultTextColor = NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.92, alpha: 1)
     private let regularFont = TerminalFontPalette.regular(size: 13.5)
@@ -490,8 +490,6 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         backgroundColor.setFill()
         dirtyRect.fill()
 
-        drawFocusStrip(in: dirtyRect)
-
         guard let session else { return }
 
         let startingRow = max(0, Int(floor((dirtyRect.minY - topInset) / lineHeight)))
@@ -513,16 +511,6 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             visibleRows: startingRow..<endingRow,
             visibleLines: visibleLines
         )
-    }
-
-    private func drawFocusStrip(in dirtyRect: NSRect) {
-        guard dirtyRect.minX < 10 else { return }
-
-        let stripRect = NSRect(x: 0, y: 0, width: 5, height: bounds.height)
-        let path = NSBezierPath(roundedRect: stripRect, xRadius: 4, yRadius: 4)
-        let stripColor = session?.tint ?? NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.32, alpha: 1)
-        stripColor.withAlphaComponent(isFocused ? 0.95 : 0.45).setFill()
-        path.fill()
     }
 
     private func drawSelection(in visibleRows: Range<Int>) {

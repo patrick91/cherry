@@ -397,7 +397,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     var sendInterrupt: (() -> Void)?
 
     private let lineHeight: CGFloat = 20
-    private let topInset: CGFloat = 24
+    private let topInset: CGFloat = 0
     private let bottomInset: CGFloat = 28
     private let sideInset: CGFloat = 22
     private let backgroundColor = NSColor(calibratedRed: 0.07, green: 0.065, blue: 0.09, alpha: 1)

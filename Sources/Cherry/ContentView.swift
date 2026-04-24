@@ -172,15 +172,16 @@ private struct TerminalSceneView: View {
     var body: some View {
         TerminalSurfaceView(session: session)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
-                    Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
+                        Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
             )
-        )
+            .ignoresSafeArea(.container, edges: .top)
     }
 }

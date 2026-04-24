@@ -31,7 +31,7 @@ struct CherryApp: App {
             ContentView(workspace: workspace)
         }
         .defaultSize(width: 1_340, height: 840)
-        .windowToolbarStyle(.unified(showsTitle: true))
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandMenu("Prototype") {
                 Button("New Tab") {

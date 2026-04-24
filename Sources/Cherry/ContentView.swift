@@ -20,7 +20,7 @@ struct ContentView: View {
                         maximumWidth: maximumSidebarWidth
                     )
                     .frame(width: 4)
-                    .padding(.trailing, 2)
+                    .padding(.trailing, -2)
                 }
 
             DetailPaneView(workspace: workspace)

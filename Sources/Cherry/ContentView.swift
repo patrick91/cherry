@@ -6,7 +6,7 @@ struct ContentView: View {
     var body: some View {
         HSplitView {
             SidebarTabsView(workspace: workspace)
-                .frame(minWidth: 220, idealWidth: 248, maxWidth: 300)
+                .frame(minWidth: 300, idealWidth: 320, maxWidth: 360)
 
             if let session = workspace.selectedSession {
                 TerminalSceneView(session: session)
@@ -25,43 +25,36 @@ private struct SidebarTabsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Ghostty Rail")
-                        .font(.system(size: 19, weight: .semibold))
-                    Text("Native macOS prototype")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    workspace.addSession()
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .bold))
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.08))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                }
-                .help("New tab")
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 18)
-            .padding(.bottom, 16)
-
-            Divider()
-
             ScrollView {
-                LazyVStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 8) {
+                    SidebarNavigationRow(
+                        title: "Live Sessions",
+                        systemImage: "rectangle.stack",
+                        tint: .primary,
+                        isSelected: true
+                    )
+
+                    Divider()
+                        .padding(.vertical, 8)
+
+                    Button {
+                        workspace.addSession()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 19, weight: .regular))
+                                .frame(width: 24, height: 24)
+
+                            Text("New Tab")
+                                .font(.system(size: 16, weight: .medium))
+                        }
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                    }
+                    .buttonStyle(.plain)
+
                     ForEach(workspace.sessions) { session in
                         SidebarTabRow(
                             session: session,
@@ -69,21 +62,87 @@ private struct SidebarTabsView: View {
                             onSelect: { workspace.select(session) },
                             onClose: { workspace.close(session) }
                         )
+                        .contextMenu {
+                            Button("Restart") {
+                                session.restart()
+                            }
+
+                            Button("Clear Scrollback") {
+                                session.clearScrollback()
+                            }
+
+                            Divider()
+
+                            Button("Close", role: .destructive) {
+                                workspace.close(session)
+                            }
+                        }
                     }
                 }
-                .padding(12)
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 16)
             }
         }
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(nsColor: NSColor(calibratedWhite: 0.97, alpha: 1)),
-                    Color(nsColor: NSColor(calibratedRed: 0.93, green: 0.95, blue: 0.98, alpha: 1))
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
+        .background {
+            SidebarBackground()
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.black.opacity(0.10))
+                .frame(width: 1)
+        }
+    }
+}
+
+private struct SidebarNavigationRow: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .medium))
+                .frame(width: 24, height: 24)
+
+            Text(title)
+                .font(.system(size: 16, weight: .semibold))
+
+            Spacer()
+        }
+        .foregroundStyle(tint)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(rowBackground)
+    }
+
+    @ViewBuilder
+    private var rowBackground: some View {
+        if isSelected {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.46))
+        }
+    }
+}
+
+private struct SidebarBackground: View {
+    var body: some View {
+        Rectangle()
+            .fill(.regularMaterial)
+            .overlay {
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.34),
+                        Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.34),
+                        Color.white.opacity(0.18)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
     }
 }
 
@@ -98,19 +157,15 @@ private struct SidebarTabRow: View {
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 12) {
-                Circle()
-                    .fill(Color(nsColor: session.tint))
-                    .frame(width: 10, height: 10)
+                Image(systemName: "terminal")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(Color(nsColor: session.tint))
+                    .frame(width: 24, height: 24)
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(session.title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 16, weight: isSelected ? .semibold : .medium))
                         .foregroundStyle(.primary)
-                        .lineLimit(1)
-
-                    Text(session.subtitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
                         .lineLimit(1)
 
                     Text(session.statusLine)
@@ -122,22 +177,13 @@ private struct SidebarTabRow: View {
                 Spacer(minLength: 8)
 
                 if isHovered || isSelected {
-                    Button(role: .destructive, action: onClose) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
-                            .frame(width: 16, height: 16)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+                    CloseTabButton(action: onClose)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(background)
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(isSelected ? Color.primary.opacity(0.10) : Color.clear, lineWidth: 1)
-            }
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -145,24 +191,31 @@ private struct SidebarTabRow: View {
         }
     }
 
+    @ViewBuilder
     private var background: some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(
-                LinearGradient(
-                    colors: isSelected
-                        ? [
-                            Color.white.opacity(0.96),
-                            Color(nsColor: session.tint).opacity(0.14)
-                        ]
-                        : [
-                            Color.white.opacity(isHovered ? 0.92 : 0.74),
-                            Color.white.opacity(isHovered ? 0.78 : 0.58)
-                        ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
-            .shadow(color: .black.opacity(isSelected ? 0.08 : 0.03), radius: isSelected ? 14 : 8, y: 5)
+        if isSelected {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.76))
+                .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
+        } else if isHovered {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.34))
+        }
+    }
+}
+
+private struct CloseTabButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(role: .destructive, action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .bold))
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help("Close tab")
     }
 }
 

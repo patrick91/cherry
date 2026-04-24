@@ -157,34 +157,18 @@ private struct SidebarTabsView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    SidebarToolbar(
-                        sessionCount: workspace.sessions.count,
-                        onNewTab: workspace.addSession
-                    )
-
-                    if let selectedSession = workspace.selectedSession {
-                        ActiveSessionPanel(
-                            session: selectedSession,
-                            onInterrupt: workspace.interruptSelectedSession,
-                            onRestart: workspace.restartSelectedSession,
-                            onClear: workspace.clearSelectedSessionScrollback
-                        )
-                    }
-
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Sessions")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .textCase(.uppercase)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 4)
+                            .padding(.horizontal, 8)
 
                         ForEach(workspace.sessions) { session in
                             SidebarTabRow(
                                 session: session,
                                 isSelected: workspace.selectedSessionID == session.id,
-                                onSelect: { workspace.select(session) },
-                                onClose: { workspace.close(session) }
+                                onSelect: { workspace.select(session) }
                             )
                             .contextMenu {
                                 Button("Restart") {
@@ -204,112 +188,14 @@ private struct SidebarTabsView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
+                .padding(.horizontal, 8)
+                .padding(.top, 50)
                 .padding(.bottom, 16)
             }
         }
         .background {
             SidebarBackground()
         }
-    }
-}
-
-private struct SidebarToolbar: View {
-    let sessionCount: Int
-    let onNewTab: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Shells")
-                    .font(.system(size: 21, weight: .semibold))
-
-                Text("\(sessionCount) active \(sessionCount == 1 ? "session" : "sessions")")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Button(action: onNewTab) {
-                Image(systemName: "plus")
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 30, height: 30)
-            }
-            .buttonStyle(.plain)
-            .background {
-                Circle()
-                    .fill(Color.white.opacity(0.42))
-            }
-            .help("New tab")
-        }
-        .padding(.horizontal, 12)
-    }
-}
-
-private struct ActiveSessionPanel: View {
-    @ObservedObject var session: TerminalSession
-    let onInterrupt: () -> Void
-    let onRestart: () -> Void
-    let onClear: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                TerminalGlyphIcon(tint: Color(nsColor: session.tint), isSelected: true)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.title)
-                        .font(.system(size: 15, weight: .semibold))
-                        .lineLimit(1)
-
-                    Text(session.statusLine)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            HStack(spacing: 8) {
-                SidebarActionButton("Interrupt", systemImage: "bolt.slash", action: onInterrupt)
-                SidebarActionButton("Restart", systemImage: "arrow.clockwise", action: onRestart)
-                SidebarActionButton("Clear", systemImage: "eraser", action: onClear)
-            }
-        }
-        .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.48))
-        }
-    }
-}
-
-private struct SidebarActionButton: View {
-    let title: String
-    let systemImage: String
-    let action: () -> Void
-
-    init(_ title: String, systemImage: String, action: @escaping () -> Void) {
-        self.title = title
-        self.systemImage = systemImage
-        self.action = action
-    }
-
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 11, weight: .semibold))
-                .labelStyle(.iconOnly)
-                .frame(maxWidth: .infinity)
-                .frame(height: 28)
-        }
-        .buttonStyle(.plain)
-        .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(0.56))
-        }
-        .help(title)
     }
 }
 
@@ -335,7 +221,6 @@ private struct SidebarTabRow: View {
     @ObservedObject var session: TerminalSession
     let isSelected: Bool
     let onSelect: () -> Void
-    let onClose: () -> Void
 
     @State private var isHovered = false
 
@@ -349,21 +234,12 @@ private struct SidebarTabRow: View {
                         .font(.system(size: 16, weight: isSelected ? .semibold : .medium))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-
-                    Text(session.statusLine)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
                 }
 
                 Spacer(minLength: 8)
-
-                if isHovered || isSelected {
-                    CloseTabButton(action: onClose)
-                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 10)
             .padding(.vertical, 10)
             .background(background)
         }
@@ -399,21 +275,6 @@ private struct TerminalGlyphIcon: View {
                 RoundedRectangle(cornerRadius: 4, style: .continuous)
                     .strokeBorder(tint.opacity(isSelected ? 0.95 : 0.72), lineWidth: 1.5)
             }
-    }
-}
-
-private struct CloseTabButton: View {
-    let action: () -> Void
-
-    var body: some View {
-        Button(role: .destructive, action: action) {
-            Image(systemName: "xmark")
-                .font(.system(size: 9, weight: .bold))
-                .frame(width: 16, height: 16)
-        }
-        .buttonStyle(.borderless)
-        .foregroundStyle(.secondary)
-        .help("Close tab")
     }
 }
 

@@ -21,6 +21,60 @@ struct TerminalTextStyle: Equatable {
 struct TerminalTextRun: Equatable {
     let text: String
     let style: TerminalTextStyle
+    let cellWidth: Int
+
+    init(text: String, style: TerminalTextStyle, cellWidth: Int? = nil) {
+        self.text = text
+        self.style = style
+        self.cellWidth = cellWidth ?? text.reduce(0) { $0 + Self.cellWidth(for: $1) }
+    }
+
+    static func cellWidth(for character: Character) -> Int {
+        let scalars = Array(character.unicodeScalars)
+        guard !scalars.isEmpty else { return 0 }
+
+        if scalars.contains(where: { $0.value == 0xFE0E }) {
+            return 1
+        }
+
+        if scalars.contains(where: { $0.value == 0xFE0F }) {
+            return 2
+        }
+
+        return scalars.map { cellWidth(for: $0) }.max() ?? 1
+    }
+
+    private static func cellWidth(for scalar: UnicodeScalar) -> Int {
+        let value = scalar.value
+
+        if value == 0 ||
+            value == 0x200D ||
+            (0x0300...0x036F).contains(value) ||
+            (0x1AB0...0x1AFF).contains(value) ||
+            (0x1DC0...0x1DFF).contains(value) ||
+            (0x20D0...0x20FF).contains(value) ||
+            (0xFE00...0xFE0F).contains(value) ||
+            (0xFE20...0xFE2F).contains(value) ||
+            (0xE0100...0xE01EF).contains(value) {
+            return 0
+        }
+
+        if (0x1100...0x115F).contains(value) ||
+            (0x2329...0x232A).contains(value) ||
+            (0x2E80...0xA4CF).contains(value) ||
+            (0xAC00...0xD7A3).contains(value) ||
+            (0xF900...0xFAFF).contains(value) ||
+            (0xFE10...0xFE19).contains(value) ||
+            (0xFE30...0xFE6F).contains(value) ||
+            (0xFF00...0xFF60).contains(value) ||
+            (0xFFE0...0xFFE6).contains(value) ||
+            (0x1F000...0x1FAFF).contains(value) ||
+            (0x20000...0x3FFFD).contains(value) {
+            return 2
+        }
+
+        return 1
+    }
 }
 
 struct TerminalRenderedLine: Equatable {
@@ -119,6 +173,7 @@ struct TerminalSelectionRange: Equatable {
 private struct TerminalCell: Equatable {
     let character: Character
     let style: TerminalTextStyle
+    var isSpacer = false
 }
 
 private struct TerminalBufferLine: Equatable {
@@ -379,7 +434,11 @@ private struct TerminalPageGrid: Equatable {
         let lower = max(0, min(startColumn, cells.count))
         let upper = max(lower, min(endColumn, cells.count))
         guard lower < upper else { return "" }
-        return cells[lower..<upper].map(\.character).map(String.init).joined()
+        return cells[lower..<upper]
+            .filter { !$0.isSpacer }
+            .map(\.character)
+            .map(String.init)
+            .joined()
     }
 }
 
@@ -415,15 +474,34 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private enum ParserState {
         case ground
         case escape
+        case charsetDesignation(GraphicCharsetSlot)
         case csi
         case osc
         case ignoredString
+    }
+
+    private enum GraphicCharsetSlot {
+        case g0
+        case g1
+        case g2
+        case g3
+    }
+
+    private enum GraphicCharset {
+        case ascii
+        case british
+        case decSpecial
     }
 
     private struct ScreenState {
         var cursorRow: Int
         var cursorColumn: Int
         var style: TerminalTextStyle
+        var g0Charset: GraphicCharset
+        var g1Charset: GraphicCharset
+        var g2Charset: GraphicCharset
+        var g3Charset: GraphicCharset
+        var activeGraphicCharsetSlot: GraphicCharsetSlot
     }
 
     private let maxScrollback: Int?
@@ -445,6 +523,13 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var pendingText: [UInt8] = []
     private var escapedStringPendingST = false
     private var currentStyle = TerminalTextStyle()
+    private var g0Charset = GraphicCharset.ascii
+    private var g1Charset = GraphicCharset.ascii
+    private var g2Charset = GraphicCharset.ascii
+    private var g3Charset = GraphicCharset.ascii
+    private var activeGraphicCharsetSlot = GraphicCharsetSlot.g0
+    private var lastWrittenCharacter: Character?
+    private var isWraparoundMode = true
 
     private static let defaultForegroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (219, 227, 235)
     private static let defaultBackgroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (18, 17, 23)
@@ -567,6 +652,13 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         pendingText.removeAll(keepingCapacity: true)
         escapedStringPendingST = false
         currentStyle = TerminalTextStyle()
+        g0Charset = .ascii
+        g1Charset = .ascii
+        g2Charset = .ascii
+        g3Charset = .ascii
+        activeGraphicCharsetSlot = .g0
+        lastWrittenCharacter = nil
+        isWraparoundMode = true
     }
 
     mutating func appendPlainLines(_ newLines: [String]) {
@@ -616,6 +708,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             processGround(byte)
         case .escape:
             processEscape(byte)
+        case .charsetDesignation(let slot):
+            processCharsetDesignation(byte, slot: slot)
         case .csi:
             processCSI(byte, viewportSize: viewportSize, responses: &responses)
         case .osc:
@@ -643,6 +737,12 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             flushPendingText()
             let spaces = max(1, 8 - (cursorColumn % 8))
             writeText(String(repeating: " ", count: spaces))
+        case 0x0E:
+            flushPendingText()
+            activeGraphicCharsetSlot = .g1
+        case 0x0F:
+            flushPendingText()
+            activeGraphicCharsetSlot = .g0
         case 0x07:
             flushPendingText()
         case 0x00...0x1F:
@@ -661,6 +761,14 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             controlBuffer.removeAll(keepingCapacity: true)
             escapedStringPendingST = false
             parserState = .osc
+        case UInt8(ascii: "("):
+            parserState = .charsetDesignation(.g0)
+        case UInt8(ascii: ")"):
+            parserState = .charsetDesignation(.g1)
+        case UInt8(ascii: "*"):
+            parserState = .charsetDesignation(.g2)
+        case UInt8(ascii: "+"):
+            parserState = .charsetDesignation(.g3)
         case UInt8(ascii: "P"), UInt8(ascii: "X"), UInt8(ascii: "^"), UInt8(ascii: "_"):
             escapedStringPendingST = false
             parserState = .ignoredString
@@ -676,6 +784,21 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         default:
             parserState = .ground
         }
+    }
+
+    private mutating func processCharsetDesignation(_ byte: UInt8, slot: GraphicCharsetSlot) {
+        switch byte {
+        case UInt8(ascii: "0"):
+            setGraphicCharset(.decSpecial, for: slot)
+        case UInt8(ascii: "A"):
+            setGraphicCharset(.british, for: slot)
+        case UInt8(ascii: "B"):
+            setGraphicCharset(.ascii, for: slot)
+        default:
+            break
+        }
+
+        parserState = .ground
     }
 
     private mutating func processCSI(
@@ -799,6 +922,11 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         switch Character(UnicodeScalar(finalByte)) {
         case "m":
+            guard !rawPayload.hasPrefix(">"),
+                  !rawPayload.hasPrefix("?"),
+                  !rawPayload.hasPrefix("=") else {
+                return
+            }
             applySGR(Self.sgrParameters(from: rawPayload))
         case "c":
             handleDeviceAttributes(rawPayload: rawPayload, responses: &responses)
@@ -845,10 +973,22 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             eraseInDisplay(mode: parameter(at: 0, default: 0))
         case "K":
             eraseInLine(mode: parameter(at: 0, default: 0))
+        case "@":
+            insertCharacters(parameter(at: 0, default: 1))
         case "P":
             deleteCharacters(parameter(at: 0, default: 1))
         case "X":
             eraseCharacters(parameter(at: 0, default: 1))
+        case "L":
+            insertLines(parameter(at: 0, default: 1))
+        case "M":
+            deleteLines(parameter(at: 0, default: 1))
+        case "S":
+            scrollAreaUp(parameter(at: 0, default: 1), top: absoluteScrollRegion.top, bottom: absoluteScrollRegion.bottom)
+        case "T":
+            scrollAreaDown(parameter(at: 0, default: 1), top: absoluteScrollRegion.top, bottom: absoluteScrollRegion.bottom)
+        case "b":
+            repeatPrecedingCharacter(parameter(at: 0, default: 1))
         default:
             return
         }
@@ -918,6 +1058,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 }
             case 25:
                 isCursorVisible = isSet
+            case 7:
+                isWraparoundMode = isSet
             case 1000:
                 currentMouseState.trackingMode = isSet ? .normal : .disabled
             case 1002:
@@ -973,7 +1115,12 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         savedCursorState = ScreenState(
             cursorRow: cursorRow,
             cursorColumn: cursorColumn,
-            style: currentStyle
+            style: currentStyle,
+            g0Charset: g0Charset,
+            g1Charset: g1Charset,
+            g2Charset: g2Charset,
+            g3Charset: g3Charset,
+            activeGraphicCharsetSlot: activeGraphicCharsetSlot
         )
     }
 
@@ -982,6 +1129,11 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         cursorRow = savedCursorState.cursorRow
         cursorColumn = savedCursorState.cursorColumn
         currentStyle = savedCursorState.style
+        g0Charset = savedCursorState.g0Charset
+        g1Charset = savedCursorState.g1Charset
+        g2Charset = savedCursorState.g2Charset
+        g3Charset = savedCursorState.g3Charset
+        activeGraphicCharsetSlot = savedCursorState.activeGraphicCharsetSlot
         clampCursor()
     }
 
@@ -1279,9 +1431,35 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         Array(repeating: TerminalCell(character: " ", style: currentStyle), count: max(0, count))
     }
 
+    private func spacerCell() -> TerminalCell {
+        TerminalCell(character: " ", style: currentStyle, isSpacer: true)
+    }
+
+    private func blankLineCells() -> [TerminalCell] {
+        currentStyle.paintsBackground ? blankCells(count: currentViewportSize.columns) : []
+    }
+
     private func ensureCellsExist(upTo count: Int, in cells: inout [TerminalCell]) {
         guard count > cells.count else { return }
         cells.append(contentsOf: blankCells(count: count - cells.count))
+    }
+
+    private mutating func insertCharacters(_ count: Int) {
+        guard count > 0 else { return }
+        ensureCursorLine()
+
+        let columns = max(1, currentViewportSize.columns)
+        guard cursorColumn < columns else { return }
+
+        let insertCount = min(count, columns - cursorColumn)
+        var cells = activeGrid.cells(at: cursorRow)
+        ensureCellsExist(upTo: cursorColumn, in: &cells)
+        cells.insert(contentsOf: blankCells(count: insertCount), at: cursorColumn)
+        if cells.count > columns {
+            cells.removeSubrange(columns..<cells.count)
+        }
+
+        activeGrid.setCells(cells, at: cursorRow)
     }
 
     private mutating func flushPendingText(preservingIncompleteUTF8: Bool = false) {
@@ -1299,7 +1477,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
     private mutating func writeText(_ text: String) {
         for character in text {
-            writeCharacter(character)
+            writeCharacter(mappedCharacter(character))
         }
     }
 
@@ -1307,25 +1485,253 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         ensureCursorLine()
 
         let columns = max(1, currentViewportSize.columns)
-        if cursorColumn >= columns {
-            activeGrid.setSoftWrapped(true, at: cursorRow)
-            appendNewLine()
+        let rawWidth = max(0, min(2, TerminalTextRun.cellWidth(for: character)))
+
+        if rawWidth == 0 {
+            appendZeroWidthCharacter(character)
+            return
         }
+
+        let width = min(rawWidth, columns)
+        if cursorColumn + width > columns {
+            if isWraparoundMode {
+                activeGrid.setSoftWrapped(true, at: cursorRow)
+                appendNewLine()
+            } else {
+                cursorColumn = max(0, columns - width)
+            }
+        }
+        let shouldClampAtRightEdge = !isWraparoundMode && cursorColumn + width >= columns
 
         var cells = activeGrid.cells(at: cursorRow)
         if cursorColumn > cells.count {
             cells.append(contentsOf: repeatElement(TerminalCell(character: " ", style: currentStyle), count: cursorColumn - cells.count))
         }
 
-        let cell = TerminalCell(character: character, style: currentStyle)
-        if cursorColumn == cells.count {
-            cells.append(cell)
-        } else {
-            cells[cursorColumn] = cell
+        ensureCellsExist(upTo: cursorColumn + width, in: &cells)
+        clearSplitWideCharacter(at: cursorColumn, in: &cells)
+        clearSplitWideCharacter(at: cursorColumn + width, in: &cells)
+
+        cells[cursorColumn] = TerminalCell(character: character, style: currentStyle)
+        if width == 2 {
+            cells[cursorColumn + 1] = spacerCell()
+        }
+
+        if cells.count > columns {
+            cells.removeSubrange(columns..<cells.count)
         }
 
         activeGrid.setCells(cells, at: cursorRow)
-        cursorColumn += 1
+        cursorColumn += width
+        if shouldClampAtRightEdge {
+            cursorColumn = max(0, columns - 1)
+        }
+        lastWrittenCharacter = character
+    }
+
+    private mutating func appendZeroWidthCharacter(_ character: Character) {
+        guard !activeGrid.isEmpty else { return }
+
+        var cells = activeGrid.cells(at: cursorRow)
+        var index = min(max(cursorColumn - 1, 0), max(0, cells.count - 1))
+        while index > 0, cells[index].isSpacer {
+            index -= 1
+        }
+
+        guard cells.indices.contains(index), !cells[index].isSpacer else { return }
+
+        let combined = String(cells[index].character) + String(character)
+        cells[index] = TerminalCell(character: Character(combined), style: cells[index].style)
+        activeGrid.setCells(cells, at: cursorRow)
+    }
+
+    private func clearSplitWideCharacter(at column: Int, in cells: inout [TerminalCell]) {
+        guard cells.indices.contains(column) else { return }
+
+        if cells[column].isSpacer, column > 0 {
+            cells[column - 1] = TerminalCell(character: " ", style: cells[column - 1].style)
+            cells[column] = TerminalCell(character: " ", style: cells[column].style)
+        } else if TerminalTextRun.cellWidth(for: cells[column].character) == 2,
+                  cells.indices.contains(column + 1),
+                  cells[column + 1].isSpacer {
+            cells[column] = TerminalCell(character: " ", style: cells[column].style)
+            cells[column + 1] = TerminalCell(character: " ", style: cells[column + 1].style)
+        }
+    }
+
+    private mutating func repeatPrecedingCharacter(_ count: Int) {
+        guard count > 0, let lastWrittenCharacter else { return }
+        for _ in 0..<count {
+            writeCharacter(lastWrittenCharacter)
+        }
+    }
+
+    private mutating func insertLines(_ count: Int) {
+        guard count > 0 else { return }
+        let scrollRegion = absoluteScrollRegion
+        guard cursorRow >= scrollRegion.top, cursorRow <= scrollRegion.bottom else { return }
+        activeGrid.ensureLine(at: scrollRegion.bottom)
+
+        let amount = min(count, scrollRegion.bottom - cursorRow + 1)
+        for _ in 0..<amount {
+            activeGrid.insertLine(blankLineCells(), at: cursorRow)
+            activeGrid.removeRows(in: (scrollRegion.bottom + 1)..<(scrollRegion.bottom + 2))
+        }
+    }
+
+    private mutating func deleteLines(_ count: Int) {
+        guard count > 0 else { return }
+        let scrollRegion = absoluteScrollRegion
+        guard cursorRow >= scrollRegion.top, cursorRow <= scrollRegion.bottom else { return }
+        activeGrid.ensureLine(at: scrollRegion.bottom)
+
+        let amount = min(count, scrollRegion.bottom - cursorRow + 1)
+        for _ in 0..<amount {
+            activeGrid.removeRows(in: cursorRow..<(cursorRow + 1))
+            activeGrid.insertLine(blankLineCells(), at: scrollRegion.bottom)
+        }
+    }
+
+    private mutating func scrollAreaUp(_ count: Int, top: Int, bottom: Int) {
+        guard count > 0, top <= bottom else { return }
+        activeGrid.ensureLine(at: bottom)
+
+        let amount = min(count, bottom - top + 1)
+        for _ in 0..<amount {
+            activeGrid.removeRows(in: top..<(top + 1))
+            activeGrid.insertLine(blankLineCells(), at: bottom)
+        }
+    }
+
+    private mutating func scrollAreaDown(_ count: Int, top: Int, bottom: Int) {
+        guard count > 0, top <= bottom else { return }
+        activeGrid.ensureLine(at: bottom)
+
+        let amount = min(count, bottom - top + 1)
+        for _ in 0..<amount {
+            activeGrid.removeRows(in: bottom..<(bottom + 1))
+            activeGrid.insertLine(blankLineCells(), at: top)
+        }
+    }
+
+    private mutating func setGraphicCharset(_ charset: GraphicCharset, for slot: GraphicCharsetSlot) {
+        switch slot {
+        case .g0:
+            g0Charset = charset
+        case .g1:
+            g1Charset = charset
+        case .g2:
+            g2Charset = charset
+        case .g3:
+            g3Charset = charset
+        }
+    }
+
+    private func mappedCharacter(_ character: Character) -> Character {
+        guard character.unicodeScalars.count == 1,
+              let scalar = character.unicodeScalars.first else {
+            return character
+        }
+        let value = scalar.value
+        guard value <= UInt8.max else { return character }
+
+        let mappedScalar: UnicodeScalar?
+        switch activeGraphicCharset {
+        case .ascii:
+            mappedScalar = scalar
+        case .british:
+            mappedScalar = value == 0x23 ? UnicodeScalar(0x00A3) : scalar
+        case .decSpecial:
+            mappedScalar = Self.decSpecialGraphicScalar(for: UInt8(value))
+        }
+
+        guard let mappedScalar else { return character }
+        return Character(mappedScalar)
+    }
+
+    private var activeGraphicCharset: GraphicCharset {
+        switch activeGraphicCharsetSlot {
+        case .g0:
+            g0Charset
+        case .g1:
+            g1Charset
+        case .g2:
+            g2Charset
+        case .g3:
+            g3Charset
+        }
+    }
+
+    private static func decSpecialGraphicScalar(for byte: UInt8) -> UnicodeScalar? {
+        let value: Int
+        switch byte {
+        case 0x60:
+            value = 0x25C6
+        case 0x61:
+            value = 0x2592
+        case 0x62:
+            value = 0x2409
+        case 0x63:
+            value = 0x240C
+        case 0x64:
+            value = 0x240D
+        case 0x65:
+            value = 0x240A
+        case 0x66:
+            value = 0x00B0
+        case 0x67:
+            value = 0x00B1
+        case 0x68:
+            value = 0x2424
+        case 0x69:
+            value = 0x240B
+        case 0x6A:
+            value = 0x2518
+        case 0x6B:
+            value = 0x2510
+        case 0x6C:
+            value = 0x250C
+        case 0x6D:
+            value = 0x2514
+        case 0x6E:
+            value = 0x253C
+        case 0x6F:
+            value = 0x23BA
+        case 0x70:
+            value = 0x23BB
+        case 0x71:
+            value = 0x2500
+        case 0x72:
+            value = 0x23BC
+        case 0x73:
+            value = 0x23BD
+        case 0x74:
+            value = 0x251C
+        case 0x75:
+            value = 0x2524
+        case 0x76:
+            value = 0x2534
+        case 0x77:
+            value = 0x252C
+        case 0x78:
+            value = 0x2502
+        case 0x79:
+            value = 0x2264
+        case 0x7A:
+            value = 0x2265
+        case 0x7B:
+            value = 0x03C0
+        case 0x7C:
+            value = 0x2260
+        case 0x7D:
+            value = 0x00A3
+        case 0x7E:
+            value = 0x00B7
+        default:
+            value = Int(byte)
+        }
+
+        return UnicodeScalar(value)
     }
 
     private mutating func appendNewLine() {
@@ -1455,14 +1861,18 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     }
 
     private static func plainLine(from text: String) -> [TerminalCell] {
-        text.map { TerminalCell(character: $0, style: TerminalTextStyle()) }
+        cells(from: text, style: TerminalTextStyle())
     }
 
     private static func text(from cells: [TerminalCell], startColumn: Int, endColumn: Int) -> String {
         let lower = max(0, min(startColumn, cells.count))
         let upper = max(lower, min(endColumn, cells.count))
         guard lower < upper else { return "" }
-        return cells[lower..<upper].map(\.character).map(String.init).joined()
+        return cells[lower..<upper]
+            .filter { !$0.isSpacer }
+            .map(\.character)
+            .map(String.init)
+            .joined()
     }
 
     private mutating func cursorPositionReport(viewportSize: TerminalViewportSize) -> Data {
@@ -1526,20 +1936,45 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
         var runs: [TerminalTextRun] = []
         var currentStyle = cells[0].style
-        var buffer = String(cells[0].character)
+        var buffer = cells[0].isSpacer ? "" : String(cells[0].character)
+        var runCellWidth = 1
 
         for cell in cells.dropFirst() {
             if cell.style == currentStyle {
-                buffer.append(cell.character)
+                if !cell.isSpacer {
+                    buffer.append(cell.character)
+                }
+                runCellWidth += 1
                 continue
             }
 
-            runs.append(TerminalTextRun(text: buffer, style: currentStyle))
+            runs.append(TerminalTextRun(text: buffer, style: currentStyle, cellWidth: runCellWidth))
             currentStyle = cell.style
-            buffer = String(cell.character)
+            buffer = cell.isSpacer ? "" : String(cell.character)
+            runCellWidth = 1
         }
 
-        runs.append(TerminalTextRun(text: buffer, style: currentStyle))
+        runs.append(TerminalTextRun(text: buffer, style: currentStyle, cellWidth: runCellWidth))
         return TerminalRenderedLine(runs: runs)
+    }
+
+    private static func cells(from text: String, style: TerminalTextStyle) -> [TerminalCell] {
+        var cells: [TerminalCell] = []
+        for character in text {
+            let width = max(0, min(2, TerminalTextRun.cellWidth(for: character)))
+            if width == 0, let lastIndex = cells.indices.last, !cells[lastIndex].isSpacer {
+                let combined = String(cells[lastIndex].character) + String(character)
+                cells[lastIndex] = TerminalCell(character: Character(combined), style: cells[lastIndex].style)
+                continue
+            }
+            guard width > 0 else { continue }
+
+            cells.append(TerminalCell(character: character, style: style))
+            if width == 2 {
+                cells.append(TerminalCell(character: " ", style: style, isSpacer: true))
+            }
+        }
+
+        return cells
     }
 }

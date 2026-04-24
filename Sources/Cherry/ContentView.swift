@@ -9,7 +9,7 @@ struct ContentView: View {
                 .frame(minWidth: 220, idealWidth: 248, maxWidth: 300)
 
             if let session = workspace.selectedSession {
-                TerminalSceneView(workspace: workspace, session: session)
+                TerminalSceneView(session: session)
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -167,77 +167,11 @@ private struct SidebarTabRow: View {
 }
 
 private struct TerminalSceneView: View {
-    @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var session: TerminalSession
 
-    @State private var draftCommand = ""
-
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 16) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.title)
-                        .font(.system(size: 21, weight: .semibold))
-                    Text(session.subtitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Label(session.statusLine, systemImage: "bolt.fill")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.secondary)
-
-                Button("Ctrl-C") {
-                    session.sendInterrupt()
-                }
-                .disabled(!session.acceptsInput)
-
-                Button("Restart") {
-                    session.restart()
-                }
-
-                Button("New Tab") {
-                    workspace.addSession()
-                }
-
-                Button("Clear Scrollback") {
-                    session.clearScrollback()
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            .background(.bar)
-
-            Divider()
-
-            TerminalSurfaceView(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            Divider()
-
-            HStack(spacing: 12) {
-                Text("$")
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(nsColor: session.tint))
-
-                CommandInputField(
-                    text: $draftCommand,
-                    placeholder: "Send a command to the live shell",
-                    isEnabled: session.acceptsInput,
-                    onSubmit: runCommand
-                )
-                .frame(height: 30)
-
-                Button("Send", action: runCommand)
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!session.acceptsInput)
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .background(.bar)
-        }
+        TerminalSurfaceView(session: session)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             LinearGradient(
                 colors: [
@@ -248,13 +182,5 @@ private struct TerminalSceneView: View {
                 endPoint: .bottomTrailing
             )
         )
-        .onChange(of: session.id) {
-            draftCommand = ""
-        }
-    }
-
-    private func runCommand() {
-        session.sendCommandLine(draftCommand)
-        draftCommand = ""
     }
 }

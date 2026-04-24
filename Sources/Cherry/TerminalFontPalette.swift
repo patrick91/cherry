@@ -31,7 +31,19 @@ enum TerminalFontPalette {
     }
 
     static func cellWidth(for font: NSFont) -> CGFloat {
-        max(7.8, "W".size(withAttributes: [.font: font]).width)
+        cellWidth(for: [font])
+    }
+
+    static func cellWidth(for fonts: [NSFont]) -> CGFloat {
+        let probeCharacters = ["W", "m", "0", "─", "│", "┌", "█"]
+        let measuredWidth = fonts.flatMap { font in
+            probeCharacters.map { character in
+                character.size(withAttributes: [.font: font]).width
+            }
+        }
+        .max() ?? 0
+
+        return max(7.8, ceil(measuredWidth))
     }
 
     static func preferredNerdFontFamilies(from families: [String]) -> [String] {

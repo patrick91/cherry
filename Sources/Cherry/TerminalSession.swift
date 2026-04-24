@@ -64,6 +64,209 @@ private final class TerminalTraceRecorder {
     }
 }
 
+final class TerminalProcessor: @unchecked Sendable {
+    private static let changeNotificationInterval: TimeInterval = 1.0 / 30.0
+
+    private let processingQueue = DispatchQueue(label: "Cherry.TerminalProcessor", qos: .userInitiated)
+    private let lock = NSLock()
+    private let notificationLock = NSLock()
+
+    private var buffer: any TerminalBuffering
+    private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
+    private var activeLaunchID: UUID?
+    private var outputEpoch = 0
+    private var isChangeNotificationScheduled = false
+    private var onDidChange: (@Sendable () -> Void)?
+
+    init(maxScrollback: Int?, buffer: (any TerminalBuffering)? = nil) {
+        self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
+    }
+
+    var lineCount: Int {
+        locked { buffer.lineCount }
+    }
+
+    var storedLineCount: Int {
+        locked { buffer.storedLineCount }
+    }
+
+    var cursorState: TerminalCursorState {
+        locked { buffer.cursorState }
+    }
+
+    var usesAlternateScreen: Bool {
+        locked { buffer.usesAlternateScreen }
+    }
+
+    var mouseState: TerminalMouseState {
+        locked { buffer.mouseState }
+    }
+
+    func setChangeHandler(_ handler: (@Sendable () -> Void)?) {
+        notificationLock.withLock {
+            onDidChange = handler
+        }
+    }
+
+    func beginLaunch(_ launchID: UUID) {
+        locked {
+            activeLaunchID = launchID
+        }
+    }
+
+    func endLaunch(_ launchID: UUID?) {
+        locked {
+            guard launchID == nil || activeLaunchID == launchID else { return }
+            activeLaunchID = nil
+        }
+    }
+
+    func snapshot(range: Range<Int>) -> [String] {
+        locked { buffer.snapshot(range: range) }
+    }
+
+    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
+        locked { buffer.styledSnapshot(range: range) }
+    }
+
+    func lineLength(at row: Int) -> Int {
+        locked { buffer.lineLength(at: row) }
+    }
+
+    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
+        locked { buffer.gridPoint(row: row, column: column) }
+    }
+
+    func selectedText(in selection: TerminalSelectionRange) -> String {
+        locked { buffer.selectedText(in: selection) }
+    }
+
+    func clear() {
+        locked {
+            buffer.clear()
+        }
+        scheduleChangeNotification(after: 0)
+    }
+
+    func resize(to viewportSize: TerminalViewportSize) {
+        locked {
+            self.viewportSize = viewportSize
+            buffer.resize(to: viewportSize)
+        }
+        scheduleChangeNotification()
+    }
+
+    func appendPlainLines(_ lines: [String]) {
+        locked {
+            buffer.appendPlainLines(lines)
+        }
+        scheduleChangeNotification(after: 0)
+    }
+
+    func ingestTestingData(_ data: Data) {
+        processOutput(data, launchID: nil, responseWriter: { _ in })
+    }
+
+    func discardPendingOutput() {
+        locked {
+            outputEpoch &+= 1
+        }
+    }
+
+    func enqueueOutput(
+        _ data: Data,
+        launchID: UUID?,
+        responseWriter: @escaping @Sendable (Data) -> Void
+    ) {
+        guard !data.isEmpty else { return }
+
+        let epoch = locked { outputEpoch }
+        processingQueue.async { [self] in
+            processOutput(data, launchID: launchID, expectedEpoch: epoch, responseWriter: responseWriter)
+        }
+    }
+
+    func processOutput(
+        _ data: Data,
+        launchID: UUID?,
+        responseWriter: (Data) -> Void
+    ) {
+        processOutput(data, launchID: launchID, expectedEpoch: nil, responseWriter: responseWriter)
+    }
+
+    private func processOutput(
+        _ data: Data,
+        launchID: UUID?,
+        expectedEpoch: Int?,
+        responseWriter: (Data) -> Void
+    ) {
+        guard !data.isEmpty else { return }
+
+        let responses: [Data] = locked {
+            if let expectedEpoch, outputEpoch != expectedEpoch {
+                return []
+            }
+            if let launchID, activeLaunchID != launchID {
+                return []
+            }
+            return buffer.ingest(data, viewportSize: viewportSize)
+        }
+
+        for response in responses {
+            responseWriter(response)
+        }
+
+        scheduleChangeNotification()
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.withLock(body)
+    }
+
+    private func scheduleChangeNotification(after delay: TimeInterval = TerminalProcessor.changeNotificationInterval) {
+        let handler: (@Sendable () -> Void)? = notificationLock.withLock {
+            guard !isChangeNotificationScheduled else { return nil }
+            isChangeNotificationScheduled = true
+            return onDidChange
+        }
+        guard let handler else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.notificationLock.withLock {
+                self.isChangeNotificationScheduled = false
+            }
+            handler()
+        }
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
+    }
+}
+
+private final class ShellProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var process: ShellProcessController?
+
+    func set(_ process: ShellProcessController?) {
+        lock.withLock {
+            self.process = process
+        }
+    }
+
+    func write(_ data: Data) {
+        let process = lock.withLock {
+            self.process
+        }
+        process?.write(data)
+    }
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
@@ -166,17 +369,22 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var revision = 0
 
     private(set) var state: SessionState = .launching
-    private var buffer: any TerminalBuffering
+    private let processor: TerminalProcessor
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var traceRecorder: TerminalTraceRecorder?
+    private var outputHoldUntil: Date?
+    private var isOutputPausedForInteraction = false
+
+    private static let defaultMaxScrollback = 50_000
+    private static let userScrollOutputHoldInterval: TimeInterval = 0.16
 
     init(
         title: String,
         subtitle: String,
         tint: NSColor,
-        maxScrollback: Int? = nil,
+        maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
         buffer: (any TerminalBuffering)? = nil,
         launchShell: Bool = true
     ) {
@@ -184,8 +392,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.subtitle = subtitle
         self.tint = tint
         self.maxScrollback = maxScrollback
-        self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
+        self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
+        self.processor.setChangeHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleProcessorDidChange()
+            }
+        }
 
         if launchShell {
             startShell()
@@ -195,19 +408,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     var lineCount: Int {
-        buffer.lineCount
+        processor.lineCount
     }
 
     var cursorState: TerminalCursorState {
-        buffer.cursorState
+        processor.cursorState
     }
 
     var usesAlternateScreen: Bool {
-        buffer.usesAlternateScreen
+        processor.usesAlternateScreen
     }
 
     var mouseState: TerminalMouseState {
-        buffer.mouseState
+        processor.mouseState
     }
 
     var statusLine: String {
@@ -223,27 +436,23 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func snapshot(range: Range<Int>) -> [String] {
-        buffer.snapshot(range: range)
+        processor.snapshot(range: range)
     }
 
     func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
-        buffer.styledSnapshot(range: range)
+        processor.styledSnapshot(range: range)
     }
 
     func lineLength(at row: Int) -> Int {
-        buffer.lineLength(at: row)
+        processor.lineLength(at: row)
     }
 
     func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        buffer.gridPoint(row: row, column: column)
+        processor.gridPoint(row: row, column: column)
     }
 
     func selectedText(in selection: TerminalSelectionRange) -> String {
-        buffer.selectedText(in: selection)
-    }
-
-    func sendCommandLine(_ command: String) {
-        send(text: command + "\r")
+        processor.selectedText(in: selection)
     }
 
     func send(text: String) {
@@ -264,11 +473,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func sendInterrupt() {
-        send(data: Data([0x03]))
+        guard acceptsInput else { return }
+        if inputDebugEnabled {
+            fputs("[send interrupt] shellProcess=\(shellProcess != nil)\n", stderr)
+        }
+        processor.discardPendingOutput()
+        shellProcess?.writeUrgent(Data([0x03]))
     }
 
     func clearScrollback() {
-        buffer.clear()
+        outputHoldUntil = nil
+        resumeOutputIfPausedForInteraction()
+        processor.clear()
         bumpRevision()
     }
 
@@ -279,7 +495,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func stop() {
+        let launchID = activeLaunchID
         activeLaunchID = nil
+        outputHoldUntil = nil
+        processor.endLaunch(launchID)
+        resumeOutputIfPausedForInteraction()
         shellProcess?.terminate()
         shellProcess = nil
     }
@@ -289,33 +509,45 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard nextSize.columns > 0, nextSize.rows > 0, nextSize != viewportSize else { return }
 
         viewportSize = nextSize
-        buffer.resize(to: nextSize)
+        processor.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
         revision &+= 1
     }
 
+    func deferOutputForUserInteraction() {
+        outputHoldUntil = Date(timeIntervalSinceNow: Self.userScrollOutputHoldInterval)
+        pauseOutputForInteractionIfNeeded()
+    }
+
     func ingestTestingData(_ data: Data) {
-        buffer.ingest(data)
+        processor.ingestTestingData(data)
         bumpRevision()
     }
 
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
+        outputHoldUntil = nil
+        processor.beginLaunch(launchID)
+        resumeOutputIfPausedForInteraction()
         state = .launching
         bumpRevision()
 
         do {
-            shellProcess = try ShellProcessController(
+            let processor = processor
+            let traceRecorder = traceRecorder
+            let processBox = ShellProcessBox()
+            let process = try ShellProcessController(
                 configuration: .init(
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: NSHomeDirectory(),
                     term: "xterm-256color",
                     initialSize: viewportSize
                 ),
-                onData: { [weak self] data in
-                    DispatchQueue.main.async {
-                        self?.receiveOutput(data, launchID: launchID)
+                onData: { data in
+                    traceRecorder?.recordOutput(data)
+                    processor.enqueueOutput(data, launchID: launchID) { response in
+                        processBox.write(response)
                     }
                 },
                 onExit: { [weak self] status in
@@ -324,30 +556,80 @@ final class TerminalSession: ObservableObject, Identifiable {
                     }
                 }
             )
+            processBox.set(process)
+            shellProcess = process
 
             state = .live
             bumpRevision()
         } catch {
             activeLaunchID = nil
+            processor.endLaunch(launchID)
             state = .failed(error.localizedDescription)
-            buffer.appendPlainLines([
+            processor.appendPlainLines([
                 "launch failed: \(error.localizedDescription)"
             ])
             bumpRevision()
         }
     }
 
-    private func receiveOutput(_ data: Data, launchID: UUID) {
+    private func handleProcessExit(status: Int32, launchID: UUID) {
+        guard activeLaunchID == launchID else { return }
+        finishProcessExit(status: status, launchID: launchID)
+    }
+
+    private func finishProcessExit(status: Int32, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
 
-        traceRecorder?.recordOutput(data)
-        let responses = buffer.ingest(data, viewportSize: viewportSize)
-        for response in responses {
-            shellProcess?.write(response)
+        activeLaunchID = nil
+        shellProcess = nil
+        outputHoldUntil = nil
+        processor.endLaunch(launchID)
+        resumeOutputIfPausedForInteraction()
+        state = .exited(status)
+        processor.appendPlainLines([
+            "",
+            "[shell exited with status \(status)]"
+        ])
+        bumpRevision()
+    }
+
+    private func pauseOutputForInteractionIfNeeded() {
+        guard !isOutputPausedForInteraction else { return }
+        isOutputPausedForInteraction = true
+        shellProcess?.pauseOutput()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.userScrollOutputHoldInterval) { [weak self] in
+            self?.resumeOutputIfScrollHoldExpired()
         }
+    }
+
+    private func resumeOutputIfScrollHoldExpired() {
+        guard let outputHoldUntil else {
+            resumeOutputIfPausedForInteraction()
+            return
+        }
+
+        let remaining = outputHoldUntil.timeIntervalSinceNow
+        if remaining > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                self?.resumeOutputIfScrollHoldExpired()
+            }
+            return
+        }
+
+        self.outputHoldUntil = nil
+        resumeOutputIfPausedForInteraction()
+    }
+
+    private func resumeOutputIfPausedForInteraction() {
+        guard isOutputPausedForInteraction else { return }
+        isOutputPausedForInteraction = false
+        shellProcess?.resumeOutput()
+    }
+
+    private func handleProcessorDidChange() {
         if inputDebugEnabled {
-            let tailStart = max(0, buffer.lineCount - 4)
-            let tail = buffer.snapshot(range: tailStart..<buffer.lineCount)
+            let tailStart = max(0, processor.lineCount - 4)
+            let tail = processor.snapshot(range: tailStart..<processor.lineCount)
             fputs("[buffer tail] \(tail.map(\.debugDescription).joined(separator: " | "))\n", stderr)
         }
         if case .launching = state {
@@ -356,21 +638,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
-    private func handleProcessExit(status: Int32, launchID: UUID) {
-        guard activeLaunchID == launchID else { return }
-
-        activeLaunchID = nil
-        shellProcess = nil
-        state = .exited(status)
-        buffer.appendPlainLines([
-            "",
-            "[shell exited with status \(status)]"
-        ])
-        bumpRevision()
-    }
-
     private var lineSummary: String {
-        let visibleLineCount = max(buffer.storedLineCount, 1)
+        let visibleLineCount = max(processor.storedLineCount, 1)
         if let maxScrollback {
             return "\(min(visibleLineCount, maxScrollback))/\(maxScrollback) lines"
         } else {

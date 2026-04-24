@@ -126,6 +126,115 @@ import Testing
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["\(branchGlyph) main \(fileGlyph) README.md"])
 }
 
+@Test func vt100CharsetDesignationDoesNotLeakSelectorBytes() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}(Bplain".utf8))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["plain"])
+}
+
+@Test func decSpecialGraphicsMapsLineDrawingCharacters() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}(0lqk\r\nx x\r\nmqj\u{1B}(B".utf8))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == [
+        "┌─┐",
+        "│ │",
+        "└─┘"
+    ])
+}
+
+@Test func shiftOutSelectsG1CharsetUntilShiftIn() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B})0\u{0E}q\u{0F}q".utf8))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["─q"])
+}
+
+@Test func wideEmojiGlyphsOccupyTwoTerminalCells() async throws {
+    let upArrow = "\u{2B06}\u{FE0F}"
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("a\(upArrow)b".utf8), viewportSize: TerminalViewportSize(columns: 10, rows: 4))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["a\(upArrow)b"])
+    #expect(buffer.lineLength(at: 0) == 4)
+    #expect(buffer.cursorState.column == 4)
+}
+
+@Test func styledWideGlyphBackgroundTracksCellWidth() async throws {
+    let upArrow = "\u{2B06}\u{FE0F}"
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[48;5;236m\(upArrow)\u{1B}[0m".utf8))
+
+    #expect(buffer.styledSnapshot(range: 0..<1)[0].runs == [
+        TerminalTextRun(
+            text: upArrow,
+            style: TerminalTextStyle(background: .palette256(236)),
+            cellWidth: 2
+        )
+    ])
+}
+
+@Test func wideGlyphSoftWrapsBeforeRightEdge() async throws {
+    let upArrow = "\u{2B06}\u{FE0F}"
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("ab\(upArrow)c".utf8), viewportSize: TerminalViewportSize(columns: 3, rows: 4))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["ab", "\(upArrow)c"])
+}
+
+@Test func disabledWraparoundOverwritesRightmostCell() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("abc\u{1B}[?7lXY".utf8), viewportSize: TerminalViewportSize(columns: 3, rows: 4))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["abY"])
+    #expect(buffer.cursorState.column == 2)
+}
+
+@Test func privateKeyboardModifierSequenceDoesNotChangeTextStyle() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[>4;2mplain".utf8))
+
+    #expect(buffer.styledSnapshot(range: 0..<1)[0].runs == [
+        TerminalTextRun(text: "plain", style: TerminalTextStyle())
+    ])
+}
+
+@Test func repeatPrecedingCharacterRepeatsLastGlyph() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("a\u{1B}[4b".utf8), viewportSize: TerminalViewportSize(columns: 10, rows: 4))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["aaaaa"])
+}
+
+@Test func insertCharactersShiftsTextRightWithinRow() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("abcdef\u{1B}[4D\u{1B}[2@".utf8), viewportSize: TerminalViewportSize(columns: 8, rows: 4))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["ab  cdef"])
+}
+
+@Test func insertAndDeleteLinesShiftWithinScrollRegion() async throws {
+    let viewportSize = TerminalViewportSize(columns: 8, rows: 4)
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[?1049ha\r\nb\r\nc\u{1B}[2;1H\u{1B}[L".utf8), viewportSize: viewportSize)
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["a", "", "b", "c"])
+
+    buffer.ingest(Data("\u{1B}[2;1H\u{1B}[M".utf8), viewportSize: viewportSize)
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["a", "b", "c", ""])
+}
+
 @Test func nerdFontFamiliesPreferMonoFonts() async throws {
     let families = [
         "Example Nerd Font",

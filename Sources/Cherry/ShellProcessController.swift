@@ -35,6 +35,10 @@ final class ShellProcessController: @unchecked Sendable {
     private let onData: (Data) -> Void
     private let onExit: (Int32) -> Void
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
+    private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
+    private let masterFDLock = NSLock()
+    private let maximumReadBatchBytes = 4 * 1024
+    private let highVolumeReadThrottleInterval: DispatchTimeInterval = .milliseconds(4)
 
     private var masterFD: Int32 = -1
     private var childPID: pid_t = 0
@@ -42,6 +46,9 @@ final class ShellProcessController: @unchecked Sendable {
     private var writeSource: DispatchSourceWrite?
     private var processSource: DispatchSourceProcess?
     private var pendingWrite = Data()
+    private var isReadSourcePaused = false
+    private var isReadSourceThrottled = false
+    private var isReadSourceSuspended = false
     private var exitReported = false
     private var isTerminating = false
     private var retainedUntilExit: ShellProcessController?
@@ -66,6 +73,10 @@ final class ShellProcessController: @unchecked Sendable {
         }
 
         writeSource?.cancel()
+        isReadSourcePaused = false
+        isReadSourceThrottled = false
+        resumeReadSourceIfNeeded()
+        setMasterFD(-1)
         readSource?.cancel()
         processSource?.cancel()
     }
@@ -94,6 +105,78 @@ final class ShellProcessController: @unchecked Sendable {
         }
     }
 
+    func writeUrgent(_ data: Data) {
+        guard !data.isEmpty else { return }
+
+        urgentWriteQueue.async { [self] in
+            var remaining = data
+            while !remaining.isEmpty {
+                switch directWriteToMaster(remaining, label: "urgent write") {
+                case .wrote(let byteCount):
+                    remaining.removeSubrange(0..<byteCount)
+                case .interrupted:
+                    continue
+                case .wouldBlock:
+                    write(remaining)
+                    return
+                case .closed, .failed:
+                    return
+                }
+            }
+        }
+    }
+
+    private enum DirectWriteResult {
+        case wrote(Int)
+        case interrupted
+        case wouldBlock
+        case closed
+        case failed(Int32)
+    }
+
+    private func directWriteToMaster(_ data: Data, label: String) -> DirectWriteResult {
+        masterFDLock.lock()
+        defer { masterFDLock.unlock() }
+
+        guard masterFD >= 0 else {
+            if shellTransportDebugEnabled {
+                fputs("[pty \(label) skipped] closed fd child=\(childPID)\n", stderr)
+            }
+            return .closed
+        }
+
+        let written = data.withUnsafeBytes { rawBuffer -> Int in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            return Darwin.write(masterFD, baseAddress, rawBuffer.count)
+        }
+
+        if written > 0 {
+            if shellTransportDebugEnabled {
+                let chunk = data.prefix(written)
+                let rendered = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
+                fputs("[pty \(label)] fd=\(masterFD) bytes=\(written) data=\(rendered)\n", stderr)
+            }
+            return .wrote(written)
+        }
+
+        if written == 0 {
+            return .wouldBlock
+        }
+
+        let writeError = errno
+        if writeError == EINTR {
+            return .interrupted
+        }
+        if writeError == EAGAIN || writeError == EWOULDBLOCK {
+            return .wouldBlock
+        }
+
+        if shellTransportDebugEnabled {
+            fputs("[pty \(label) error] fd=\(masterFD) errno=\(writeError)\n", stderr)
+        }
+        return .failed(writeError)
+    }
+
     func resize(columns: Int, rows: Int) {
         ioQueue.async { [weak self] in
             guard let self, self.masterFD >= 0 else { return }
@@ -106,6 +189,22 @@ final class ShellProcessController: @unchecked Sendable {
             )
 
             _ = ioctl(self.masterFD, TIOCSWINSZ, &size)
+        }
+    }
+
+    func pauseOutput() {
+        ioQueue.async { [self] in
+            guard self.readSource != nil else { return }
+            self.isReadSourcePaused = true
+            self.updateReadSourceSuspension()
+        }
+    }
+
+    func resumeOutput() {
+        ioQueue.async { [self] in
+            guard self.readSource != nil else { return }
+            self.isReadSourcePaused = false
+            self.updateReadSourceSuspension()
         }
     }
 
@@ -158,7 +257,7 @@ final class ShellProcessController: @unchecked Sendable {
             _exit(127)
         }
 
-        masterFD = master
+        setMasterFD(master)
         childPID = pid
 
         let currentFlags = fcntl(master, F_GETFL)
@@ -174,10 +273,17 @@ final class ShellProcessController: @unchecked Sendable {
         readSource.setEventHandler { [weak self] in
             self?.drainReadableData()
         }
-        readSource.setCancelHandler {
-            _ = close(master)
+        readSource.setCancelHandler { [weak self] in
+            if let self {
+                self.closeMasterFD(master)
+            } else {
+                _ = close(master)
+            }
         }
         self.readSource = readSource
+        isReadSourcePaused = false
+        isReadSourceThrottled = false
+        isReadSourceSuspended = false
         readSource.resume()
 
         let processSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: ioQueue)
@@ -191,14 +297,18 @@ final class ShellProcessController: @unchecked Sendable {
     private func drainReadableData() {
         guard masterFD >= 0 else { return }
 
-        var buffer = [UInt8](repeating: 0, count: 8_192)
-        while true {
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        var output = Data()
+        output.reserveCapacity(maximumReadBatchBytes)
+        var didCloseReadSide = false
+
+        while output.count < maximumReadBatchBytes {
             let bytesRead = Darwin.read(masterFD, &buffer, buffer.count)
             if bytesRead > 0 {
                 if shellTransportDebugEnabled {
                     fputs("[pty read] fd=\(masterFD) bytes=\(bytesRead)\n", stderr)
                 }
-                onData(Data(buffer.prefix(bytesRead)))
+                output.append(contentsOf: buffer.prefix(bytesRead))
                 continue
             }
 
@@ -206,17 +316,33 @@ final class ShellProcessController: @unchecked Sendable {
                 if shellTransportDebugEnabled {
                     fputs("[pty eof] fd=\(masterFD)\n", stderr)
                 }
-                handleReadSideClosed()
+                didCloseReadSide = true
+                break
             }
 
-            if bytesRead < 0, errno != EAGAIN, errno != EINTR {
+            if bytesRead < 0, errno == EINTR {
+                continue
+            }
+
+            if bytesRead < 0, errno != EAGAIN {
                 if shellTransportDebugEnabled {
                     fputs("[pty read error] fd=\(masterFD) errno=\(errno)\n", stderr)
                 }
-                handleReadSideClosed()
+                didCloseReadSide = true
             }
 
             break
+        }
+
+        if !output.isEmpty {
+            onData(output)
+            if output.count >= maximumReadBatchBytes {
+                throttleReadSourceBriefly()
+            }
+        }
+
+        if didCloseReadSide {
+            handleReadSideClosed()
         }
     }
 
@@ -384,9 +510,58 @@ final class ShellProcessController: @unchecked Sendable {
     }
 
     private func cancelReadSource() {
+        isReadSourcePaused = false
+        isReadSourceThrottled = false
+        resumeReadSourceIfNeeded()
+        setMasterFD(-1)
         readSource?.cancel()
         readSource = nil
-        masterFD = -1
+    }
+
+    private func throttleReadSourceBriefly() {
+        guard readSource != nil, !isReadSourcePaused, !isReadSourceThrottled else { return }
+
+        isReadSourceThrottled = true
+        updateReadSourceSuspension()
+
+        ioQueue.asyncAfter(deadline: .now() + highVolumeReadThrottleInterval) { [weak self] in
+            guard let self else { return }
+            self.isReadSourceThrottled = false
+            self.updateReadSourceSuspension()
+        }
+    }
+
+    private func updateReadSourceSuspension() {
+        guard readSource != nil else { return }
+
+        let shouldSuspend = isReadSourcePaused || isReadSourceThrottled
+        if shouldSuspend, !isReadSourceSuspended {
+            readSource?.suspend()
+            isReadSourceSuspended = true
+        } else if !shouldSuspend {
+            resumeReadSourceIfNeeded()
+        }
+    }
+
+    private func resumeReadSourceIfNeeded() {
+        guard isReadSourceSuspended else { return }
+        readSource?.resume()
+        isReadSourceSuspended = false
+    }
+
+    private func setMasterFD(_ fileDescriptor: Int32) {
+        masterFDLock.lock()
+        masterFD = fileDescriptor
+        masterFDLock.unlock()
+    }
+
+    private func closeMasterFD(_ fileDescriptor: Int32) {
+        masterFDLock.lock()
+        if masterFD == fileDescriptor {
+            masterFD = -1
+        }
+        _ = close(fileDescriptor)
+        masterFDLock.unlock()
     }
 
     private func cleanup() {

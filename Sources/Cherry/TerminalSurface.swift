@@ -186,6 +186,7 @@ final class TerminalScrollView: NSScrollView {
     private var revisionObserver: AnyCancellable?
     private weak var activeSession: TerminalSession?
     private var terminalScrollRemainder: CGFloat = 0
+    private var isFollowingOutput = true
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -213,10 +214,14 @@ final class TerminalScrollView: NSScrollView {
     func configure(with session: TerminalSession) {
         if activeSession !== session {
             activeSession = session
+            isFollowingOutput = true
             canvasView.session = session
             canvasView.clearSelection()
             canvasView.sendInput = { [weak session] data in
                 session?.send(data: data)
+            }
+            canvasView.sendInterrupt = { [weak session] in
+                session?.sendInterrupt()
             }
             revisionObserver = session.$revision.sink { [weak self] _ in
                 self?.syncDocumentFrame(scrollToBottomIfPinned: true)
@@ -306,7 +311,10 @@ final class TerminalScrollView: NSScrollView {
             return
         }
 
-        scrollDocument(with: event)
+        activeSession.deferOutputForUserInteraction()
+        if scrollDocument(with: event) {
+            isFollowingOutput = isPinnedToBottom
+        }
     }
 
     @objc func copy(_ sender: Any?) {
@@ -318,7 +326,7 @@ final class TerminalScrollView: NSScrollView {
     private func syncDocumentFrame(scrollToBottomIfPinned: Bool) {
         guard let activeSession else { return }
 
-        let wasPinnedToBottom = isPinnedToBottom
+        let shouldFollowOutput = isFollowingOutput || (scrollToBottomIfPinned && isPinnedToBottom)
         let targetHeight = max(contentSize.height, canvasView.preferredHeight(for: activeSession))
         canvasView.frame = NSRect(x: 0, y: 0, width: max(contentSize.width, 1), height: targetHeight)
         canvasView.resetCursorBlink()
@@ -326,7 +334,8 @@ final class TerminalScrollView: NSScrollView {
         let viewport = canvasView.viewportSize(for: contentSize)
         activeSession.resize(columns: viewport.columns, rows: viewport.rows)
 
-        guard scrollToBottomIfPinned, wasPinnedToBottom else { return }
+        guard shouldFollowOutput else { return }
+        isFollowingOutput = true
         scrollToBottom()
     }
 
@@ -340,7 +349,8 @@ final class TerminalScrollView: NSScrollView {
         reflectScrolledClipView(contentView)
     }
 
-    private func scrollDocument(with event: NSEvent) {
+    @discardableResult
+    private func scrollDocument(with event: NSEvent) -> Bool {
         let currentOrigin = contentView.bounds.origin
         let nextY = TerminalInputEncoder.clampedViewportOffset(
             currentOffset: currentOrigin.y,
@@ -350,10 +360,11 @@ final class TerminalScrollView: NSScrollView {
             documentHeight: canvasView.frame.height,
             viewportHeight: contentSize.height
         )
-        guard nextY != currentOrigin.y else { return }
+        guard nextY != currentOrigin.y else { return false }
 
         contentView.scroll(to: NSPoint(x: currentOrigin.x, y: nextY))
         reflectScrolledClipView(contentView)
+        return true
     }
 
     private func focusScrollViewIfPossible() {
@@ -383,6 +394,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
     weak var session: TerminalSession?
     var sendInput: ((Data) -> Void)?
+    var sendInterrupt: (() -> Void)?
 
     private let lineHeight: CGFloat = 20
     private let topInset: CGFloat = 24
@@ -393,7 +405,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private let regularFont = TerminalFontPalette.regular(size: 13.5)
     private let boldFont = TerminalFontPalette.semibold(size: 13.5)
     private let selectionDragThreshold: CGFloat = 3
-    private lazy var cellWidth = TerminalFontPalette.cellWidth(for: regularFont)
+    private lazy var cellWidth = TerminalFontPalette.cellWidth(for: [regularFont, boldFont])
     private var isFocused = false
     private var selection: TerminalSelectionRange?
     private var selectionAnchor: TerminalGridPoint?
@@ -493,8 +505,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         for (offset, line) in visibleLines.enumerated() {
             let row = startingRow + offset
-            let point = NSPoint(x: sideInset, y: topInset + (CGFloat(row) * lineHeight))
-            attributedLine(for: line).draw(at: point)
+            drawLine(line, row: row)
         }
 
         drawTerminalCursor(
@@ -539,7 +550,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             var column = 0
 
             for run in line.runs {
-                let width = run.text.count
+                let width = run.cellWidth
                 defer { column += width }
                 guard width > 0,
                       let background = resolvedBackgroundColor(for: run.style) else {
@@ -557,21 +568,26 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
     }
 
-    private func attributedLine(for line: TerminalRenderedLine) -> NSAttributedString {
-        let attributed = NSMutableAttributedString()
+    private func drawLine(_ line: TerminalRenderedLine, row: Int) {
+        var column = 0
         for run in line.runs {
-            attributed.append(
-                NSAttributedString(
-                    string: run.text,
-                    attributes: [
-                        .font: run.style.isBold ? boldFont : regularFont,
-                        .foregroundColor: resolvedForegroundColor(for: run.style)
-                    ]
-                )
-            )
-        }
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: run.style.isBold ? boldFont : regularFont,
+                .foregroundColor: resolvedForegroundColor(for: run.style)
+            ]
 
-        return attributed
+            for character in run.text {
+                let point = NSPoint(
+                    x: sideInset + (CGFloat(column) * cellWidth),
+                    y: topInset + (CGFloat(row) * lineHeight)
+                )
+                NSAttributedString(string: String(character), attributes: attributes).draw(at: point)
+                column += TerminalTextRun.cellWidth(for: character)
+            }
+
+            let measuredWidth = run.text.reduce(0) { $0 + TerminalTextRun.cellWidth(for: $1) }
+            column += max(0, run.cellWidth - measuredWidth)
+        }
     }
 
     private func resolvedForegroundColor(for style: TerminalTextStyle) -> NSColor {
@@ -700,7 +716,11 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
                 if remaining == 0 {
                     return (character, run.style)
                 }
-                remaining -= 1
+                remaining -= TerminalTextRun.cellWidth(for: character)
+            }
+
+            if remaining < 0 {
+                return (nil, run.style)
             }
         }
 
@@ -858,7 +878,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         if let encoded = encodedInput(for: event) {
             clearSelection()
-            sendInput?(encoded)
+            sendEncodedInput(encoded)
             return true
         }
 
@@ -1015,12 +1035,21 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         if let sequence = commandSequence(for: selector) {
             handledCommand = true
             clearSelection()
-            sendInput?(sequence)
+            sendEncodedInput(sequence)
         }
     }
 
     private func commandSequence(for selector: Selector) -> Data? {
         TerminalInputEncoder.commandSequence(for: selector)
+    }
+
+    private func sendEncodedInput(_ data: Data) {
+        if data == Data([0x03]) {
+            sendInterrupt?()
+            return
+        }
+
+        sendInput?(data)
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {

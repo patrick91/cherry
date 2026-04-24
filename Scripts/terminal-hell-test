@@ -129,7 +129,17 @@ file_glyph="$(printf '\xef\x85\x9b')"
 printf 'Nerd/private-use glyphs: %s main  %s README.md\n' "$branch_glyph" "$file_glyph"
 printf 'Combining-ish samples: cafe\xcc\x81, box chars: \xe2\x94\x8c\xe2\x94\x80\xe2\x94\xac\xe2\x94\x80\xe2\x94\x90 \xe2\x94\x82 \xe2\x94\x82 \xe2\x94\x94\xe2\x94\x80\xe2\x94\xb4\xe2\x94\x80\xe2\x94\x98\n'
 printf 'Emoji sanity: \xf0\x9f\x98\x80 \xe2\x9a\x99 \xe2\x9c\x93\n'
-printf 'Expected: no replacement diamonds for split/private-use glyphs; alignment may still be a future renderer issue.\n'
+printf 'Wide cell sanity: A\xe2\xac\x86\xef\xb8\x8fB should occupy four terminal cells, with B after the two-cell arrow.\n'
+printf 'Expected: no replacement diamonds for split/private-use glyphs; wide emoji should not shove later columns out of sync.\n'
+pause
+
+reset_screen
+title "VT100 alternate character set"
+printf 'The next box uses smacs/rmacs, the same DEC special graphics path used by TUIs like lazygit.\n\n'
+printf '%s(0lqqqqqqk%s(B  should render as top border, not literal l/q/k/B\n' "$ESC" "$ESC"
+printf '%s(0x%s(B lazygit-style content %s(0x%s(B\n' "$ESC" "$ESC" "$ESC" "$ESC"
+printf '%s(0mqqqqqqj%s(B  should render as bottom border, not literal m/q/j/B\n' "$ESC" "$ESC"
+printf '%s)0\x0eq\x0fq  shift-out should map only the first q to a horizontal line.\n' "$ESC"
 pause
 
 reset_screen

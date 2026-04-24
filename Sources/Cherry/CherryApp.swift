@@ -25,15 +25,21 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate {
 struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var workspace = TerminalWorkspace()
+    @State private var isSidebarHidden = false
 
     var body: some Scene {
         WindowGroup("Cherry") {
-            ContentView(workspace: workspace)
+            ContentView(workspace: workspace, isSidebarHidden: $isSidebarHidden)
         }
         .defaultSize(width: 1_340, height: 840)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandMenu("Prototype") {
+                Button(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar") {
+                    isSidebarHidden.toggle()
+                }
+                .keyboardShortcut("s")
+
                 Button("New Tab") {
                     workspace.addSession()
                 }

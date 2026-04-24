@@ -6,30 +6,85 @@ struct ContentView: View {
     private let maximumSidebarWidth: CGFloat = 420
 
     @ObservedObject var workspace: TerminalWorkspace
+    @Binding var isSidebarHidden: Bool
     @State private var sidebarWidth: CGFloat = 320
+    @State private var isSidebarRevealed = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            SidebarTabsView(workspace: workspace)
-                .frame(width: sidebarWidth)
-                .ignoresSafeArea(.all, edges: .top)
-                .overlay(alignment: .trailing) {
-                    SidebarResizeHandle(
-                        sidebarWidth: $sidebarWidth,
-                        minimumWidth: minimumSidebarWidth,
-                        maximumWidth: maximumSidebarWidth
-                    )
-                    .frame(width: 4)
-                    .padding(.trailing, -2)
+        ZStack(alignment: .leading) {
+            HStack(spacing: 0) {
+                if !isSidebarHidden {
+                    dockedSidebar
                 }
 
-            DetailPaneView(workspace: workspace)
-                .ignoresSafeArea(.all, edges: .top)
+                DetailPaneView(workspace: workspace, includeLeadingPadding: isSidebarHidden)
+                    .ignoresSafeArea(.all, edges: .top)
+            }
+
+            if isSidebarHidden {
+                floatingSidebar
+                    .offset(x: isSidebarRevealed ? 0 : -sidebarWidth)
+                    .opacity(isSidebarRevealed ? 1 : 0)
+                    .allowsHitTesting(isSidebarRevealed)
+
+                Rectangle()
+                    .fill(Color.black.opacity(0.001))
+                    .frame(width: 14)
+                    .ignoresSafeArea(.all, edges: .vertical)
+                    .onHover { hovering in
+                        if hovering {
+                            isSidebarRevealed = true
+                        }
+                    }
+            }
+
+            NativeWindowControlsOverlay(
+                isVisible: !isSidebarHidden || isSidebarRevealed,
+                sidebarWidth: sidebarWidth
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea(.all, edges: .top)
         }
         .ignoresSafeArea(.all, edges: .top)
         .background(AppShellBackground())
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
+        .animation(.snappy(duration: 0.18), value: isSidebarHidden)
+        .animation(.snappy(duration: 0.16), value: isSidebarRevealed)
+        .onChange(of: isSidebarHidden) { _, hidden in
+            if !hidden {
+                isSidebarRevealed = false
+            }
+        }
+    }
+
+    private var dockedSidebar: some View {
+        SidebarTabsView(workspace: workspace)
+            .frame(width: sidebarWidth)
+            .ignoresSafeArea(.all, edges: .top)
+            .overlay(alignment: .trailing) {
+                SidebarResizeHandle(
+                    sidebarWidth: $sidebarWidth,
+                    minimumWidth: minimumSidebarWidth,
+                    maximumWidth: maximumSidebarWidth
+                )
+                .frame(width: 4)
+                .padding(.trailing, -2)
+            }
+    }
+
+    private var floatingSidebar: some View {
+        SidebarTabsView(workspace: workspace)
+            .frame(width: sidebarWidth)
+            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 10)
+            .padding(.bottom, 5)
+            .ignoresSafeArea(.all, edges: .top)
+            .onHover { hovering in
+                if !hovering {
+                    isSidebarRevealed = false
+                }
+            }
     }
 }
 
@@ -120,6 +175,7 @@ private struct WindowConfigurator: NSViewRepresentable {
 
 private struct DetailPaneView: View {
     @ObservedObject var workspace: TerminalWorkspace
+    let includeLeadingPadding: Bool
 
     var body: some View {
         Group {
@@ -138,6 +194,7 @@ private struct DetailPaneView: View {
         }
         .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 10)
         .padding(.top, 5)
+        .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
         .background(AppShellBackground())
@@ -195,6 +252,144 @@ private struct SidebarTabsView: View {
         }
         .background {
             SidebarBackground()
+        }
+    }
+}
+
+private struct NativeWindowControlsOverlay: NSViewRepresentable {
+    let isVisible: Bool
+    let sidebarWidth: CGFloat
+
+    func makeNSView(context: Context) -> NativeWindowControlsOverlayView {
+        let view = NativeWindowControlsOverlayView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: NativeWindowControlsOverlayView, context: Context) {
+        nsView.isControlsVisible = isVisible
+        nsView.sidebarWidth = sidebarWidth
+        DispatchQueue.main.async {
+            nsView.attachWindowButtons()
+            nsView.updateControlsPosition(animated: true)
+        }
+    }
+
+    static func dismantleNSView(_ nsView: NativeWindowControlsOverlayView, coordinator: ()) {
+        nsView.restoreWindowButtons()
+    }
+}
+
+private final class NativeWindowControlsOverlayView: NSView {
+    var isControlsVisible = true
+    var sidebarWidth: CGFloat = 320
+
+    private let leftInset: CGFloat = 18
+    private let topInset: CGFloat = 18
+    private let buttonSpacing: CGFloat = 20
+    private weak var originalSuperview: NSView?
+    private var hostedButtons: [NSButton] = []
+    private var didAttachButtons = false
+    private var lastButtonOrigins: [NSPoint] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        attachWindowButtons()
+        updateControlsPosition(animated: false)
+    }
+
+    override func layout() {
+        super.layout()
+        updateControlsPosition(animated: false)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    @MainActor
+    func attachWindowButtons() {
+        guard let window else { return }
+
+        let buttons = [
+            window.standardWindowButton(.closeButton),
+            window.standardWindowButton(.miniaturizeButton),
+            window.standardWindowButton(.zoomButton)
+        ].compactMap { $0 }
+
+        guard buttons.count == 3 else { return }
+
+        if originalSuperview == nil {
+            originalSuperview = buttons.first?.superview
+        }
+
+        hostedButtons = buttons
+
+        for button in buttons {
+            button.autoresizingMask = []
+            button.isHidden = false
+        }
+
+        didAttachButtons = true
+    }
+
+    @MainActor
+    func restoreWindowButtons() {
+        hostedButtons = []
+        didAttachButtons = false
+        lastButtonOrigins = []
+    }
+
+    @MainActor
+    func updateControlsPosition(animated: Bool) {
+        guard didAttachButtons, let originalSuperview else { return }
+
+        let visibleX = leftInset
+        let controlWidth = buttonSpacing * CGFloat(max(hostedButtons.count - 1, 0)) + (hostedButtons.last?.frame.width ?? 14)
+        let controlHeight = hostedButtons.map(\.frame.height).max() ?? 14
+        let hiddenX = visibleX - max(sidebarWidth, controlWidth + visibleX)
+        let targetX = isControlsVisible ? visibleX : hiddenX
+        let targetY = bounds.height - topInset - controlHeight
+        let targetRect = convert(
+            NSRect(
+                x: targetX,
+                y: max(0, targetY),
+                width: controlWidth,
+                height: controlHeight
+            ),
+            to: originalSuperview
+        )
+        let targetOrigins = hostedButtons.enumerated().map { index, button in
+            NSPoint(
+                x: targetRect.minX + CGFloat(index) * buttonSpacing,
+                y: targetRect.minY + (controlHeight - button.frame.height) / 2
+            )
+        }
+
+        let shouldAnimate = animated && !lastButtonOrigins.isEmpty && lastButtonOrigins != targetOrigins
+        lastButtonOrigins = targetOrigins
+
+        if shouldAnimate {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                for (button, origin) in zip(hostedButtons, targetOrigins) {
+                    button.animator().setFrameOrigin(origin)
+                }
+            }
+        } else {
+            for (button, origin) in zip(hostedButtons, targetOrigins) {
+                button.setFrameOrigin(origin)
+            }
         }
     }
 }

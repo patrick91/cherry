@@ -218,7 +218,7 @@ private struct SidebarBackground: View {
 }
 
 private struct SidebarTabRow: View {
-    @ObservedObject var session: TerminalSession
+    let session: TerminalSession
     let isSelected: Bool
     let onSelect: () -> Void
 
@@ -241,6 +241,7 @@ private struct SidebarTabRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
             .padding(.vertical, 10)
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .background(background)
         }
         .buttonStyle(.plain)

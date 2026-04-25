@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 final class CherryAppDelegate: NSObject, NSApplicationDelegate {
+    private var isQuitConfirmed = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
@@ -18,6 +20,31 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate {
 
         sender.activate(ignoringOtherApps: true)
         return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isQuitConfirmed else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.messageText = "Quit Cherry?"
+        alert.informativeText = "Active terminal sessions will be closed."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+
+        let window = sender.keyWindow ?? sender.windows.first
+        if let window {
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                self?.isQuitConfirmed = true
+                sender.terminate(nil)
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            isQuitConfirmed = true
+            return .terminateNow
+        }
+
+        return .terminateCancel
     }
 }
 

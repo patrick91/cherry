@@ -58,6 +58,21 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard event.window === window else { return false }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if modifiers.contains([.command, .option]),
+               modifiers.isDisjoint(with: [.control, .shift])
+            {
+                switch event.keyCode {
+                case 126:
+                    workspace?.selectPreviousSession()
+                    return true
+                case 125:
+                    workspace?.selectNextSession()
+                    return true
+                default:
+                    break
+                }
+            }
+
             guard modifiers == .command else { return false }
 
             switch event.charactersIgnoringModifiers?.lowercased() {

@@ -26,10 +26,17 @@ struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var workspace = TerminalWorkspace()
     @State private var isSidebarHidden = false
+    @State private var controlServer: CherryControlServer?
 
     var body: some Scene {
         WindowGroup("Cherry") {
             ContentView(workspace: workspace, isSidebarHidden: $isSidebarHidden)
+                .onAppear {
+                    guard controlServer == nil else { return }
+                    let server = CherryControlServer(workspace: workspace)
+                    server.start()
+                    controlServer = server
+                }
         }
         .defaultSize(width: 1_340, height: 840)
         .windowStyle(.hiddenTitleBar)

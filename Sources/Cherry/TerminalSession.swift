@@ -267,6 +267,44 @@ private final class ShellProcessBox: @unchecked Sendable {
     }
 }
 
+private final class TerminalRawOutputStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumBytes: Int
+    private var data = Data()
+
+    init(maximumBytes: Int = 1_048_576) {
+        self.maximumBytes = maximumBytes
+    }
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+
+        lock.withLock {
+            data.append(chunk)
+            if data.count > maximumBytes {
+                data.removeFirst(data.count - maximumBytes)
+            }
+        }
+    }
+
+    func snapshot(maxBytes requestedMaxBytes: Int) -> (data: Data, truncated: Bool) {
+        lock.withLock {
+            let maxBytes = max(0, min(requestedMaxBytes, maximumBytes))
+            guard data.count > maxBytes else {
+                return (data, false)
+            }
+
+            return (data.suffix(maxBytes), true)
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            data.removeAll(keepingCapacity: true)
+        }
+    }
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
@@ -287,10 +325,28 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = session.id
     }
 
-    func addSession() {
-        let session = Self.makeSession(index: sessions.count + 1)
+    @discardableResult
+    func addSession(
+        title: String? = nil,
+        workingDirectory: String? = nil,
+        command: String? = nil,
+        select: Bool = true
+    ) -> TerminalSession {
+        let session = Self.makeSession(
+            index: sessions.count + 1,
+            title: title,
+            workingDirectory: workingDirectory
+        )
         sessions.append(session)
-        selectedSessionID = session.id
+        if select {
+            selectedSessionID = session.id
+        }
+
+        if let command, !command.isEmpty {
+            session.send(text: command + "\n")
+        }
+
+        return session
     }
 
     func close(_ session: TerminalSession) {
@@ -340,12 +396,32 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = sessions[nextIndex].id
     }
 
-    private static func makeSession(index: Int) -> TerminalSession {
+    func session(id terminalID: String) -> TerminalSession? {
+        guard let uuid = UUID(uuidString: terminalID) else { return nil }
+        return sessions.first(where: { $0.id == uuid })
+    }
+
+    private static func makeSession(index: Int, title: String? = nil, workingDirectory: String? = nil) -> TerminalSession {
         TerminalSession(
-            title: "Shell \(index)",
+            title: title?.isEmpty == false ? title! : "Shell \(index)",
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
-            tint: palette[(index - 1) % palette.count]
+            tint: palette[(index - 1) % palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory)
         )
+    }
+
+    private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
+        guard let requestedWorkingDirectory, !requestedWorkingDirectory.isEmpty else {
+            return NSHomeDirectory()
+        }
+
+        let expandedPath = NSString(string: requestedWorkingDirectory).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return NSHomeDirectory()
+        }
+
+        return expandedPath
     }
 
     private static let palette: [NSColor] = [
@@ -384,11 +460,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     let subtitle: String
     let tint: NSColor
     let maxScrollback: Int?
+    let workingDirectory: String
 
     @Published private(set) var revision = 0
 
     private(set) var state: SessionState = .launching
     private let processor: TerminalProcessor
+    private let rawOutputStore = TerminalRawOutputStore()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
@@ -403,6 +481,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         title: String,
         subtitle: String,
         tint: NSColor,
+        workingDirectory: String = NSHomeDirectory(),
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
         buffer: (any TerminalBuffering)? = nil,
         launchShell: Bool = true
@@ -410,6 +489,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.title = title
         self.subtitle = subtitle
         self.tint = tint
+        self.workingDirectory = workingDirectory
         self.maxScrollback = maxScrollback
         self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
@@ -503,6 +583,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func clearScrollback() {
         outputHoldUntil = nil
         resumeOutputIfPausedForInteraction()
+        rawOutputStore.clear()
         processor.clear()
         bumpRevision()
     }
@@ -539,8 +620,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestTestingData(_ data: Data) {
+        rawOutputStore.append(data)
         processor.ingestTestingData(data)
         bumpRevision()
+    }
+
+    func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
+        rawOutputStore.snapshot(maxBytes: maxBytes)
     }
 
     private func startShell() {
@@ -559,12 +645,13 @@ final class TerminalSession: ObservableObject, Identifiable {
             let process = try ShellProcessController(
                 configuration: .init(
                     shellPath: ShellProcessController.defaultShellPath,
-                    workingDirectory: NSHomeDirectory(),
+                    workingDirectory: workingDirectory,
                     term: "xterm-256color",
                     initialSize: viewportSize
                 ),
                 onData: { data in
                     traceRecorder?.recordOutput(data)
+                    self.rawOutputStore.append(data)
                     processor.enqueueOutput(data, launchID: launchID) { response in
                         processBox.write(response)
                     }

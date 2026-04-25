@@ -18,7 +18,7 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
 ## Run
 
 ```bash
-swift run
+swift run Cherry
 ```
 
 Inside the prototype:
@@ -27,6 +27,19 @@ Inside the prototype:
 - Use `New Tab` or `Cmd-T` to create another shell session.
 - Click inside the terminal to type directly.
 - Use the `Prototype` menu commands for interrupt, restart, and clearing scrollback.
+
+## MCP Control
+
+Cherry also builds a local MCP helper that controls the visible app:
+
+```bash
+swift run CherryMCP
+```
+
+Run the Cherry app first. The app listens on a per-user Unix socket at
+`/tmp/cherry-$UID/control.sock`; the MCP helper exposes tools for listing,
+creating, selecting, reading, searching, clearing, restarting, closing, and
+sending input to visible Cherry terminal tabs.
 
 ## Rendering Debug
 

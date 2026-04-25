@@ -8,15 +8,34 @@ let package = Package(
     platforms: [
         .macOS(.v14)
     ],
+    products: [
+        .executable(name: "Cherry", targets: ["Cherry"]),
+        .executable(name: "CherryMCP", targets: ["CherryMCP"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+    ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
+        .target(
+            name: "CherryControl"
+        ),
         .executableTarget(
-            name: "Cherry"
+            name: "Cherry",
+            dependencies: ["CherryControl"]
+        ),
+        .executableTarget(
+            name: "CherryMCP",
+            dependencies: [
+                "CherryControl",
+                .product(name: "MCP", package: "swift-sdk"),
+            ]
         ),
         .testTarget(
             name: "CherryTests",
-            dependencies: ["Cherry"]
+            dependencies: [
+                "Cherry",
+                "CherryControl",
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

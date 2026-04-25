@@ -1,7 +1,57 @@
 import AppKit
+import CherryControl
 import Foundation
 import Testing
 @testable import Cherry
+
+@Test func cherryControlRequestRoundTrips() async throws {
+    let request = CherryControlRequest.sendInput(.init(
+        terminalID: UUID().uuidString,
+        text: "pwd\n",
+        rawBase64: nil,
+        waitMilliseconds: 100,
+        lineLimit: 20
+    ))
+
+    let data = try JSONEncoder().encode(request)
+    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+
+    #expect(decoded == request)
+}
+
+@MainActor
+@Test func terminalSessionCapturesAndClearsRawOutput() async throws {
+    let session = TerminalSession(
+        title: "Test",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data("hello\u{1B}[31m raw".utf8))
+
+    let output = session.rawOutput(maxBytes: 1024)
+    #expect(String(decoding: output.data, as: UTF8.self) == "hello\u{1B}[31m raw")
+    #expect(output.truncated == false)
+
+    let truncated = session.rawOutput(maxBytes: 4)
+    #expect(String(decoding: truncated.data, as: UTF8.self) == " raw")
+    #expect(truncated.truncated == true)
+
+    session.clearScrollback()
+    #expect(session.rawOutput(maxBytes: 1024).data.isEmpty)
+}
+
+@MainActor
+@Test func workspaceCanCreateBackgroundSession() async throws {
+    let workspace = TerminalWorkspace()
+    let initialSelection = workspace.selectedSessionID
+
+    let session = workspace.addSession(title: "Background", select: false)
+
+    #expect(workspace.selectedSessionID == initialSelection)
+    #expect(workspace.sessions.contains(where: { $0.id == session.id }))
+}
 
 @Test func scrollbackIsBounded() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: 3)

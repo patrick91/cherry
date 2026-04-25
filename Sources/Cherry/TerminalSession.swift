@@ -388,6 +388,11 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    func closeSelectedSession() {
+        guard let selectedSession else { return }
+        close(selectedSession)
+    }
+
     func selectPreviousSession() {
         selectSession(offset: -1)
     }

@@ -52,6 +52,11 @@ struct CherryApp: App {
                 }
                 .keyboardShortcut("t")
 
+                Button("Close Tab") {
+                    workspace.closeSelectedSession()
+                }
+                .keyboardShortcut("w")
+
                 Button("Previous Tab") {
                     workspace.selectPreviousSession()
                 }

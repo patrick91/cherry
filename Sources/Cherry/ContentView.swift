@@ -47,6 +47,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.all, edges: .top)
         .background(AppShellBackground())
+        .background(AppShortcutMonitor(workspace: workspace))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
         .animation(.snappy(duration: 0.18), value: isSidebarHidden)

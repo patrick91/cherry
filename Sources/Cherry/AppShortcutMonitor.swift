@@ -80,10 +80,23 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 workspace?.addSession()
                 return true
             case "w":
-                workspace?.closeSelectedSession()
+                closeSelectedSessionOrWindow()
+                return true
+            case "q":
+                NSApp.terminate(nil)
                 return true
             default:
                 return false
+            }
+        }
+
+        private func closeSelectedSessionOrWindow() {
+            guard let workspace else { return }
+
+            if workspace.sessions.count > 1 {
+                workspace.closeSelectedSession()
+            } else {
+                window?.performClose(nil)
             }
         }
     }

@@ -53,7 +53,11 @@ struct CherryApp: App {
                 .keyboardShortcut("t")
 
                 Button("Close Tab") {
-                    workspace.closeSelectedSession()
+                    if workspace.sessions.count > 1 {
+                        workspace.closeSelectedSession()
+                    } else {
+                        NSApp.keyWindow?.performClose(nil)
+                    }
                 }
                 .keyboardShortcut("w")
 

@@ -517,7 +517,11 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var isCursorVisible = true
     private var scrollRegionTop: Int?
     private var scrollRegionBottom: Int?
+    private var isLeftRightMarginMode = false
+    private var leftMarginColumn = 0
+    private var rightMarginColumn: Int?
     private var currentMouseState = TerminalMouseState()
+    private var isBracketedPasteMode = false
     private var parserState: ParserState = .ground
     private var controlBuffer: [UInt8] = []
     private var pendingText: [UInt8] = []
@@ -932,6 +936,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
             handleDeviceAttributes(rawPayload: rawPayload, responses: &responses)
         case "n":
             handleDeviceStatusReport(parameter(at: 0, default: 0), viewportSize: viewportSize, responses: &responses)
+        case "p":
+            handleModeStatusReport(rawPayload: rawPayload, responses: &responses)
         case "h", "l":
             guard isPrivateMode else { return }
             handlePrivateMode(
@@ -940,7 +946,14 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 viewportSize: viewportSize
             )
         case "s":
-            saveCursorState()
+            if isLeftRightMarginMode, !rawPayload.isEmpty {
+                setHorizontalMargins(
+                    left: parameter(at: 0, default: 1),
+                    right: parameter(at: 1, default: currentViewportSize.columns)
+                )
+            } else {
+                saveCursorState()
+            }
         case "u":
             handleCursorRestoreOrKeyboardProtocol(rawPayload: rawPayload, responses: &responses)
         case "q":
@@ -1031,6 +1044,49 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         }
     }
 
+    private func handleModeStatusReport(rawPayload: String, responses: inout [Data]) {
+        guard rawPayload.hasPrefix("?"), rawPayload.hasSuffix("$") else { return }
+
+        let modeText = rawPayload
+            .dropFirst()
+            .dropLast()
+        guard let mode = Int(modeText) else { return }
+
+        let status = privateModeStatus(mode)
+        responses.append(Data("\u{1B}[?\(mode);\(status)$y".utf8))
+    }
+
+    private func privateModeStatus(_ mode: Int) -> Int {
+        switch mode {
+        case 25:
+            isCursorVisible ? 1 : 2
+        case 7:
+            isWraparoundMode ? 1 : 2
+        case 47, 1047, 1049:
+            isUsingAlternateScreen ? 1 : 2
+        case 69:
+            isLeftRightMarginMode ? 1 : 2
+        case 1000:
+            currentMouseState.trackingMode == .normal ? 1 : 2
+        case 1002:
+            currentMouseState.trackingMode == .buttonEvent ? 1 : 2
+        case 1003:
+            currentMouseState.trackingMode == .anyEvent ? 1 : 2
+        case 1004:
+            currentMouseState.sendsFocusEvents ? 1 : 2
+        case 1006:
+            currentMouseState.usesSGREncoding ? 1 : 2
+        case 1007:
+            currentMouseState.alternateScrollMode ? 1 : 2
+        case 2004:
+            isBracketedPasteMode ? 1 : 2
+        case 2026, 2027, 2031, 2048:
+            4
+        default:
+            0
+        }
+    }
+
     private mutating func handlePrivateMode(
         isSet: Bool,
         parameters: [Int],
@@ -1058,6 +1114,11 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 }
             case 25:
                 isCursorVisible = isSet
+            case 69:
+                isLeftRightMarginMode = isSet
+                if !isSet {
+                    resetHorizontalMargins()
+                }
             case 7:
                 isWraparoundMode = isSet
             case 1000:
@@ -1072,7 +1133,9 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 currentMouseState.alternateScrollMode = isSet
             case 1004:
                 currentMouseState.sendsFocusEvents = isSet
-            case 2004, 2026:
+            case 2004:
+                isBracketedPasteMode = isSet
+            case 2026:
                 continue
             default:
                 continue
@@ -1089,6 +1152,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         isUsingAlternateScreen = true
         scrollRegionTop = nil
         scrollRegionBottom = nil
+        resetHorizontalMargins()
         alternateGrid.removeAll(keepingCapacity: true)
         alternateGrid.appendLine()
         cursorRow = 0
@@ -1103,6 +1167,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         isUsingAlternateScreen = false
         scrollRegionTop = nil
         scrollRegionBottom = nil
+        resetHorizontalMargins()
 
         if restoreCursor {
             restoreCursorState()
@@ -1164,6 +1229,26 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         scrollRegionTop = normalizedTop
         scrollRegionBottom = normalizedBottom
         moveCursor(toRow: 0, column: 0)
+    }
+
+    private mutating func setHorizontalMargins(left: Int, right: Int) {
+        let columns = max(1, currentViewportSize.columns)
+        let normalizedLeft = min(max(left - 1, 0), columns - 1)
+        let normalizedRight = min(max(right - 1, 0), columns - 1)
+        guard normalizedLeft < normalizedRight else {
+            resetHorizontalMargins()
+            return
+        }
+
+        leftMarginColumn = normalizedLeft
+        rightMarginColumn = normalizedRight
+        cursorRow = screenTopRow
+        cursorColumn = normalizedLeft
+    }
+
+    private mutating func resetHorizontalMargins() {
+        leftMarginColumn = 0
+        rightMarginColumn = nil
     }
 
     private mutating func normalizeScrollRegion() {

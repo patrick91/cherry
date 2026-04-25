@@ -402,10 +402,10 @@ import Testing
         remainder: &remainder
     )
 
-    #expect(sequence == Data("\u{1B}[A".utf8))
+    #expect(sequence == Data("\u{1B}[A\u{1B}[A\u{1B}[A".utf8))
 }
 
-@Test func preciseScrollAccumulatesByFullTerminalCell() async throws {
+@Test func preciseScrollAccumulatesByPartialTerminalCells() async throws {
     var remainder: CGFloat = 0
 
     let firstSequence = TerminalInputEncoder.alternateScreenScrollSequence(
@@ -421,8 +421,8 @@ import Testing
         remainder: &remainder
     )
 
-    #expect(firstSequence == nil)
-    #expect(secondSequence == Data("\u{1B}[A".utf8))
+    #expect(firstSequence == Data("\u{1B}[A".utf8))
+    #expect(secondSequence == Data("\u{1B}[A\u{1B}[A".utf8))
 }
 
 @Test func sgrMouseWheelProducesTerminalMouseEvents() async throws {
@@ -438,7 +438,39 @@ import Testing
         remainder: &remainder
     )
 
-    #expect(sequence == Data("\u{1B}[<65;5;3M".utf8))
+    #expect(sequence == Data("\u{1B}[<65;5;3M\u{1B}[<65;5;3M\u{1B}[<65;5;3M".utf8))
+}
+
+@Test func decPrivateModeStatusReportsCurrentAndUnsupportedModes() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    let responses = buffer.ingest(Data((
+        "\u{1B}[?25l" +
+        "\u{1B}[?69h" +
+        "\u{1B}[?1004h" +
+        "\u{1B}[?2004h" +
+        "\u{1B}[?25$p" +
+        "\u{1B}[?69$p" +
+        "\u{1B}[?1004$p" +
+        "\u{1B}[?2004$p" +
+        "\u{1B}[?2026$p"
+    ).utf8))
+
+    #expect(responses == [
+        Data("\u{1B}[?25;2$y".utf8),
+        Data("\u{1B}[?69;1$y".utf8),
+        Data("\u{1B}[?1004;1$y".utf8),
+        Data("\u{1B}[?2004;1$y".utf8),
+        Data("\u{1B}[?2026;4$y".utf8)
+    ])
+}
+
+@Test func horizontalMarginCommandDoesNotOverwriteSavedCursor() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[sabc\u{1B}[2;5H\u{1B}[?69h\u{1B}[3;8s\u{1B}[uX".utf8))
+
+    #expect(buffer.snapshot(range: 0..<1) == ["Xbc"])
 }
 
 @Test func terminalMousePositionUsesVisibleViewportCoordinates() async throws {

@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "CherryMCP", targets: ["CherryMCP"]),
     ],
     dependencies: [
+        .package(url: "https://github.com/Lakr233/libghostty-spm.git", from: "1.0.1776871800"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
     ],
     targets: [
@@ -21,7 +22,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "Cherry",
-            dependencies: ["CherryControl"]
+            dependencies: [
+                "CherryControl",
+                .product(name: "GhosttyTerminal", package: "libghostty-spm"),
+            ]
         ),
         .executableTarget(
             name: "CherryMCP",

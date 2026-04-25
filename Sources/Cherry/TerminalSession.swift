@@ -271,6 +271,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumBytes: Int
     private var data = Data()
+    private var observers: [UUID: @Sendable (Data) -> Void] = [:]
 
     init(maximumBytes: Int = 1_048_576) {
         self.maximumBytes = maximumBytes
@@ -279,11 +280,33 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     func append(_ chunk: Data) {
         guard !chunk.isEmpty else { return }
 
-        lock.withLock {
+        let currentObservers: [@Sendable (Data) -> Void] = lock.withLock {
             data.append(chunk)
             if data.count > maximumBytes {
                 data.removeFirst(data.count - maximumBytes)
             }
+            return Array(observers.values)
+        }
+
+        for observer in currentObservers {
+            observer(chunk)
+        }
+    }
+
+    func observe(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+        let id = UUID()
+        lock.withLock {
+            if replayExistingOutput, !data.isEmpty {
+                observer(data)
+            }
+            observers[id] = observer
+        }
+        return id
+    }
+
+    func removeObserver(id: UUID) {
+        _ = lock.withLock {
+            observers.removeValue(forKey: id)
         }
     }
 
@@ -473,6 +496,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var traceRecorder: TerminalTraceRecorder?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
+    private var ghosttyBridgeStorage: GhosttySessionBridge?
 
     private static let defaultMaxScrollback = 50_000
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
@@ -585,6 +609,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         resumeOutputIfPausedForInteraction()
         rawOutputStore.clear()
         processor.clear()
+        ghosttyBridgeStorage?.reset()
         bumpRevision()
     }
 
@@ -627,6 +652,24 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
         rawOutputStore.snapshot(maxBytes: maxBytes)
+    }
+
+    func observeRawOutput(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+        rawOutputStore.observe(replayExistingOutput: replayExistingOutput, observer)
+    }
+
+    func removeRawOutputObserver(id: UUID) {
+        rawOutputStore.removeObserver(id: id)
+    }
+
+    var ghosttyBridge: GhosttySessionBridge {
+        if let ghosttyBridgeStorage {
+            return ghosttyBridgeStorage
+        }
+
+        let bridge = GhosttySessionBridge(session: self)
+        ghosttyBridgeStorage = bridge
+        return bridge
     }
 
     private func startShell() {
@@ -688,6 +731,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         activeLaunchID = nil
         shellProcess = nil
+        ghosttyBridgeStorage?.finish(exitCode: UInt32(max(status, 0)))
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()

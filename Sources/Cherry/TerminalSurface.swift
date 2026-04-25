@@ -5,7 +5,8 @@ import SwiftUI
 private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
 enum TerminalInputEncoder {
-    private static let maximumScrollStepsPerEvent = 12
+    private static let maximumScrollStepsPerEvent = 36
+    private static let terminalScrollRowsPerLine: CGFloat = 3
 
     static func commandSequence(for selector: Selector) -> Data? {
         switch selector {
@@ -147,12 +148,12 @@ enum TerminalInputEncoder {
 
         let rawSteps: Int
         if hasPreciseScrollingDeltas {
-            let scrollUnit = max(1, lineHeight)
+            let scrollUnit = max(1, lineHeight / terminalScrollRowsPerLine)
             remainder += deltaY / scrollUnit
             rawSteps = Int(remainder.rounded(.towardZero))
             remainder -= CGFloat(rawSteps)
         } else {
-            rawSteps = Int(deltaY.rounded(.awayFromZero))
+            rawSteps = Int((deltaY * terminalScrollRowsPerLine).rounded(.awayFromZero))
         }
 
         return min(max(rawSteps, -maximumScrollStepsPerEvent), maximumScrollStepsPerEvent)
@@ -175,13 +176,13 @@ enum TerminalInputEncoder {
 struct TerminalSurfaceView: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
 
-    func makeNSView(context: Context) -> TerminalScrollView {
-        let scrollView = TerminalScrollView()
-        scrollView.configure(with: session)
-        return scrollView
+    func makeNSView(context: Context) -> GhosttyTerminalContainerView {
+        let containerView = GhosttyTerminalContainerView()
+        containerView.configure(with: session)
+        return containerView
     }
 
-    func updateNSView(_ nsView: TerminalScrollView, context: Context) {
+    func updateNSView(_ nsView: GhosttyTerminalContainerView, context: Context) {
         nsView.configure(with: session)
     }
 }

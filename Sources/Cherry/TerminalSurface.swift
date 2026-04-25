@@ -44,6 +44,13 @@ enum TerminalInputEncoder {
         }
     }
 
+    static func pastedTextData(_ text: String) -> Data {
+        let normalizedText = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        return Data(normalizedText.utf8)
+    }
+
     static func alternateScreenScrollSequence(
         deltaY: CGFloat,
         hasPreciseScrollingDeltas: Bool,
@@ -332,6 +339,10 @@ final class TerminalScrollView: NSScrollView {
         if canvasView.copySelectionToPasteboard() {
             return
         }
+    }
+
+    @objc func paste(_ sender: Any?) {
+        _ = canvasView.pasteFromPasteboard()
     }
 
     private func syncDocumentFrame(scrollToBottomIfPinned: Bool) {
@@ -858,6 +869,24 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         _ = copySelectionToPasteboard()
     }
 
+    @discardableResult
+    func pasteFromPasteboard(_ pasteboard: NSPasteboard = .general) -> Bool {
+        guard session?.acceptsInput == true,
+              let text = pasteboard.string(forType: .string),
+              !text.isEmpty else {
+            return false
+        }
+
+        clearSelection()
+        resetCursorBlink()
+        sendInput?(TerminalInputEncoder.pastedTextData(text))
+        return true
+    }
+
+    @objc func paste(_ sender: Any?) {
+        _ = pasteFromPasteboard()
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .iBeam)
@@ -866,6 +895,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     @discardableResult
     func handleKeyDown(_ event: NSEvent) -> Bool {
         if isCopyShortcut(event), copySelectionToPasteboard() {
+            return true
+        }
+
+        if isPasteShortcut(event), pasteFromPasteboard() {
             return true
         }
 
@@ -987,6 +1020,18 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
               !modifiers.contains(.control),
               !modifiers.contains(.option),
               event.charactersIgnoringModifiers?.lowercased() == "c" else {
+            return false
+        }
+
+        return true
+    }
+
+    private func isPasteShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command),
+              !modifiers.contains(.control),
+              !modifiers.contains(.option),
+              event.charactersIgnoringModifiers?.lowercased() == "v" else {
             return false
         }
 

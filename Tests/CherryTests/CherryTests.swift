@@ -484,6 +484,12 @@ import Testing
     #expect(enter == Data("\r".utf8))
 }
 
+@Test func pastedTextNormalizesLineEndings() async throws {
+    let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
+
+    #expect(String(decoding: data, as: UTF8.self) == "one\ntwo\nthree")
+}
+
 @Test func selectedTextSpansRows() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))

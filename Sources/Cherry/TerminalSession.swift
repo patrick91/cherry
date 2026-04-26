@@ -328,6 +328,120 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     }
 }
 
+private enum TerminalMetadataEvent: Equatable {
+    case title(String)
+    case workingDirectory(String)
+}
+
+private final class TerminalMetadataParser {
+    private enum ParserState {
+        case ground
+        case afterEscape
+        case osc
+        case oscAfterEscape
+    }
+
+    private static let maximumOSCBytes = 8_192
+
+    private var state = ParserState.ground
+    private var controlBuffer = [UInt8]()
+
+    func parse(_ data: Data) -> [TerminalMetadataEvent] {
+        var events: [TerminalMetadataEvent] = []
+
+        for byte in data {
+            switch state {
+            case .ground:
+                if byte == 0x1B {
+                    state = .afterEscape
+                }
+
+            case .afterEscape:
+                if byte == UInt8(ascii: "]") {
+                    controlBuffer.removeAll(keepingCapacity: true)
+                    state = .osc
+                } else {
+                    state = byte == 0x1B ? .afterEscape : .ground
+                }
+
+            case .osc:
+                if byte == 0x07 {
+                    finishOSC(events: &events)
+                } else if byte == 0x1B {
+                    state = .oscAfterEscape
+                } else {
+                    appendOSCByte(byte)
+                }
+
+            case .oscAfterEscape:
+                if byte == UInt8(ascii: "\\") {
+                    finishOSC(events: &events)
+                } else {
+                    appendOSCByte(0x1B)
+                    appendOSCByte(byte)
+                    state = .osc
+                }
+            }
+        }
+
+        return events
+    }
+
+    private func appendOSCByte(_ byte: UInt8) {
+        guard controlBuffer.count < Self.maximumOSCBytes else { return }
+        controlBuffer.append(byte)
+    }
+
+    private func finishOSC(events: inout [TerminalMetadataEvent]) {
+        let rawPayload = String(decoding: controlBuffer, as: UTF8.self)
+        if let event = Self.metadataEvent(from: rawPayload) {
+            events.append(event)
+        }
+
+        controlBuffer.removeAll(keepingCapacity: true)
+        state = .ground
+    }
+
+    private static func metadataEvent(from rawPayload: String) -> TerminalMetadataEvent? {
+        let parts = rawPayload.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+
+        let code = String(parts[0])
+        let value = sanitized(String(parts[1]))
+        guard !value.isEmpty else { return nil }
+
+        switch code {
+        case "0", "1", "2":
+            return .title(value)
+        case "7":
+            return workingDirectoryEvent(from: value)
+        default:
+            return nil
+        }
+    }
+
+    private static func workingDirectoryEvent(from value: String) -> TerminalMetadataEvent? {
+        if value.hasPrefix("file://"),
+           let url = URL(string: value),
+           url.isFileURL {
+            let path = url.path.removingPercentEncoding ?? url.path
+            return path.isEmpty ? nil : .workingDirectory(path)
+        }
+
+        if value.hasPrefix("/") {
+            return .workingDirectory(value)
+        }
+
+        return nil
+    }
+
+    private static func sanitized(_ value: String) -> String {
+        value
+            .filter { !$0.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) } }
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
@@ -484,17 +598,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     let id = UUID()
-    let title: String
+    @Published private(set) var title: String
+    @Published private(set) var workingDirectory: String
+    @Published private(set) var state: SessionState = .launching
+
     let subtitle: String
     let tint: NSColor
     let maxScrollback: Int?
-    let workingDirectory: String
+    let launchWorkingDirectory: String
 
     @Published private(set) var revision = 0
 
-    private(set) var state: SessionState = .launching
     private let processor: TerminalProcessor
     private let rawOutputStore = TerminalRawOutputStore()
+    private let metadataParser = TerminalMetadataParser()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
@@ -519,6 +636,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.subtitle = subtitle
         self.tint = tint
         self.workingDirectory = workingDirectory
+        self.launchWorkingDirectory = workingDirectory
         self.maxScrollback = maxScrollback
         self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
@@ -651,6 +769,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func ingestTestingData(_ data: Data) {
         rawOutputStore.append(data)
+        ingestTerminalMetadata(data)
         processor.ingestTestingData(data)
         bumpRevision()
     }
@@ -700,6 +819,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                 onData: { data in
                     traceRecorder?.recordOutput(data)
                     self.rawOutputStore.append(data)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.ingestTerminalMetadata(data)
+                    }
                     processor.enqueueOutput(data, launchID: launchID) { response in
                         processBox.write(response)
                     }
@@ -791,6 +913,27 @@ final class TerminalSession: ObservableObject, Identifiable {
             state = .live
         }
         bumpRevision()
+    }
+
+    private func ingestTerminalMetadata(_ data: Data) {
+        var didChange = false
+        for event in metadataParser.parse(data) {
+            switch event {
+            case .title(let nextTitle):
+                guard title != nextTitle else { continue }
+                title = nextTitle
+                didChange = true
+
+            case .workingDirectory(let nextWorkingDirectory):
+                guard workingDirectory != nextWorkingDirectory else { continue }
+                workingDirectory = nextWorkingDirectory
+                didChange = true
+            }
+        }
+
+        if didChange {
+            bumpRevision()
+        }
     }
 
     private var lineSummary: String {

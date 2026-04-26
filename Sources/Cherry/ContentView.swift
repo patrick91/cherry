@@ -512,7 +512,8 @@ private struct SidebarBackground: View {
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
 
-    let session: TerminalSession
+    @ObservedObject var session: TerminalSession
+
     let isSelected: Bool
     let onSelect: () -> Void
 

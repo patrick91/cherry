@@ -43,6 +43,22 @@ import Testing
 }
 
 @MainActor
+@Test func terminalSessionMetadataFollowsOSCSequences() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data("\u{1B}]2;vim README.md\u{7}".utf8))
+    #expect(session.title == "vim README.md")
+
+    session.ingestTestingData(Data("\u{1B}]7;file://localhost/tmp/cherry\u{7}".utf8))
+    #expect(session.workingDirectory == "/tmp/cherry")
+}
+
+@MainActor
 @Test func workspaceCanCreateBackgroundSession() async throws {
     let workspace = TerminalWorkspace()
     let initialSelection = workspace.selectedSessionID

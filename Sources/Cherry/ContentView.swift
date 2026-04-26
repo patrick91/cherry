@@ -64,7 +64,10 @@ struct ContentView: View {
             .ignoresSafeArea(.all, edges: .top)
         }
         .ignoresSafeArea(.all, edges: .top)
-        .background(AppShellBackground())
+        .background {
+            AppShellBackground()
+                .ignoresSafeArea(.all)
+        }
         .background(AppShortcutMonitor(workspace: workspace, openSettings: { openSettings() }))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
@@ -253,7 +256,8 @@ private struct WindowConfigurator: NSViewRepresentable {
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
         window.toolbar = nil
-        window.backgroundColor = NSColor(calibratedWhite: 0.82, alpha: 1)
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.styleMask.insert(.fullSizeContentView)
     }
 }
@@ -277,24 +281,12 @@ private struct DetailPaneView: View {
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
-        .background(TerminalThemeBackground())
     }
 }
 
 private struct AppShellBackground: View {
     var body: some View {
-        TerminalThemeBackground()
-    }
-}
-
-private struct TerminalThemeBackground: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
-    var body: some View {
-        let themeColors = terminalSettings.ghosttyThemeColors(for: colorScheme)
-        let sample = SidebarThemeSample(themeColors: themeColors, fallbackColorScheme: colorScheme)
-        Color(nsColor: sample.shellBackground)
+        SidebarBackground(presentation: .docked)
     }
 }
 
@@ -360,7 +352,9 @@ private struct SidebarTabsView: View {
             }
         }
         .background {
-            SidebarBackground(presentation: presentation)
+            if presentation == .floating {
+                SidebarBackground(presentation: presentation)
+            }
         }
     }
 }
@@ -645,10 +639,11 @@ private struct SidebarPalette {
         let selection = sample.selectionBackground.map { Color(nsColor: $0) }
 
         if sample.isDark {
-            let liftedBackground = Color(nsColor: sample.background.mixed(toward: sample.foreground, amount: 0.10))
             self = Self(
-                backgroundMaterial: AnyShapeStyle(presentation == .floating ? liftedBackground : shellBackground),
-                backgroundTint: presentation == .floating ? background.opacity(0.18) : .clear,
+                backgroundMaterial: presentation == .floating
+                    ? AnyShapeStyle(shellBackground)
+                    : AnyShapeStyle(shellBackground),
+                backgroundTint: presentation == .floating ? background.opacity(0.10) : .clear,
                 backgroundOverlay: [
                     foreground.opacity(presentation == .floating ? 0.035 : 0),
                     .clear
@@ -664,11 +659,11 @@ private struct SidebarPalette {
         } else {
             self = Self(
                 backgroundMaterial: presentation == .floating
-                    ? AnyShapeStyle(.regularMaterial)
-                    : AnyShapeStyle(background),
-                backgroundTint: presentation == .floating ? background.opacity(0.88) : .clear,
+                    ? AnyShapeStyle(shellBackground)
+                    : AnyShapeStyle(shellBackground),
+                backgroundTint: presentation == .floating ? background.opacity(0.08) : .clear,
                 backgroundOverlay: [
-                    Color.white.opacity(presentation == .floating ? 0.10 : 0),
+                    Color.white.opacity(presentation == .floating ? 0.08 : 0),
                     .clear
                 ],
                 headerText: foreground.opacity(0.52),
@@ -694,9 +689,9 @@ private struct SidebarThemeSample {
 
     var shellBackground: NSColor {
         if isDark {
-            background.mixed(toward: foreground, amount: 0.06)
+            background.mixed(toward: foreground, amount: 0.10)
         } else {
-            background.mixed(toward: .white, amount: 0.04)
+            background.mixed(toward: .white, amount: 0.08)
         }
     }
 

@@ -469,13 +469,13 @@ private final class NativeWindowControlsOverlayView: NSView {
 private struct SidebarBackground: View {
     var body: some View {
         Rectangle()
-            .fill(.regularMaterial)
+            .fill(.ultraThinMaterial)
             .overlay {
                 LinearGradient(
                     colors: [
-                        Color.white.opacity(0.34),
-                        Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.34),
-                        Color.white.opacity(0.18)
+                        Color.white.opacity(0.22),
+                        Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.16),
+                        Color.white.opacity(0.08)
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing

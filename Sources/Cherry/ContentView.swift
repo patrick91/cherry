@@ -273,22 +273,28 @@ private struct DetailPaneView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 10)
         .padding(.top, 5)
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
-        .background(AppShellBackground())
+        .background(TerminalThemeBackground())
     }
 }
 
 private struct AppShellBackground: View {
     var body: some View {
-        SidebarBackground(presentation: .docked)
+        TerminalThemeBackground()
+    }
+}
+
+private struct TerminalThemeBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    var body: some View {
+        let themeColors = terminalSettings.ghosttyThemeColors(for: colorScheme)
+        let sample = SidebarThemeSample(themeColors: themeColors, fallbackColorScheme: colorScheme)
+        Color(nsColor: sample.shellBackground)
     }
 }
 
@@ -634,17 +640,17 @@ private struct SidebarPalette {
     ) {
         let sample = SidebarThemeSample(themeColors: themeColors, fallbackColorScheme: fallbackColorScheme)
         let background = Color(nsColor: sample.background)
+        let shellBackground = Color(nsColor: sample.shellBackground)
         let foreground = Color(nsColor: sample.foreground)
         let selection = sample.selectionBackground.map { Color(nsColor: $0) }
 
         if sample.isDark {
+            let liftedBackground = Color(nsColor: sample.background.mixed(toward: sample.foreground, amount: 0.10))
             self = Self(
-                backgroundMaterial: presentation == .floating
-                    ? AnyShapeStyle(.thinMaterial)
-                    : AnyShapeStyle(background),
-                backgroundTint: presentation == .floating ? background.opacity(0.92) : .clear,
+                backgroundMaterial: AnyShapeStyle(presentation == .floating ? liftedBackground : shellBackground),
+                backgroundTint: presentation == .floating ? background.opacity(0.18) : .clear,
                 backgroundOverlay: [
-                    foreground.opacity(presentation == .floating ? 0.04 : 0),
+                    foreground.opacity(presentation == .floating ? 0.035 : 0),
                     .clear
                 ],
                 headerText: foreground.opacity(0.58),
@@ -684,6 +690,14 @@ private struct SidebarThemeSample {
 
     var isDark: Bool {
         background.relativeLuminance < 0.50
+    }
+
+    var shellBackground: NSColor {
+        if isDark {
+            background.mixed(toward: foreground, amount: 0.06)
+        } else {
+            background.mixed(toward: .white, amount: 0.04)
+        }
     }
 
     init(themeColors: TerminalThemeColors, fallbackColorScheme: ColorScheme) {
@@ -742,6 +756,23 @@ private extension NSColor {
         return 0.2126 * channel(color.redComponent)
             + 0.7152 * channel(color.greenComponent)
             + 0.0722 * channel(color.blueComponent)
+    }
+
+    func mixed(toward otherColor: NSColor, amount: CGFloat) -> NSColor {
+        guard let base = usingColorSpace(.sRGB),
+              let other = otherColor.usingColorSpace(.sRGB)
+        else {
+            return self
+        }
+
+        let clampedAmount = min(max(amount, 0), 1)
+        let inverseAmount = 1 - clampedAmount
+        return NSColor(
+            calibratedRed: base.redComponent * inverseAmount + other.redComponent * clampedAmount,
+            green: base.greenComponent * inverseAmount + other.greenComponent * clampedAmount,
+            blue: base.blueComponent * inverseAmount + other.blueComponent * clampedAmount,
+            alpha: base.alphaComponent * inverseAmount + other.alphaComponent * clampedAmount
+        )
     }
 }
 

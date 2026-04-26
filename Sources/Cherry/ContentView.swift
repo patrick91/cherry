@@ -4,6 +4,9 @@ import SwiftUI
 struct ContentView: View {
     private let minimumSidebarWidth: CGFloat = 190
     private let maximumSidebarWidth: CGFloat = 420
+    private let floatingSidebarLeadingInset: CGFloat = 3
+    private let floatingSidebarTopInset: CGFloat = 3
+    private let floatingSidebarBottomInset: CGFloat = 3
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
@@ -24,7 +27,7 @@ struct ContentView: View {
 
             if isSidebarHidden {
                 floatingSidebar
-                    .offset(x: isSidebarRevealed ? 0 : -sidebarWidth)
+                    .offset(x: isSidebarRevealed ? 0 : -(sidebarWidth + floatingSidebarLeadingInset))
                     .opacity(isSidebarRevealed ? 1 : 0)
                     .allowsHitTesting(isSidebarRevealed)
 
@@ -41,7 +44,9 @@ struct ContentView: View {
 
             NativeWindowControlsOverlay(
                 isVisible: !isSidebarHidden || isSidebarRevealed,
-                sidebarWidth: sidebarWidth
+                sidebarWidth: sidebarWidth,
+                leadingOffset: isSidebarHidden ? floatingSidebarLeadingInset : 0,
+                topOffset: isSidebarHidden ? floatingSidebarTopInset : 0
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea(.all, edges: .top)
@@ -65,29 +70,37 @@ struct ContentView: View {
             .frame(width: sidebarWidth)
             .ignoresSafeArea(.all, edges: .top)
             .overlay(alignment: .trailing) {
-                SidebarResizeHandle(
-                    sidebarWidth: $sidebarWidth,
-                    minimumWidth: minimumSidebarWidth,
-                    maximumWidth: maximumSidebarWidth
-                )
-                .frame(width: 12)
-                .frame(maxHeight: .infinity)
-                .padding(.trailing, -6)
+                sidebarResizeHandle
             }
     }
 
     private var floatingSidebar: some View {
         SidebarTabsView(workspace: workspace)
             .frame(width: sidebarWidth)
+            .overlay(alignment: .trailing) {
+                sidebarResizeHandle
+            }
             .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 10)
-            .padding(.bottom, 5)
+            .padding(.leading, floatingSidebarLeadingInset)
+            .padding(.top, floatingSidebarTopInset)
+            .padding(.bottom, floatingSidebarBottomInset)
             .ignoresSafeArea(.all, edges: .top)
             .onHover { hovering in
                 if !hovering {
                     isSidebarRevealed = false
                 }
             }
+    }
+
+    private var sidebarResizeHandle: some View {
+        SidebarResizeHandle(
+            sidebarWidth: $sidebarWidth,
+            minimumWidth: minimumSidebarWidth,
+            maximumWidth: maximumSidebarWidth
+        )
+        .frame(width: 12)
+        .frame(maxHeight: .infinity)
     }
 }
 
@@ -122,12 +135,40 @@ private final class SidebarResizeHandleView: NSView {
 
     private var dragStartWidth: CGFloat?
     private var dragStartLocationX: CGFloat?
+    private var trackingArea: NSTrackingArea?
+    private var didPushCursor = false
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(nextTrackingArea)
+        trackingArea = nextTrackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pushResizeCursor()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        popResizeCursorIfNeeded()
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        pushResizeCursor()
         dragStartWidth = sidebarWidth
         dragStartLocationX = event.locationInWindow.x
     }
@@ -147,6 +188,28 @@ private final class SidebarResizeHandleView: NSView {
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .resizeLeftRight)
+    }
+
+    private func pushResizeCursor() {
+        guard !didPushCursor else {
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+
+        NSCursor.resizeLeftRight.push()
+        didPushCursor = true
+    }
+
+    private func popResizeCursorIfNeeded() {
+        guard didPushCursor else { return }
+        NSCursor.pop()
+        didPushCursor = false
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            popResizeCursorIfNeeded()
+        }
     }
 }
 
@@ -262,6 +325,8 @@ private struct SidebarTabsView: View {
 private struct NativeWindowControlsOverlay: NSViewRepresentable {
     let isVisible: Bool
     let sidebarWidth: CGFloat
+    let leadingOffset: CGFloat
+    let topOffset: CGFloat
 
     func makeNSView(context: Context) -> NativeWindowControlsOverlayView {
         let view = NativeWindowControlsOverlayView()
@@ -272,6 +337,8 @@ private struct NativeWindowControlsOverlay: NSViewRepresentable {
     func updateNSView(_ nsView: NativeWindowControlsOverlayView, context: Context) {
         nsView.isControlsVisible = isVisible
         nsView.sidebarWidth = sidebarWidth
+        nsView.leadingOffset = leadingOffset
+        nsView.topOffset = topOffset
         DispatchQueue.main.async {
             nsView.attachWindowButtons()
             nsView.updateControlsPosition(animated: true)
@@ -286,6 +353,8 @@ private struct NativeWindowControlsOverlay: NSViewRepresentable {
 private final class NativeWindowControlsOverlayView: NSView {
     var isControlsVisible = true
     var sidebarWidth: CGFloat = 320
+    var leadingOffset: CGFloat = 0
+    var topOffset: CGFloat = 0
 
     private let leftInset: CGFloat = 18
     private let topInset: CGFloat = 18
@@ -356,12 +425,12 @@ private final class NativeWindowControlsOverlayView: NSView {
     func updateControlsPosition(animated: Bool) {
         guard didAttachButtons, let originalSuperview else { return }
 
-        let visibleX = leftInset
+        let visibleX = leadingOffset + leftInset
         let controlWidth = buttonSpacing * CGFloat(max(hostedButtons.count - 1, 0)) + (hostedButtons.last?.frame.width ?? 14)
         let controlHeight = hostedButtons.map(\.frame.height).max() ?? 14
-        let hiddenX = visibleX - max(sidebarWidth, controlWidth + visibleX)
+        let hiddenX = visibleX - max(sidebarWidth + leadingOffset, controlWidth + visibleX)
         let targetX = isControlsVisible ? visibleX : hiddenX
-        let targetY = bounds.height - topInset - controlHeight
+        let targetY = bounds.height - topOffset - topInset - controlHeight
         let targetRect = convert(
             NSRect(
                 x: targetX,

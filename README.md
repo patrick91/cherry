@@ -21,6 +21,22 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
 swift run Cherry
 ```
 
+## Local Install
+
+Build and install a local `.app` copy into `~/Applications`:
+
+```bash
+Scripts/install-local-app
+open ~/Applications/Cherry.app
+```
+
+Run the installer again after making changes to replace the installed copy.
+You can customize the destination/name if you want a separate dogfood build:
+
+```bash
+CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
+```
+
 Inside the prototype:
 
 - Use the left rail to switch tabs.

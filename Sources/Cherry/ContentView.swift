@@ -81,7 +81,7 @@ struct ContentView: View {
     }
 
     private var dockedSidebar: some View {
-        SidebarTabsView(workspace: workspace)
+        SidebarTabsView(workspace: workspace, presentation: .docked)
             .frame(width: sidebarWidth)
             .ignoresSafeArea(.all, edges: .top)
             .overlay(alignment: .trailing) {
@@ -90,7 +90,7 @@ struct ContentView: View {
     }
 
     private var floatingSidebar: some View {
-        SidebarTabsView(workspace: workspace)
+        SidebarTabsView(workspace: workspace, presentation: .floating)
             .frame(width: sidebarWidth)
             .overlay(alignment: .trailing) {
                 sidebarResizeHandle
@@ -288,17 +288,28 @@ private struct DetailPaneView: View {
 
 private struct AppShellBackground: View {
     var body: some View {
-        SidebarBackground()
+        SidebarBackground(presentation: .docked)
     }
+}
+
+private enum SidebarPresentation {
+    case docked
+    case floating
 }
 
 private struct SidebarTabsView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
 
     @ObservedObject var workspace: TerminalWorkspace
+    let presentation: SidebarPresentation
 
     var body: some View {
-        let palette = SidebarPalette(colorScheme: colorScheme)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
 
         VStack(spacing: 0) {
             ScrollView {
@@ -315,6 +326,7 @@ private struct SidebarTabsView: View {
                                 SidebarTabRow(
                                     session: session,
                                     isSelected: workspace.selectedSessionID == session.id,
+                                    presentation: presentation,
                                     onSelect: { workspace.select(session) }
                                 )
                                 .contextMenu {
@@ -342,7 +354,7 @@ private struct SidebarTabsView: View {
             }
         }
         .background {
-            SidebarBackground()
+            SidebarBackground(presentation: presentation)
         }
     }
 }
@@ -493,12 +505,23 @@ private final class NativeWindowControlsOverlayView: NSView {
 
 private struct SidebarBackground: View {
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    let presentation: SidebarPresentation
 
     var body: some View {
-        let palette = SidebarPalette(colorScheme: colorScheme)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
 
         Rectangle()
-            .fill(.ultraThinMaterial)
+            .fill(palette.backgroundMaterial)
+            .overlay {
+                Rectangle()
+                    .fill(palette.backgroundTint)
+            }
             .overlay {
                 LinearGradient(
                     colors: palette.backgroundOverlay,
@@ -511,16 +534,22 @@ private struct SidebarBackground: View {
 
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
 
     @ObservedObject var session: TerminalSession
 
     let isSelected: Bool
+    let presentation: SidebarPresentation
     let onSelect: () -> Void
 
     @State private var isHovered = false
 
     var body: some View {
-        let palette = SidebarPalette(colorScheme: colorScheme)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
 
         Button(action: onSelect) {
             HStack(spacing: 0) {
@@ -563,6 +592,8 @@ private struct SidebarTabRow: View {
 }
 
 private struct SidebarPalette {
+    let backgroundMaterial: AnyShapeStyle
+    let backgroundTint: Color
     let backgroundOverlay: [Color]
     let headerText: Color
     let rowText: Color
@@ -573,6 +604,8 @@ private struct SidebarPalette {
     let selectedShadow: Color
 
     private init(
+        backgroundMaterial: AnyShapeStyle,
+        backgroundTint: Color,
         backgroundOverlay: [Color],
         headerText: Color,
         rowText: Color,
@@ -582,6 +615,8 @@ private struct SidebarPalette {
         selectedStroke: Color,
         selectedShadow: Color
     ) {
+        self.backgroundMaterial = backgroundMaterial
+        self.backgroundTint = backgroundTint
         self.backgroundOverlay = backgroundOverlay
         self.headerText = headerText
         self.rowText = rowText
@@ -592,43 +627,121 @@ private struct SidebarPalette {
         self.selectedShadow = selectedShadow
     }
 
-    init(colorScheme: ColorScheme) {
-        switch colorScheme {
-        case .light:
-            self = Self(
-                backgroundOverlay: [
-                    Color.white.opacity(0.32),
-                    Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.18),
-                    Color.white.opacity(0.10)
-                ],
-                headerText: Color.black.opacity(0.48),
-                rowText: Color.black.opacity(0.70),
-                selectedText: Color.black.opacity(0.86),
-                hoverFill: Color.white.opacity(0.30),
-                selectedFill: Color.white.opacity(0.68),
-                selectedStroke: Color.white.opacity(0.70),
-                selectedShadow: Color.black.opacity(0.07)
-            )
+    init(
+        themeColors: TerminalThemeColors,
+        fallbackColorScheme: ColorScheme,
+        presentation: SidebarPresentation
+    ) {
+        let sample = SidebarThemeSample(themeColors: themeColors, fallbackColorScheme: fallbackColorScheme)
+        let background = Color(nsColor: sample.background)
+        let foreground = Color(nsColor: sample.foreground)
+        let selection = sample.selectionBackground.map { Color(nsColor: $0) }
 
-        case .dark:
+        if sample.isDark {
             self = Self(
+                backgroundMaterial: presentation == .floating
+                    ? AnyShapeStyle(.thinMaterial)
+                    : AnyShapeStyle(.ultraThinMaterial),
+                backgroundTint: background.opacity(presentation == .floating ? 0.84 : 0.68),
                 backgroundOverlay: [
-                    Color.white.opacity(0.16),
-                    Color.black.opacity(0.12),
-                    Color.white.opacity(0.06)
+                    foreground.opacity(presentation == .floating ? 0.05 : 0.08),
+                    background.opacity(0.18)
                 ],
-                headerText: Color.black.opacity(0.56),
-                rowText: Color.black.opacity(0.72),
-                selectedText: Color.black.opacity(0.88),
-                hoverFill: Color.black.opacity(0.08),
-                selectedFill: Color.white.opacity(0.34),
-                selectedStroke: Color.white.opacity(0.22),
-                selectedShadow: Color.black.opacity(0.16)
+                headerText: foreground.opacity(0.58),
+                rowText: foreground.opacity(0.78),
+                selectedText: foreground.opacity(0.96),
+                hoverFill: foreground.opacity(0.08),
+                selectedFill: selection?.opacity(0.44) ?? foreground.opacity(0.13),
+                selectedStroke: foreground.opacity(0.16),
+                selectedShadow: Color.black.opacity(presentation == .floating ? 0.22 : 0.16)
             )
-
-        @unknown default:
-            self.init(colorScheme: .dark)
+        } else {
+            self = Self(
+                backgroundMaterial: presentation == .floating
+                    ? AnyShapeStyle(.regularMaterial)
+                    : AnyShapeStyle(.ultraThinMaterial),
+                backgroundTint: background.opacity(presentation == .floating ? 0.76 : 0.48),
+                backgroundOverlay: [
+                    Color.white.opacity(presentation == .floating ? 0.14 : 0.24),
+                    foreground.opacity(0.03)
+                ],
+                headerText: foreground.opacity(0.52),
+                rowText: foreground.opacity(0.74),
+                selectedText: foreground.opacity(0.92),
+                hoverFill: foreground.opacity(0.06),
+                selectedFill: selection?.opacity(0.34) ?? Color.white.opacity(0.64),
+                selectedStroke: foreground.opacity(0.10),
+                selectedShadow: Color.black.opacity(presentation == .floating ? 0.12 : 0.07)
+            )
         }
+    }
+}
+
+private struct SidebarThemeSample {
+    let background: NSColor
+    let foreground: NSColor
+    let selectionBackground: NSColor?
+
+    var isDark: Bool {
+        background.relativeLuminance < 0.50
+    }
+
+    init(themeColors: TerminalThemeColors, fallbackColorScheme: ColorScheme) {
+        let fallbackBackground: NSColor = switch fallbackColorScheme {
+        case .light:
+            NSColor(calibratedWhite: 0.96, alpha: 1)
+        case .dark:
+            NSColor(calibratedRed: 0.08, green: 0.08, blue: 0.10, alpha: 1)
+        @unknown default:
+            NSColor(calibratedRed: 0.08, green: 0.08, blue: 0.10, alpha: 1)
+        }
+
+        let fallbackForeground: NSColor = switch fallbackColorScheme {
+        case .light:
+            NSColor(calibratedWhite: 0.08, alpha: 1)
+        case .dark:
+            NSColor(calibratedWhite: 0.92, alpha: 1)
+        @unknown default:
+            NSColor(calibratedWhite: 0.92, alpha: 1)
+        }
+
+        background = NSColor(hexRGB: themeColors.background) ?? fallbackBackground
+        foreground = NSColor(hexRGB: themeColors.foreground) ?? fallbackForeground
+        selectionBackground = themeColors.selectionBackground.flatMap(NSColor.init(hexRGB:))
+    }
+}
+
+private extension NSColor {
+    convenience init?(hexRGB: String) {
+        let trimmed = hexRGB.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingPrefix("#")
+
+        guard trimmed.count == 6, let value = Int(trimmed, radix: 16) else {
+            return nil
+        }
+
+        self.init(
+            calibratedRed: CGFloat((value >> 16) & 0xFF) / 255,
+            green: CGFloat((value >> 8) & 0xFF) / 255,
+            blue: CGFloat(value & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+
+    var relativeLuminance: CGFloat {
+        guard let color = usingColorSpace(.sRGB) else { return 0 }
+
+        func channel(_ value: CGFloat) -> CGFloat {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                pow((value + 0.055) / 1.055, 2.4)
+            }
+        }
+
+        return 0.2126 * channel(color.redComponent)
+            + 0.7152 * channel(color.greenComponent)
+            + 0.0722 * channel(color.blueComponent)
     }
 }
 

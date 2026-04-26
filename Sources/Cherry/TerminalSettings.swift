@@ -30,6 +30,12 @@ extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
 
+struct TerminalThemeColors: Equatable {
+    let background: String
+    let foreground: String
+    let selectionBackground: String?
+}
+
 @MainActor
 final class TerminalSettings: ObservableObject {
     static let shared = TerminalSettings()
@@ -99,6 +105,23 @@ final class TerminalSettings: ObservableObject {
                 .toTerminalConfiguration(),
             dark: terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
                 .toTerminalConfiguration()
+        )
+    }
+
+    func ghosttyThemeColors(for colorScheme: ColorScheme) -> TerminalThemeColors {
+        let theme = switch colorScheme {
+        case .light:
+            terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
+        case .dark:
+            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
+        @unknown default:
+            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
+        }
+
+        return TerminalThemeColors(
+            background: theme.background,
+            foreground: theme.foreground,
+            selectionBackground: theme.selectionBackground
         )
     }
 

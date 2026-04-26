@@ -641,11 +641,11 @@ private struct SidebarPalette {
             self = Self(
                 backgroundMaterial: presentation == .floating
                     ? AnyShapeStyle(.thinMaterial)
-                    : AnyShapeStyle(.ultraThinMaterial),
-                backgroundTint: background.opacity(presentation == .floating ? 0.84 : 0.68),
+                    : AnyShapeStyle(background),
+                backgroundTint: presentation == .floating ? background.opacity(0.92) : .clear,
                 backgroundOverlay: [
-                    foreground.opacity(presentation == .floating ? 0.05 : 0.08),
-                    background.opacity(0.18)
+                    foreground.opacity(presentation == .floating ? 0.04 : 0),
+                    .clear
                 ],
                 headerText: foreground.opacity(0.58),
                 rowText: foreground.opacity(0.78),
@@ -659,11 +659,11 @@ private struct SidebarPalette {
             self = Self(
                 backgroundMaterial: presentation == .floating
                     ? AnyShapeStyle(.regularMaterial)
-                    : AnyShapeStyle(.ultraThinMaterial),
-                backgroundTint: background.opacity(presentation == .floating ? 0.76 : 0.48),
+                    : AnyShapeStyle(background),
+                backgroundTint: presentation == .floating ? background.opacity(0.88) : .clear,
                 backgroundOverlay: [
-                    Color.white.opacity(presentation == .floating ? 0.14 : 0.24),
-                    foreground.opacity(0.03)
+                    Color.white.opacity(presentation == .floating ? 0.10 : 0),
+                    .clear
                 ],
                 headerText: foreground.opacity(0.52),
                 rowText: foreground.opacity(0.74),

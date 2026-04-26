@@ -26,6 +26,9 @@ private final class GhosttyOutputSink: @unchecked Sendable {
 }
 
 private final class GhosttySessionProxy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isHostInputSuppressed = false
+
     weak var session: TerminalSession?
 
     init(session: TerminalSession) {
@@ -33,6 +36,11 @@ private final class GhosttySessionProxy: @unchecked Sendable {
     }
 
     func send(_ data: Data) {
+        let shouldSuppress = lock.withLock {
+            isHostInputSuppressed
+        }
+        guard !shouldSuppress else { return }
+
         Task { @MainActor [weak self] in
             self?.session?.send(data: data)
         }
@@ -42,6 +50,19 @@ private final class GhosttySessionProxy: @unchecked Sendable {
         Task { @MainActor [weak self] in
             self?.session?.resize(columns: columns, rows: rows)
         }
+    }
+
+    func withHostInputSuppressed(_ body: () -> Void) {
+        lock.withLock {
+            isHostInputSuppressed = true
+        }
+        defer {
+            lock.withLock {
+                isHostInputSuppressed = false
+            }
+        }
+
+        body()
     }
 }
 
@@ -154,7 +175,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private func installOutputObserver() {
         guard outputObserverID == nil, let session = proxy.session else { return }
 
-        outputObserverID = session.observeRawOutput(replayExistingOutput: true) { [outputSink] data in
+        let existingOutput = session.rawOutput(maxBytes: 1_048_576).data
+        if !existingOutput.isEmpty {
+            proxy.withHostInputSuppressed {
+                outputSink.receive(existingOutput)
+            }
+        }
+
+        outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
             outputSink.receive(data)
         }
     }

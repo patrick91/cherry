@@ -822,9 +822,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     DispatchQueue.main.async { [weak self] in
                         self?.ingestTerminalMetadata(data)
                     }
-                    processor.enqueueOutput(data, launchID: launchID) { response in
-                        processBox.write(response)
-                    }
+                    processor.enqueueOutput(data, launchID: launchID, responseWriter: { _ in })
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {

@@ -3,9 +3,10 @@ import SwiftUI
 
 struct AppShortcutMonitor: NSViewRepresentable {
     @ObservedObject var workspace: TerminalWorkspace
+    let openSettings: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(workspace: workspace)
+        Coordinator(workspace: workspace, openSettings: openSettings)
     }
 
     func makeNSView(context: Context) -> ShortcutMonitorView {
@@ -16,6 +17,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
+        context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
 
@@ -31,11 +33,13 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         weak var workspace: TerminalWorkspace?
+        var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
 
-        init(workspace: TerminalWorkspace) {
+        init(workspace: TerminalWorkspace, openSettings: @escaping () -> Void) {
             self.workspace = workspace
+            self.openSettings = openSettings
             install()
         }
 
@@ -84,6 +88,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 return true
             case "q":
                 NSApp.terminate(nil)
+                return true
+            case ",":
+                openSettings()
                 return true
             default:
                 return false

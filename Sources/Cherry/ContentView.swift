@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-    private let minimumSidebarWidth: CGFloat = 260
+    private let minimumSidebarWidth: CGFloat = 190
     private let maximumSidebarWidth: CGFloat = 420
 
+    @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
     @Binding var isSidebarHidden: Bool
     @State private var sidebarWidth: CGFloat = 320
@@ -47,7 +48,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.all, edges: .top)
         .background(AppShellBackground())
-        .background(AppShortcutMonitor(workspace: workspace))
+        .background(AppShortcutMonitor(workspace: workspace, openSettings: { openSettings() }))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
         .animation(.snappy(duration: 0.18), value: isSidebarHidden)
@@ -69,8 +70,9 @@ struct ContentView: View {
                     minimumWidth: minimumSidebarWidth,
                     maximumWidth: maximumSidebarWidth
                 )
-                .frame(width: 4)
-                .padding(.trailing, -2)
+                .frame(width: 12)
+                .frame(maxHeight: .infinity)
+                .padding(.trailing, -6)
             }
     }
 
@@ -114,7 +116,7 @@ private struct SidebarResizeHandle: NSViewRepresentable {
 
 private final class SidebarResizeHandleView: NSView {
     var sidebarWidth: CGFloat = 320
-    var minimumWidth: CGFloat = 260
+    var minimumWidth: CGFloat = 190
     var maximumWidth: CGFloat = 420
     var onResize: ((CGFloat) -> Void)?
 

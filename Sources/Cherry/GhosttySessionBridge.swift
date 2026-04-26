@@ -54,6 +54,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var inMemorySession: InMemoryTerminalSession
     private var outputObserverID: UUID?
     private var pendingFeedActivation = false
+    private nonisolated(unsafe) var settingsObserver: Any?
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -70,6 +71,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.delegate = self
         terminalView.controller = controller
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
+        observeSettingsChanges()
     }
 
     func attach(to container: NSView) {
@@ -125,6 +127,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         NSSound.beep()
     }
 
+    deinit {
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
+        }
+    }
+
     private func activateOutputFeedWhenSurfaceIsReady() {
         guard outputObserverID == nil, !pendingFeedActivation else { return }
         pendingFeedActivation = true
@@ -177,40 +185,27 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     private static func makeController() -> TerminalController {
-        let configuration = TerminalConfiguration { builder in
-            builder.withFontFamily("SF Mono")
-            builder.withFontSize(14)
-            builder.withCursorStyle(.block)
-            builder.withCursorStyleBlink(true)
-            builder.withBackground("#121018")
-            builder.withForeground("#DCE4EC")
-            builder.withCursorColor("#92E6A7")
-            builder.withSelectionBackground("#363C4D")
-            builder.withMinimumContrast(1.15)
-            builder.withWindowPaddingX(8)
-            builder.withWindowPaddingY(14)
-            builder.withPalette(0, color: "#65717D")
-            builder.withPalette(1, color: "#EA5E5E")
-            builder.withPalette(2, color: "#94DE8A")
-            builder.withPalette(3, color: "#E8C76E")
-            builder.withPalette(4, color: "#7CB7F7")
-            builder.withPalette(5, color: "#D696F2")
-            builder.withPalette(6, color: "#6ED1DB")
-            builder.withPalette(7, color: "#CAD1DB")
-            builder.withPalette(8, color: "#8995A1")
-            builder.withPalette(9, color: "#FA8280")
-            builder.withPalette(10, color: "#ABF29E")
-            builder.withPalette(11, color: "#FADE85")
-            builder.withPalette(12, color: "#9FD0FF")
-            builder.withPalette(13, color: "#EBB0FC")
-            builder.withPalette(14, color: "#91EEF2")
-            builder.withPalette(15, color: "#F0F5FA")
-        }
-
         return TerminalController(
-            configuration: configuration,
+            configuration: TerminalSettings.shared.ghosttyConfiguration(),
             theme: TerminalTheme()
         )
+    }
+
+    private func observeSettingsChanges() {
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: .terminalSettingsDidChange,
+            object: TerminalSettings.shared,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.applyTerminalSettings()
+            }
+        }
+    }
+
+    private func applyTerminalSettings() {
+        controller.setTerminalConfiguration(TerminalSettings.shared.ghosttyConfiguration())
+        terminalView.fitToSize()
     }
 }
 

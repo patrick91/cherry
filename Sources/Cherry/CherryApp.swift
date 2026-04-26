@@ -114,5 +114,9 @@ struct CherryApp: App {
                 .keyboardShortcut("k")
             }
         }
+
+        Settings {
+            SettingsView()
+        }
     }
 }

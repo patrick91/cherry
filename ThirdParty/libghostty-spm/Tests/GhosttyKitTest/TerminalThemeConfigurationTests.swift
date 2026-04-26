@@ -1,0 +1,176 @@
+@testable import GhosttyTerminal
+import SwiftUI
+import Testing
+
+@MainActor
+struct TerminalThemeConfigurationTests {
+    @Test
+    func commandBuilderPreservesInsertionOrder() {
+        let configuration = TerminalConfiguration {
+            $0.withFontSize(13)
+            $0.withCursorStyle(.bar)
+            $0.withCursorStyleBlink(false)
+            $0.withBackground("#101010")
+        }
+
+        #expect(
+            configuration.rendered
+                == """
+                font-size = 13
+                cursor-style = bar
+                cursor-style-blink = false
+                background = #101010
+                """
+        )
+    }
+
+    @Test
+    func renderedConfigComposesBaseBehaviorAndTheme() {
+        let state = TerminalViewState(
+            configSource: .generated(
+                """
+                font-size = 14
+                cursor-style = block
+                """
+            ),
+            theme: .init(
+                light: TerminalConfiguration()
+                    .backgroundOpacity(0.82)
+                    .background("#111111"),
+                dark: TerminalConfiguration()
+                    .backgroundOpacity(0.62)
+                    .background("#000000")
+            ),
+            terminalConfiguration: TerminalConfiguration()
+                .cursorStyleBlink(true)
+        )
+
+        #expect(state.renderedConfig.contains("font-size = 14"))
+        #expect(state.renderedConfig.contains("cursor-style = block"))
+        #expect(state.renderedConfig.contains("cursor-style-blink = true"))
+        #expect(state.renderedConfig.contains("background-opacity = 0.82"))
+        #expect(state.renderedConfig.contains("background = #111111"))
+    }
+
+    @Test
+    func validConfigurationUpdatePreservesControllerIdentity() {
+        let state = TerminalViewState(
+            terminalConfiguration: TerminalConfiguration()
+                .fontSize(14)
+        )
+        let controller = state.controller
+
+        let didApply = state.setTerminalConfiguration(
+            TerminalConfiguration()
+                .fontSize(16)
+                .cursorStyle(.underline)
+        )
+
+        #expect(didApply)
+        #expect(state.controller === controller)
+        #expect(state.terminalConfiguration == TerminalConfiguration()
+            .fontSize(16)
+            .cursorStyle(.underline))
+        #expect(state.renderedConfig.contains("font-size = 16"))
+        #expect(state.renderedConfig.contains("cursor-style = underline"))
+        let fontSizeLines = state.renderedConfig
+            .split(separator: "\n")
+            .filter { $0.hasPrefix("font-size = ") }
+        #expect(fontSizeLines.last == "font-size = 16")
+    }
+
+    @Test
+    func adoptingDarkModeSwitchesRenderedThemeVariant() {
+        let state = TerminalViewState(
+            theme: .init(
+                light: TerminalConfiguration()
+                    .backgroundOpacity(0.91),
+                dark: TerminalConfiguration()
+                    .backgroundOpacity(0.47)
+            )
+        )
+        let controller = state.controller
+
+        #expect(state.effectiveColorScheme == .light)
+        #expect(state.renderedConfig.contains("background-opacity = 0.91"))
+
+        state.adopt(colorScheme: .dark)
+
+        #expect(state.effectiveColorScheme == .dark)
+        #expect(state.renderedConfig.contains("background-opacity = 0.47"))
+        #expect(!state.renderedConfig.contains("background-opacity = 0.91"))
+        #expect(state.controller === controller)
+    }
+
+    @Test
+    func invalidDarkThemeRollsBackColorSchemeAndRenderedConfig() {
+        let state = TerminalViewState(
+            theme: .init(
+                light: TerminalConfiguration()
+                    .backgroundOpacity(0.91),
+                dark: TerminalConfiguration()
+                    .custom("not-a-real-ghostty-option", "true")
+            )
+        )
+        let previousRenderedConfig = state.renderedConfig
+
+        state.adopt(colorScheme: .dark)
+
+        // Controller rolls back on config failure, so color scheme stays light
+        #expect(state.effectiveColorScheme == .light)
+        #expect(state.renderedConfig == previousRenderedConfig)
+        #expect(state.renderedConfig.contains("background-opacity = 0.91"))
+    }
+
+    @Test
+    func sharedControllerAcceptsMutations() {
+        let controller = TerminalController()
+        let state = TerminalViewState(controller: controller)
+
+        // With the single-source-of-truth architecture, mutations go
+        // directly to the controller and succeed.
+        let didSetTheme = state.setTheme(
+            .init(
+                light: TerminalConfiguration()
+                    .backgroundOpacity(0.5)
+            )
+        )
+
+        #expect(didSetTheme)
+        #expect(state.controller === controller)
+        #expect(state.renderedConfig.contains("background-opacity = 0.5"))
+    }
+
+    @Test
+    func noOpThemeUpdateReturnsFalse() {
+        let theme = TerminalTheme(
+            light: TerminalConfiguration()
+                .backgroundOpacity(0.7)
+        )
+        let state = TerminalViewState(theme: theme)
+        let previousRenderedConfig = state.renderedConfig
+
+        let didApply = state.setTheme(theme)
+
+        #expect(!didApply)
+        #expect(state.renderedConfig == previousRenderedConfig)
+    }
+
+    @Test
+    func invalidConfigurationDoesNotReplaceRenderedConfig() {
+        let state = TerminalViewState(
+            terminalConfiguration: TerminalConfiguration()
+                .fontSize(14)
+        )
+        let previousRenderedConfig = state.renderedConfig
+
+        let didApply = state.setTerminalConfiguration(
+            TerminalConfiguration()
+                .custom("not-a-real-ghostty-option", "true")
+        )
+
+        #expect(!didApply)
+        #expect(state.renderedConfig == previousRenderedConfig)
+        #expect(state.terminalConfiguration == TerminalConfiguration().fontSize(14))
+    }
+}

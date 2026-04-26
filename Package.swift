@@ -13,7 +13,7 @@ let package = Package(
         .executable(name: "CherryMCP", targets: ["CherryMCP"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Lakr233/libghostty-spm.git", from: "1.0.1776871800"),
+        .package(path: "ThirdParty/libghostty-spm"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
     ],
     targets: [

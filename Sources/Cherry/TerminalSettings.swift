@@ -88,7 +88,19 @@ final class TerminalSettings: ObservableObject {
     }
 
     func ghosttyConfiguration() -> TerminalConfiguration {
-        return TerminalConfiguration { builder in
+        Self.ghosttyConfiguration(
+            fontSize: fontSize,
+            cursorBlink: cursorBlink,
+            minimumContrast: minimumContrast
+        )
+    }
+
+    static func ghosttyConfiguration(
+        fontSize: Double,
+        cursorBlink: Bool,
+        minimumContrast: Double
+    ) -> TerminalConfiguration {
+        TerminalConfiguration { builder in
             builder.withFontFamily("SF Mono")
             builder.withFontSize(Float(fontSize))
             builder.withCursorStyle(.block)

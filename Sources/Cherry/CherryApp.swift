@@ -52,12 +52,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate {
 struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var workspace = TerminalWorkspace()
+    @StateObject private var terminalSettings = TerminalSettings.shared
     @State private var isSidebarHidden = false
     @State private var controlServer: CherryControlServer?
 
     var body: some Scene {
         WindowGroup("Cherry") {
             ContentView(workspace: workspace, isSidebarHidden: $isSidebarHidden)
+                .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
                     guard controlServer == nil else { return }
                     let server = CherryControlServer(workspace: workspace)
@@ -117,6 +119,7 @@ struct CherryApp: App {
 
         Settings {
             SettingsView()
+                .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
         }
     }
 }

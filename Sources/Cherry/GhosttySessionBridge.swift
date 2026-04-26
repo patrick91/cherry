@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import GhosttyTerminal
+import SwiftUI
 
 private final class GhosttyOutputSink: @unchecked Sendable {
     private let lock = NSLock()
@@ -54,6 +55,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var inMemorySession: InMemoryTerminalSession
     private var outputObserverID: UUID?
     private var pendingFeedActivation = false
+    private var activeColorScheme: ColorScheme?
     private nonisolated(unsafe) var settingsObserver: Any?
 
     init(session: TerminalSession) {
@@ -99,6 +101,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func focus(in window: NSWindow?) {
         guard let window, window.firstResponder !== terminalView else { return }
         window.makeFirstResponder(terminalView)
+    }
+
+    func applyTerminalSettings(colorScheme: ColorScheme) {
+        activeColorScheme = colorScheme
+        applyTerminalSettings()
     }
 
     func reset() {
@@ -187,7 +194,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private static func makeController() -> TerminalController {
         return TerminalController(
             configuration: TerminalSettings.shared.ghosttyConfiguration(),
-            theme: TerminalTheme()
+            theme: TerminalSettings.shared.ghosttyTheme()
         )
     }
 
@@ -205,7 +212,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private func applyTerminalSettings() {
         controller.setTerminalConfiguration(TerminalSettings.shared.ghosttyConfiguration())
+        controller.setTheme(TerminalSettings.shared.ghosttyTheme())
+        if let activeColorScheme {
+            controller.setColorScheme(terminalColorScheme(from: activeColorScheme))
+        }
         terminalView.fitToSize()
+    }
+
+    private func terminalColorScheme(from colorScheme: ColorScheme) -> TerminalColorScheme {
+        switch colorScheme {
+        case .dark: .dark
+        case .light: .light
+        @unknown default: .dark
+        }
     }
 }
 
@@ -217,7 +236,7 @@ final class GhosttyTerminalContainerView: NSView {
         true
     }
 
-    func configure(with session: TerminalSession) {
+    func configure(with session: TerminalSession, colorScheme: ColorScheme) {
         if activeSession !== session {
             activeSession?.ghosttyBridge.detach(from: self)
             activeSession = session
@@ -225,6 +244,8 @@ final class GhosttyTerminalContainerView: NSView {
         } else {
             session.ghosttyBridge.attach(to: self)
         }
+
+        session.ghosttyBridge.applyTerminalSettings(colorScheme: colorScheme)
     }
 
     override func layout() {

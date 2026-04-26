@@ -293,46 +293,52 @@ private struct AppShellBackground: View {
 }
 
 private struct SidebarTabsView: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     @ObservedObject var workspace: TerminalWorkspace
 
     var body: some View {
+        let palette = SidebarPalette(colorScheme: colorScheme)
+
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Sessions")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .textCase(.uppercase)
-                            .padding(.horizontal, 8)
+                VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Sessions")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(palette.headerText)
+                                .textCase(.uppercase)
+                                .padding(.horizontal, 10)
 
-                        ForEach(workspace.sessions) { session in
-                            SidebarTabRow(
-                                session: session,
-                                isSelected: workspace.selectedSessionID == session.id,
-                                onSelect: { workspace.select(session) }
-                            )
-                            .contextMenu {
-                                Button("Restart") {
-                                    session.restart()
-                                }
+                            ForEach(workspace.sessions) { session in
+                                SidebarTabRow(
+                                    session: session,
+                                    isSelected: workspace.selectedSessionID == session.id,
+                                    onSelect: { workspace.select(session) }
+                                )
+                                .contextMenu {
+                                    Button("Restart") {
+                                        session.restart()
+                                    }
 
-                                Button("Clear Scrollback") {
-                                    session.clearScrollback()
-                                }
+                                    Button("Clear Scrollback") {
+                                        session.clearScrollback()
+                                    }
 
-                                Divider()
+                                    Divider()
 
-                                Button("Close", role: .destructive) {
-                                    workspace.close(session)
+                                    Button("Close", role: .destructive) {
+                                        workspace.close(session)
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 .padding(.horizontal, 8)
-                .padding(.top, 50)
-                .padding(.bottom, 16)
+                .padding(.top, 48)
+                .padding(.bottom, 10)
             }
         }
         .background {
@@ -486,16 +492,16 @@ private final class NativeWindowControlsOverlayView: NSView {
 }
 
 private struct SidebarBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
+        let palette = SidebarPalette(colorScheme: colorScheme)
+
         Rectangle()
             .fill(.ultraThinMaterial)
             .overlay {
                 LinearGradient(
-                    colors: [
-                        Color.white.opacity(0.22),
-                        Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.16),
-                        Color.white.opacity(0.08)
-                    ],
+                    colors: palette.backgroundOverlay,
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
@@ -504,6 +510,8 @@ private struct SidebarBackground: View {
 }
 
 private struct SidebarTabRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     let session: TerminalSession
     let isSelected: Bool
     let onSelect: () -> Void
@@ -511,24 +519,24 @@ private struct SidebarTabRow: View {
     @State private var isHovered = false
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 12) {
-                TerminalGlyphIcon(tint: Color(nsColor: session.tint), isSelected: isSelected)
+        let palette = SidebarPalette(colorScheme: colorScheme)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.title)
-                        .font(.system(size: 16, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                }
+        Button(action: onSelect) {
+            HStack(spacing: 0) {
+                Text(session.title)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
 
                 Spacer(minLength: 8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 10)
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .background(background)
+            .frame(height: 42)
+            .padding(.horizontal, 12)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background {
+                rowBackground(palette: palette)
+            }
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -537,35 +545,94 @@ private struct SidebarTabRow: View {
     }
 
     @ViewBuilder
-    private var background: some View {
+    private func rowBackground(palette: SidebarPalette) -> some View {
         if isSelected {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.76))
-                .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.selectedFill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
         } else if isHovered {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.34))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.hoverFill)
         }
     }
 }
 
-private struct TerminalGlyphIcon: View {
-    let tint: Color
-    let isSelected: Bool
+private struct SidebarPalette {
+    let backgroundOverlay: [Color]
+    let headerText: Color
+    let rowText: Color
+    let selectedText: Color
+    let hoverFill: Color
+    let selectedFill: Color
+    let selectedStroke: Color
+    let selectedShadow: Color
 
-    var body: some View {
-        Image(systemName: "terminal")
-            .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(tint)
-            .frame(width: 24, height: 24)
-            .background {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .strokeBorder(tint.opacity(isSelected ? 0.95 : 0.72), lineWidth: 1.5)
-            }
+    private init(
+        backgroundOverlay: [Color],
+        headerText: Color,
+        rowText: Color,
+        selectedText: Color,
+        hoverFill: Color,
+        selectedFill: Color,
+        selectedStroke: Color,
+        selectedShadow: Color
+    ) {
+        self.backgroundOverlay = backgroundOverlay
+        self.headerText = headerText
+        self.rowText = rowText
+        self.selectedText = selectedText
+        self.hoverFill = hoverFill
+        self.selectedFill = selectedFill
+        self.selectedStroke = selectedStroke
+        self.selectedShadow = selectedShadow
+    }
+
+    init(colorScheme: ColorScheme) {
+        switch colorScheme {
+        case .light:
+            self = Self(
+                backgroundOverlay: [
+                    Color.white.opacity(0.32),
+                    Color(nsColor: NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.94, alpha: 1)).opacity(0.18),
+                    Color.white.opacity(0.10)
+                ],
+                headerText: Color.black.opacity(0.48),
+                rowText: Color.black.opacity(0.70),
+                selectedText: Color.black.opacity(0.86),
+                hoverFill: Color.white.opacity(0.30),
+                selectedFill: Color.white.opacity(0.68),
+                selectedStroke: Color.white.opacity(0.70),
+                selectedShadow: Color.black.opacity(0.07)
+            )
+
+        case .dark:
+            self = Self(
+                backgroundOverlay: [
+                    Color.white.opacity(0.16),
+                    Color.black.opacity(0.12),
+                    Color.white.opacity(0.06)
+                ],
+                headerText: Color.black.opacity(0.56),
+                rowText: Color.black.opacity(0.72),
+                selectedText: Color.black.opacity(0.88),
+                hoverFill: Color.black.opacity(0.08),
+                selectedFill: Color.white.opacity(0.34),
+                selectedStroke: Color.white.opacity(0.22),
+                selectedShadow: Color.black.opacity(0.16)
+            )
+
+        @unknown default:
+            self.init(colorScheme: .dark)
+        }
     }
 }
 
 private struct TerminalSceneView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var session: TerminalSession
 
     var body: some View {
@@ -573,14 +640,31 @@ private struct TerminalSceneView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 LinearGradient(
-                    colors: [
-                        Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
-                        Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
-                    ],
+                    colors: backgroundColors,
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
             )
             .ignoresSafeArea(.container, edges: .top)
+    }
+
+    private var backgroundColors: [Color] {
+        switch colorScheme {
+        case .light:
+            [
+                Color(nsColor: NSColor(calibratedRed: 0.96, green: 0.98, blue: 0.99, alpha: 1)),
+                Color(nsColor: NSColor(calibratedRed: 0.91, green: 0.94, blue: 0.96, alpha: 1))
+            ]
+        case .dark:
+            [
+                Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
+                Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
+            ]
+        @unknown default:
+            [
+                Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
+                Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
+            ]
+        }
     }
 }

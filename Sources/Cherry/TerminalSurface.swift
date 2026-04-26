@@ -178,12 +178,12 @@ struct TerminalSurfaceView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
         let containerView = GhosttyTerminalContainerView()
-        containerView.configure(with: session)
+        containerView.configure(with: session, colorScheme: context.environment.colorScheme)
         return containerView
     }
 
     func updateNSView(_ nsView: GhosttyTerminalContainerView, context: Context) {
-        nsView.configure(with: session)
+        nsView.configure(with: session, colorScheme: context.environment.colorScheme)
     }
 }
 

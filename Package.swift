@@ -25,6 +25,7 @@ let package = Package(
             dependencies: [
                 "CherryControl",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
+                .product(name: "GhosttyTheme", package: "libghostty-spm"),
             ]
         ),
         .executableTarget(

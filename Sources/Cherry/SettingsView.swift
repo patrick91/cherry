@@ -19,6 +19,30 @@ private struct TerminalSettingsPane: View {
 
     var body: some View {
         Form {
+            Section("Appearance") {
+                Picker("App appearance", selection: $settings.appearance) {
+                    ForEach(CherryAppearancePreference.allCases) { appearance in
+                        Text(appearance.label)
+                            .tag(appearance)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Section("Terminal Theme") {
+                GhosttyThemeNameField(
+                    title: "Light",
+                    name: $settings.lightTerminalThemeName,
+                    isKnown: settings.isKnownGhosttyTheme(settings.lightTerminalThemeName)
+                )
+
+                GhosttyThemeNameField(
+                    title: "Dark",
+                    name: $settings.darkTerminalThemeName,
+                    isKnown: settings.isKnownGhosttyTheme(settings.darkTerminalThemeName)
+                )
+            }
+
             Section("Text") {
                 SettingsSlider(
                     title: "Font size",
@@ -52,6 +76,26 @@ private struct TerminalSettingsPane: View {
         }
         .formStyle(.grouped)
         .padding(20)
+    }
+}
+
+private struct GhosttyThemeNameField: View {
+    let title: String
+    @Binding var name: String
+    let isKnown: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .frame(width: 140, alignment: .leading)
+
+            TextField("Ghostty theme name", text: $name)
+                .textFieldStyle(.roundedBorder)
+
+            Image(systemName: isKnown ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(isKnown ? .green : .orange)
+                .frame(width: 22)
+        }
     }
 }
 

@@ -1,5 +1,30 @@
-import Foundation
 import GhosttyTerminal
+import GhosttyTheme
+import SwiftUI
+
+enum CherryAppearancePreference: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var preferredColorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+}
 
 extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
@@ -21,6 +46,18 @@ final class TerminalSettings: ObservableObject {
         didSet { save(minimumContrast, forKey: Keys.minimumContrast) }
     }
 
+    @Published var appearance: CherryAppearancePreference {
+        didSet { save(appearance.rawValue, forKey: Keys.appearance) }
+    }
+
+    @Published var lightTerminalThemeName: String {
+        didSet { save(lightTerminalThemeName, forKey: Keys.lightTerminalThemeName) }
+    }
+
+    @Published var darkTerminalThemeName: String {
+        didSet { save(darkTerminalThemeName, forKey: Keys.darkTerminalThemeName) }
+    }
+
     private let defaults: UserDefaults
 
     private init(defaults: UserDefaults = .standard) {
@@ -28,44 +65,45 @@ final class TerminalSettings: ObservableObject {
         fontSize = defaults.object(forKey: Keys.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = defaults.object(forKey: Keys.cursorBlink) as? Bool ?? Defaults.cursorBlink
         minimumContrast = defaults.object(forKey: Keys.minimumContrast) as? Double ?? Defaults.minimumContrast
+        appearance = (defaults.object(forKey: Keys.appearance) as? String)
+            .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
+        lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
+            ?? Defaults.lightTerminalThemeName
+        darkTerminalThemeName = defaults.object(forKey: Keys.darkTerminalThemeName) as? String
+            ?? Defaults.darkTerminalThemeName
     }
 
     func resetTerminalAppearance() {
         fontSize = Defaults.fontSize
         cursorBlink = Defaults.cursorBlink
         minimumContrast = Defaults.minimumContrast
+        lightTerminalThemeName = Defaults.lightTerminalThemeName
+        darkTerminalThemeName = Defaults.darkTerminalThemeName
     }
 
     func ghosttyConfiguration() -> TerminalConfiguration {
-        TerminalConfiguration { builder in
+        return TerminalConfiguration { builder in
             builder.withFontFamily("SF Mono")
             builder.withFontSize(Float(fontSize))
             builder.withCursorStyle(.block)
             builder.withCursorStyleBlink(cursorBlink)
-            builder.withBackground("#121018")
-            builder.withForeground("#DCE4EC")
-            builder.withCursorColor("#92E6A7")
-            builder.withSelectionBackground("#363C4D")
             builder.withMinimumContrast(minimumContrast)
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
-            builder.withPalette(0, color: "#65717D")
-            builder.withPalette(1, color: "#EA5E5E")
-            builder.withPalette(2, color: "#94DE8A")
-            builder.withPalette(3, color: "#E8C76E")
-            builder.withPalette(4, color: "#7CB7F7")
-            builder.withPalette(5, color: "#D696F2")
-            builder.withPalette(6, color: "#6ED1DB")
-            builder.withPalette(7, color: "#CAD1DB")
-            builder.withPalette(8, color: "#8995A1")
-            builder.withPalette(9, color: "#FA8280")
-            builder.withPalette(10, color: "#ABF29E")
-            builder.withPalette(11, color: "#FADE85")
-            builder.withPalette(12, color: "#9FD0FF")
-            builder.withPalette(13, color: "#EBB0FC")
-            builder.withPalette(14, color: "#91EEF2")
-            builder.withPalette(15, color: "#F0F5FA")
         }
+    }
+
+    func ghosttyTheme() -> TerminalTheme {
+        TerminalTheme(
+            light: terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
+                .toTerminalConfiguration(),
+            dark: terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
+                .toTerminalConfiguration()
+        )
+    }
+
+    func isKnownGhosttyTheme(_ name: String) -> Bool {
+        GhosttyThemeCatalog.theme(named: name.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
     }
 
     private func save(_ value: Double, forKey key: String) {
@@ -78,6 +116,11 @@ final class TerminalSettings: ObservableObject {
         notifyChanged()
     }
 
+    private func save(_ value: String, forKey key: String) {
+        defaults.set(value, forKey: key)
+        notifyChanged()
+    }
+
     private func notifyChanged() {
         NotificationCenter.default.post(name: .terminalSettingsDidChange, object: self)
     }
@@ -86,11 +129,24 @@ final class TerminalSettings: ObservableObject {
         static let fontSize = 14.0
         static let cursorBlink = true
         static let minimumContrast = 1.15
+        static let appearance = CherryAppearancePreference.system
+        static let lightTerminalThemeName = "Alabaster"
+        static let darkTerminalThemeName = "Afterglow"
     }
 
     private enum Keys {
         static let fontSize = "terminal.fontSize"
         static let cursorBlink = "terminal.cursorBlink"
         static let minimumContrast = "terminal.minimumContrast"
+        static let appearance = "appearance.theme"
+        static let lightTerminalThemeName = "terminal.theme.light"
+        static let darkTerminalThemeName = "terminal.theme.dark"
+    }
+
+    private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return GhosttyThemeCatalog.theme(named: trimmedName)
+            ?? GhosttyThemeCatalog.theme(named: fallback)
+            ?? .afterglow
     }
 }

@@ -331,17 +331,22 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 private enum TerminalMetadataEvent: Equatable {
     case title(String)
     case workingDirectory(String)
+    case keyboardProtocolPush
+    case keyboardProtocolPop(Int)
+    case keyboardProtocolSet(Bool)
 }
 
 private final class TerminalMetadataParser {
     private enum ParserState {
         case ground
         case afterEscape
+        case csi
         case osc
         case oscAfterEscape
     }
 
     private static let maximumOSCBytes = 8_192
+    private static let maximumCSIBytes = 256
 
     private var state = ParserState.ground
     private var controlBuffer = [UInt8]()
@@ -360,8 +365,18 @@ private final class TerminalMetadataParser {
                 if byte == UInt8(ascii: "]") {
                     controlBuffer.removeAll(keepingCapacity: true)
                     state = .osc
+                } else if byte == UInt8(ascii: "[") {
+                    controlBuffer.removeAll(keepingCapacity: true)
+                    state = .csi
                 } else {
                     state = byte == 0x1B ? .afterEscape : .ground
+                }
+
+            case .csi:
+                if (0x40...0x7E).contains(byte) {
+                    finishCSI(finalByte: byte, events: &events)
+                } else {
+                    appendCSIByte(byte)
                 }
 
             case .osc:
@@ -390,6 +405,21 @@ private final class TerminalMetadataParser {
     private func appendOSCByte(_ byte: UInt8) {
         guard controlBuffer.count < Self.maximumOSCBytes else { return }
         controlBuffer.append(byte)
+    }
+
+    private func appendCSIByte(_ byte: UInt8) {
+        guard controlBuffer.count < Self.maximumCSIBytes else { return }
+        controlBuffer.append(byte)
+    }
+
+    private func finishCSI(finalByte: UInt8, events: inout [TerminalMetadataEvent]) {
+        let rawPayload = String(decoding: controlBuffer, as: UTF8.self)
+        if let event = Self.keyboardProtocolEvent(from: rawPayload, finalByte: finalByte) {
+            events.append(event)
+        }
+
+        controlBuffer.removeAll(keepingCapacity: true)
+        state = .ground
     }
 
     private func finishOSC(events: inout [TerminalMetadataEvent]) {
@@ -435,10 +465,37 @@ private final class TerminalMetadataParser {
         return nil
     }
 
+    private static func keyboardProtocolEvent(from rawPayload: String, finalByte: UInt8) -> TerminalMetadataEvent? {
+        guard finalByte == UInt8(ascii: "u"), let prefix = rawPayload.first else { return nil }
+
+        switch prefix {
+        case ">":
+            return .keyboardProtocolPush
+        case "<":
+            let count = Int(rawPayload.dropFirst().filter(\.isNumber)) ?? 1
+            return .keyboardProtocolPop(max(1, count))
+        case "=":
+            let flags = Int(rawPayload.dropFirst().filter(\.isNumber)) ?? 0
+            return .keyboardProtocolSet(flags > 0)
+        default:
+            return nil
+        }
+    }
+
     private static func sanitized(_ value: String) -> String {
         value
             .filter { !$0.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) } }
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum TerminalInputNormalizer {
+    static func normalize(_ data: Data, isEnhancedKeyboardProtocolActive: Bool) -> Data {
+        guard isEnhancedKeyboardProtocolActive, data == Data([0x09]) else {
+            return data
+        }
+
+        return Data("\u{1B}[9u".utf8)
     }
 }
 
@@ -601,6 +658,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var title: String
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
+    private(set) var isEnhancedKeyboardProtocolActive = false
 
     let subtitle: String
     let tint: NSColor
@@ -618,6 +676,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var traceRecorder: TerminalTraceRecorder?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
+    private var keyboardProtocolStackDepth = 0
     private var ghosttyBridgeStorage: GhosttySessionBridge?
 
     private static let defaultMaxScrollback = 50_000
@@ -711,11 +770,12 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func send(data: Data) {
         guard acceptsInput else { return }
+        let outboundData = normalizedInputData(data)
         if inputDebugEnabled {
-            let rendered = data.map { String(format: "%02x", $0) }.joined(separator: " ")
+            let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
         }
-        shellProcess?.write(data)
+        shellProcess?.write(outboundData)
     }
 
     func sendInterrupt() {
@@ -745,6 +805,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func stop() {
         let launchID = activeLaunchID
         activeLaunchID = nil
+        resetKeyboardProtocolState()
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
@@ -799,6 +860,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
+        resetKeyboardProtocolState()
         outputHoldUntil = nil
         processor.beginLaunch(launchID)
         resumeOutputIfPausedForInteraction()
@@ -856,6 +918,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         activeLaunchID = nil
         shellProcess = nil
+        resetKeyboardProtocolState()
         ghosttyBridgeStorage?.finish(exitCode: UInt32(max(status, 0)))
         outputHoldUntil = nil
         processor.endLaunch(launchID)
@@ -926,12 +989,33 @@ final class TerminalSession: ObservableObject, Identifiable {
                 guard workingDirectory != nextWorkingDirectory else { continue }
                 workingDirectory = nextWorkingDirectory
                 didChange = true
+
+            case .keyboardProtocolPush:
+                keyboardProtocolStackDepth += 1
+                isEnhancedKeyboardProtocolActive = true
+
+            case .keyboardProtocolPop(let count):
+                keyboardProtocolStackDepth = max(0, keyboardProtocolStackDepth - count)
+                isEnhancedKeyboardProtocolActive = keyboardProtocolStackDepth > 0
+
+            case .keyboardProtocolSet(let isActive):
+                keyboardProtocolStackDepth = isActive ? max(1, keyboardProtocolStackDepth) : 0
+                isEnhancedKeyboardProtocolActive = isActive
             }
         }
 
         if didChange {
             bumpRevision()
         }
+    }
+
+    private func normalizedInputData(_ data: Data) -> Data {
+        TerminalInputNormalizer.normalize(data, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive)
+    }
+
+    private func resetKeyboardProtocolState() {
+        keyboardProtocolStackDepth = 0
+        isEnhancedKeyboardProtocolActive = false
     }
 
     private var lineSummary: String {

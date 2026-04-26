@@ -59,6 +59,38 @@ import Testing
 }
 
 @MainActor
+@Test func terminalSessionTracksEnhancedKeyboardProtocol() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data("\u{1B}[>7u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == true)
+
+    session.ingestTestingData(Data("\u{1B}[<u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == false)
+
+    session.ingestTestingData(Data("\u{1B}[=1u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == true)
+
+    session.ingestTestingData(Data("\u{1B}[=0u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == false)
+}
+
+@Test func tabInputIsOnlyRewrittenForEnhancedKeyboardProtocol() async throws {
+    let tab = Data([0x09])
+    let enter = Data("\r".utf8)
+    let encodedTab = Data("\u{1B}[9u".utf8)
+
+    #expect(TerminalInputNormalizer.normalize(tab, isEnhancedKeyboardProtocolActive: false) == tab)
+    #expect(TerminalInputNormalizer.normalize(tab, isEnhancedKeyboardProtocolActive: true) == encodedTab)
+    #expect(TerminalInputNormalizer.normalize(enter, isEnhancedKeyboardProtocolActive: true) == enter)
+}
+
+@MainActor
 @Test func workspaceCanCreateBackgroundSession() async throws {
     let workspace = TerminalWorkspace()
     let initialSelection = workspace.selectedSessionID

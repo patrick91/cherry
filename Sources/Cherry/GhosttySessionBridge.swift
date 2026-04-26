@@ -277,6 +277,7 @@ final class GhosttyTerminalContainerView: NSView {
     private nonisolated(unsafe) var observers: [NSObjectProtocol] = []
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
+    private var pendingTerminalFocus = false
 
     override var acceptsFirstResponder: Bool {
         true
@@ -305,6 +306,7 @@ final class GhosttyTerminalContainerView: NSView {
             activeSession?.ghosttyBridge.detach(from: self)
             activeSession = session
             session.ghosttyBridge.attach(to: self)
+            requestTerminalFocus()
         } else {
             session.ghosttyBridge.attach(to: self)
         }
@@ -322,11 +324,7 @@ final class GhosttyTerminalContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         activeSession?.ghosttyBridge.attach(to: self)
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.activeSession?.ghosttyBridge.focus(in: self.window)
-        }
+        requestTerminalFocus()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -433,6 +431,21 @@ final class GhosttyTerminalContainerView: NSView {
                 self?.handleLiveScroll()
             }
         })
+    }
+
+    private func requestTerminalFocus() {
+        guard !pendingTerminalFocus else { return }
+        pendingTerminalFocus = true
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingTerminalFocus = false
+            guard let window = self.window else { return }
+            if !window.isKeyWindow {
+                window.makeKeyAndOrderFront(nil)
+            }
+            self.activeSession?.ghosttyBridge.focus(in: window)
+        }
     }
 
     private func handleScrollBoundsChange() {

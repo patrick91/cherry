@@ -11,8 +11,20 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
     @Binding var isSidebarHidden: Bool
-    @State private var sidebarWidth: CGFloat = 320
+    @AppStorage("sidebar.width") private var storedSidebarWidth: Double = 320
     @State private var isSidebarRevealed = false
+
+    private var sidebarWidth: CGFloat {
+        clampedSidebarWidth(CGFloat(storedSidebarWidth))
+    }
+
+    private var sidebarWidthBinding: Binding<CGFloat> {
+        Binding {
+            sidebarWidth
+        } set: { nextWidth in
+            storedSidebarWidth = Double(clampedSidebarWidth(nextWidth))
+        }
+    }
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -63,6 +75,9 @@ struct ContentView: View {
                 isSidebarRevealed = false
             }
         }
+        .onAppear {
+            storedSidebarWidth = Double(sidebarWidth)
+        }
     }
 
     private var dockedSidebar: some View {
@@ -95,12 +110,16 @@ struct ContentView: View {
 
     private var sidebarResizeHandle: some View {
         SidebarResizeHandle(
-            sidebarWidth: $sidebarWidth,
+            sidebarWidth: sidebarWidthBinding,
             minimumWidth: minimumSidebarWidth,
             maximumWidth: maximumSidebarWidth
         )
         .frame(width: 12)
         .frame(maxHeight: .infinity)
+    }
+
+    private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
+        min(max(width, minimumSidebarWidth), maximumSidebarWidth)
     }
 }
 

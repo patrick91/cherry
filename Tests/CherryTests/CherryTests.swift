@@ -101,6 +101,40 @@ import Testing
     #expect(workspace.sessions.contains(where: { $0.id == session.id }))
 }
 
+@Test func zshShellIntegrationBootstrapInstallsTitleHooks() async throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: temporaryDirectory)
+    }
+
+    let bootstrap = try #require(try ShellIntegrationBootstrap.prepare(
+        shellPath: "/bin/zsh",
+        homeDirectory: temporaryDirectory
+    ))
+
+    let integrationURL = URL(fileURLWithPath: bootstrap.zdotdir)
+        .appendingPathComponent("cherry-integration.zsh")
+    let integration = try String(contentsOf: integrationURL, encoding: .utf8)
+
+    #expect(integration.contains("add-zsh-hook preexec _cherry_preexec"))
+    #expect(integration.contains("add-zsh-hook precmd _cherry_precmd"))
+    #expect(integration.contains("\\e]2;"))
+
+    let syntaxCheck = Process()
+    syntaxCheck.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    syntaxCheck.arguments = ["-n", integrationURL.path]
+    try syntaxCheck.run()
+    syntaxCheck.waitUntilExit()
+    #expect(syntaxCheck.terminationStatus == 0)
+
+    let zshrcURL = URL(fileURLWithPath: bootstrap.zdotdir).appendingPathComponent(".zshrc")
+    let zshrc = try String(contentsOf: zshrcURL, encoding: .utf8)
+
+    #expect(zshrc.contains("source \"${CHERRY_BOOTSTRAP_ZDOTDIR}/cherry-integration.zsh\""))
+    #expect(zshrc.contains("CHERRY_ORIGINAL_ZDOTDIR"))
+}
+
 @Test func scrollbackIsBounded() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: 3)
     buffer.appendPlainLines(["one", "two", "three", "four"])

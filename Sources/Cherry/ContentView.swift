@@ -442,6 +442,9 @@ private struct SidebarTabsView: View {
                                     presentation: presentation,
                                     onSelect: { workspace.select(session) }
                                 )
+                                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
+                                    [session.id: anchor]
+                                }
                                 .contextMenu {
                                     Button("Restart") {
                                         session.restart()
@@ -478,6 +481,13 @@ private struct SidebarTabsView: View {
                 SidebarBackground(presentation: presentation)
             }
         }
+        .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
+            GeometryReader { geometry in
+                SidebarWindowDragRegion(
+                    excludedRects: rowBounds.values.map { geometry[$0].insetBy(dx: -4, dy: -3) }
+                )
+            }
+        }
     }
 
     // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the inner
@@ -485,6 +495,53 @@ private struct SidebarTabsView: View {
     private static let floatingOuterInset: CGFloat = 3
     private var dockedCompensation: CGFloat {
         presentation == .docked ? Self.floatingOuterInset : 0
+    }
+}
+
+private struct SidebarRowBoundsPreferenceKey: PreferenceKey {
+    static let defaultValue: [UUID: Anchor<CGRect>] = [:]
+
+    static func reduce(value: inout [UUID: Anchor<CGRect>], nextValue: () -> [UUID: Anchor<CGRect>]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, next in next })
+    }
+}
+
+private struct SidebarWindowDragRegion: NSViewRepresentable {
+    let excludedRects: [CGRect]
+
+    func makeNSView(context: Context) -> SidebarWindowDragRegionView {
+        let view = SidebarWindowDragRegionView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: SidebarWindowDragRegionView, context: Context) {
+        nsView.excludedRects = excludedRects
+    }
+}
+
+private final class SidebarWindowDragRegionView: NSView {
+    var excludedRects: [CGRect] = [] {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        guard !excludedRects.contains(where: { $0.contains(point) }) else { return nil }
+        return self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
     }
 }
 

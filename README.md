@@ -37,6 +37,18 @@ You can customize the destination/name if you want a separate dogfood build:
 CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
 ```
 
+By default the installer uses ad-hoc signing, which can make macOS privacy
+permissions reset after each rebuild because the code identity changes. To keep
+Desktop/Documents/etc. permissions stable, sign local builds with a persistent
+certificate:
+
+```bash
+CHERRY_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" Scripts/install-local-app
+```
+
+If you do not have an Apple development certificate, create a local code-signing
+certificate in Keychain Access and pass its common name as `CHERRY_CODESIGN_IDENTITY`.
+
 Inside the prototype:
 
 - Use the left rail to switch tabs.

@@ -6,6 +6,7 @@ CONFIGURATION="${CHERRY_CONFIGURATION:-release}"
 APP_NAME="${CHERRY_APP_NAME:-Cherry}"
 BUNDLE_ID="${CHERRY_BUNDLE_ID:-dev.patrick.cherry.local}"
 INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
+CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
 BUILD_DIR="$ROOT/.build/install"
 APP_PATH="$BUILD_DIR/$APP_NAME.app"
 INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
@@ -60,7 +61,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 PLIST
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_PATH" >/dev/null
+  codesign --force --deep --sign "$CODE_SIGN_IDENTITY" "$APP_PATH" >/dev/null
 fi
 
 mkdir -p "$INSTALL_DIR"

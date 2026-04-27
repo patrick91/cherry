@@ -13,6 +13,7 @@ struct ContentView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @Binding var isSidebarHidden: Bool
     @Binding var isSidebarRevealed: Bool
+    @Binding var isCursorOverSidebar: Bool
     @AppStorage("sidebar.width") private var storedSidebarWidth: Double = 320
     @State private var trafficLights = TrafficLightController()
 
@@ -119,6 +120,21 @@ struct ContentView: View {
                 withAnimation(.snappy(duration: 0.18)) {
                     isSidebarRevealed = false
                 }
+                // The docked sidebar's `.onHover` won't fire when it
+                // appears under a stationary cursor (NSTrackingArea fires on
+                // entry, not on becoming active). The cursor was just over
+                // the floating sidebar — so it's almost certainly over the
+                // new docked sidebar too. Mark it explicitly so a
+                // subsequent Cmd+S can switch back to floating without
+                // requiring a mouse wiggle.
+                isCursorOverSidebar = true
+            }
+            // The docked sidebar's `.onHover` only fires when its hit area
+            // is active, so once it's hidden it can't update this flag. Reset
+            // it so a stale `true` doesn't carry over and trigger the
+            // "switch to floating" branch on the next Cmd+S.
+            if hidden {
+                isCursorOverSidebar = false
             }
             syncTrafficLights()
         }
@@ -144,6 +160,13 @@ struct ContentView: View {
             .ignoresSafeArea(.all, edges: .top)
             .overlay(alignment: .trailing) {
                 sidebarResizeHandle
+            }
+            // Track whether the cursor is over the docked sidebar so that
+            // CherryApp's Cmd+S can decide between "hide" and "switch to
+            // floating-revealed" — we want the sidebar to stay open if the
+            // user is actively pointing at it when toggling.
+            .onHover { hovering in
+                isCursorOverSidebar = hovering
             }
     }
 

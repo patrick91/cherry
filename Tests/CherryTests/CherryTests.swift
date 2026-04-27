@@ -111,6 +111,26 @@ import Testing
 }
 
 @MainActor
+@Test func workspaceCanReorderSessions() async throws {
+    let workspace = TerminalWorkspace()
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let firstSession = try #require(workspace.sessions.first)
+    let secondSession = workspace.addSession(title: "Second")
+    let thirdSession = workspace.addSession(title: "Third")
+
+    workspace.moveSession(id: thirdSession.id, to: 0)
+
+    #expect(workspace.sessions.map(\.id) == [thirdSession.id, firstSession.id, secondSession.id])
+
+    workspace.moveSession(id: thirdSession.id, to: 99)
+
+    #expect(workspace.sessions.map(\.id) == [firstSession.id, secondSession.id, thirdSession.id])
+}
+
+@MainActor
 @Test func newSessionInheritsSelectedSessionWorkingDirectory() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -417,6 +417,9 @@ private struct SidebarTabsView: View {
     @ObservedObject var workspace: TerminalWorkspace
     let presentation: SidebarPresentation
 
+    @State private var draggedSessionID: UUID?
+    @State private var draggedRowOffsetY: CGFloat = 0
+
     var body: some View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
@@ -442,6 +445,8 @@ private struct SidebarTabsView: View {
                                     presentation: presentation,
                                     onSelect: { workspace.select(session) }
                                 )
+                                .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
+                                .zIndex(draggedSessionID == session.id ? 1 : 0)
                                 .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
                                     [session.id: anchor]
                                 }
@@ -483,8 +488,33 @@ private struct SidebarTabsView: View {
         }
         .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
             GeometryReader { geometry in
-                SidebarWindowDragRegion(
-                    excludedRects: rowBounds.values.map { geometry[$0].insetBy(dx: -4, dy: -3) }
+                SidebarInteractionOverlay(
+                    rows: workspace.sessions.compactMap { session in
+                        rowBounds[session.id].map { anchor in
+                            SidebarRowFrame(id: session.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
+                        }
+                    },
+                    onSelect: { sessionID in
+                        guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else { return }
+                        workspace.select(session)
+                    },
+                    onDragChanged: { sessionID, offsetY in
+                        draggedSessionID = sessionID
+                        draggedRowOffsetY = offsetY
+                    },
+                    onMove: { sessionID, targetIndex in
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            workspace.moveSession(id: sessionID, to: targetIndex)
+                        }
+                    },
+                    onDragEnded: {
+                        withAnimation(.snappy(duration: 0.16)) {
+                            draggedSessionID = nil
+                            draggedRowOffsetY = 0
+                        }
+                    }
                 )
             }
         }
@@ -506,26 +536,51 @@ private struct SidebarRowBoundsPreferenceKey: PreferenceKey {
     }
 }
 
-private struct SidebarWindowDragRegion: NSViewRepresentable {
-    let excludedRects: [CGRect]
+private struct SidebarRowFrame: Equatable {
+    let id: UUID
+    let rect: CGRect
+}
 
-    func makeNSView(context: Context) -> SidebarWindowDragRegionView {
-        let view = SidebarWindowDragRegionView()
+private struct SidebarInteractionOverlay: NSViewRepresentable {
+    let rows: [SidebarRowFrame]
+    let onSelect: (UUID) -> Void
+    let onDragChanged: (UUID, CGFloat) -> Void
+    let onMove: (UUID, Int) -> Void
+    let onDragEnded: () -> Void
+
+    func makeNSView(context: Context) -> SidebarInteractionOverlayView {
+        let view = SidebarInteractionOverlayView()
         updateNSView(view, context: context)
         return view
     }
 
-    func updateNSView(_ nsView: SidebarWindowDragRegionView, context: Context) {
-        nsView.excludedRects = excludedRects
+    func updateNSView(_ nsView: SidebarInteractionOverlayView, context: Context) {
+        nsView.rows = rows
+        nsView.onSelect = onSelect
+        nsView.onDragChanged = onDragChanged
+        nsView.onMove = onMove
+        nsView.onDragEnded = onDragEnded
     }
 }
 
-private final class SidebarWindowDragRegionView: NSView {
-    var excludedRects: [CGRect] = [] {
+private final class SidebarInteractionOverlayView: NSView {
+    var rows: [SidebarRowFrame] = [] {
         didSet {
-            needsDisplay = true
+            rows.sort { $0.rect.minY < $1.rect.minY }
+            if activeDragID == nil {
+                rowOrder = rows.map(\.id)
+            }
         }
     }
+    var onSelect: ((UUID) -> Void)?
+    var onDragChanged: ((UUID, CGFloat) -> Void)?
+    var onMove: ((UUID, Int) -> Void)?
+    var onDragEnded: (() -> Void)?
+
+    private var activeDragID: UUID?
+    private var dragStartY: CGFloat = 0
+    private var dragOffsetY: CGFloat = 0
+    private var rowOrder: [UUID] = []
 
     override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { true }
@@ -536,12 +591,96 @@ private final class SidebarWindowDragRegionView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard bounds.contains(point) else { return nil }
-        guard !excludedRects.contains(where: { $0.contains(point) }) else { return nil }
+
+        let eventType = NSApp.currentEvent?.type
+        guard eventType == .leftMouseDown || eventType == .leftMouseDragged else { return nil }
+
         return self
     }
 
     override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
+        let point = convert(event.locationInWindow, from: nil)
+
+        guard let row = row(at: point) else {
+            window?.performDrag(with: event)
+            return
+        }
+
+        activeDragID = row.id
+        dragStartY = point.y
+        dragOffsetY = 0
+        rowOrder = rows.map(\.id)
+        onSelect?(row.id)
+        onDragChanged?(row.id, 0)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let activeDragID else { return }
+
+        let point = convert(event.locationInWindow, from: nil)
+        dragOffsetY = point.y - dragStartY
+
+        reorderActiveRowIfNeeded()
+        onDragChanged?(activeDragID, dragOffsetY)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard activeDragID != nil else { return }
+
+        activeDragID = nil
+        dragStartY = 0
+        dragOffsetY = 0
+        rowOrder = rows.map(\.id)
+        onDragEnded?()
+    }
+
+    private func row(at point: CGPoint) -> SidebarRowFrame? {
+        rows.first { $0.rect.contains(point) }
+    }
+
+    private func reorderActiveRowIfNeeded() {
+        guard let activeDragID,
+              var currentIndex = rowOrder.firstIndex(of: activeDragID)
+        else {
+            return
+        }
+
+        let rowStep = estimatedRowStep()
+        var didMove = false
+
+        while dragOffsetY > rowStep / 2, currentIndex < rowOrder.count - 1 {
+            dragOffsetY -= rowStep
+            dragStartY += rowStep
+            rowOrder.remove(at: currentIndex)
+            currentIndex += 1
+            rowOrder.insert(activeDragID, at: currentIndex)
+            onMove?(activeDragID, currentIndex)
+            didMove = true
+        }
+
+        while dragOffsetY < -rowStep / 2, currentIndex > 0 {
+            dragOffsetY += rowStep
+            dragStartY -= rowStep
+            rowOrder.remove(at: currentIndex)
+            currentIndex -= 1
+            rowOrder.insert(activeDragID, at: currentIndex)
+            onMove?(activeDragID, currentIndex)
+            didMove = true
+        }
+
+        if didMove {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        }
+    }
+
+    private func estimatedRowStep() -> CGFloat {
+        let sortedRows = rows.sorted { $0.rect.minY < $1.rect.minY }
+        guard sortedRows.count > 1 else { return 46 }
+
+        let deltas = zip(sortedRows, sortedRows.dropFirst()).map { next, previous in
+            previous.rect.minY - next.rect.minY
+        }
+        return deltas.first(where: { $0 > 0 }) ?? 46
     }
 }
 

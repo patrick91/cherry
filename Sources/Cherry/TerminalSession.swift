@@ -575,6 +575,16 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = session.id
     }
 
+    func moveSession(id sessionID: UUID, to targetIndex: Int) {
+        guard let currentIndex = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+
+        let clampedIndex = min(max(targetIndex, 0), sessions.count - 1)
+        guard currentIndex != clampedIndex else { return }
+
+        let session = sessions.remove(at: currentIndex)
+        sessions.insert(session, at: clampedIndex)
+    }
+
     @discardableResult
     func addSession(
         title: String? = nil,

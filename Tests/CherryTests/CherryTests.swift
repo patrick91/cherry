@@ -56,6 +56,15 @@ import Testing
 
     session.ingestTestingData(Data("\u{1B}]7;file://localhost/tmp/cherry\u{7}".utf8))
     #expect(session.workingDirectory == "/tmp/cherry")
+
+    session.ingestTestingData(Data("\u{1B}]7;kitty-shell-cwd://localhost/tmp/cherry/kitty\u{7}".utf8))
+    #expect(session.workingDirectory == "/tmp/cherry/kitty")
+
+    session.ingestTestingData(Data("\u{1B}]7;kitty-shell-cwd://example.com/tmp/cherry/remote\u{7}".utf8))
+    #expect(session.workingDirectory == "/tmp/cherry/kitty")
+
+    session.ingestTestingData(Data("\u{1B}]7;/tmp/cherry/raw\u{7}".utf8))
+    #expect(session.workingDirectory == "/tmp/cherry/kitty")
 }
 
 @MainActor
@@ -101,6 +110,47 @@ import Testing
     #expect(workspace.sessions.contains(where: { $0.id == session.id }))
 }
 
+@MainActor
+@Test func newSessionInheritsSelectedSessionWorkingDirectory() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace()
+    let selectedSession = workspace.addSession(workingDirectory: directory.path)
+
+    let inheritedSession = workspace.addSession()
+
+    #expect(selectedSession.workingDirectory == directory.path)
+    #expect(inheritedSession.workingDirectory == directory.path)
+    #expect(inheritedSession.launchWorkingDirectory == directory.path)
+}
+
+@MainActor
+@Test func explicitWorkingDirectoryOverridesSelectedSessionDirectory() async throws {
+    let selectedDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let requestedDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: selectedDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: requestedDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: selectedDirectory)
+        try? FileManager.default.removeItem(at: requestedDirectory)
+    }
+
+    let workspace = TerminalWorkspace()
+    _ = workspace.addSession(workingDirectory: selectedDirectory.path)
+
+    let explicitSession = workspace.addSession(workingDirectory: requestedDirectory.path)
+
+    #expect(explicitSession.workingDirectory == requestedDirectory.path)
+    #expect(explicitSession.launchWorkingDirectory == requestedDirectory.path)
+}
+
 @Test func zshShellIntegrationBootstrapInstallsTitleHooks() async throws {
     let temporaryDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -118,8 +168,12 @@ import Testing
     let integration = try String(contentsOf: integrationURL, encoding: .utf8)
 
     #expect(integration.contains("add-zsh-hook preexec _cherry_preexec"))
+    #expect(integration.contains("add-zsh-hook chpwd _cherry_set_working_directory"))
     #expect(integration.contains("add-zsh-hook precmd _cherry_precmd"))
     #expect(integration.contains("\\e]2;"))
+    #expect(integration.contains("\\e]7;"))
+    #expect(integration.contains("kitty-shell-cwd://"))
+    #expect(integration.contains("_cherry_set_working_directory"))
 
     let syntaxCheck = Process()
     syntaxCheck.executableURL = URL(fileURLWithPath: "/bin/zsh")

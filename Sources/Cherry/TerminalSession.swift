@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
@@ -451,18 +452,73 @@ private final class TerminalMetadataParser {
     }
 
     private static func workingDirectoryEvent(from value: String) -> TerminalMetadataEvent? {
+        // Follow Ghostty's OSC 7 model: accept file:// and kitty-shell-cwd://
+        // cwd reports only when their host resolves to this machine.
+        if value.hasPrefix("kitty-shell-cwd://") {
+            return kittyShellWorkingDirectoryEvent(from: value)
+        }
+
         if value.hasPrefix("file://"),
            let url = URL(string: value),
-           url.isFileURL {
+           url.isFileURL,
+           let host = url.host(percentEncoded: false),
+           isLocalHost(host) {
             let path = url.path.removingPercentEncoding ?? url.path
             return path.isEmpty ? nil : .workingDirectory(path)
         }
 
-        if value.hasPrefix("/") {
-            return .workingDirectory(value)
+        return nil
+    }
+
+    private static func kittyShellWorkingDirectoryEvent(from value: String) -> TerminalMetadataEvent? {
+        let prefix = "kitty-shell-cwd://"
+        let remainder = value.dropFirst(prefix.count)
+        guard let pathStart = remainder.firstIndex(of: "/") else { return nil }
+
+        let host = String(remainder[..<pathStart])
+        let path = String(remainder[pathStart...])
+        guard isLocalHost(host), !path.isEmpty else { return nil }
+
+        return .workingDirectory(path)
+    }
+
+    private static func isLocalHost(_ host: String) -> Bool {
+        let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased()
+        guard !normalizedHost.isEmpty else { return false }
+
+        if normalizedHost == "localhost"
+            || normalizedHost == "127.0.0.1"
+            || normalizedHost == "::1" {
+            return true
         }
 
-        return nil
+        return localHostnames().contains(normalizedHost)
+    }
+
+    private static func localHostnames() -> Set<String> {
+        var names = Set<String>()
+
+        var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        if gethostname(&buffer, buffer.count) == 0 {
+            let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+            let hostname = String(decoding: bytes, as: UTF8.self).lowercased()
+            if !hostname.isEmpty {
+                names.insert(hostname)
+                if let shortName = hostname.split(separator: ".").first {
+                    names.insert(String(shortName))
+                }
+            }
+        }
+
+        if let localizedName = Host.current().localizedName?.lowercased(), !localizedName.isEmpty {
+            names.insert(localizedName)
+            if let shortName = localizedName.split(separator: ".").first {
+                names.insert(String(shortName))
+            }
+        }
+
+        return names
     }
 
     private static func keyboardProtocolEvent(from rawPayload: String, finalByte: UInt8) -> TerminalMetadataEvent? {
@@ -526,10 +582,13 @@ final class TerminalWorkspace: ObservableObject {
         command: String? = nil,
         select: Bool = true
     ) -> TerminalSession {
+        // Match Ghostty's new-surface behavior: when no cwd is requested,
+        // inherit the selected session's last trusted OSC 7 cwd report.
+        let resolvedWorkingDirectory = workingDirectory ?? selectedSession?.workingDirectory
         let session = Self.makeSession(
             index: sessions.count + 1,
             title: title,
-            workingDirectory: workingDirectory
+            workingDirectory: resolvedWorkingDirectory
         )
         sessions.append(session)
         if select {

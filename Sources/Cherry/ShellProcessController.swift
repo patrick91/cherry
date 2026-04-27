@@ -116,6 +116,17 @@ struct ShellIntegrationBootstrap {
                 print -n -- $'\\e]2;'"$title"$'\\a'
               }
 
+              _cherry_set_working_directory() {
+                emulate -L zsh
+                local directory="$PWD"
+                directory="${directory//$'\\e'/}"
+                directory="${directory//$'\\a'/}"
+                # Match Ghostty's shell integration: report cwd with OSC 7
+                # using the kitty-shell-cwd scheme, and report on both chpwd
+                # and precmd because commands may change cwd without chpwd.
+                print -n -- $'\\e]7;kitty-shell-cwd://'"$HOST$directory"$'\\a'
+              }
+
               _cherry_preexec() {
                 emulate -L zsh
                 _cherry_set_title "$1"
@@ -124,12 +135,15 @@ struct ShellIntegrationBootstrap {
               _cherry_precmd() {
                 emulate -L zsh
                 local directory="${PWD/#$HOME/~}"
+                _cherry_set_working_directory
                 _cherry_set_title "$directory"
               }
 
               autoload -Uz add-zsh-hook
               add-zsh-hook preexec _cherry_preexec
+              add-zsh-hook chpwd _cherry_set_working_directory
               add-zsh-hook precmd _cherry_precmd
+              _cherry_set_working_directory
             fi
             """
         )
@@ -365,6 +379,9 @@ final class ShellProcessController: @unchecked Sendable {
         if pid == 0 {
             _ = chdir(workingDirectory)
             _ = setenv("TERM", term, 1)
+            // Keep PWD aligned with the inherited cwd, matching Ghostty's
+            // launch behavior so shells preserve user-facing directory text.
+            _ = setenv("PWD", workingDirectory, 1)
             _ = setenv("TERM_PROGRAM", "Cherry", 1)
             _ = setenv("COLORTERM", "truecolor", 1)
             _ = setenv("INSIDE_CHERRY", "1", 1)

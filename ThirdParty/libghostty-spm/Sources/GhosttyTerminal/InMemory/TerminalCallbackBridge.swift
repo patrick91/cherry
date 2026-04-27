@@ -64,6 +64,30 @@ final class TerminalCallbackBridge {
             (delegate as? any TerminalSurfaceScrollbarDelegate)?
                 .terminalDidUpdateScrollbar(metrics)
 
+        case GHOSTTY_ACTION_MOUSE_SHAPE:
+            guard let style = TerminalPointerStyle(action.action.mouse_shape) else { return }
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=mouse_shape style=\(style)"
+            )
+            (delegate as? any TerminalSurfacePointerDelegate)?
+                .terminalDidChangePointerStyle(style)
+
+        case GHOSTTY_ACTION_MOUSE_OVER_LINK:
+            let link = action.action.mouse_over_link
+            let url: String?
+            if link.len > 0, let buffer = link.url {
+                url = String(data: Data(bytes: buffer, count: link.len), encoding: .utf8)
+            } else {
+                url = nil
+            }
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=mouse_over_link url=\(TerminalDebugLog.describe(url ?? ""))"
+            )
+            (delegate as? any TerminalSurfaceLinkHoverDelegate)?
+                .terminalDidHoverLink(url)
+
         case GHOSTTY_ACTION_CONFIG_CHANGE:
             // Colors/theme may have changed (e.g. on system appearance
             // toggle). Ghostty applies the new config internally but won't

@@ -68,7 +68,8 @@ private final class GhosttySessionProxy: @unchecked Sendable {
 
 @MainActor
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
-    TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate
+    TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
+    TerminalSurfaceLinkHoverDelegate
 {
     let terminalView: TerminalView
 
@@ -83,6 +84,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private(set) var gridMetrics: TerminalGridMetrics?
     private(set) var scrollbarMetrics: TerminalScrollbarMetrics?
     private weak var scrollContainer: GhosttyTerminalContainerView?
+    private var pointerStyle: TerminalPointerStyle = .text
+    private var hoveredLink: String?
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -165,6 +168,16 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
         scrollbarMetrics = metrics
         scrollContainer?.synchronizeScrollState()
+    }
+
+    func terminalDidChangePointerStyle(_ style: TerminalPointerStyle) {
+        pointerStyle = style
+        updateTerminalPointerStyle()
+    }
+
+    func terminalDidHoverLink(_ url: String?) {
+        hoveredLink = url
+        updateTerminalPointerStyle()
     }
 
     deinit {
@@ -257,6 +270,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             controller.setColorScheme(terminalColorScheme(from: activeColorScheme))
         }
         terminalView.fitToSize()
+    }
+
+    private func updateTerminalPointerStyle() {
+        scrollContainer?.setTerminalPointerStyle(hoveredLink == nil ? pointerStyle : .pointingHand)
     }
 
     private func terminalColorScheme(from colorScheme: ColorScheme) -> TerminalColorScheme {
@@ -370,6 +387,12 @@ final class GhosttyTerminalContainerView: NSView {
 
         scrollView.reflectScrolledClipView(scrollView.contentView)
         synchronizeTerminalFrame(terminalView)
+    }
+
+    func setTerminalPointerStyle(_ style: TerminalPointerStyle) {
+        let cursor = style.nsCursor
+        scrollView.documentCursor = cursor
+        cursor.set()
     }
 
     private func configureScrollView() {
@@ -520,6 +543,67 @@ final class GhosttyTerminalContainerView: NSView {
             ?? NSScreen.main?.backingScaleFactor
             ?? 2
         return CGFloat(metrics.cellHeightPixels) / scale
+    }
+}
+
+private extension TerminalPointerStyle {
+    var nsCursor: NSCursor {
+        switch self {
+        case .arrow:
+            .arrow
+        case .text:
+            .iBeam
+        case .verticalText:
+            .iBeamCursorForVerticalLayout
+        case .pointingHand:
+            .pointingHand
+        case .openHand:
+            .openHand
+        case .closedHand:
+            .closedHand
+        case .resizeLeft:
+            if #available(macOS 15.0, *) {
+                .columnResize(directions: .left)
+            } else {
+                .resizeLeft
+            }
+        case .resizeRight:
+            if #available(macOS 15.0, *) {
+                .columnResize(directions: .right)
+            } else {
+                .resizeRight
+            }
+        case .resizeUp:
+            if #available(macOS 15.0, *) {
+                .rowResize(directions: .up)
+            } else {
+                .resizeUp
+            }
+        case .resizeDown:
+            if #available(macOS 15.0, *) {
+                .rowResize(directions: .down)
+            } else {
+                .resizeDown
+            }
+        case .resizeUpDown:
+            if #available(macOS 15.0, *) {
+                .rowResize
+            } else {
+                .resizeUpDown
+            }
+        case .resizeLeftRight:
+            if #available(macOS 15.0, *) {
+                .columnResize
+            } else {
+                .resizeLeftRight
+            }
+        case .contextualMenu:
+            .contextualMenu
+        case .crosshair:
+            .crosshair
+        case .operationNotAllowed:
+            .operationNotAllowed
+        }
     }
 }
 

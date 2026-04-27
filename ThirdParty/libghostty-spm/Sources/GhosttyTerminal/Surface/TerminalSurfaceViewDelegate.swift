@@ -48,6 +48,71 @@ public protocol TerminalSurfaceScrollbarDelegate: TerminalSurfaceViewDelegate {
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics)
 }
 
+public enum TerminalPointerStyle: Sendable, Equatable {
+    case arrow
+    case text
+    case verticalText
+    case pointingHand
+    case openHand
+    case closedHand
+    case resizeLeft
+    case resizeRight
+    case resizeUp
+    case resizeDown
+    case resizeUpDown
+    case resizeLeftRight
+    case contextualMenu
+    case crosshair
+    case operationNotAllowed
+
+    init?(_ rawValue: ghostty_action_mouse_shape_e) {
+        switch rawValue {
+        case GHOSTTY_MOUSE_SHAPE_DEFAULT:
+            self = .arrow
+        case GHOSTTY_MOUSE_SHAPE_TEXT:
+            self = .text
+        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT:
+            self = .verticalText
+        case GHOSTTY_MOUSE_SHAPE_POINTER:
+            self = .pointingHand
+        case GHOSTTY_MOUSE_SHAPE_GRAB:
+            self = .openHand
+        case GHOSTTY_MOUSE_SHAPE_GRABBING:
+            self = .closedHand
+        case GHOSTTY_MOUSE_SHAPE_W_RESIZE:
+            self = .resizeLeft
+        case GHOSTTY_MOUSE_SHAPE_E_RESIZE:
+            self = .resizeRight
+        case GHOSTTY_MOUSE_SHAPE_N_RESIZE:
+            self = .resizeUp
+        case GHOSTTY_MOUSE_SHAPE_S_RESIZE:
+            self = .resizeDown
+        case GHOSTTY_MOUSE_SHAPE_NS_RESIZE:
+            self = .resizeUpDown
+        case GHOSTTY_MOUSE_SHAPE_EW_RESIZE:
+            self = .resizeLeftRight
+        case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU:
+            self = .contextualMenu
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+            self = .crosshair
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED:
+            self = .operationNotAllowed
+        default:
+            return nil
+        }
+    }
+}
+
+@MainActor
+public protocol TerminalSurfacePointerDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidChangePointerStyle(_ style: TerminalPointerStyle)
+}
+
+@MainActor
+public protocol TerminalSurfaceLinkHoverDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidHoverLink(_ url: String?)
+}
+
 @MainActor
 public protocol TerminalSurfaceFocusDelegate: TerminalSurfaceViewDelegate {
     func terminalDidChangeFocus(_ focused: Bool)

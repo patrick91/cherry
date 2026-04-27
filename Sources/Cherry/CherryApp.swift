@@ -54,11 +54,16 @@ struct CherryApp: App {
     @StateObject private var workspace = TerminalWorkspace()
     @StateObject private var terminalSettings = TerminalSettings.shared
     @State private var isSidebarHidden = false
+    @State private var isSidebarRevealed = false
     @State private var controlServer: CherryControlServer?
 
     var body: some Scene {
         WindowGroup("Cherry") {
-            ContentView(workspace: workspace, isSidebarHidden: $isSidebarHidden)
+            ContentView(
+                workspace: workspace,
+                isSidebarHidden: $isSidebarHidden,
+                isSidebarRevealed: $isSidebarRevealed
+            )
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
                     guard controlServer == nil else { return }
@@ -72,7 +77,19 @@ struct CherryApp: App {
         .commands {
             CommandMenu("Prototype") {
                 Button(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar") {
-                    isSidebarHidden.toggle()
+                    // Decide animation based on floating-revealed state:
+                    //  - Revealed → toggle without `withAnimation` so the
+                    //    docked sidebar snaps into place behind the floating
+                    //    fade-out (handled in ContentView).
+                    //  - Not revealed → wrap in `withAnimation` so the
+                    //    normal slide-in/slide-out plays.
+                    if isSidebarRevealed {
+                        isSidebarHidden.toggle()
+                    } else {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            isSidebarHidden.toggle()
+                        }
+                    }
                 }
                 .keyboardShortcut("s")
 

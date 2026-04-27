@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct ContentView: View {
@@ -11,8 +12,9 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
     @Binding var isSidebarHidden: Bool
+    @Binding var isSidebarRevealed: Bool
     @AppStorage("sidebar.width") private var storedSidebarWidth: Double = 320
-    @State private var isSidebarRevealed = false
+    @State private var trafficLights = TrafficLightController()
 
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
@@ -28,40 +30,61 @@ struct ContentView: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
+            // The overlay sits at the bottom of the z-stack on purpose.
+            // Native AppKit traffic-light buttons render above all SwiftUI
+            // content via the window's titlebar, so visual layering is
+            // unaffected — but keeping the representable behind the hover
+            // strip prevents any chance of it intercepting hover events
+            // (which we observed happening in maximized/fullscreen windows
+            // even with `.allowsHitTesting(false)` applied).
+            TrafficLightOverlay(controller: trafficLights)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea(.all, edges: .top)
+                .allowsHitTesting(false)
+
             HStack(spacing: 0) {
-                if !isSidebarHidden {
-                    dockedSidebar
-                }
+                dockedSidebarSlot
 
                 DetailPaneView(workspace: workspace, includeLeadingPadding: isSidebarHidden)
                     .ignoresSafeArea(.all, edges: .top)
             }
 
-            if isSidebarHidden {
-                floatingSidebar
-                    .offset(x: isSidebarRevealed ? 0 : -(sidebarWidth + floatingSidebarLeadingInset))
-                    .opacity(isSidebarRevealed ? 1 : 0)
-                    .allowsHitTesting(isSidebarRevealed)
+            // The floating sidebar is always in the tree so a `(hidden,
+            // revealed) → Cmd+S` transition can fade it out *in place* while
+            // the docked sidebar grows in behind it. If it were gated on
+            // `isSidebarHidden` it would be removed mid-transition and the
+            // user would see the jarring slide-off + slide-in.
+            floatingSidebar
+                // Only slide off-screen when the sidebar is BOTH hidden and
+                // not revealed. When transitioning to `shown`, the offset
+                // stays at 0 so the sidebar fades out without sliding.
+                .offset(
+                    x: (isSidebarHidden && !isSidebarRevealed)
+                        ? -(sidebarWidth + floatingSidebarLeadingInset)
+                        : 0
+                )
+                .opacity(isSidebarRevealed ? 1 : 0)
+                .allowsHitTesting(isSidebarRevealed)
 
-                Rectangle()
-                    .fill(Color.black.opacity(0.001))
-                    .frame(width: 14)
+            if isSidebarHidden {
+                // Wider hot-zone (24pt) avoids the macOS fullscreen edge
+                // gestures that reserve the leftmost few pixels. Using
+                // `.contentShape` + `onContinuousHover` is more robust than
+                // a near-transparent `Rectangle` + `onHover`, whose
+                // NSTrackingArea has been observed to go stale on window
+                // resize / fullscreen transitions.
+                Color.clear
+                    .frame(width: 24)
                     .ignoresSafeArea(.all, edges: .vertical)
-                    .onHover { hovering in
-                        if hovering {
-                            isSidebarRevealed = true
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        if case .active = phase, !isSidebarRevealed {
+                            withAnimation(.snappy(duration: 0.18)) {
+                                isSidebarRevealed = true
+                            }
                         }
                     }
             }
-
-            NativeWindowControlsOverlay(
-                isVisible: !isSidebarHidden || isSidebarRevealed,
-                sidebarWidth: sidebarWidth,
-                leadingOffset: isSidebarHidden ? floatingSidebarLeadingInset : 0,
-                topOffset: isSidebarHidden ? floatingSidebarTopInset : 0
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea(.all, edges: .top)
         }
         .ignoresSafeArea(.all, edges: .top)
         .background {
@@ -71,15 +94,47 @@ struct ContentView: View {
         .background(AppShortcutMonitor(workspace: workspace, openSettings: { openSettings() }))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
-        .animation(.snappy(duration: 0.18), value: isSidebarHidden)
-        .animation(.snappy(duration: 0.16), value: isSidebarRevealed)
+        // The Animatable modifier MUST be inside the `.animation(...)` scope:
+        // SwiftUI only calls `animatableData.set` when a transaction is in
+        // play, and `.animation(...)` only creates one for views *within* its
+        // scope. If the modifier sat outside, hover-driven state changes
+        // would skip the setter entirely and the controller would stay stale.
+        .modifier(ChromeWidthAnimator(
+            dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
+            floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+            sidebarWidth: sidebarWidth,
+            controller: trafficLights
+        ))
+        // No `.animation(value: isSidebarHidden)` here — the toggle in
+        // CherryApp wraps in `withAnimation` only when the floating sidebar
+        // is NOT revealed. When it IS revealed, the toggle is unwrapped, so
+        // the docked + pane snap into place behind the floating's fade-out
+        // (driven by the `.animation(value: isSidebarRevealed)` below).
+        .animation(.snappy(duration: 0.18), value: isSidebarRevealed)
         .onChange(of: isSidebarHidden) { _, hidden in
-            if !hidden {
-                isSidebarRevealed = false
+            // When toggling from `(hidden, revealed)` to `shown`, dismiss
+            // the floating sidebar within the same animation so it fades
+            // out in place while the docked sidebar grows in.
+            if !hidden, isSidebarRevealed {
+                withAnimation(.snappy(duration: 0.18)) {
+                    isSidebarRevealed = false
+                }
             }
+            syncTrafficLights()
+        }
+        .onChange(of: isSidebarRevealed) { _, _ in
+            syncTrafficLights()
+        }
+        .onChange(of: sidebarWidth) { _, _ in
+            syncTrafficLights()
         }
         .onAppear {
             storedSidebarWidth = Double(sidebarWidth)
+            trafficLights.seedTarget(
+                docked: isSidebarHidden ? 0 : sidebarWidth,
+                floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+                sidebarWidth: sidebarWidth
+            )
         }
     }
 
@@ -90,6 +145,29 @@ struct ContentView: View {
             .overlay(alignment: .trailing) {
                 sidebarResizeHandle
             }
+    }
+
+    private var dockedSidebarSlot: some View {
+        dockedSidebar
+            // .trailing pins the sidebar's content to the slot's right edge
+            // as the slot's width animates from `sidebarWidth → 0`. As the
+            // right edge slides left, the contents (and the traffic lights
+            // riding on top) translate left in lockstep — Dia's behavior.
+            .frame(width: isSidebarHidden ? 0 : sidebarWidth, alignment: .trailing)
+            .clipped()
+            .allowsHitTesting(!isSidebarHidden)
+            // Explicit local .animation for the frame width change. It's
+            // conditional on `isSidebarRevealed` because when handing off
+            // from the floating sidebar, we want the docked slot to snap
+            // into place behind the floating fade-out (matching the
+            // unwrapped toggle in CherryApp). Without this modifier, the
+            // frame change relies entirely on `withAnimation`, but in
+            // practice that doesn't reliably drive the slide animation
+            // through the binding chain — making it explicit fixes it.
+            .animation(
+                isSidebarRevealed ? nil : .snappy(duration: 0.18),
+                value: isSidebarHidden
+            )
     }
 
     private var floatingSidebar: some View {
@@ -105,8 +183,10 @@ struct ContentView: View {
             .padding(.bottom, floatingSidebarBottomInset)
             .ignoresSafeArea(.all, edges: .top)
             .onHover { hovering in
-                if !hovering {
-                    isSidebarRevealed = false
+                if !hovering, isSidebarRevealed {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        isSidebarRevealed = false
+                    }
                 }
             }
     }
@@ -119,6 +199,18 @@ struct ContentView: View {
         )
         .frame(width: 12)
         .frame(maxHeight: .infinity)
+    }
+
+    // Belt-and-suspenders: SwiftUI's Animatable setter only fires inside an
+    // animation transaction, and the modifier's `body` side effect can be
+    // skipped by SwiftUI's render diffing. Calling this from every
+    // `.onChange(...)` guarantees the controller catches the new state.
+    private func syncTrafficLights() {
+        trafficLights.update(
+            docked: isSidebarHidden ? 0 : sidebarWidth,
+            floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+            sidebarWidth: sidebarWidth
+        )
     }
 
     private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
@@ -359,66 +451,149 @@ private struct SidebarTabsView: View {
     }
 }
 
-private struct NativeWindowControlsOverlay: NSViewRepresentable {
-    let isVisible: Bool
+// Drives the traffic-light mask in lockstep with SwiftUI's own animation
+// timeline. Because `animatableData` is interpolated by SwiftUI itself, the
+// mask edge tracks the pane edge frame-by-frame instead of running on a
+// separate Core Animation clock with a different curve.
+@MainActor
+private struct ChromeWidthAnimator: ViewModifier, @preconcurrency Animatable {
+    var dockedWidth: CGFloat
+    var floatingWidth: CGFloat
     let sidebarWidth: CGFloat
-    let leadingOffset: CGFloat
-    let topOffset: CGFloat
+    let controller: TrafficLightController
 
-    func makeNSView(context: Context) -> NativeWindowControlsOverlayView {
-        let view = NativeWindowControlsOverlayView()
-        updateNSView(view, context: context)
-        return view
-    }
-
-    func updateNSView(_ nsView: NativeWindowControlsOverlayView, context: Context) {
-        nsView.isControlsVisible = isVisible
-        nsView.sidebarWidth = sidebarWidth
-        nsView.leadingOffset = leadingOffset
-        nsView.topOffset = topOffset
-        DispatchQueue.main.async {
-            nsView.attachWindowButtons()
-            nsView.updateControlsPosition(animated: true)
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(dockedWidth, floatingWidth) }
+        set {
+            dockedWidth = newValue.first
+            floatingWidth = newValue.second
+            controller.update(
+                docked: newValue.first,
+                floating: newValue.second,
+                sidebarWidth: sidebarWidth
+            )
         }
     }
 
-    static func dismantleNSView(_ nsView: NativeWindowControlsOverlayView, coordinator: ()) {
-        nsView.restoreWindowButtons()
+    func body(content: Content) -> some View {
+        // SwiftUI only invokes `animatableData.set` while an animation
+        // transaction is active. When `.animation(...)` resolves to `nil`
+        // (e.g., the floating → docked snap), the setter is skipped and the
+        // controller would otherwise hold the previous values forever — so
+        // the buttons stay at their old translation. Pushing the current
+        // values from `body` keeps the controller in sync regardless of
+        // whether an animation is in scope. During a real animation the
+        // setter still runs and overrides this with interpolated values
+        // each tick, so the body update is harmless in that case.
+        controller.update(
+            docked: dockedWidth,
+            floating: floatingWidth,
+            sidebarWidth: sidebarWidth
+        )
+        return content
     }
 }
 
-private final class NativeWindowControlsOverlayView: NSView {
-    var isControlsVisible = true
-    var sidebarWidth: CGFloat = 320
-    var leadingOffset: CGFloat = 0
-    var topOffset: CGFloat = 0
+@MainActor
+final class TrafficLightController {
+    fileprivate weak var view: TrafficLightOverlayView?
+    private var lastDocked: CGFloat = 0
+    private var lastFloating: CGFloat = 0
+    private var lastSidebarWidth: CGFloat = 320
+
+    fileprivate func attach(_ view: TrafficLightOverlayView) {
+        self.view = view
+        applyCurrent()
+    }
+
+    fileprivate func detach(_ view: TrafficLightOverlayView) {
+        guard self.view === view else { return }
+        self.view = nil
+    }
+
+    func seedTarget(docked: CGFloat, floating: CGFloat, sidebarWidth: CGFloat) {
+        lastDocked = docked
+        lastFloating = floating
+        lastSidebarWidth = sidebarWidth
+        applyCurrent()
+    }
+
+    func update(docked: CGFloat, floating: CGFloat, sidebarWidth: CGFloat) {
+        lastDocked = docked
+        lastFloating = floating
+        lastSidebarWidth = sidebarWidth
+        applyCurrent()
+    }
+
+    // Translation matches the sidebar's contents: when the sidebar is fully
+    // collapsed (chrome = 0), the buttons have shifted by -sidebarWidth, the
+    // same distance the sidebar's right-aligned contents have shifted. When
+    // the sidebar is wider than `sidebarWidth` (e.g. floating sidebar reveal
+    // overshooting by `floatingSidebarLeadingInset`), translation clamps to 0.
+    private func applyCurrent() {
+        let chrome = max(lastDocked, lastFloating)
+        let translationX = min(0, chrome - lastSidebarWidth)
+        view?.applyButtonTranslation(translationX)
+    }
+}
+
+private struct TrafficLightOverlay: NSViewRepresentable {
+    let controller: TrafficLightController
+
+    func makeNSView(context: Context) -> TrafficLightOverlayView {
+        let view = TrafficLightOverlayView()
+        view.controller = controller
+        return view
+    }
+
+    func updateNSView(_ nsView: TrafficLightOverlayView, context: Context) {
+        nsView.controller = controller
+        nsView.repositionButtons()
+    }
+
+    static func dismantleNSView(_ nsView: TrafficLightOverlayView, coordinator: ()) {
+        nsView.restore()
+    }
+}
+
+private final class TrafficLightOverlayView: NSView {
+    weak var controller: TrafficLightController? {
+        didSet {
+            if oldValue !== controller {
+                oldValue?.detach(self)
+                controller?.attach(self)
+            }
+        }
+    }
 
     private let leftInset: CGFloat = 18
     private let topInset: CGFloat = 18
     private let buttonSpacing: CGFloat = 20
-    private weak var originalSuperview: NSView?
+
     private var hostedButtons: [NSButton] = []
-    private var didAttachButtons = false
-    private var lastButtonOrigins: [NSPoint] = []
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
+    private weak var attachedWindow: NSWindow?
+    private var lastTranslationX: CGFloat = 0
+    private var windowObservers: Set<AnyCancellable> = []
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        attachWindowButtons()
-        updateControlsPosition(animated: false)
+        // The window can change (or become nil) across fullscreen transitions
+        // and other AppKit lifecycle events. Force a re-attach to make sure
+        // hostedButtons references are pointing at the *current* window's
+        // standard buttons, not stale ones from the previous window.
+        if window !== attachedWindow {
+            hostedButtons = []
+            attachedWindow = window
+            registerWindowObservers()
+        }
+        attachWindowButtonsIfNeeded()
+        applyButtonTranslation(lastTranslationX)
+        controller?.attach(self)
     }
 
     override func layout() {
         super.layout()
-        updateControlsPosition(animated: false)
+        applyButtonTranslation(lastTranslationX)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -426,8 +601,47 @@ private final class NativeWindowControlsOverlayView: NSView {
     }
 
     @MainActor
-    func attachWindowButtons() {
+    private func registerWindowObservers() {
+        windowObservers.removeAll()
+
         guard let window else { return }
+
+        // Re-apply our translation after AppKit-driven window state changes
+        // — these are the moments when the standard buttons can get moved
+        // back to default by AppKit's titlebar layout.
+        let names: [NSNotification.Name] = [
+            NSWindow.didResizeNotification,
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification
+        ]
+
+        for name in names {
+            NotificationCenter.default.publisher(for: name, object: window)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.refreshButtonState()
+                    }
+                }
+                .store(in: &windowObservers)
+        }
+    }
+
+    @MainActor
+    private func refreshButtonState() {
+        // Drop stale references and re-resolve from the window. AppKit may
+        // have re-parented the buttons during the state change.
+        hostedButtons = []
+        attachWindowButtonsIfNeeded()
+        applyButtonTranslation(lastTranslationX)
+    }
+
+    @MainActor
+    private func attachWindowButtonsIfNeeded() {
+        guard hostedButtons.isEmpty, let window else { return }
 
         let buttons = [
             window.standardWindowButton(.closeButton),
@@ -437,69 +651,77 @@ private final class NativeWindowControlsOverlayView: NSView {
 
         guard buttons.count == 3 else { return }
 
-        if originalSuperview == nil {
-            originalSuperview = buttons.first?.superview
-        }
-
         hostedButtons = buttons
+        configureButtons()
+    }
 
-        for button in buttons {
+    @MainActor
+    private func configureButtons() {
+        // Re-apply each call: AppKit can reset autoresizingMask / isHidden
+        // during window state transitions, which would otherwise let the
+        // buttons drift back to default position or vanish entirely.
+        for button in hostedButtons {
             button.autoresizingMask = []
             button.isHidden = false
+            button.wantsLayer = true
+            button.layer?.mask = nil
+        }
+    }
+
+    @MainActor
+    func repositionButtons() {
+        applyButtonTranslation(lastTranslationX)
+    }
+
+    // Place the native traffic-light buttons at their standard top-left
+    // position, shifted horizontally by `translationX`. SwiftUI's animation
+    // clock drives this value frame-by-frame via `TrafficLightController`,
+    // so the buttons slide in lockstep with the sidebar collapsing.
+    @MainActor
+    func applyButtonTranslation(_ translationX: CGFloat) {
+        attachWindowButtonsIfNeeded()
+        lastTranslationX = translationX
+
+        guard !hostedButtons.isEmpty,
+              let parent = hostedButtons.first?.superview
+        else {
+            return
         }
 
-        didAttachButtons = true
-    }
+        // Reassert these every call — AppKit can flip them during titlebar
+        // layout changes (key/non-key, fullscreen, etc.).
+        configureButtons()
 
-    @MainActor
-    func restoreWindowButtons() {
-        hostedButtons = []
-        didAttachButtons = false
-        lastButtonOrigins = []
-    }
-
-    @MainActor
-    func updateControlsPosition(animated: Bool) {
-        guard didAttachButtons, let originalSuperview else { return }
-
-        let visibleX = leadingOffset + leftInset
-        let controlWidth = buttonSpacing * CGFloat(max(hostedButtons.count - 1, 0)) + (hostedButtons.last?.frame.width ?? 14)
+        let baseX = leftInset + translationX
         let controlHeight = hostedButtons.map(\.frame.height).max() ?? 14
-        let hiddenX = visibleX - max(sidebarWidth + leadingOffset, controlWidth + visibleX)
-        let targetX = isControlsVisible ? visibleX : hiddenX
-        let targetY = bounds.height - topOffset - topInset - controlHeight
-        let targetRect = convert(
-            NSRect(
-                x: targetX,
-                y: max(0, targetY),
-                width: controlWidth,
-                height: controlHeight
-            ),
-            to: originalSuperview
+        let targetY = bounds.height - topInset - controlHeight
+        let originInParent = convert(
+            NSPoint(x: baseX, y: max(0, targetY)),
+            to: parent
         )
-        let targetOrigins = hostedButtons.enumerated().map { index, button in
-            NSPoint(
-                x: targetRect.minX + CGFloat(index) * buttonSpacing,
-                y: targetRect.minY + (controlHeight - button.frame.height) / 2
-            )
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        for (index, button) in hostedButtons.enumerated() {
+            button.setFrameOrigin(NSPoint(
+                x: originInParent.x + CGFloat(index) * buttonSpacing,
+                y: originInParent.y + (controlHeight - button.frame.height) / 2
+            ))
         }
 
-        let shouldAnimate = animated && !lastButtonOrigins.isEmpty && lastButtonOrigins != targetOrigins
-        lastButtonOrigins = targetOrigins
+        CATransaction.commit()
+    }
 
-        if shouldAnimate {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.16
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                for (button, origin) in zip(hostedButtons, targetOrigins) {
-                    button.animator().setFrameOrigin(origin)
-                }
-            }
-        } else {
-            for (button, origin) in zip(hostedButtons, targetOrigins) {
-                button.setFrameOrigin(origin)
-            }
+    @MainActor
+    func restore() {
+        for button in hostedButtons {
+            button.layer?.mask = nil
+            button.isEnabled = true
+            button.isHidden = false
         }
+        hostedButtons = []
+        controller?.detach(self)
     }
 }
 

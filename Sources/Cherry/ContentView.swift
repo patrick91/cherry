@@ -438,9 +438,16 @@ private struct SidebarTabsView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.top, 48)
-                .padding(.bottom, 10)
+                // The floating sidebar's outer wrapper adds 3pt leading/top/
+                // bottom inset (`floatingSidebarLeadingInset` etc.). The
+                // docked sidebar has no such outer wrapper, so without
+                // compensation the content sits 3pt up + left of where it
+                // sits in floating mode — and the user sees text shift
+                // every time the presentation changes.
+                .padding(.leading, 8 + dockedCompensation)
+                .padding(.trailing, 8 - dockedCompensation)
+                .padding(.top, 48 + dockedCompensation)
+                .padding(.bottom, 10 + dockedCompensation)
             }
         }
         .background {
@@ -448,6 +455,13 @@ private struct SidebarTabsView: View {
                 SidebarBackground(presentation: presentation)
             }
         }
+    }
+
+    // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the inner
+    // content at the same on-screen position across both presentations.
+    private static let floatingOuterInset: CGFloat = 3
+    private var dockedCompensation: CGFloat {
+        presentation == .docked ? Self.floatingOuterInset : 0
     }
 }
 

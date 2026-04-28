@@ -51,25 +51,21 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
-    @StateObject private var workspace = TerminalWorkspace()
     @StateObject private var terminalSettings = TerminalSettings.shared
-    @State private var isSidebarHidden = false
-    @State private var isSidebarRevealed = false
-    @State private var isCursorOverSidebar = false
+    @StateObject private var agentSettings = AgentSettings.shared
     @State private var controlServer: CherryControlServer?
+    @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
+    @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
     var body: some Scene {
-        WindowGroup("Cherry") {
-            ContentView(
-                workspace: workspace,
-                isSidebarHidden: $isSidebarHidden,
-                isSidebarRevealed: $isSidebarRevealed,
-                isCursorOverSidebar: $isCursorOverSidebar
-            )
+        WindowGroup("Cherry", for: String.self) { projectRoot in
+            ProjectWindowView(projectRoot: projectRoot.wrappedValue)
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
                     guard controlServer == nil else { return }
-                    let server = CherryControlServer(workspace: workspace)
+                    let server = CherryControlServer(workspaceProvider: {
+                        ProjectWindowRegistry.shared.activeWorkspace
+                    })
                     server.start()
                     controlServer = server
                 }
@@ -78,49 +74,20 @@ struct CherryApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandMenu("Prototype") {
-                Button(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar") {
-                    // Cmd+S behavior:
-                    //  - (hidden, revealed): toggle without `withAnimation`
-                    //    so the docked sidebar snaps into place behind the
-                    //    floating fade-out (handoff handled in ContentView).
-                    //  - (hidden, ¬revealed): wrap in `withAnimation` so the
-                    //    docked sidebar slides in normally.
-                    //  - (shown, cursor-over-sidebar): switch to floating-
-                    //    revealed in one shot so the sidebar visibly
-                    //    transitions from docked to floating without the
-                    //    user losing their place.
-                    //  - (shown, cursor-elsewhere): hide normally.
-                    if isSidebarHidden {
-                        if isSidebarRevealed {
-                            isSidebarHidden.toggle()
-                        } else {
-                            withAnimation(.snappy(duration: 0.18)) {
-                                isSidebarHidden.toggle()
-                            }
-                        }
-                    } else if isCursorOverSidebar {
-                        // Snap both states — the sidebar swaps presentation
-                        // from docked to floating without any motion. Mirror
-                        // of the (hidden, revealed) → docked handoff, which
-                        // also snaps.
-                        withAnimation(nil) {
-                            isSidebarHidden = true
-                            isSidebarRevealed = true
-                        }
-                    } else {
-                        withAnimation(.snappy(duration: 0.18)) {
-                            isSidebarHidden = true
-                        }
-                    }
+                Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
+                    focusedChromeState?.toggleSidebar()
                 }
                 .keyboardShortcut("s")
+                .disabled(focusedChromeState == nil)
 
                 Button("New Tab") {
-                    workspace.addSession()
+                    focusedWorkspace?.addSession()
                 }
                 .keyboardShortcut("t")
+                .disabled(focusedWorkspace == nil)
 
                 Button("Close Tab") {
+                    guard let workspace = focusedWorkspace else { return }
                     if workspace.sessions.count > 1 {
                         workspace.closeSelectedSession()
                     } else {
@@ -128,31 +95,52 @@ struct CherryApp: App {
                     }
                 }
                 .keyboardShortcut("w")
+                .disabled(focusedWorkspace == nil)
 
                 Button("Previous Tab") {
-                    workspace.selectPreviousSession()
+                    focusedWorkspace?.selectPreviousSession()
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                .disabled(focusedWorkspace == nil)
 
                 Button("Next Tab") {
-                    workspace.selectNextSession()
+                    focusedWorkspace?.selectNextSession()
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                .disabled(focusedWorkspace == nil)
 
                 Button("Interrupt Active Tab") {
-                    workspace.interruptSelectedSession()
+                    focusedWorkspace?.interruptSelectedSession()
                 }
                 .keyboardShortcut("c", modifiers: [.control])
+                .disabled(focusedWorkspace == nil)
 
                 Button("Restart Active Tab") {
-                    workspace.restartSelectedSession()
+                    focusedWorkspace?.restartSelectedSession()
                 }
                 .keyboardShortcut("r")
+                .disabled(focusedWorkspace == nil)
 
                 Button("Clear Scrollback") {
-                    workspace.clearSelectedSessionScrollback()
+                    focusedWorkspace?.clearSelectedSessionScrollback()
                 }
                 .keyboardShortcut("k")
+                .disabled(focusedWorkspace == nil)
+            }
+
+            CommandMenu("Agents") {
+                let project = agentSettings.resolvedProject(for: focusedWorkspace?.projectRoot)
+                if project.launchableAgents.isEmpty {
+                    Button("No Launchable Agents") {}
+                        .disabled(true)
+                } else {
+                    ForEach(project.launchableAgents) { agent in
+                        Button(agent.name) {
+                            guard let workspace = focusedWorkspace, let projectRoot = project.validProjectRoot else { return }
+                            workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot)
+                        }
+                    }
+                }
             }
         }
 
@@ -160,5 +148,38 @@ struct CherryApp: App {
             SettingsView()
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
         }
+    }
+}
+
+private struct ProjectWindowView: View {
+    @Environment(\.openWindow) private var openWindow
+    @StateObject private var workspace: TerminalWorkspace
+    @StateObject private var chromeState = ProjectWindowChromeState()
+
+    init(projectRoot: String?) {
+        let validProjectRoot = AgentSettings.validDirectory(projectRoot ?? "")
+        _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: validProjectRoot))
+    }
+
+    var body: some View {
+        ContentView(
+            workspace: workspace,
+            projectRoot: workspace.projectRoot,
+            openProject: openProject,
+            isSidebarHidden: $chromeState.isSidebarHidden,
+            isSidebarRevealed: $chromeState.isSidebarRevealed,
+            isCursorOverSidebar: $chromeState.isCursorOverSidebar
+        )
+        .background(ProjectWindowBinder(projectRoot: workspace.projectRoot, workspace: workspace))
+        .focusedValue(\.terminalWorkspace, workspace)
+        .focusedValue(\.projectWindowChromeState, chromeState)
+        .onAppear {
+            ProjectWindowRegistry.shared.activeWorkspace = workspace
+        }
+    }
+
+    private func openProject(_ project: CherryProject) {
+        guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
+        openWindow(value: project.root)
     }
 }

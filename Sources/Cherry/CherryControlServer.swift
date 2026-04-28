@@ -4,6 +4,7 @@ import Foundation
 
 final class CherryControlServer: @unchecked Sendable {
     private weak var workspace: TerminalWorkspace?
+    private let workspaceProvider: @MainActor () -> TerminalWorkspace?
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
     private var listenFileDescriptor: Int32 = -1
@@ -11,6 +12,13 @@ final class CherryControlServer: @unchecked Sendable {
 
     init(workspace: TerminalWorkspace, socketURL: URL = CherryControl.socketURL) {
         self.workspace = workspace
+        self.workspaceProvider = { workspace }
+        self.socketURL = socketURL
+    }
+
+    init(workspaceProvider: @escaping @MainActor () -> TerminalWorkspace?, socketURL: URL = CherryControl.socketURL) {
+        self.workspace = nil
+        self.workspaceProvider = workspaceProvider
         self.socketURL = socketURL
     }
 
@@ -166,7 +174,7 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func handle(_ request: CherryControlRequest) async throws -> CherryControlResponse {
-        guard let workspace else {
+        guard let workspace = workspace ?? workspaceProvider() else {
             throw CherryControlError(code: "workspace_unavailable", message: "Cherry workspace is unavailable.")
         }
 
@@ -233,7 +241,9 @@ final class CherryControlServer: @unchecked Sendable {
                     state: session.state.label,
                     selected: workspace.selectedSessionID == session.id,
                     workingDirectory: session.workingDirectory,
-                    lineCount: session.lineCount
+                    lineCount: session.lineCount,
+                    kind: session.kind.rawValue,
+                    agentName: session.agentName
                 )
             },
             selectedTerminalID: workspace.selectedSessionID?.uuidString
@@ -253,7 +263,9 @@ final class CherryControlServer: @unchecked Sendable {
         TerminalSummaryResult(
             terminalID: session.id.uuidString,
             title: session.title,
-            state: session.state.label
+            state: session.state.label,
+            kind: session.kind.rawValue,
+            agentName: session.agentName
         )
     }
 

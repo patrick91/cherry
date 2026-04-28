@@ -147,6 +147,8 @@ public struct TerminalInfo: Codable, Equatable {
     public let selected: Bool
     public let workingDirectory: String
     public let lineCount: Int
+    public let kind: String?
+    public let agentName: String?
 
     public init(
         id: String,
@@ -154,7 +156,9 @@ public struct TerminalInfo: Codable, Equatable {
         state: String,
         selected: Bool,
         workingDirectory: String,
-        lineCount: Int
+        lineCount: Int,
+        kind: String? = nil,
+        agentName: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -162,6 +166,8 @@ public struct TerminalInfo: Codable, Equatable {
         self.selected = selected
         self.workingDirectory = workingDirectory
         self.lineCount = lineCount
+        self.kind = kind
+        self.agentName = agentName
     }
 }
 
@@ -179,11 +185,15 @@ public struct TerminalSummaryResult: Codable, Equatable {
     public let terminalID: String
     public let title: String
     public let state: String
+    public let kind: String?
+    public let agentName: String?
 
-    public init(terminalID: String, title: String, state: String) {
+    public init(terminalID: String, title: String, state: String, kind: String? = nil, agentName: String? = nil) {
         self.terminalID = terminalID
         self.title = title
         self.state = state
+        self.kind = kind
+        self.agentName = agentName
     }
 }
 

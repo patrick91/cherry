@@ -250,6 +250,12 @@ private extension NSLock {
     }
 }
 
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
 private final class ShellProcessBox: @unchecked Sendable {
     private let lock = NSLock()
     private weak var process: ShellProcessController?
@@ -559,9 +565,11 @@ enum TerminalInputNormalizer {
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
     @Published var selectedSessionID: UUID?
+    let projectRoot: String?
 
-    init() {
-        let firstSession = Self.makeSession(index: 1)
+    init(projectRoot: String? = nil) {
+        self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
+        let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot)
         sessions = [firstSession]
         selectedSessionID = firstSession.id
     }
@@ -569,6 +577,14 @@ final class TerminalWorkspace: ObservableObject {
     var selectedSession: TerminalSession? {
         guard let selectedSessionID else { return sessions.first }
         return sessions.first(where: { $0.id == selectedSessionID }) ?? sessions.first
+    }
+
+    var agentSessions: [TerminalSession] {
+        sessions.filter { $0.kind == .agent }
+    }
+
+    var terminalSessions: [TerminalSession] {
+        sessions.filter { $0.kind == .terminal }
     }
 
     func select(_ session: TerminalSession) {
@@ -583,6 +599,32 @@ final class TerminalWorkspace: ObservableObject {
 
         let session = sessions.remove(at: currentIndex)
         sessions.insert(session, at: clampedIndex)
+    }
+
+    func moveSession(id sessionID: UUID, to targetIndex: Int, within kind: TerminalSession.SessionKind) {
+        let scopedSessions = sessions.filter { $0.kind == kind }
+        guard let currentScopedIndex = scopedSessions.firstIndex(where: { $0.id == sessionID }) else { return }
+
+        let clampedScopedIndex = min(max(targetIndex, 0), scopedSessions.count - 1)
+        guard currentScopedIndex != clampedScopedIndex else { return }
+
+        let session = scopedSessions[currentScopedIndex]
+        let remainingScopedIDs = scopedSessions
+            .filter { $0.id != sessionID }
+            .map(\.id)
+        var nextScopedIDs = remainingScopedIDs
+        nextScopedIDs.insert(session.id, at: min(clampedScopedIndex, nextScopedIDs.count))
+
+        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        var scopedIterator = nextScopedIDs.makeIterator()
+        sessions = sessions.map { existing in
+            guard existing.kind == kind, let nextID = scopedIterator.next(),
+                  let replacement = sessionsByID[nextID]
+            else {
+                return existing
+            }
+            return replacement
+        }
     }
 
     @discardableResult
@@ -609,6 +651,24 @@ final class TerminalWorkspace: ObservableObject {
             session.send(text: command + "\n")
         }
 
+        return session
+    }
+
+    @discardableResult
+    func addAgentSession(
+        agent: AgentToolDefinition,
+        projectRoot: String,
+        select: Bool = true
+    ) -> TerminalSession {
+        let session = Self.makeAgentSession(
+            index: agentSessions.count + 1,
+            agent: agent,
+            workingDirectory: projectRoot
+        )
+        sessions.append(session)
+        if select {
+            selectedSessionID = session.id
+        }
         return session
     }
 
@@ -678,6 +738,18 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    private static func makeAgentSession(index: Int, agent: AgentToolDefinition, workingDirectory: String) -> TerminalSession {
+        TerminalSession(
+            title: agent.name.isEmpty ? "Agent \(index)" : agent.name,
+            subtitle: agent.commandLine,
+            tint: palette[(index - 1) % palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            kind: .agent,
+            agentName: agent.name,
+            launchCommand: agent.commandLine
+        )
+    }
+
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
         guard let requestedWorkingDirectory, !requestedWorkingDirectory.isEmpty else {
             return NSHomeDirectory()
@@ -703,6 +775,11 @@ final class TerminalWorkspace: ObservableObject {
 
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable {
+    enum SessionKind: String, Codable, Equatable {
+        case terminal
+        case agent
+    }
+
     enum SessionState: Equatable {
         case launching
         case live
@@ -733,6 +810,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     let tint: NSColor
     let maxScrollback: Int?
     let launchWorkingDirectory: String
+    let kind: SessionKind
+    let agentName: String?
+    private let launchCommand: String?
 
     @Published private(set) var revision = 0
 
@@ -758,7 +838,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         workingDirectory: String = NSHomeDirectory(),
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
         buffer: (any TerminalBuffering)? = nil,
-        launchShell: Bool = true
+        launchShell: Bool = true,
+        kind: SessionKind = .terminal,
+        agentName: String? = nil,
+        launchCommand: String? = nil
     ) {
         self.title = title
         self.subtitle = subtitle
@@ -766,6 +849,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.workingDirectory = workingDirectory
         self.launchWorkingDirectory = workingDirectory
         self.maxScrollback = maxScrollback
+        self.kind = kind
+        self.agentName = agentName
+        self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
@@ -965,6 +1051,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             shellProcess = process
 
             state = .live
+            if let launchCommand {
+                process.write(launchCommand + "\n")
+            }
             bumpRevision()
         } catch {
             activeLaunchID = nil

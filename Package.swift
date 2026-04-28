@@ -15,6 +15,7 @@ let package = Package(
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
         .target(
@@ -26,6 +27,7 @@ let package = Package(
                 "CherryControl",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
+                .product(name: "TOMLKit", package: "TOMLKit"),
             ]
         ),
         .executableTarget(

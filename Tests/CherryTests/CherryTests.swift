@@ -130,6 +130,168 @@ import Testing
     #expect(workspace.sessions.map(\.id) == [firstSession.id, secondSession.id, thirdSession.id])
 }
 
+@Test func projectAgentTomlDecodesAndValidates() async throws {
+    let toml = """
+    [[agents]]
+    name = "Codex"
+    command = "codex"
+    arguments = "--yolo"
+    enabled = true
+
+    [[agents]]
+    name = "Claude"
+    command = "claude"
+    """
+
+    let agents = try AgentConfiguration.decodeSharedAgents(from: toml)
+
+    #expect(agents == [
+        AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo", enabled: true),
+        AgentToolDefinition(name: "Claude", command: "claude", arguments: "", enabled: true)
+    ])
+}
+
+@Test func projectAgentTomlRejectsDuplicateNames() async throws {
+    let toml = """
+    [[agents]]
+    name = "Codex"
+    command = "codex"
+
+    [[agents]]
+    name = " codex "
+    command = "other"
+    """
+
+    #expect(throws: AgentConfigurationError.duplicateName("codex")) {
+        try AgentConfiguration.decodeSharedAgents(from: toml)
+    }
+}
+
+@Test func localAgentDefinitionsOverrideSharedDefinitions() async throws {
+    let shared = [
+        AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"),
+        AgentToolDefinition(name: "Claude", command: "claude")
+    ]
+    let local = [
+        AgentToolDefinition(name: "codex", command: "custom-codex", arguments: "--model test", enabled: false),
+        AgentToolDefinition(name: "Pi", command: "pi")
+    ]
+
+    let merged = AgentConfiguration.merge(sharedAgents: shared, localAgents: local, isSharedConfigTrusted: true)
+
+    #expect(merged.map(\.name) == ["codex", "Claude", "Pi"])
+    #expect(merged[0].source == .localOverride)
+    #expect(merged[0].commandLine == "custom-codex --model test")
+    #expect(merged[0].isLaunchable == false)
+    #expect(merged[1].source == .shared)
+    #expect(merged[2].source == .local)
+}
+
+@MainActor
+@Test func sharedAgentConfigRequiresTrustAndInvalidatesWhenChanged() async throws {
+    let defaultsName = "CherryTests.AgentSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let configURL = directory.appendingPathComponent(AgentConfiguration.fileName)
+    try """
+    [[agents]]
+    name = "Codex"
+    command = "codex"
+    """.write(to: configURL, atomically: true, encoding: .utf8)
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+
+    var project = settings.resolvedProject(for: directory.path)
+    #expect(project.agents.count == 1)
+    #expect(project.agents[0].source == .shared)
+    #expect(project.agents[0].isLaunchable == false)
+
+    settings.trustSharedConfig(for: directory.path)
+
+    project = settings.resolvedProject(for: directory.path)
+    #expect(project.agents[0].isLaunchable == true)
+
+    try """
+    [[agents]]
+    name = "Codex"
+    command = "codex"
+    arguments = "--yolo"
+    """.write(to: configURL, atomically: true, encoding: .utf8)
+
+    project = settings.resolvedProject(for: directory.path)
+    #expect(project.agents[0].isLaunchable == false)
+}
+
+@MainActor
+@Test func agentSettingsCanAddProjectsWithoutGlobalSelection() async throws {
+    let defaultsName = "CherryTests.Projects.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let firstDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let secondDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: firstDirectory)
+        try? FileManager.default.removeItem(at: secondDirectory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: firstDirectory.path)
+    settings.addProject(path: secondDirectory.path)
+
+    #expect(settings.projects.map(\.root) == [firstDirectory.path, secondDirectory.path])
+
+    let reloadedSettings = AgentSettings(defaults: defaults)
+
+    #expect(reloadedSettings.projects.map(\.root) == [firstDirectory.path, secondDirectory.path])
+    #expect(reloadedSettings.resolvedProject(for: firstDirectory.path).validProjectRoot == firstDirectory.path)
+    #expect(reloadedSettings.resolvedProject(for: secondDirectory.path).validProjectRoot == secondDirectory.path)
+}
+
+@MainActor
+@Test func workspaceCanCreateAgentSession() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace()
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let session = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"),
+        projectRoot: directory.path
+    )
+
+    #expect(session.kind == .agent)
+    #expect(session.agentName == "Codex")
+    #expect(session.title == "Codex")
+    #expect(session.subtitle == "codex --yolo")
+    #expect(session.workingDirectory == directory.path)
+    #expect(workspace.agentSessions.map(\.id) == [session.id])
+}
+
 @MainActor
 @Test func newSessionInheritsSelectedSessionWorkingDirectory() async throws {
     let directory = FileManager.default.temporaryDirectory

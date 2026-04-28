@@ -11,6 +11,8 @@ struct ContentView: View {
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
+    let openProject: (CherryProject) -> Void
     @Binding var isSidebarHidden: Bool
     @Binding var isSidebarRevealed: Bool
     @Binding var isCursorOverSidebar: Bool
@@ -155,7 +157,12 @@ struct ContentView: View {
     }
 
     private var dockedSidebar: some View {
-        SidebarTabsView(workspace: workspace, presentation: .docked)
+        SidebarTabsView(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            presentation: .docked,
+            openProject: openProject
+        )
             .frame(width: sidebarWidth)
             .ignoresSafeArea(.all, edges: .top)
             .overlay(alignment: .trailing) {
@@ -194,7 +201,12 @@ struct ContentView: View {
     }
 
     private var floatingSidebar: some View {
-        SidebarTabsView(workspace: workspace, presentation: .floating)
+        SidebarTabsView(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            presentation: .floating,
+            openProject: openProject
+        )
             .frame(width: sidebarWidth)
             .overlay(alignment: .trailing) {
                 sidebarResizeHandle
@@ -411,63 +423,40 @@ private enum SidebarPresentation {
 }
 
 private struct SidebarTabsView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
+    @Environment(\.openSettings) private var openSettings
+    @ObservedObject private var agentSettings = AgentSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
     let presentation: SidebarPresentation
-
-    @State private var draggedSessionID: UUID?
-    @State private var draggedRowOffsetY: CGFloat = 0
+    let openProject: (CherryProject) -> Void
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            presentation: presentation
-        )
-
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Sessions")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(palette.headerText)
-                                .textCase(.uppercase)
-                                .padding(.horizontal, 10)
+                VStack(alignment: .leading, spacing: 12) {
+                    SidebarProjectPicker(
+                        settings: agentSettings,
+                        projectRoot: projectRoot,
+                        presentation: presentation,
+                        openProject: openProject,
+                        openSettings: { openSettings() }
+                    )
 
-                            ForEach(workspace.sessions) { session in
-                                SidebarTabRow(
-                                    session: session,
-                                    isSelected: workspace.selectedSessionID == session.id,
-                                    presentation: presentation,
-                                    onSelect: { workspace.select(session) }
-                                )
-                                .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
-                                .zIndex(draggedSessionID == session.id ? 1 : 0)
-                                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
-                                    [session.id: anchor]
-                                }
-                                .contextMenu {
-                                    Button("Restart") {
-                                        session.restart()
-                                    }
+                    SidebarAgentToolsSection(
+                        settings: agentSettings,
+                        workspace: workspace,
+                        projectRoot: projectRoot,
+                        presentation: presentation,
+                        openSettings: { openSettings() }
+                    )
 
-                                    Button("Clear Scrollback") {
-                                        session.clearScrollback()
-                                    }
-
-                                    Divider()
-
-                                    Button("Close", role: .destructive) {
-                                        workspace.close(session)
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    SidebarSessionSection(
+                        title: "Terminals",
+                        sessions: workspace.terminalSessions,
+                        kind: .terminal,
+                        workspace: workspace,
+                        presentation: presentation
+                    )
                 }
                 // The floating sidebar's outer wrapper adds 3pt leading/top/
                 // bottom inset (`floatingSidebarLeadingInset` etc.). The
@@ -486,10 +475,284 @@ private struct SidebarTabsView: View {
                 SidebarBackground(presentation: presentation)
             }
         }
+    }
+
+    // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the inner
+    // content at the same on-screen position across both presentations.
+    private static let floatingOuterInset: CGFloat = 3
+    private var dockedCompensation: CGFloat {
+        presentation == .docked ? Self.floatingOuterInset : 0
+    }
+}
+
+private struct SidebarProjectPicker: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let openProject: (CherryProject) -> Void
+    let openSettings: () -> Void
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        Menu {
+            if settings.projects.isEmpty {
+                Button("No Projects") {}
+                    .disabled(true)
+            } else {
+                Section("Projects") {
+                    ForEach(settings.projects) { project in
+                        Button {
+                            openProject(project)
+                        } label: {
+                            Label(project.name, systemImage: selectedProject?.id == project.id ? "checkmark" : "folder")
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button {
+                chooseProjectRoot()
+            } label: {
+                Label("Add Project...", systemImage: "plus")
+            }
+
+            Button {
+                openSettings()
+            } label: {
+                Label("Edit Projects...", systemImage: "gearshape")
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(palette.rowText.opacity(0.78))
+
+                Text(selectedProject?.name ?? "No Project")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(palette.rowText)
+                    .lineLimit(1)
+
+                Spacer(minLength: 6)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(palette.rowText.opacity(0.62))
+            }
+            .frame(height: 40)
+            .padding(.horizontal, 12)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(palette.hoverFill.opacity(0.72))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 2)
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        settings.addProject(path: url.path)
+        if let project = settings.selectedProject(for: url.path) {
+            openProject(project)
+        }
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+}
+
+private struct SidebarAgentToolsSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let openSettings: () -> Void
+
+    var body: some View {
+        let project = settings.resolvedProject(for: projectRoot)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarSectionHeader(title: "Agents", count: project.agents.count, palette: palette)
+
+            if project.agents.isEmpty {
+                SidebarEmptyRow(
+                    title: project.validProjectRoot == nil ? "Select a project" : "No agents configured",
+                    palette: palette
+                )
+            } else {
+                ForEach(project.agents) { agent in
+                    SidebarAgentToolRow(
+                        agent: agent,
+                        isSelected: selectedAgentName == agent.definition.normalizedName,
+                        presentation: presentation,
+                        onSelect: {
+                            selectOrLaunch(agent)
+                        }
+                    )
+                    .contextMenu {
+                        Button("New Agent Session") {
+                            launch(agent)
+                        }
+                        .disabled(!agent.isLaunchable || project.validProjectRoot == nil)
+
+                        Button("Edit Agents...") {
+                            openSettings()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var selectedAgentName: String? {
+        guard let session = workspace.selectedSession, session.kind == .agent, let agentName = session.agentName else {
+            return nil
+        }
+        return AgentToolDefinition.normalizedName(agentName)
+    }
+
+    private func selectOrLaunch(_ agent: ResolvedAgentTool) {
+        if let existingSession = workspace.agentSessions.last(where: {
+            $0.agentName.map { AgentToolDefinition.normalizedName($0) } == agent.definition.normalizedName
+        }) {
+            workspace.select(existingSession)
+            return
+        }
+
+        launch(agent)
+    }
+
+    private func launch(_ agent: ResolvedAgentTool) {
+        let project = settings.resolvedProject(for: projectRoot)
+        guard agent.isLaunchable, let root = project.validProjectRoot else { return }
+        workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+    }
+}
+
+private struct SidebarSectionHeader: View {
+    let title: String
+    let count: Int
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(palette.headerText)
+                .textCase(.uppercase)
+
+            Rectangle()
+                .fill(palette.headerText.opacity(0.22))
+                .frame(height: 1)
+
+            Text("\(count)")
+                .font(.system(size: 12, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(palette.headerText)
+        }
+        .padding(.horizontal, 10)
+    }
+}
+
+private struct SidebarEmptyRow: View {
+    let title: String
+    let palette: SidebarPalette
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(palette.headerText)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 34)
+            .padding(.horizontal, 12)
+    }
+}
+
+private struct SidebarSessionSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    let title: String
+    let sessions: [TerminalSession]
+    let kind: TerminalSession.SessionKind
+    @ObservedObject var workspace: TerminalWorkspace
+    let presentation: SidebarPresentation
+
+    @State private var draggedSessionID: UUID?
+    @State private var draggedRowOffsetY: CGFloat = 0
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarSectionHeader(title: title, count: sessions.count, palette: palette)
+
+            ForEach(sessions) { session in
+                SidebarTabRow(
+                    session: session,
+                    isSelected: workspace.selectedSessionID == session.id,
+                    presentation: presentation,
+                    onSelect: { workspace.select(session) }
+                )
+                .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
+                .zIndex(draggedSessionID == session.id ? 1 : 0)
+                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
+                    [session.id: anchor]
+                }
+                .contextMenu {
+                    Button("Restart") {
+                        session.restart()
+                    }
+
+                    Button("Clear Scrollback") {
+                        session.clearScrollback()
+                    }
+
+                    Divider()
+
+                    Button("Close", role: .destructive) {
+                        workspace.close(session)
+                    }
+                    .disabled(workspace.sessions.count <= 1)
+                }
+            }
+        }
         .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
             GeometryReader { geometry in
                 SidebarInteractionOverlay(
-                    rows: workspace.sessions.compactMap { session in
+                    rows: sessions.compactMap { session in
                         rowBounds[session.id].map { anchor in
                             SidebarRowFrame(id: session.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
                         }
@@ -506,7 +769,7 @@ private struct SidebarTabsView: View {
                         var transaction = Transaction()
                         transaction.disablesAnimations = true
                         withTransaction(transaction) {
-                            workspace.moveSession(id: sessionID, to: targetIndex)
+                            workspace.moveSession(id: sessionID, to: targetIndex, within: kind)
                         }
                     },
                     onDragEnded: {
@@ -518,13 +781,6 @@ private struct SidebarTabsView: View {
                 )
             }
         }
-    }
-
-    // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the inner
-    // content at the same on-screen position across both presentations.
-    private static let floatingOuterInset: CGFloat = 3
-    private var dockedCompensation: CGFloat {
-        presentation == .docked ? Self.floatingOuterInset : 0
     }
 }
 
@@ -1027,6 +1283,88 @@ private struct SidebarTabRow: View {
         .onHover { hovering in
             isHovered = hovering
         }
+    }
+
+    @ViewBuilder
+    private func rowBackground(palette: SidebarPalette) -> some View {
+        if isSelected {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.selectedFill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
+        } else if isHovered {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.hoverFill)
+        }
+    }
+}
+
+private struct SidebarAgentToolRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    let agent: ResolvedAgentTool
+    let isSelected: Bool
+    let presentation: SidebarPresentation
+    let onSelect: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                    .opacity(agent.enabled ? 1 : 0.45)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(agent.name)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+
+                    if !agent.enabled || !agent.isLaunchable {
+                        Text(agent.enabled ? "Blocked" : "Disabled")
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle((isSelected ? palette.selectedText : palette.headerText).opacity(0.82))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 8)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 42)
+            .padding(.horizontal, 12)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background {
+                rowBackground(palette: palette)
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+
+    private var statusColor: Color {
+        if !agent.enabled {
+            return .gray
+        }
+        if !agent.isLaunchable {
+            return .orange
+        }
+        return .green
     }
 
     @ViewBuilder

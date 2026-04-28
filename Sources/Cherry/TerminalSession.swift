@@ -1031,7 +1031,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
                     term: "xterm-256color",
-                    initialSize: viewportSize
+                    initialSize: viewportSize,
+                    startupCommand: launchCommand
                 ),
                 onData: { data in
                     traceRecorder?.recordOutput(data)
@@ -1051,9 +1052,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             shellProcess = process
 
             state = .live
-            if let launchCommand {
-                process.write(launchCommand + "\n")
-            }
             bumpRevision()
         } catch {
             activeLaunchID = nil
@@ -1077,15 +1075,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeLaunchID = nil
         shellProcess = nil
         resetKeyboardProtocolState()
-        ghosttyBridgeStorage?.finish(exitCode: UInt32(max(status, 0)))
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
         state = .exited(status)
-        processor.appendPlainLines([
-            "",
-            "[shell exited with status \(status)]"
-        ])
+        if kind == .agent {
+            let hideCursor = Data("\u{1B}[?25l".utf8)
+            rawOutputStore.append(hideCursor)
+            processor.ingestTestingData(hideCursor)
+        } else {
+            processor.appendPlainLines([
+                "",
+                "[shell exited with status \(status)]"
+            ])
+        }
         bumpRevision()
     }
 

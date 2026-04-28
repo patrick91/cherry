@@ -156,6 +156,21 @@ final class ShellProcessController: @unchecked Sendable {
         let workingDirectory: String
         let term: String
         let initialSize: TerminalViewportSize
+        let startupCommand: String?
+
+        init(
+            shellPath: String,
+            workingDirectory: String,
+            term: String,
+            initialSize: TerminalViewportSize,
+            startupCommand: String? = nil
+        ) {
+            self.shellPath = shellPath
+            self.workingDirectory = workingDirectory
+            self.term = term
+            self.initialSize = initialSize
+            self.startupCommand = startupCommand
+        }
     }
 
     static let defaultShellPath: String = {
@@ -368,6 +383,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
         let workingDirectory = configuration.workingDirectory
         let term = configuration.term
+        let startupCommand = configuration.startupCommand
         let originalZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
         let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
 
@@ -395,16 +411,39 @@ final class ShellProcessController: @unchecked Sendable {
                 _ = setenv("ZDOTDIR", shellIntegration.zdotdir, 1)
             }
 
-            shellPath.withCString { shellPathPointer in
-                shellName.withCString { shellNamePointer in
-                    "-l".withCString { loginFlagPointer in
-                        var arguments: [UnsafeMutablePointer<CChar>?] = [
-                            UnsafeMutablePointer(mutating: shellNamePointer),
-                            UnsafeMutablePointer(mutating: loginFlagPointer),
-                            nil
-                        ]
+            if let startupCommand {
+                let command = "exec \(startupCommand)"
+                shellPath.withCString { shellPathPointer in
+                    shellName.withCString { shellNamePointer in
+                        "-l".withCString { loginFlagPointer in
+                            "-c".withCString { commandFlagPointer in
+                                command.withCString { commandPointer in
+                                    var arguments: [UnsafeMutablePointer<CChar>?] = [
+                                        UnsafeMutablePointer(mutating: shellNamePointer),
+                                        UnsafeMutablePointer(mutating: loginFlagPointer),
+                                        UnsafeMutablePointer(mutating: commandFlagPointer),
+                                        UnsafeMutablePointer(mutating: commandPointer),
+                                        nil
+                                    ]
 
-                        execv(shellPathPointer, &arguments)
+                                    execv(shellPathPointer, &arguments)
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                shellPath.withCString { shellPathPointer in
+                    shellName.withCString { shellNamePointer in
+                        "-l".withCString { loginFlagPointer in
+                            var arguments: [UnsafeMutablePointer<CChar>?] = [
+                                UnsafeMutablePointer(mutating: shellNamePointer),
+                                UnsafeMutablePointer(mutating: loginFlagPointer),
+                                nil
+                            ]
+
+                            execv(shellPathPointer, &arguments)
+                        }
                     }
                 }
             }

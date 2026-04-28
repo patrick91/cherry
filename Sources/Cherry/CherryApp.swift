@@ -152,13 +152,38 @@ struct CherryApp: App {
 }
 
 private struct ProjectWindowView: View {
+    @ObservedObject private var agentSettings = AgentSettings.shared
+    @State private var onboardedProjectRoot: String?
+
+    let requestedProjectRoot: String?
+
+    init(projectRoot: String?) {
+        requestedProjectRoot = projectRoot
+    }
+
+    var body: some View {
+        if let projectRoot {
+            ProjectWorkspaceView(projectRoot: projectRoot)
+                .id(projectRoot)
+        } else {
+            ProjectOnboardingView { project in
+                onboardedProjectRoot = project.root
+            }
+        }
+    }
+
+    private var projectRoot: String? {
+        agentSettings.projectRoot(for: requestedProjectRoot) ?? agentSettings.projectRoot(for: onboardedProjectRoot)
+    }
+}
+
+private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var workspace: TerminalWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
 
-    init(projectRoot: String?) {
-        let validProjectRoot = AgentSettings.validDirectory(projectRoot ?? "")
-        _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: validProjectRoot))
+    init(projectRoot: String) {
+        _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
     }
 
     var body: some View {

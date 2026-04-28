@@ -248,6 +248,13 @@ final class AgentSettings: ObservableObject {
         return projects.first(where: { $0.root == root }) ?? CherryProject(root: root)
     }
 
+    func projectRoot(for requestedRoot: String?) -> String? {
+        if let root = Self.validDirectory(requestedRoot ?? "") {
+            return root
+        }
+        return projects.first?.root
+    }
+
     func resolvedProject(for requestedRoot: String?) -> ResolvedAgentProject {
         guard let root = Self.validDirectory(requestedRoot ?? "") else {
             return ResolvedAgentProject(root: nil, agents: [], configState: .noProject)

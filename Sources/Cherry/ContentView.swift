@@ -411,6 +411,82 @@ private struct DetailPaneView: View {
     }
 }
 
+struct ProjectOnboardingView: View {
+    @ObservedObject private var settings = AgentSettings.shared
+    @State private var trafficLights = TrafficLightController()
+
+    let onProjectCreated: (CherryProject) -> Void
+
+    var body: some View {
+        ZStack {
+            TrafficLightOverlay(controller: trafficLights)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea(.all, edges: .top)
+                .allowsHitTesting(false)
+
+            VStack(spacing: 16) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 42, weight: .regular))
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 6) {
+                    Text("No Project")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(.primary)
+
+                    Text("Create a project to start using Cherry.")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    chooseProjectRoot()
+                } label: {
+                    Label("Create Project", systemImage: "plus")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(height: 34)
+                        .padding(.horizontal, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+            .padding(32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 560, minHeight: 420)
+        .background {
+            AppShellBackground()
+                .ignoresSafeArea(.all)
+        }
+        .background(WindowConfigurator())
+        .modifier(ChromeWidthAnimator(
+            dockedWidth: 320,
+            floatingWidth: 0,
+            sidebarWidth: 320,
+            controller: trafficLights
+        ))
+        .onAppear {
+            trafficLights.seedTarget(docked: 320, floating: 0, sidebarWidth: 320)
+        }
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Create"
+
+        guard panel.runModal() == .OK, let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+
+        onProjectCreated(project)
+    }
+}
+
 private struct AppShellBackground: View {
     var body: some View {
         SidebarBackground(presentation: .docked)

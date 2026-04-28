@@ -261,6 +261,7 @@ import Testing
     let reloadedSettings = AgentSettings(defaults: defaults)
 
     #expect(reloadedSettings.projects.map(\.root) == [firstDirectory.path, secondDirectory.path])
+    #expect(reloadedSettings.projectRoot(for: nil) == firstDirectory.path)
     #expect(reloadedSettings.resolvedProject(for: firstDirectory.path).validProjectRoot == firstDirectory.path)
     #expect(reloadedSettings.resolvedProject(for: secondDirectory.path).validProjectRoot == secondDirectory.path)
 }
@@ -290,6 +291,49 @@ import Testing
     #expect(session.subtitle == "codex --yolo")
     #expect(session.workingDirectory == directory.path)
     #expect(workspace.agentSessions.map(\.id) == [session.id])
+}
+
+@MainActor
+@Test func agentSessionExecsCommandAndKeepsFinalOutput() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let session = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Echo", command: "/bin/echo", arguments: "agent-done"),
+        projectRoot: directory.path
+    )
+
+    try await waitForExit(session)
+
+    let output = session.snapshot(range: 0..<session.lineCount).joined(separator: "\n")
+    let rawOutput = String(decoding: session.rawOutput(maxBytes: 1024).data, as: UTF8.self)
+    #expect(workspace.selectedSessionID == session.id)
+    #expect(session.kind == .agent)
+    #expect(output.contains("agent-done"))
+    #expect(!output.contains("[agent exited with status 0]"))
+    #expect(rawOutput.contains("agent-done"))
+    #expect(!rawOutput.contains("[agent exited with status 0]"))
+    #expect(session.cursorState.isVisible == false)
+}
+
+@MainActor
+private func waitForExit(_ session: TerminalSession) async throws {
+    for _ in 0..<100 {
+        if case .exited = session.state {
+            return
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    Issue.record("Timed out waiting for session to exit")
 }
 
 @MainActor

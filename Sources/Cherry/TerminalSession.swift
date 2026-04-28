@@ -660,10 +660,14 @@ final class TerminalWorkspace: ObservableObject {
         projectRoot: String,
         select: Bool = true
     ) -> TerminalSession {
+        let matchingAgentCount = agentSessions.filter {
+            $0.agentName.map { AgentToolDefinition.normalizedName($0) } == agent.normalizedName
+        }.count
         let session = Self.makeAgentSession(
             index: agentSessions.count + 1,
             agent: agent,
-            workingDirectory: projectRoot
+            workingDirectory: projectRoot,
+            duplicateIndex: matchingAgentCount + 1
         )
         sessions.append(session)
         if select {
@@ -738,9 +742,15 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
-    private static func makeAgentSession(index: Int, agent: AgentToolDefinition, workingDirectory: String) -> TerminalSession {
-        TerminalSession(
-            title: agent.name.isEmpty ? "Agent \(index)" : agent.name,
+    private static func makeAgentSession(
+        index: Int,
+        agent: AgentToolDefinition,
+        workingDirectory: String,
+        duplicateIndex: Int
+    ) -> TerminalSession {
+        let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
+        return TerminalSession(
+            title: duplicateIndex == 1 ? baseTitle : "\(baseTitle) \(duplicateIndex)",
             subtitle: agent.commandLine,
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
@@ -798,6 +808,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 "failed"
             }
         }
+
     }
 
     let id = UUID()

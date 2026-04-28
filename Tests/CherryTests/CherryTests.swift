@@ -291,6 +291,16 @@ import Testing
     #expect(session.subtitle == "codex --yolo")
     #expect(session.workingDirectory == directory.path)
     #expect(workspace.agentSessions.map(\.id) == [session.id])
+
+    let secondSession = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"),
+        projectRoot: directory.path
+    )
+
+    #expect(secondSession.kind == .agent)
+    #expect(secondSession.agentName == "Codex")
+    #expect(secondSession.title == "Codex 2")
+    #expect(workspace.agentSessions.map(\.id) == [session.id, secondSession.id])
 }
 
 @MainActor

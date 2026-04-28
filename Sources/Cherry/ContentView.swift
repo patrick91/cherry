@@ -97,11 +97,6 @@ struct ContentView: View {
         .background(AppShortcutMonitor(workspace: workspace, openSettings: { openSettings() }))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
-        // The Animatable modifier MUST be inside the `.animation(...)` scope:
-        // SwiftUI only calls `animatableData.set` when a transaction is in
-        // play, and `.animation(...)` only creates one for views *within* its
-        // scope. If the modifier sat outside, hover-driven state changes
-        // would skip the setter entirely and the controller would stay stale.
         .modifier(ChromeWidthAnimator(
             dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
             floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
@@ -111,9 +106,9 @@ struct ContentView: View {
         // No `.animation(value: isSidebarHidden)` here — the toggle in
         // CherryApp wraps in `withAnimation` only when the floating sidebar
         // is NOT revealed. When it IS revealed, the toggle is unwrapped, so
-        // the docked + pane snap into place behind the floating's fade-out
-        // (driven by the `.animation(value: isSidebarRevealed)` below).
-        .animation(.snappy(duration: 0.18), value: isSidebarRevealed)
+        // the docked + pane snap into place behind the floating sidebar.
+        // Reveal/dismiss animations are driven by their explicit
+        // `withAnimation` calls so the Cmd+S handoff can opt out cleanly.
         .onChange(of: isSidebarHidden) { _, hidden in
             // When toggling from `(hidden, revealed)` to `shown`, dismiss
             // the floating sidebar within the same animation so it fades
@@ -518,7 +513,7 @@ private struct SidebarTabsView: View {
                         openSettings: { openSettings() }
                     )
 
-                    SidebarAgentToolsSection(
+                    SidebarAgentSessionSection(
                         settings: agentSettings,
                         workspace: workspace,
                         projectRoot: projectRoot,
@@ -656,7 +651,7 @@ private struct SidebarProjectPicker: View {
     }
 }
 
-private struct SidebarAgentToolsSection: View {
+private struct SidebarAgentSessionSection: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
 
@@ -675,60 +670,94 @@ private struct SidebarAgentToolsSection: View {
         )
 
         VStack(alignment: .leading, spacing: 4) {
-            SidebarSectionHeader(title: "Agents", count: project.agents.count, palette: palette)
+            HStack(spacing: 8) {
+                SidebarSectionHeader(title: "Agents", count: workspace.agentSessions.count, palette: palette)
+                    .padding(.horizontal, 0)
 
-            if project.agents.isEmpty {
+                AgentLaunchMenu(
+                    project: project,
+                    palette: palette,
+                    openSettings: openSettings,
+                    launch: launch
+                )
+            }
+            .padding(.horizontal, 10)
+
+            if workspace.agentSessions.isEmpty {
                 SidebarEmptyRow(
-                    title: project.validProjectRoot == nil ? "Select a project" : "No agents configured",
+                    title: "No agents",
                     palette: palette
                 )
             } else {
-                ForEach(project.agents) { agent in
-                    SidebarAgentToolRow(
-                        agent: agent,
-                        isSelected: selectedAgentName == agent.definition.normalizedName,
+                ForEach(workspace.agentSessions) { session in
+                    SidebarTabRow(
+                        session: session,
+                        isSelected: workspace.selectedSessionID == session.id,
                         presentation: presentation,
-                        onSelect: {
-                            selectOrLaunch(agent)
-                        }
+                        onSelect: { workspace.select(session) }
                     )
                     .contextMenu {
-                        Button("New Agent Session") {
-                            launch(agent)
+                        Button("Restart") {
+                            session.restart()
                         }
-                        .disabled(!agent.isLaunchable || project.validProjectRoot == nil)
 
-                        Button("Edit Agents...") {
-                            openSettings()
+                        Button("Clear Scrollback") {
+                            session.clearScrollback()
                         }
+
+                        Divider()
+
+                        Button("Close", role: .destructive) {
+                            workspace.close(session)
+                        }
+                        .disabled(workspace.sessions.count <= 1)
                     }
                 }
             }
         }
     }
 
-    private var selectedAgentName: String? {
-        guard let session = workspace.selectedSession, session.kind == .agent, let agentName = session.agentName else {
-            return nil
-        }
-        return AgentToolDefinition.normalizedName(agentName)
-    }
-
-    private func selectOrLaunch(_ agent: ResolvedAgentTool) {
-        if let existingSession = workspace.agentSessions.last(where: {
-            $0.agentName.map { AgentToolDefinition.normalizedName($0) } == agent.definition.normalizedName
-        }) {
-            workspace.select(existingSession)
-            return
-        }
-
-        launch(agent)
-    }
-
     private func launch(_ agent: ResolvedAgentTool) {
         let project = settings.resolvedProject(for: projectRoot)
         guard agent.isLaunchable, let root = project.validProjectRoot else { return }
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+    }
+}
+
+private struct AgentLaunchMenu: View {
+    let project: ResolvedAgentProject
+    let palette: SidebarPalette
+    let openSettings: () -> Void
+    let launch: (ResolvedAgentTool) -> Void
+
+    var body: some View {
+        Menu {
+            if project.launchableAgents.isEmpty {
+                Button(project.validProjectRoot == nil ? "Select a Project" : "No Launchable Agents") {}
+                    .disabled(true)
+            } else {
+                ForEach(project.launchableAgents) { agent in
+                    Button(agent.name) {
+                        launch(agent)
+                    }
+                }
+            }
+
+            Divider()
+
+            Button("Edit Agents...") {
+                openSettings()
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(palette.headerText)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+        .help("New agent")
     }
 }
 
@@ -1359,88 +1388,6 @@ private struct SidebarTabRow: View {
         .onHover { hovering in
             isHovered = hovering
         }
-    }
-
-    @ViewBuilder
-    private func rowBackground(palette: SidebarPalette) -> some View {
-        if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.selectedFill)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                }
-                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
-        } else if isHovered {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.hoverFill)
-        }
-    }
-}
-
-private struct SidebarAgentToolRow: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
-    let agent: ResolvedAgentTool
-    let isSelected: Bool
-    let presentation: SidebarPresentation
-    let onSelect: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            presentation: presentation
-        )
-
-        Button(action: onSelect) {
-            HStack(spacing: 10) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                    .opacity(agent.enabled ? 1 : 0.45)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(agent.name)
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                        .lineLimit(1)
-
-                    if !agent.enabled || !agent.isLaunchable {
-                        Text(agent.enabled ? "Blocked" : "Disabled")
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle((isSelected ? palette.selectedText : palette.headerText).opacity(0.82))
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer(minLength: 8)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 42)
-            .padding(.horizontal, 12)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .background {
-                rowBackground(palette: palette)
-            }
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovered = hovering
-        }
-    }
-
-    private var statusColor: Color {
-        if !agent.enabled {
-            return .gray
-        }
-        if !agent.isLaunchable {
-            return .orange
-        }
-        return .green
     }
 
     @ViewBuilder

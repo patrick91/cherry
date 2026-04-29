@@ -67,7 +67,8 @@ swift run CherryMCP
 Run the Cherry app first. The app listens on a per-user Unix socket at
 `/tmp/cherry-$UID/control.sock`; the MCP helper exposes tools for listing,
 creating, selecting, reading, searching, clearing, restarting, closing, and
-sending input to visible Cherry terminal tabs.
+sending input to visible Cherry terminal tabs. It can also list configured
+agent tools and launch a new configured agent in the active project window.
 
 ## Rendering Debug
 

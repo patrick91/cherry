@@ -33,6 +33,11 @@ private enum CherryMCPTools {
             properties: [:]
         ),
         tool(
+            "list_agents",
+            "List configured Cherry agents available to the active project.",
+            properties: [:]
+        ),
+        tool(
             "create_terminal",
             "Create and select a new visible Cherry terminal tab.",
             properties: [
@@ -40,6 +45,19 @@ private enum CherryMCPTools {
                 "working_directory": string("Optional working directory."),
                 "command": string("Optional command to run after launch.")
             ]
+        ),
+        tool(
+            "run_agent",
+            "Create a new configured Cherry agent session in the active project.",
+            properties: [
+                "agent_name": string("Configured Cherry agent name."),
+                "text": string("Optional text to send exactly as provided after launch."),
+                "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
+                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
+                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000."),
+                "select": boolean("Whether to select the new agent session in Cherry.")
+            ],
+            required: ["agent_name"]
         ),
         tool(
             "select_terminal",
@@ -132,11 +150,22 @@ private enum CherryMCPTools {
         switch name {
         case "list_terminals":
             return .listTerminals
+        case "list_agents":
+            return .listAgents
         case "create_terminal":
             return .createTerminal(.init(
                 title: stringArgument("title", in: arguments),
                 workingDirectory: stringArgument("working_directory", in: arguments),
                 command: stringArgument("command", in: arguments)
+            ))
+        case "run_agent":
+            return .runAgent(.init(
+                agentName: try requiredString("agent_name", in: arguments),
+                text: stringArgument("text", in: arguments),
+                rawBase64: stringArgument("raw_base64", in: arguments),
+                waitMilliseconds: intArgument("wait_ms", in: arguments),
+                lineLimit: intArgument("line_limit", in: arguments),
+                select: boolArgument("select", in: arguments)
             ))
         case "select_terminal":
             return .selectTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))
@@ -181,7 +210,11 @@ private enum CherryMCPTools {
         switch result {
         case .listTerminals(let payload):
             return try encodedResult(payload)
+        case .listAgents(let payload):
+            return try encodedResult(payload)
         case .createTerminal(let payload):
+            return try encodedResult(payload)
+        case .runAgent(let payload):
             return try encodedResult(payload)
         case .selectTerminal(let payload):
             return try encodedResult(payload)

@@ -11,9 +11,11 @@ public enum CherryControl {
     }
 }
 
-public enum CherryControlRequest: Codable, Equatable {
+public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listTerminals
+    case listAgents
     case createTerminal(CreateTerminalRequest)
+    case runAgent(RunAgentRequest)
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
     case getTerminalOutput(GetTerminalOutputRequest)
@@ -24,7 +26,7 @@ public enum CherryControlRequest: Codable, Equatable {
     case closeTerminal(TerminalIDRequest)
 }
 
-public struct TerminalIDRequest: Codable, Equatable {
+public struct TerminalIDRequest: Codable, Equatable, Sendable {
     public let terminalID: String
 
     public init(terminalID: String) {
@@ -32,7 +34,7 @@ public struct TerminalIDRequest: Codable, Equatable {
     }
 }
 
-public struct CreateTerminalRequest: Codable, Equatable {
+public struct CreateTerminalRequest: Codable, Equatable, Sendable {
     public let title: String?
     public let workingDirectory: String?
     public let command: String?
@@ -44,7 +46,32 @@ public struct CreateTerminalRequest: Codable, Equatable {
     }
 }
 
-public struct SendInputRequest: Codable, Equatable {
+public struct RunAgentRequest: Codable, Equatable, Sendable {
+    public let agentName: String
+    public let text: String?
+    public let rawBase64: String?
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+    public let select: Bool?
+
+    public init(
+        agentName: String,
+        text: String? = nil,
+        rawBase64: String? = nil,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil,
+        select: Bool? = nil
+    ) {
+        self.agentName = agentName
+        self.text = text
+        self.rawBase64 = rawBase64
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+        self.select = select
+    }
+}
+
+public struct SendInputRequest: Codable, Equatable, Sendable {
     public let terminalID: String
     public let text: String?
     public let rawBase64: String?
@@ -66,7 +93,7 @@ public struct SendInputRequest: Codable, Equatable {
     }
 }
 
-public struct GetTerminalOutputRequest: Codable, Equatable {
+public struct GetTerminalOutputRequest: Codable, Equatable, Sendable {
     public let terminalID: String
     public let startLine: Int?
     public let lineLimit: Int?
@@ -78,7 +105,7 @@ public struct GetTerminalOutputRequest: Codable, Equatable {
     }
 }
 
-public struct GetTerminalRawOutputRequest: Codable, Equatable {
+public struct GetTerminalRawOutputRequest: Codable, Equatable, Sendable {
     public let terminalID: String
     public let maxBytes: Int?
 
@@ -88,7 +115,7 @@ public struct GetTerminalRawOutputRequest: Codable, Equatable {
     }
 }
 
-public struct SearchOutputRequest: Codable, Equatable {
+public struct SearchOutputRequest: Codable, Equatable, Sendable {
     public let terminalID: String
     public let query: String
     public let caseSensitive: Bool?
@@ -102,7 +129,7 @@ public struct SearchOutputRequest: Codable, Equatable {
     }
 }
 
-public struct CherryControlResponse: Codable, Equatable {
+public struct CherryControlResponse: Codable, Equatable, Sendable {
     public let result: CherryControlResult?
     public let error: CherryControlError?
 
@@ -117,9 +144,11 @@ public struct CherryControlResponse: Codable, Equatable {
     }
 }
 
-public enum CherryControlResult: Codable, Equatable {
+public enum CherryControlResult: Codable, Equatable, Sendable {
     case listTerminals(ListTerminalsResult)
+    case listAgents(ListAgentsResult)
     case createTerminal(TerminalSummaryResult)
+    case runAgent(RunAgentResult)
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
     case getTerminalOutput(TerminalOutputResult)
@@ -130,7 +159,7 @@ public enum CherryControlResult: Codable, Equatable {
     case closeTerminal(CloseTerminalResult)
 }
 
-public struct CherryControlError: Codable, Equatable, Error {
+public struct CherryControlError: Codable, Equatable, Error, Sendable {
     public let code: String
     public let message: String
 
@@ -140,7 +169,7 @@ public struct CherryControlError: Codable, Equatable, Error {
     }
 }
 
-public struct TerminalInfo: Codable, Equatable {
+public struct TerminalInfo: Codable, Equatable, Sendable {
     public let id: String
     public let title: String
     public let state: String
@@ -171,7 +200,7 @@ public struct TerminalInfo: Codable, Equatable {
     }
 }
 
-public struct ListTerminalsResult: Codable, Equatable {
+public struct ListTerminalsResult: Codable, Equatable, Sendable {
     public let terminals: [TerminalInfo]
     public let selectedTerminalID: String?
 
@@ -181,7 +210,48 @@ public struct ListTerminalsResult: Codable, Equatable {
     }
 }
 
-public struct TerminalSummaryResult: Codable, Equatable {
+public struct AgentInfo: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let command: String
+    public let arguments: String
+    public let commandLine: String
+    public let enabled: Bool
+    public let launchable: Bool
+    public let activeSessionCount: Int
+
+    public init(
+        id: String,
+        name: String,
+        command: String,
+        arguments: String,
+        commandLine: String,
+        enabled: Bool,
+        launchable: Bool,
+        activeSessionCount: Int
+    ) {
+        self.id = id
+        self.name = name
+        self.command = command
+        self.arguments = arguments
+        self.commandLine = commandLine
+        self.enabled = enabled
+        self.launchable = launchable
+        self.activeSessionCount = activeSessionCount
+    }
+}
+
+public struct ListAgentsResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String?
+    public let agents: [AgentInfo]
+
+    public init(activeProjectRoot: String?, agents: [AgentInfo]) {
+        self.activeProjectRoot = activeProjectRoot
+        self.agents = agents
+    }
+}
+
+public struct TerminalSummaryResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let title: String
     public let state: String
@@ -197,7 +267,38 @@ public struct TerminalSummaryResult: Codable, Equatable {
     }
 }
 
-public struct SelectTerminalResult: Codable, Equatable {
+public struct RunAgentResult: Codable, Equatable, Sendable {
+    public let terminalID: String
+    public let title: String
+    public let state: String
+    public let kind: String?
+    public let agentName: String?
+    public let projectRoot: String
+    public let sentBytes: Int
+    public let output: TerminalOutputResult?
+
+    public init(
+        terminalID: String,
+        title: String,
+        state: String,
+        kind: String?,
+        agentName: String?,
+        projectRoot: String,
+        sentBytes: Int,
+        output: TerminalOutputResult?
+    ) {
+        self.terminalID = terminalID
+        self.title = title
+        self.state = state
+        self.kind = kind
+        self.agentName = agentName
+        self.projectRoot = projectRoot
+        self.sentBytes = sentBytes
+        self.output = output
+    }
+}
+
+public struct SelectTerminalResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let selected: Bool
 
@@ -207,7 +308,7 @@ public struct SelectTerminalResult: Codable, Equatable {
     }
 }
 
-public struct SendInputResult: Codable, Equatable {
+public struct SendInputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let sentBytes: Int
     public let output: TerminalOutputResult?
@@ -219,7 +320,7 @@ public struct SendInputResult: Codable, Equatable {
     }
 }
 
-public struct TerminalOutputResult: Codable, Equatable {
+public struct TerminalOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let startLine: Int
     public let endLineExclusive: Int
@@ -241,7 +342,7 @@ public struct TerminalOutputResult: Codable, Equatable {
     }
 }
 
-public struct TerminalRawOutputResult: Codable, Equatable {
+public struct TerminalRawOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let text: String
     public let byteCount: Int
@@ -255,7 +356,7 @@ public struct TerminalRawOutputResult: Codable, Equatable {
     }
 }
 
-public struct SearchOutputResult: Codable, Equatable {
+public struct SearchOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let matches: [SearchOutputMatch]
 
@@ -265,7 +366,7 @@ public struct SearchOutputResult: Codable, Equatable {
     }
 }
 
-public struct SearchOutputMatch: Codable, Equatable {
+public struct SearchOutputMatch: Codable, Equatable, Sendable {
     public let lineNumber: Int
     public let text: String
 
@@ -275,7 +376,7 @@ public struct SearchOutputMatch: Codable, Equatable {
     }
 }
 
-public struct ClearOutputResult: Codable, Equatable {
+public struct ClearOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let cleared: Bool
 
@@ -285,7 +386,7 @@ public struct ClearOutputResult: Codable, Equatable {
     }
 }
 
-public struct CloseTerminalResult: Codable, Equatable {
+public struct CloseTerminalResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let closed: Bool
 

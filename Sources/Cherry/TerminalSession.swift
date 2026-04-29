@@ -1042,7 +1042,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
                     term: "xterm-256color",
-                    initialSize: viewportSize
+                    initialSize: viewportSize,
+                    startupCommand: launchCommand
                 ),
                 onData: { data in
                     traceRecorder?.recordOutput(data)
@@ -1062,9 +1063,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             shellProcess = process
 
             state = .live
-            if let launchCommand {
-                process.write("exec \(launchCommand)\n")
-            }
             bumpRevision()
         } catch {
             activeLaunchID = nil

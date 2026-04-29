@@ -19,6 +19,125 @@ import Testing
     #expect(decoded == request)
 }
 
+@Test func cherryControlRunAgentRequestRoundTrips() async throws {
+    let request = CherryControlRequest.runAgent(.init(
+        agentName: "Codex",
+        text: "status\n",
+        rawBase64: nil,
+        waitMilliseconds: 100,
+        lineLimit: 20,
+        select: true
+    ))
+
+    let data = try JSONEncoder().encode(request)
+    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+
+    #expect(decoded == request)
+}
+
+@MainActor
+@Test func controlServerListsConfiguredAgents() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"))
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude", enabled: false))
+    harness.server.start()
+
+    let response = try await harness.send(.listAgents)
+    guard case .listAgents(let result)? = response.result else {
+        Issue.record("Expected listAgents result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(response.error == nil)
+    #expect(result.activeProjectRoot == harness.projectRoot.path)
+    #expect(result.agents.map(\.name) == ["Codex", "Claude"])
+    #expect(result.agents[0].commandLine == "codex --yolo")
+    #expect(result.agents[0].launchable == true)
+    #expect(result.agents[0].activeSessionCount == 0)
+    #expect(result.agents[1].enabled == false)
+    #expect(result.agents[1].launchable == false)
+}
+
+@MainActor
+@Test func controlServerRunsConfiguredAgentSession() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let response = try await harness.send(.runAgent(.init(
+        agentName: " echo ",
+        text: "agent-input\n",
+        waitMilliseconds: 250,
+        lineLimit: 20,
+        select: false
+    )))
+
+    guard case .runAgent(let result)? = response.result else {
+        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(response.error == nil)
+    #expect(result.projectRoot == harness.projectRoot.path)
+    #expect(result.kind == "agent")
+    #expect(result.agentName == "Echo")
+    #expect(result.title == "Echo")
+    #expect(result.sentBytes == Data("agent-input\n".utf8).count)
+    #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
+    #expect(harness.workspace.agentSessions.count == 1)
+    #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.terminalID))
+}
+
+@MainActor
+@Test func controlServerCreatesDuplicateAgentSessions() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
+    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
+
+    guard case .runAgent(let firstResult)? = firstResponse.result,
+          case .runAgent(let secondResult)? = secondResponse.result
+    else {
+        Issue.record("Expected runAgent results")
+        return
+    }
+
+    #expect(firstResult.title == "Echo")
+    #expect(secondResult.title == "Echo 2")
+    #expect(harness.workspace.agentSessions.map(\.title) == ["Echo", "Echo 2"])
+}
+
+@MainActor
+@Test func controlServerRejectsUnknownAndDisabledAgents() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude", enabled: false))
+    harness.server.start()
+
+    let missingResponse = try await harness.send(.runAgent(.init(agentName: "Codex")))
+    #expect(missingResponse.error?.code == "agent_not_found")
+
+    let disabledResponse = try await harness.send(.runAgent(.init(agentName: "Claude")))
+    #expect(disabledResponse.error?.code == "agent_not_launchable")
+}
+
 @MainActor
 @Test func terminalSessionCapturesAndClearsRawOutput() async throws {
     let session = TerminalSession(
@@ -299,8 +418,10 @@ import Testing
     #expect(workspace.selectedSessionID == session.id)
     #expect(session.kind == .agent)
     #expect(output.contains("agent-done"))
+    #expect(!output.contains("exec /bin/echo agent-done"))
     #expect(!output.contains("[agent exited with status 0]"))
     #expect(rawOutput.contains("agent-done"))
+    #expect(!rawOutput.contains("exec /bin/echo agent-done"))
     #expect(!rawOutput.contains("[agent exited with status 0]"))
     #expect(session.cursorState.isVisible == false)
 }
@@ -314,6 +435,65 @@ private func waitForExit(_ session: TerminalSession) async throws {
         try await Task.sleep(for: .milliseconds(25))
     }
     Issue.record("Timed out waiting for session to exit")
+}
+
+@MainActor
+private final class ControlServerHarness {
+    let defaultsName: String
+    let defaults: UserDefaults
+    let settings: AgentSettings
+    let projectRoot: URL
+    let workspace: TerminalWorkspace
+    let socketURL: URL
+    let server: CherryControlServer
+
+    init() throws {
+        defaultsName = "CherryTests.ControlServer.\(UUID().uuidString)"
+        defaults = try #require(UserDefaults(suiteName: defaultsName))
+
+        projectRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+
+        let socketDirectory = URL(
+            fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
+            isDirectory: true
+        )
+        socketURL = socketDirectory.appendingPathComponent("control.sock")
+
+        settings = AgentSettings(defaults: defaults)
+        _ = settings.addProject(path: projectRoot.path)
+        workspace = TerminalWorkspace(projectRoot: projectRoot.path)
+        server = CherryControlServer(workspace: workspace, socketURL: socketURL, agentSettings: settings)
+    }
+
+    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+        try await Self.send(request, socketURL: socketURL)
+    }
+
+    func stop() {
+        server.stop()
+        workspace.sessions.forEach { $0.stop() }
+        defaults.removePersistentDomain(forName: defaultsName)
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
+    }
+
+    nonisolated private static func send(
+        _ request: CherryControlRequest,
+        socketURL: URL
+    ) async throws -> CherryControlResponse {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try CherryControlClient(socketURL: socketURL).send(request)
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 }
 
 @MainActor

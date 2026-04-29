@@ -5,20 +5,33 @@ import Foundation
 final class CherryControlServer: @unchecked Sendable {
     private weak var workspace: TerminalWorkspace?
     private let workspaceProvider: @MainActor () -> TerminalWorkspace?
+    private let agentSettings: AgentSettings
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
     private var listenFileDescriptor: Int32 = -1
     private var acceptSource: DispatchSourceRead?
 
-    init(workspace: TerminalWorkspace, socketURL: URL = CherryControl.socketURL) {
+    @MainActor
+    init(
+        workspace: TerminalWorkspace,
+        socketURL: URL = CherryControl.socketURL,
+        agentSettings: AgentSettings = .shared
+    ) {
         self.workspace = workspace
         self.workspaceProvider = { workspace }
+        self.agentSettings = agentSettings
         self.socketURL = socketURL
     }
 
-    init(workspaceProvider: @escaping @MainActor () -> TerminalWorkspace?, socketURL: URL = CherryControl.socketURL) {
+    @MainActor
+    init(
+        workspaceProvider: @escaping @MainActor () -> TerminalWorkspace?,
+        socketURL: URL = CherryControl.socketURL,
+        agentSettings: AgentSettings = .shared
+    ) {
         self.workspace = nil
         self.workspaceProvider = workspaceProvider
+        self.agentSettings = agentSettings
         self.socketURL = socketURL
     }
 
@@ -181,6 +194,8 @@ final class CherryControlServer: @unchecked Sendable {
         switch request {
         case .listTerminals:
             return .init(result: .listTerminals(listTerminals(workspace: workspace)))
+        case .listAgents:
+            return .init(result: .listAgents(listAgents(workspace: workspace)))
         case .createTerminal(let request):
             let session = workspace.addSession(
                 title: request.title,
@@ -189,6 +204,39 @@ final class CherryControlServer: @unchecked Sendable {
                 select: false
             )
             return .init(result: .createTerminal(summary(for: session)))
+        case .runAgent(let request):
+            guard let projectRoot = workspace.projectRoot else {
+                throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+            }
+            let agent = try findAgent(named: request.agentName)
+            guard agent.isLaunchable else {
+                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
+            }
+            let session = workspace.addAgentSession(
+                agent: agent.definition,
+                projectRoot: projectRoot,
+                select: request.select ?? false
+            )
+            let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
+            if let payload, !payload.isEmpty {
+                session.send(data: payload)
+            }
+            let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
+            let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
+            if waitMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(waitMilliseconds))
+            }
+            let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
+            return .init(result: .runAgent(.init(
+                terminalID: session.id.uuidString,
+                title: session.title,
+                state: session.state.label,
+                kind: session.kind.rawValue,
+                agentName: session.agentName,
+                projectRoot: projectRoot,
+                sentBytes: payload?.count ?? 0,
+                output: output
+            )))
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
@@ -251,6 +299,39 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func listAgents(workspace: TerminalWorkspace) -> ListAgentsResult {
+        ListAgentsResult(
+            activeProjectRoot: workspace.projectRoot,
+            agents: agentSettings.resolvedAgents.map { agent in
+                let normalizedName = agent.definition.normalizedName
+                let activeSessionCount = workspace.agentSessions.filter {
+                    $0.agentName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
+                }.count
+
+                return AgentInfo(
+                    id: agent.id,
+                    name: agent.name,
+                    command: agent.definition.command,
+                    arguments: agent.definition.arguments,
+                    commandLine: agent.commandLine,
+                    enabled: agent.enabled,
+                    launchable: agent.isLaunchable,
+                    activeSessionCount: activeSessionCount
+                )
+            }
+        )
+    }
+
+    @MainActor
+    private func findAgent(named requestedName: String) throws -> ResolvedAgentTool {
+        let normalizedName = AgentToolDefinition.normalizedName(requestedName)
+        guard let agent = agentSettings.resolvedAgents.first(where: { $0.definition.normalizedName == normalizedName }) else {
+            throw CherryControlError(code: "agent_not_found", message: "No Cherry agent is configured with name \(requestedName).")
+        }
+        return agent
+    }
+
+    @MainActor
     private func findSession(workspace: TerminalWorkspace, terminalID: String) throws -> TerminalSession {
         guard let session = workspace.session(id: terminalID) else {
             throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
@@ -280,6 +361,22 @@ final class CherryControlServer: @unchecked Sendable {
             return data
         default:
             throw CherryControlError(code: "invalid_input", message: "Provide exactly one of text or raw_base64.")
+        }
+    }
+
+    private func optionalInputPayload(text: String?, rawBase64: String?) throws -> Data? {
+        switch (text, rawBase64) {
+        case let (text?, nil):
+            return Data(text.utf8)
+        case let (nil, rawBase64?):
+            guard let data = Data(base64Encoded: rawBase64) else {
+                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
+            }
+            return data
+        case (nil, nil):
+            return nil
+        case (_?, _?):
+            throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
         }
     }
 

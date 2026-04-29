@@ -69,6 +69,25 @@ struct ContentView: View {
                 .opacity(isSidebarRevealed ? 1 : 0)
                 .allowsHitTesting(isSidebarRevealed)
 
+            // Project picker, anchored to the window's top-leading corner so
+            // it shares coordinate space with the traffic-light overlay
+            // (which positions correctly at this level). It rides the same
+            // chrome translation as the traffic lights so it slides off
+            // with the sidebar, and is hidden via offset when the sidebar
+            // is fully gone.
+            TitlebarProjectPicker(
+                settings: AgentSettings.shared,
+                projectRoot: projectRoot,
+                presentation: isSidebarRevealed ? .floating : .docked,
+                openProject: openProject,
+                openSettings: { openSettings() }
+            )
+            .padding(.leading, 80)
+            .padding(.top, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .offset(x: titlebarPickerTranslationX)
+            .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
+
             if isSidebarHidden {
                 // Wider hot-zone (24pt) avoids the macOS fullscreen edge
                 // gestures that reserve the leftmost few pixels. Using
@@ -245,6 +264,16 @@ struct ContentView: View {
 
     private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
         min(max(width, minimumSidebarWidth), maximumSidebarWidth)
+    }
+
+    // Mirrors `TrafficLightController.applyCurrent` so the project picker
+    // slides in lockstep with the native traffic-light buttons.
+    private var titlebarPickerTranslationX: CGFloat {
+        let chrome = max(
+            isSidebarHidden ? 0 : sidebarWidth,
+            isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0
+        )
+        return min(0, chrome - sidebarWidth)
     }
 }
 
@@ -505,14 +534,6 @@ private struct SidebarTabsView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    SidebarProjectPicker(
-                        settings: agentSettings,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
-                        openProject: openProject,
-                        openSettings: { openSettings() }
-                    )
-
                     SidebarAgentSessionSection(
                         settings: agentSettings,
                         workspace: workspace,
@@ -563,7 +584,7 @@ private struct SidebarTabsView: View {
     }
 }
 
-private struct SidebarProjectPicker: View {
+private struct TitlebarProjectPicker: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
 
@@ -573,6 +594,9 @@ private struct SidebarProjectPicker: View {
     let openProject: (CherryProject) -> Void
     let openSettings: () -> Void
 
+    @State private var isHovering = false
+    @State private var anchorRef = TitlebarProjectMenuAnchorRef()
+
     var body: some View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
@@ -580,63 +604,91 @@ private struct SidebarProjectPicker: View {
             presentation: presentation
         )
 
-        Menu {
-            if settings.projects.isEmpty {
-                Button("No Projects") {}
-                    .disabled(true)
-            } else {
-                Section("Projects") {
-                    ForEach(settings.projects) { project in
-                        Button {
-                            openProject(project)
-                        } label: {
-                            Label(project.name, systemImage: selectedProject?.id == project.id ? "checkmark" : "folder")
-                        }
-                    }
+        // SwiftUI Menu's underlying NSPopUpButton owns mouse-tracking on its
+        // label, so neither `.onHover` nor an NSTrackingArea overlay fire.
+        // A plain Button has no such interference — we present an NSMenu
+        // programmatically on click.
+        Button(action: presentMenu) {
+            Text(selectedProject?.name ?? "No Project")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(palette.rowText)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(palette.hoverFill.opacity(isHovering ? 1 : 0))
                 }
-            }
-
-            Divider()
-
-            Button {
-                chooseProjectRoot()
-            } label: {
-                Label("Add Project...", systemImage: "plus")
-            }
-
-            Button {
-                openSettings()
-            } label: {
-                Label("Edit Projects...", systemImage: "gearshape")
-            }
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "folder")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(palette.rowText.opacity(0.78))
-
-                Text(selectedProject?.name ?? "No Project")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(palette.rowText)
-                    .lineLimit(1)
-
-                Spacer(minLength: 6)
-
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(palette.rowText.opacity(0.62))
-            }
-            .frame(height: 40)
-            .padding(.horizontal, 12)
-            .background {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(palette.hoverFill.opacity(0.72))
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
-        .menuStyle(.borderlessButton)
         .buttonStyle(.plain)
-        .padding(.horizontal, 2)
+        .background(TitlebarProjectMenuAnchor(ref: anchorRef))
+        .fixedSize()
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                isHovering = hovering
+            }
+        }
+    }
+
+    private func presentMenu() {
+        let menu = NSMenu()
+        var targets: [TitlebarProjectMenuTarget] = []
+
+        if settings.projects.isEmpty {
+            let item = NSMenuItem(title: "No Projects", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            menu.addItem(NSMenuItem.sectionHeader(title: "Projects"))
+
+            for project in settings.projects {
+                let item = NSMenuItem(title: project.name, action: nil, keyEquivalent: "")
+                if selectedProject?.id == project.id {
+                    item.state = .on
+                }
+                let target = TitlebarProjectMenuTarget { [openProject] in
+                    openProject(project)
+                }
+                targets.append(target)
+                item.target = target
+                item.action = #selector(TitlebarProjectMenuTarget.invoke)
+                menu.addItem(item)
+            }
+        }
+
+        menu.addItem(.separator())
+
+        let addItem = NSMenuItem(title: "Add Project...", action: nil, keyEquivalent: "")
+        let addTarget = TitlebarProjectMenuTarget(chooseProjectRoot)
+        targets.append(addTarget)
+        addItem.target = addTarget
+        addItem.action = #selector(TitlebarProjectMenuTarget.invoke)
+        menu.addItem(addItem)
+
+        let editItem = NSMenuItem(title: "Edit Projects...", action: nil, keyEquivalent: "")
+        let editTarget = TitlebarProjectMenuTarget(openSettings)
+        targets.append(editTarget)
+        editItem.target = editTarget
+        editItem.action = #selector(TitlebarProjectMenuTarget.invoke)
+        menu.addItem(editItem)
+
+        // Anchor the menu's top-left to the bottom-leading corner of the
+        // button, with a 4pt gap. NSMenuItem.target is `weak`, but
+        // `popUp(positioning:at:in:)` is synchronous: actions fire before
+        // the call returns, so the local `targets` array keeps them alive
+        // long enough.
+        if let anchor = anchorRef.view {
+            let bounds = anchor.bounds
+            let point: NSPoint = anchor.isFlipped
+                ? NSPoint(x: bounds.minX, y: bounds.maxY + 4)
+                : NSPoint(x: bounds.minX, y: bounds.minY - 4)
+            menu.popUp(positioning: nil, at: point, in: anchor)
+        } else {
+            menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        }
+
+        _ = targets
     }
 
     private func chooseProjectRoot() {
@@ -655,6 +707,38 @@ private struct SidebarProjectPicker: View {
 
     private var selectedProject: CherryProject? {
         settings.selectedProject(for: projectRoot)
+    }
+}
+
+@MainActor
+private final class TitlebarProjectMenuTarget: NSObject {
+    let action: () -> Void
+
+    init(_ action: @escaping () -> Void) {
+        self.action = action
+    }
+
+    @objc func invoke() {
+        action()
+    }
+}
+
+@MainActor
+private final class TitlebarProjectMenuAnchorRef {
+    weak var view: NSView?
+}
+
+private struct TitlebarProjectMenuAnchor: NSViewRepresentable {
+    let ref: TitlebarProjectMenuAnchorRef
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        ref.view = view
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        ref.view = nsView
     }
 }
 

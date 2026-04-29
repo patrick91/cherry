@@ -587,6 +587,10 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .terminal }
     }
 
+    var sidebarOrderedSessions: [TerminalSession] {
+        agentSessions + terminalSessions
+    }
+
     func select(_ session: TerminalSession) {
         selectedSessionID = session.id
     }
@@ -718,14 +722,15 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     private func selectSession(offset: Int) {
-        guard !sessions.isEmpty else { return }
+        let orderedSessions = sidebarOrderedSessions
+        guard !orderedSessions.isEmpty else { return }
 
         let currentIndex = selectedSession
             .flatMap { selectedSession in
-                sessions.firstIndex(where: { $0.id == selectedSession.id })
+                orderedSessions.firstIndex(where: { $0.id == selectedSession.id })
             } ?? 0
-        let nextIndex = (currentIndex + offset + sessions.count) % sessions.count
-        selectedSessionID = sessions[nextIndex].id
+        let nextIndex = (currentIndex + offset + orderedSessions.count) % orderedSessions.count
+        selectedSessionID = orderedSessions[nextIndex].id
     }
 
     func session(id terminalID: String) -> TerminalSession? {

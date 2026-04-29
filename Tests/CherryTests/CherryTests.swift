@@ -270,6 +270,63 @@ import Testing
     #expect(workspace.sessions.map(\.id) == [firstSession.id, secondSession.id, thirdSession.id])
 }
 
+@MainActor
+@Test func workspaceShortcutSelectionFollowsSidebarOrder() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let firstTerminal = try #require(workspace.terminalSessions.first)
+    let secondTerminal = workspace.addSession(title: "Second", select: false)
+    let firstAgent = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+    let secondAgent = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Claude", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+
+    #expect(workspace.sessions.map(\.id) == [
+        firstTerminal.id,
+        secondTerminal.id,
+        firstAgent.id,
+        secondAgent.id
+    ])
+    #expect(workspace.sidebarOrderedSessions.map(\.id) == [
+        firstAgent.id,
+        secondAgent.id,
+        firstTerminal.id,
+        secondTerminal.id
+    ])
+
+    workspace.select(firstAgent)
+    workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == secondAgent.id)
+
+    workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == firstTerminal.id)
+
+    workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == secondTerminal.id)
+
+    workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == firstAgent.id)
+
+    workspace.selectPreviousSession()
+    #expect(workspace.selectedSessionID == secondTerminal.id)
+}
+
 @Test func agentDefinitionsValidateAndNormalize() async throws {
     let agents = try AgentConfiguration.validated([
         AgentToolDefinition(name: " Codex ", command: " codex ", arguments: " --yolo ", enabled: true),

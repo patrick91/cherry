@@ -21,6 +21,11 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Agents", systemImage: "sparkles")
                 }
+
+            CommandSettingsPane(settings: agentSettings)
+                .tabItem {
+                    Label("Commands", systemImage: "play.rectangle")
+                }
         }
         .frame(width: 680, height: 560)
     }
@@ -339,6 +344,349 @@ private struct AgentSettingsPane: View {
                 }
             )
         }
+    }
+}
+
+private struct CommandSettingsPane: View {
+    @ObservedObject var settings: AgentSettings
+
+    @State private var selectedProjectRoot = ""
+    @State private var editingCommand: ProjectCommandDefinition?
+    @State private var editingOriginalName: String?
+    @State private var commandError: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section("Project") {
+                    if settings.projects.isEmpty {
+                        Text("Add a project before configuring commands.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Project", selection: $selectedProjectRoot) {
+                            ForEach(settings.projects) { project in
+                                Text(project.name)
+                                    .tag(project.root)
+                            }
+                        }
+                    }
+                }
+
+                Section("Commands") {
+                    if selectedProjectRoot.isEmpty || settings.projectCommands(for: selectedProjectRoot).isEmpty {
+                        Text(settings.projects.isEmpty ? "No projects configured." : "No commands configured for this project.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(settings.projectCommands(for: selectedProjectRoot)) { command in
+                            ProjectCommandRow(command: command) {
+                                editingCommand = command
+                                editingOriginalName = command.name
+                            } onDelete: {
+                                settings.removeCommand(named: command.name, for: selectedProjectRoot)
+                            }
+                        }
+                    }
+
+                    HStack {
+                        Button("Add Command") {
+                            editingCommand = ProjectCommandDefinition(name: "Dev server", command: "npm", arguments: "run dev")
+                            editingOriginalName = nil
+                        }
+                        .disabled(selectedProjectRoot.isEmpty)
+
+                        Spacer()
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .padding(20)
+        }
+        .onAppear {
+            if selectedProjectRoot.isEmpty {
+                selectedProjectRoot = settings.projects.first?.root ?? ""
+            }
+        }
+        .onChange(of: settings.projects) { _, projects in
+            guard !projects.contains(where: { $0.root == selectedProjectRoot }) else { return }
+            selectedProjectRoot = projects.first?.root ?? ""
+        }
+        .sheet(item: $editingCommand) { command in
+            ProjectCommandEditor(
+                command: command,
+                projectRoot: selectedProjectRoot,
+                canDelete: editingOriginalName != nil,
+                errorMessage: commandError,
+                onSave: { updatedCommand, storage in
+                    do {
+                        try settings.upsertCommand(
+                            updatedCommand,
+                            for: selectedProjectRoot,
+                            replacing: editingOriginalName,
+                            storage: storage
+                        )
+                        commandError = nil
+                        editingOriginalName = nil
+                        editingCommand = nil
+                    } catch {
+                        commandError = error.localizedDescription
+                    }
+                },
+                onDelete: {
+                    settings.removeCommand(named: command.name, for: selectedProjectRoot)
+                    commandError = nil
+                    editingOriginalName = nil
+                    editingCommand = nil
+                },
+                onCancel: {
+                    commandError = nil
+                    editingOriginalName = nil
+                    editingCommand = nil
+                }
+            )
+        }
+    }
+}
+
+private struct ProjectCommandRow: View {
+    let command: ProjectCommandDefinition
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(command.name)
+                    .foregroundStyle(command.enabled ? .primary : .secondary)
+
+                Text(command.commandLine)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button("Edit", action: onEdit)
+        }
+        .contextMenu {
+            Button("Delete", role: .destructive, action: onDelete)
+        }
+    }
+}
+
+struct ProjectCommandEditor: View {
+    @State private var draft: ProjectCommandDraft
+
+    let projectRoot: String
+    let canDelete: Bool
+    let errorMessage: String?
+    let onSave: (ProjectCommandDefinition, ProjectCommandStorage) -> Void
+    let onDelete: () -> Void
+    let onCancel: () -> Void
+
+    init(
+        command: ProjectCommandDefinition,
+        projectRoot: String,
+        canDelete: Bool,
+        errorMessage: String?,
+        onSave: @escaping (ProjectCommandDefinition, ProjectCommandStorage) -> Void,
+        onDelete: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        _draft = State(initialValue: ProjectCommandDraft(command: command, projectRoot: projectRoot))
+        self.projectRoot = projectRoot
+        self.canDelete = canDelete
+        self.errorMessage = errorMessage
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Text(canDelete ? "Edit command" : "Add command")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Command name")
+                        .foregroundStyle(.secondary)
+                    TextField("e.g., Vite, Queue, Logs", text: $draft.name)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Command")
+                        .foregroundStyle(.secondary)
+                    TextField("e.g., npm run dev", text: $draft.commandLine)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Working directory")
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 10) {
+                        TextField(projectRoot, text: $draft.workingDirectory)
+
+                        Button("Browse") {
+                            chooseWorkingDirectory()
+                        }
+                    }
+
+                    Text("Leave empty to use project root")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                Toggle("Auto-start when project starts", isOn: $draft.autoStart)
+                Toggle("Auto-restart if command exits", isOn: $draft.autoRestart)
+            }
+            .textFieldStyle(.roundedBorder)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Where to save this command")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                ProjectCommandStorageOption(
+                    title: "Save to cherry.toml",
+                    subtitle: CherryProjectFile.exists(projectRoot: projectRoot)
+                        ? "Share this command through the project config"
+                        : "No cherry.toml found — Cherry will create one",
+                    isSelected: draft.storage == .projectFile
+                ) {
+                    draft.storage = .projectFile
+                }
+
+                ProjectCommandStorageOption(
+                    title: "Store locally only",
+                    subtitle: "Keep this command just for yourself on this machine",
+                    isSelected: draft.storage == .local
+                ) {
+                    draft.storage = .local
+                }
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                if canDelete {
+                    Button("Delete", role: .destructive, action: onDelete)
+                }
+
+                Spacer()
+
+                Button("Cancel", action: onCancel)
+                Button("Save") {
+                    onSave(draft.definition, draft.storage)
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private func chooseWorkingDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if !draft.workingDirectory.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: NSString(string: draft.workingDirectory).expandingTildeInPath)
+        } else if !projectRoot.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: projectRoot, isDirectory: true)
+        }
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        draft.workingDirectory = url.path
+    }
+}
+
+private struct ProjectCommandStorageOption: View {
+    let title: String
+    let subtitle: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isSelected ? "smallcircle.filled.circle.fill" : "circle")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(isSelected ? .blue : .secondary)
+                    .frame(width: 18, height: 20)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ProjectCommandDraft {
+    var name: String
+    var commandLine: String
+    var workingDirectory: String
+    var autoStart: Bool
+    var autoRestart: Bool
+    var enabled: Bool
+    var storage: ProjectCommandStorage
+
+    init(command: ProjectCommandDefinition, projectRoot: String) {
+        name = command.name
+        commandLine = command.commandLine
+        workingDirectory = command.workingDirectory.isEmpty ? "" : command.workingDirectory
+        autoStart = command.autoStart
+        autoRestart = command.autoRestart
+        enabled = command.enabled
+        storage = .local
+        if name.isEmpty, commandLine.isEmpty, workingDirectory.isEmpty {
+            self.workingDirectory = ""
+        }
+    }
+
+    var definition: ProjectCommandDefinition {
+        let parts = Self.splitCommandLine(commandLine)
+        return ProjectCommandDefinition(
+            name: name,
+            command: parts.command,
+            arguments: parts.arguments,
+            workingDirectory: workingDirectory,
+            autoStart: autoStart,
+            autoRestart: autoRestart,
+            enabled: enabled
+        )
+    }
+
+    private static func splitCommandLine(_ commandLine: String) -> (command: String, arguments: String) {
+        let trimmed = commandLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let separator = trimmed.firstIndex(where: { $0.isWhitespace }) else {
+            return (trimmed, "")
+        }
+
+        let command = String(trimmed[..<separator])
+        let arguments = String(trimmed[separator...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (command, arguments)
     }
 }
 

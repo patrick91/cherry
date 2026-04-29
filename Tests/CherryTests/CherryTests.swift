@@ -296,18 +296,25 @@ import Testing
         projectRoot: directory.path,
         select: false
     )
+    let command = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
 
     #expect(workspace.sessions.map(\.id) == [
         firstTerminal.id,
         secondTerminal.id,
         firstAgent.id,
-        secondAgent.id
+        secondAgent.id,
+        command.id
     ])
     #expect(workspace.sidebarOrderedSessions.map(\.id) == [
         firstAgent.id,
         secondAgent.id,
         firstTerminal.id,
-        secondTerminal.id
+        secondTerminal.id,
+        command.id
     ])
 
     workspace.select(firstAgent)
@@ -321,10 +328,13 @@ import Testing
     #expect(workspace.selectedSessionID == secondTerminal.id)
 
     workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == command.id)
+
+    workspace.selectNextSession()
     #expect(workspace.selectedSessionID == firstAgent.id)
 
     workspace.selectPreviousSession()
-    #expect(workspace.selectedSessionID == secondTerminal.id)
+    #expect(workspace.selectedSessionID == command.id)
 }
 
 @Test func agentDefinitionsValidateAndNormalize() async throws {
@@ -344,6 +354,27 @@ import Testing
         try AgentConfiguration.validated([
             AgentToolDefinition(name: "Codex", command: "codex"),
             AgentToolDefinition(name: " codex ", command: "other")
+        ])
+    }
+}
+
+@Test func projectCommandDefinitionsValidateAndNormalize() async throws {
+    let commands = try ProjectCommandConfiguration.validated([
+        ProjectCommandDefinition(name: " Web ", command: " npm ", arguments: " run dev ", enabled: true),
+        ProjectCommandDefinition(name: "API", command: "uvicorn", arguments: "main:app")
+    ])
+
+    #expect(commands == [
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev", enabled: true),
+        ProjectCommandDefinition(name: "API", command: "uvicorn", arguments: "main:app", enabled: true)
+    ])
+}
+
+@Test func projectCommandDefinitionsRejectDuplicateNames() async throws {
+    #expect(throws: ProjectCommandConfigurationError.duplicateName("web")) {
+        try ProjectCommandConfiguration.validated([
+            ProjectCommandDefinition(name: "Web", command: "npm"),
+            ProjectCommandDefinition(name: " web ", command: "pnpm")
         ])
     }
 }
@@ -377,6 +408,115 @@ import Testing
         AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo")
     ])
     #expect(reloadedSettings.resolvedProject(for: directory.path).agents == project.agents)
+}
+
+@MainActor
+@Test func agentSettingsPersistProjectCommandsPerProject() async throws {
+    let defaultsName = "CherryTests.ProjectCommands.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let firstDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let secondDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: firstDirectory)
+        try? FileManager.default.removeItem(at: secondDirectory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: firstDirectory.path)
+    settings.addProject(path: secondDirectory.path)
+    try settings.upsertCommand(
+        ProjectCommandDefinition(
+            name: "Web",
+            command: "npm",
+            arguments: "run dev",
+            workingDirectory: firstDirectory.path,
+            autoStart: true,
+            autoRestart: true
+        ),
+        for: firstDirectory.path
+    )
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "API", command: "uvicorn", arguments: "main:app"),
+        for: secondDirectory.path
+    )
+
+    let reloadedSettings = AgentSettings(defaults: defaults)
+    #expect(reloadedSettings.projectCommands(for: firstDirectory.path) == [
+        ProjectCommandDefinition(
+            name: "Web",
+            command: "npm",
+            arguments: "run dev",
+            workingDirectory: firstDirectory.path,
+            autoStart: true,
+            autoRestart: true
+        )
+    ])
+    #expect(reloadedSettings.projectCommands(for: secondDirectory.path) == [
+        ProjectCommandDefinition(name: "API", command: "uvicorn", arguments: "main:app")
+    ])
+    #expect(reloadedSettings.launchableProjectCommands(for: firstDirectory.path).map(\.name) == ["Web"])
+}
+
+@MainActor
+@Test func agentSettingsCanStoreProjectCommandsInCherryToml() async throws {
+    let defaultsName = "CherryTests.ProjectFileCommands.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let configURL = directory.appendingPathComponent("cherry.toml")
+    try "# Existing config\n[project]\nname = \"Demo\"\n".write(to: configURL, atomically: true, encoding: .utf8)
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+    try settings.upsertCommand(
+        ProjectCommandDefinition(
+            name: "Web",
+            command: "npm",
+            arguments: "run dev",
+            autoStart: true,
+            autoRestart: true
+        ),
+        for: directory.path,
+        storage: .projectFile
+    )
+
+    let contents = try String(contentsOf: configURL, encoding: .utf8)
+    #expect(contents.contains("[project]"))
+    #expect(contents.contains("[[commands]]"))
+    #expect(contents.contains("name = \"Web\""))
+
+    let reloadedSettings = AgentSettings(defaults: defaults)
+    #expect(reloadedSettings.projectCommands(for: directory.path) == [
+        ProjectCommandDefinition(
+            name: "Web",
+            command: "npm",
+            arguments: "run dev",
+            autoStart: true,
+            autoRestart: true
+        )
+    ])
+
+    reloadedSettings.removeCommand(named: "Web", for: directory.path)
+    let removedContents = try String(contentsOf: configURL, encoding: .utf8)
+    #expect(removedContents.contains("[project]"))
+    #expect(!removedContents.contains("[[commands]]"))
 }
 
 @MainActor
@@ -447,6 +587,49 @@ import Testing
     #expect(secondSession.agentName == "Codex")
     #expect(secondSession.title == "Codex 2")
     #expect(workspace.agentSessions.map(\.id) == [session.id, secondSession.id])
+}
+
+@MainActor
+@Test func workspaceCanCreateCommandSession() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let customDirectory = directory.appendingPathComponent("web", isDirectory: true)
+    try FileManager.default.createDirectory(at: customDirectory, withIntermediateDirectories: true)
+
+    let session = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat", workingDirectory: customDirectory.path),
+        projectRoot: directory.path
+    )
+    let duplicate = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: " web ", command: "/bin/cat"),
+        projectRoot: directory.path
+    )
+
+    #expect(session.id == duplicate.id)
+    #expect(session.kind == .command)
+    #expect(session.commandName == "Web")
+    #expect(session.title == "Web")
+    #expect(session.subtitle == "/bin/cat")
+    #expect(session.workingDirectory == customDirectory.path)
+    #expect(workspace.commandSessions.map(\.id) == [session.id])
+    #expect(workspace.commandSession(named: "web")?.id == session.id)
+
+    session.stopManagedCommand()
+    if case .exited(let status) = session.state {
+        #expect(status == 0)
+    } else {
+        Issue.record("Expected stopped command session to be exited")
+    }
 }
 
 @MainActor
@@ -971,6 +1154,16 @@ private final class ControlServerHarness {
     ))
 }
 
+@Test func terminalTracksApplicationCursorKeyMode() async throws {
+    var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
+
+    buffer.ingest(Data("\u{1B}[?1h".utf8))
+    #expect(buffer.usesApplicationCursorKeys)
+
+    buffer.ingest(Data("\u{1B}[?1l".utf8))
+    #expect(!buffer.usesApplicationCursorKeys)
+}
+
 @Test func alternateScreenScrollWheelProducesCursorKeys() async throws {
     var remainder: CGFloat = 0
 
@@ -1024,10 +1217,12 @@ private final class ControlServerHarness {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
 
     let responses = buffer.ingest(Data((
+        "\u{1B}[?1h" +
         "\u{1B}[?25l" +
         "\u{1B}[?69h" +
         "\u{1B}[?1004h" +
         "\u{1B}[?2004h" +
+        "\u{1B}[?1$p" +
         "\u{1B}[?25$p" +
         "\u{1B}[?69$p" +
         "\u{1B}[?1004$p" +
@@ -1036,6 +1231,7 @@ private final class ControlServerHarness {
     ).utf8))
 
     #expect(responses == [
+        Data("\u{1B}[?1;1$y".utf8),
         Data("\u{1B}[?25;2$y".utf8),
         Data("\u{1B}[?69;1$y".utf8),
         Data("\u{1B}[?1004;1$y".utf8),
@@ -1093,6 +1289,53 @@ private final class ControlServerHarness {
     let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
 
     #expect(enter == Data("\r".utf8))
+}
+
+@Test func terminalArrowKeysFollowApplicationCursorMode() async throws {
+    let normalUp = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.moveUp(_:)))
+    let applicationUp = TerminalInputEncoder.commandSequence(
+        for: #selector(NSResponder.moveUp(_:)),
+        usesApplicationCursorKeys: true
+    )
+
+    #expect(normalUp == Data("\u{1B}[A".utf8))
+    #expect(applicationUp == Data("\u{1B}OA".utf8))
+    #expect(TerminalInputEncoder.cursorKeySequence(.down, usesApplicationCursorKeys: true) == "\u{1B}OB")
+    #expect(TerminalInputEncoder.cursorKeySequence(.right, usesApplicationCursorKeys: true) == "\u{1B}OC")
+    #expect(TerminalInputEncoder.cursorKeySequence(.left, usesApplicationCursorKeys: true) == "\u{1B}OD")
+}
+
+@Test func terminalInsertedTextIgnoresAppKitFunctionKeyCharacters() async throws {
+    #expect(TerminalInputEncoder.insertedTextData(String(UnicodeScalar(NSUpArrowFunctionKey)!)) == nil)
+    #expect(TerminalInputEncoder.insertedTextData("a") == Data("a".utf8))
+}
+
+@Test func appKitArrowFastPathUsesApplicationCursorMode() async throws {
+    let normal = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+        keyCode: 0x7D,
+        modifiers: [],
+        usesApplicationCursorKeys: false
+    )
+    let application = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+        keyCode: 0x7D,
+        modifiers: [],
+        usesApplicationCursorKeys: true
+    )
+    let modified = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+        keyCode: 0x7D,
+        modifiers: .shift,
+        usesApplicationCursorKeys: true
+    )
+    let appKitArrowFlags = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+        keyCode: 0x7D,
+        modifiers: [.numericPad, .function],
+        usesApplicationCursorKeys: true
+    )
+
+    #expect(normal == Data("\u{1B}[B".utf8))
+    #expect(application == Data("\u{1B}OB".utf8))
+    #expect(modified == nil)
+    #expect(appKitArrowFlags == Data("\u{1B}OB".utf8))
 }
 
 @Test func pastedTextNormalizesLineEndings() async throws {

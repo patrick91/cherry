@@ -99,6 +99,10 @@ final class TerminalProcessor: @unchecked Sendable {
         locked { buffer.usesAlternateScreen }
     }
 
+    var usesApplicationCursorKeys: Bool {
+        locked { buffer.usesApplicationCursorKeys }
+    }
+
     var mouseState: TerminalMouseState {
         locked { buffer.mouseState }
     }
@@ -587,8 +591,12 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .terminal }
     }
 
+    var commandSessions: [TerminalSession] {
+        sessions.filter { $0.kind == .command }
+    }
+
     var sidebarOrderedSessions: [TerminalSession] {
-        agentSessions + terminalSessions
+        agentSessions + terminalSessions + commandSessions
     }
 
     func select(_ session: TerminalSession) {
@@ -680,6 +688,38 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
+    @discardableResult
+    func addCommandSession(
+        command: ProjectCommandDefinition,
+        projectRoot: String,
+        select: Bool = true
+    ) -> TerminalSession {
+        if let session = commandSession(named: command.name) {
+            if select {
+                selectedSessionID = session.id
+            }
+            return session
+        }
+
+        let session = Self.makeCommandSession(
+            index: commandSessions.count + 1,
+            command: command,
+            workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot)
+        )
+        sessions.append(session)
+        if select {
+            selectedSessionID = session.id
+        }
+        return session
+    }
+
+    func commandSession(named name: String) -> TerminalSession? {
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        return commandSessions.first {
+            $0.commandName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
+        }
+    }
+
     func close(_ session: TerminalSession) {
         guard sessions.count > 1 else { return }
 
@@ -765,6 +805,23 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    private static func makeCommandSession(
+        index: Int,
+        command: ProjectCommandDefinition,
+        workingDirectory: String
+    ) -> TerminalSession {
+        TerminalSession(
+            title: command.name.isEmpty ? "Command \(index)" : command.name,
+            subtitle: command.commandLine,
+            tint: palette[(index - 1) % palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            kind: .command,
+            commandName: command.name,
+            launchCommand: command.commandLine,
+            restartOnExit: command.autoRestart
+        )
+    }
+
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
         guard let requestedWorkingDirectory, !requestedWorkingDirectory.isEmpty else {
             return NSHomeDirectory()
@@ -793,6 +850,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     enum SessionKind: String, Codable, Equatable {
         case terminal
         case agent
+        case command
     }
 
     enum SessionState: Equatable {
@@ -828,7 +886,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     let launchWorkingDirectory: String
     let kind: SessionKind
     let agentName: String?
+    let commandName: String?
     private let launchCommand: String?
+    private let restartOnExit: Bool
 
     @Published private(set) var revision = 0
 
@@ -857,7 +917,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchShell: Bool = true,
         kind: SessionKind = .terminal,
         agentName: String? = nil,
-        launchCommand: String? = nil
+        commandName: String? = nil,
+        launchCommand: String? = nil,
+        restartOnExit: Bool = false
     ) {
         self.title = title
         self.subtitle = subtitle
@@ -867,7 +929,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.maxScrollback = maxScrollback
         self.kind = kind
         self.agentName = agentName
+        self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.restartOnExit = restartOnExit
         self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
@@ -893,6 +957,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var usesAlternateScreen: Bool {
         processor.usesAlternateScreen
+    }
+
+    var usesApplicationCursorKeys: Bool {
+        processor.usesApplicationCursorKeys
     }
 
     var mouseState: TerminalMouseState {
@@ -982,6 +1050,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         resumeOutputIfPausedForInteraction()
         shellProcess?.terminate()
         shellProcess = nil
+    }
+
+    func stopManagedCommand() {
+        guard kind == .command else {
+            stop()
+            return
+        }
+
+        stop()
+        state = .exited(0)
+        let hideCursor = Data("\u{1B}[?25l".utf8)
+        rawOutputStore.append(hideCursor)
+        processor.ingestTestingData(hideCursor)
+        bumpRevision()
     }
 
     func resize(columns: Int, rows: Int) {
@@ -1095,10 +1177,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
         state = .exited(status)
-        if kind == .agent {
+        if kind == .agent || kind == .command {
             let hideCursor = Data("\u{1B}[?25l".utf8)
             rawOutputStore.append(hideCursor)
             processor.ingestTestingData(hideCursor)
+            if kind == .command, restartOnExit {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    guard let self, self.shellProcess == nil else { return }
+                    self.clearScrollback()
+                    self.startShell()
+                }
+            }
         } else {
             processor.appendPlainLines([
                 "",

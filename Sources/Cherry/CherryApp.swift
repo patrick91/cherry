@@ -179,8 +179,10 @@ private struct ProjectWindowView: View {
 
 private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var agentSettings = AgentSettings.shared
     @StateObject private var workspace: TerminalWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
+    @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
         _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
@@ -200,11 +202,20 @@ private struct ProjectWorkspaceView: View {
         .focusedValue(\.projectWindowChromeState, chromeState)
         .onAppear {
             ProjectWindowRegistry.shared.activeWorkspace = workspace
+            autoStartCommandsIfNeeded()
         }
     }
 
     private func openProject(_ project: CherryProject) {
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
         openWindow(value: project.root)
+    }
+
+    private func autoStartCommandsIfNeeded() {
+        guard !didAutoStartCommands, let projectRoot = workspace.projectRoot else { return }
+        didAutoStartCommands = true
+        for command in agentSettings.launchableProjectCommands(for: projectRoot) where command.autoStart {
+            workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
+        }
     }
 }

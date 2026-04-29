@@ -447,6 +447,7 @@ protocol TerminalBuffering {
     var storedLineCount: Int { get }
     var cursorState: TerminalCursorState { get }
     var usesAlternateScreen: Bool { get }
+    var usesApplicationCursorKeys: Bool { get }
     var mouseState: TerminalMouseState { get }
 
     func snapshot(range: Range<Int>) -> [String]
@@ -515,6 +516,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     private var cursorColumn = 0
     private var cursorShape = TerminalCursorShape.block
     private var isCursorVisible = true
+    private var isApplicationCursorMode = false
     private var scrollRegionTop: Int?
     private var scrollRegionBottom: Int?
     private var isLeftRightMarginMode = false
@@ -615,6 +617,10 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         isUsingAlternateScreen
     }
 
+    var usesApplicationCursorKeys: Bool {
+        isApplicationCursorMode
+    }
+
     var mouseState: TerminalMouseState {
         currentMouseState
     }
@@ -648,6 +654,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         cursorColumn = 0
         cursorShape = .block
         isCursorVisible = true
+        isApplicationCursorMode = false
         scrollRegionTop = nil
         scrollRegionBottom = nil
         currentMouseState = TerminalMouseState()
@@ -1058,6 +1065,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
     private func privateModeStatus(_ mode: Int) -> Int {
         switch mode {
+        case 1:
+            isApplicationCursorMode ? 1 : 2
         case 25:
             isCursorVisible ? 1 : 2
         case 7:
@@ -1114,6 +1123,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 }
             case 25:
                 isCursorVisible = isSet
+            case 1:
+                isApplicationCursorMode = isSet
             case 69:
                 isLeftRightMarginMode = isSet
                 if !isSet {

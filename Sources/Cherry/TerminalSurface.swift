@@ -9,8 +9,15 @@ enum TerminalInputEncoder {
     private static let terminalScrollRowsPerLine: CGFloat = 3
     private static let returnKeyCode: UInt16 = 36
     private static let keypadEnterKeyCode: UInt16 = 76
+    private static let appKitLeftArrowKeyCode: UInt16 = 0x7B
+    private static let appKitRightArrowKeyCode: UInt16 = 0x7C
+    private static let appKitDownArrowKeyCode: UInt16 = 0x7D
+    private static let appKitUpArrowKeyCode: UInt16 = 0x7E
 
-    static func commandSequence(for selector: Selector) -> Data? {
+    static func commandSequence(
+        for selector: Selector,
+        usesApplicationCursorKeys: Bool = false
+    ) -> Data? {
         switch selector {
         case #selector(NSResponder.insertNewline(_:)):
             return Data("\r".utf8)
@@ -23,13 +30,13 @@ enum TerminalInputEncoder {
         case #selector(NSResponder.deleteForward(_:)):
             return Data("\u{1B}[3~".utf8)
         case #selector(NSResponder.moveLeft(_:)):
-            return Data("\u{1B}[D".utf8)
+            return Data(cursorKeySequence(.left, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
         case #selector(NSResponder.moveRight(_:)):
-            return Data("\u{1B}[C".utf8)
+            return Data(cursorKeySequence(.right, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
         case #selector(NSResponder.moveUp(_:)):
-            return Data("\u{1B}[A".utf8)
+            return Data(cursorKeySequence(.up, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
         case #selector(NSResponder.moveDown(_:)):
-            return Data("\u{1B}[B".utf8)
+            return Data(cursorKeySequence(.down, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
         case #selector(NSResponder.moveToBeginningOfLine(_:)):
             return Data([0x01])
         case #selector(NSResponder.moveToEndOfLine(_:)):
@@ -45,6 +52,66 @@ enum TerminalInputEncoder {
         default:
             return nil
         }
+    }
+
+    enum CursorKey {
+        case up
+        case down
+        case right
+        case left
+    }
+
+    static func cursorKeySequence(
+        _ key: CursorKey,
+        usesApplicationCursorKeys: Bool
+    ) -> String {
+        if usesApplicationCursorKeys {
+            return switch key {
+            case .up:
+                "\u{1B}OA"
+            case .down:
+                "\u{1B}OB"
+            case .right:
+                "\u{1B}OC"
+            case .left:
+                "\u{1B}OD"
+            }
+        }
+
+        return switch key {
+        case .up:
+            "\u{1B}[A"
+        case .down:
+            "\u{1B}[B"
+        case .right:
+            "\u{1B}[C"
+        case .left:
+            "\u{1B}[D"
+        }
+    }
+
+    static func appKitUnmodifiedArrowSequence(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        usesApplicationCursorKeys: Bool
+    ) -> Data? {
+        guard modifiers.intersection([.shift, .control, .option, .command]).isEmpty else { return nil }
+
+        let key: CursorKey
+        switch keyCode {
+        case appKitLeftArrowKeyCode:
+            key = .left
+        case appKitRightArrowKeyCode:
+            key = .right
+        case appKitDownArrowKeyCode:
+            key = .down
+        case appKitUpArrowKeyCode:
+            key = .up
+        default:
+            return nil
+        }
+
+        return Data(cursorKeySequence(key, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
     }
 
     static func shiftEnterSequence(
@@ -73,6 +140,18 @@ enum TerminalInputEncoder {
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         return Data(normalizedText.utf8)
+    }
+
+    static func insertedTextData(_ text: String) -> Data? {
+        guard !isAppKitFunctionKeyText(text) else { return nil }
+        return Data(text.utf8)
+    }
+
+    static func isAppKitFunctionKeyText(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        return text.unicodeScalars.allSatisfy { scalar in
+            scalar.value >= 0xF700 && scalar.value <= 0xF8FF
+        }
     }
 
     static func alternateScreenScrollSequence(
@@ -259,7 +338,9 @@ final class TerminalScrollView: NSScrollView {
             pendingRestoredOffsetY = restoredState?.offsetY
             canvasView.session = session
             canvasView.clearSelection()
-            canvasView.sendInput = { [weak session] data in
+            canvasView.sendInput = { [weak self, weak session] data in
+                self?.isFollowingOutput = true
+                self?.scrollToBottom()
                 session?.send(data: data)
             }
             canvasView.sendInterrupt = { [weak session] in
@@ -955,11 +1036,18 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         interpretKeyEvents([event])
 
         if let accumulator = keyTextAccumulator, !accumulator.isEmpty {
-            clearSelection()
+            var sentText = false
             for text in accumulator {
-                sendInput?(Data(text.utf8))
+                guard let data = TerminalInputEncoder.insertedTextData(text) else { continue }
+                if !sentText {
+                    clearSelection()
+                    sentText = true
+                }
+                sendInput?(data)
             }
-            return true
+            if sentText {
+                return true
+            }
         }
 
         if handledCommand {
@@ -1091,7 +1179,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
         if let characters = event.charactersIgnoringModifiers,
            let scalar = characters.unicodeScalars.first,
-           let mappedSequence = specialSequence(for: scalar.value) {
+           let mappedSequence = specialSequence(
+               for: scalar.value,
+               usesApplicationCursorKeys: session?.usesApplicationCursorKeys ?? false
+           ) {
             return Data(mappedSequence.utf8)
         }
 
@@ -1113,16 +1204,19 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         }
     }
 
-    private func specialSequence(for scalar: UInt32) -> String? {
+    private func specialSequence(
+        for scalar: UInt32,
+        usesApplicationCursorKeys: Bool
+    ) -> String? {
         switch scalar {
         case UInt32(NSUpArrowFunctionKey):
-            "\u{1B}[A"
+            TerminalInputEncoder.cursorKeySequence(.up, usesApplicationCursorKeys: usesApplicationCursorKeys)
         case UInt32(NSDownArrowFunctionKey):
-            "\u{1B}[B"
+            TerminalInputEncoder.cursorKeySequence(.down, usesApplicationCursorKeys: usesApplicationCursorKeys)
         case UInt32(NSRightArrowFunctionKey):
-            "\u{1B}[C"
+            TerminalInputEncoder.cursorKeySequence(.right, usesApplicationCursorKeys: usesApplicationCursorKeys)
         case UInt32(NSLeftArrowFunctionKey):
-            "\u{1B}[D"
+            TerminalInputEncoder.cursorKeySequence(.left, usesApplicationCursorKeys: usesApplicationCursorKeys)
         case UInt32(NSDeleteFunctionKey):
             "\u{1B}[3~"
         default:
@@ -1142,7 +1236,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     }
 
     private func commandSequence(for selector: Selector) -> Data? {
-        TerminalInputEncoder.commandSequence(for: selector)
+        TerminalInputEncoder.commandSequence(
+            for: selector,
+            usesApplicationCursorKeys: session?.usesApplicationCursorKeys ?? false
+        )
     }
 
     private func sendEncodedInput(_ data: Data) {
@@ -1174,9 +1271,9 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
         if var accumulator = keyTextAccumulator {
             accumulator.append(text)
             keyTextAccumulator = accumulator
-        } else {
+        } else if let data = TerminalInputEncoder.insertedTextData(text) {
             clearSelection()
-            sendInput?(Data(text.utf8))
+            sendInput?(data)
         }
     }
 

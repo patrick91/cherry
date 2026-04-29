@@ -528,6 +528,13 @@ private struct SidebarTabsView: View {
                         workspace: workspace,
                         presentation: presentation
                     )
+
+                    SidebarCommandSection(
+                        settings: agentSettings,
+                        workspace: workspace,
+                        projectRoot: projectRoot,
+                        presentation: presentation
+                    )
                 }
                 // The floating sidebar's outer wrapper adds 3pt leading/top/
                 // bottom inset (`floatingSidebarLeadingInset` etc.). The
@@ -758,6 +765,282 @@ private struct AgentLaunchMenu: View {
         .menuStyle(.borderlessButton)
         .buttonStyle(.plain)
         .help("New agent")
+    }
+}
+
+private struct SidebarCommandSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+
+    @State private var editingCommand: ProjectCommandDefinition?
+    @State private var editingOriginalName: String?
+    @State private var commandError: String?
+
+    var body: some View {
+        let commands = settings.launchableProjectCommands(for: projectRoot)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                SidebarSectionHeader(title: "Commands", count: commands.count, palette: palette)
+                    .padding(.horizontal, 0)
+
+                Button(action: addCommand) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.headerText)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(projectRoot == nil)
+                .help("Add command")
+            }
+            .padding(.horizontal, 10)
+
+            if commands.isEmpty {
+                SidebarEmptyRow(
+                    title: projectRoot == nil ? "Select a project" : "No commands",
+                    palette: palette
+                )
+            } else {
+                ForEach(commands) { command in
+                    let session = workspace.commandSession(named: command.name)
+                    SidebarCommandRow(
+                        command: command,
+                        session: session,
+                        isSelected: session.map { workspace.selectedSessionID == $0.id } ?? false,
+                        presentation: presentation,
+                        start: { start(command, existingSession: session) },
+                        stop: { session?.stopManagedCommand() },
+                        restart: { restart(command, existingSession: session) },
+                        select: {
+                            if let session {
+                                workspace.select(session)
+                            }
+                        }
+                    )
+                    .contextMenu {
+                        Button(session == nil ? "Start" : "Restart") {
+                            restart(command, existingSession: session)
+                        }
+
+                        Button("Stop") {
+                            session?.stopManagedCommand()
+                        }
+                        .disabled(session?.isRunningCommand != true)
+
+                        if let session {
+                            Button("Clear Scrollback") {
+                                session.clearScrollback()
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Edit") {
+                            editingCommand = command
+                            editingOriginalName = command.name
+                        }
+
+                        Button("Remove", role: .destructive) {
+                            remove(command, existingSession: session)
+                        }
+                    }
+                }
+            }
+        }
+        .sheet(item: $editingCommand) { command in
+            ProjectCommandEditor(
+                command: command,
+                projectRoot: projectRoot ?? "",
+                canDelete: editingOriginalName != nil,
+                errorMessage: commandError,
+                onSave: { updatedCommand, storage in
+                    guard let projectRoot else { return }
+                    do {
+                        try settings.upsertCommand(
+                            updatedCommand,
+                            for: projectRoot,
+                            replacing: editingOriginalName,
+                            storage: storage
+                        )
+                        commandError = nil
+                        editingOriginalName = nil
+                        editingCommand = nil
+                    } catch {
+                        commandError = error.localizedDescription
+                    }
+                },
+                onDelete: {
+                    if projectRoot != nil {
+                        remove(command, existingSession: workspace.commandSession(named: command.name))
+                    }
+                    commandError = nil
+                    editingOriginalName = nil
+                    editingCommand = nil
+                },
+                onCancel: {
+                    commandError = nil
+                    editingOriginalName = nil
+                    editingCommand = nil
+                }
+            )
+        }
+    }
+
+    private func addCommand() {
+        editingCommand = ProjectCommandDefinition(name: "", command: "")
+        editingOriginalName = nil
+    }
+
+    private func start(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+        guard command.isLaunchable, let root = settings.resolvedProject(for: projectRoot).validProjectRoot else { return }
+        if let existingSession {
+            if existingSession.isRunningCommand {
+                workspace.select(existingSession)
+            } else {
+                existingSession.restart()
+                workspace.select(existingSession)
+            }
+        } else {
+            workspace.addCommandSession(command: command, projectRoot: root)
+        }
+    }
+
+    private func restart(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+        guard command.isLaunchable else { return }
+        if let existingSession {
+            existingSession.restart()
+            workspace.select(existingSession)
+        } else {
+            start(command, existingSession: nil)
+        }
+    }
+
+    private func remove(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+        if let existingSession, workspace.sessions.count > 1 {
+            workspace.close(existingSession)
+        } else {
+            existingSession?.stop()
+        }
+        if let projectRoot {
+            settings.removeCommand(named: command.name, for: projectRoot)
+        }
+    }
+}
+
+private struct SidebarCommandRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    let command: ProjectCommandDefinition
+    let session: TerminalSession?
+    let isSelected: Bool
+    let presentation: SidebarPresentation
+    let start: () -> Void
+    let stop: () -> Void
+    let restart: () -> Void
+    let select: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        Button(action: select) {
+            HStack(spacing: 8) {
+                Image(systemName: statusSymbol)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(statusColor(palette: palette))
+                    .frame(width: 14)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(command.name)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+
+                    Text(command.commandLine)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Button(action: session?.isRunningCommand == true ? stop : start) {
+                    Image(systemName: session?.isRunningCommand == true ? "stop.fill" : "play.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(session?.isRunningCommand == true ? "Stop" : "Start")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 46)
+            .padding(.horizontal, 12)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background {
+                rowBackground(palette: palette)
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+
+    private var statusSymbol: String {
+        guard let session else { return "circle" }
+        return session.isRunningCommand ? "circle.fill" : "circle"
+    }
+
+    private func statusColor(palette: SidebarPalette) -> Color {
+        guard let session else { return palette.headerText.opacity(0.62) }
+        return session.isRunningCommand ? .green : palette.headerText.opacity(0.62)
+    }
+
+    @ViewBuilder
+    private func rowBackground(palette: SidebarPalette) -> some View {
+        if isSelected {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.selectedFill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
+        } else if isHovered {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.hoverFill)
+        }
+    }
+}
+
+private extension TerminalSession {
+    var isRunningCommand: Bool {
+        switch state {
+        case .launching, .live:
+            true
+        case .exited, .failed:
+            false
+        }
     }
 }
 

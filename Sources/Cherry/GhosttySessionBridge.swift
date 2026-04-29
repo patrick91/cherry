@@ -475,18 +475,30 @@ final class GhosttyTerminalContainerView: NSView {
         guard event.window === window,
               let activeSession,
               activeSession.acceptsInput,
-              window?.firstResponder === activeBridge?.terminalView,
-              let sequence = TerminalInputEncoder.shiftEnterSequence(
-                  keyCode: event.keyCode,
-                  modifiers: event.modifierFlags,
-                  isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive
-              )
+              window?.firstResponder === activeBridge?.terminalView
         else {
             return false
         }
 
-        activeSession.send(data: sequence)
-        return true
+        if let sequence = TerminalInputEncoder.shiftEnterSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive
+        ) {
+            activeSession.send(data: sequence)
+            return true
+        }
+
+        if let sequence = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            usesApplicationCursorKeys: activeSession.usesApplicationCursorKeys
+        ) {
+            activeSession.send(data: sequence)
+            return true
+        }
+
+        return false
     }
 
     private func requestTerminalFocus() {

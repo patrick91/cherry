@@ -5,7 +5,7 @@ import SwiftUI
 struct ContentView: View {
     private let minimumSidebarWidth: CGFloat = 190
     private let maximumSidebarWidth: CGFloat = 420
-    private let floatingSidebarLeadingInset: CGFloat = 3
+    private let floatingSidebarLeadingInset: CGFloat = SidebarLayout.floatingOuterInset
     private let floatingSidebarTopInset: CGFloat = 3
     private let floatingSidebarBottomInset: CGFloat = 3
 
@@ -530,6 +530,13 @@ private enum SidebarPresentation {
     case floating
 }
 
+private enum SidebarLayout {
+    static let trafficLightLeadingInset: CGFloat = 18
+    static let floatingOuterInset: CGFloat = 3
+    static let trailingInset: CGFloat = 8
+    static let rowHorizontalInset: CGFloat = 12
+}
+
 private struct SidebarTabsView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
@@ -565,14 +572,12 @@ private struct SidebarTabsView: View {
                         presentation: presentation
                     )
                 }
-                // The floating sidebar's outer wrapper adds 3pt leading/top/
-                // bottom inset (`floatingSidebarLeadingInset` etc.). The
-                // docked sidebar has no such outer wrapper, so without
-                // compensation the content sits 3pt up + left of where it
-                // sits in floating mode — and the user sees text shift
-                // every time the presentation changes.
-                .padding(.leading, 8 + dockedCompensation)
-                .padding(.trailing, 8 - dockedCompensation)
+                // Keep the sidebar's text column aligned with the native
+                // traffic-light leading edge in both docked and floating
+                // presentations. Floating mode has an outer wrapper inset,
+                // so the inner leading padding subtracts that amount.
+                .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
+                .padding(.trailing, SidebarLayout.trailingInset)
                 .padding(.top, 48 + dockedCompensation)
                 .padding(.bottom, 10 + dockedCompensation)
             }
@@ -584,11 +589,14 @@ private struct SidebarTabsView: View {
         }
     }
 
-    // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the inner
+    private var floatingOuterInset: CGFloat {
+        presentation == .floating ? SidebarLayout.floatingOuterInset : 0
+    }
+
+    // Resolves to 3pt for `.docked` and 0 for `.floating`. Keeps the vertical
     // content at the same on-screen position across both presentations.
-    private static let floatingOuterInset: CGFloat = 3
     private var dockedCompensation: CGFloat {
-        presentation == .docked ? Self.floatingOuterInset : 0
+        presentation == .docked ? SidebarLayout.floatingOuterInset : 0
     }
 }
 
@@ -771,7 +779,6 @@ private struct SidebarAgentSessionSection: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(title: "Agents", count: workspace.agentSessions.count, palette: palette)
-                    .padding(.horizontal, 0)
 
                 AgentLaunchMenu(
                     project: project,
@@ -780,7 +787,6 @@ private struct SidebarAgentSessionSection: View {
                     launch: launch
                 )
             }
-            .padding(.horizontal, 10)
 
             if workspace.agentSessions.isEmpty {
                 SidebarEmptyRow(
@@ -884,7 +890,6 @@ private struct SidebarCommandSection: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(title: "Commands", count: commands.count, palette: palette)
-                    .padding(.horizontal, 0)
 
                 Button(action: addCommand) {
                     Image(systemName: "plus")
@@ -897,7 +902,6 @@ private struct SidebarCommandSection: View {
                 .disabled(projectRoot == nil)
                 .help("Add command")
             }
-            .padding(.horizontal, 10)
 
             if commands.isEmpty {
                 SidebarEmptyRow(
@@ -1055,11 +1059,6 @@ private struct SidebarCommandRow: View {
 
         Button(action: select) {
             HStack(spacing: 8) {
-                Image(systemName: statusSymbol)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(statusColor(palette: palette))
-                    .frame(width: 14)
-
                 VStack(alignment: .leading, spacing: 1) {
                     Text(command.name)
                         .font(.system(size: 15, weight: .regular))
@@ -1086,26 +1085,18 @@ private struct SidebarCommandRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 46)
-            .padding(.horizontal, 12)
+            .padding(.leading, SidebarLayout.rowHorizontalInset)
+            .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background {
                 rowBackground(palette: palette)
             }
         }
         .buttonStyle(.plain)
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
         .onHover { hovering in
             isHovered = hovering
         }
-    }
-
-    private var statusSymbol: String {
-        guard let session else { return "circle" }
-        return session.isRunningCommand ? "circle.fill" : "circle"
-    }
-
-    private func statusColor(palette: SidebarPalette) -> Color {
-        guard let session else { return palette.headerText.opacity(0.62) }
-        return session.isRunningCommand ? .green : palette.headerText.opacity(0.62)
     }
 
     @ViewBuilder
@@ -1157,7 +1148,7 @@ private struct SidebarSectionHeader: View {
                 .monospacedDigit()
                 .foregroundStyle(palette.headerText)
         }
-        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1172,7 +1163,7 @@ private struct SidebarEmptyRow: View {
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 34)
-            .padding(.horizontal, 12)
+            .padding(.trailing, 12)
     }
 }
 
@@ -1535,7 +1526,7 @@ private final class TrafficLightOverlayView: NSView {
         }
     }
 
-    private let leftInset: CGFloat = 18
+    private let leftInset: CGFloat = SidebarLayout.trafficLightLeadingInset
     private let topInset: CGFloat = 18
     private let buttonSpacing: CGFloat = 20
 
@@ -1753,13 +1744,15 @@ private struct SidebarTabRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 42)
-            .padding(.horizontal, 12)
+            .padding(.leading, SidebarLayout.rowHorizontalInset)
+            .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background {
                 rowBackground(palette: palette)
             }
         }
         .buttonStyle(.plain)
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
         .onHover { hovering in
             isHovered = hovering
         }

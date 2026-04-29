@@ -48,14 +48,13 @@ private enum CherryMCPTools {
         ),
         tool(
             "run_agent",
-            "Create a new configured Cherry agent session in the active project.",
+            "Create a new configured Cherry agent session in the active project without selecting it.",
             properties: [
                 "agent_name": string("Configured Cherry agent name."),
                 "text": string("Optional text to send exactly as provided after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
-                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000."),
-                "select": boolean("Whether to select the new agent session in Cherry.")
+                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
             required: ["agent_name"]
         ),
@@ -165,7 +164,7 @@ private enum CherryMCPTools {
                 rawBase64: stringArgument("raw_base64", in: arguments),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
-                select: boolArgument("select", in: arguments)
+                select: false
             ))
         case "select_terminal":
             return .selectTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))

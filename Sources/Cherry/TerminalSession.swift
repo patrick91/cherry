@@ -1273,6 +1273,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         for event in metadataParser.parse(data) {
             switch event {
             case .title(let nextTitle):
+                guard kind != .agent else { continue }
                 guard title != nextTitle else { continue }
                 title = nextTitle
                 didChange = true

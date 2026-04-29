@@ -187,6 +187,24 @@ import Testing
 }
 
 @MainActor
+@Test func agentSessionIgnoresTitleMetadata() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.ingestTestingData(Data("\u{1B}]2;~/github/patrick91/cherry\u{7}".utf8))
+    session.ingestTestingData(Data("\u{1B}]7;file://localhost/tmp/cherry\u{7}".utf8))
+
+    #expect(session.title == "Codex")
+    #expect(session.workingDirectory == "/tmp/cherry")
+}
+
+@MainActor
 @Test func terminalSessionTracksEnhancedKeyboardProtocol() async throws {
     let session = TerminalSession(
         title: "Shell 1",

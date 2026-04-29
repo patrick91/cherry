@@ -26,6 +26,9 @@ let package = Package(
                 "CherryControl",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
+            ],
+            resources: [
+                .process("Resources")
             ]
         ),
         .executableTarget(

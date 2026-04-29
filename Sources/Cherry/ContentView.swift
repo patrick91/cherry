@@ -1739,7 +1739,11 @@ private struct SidebarTabRow: View {
         )
 
         Button(action: onSelect) {
-            HStack(spacing: 0) {
+            HStack(spacing: session.kind == .agent ? 8 : 0) {
+                if let icon = AgentToolIconDescriptor(session: session) {
+                    AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+                }
+
                 Text(session.title)
                     .font(.system(size: 15, weight: .regular))
                     .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
@@ -1777,6 +1781,118 @@ private struct SidebarTabRow: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
+    }
+}
+
+private struct AgentToolIconDescriptor {
+    let label: String
+    let logoResourceName: String?
+    let rendersAsTemplate: Bool
+    let foreground: Color
+    let background: Color
+
+    private init(
+        label: String,
+        logoResourceName: String? = nil,
+        rendersAsTemplate: Bool = true,
+        foreground: Color,
+        background: Color
+    ) {
+        self.label = label
+        self.logoResourceName = logoResourceName
+        self.rendersAsTemplate = rendersAsTemplate
+        self.foreground = foreground
+        self.background = background
+    }
+
+    @MainActor
+    init?(session: TerminalSession) {
+        guard session.kind == .agent else { return nil }
+
+        let displayName = session.agentName != nil ? session.agentName! : session.title
+        let name = displayName.lowercased()
+        if name.contains("codex") || name.contains("openai") {
+            self.init(label: "Cx", logoResourceName: "openai", foreground: .white, background: .black.opacity(0.82))
+        } else if name.contains("claude") || name.contains("anthropic") {
+            self.init(label: "Cl", logoResourceName: "claude", foreground: Color(red: 0.24, green: 0.16, blue: 0.10), background: Color(red: 0.86, green: 0.70, blue: 0.52))
+        } else if name.contains("gemini") {
+            self.init(label: "", logoResourceName: "gemini", foreground: .white, background: Color(red: 0.36, green: 0.42, blue: 0.95))
+        } else if name.contains("amp") {
+            self.init(label: "A", logoResourceName: "amp", rendersAsTemplate: false, foreground: Color(red: 0.95, green: 0.31, blue: 0.25), background: .white.opacity(0.94))
+        } else if name == "pi" || name.contains(" pi ") || name.contains("pi.ai") || name.contains("inflection") {
+            self.init(label: "Pi", foreground: .white, background: Color(red: 0.12, green: 0.54, blue: 0.53))
+        } else {
+            return nil
+        }
+    }
+}
+
+private struct AgentToolIcon: View {
+    let descriptor: AgentToolIconDescriptor
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(isSelected ? palette.selectedText.opacity(0.22) : descriptor.background)
+
+            if let logoResourceName = descriptor.logoResourceName {
+                AgentLogoImage(
+                    resourceName: logoResourceName,
+                    rendersAsTemplate: descriptor.rendersAsTemplate,
+                    fallbackLabel: descriptor.label
+                )
+                .frame(width: 13, height: 13)
+            } else {
+                Text(descriptor.label)
+                    .font(.system(size: 9, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+        }
+        .foregroundStyle(isSelected ? palette.selectedText : descriptor.foreground)
+        .frame(width: 20, height: 20)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct AgentLogoImage: View {
+    let resourceName: String
+    let rendersAsTemplate: Bool
+    let fallbackLabel: String
+
+    var body: some View {
+        if let image = Self.image(named: resourceName, rendersAsTemplate: rendersAsTemplate) {
+            Image(nsImage: image)
+                .resizable()
+                .renderingMode(rendersAsTemplate ? .template : .original)
+                .scaledToFit()
+        } else {
+            Text(fallbackLabel)
+                .font(.system(size: 9, weight: .bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+    }
+
+    @MainActor
+    private static func image(named name: String, rendersAsTemplate: Bool) -> NSImage? {
+        let url = Bundle.module.url(
+            forResource: name,
+            withExtension: "svg",
+            subdirectory: "AgentLogos"
+        ) ?? Bundle.module.url(
+            forResource: name,
+            withExtension: "svg"
+        )
+
+        guard let url, let image = NSImage(contentsOf: url) else {
+            return nil
+        }
+
+        image.isTemplate = rendersAsTemplate
+        return image
     }
 }
 

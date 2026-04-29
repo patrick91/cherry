@@ -7,6 +7,8 @@ private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHE
 enum TerminalInputEncoder {
     private static let maximumScrollStepsPerEvent = 36
     private static let terminalScrollRowsPerLine: CGFloat = 3
+    private static let returnKeyCode: UInt16 = 36
+    private static let keypadEnterKeyCode: UInt16 = 76
 
     static func commandSequence(for selector: Selector) -> Data? {
         switch selector {
@@ -43,6 +45,27 @@ enum TerminalInputEncoder {
         default:
             return nil
         }
+    }
+
+    static func shiftEnterSequence(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isEnhancedKeyboardProtocolActive: Bool
+    ) -> Data? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.shift),
+              !modifiers.contains(.command),
+              !modifiers.contains(.control),
+              !modifiers.contains(.option),
+              keyCode == returnKeyCode || keyCode == keypadEnterKeyCode
+        else {
+            return nil
+        }
+
+        if isEnhancedKeyboardProtocolActive {
+            return Data("\u{1B}[13;2u".utf8)
+        }
+        return Data("\r".utf8)
     }
 
     static func pastedTextData(_ text: String) -> Data {
@@ -903,7 +926,7 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             return true
         }
 
-        guard session?.acceptsInput == true else {
+        guard let session, session.acceptsInput else {
             return false
         }
 
@@ -911,6 +934,16 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             fputs("[keyDown] chars=\(String(describing: event.characters)) charsIgnoringMods=\(String(describing: event.charactersIgnoringModifiers)) keyCode=\(event.keyCode) mods=\(event.modifierFlags.rawValue)\n", stderr)
         }
         resetCursorBlink()
+
+        if let encoded = TerminalInputEncoder.shiftEnterSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            isEnhancedKeyboardProtocolActive: session.isEnhancedKeyboardProtocolActive
+        ) {
+            clearSelection()
+            sendInput?(encoded)
+            return true
+        }
 
         keyTextAccumulator = []
         handledCommand = false

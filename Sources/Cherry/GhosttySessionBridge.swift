@@ -292,6 +292,7 @@ final class GhosttyTerminalContainerView: NSView {
     private weak var activeSession: TerminalSession?
     private weak var activeBridge: GhosttySessionBridge?
     private nonisolated(unsafe) var observers: [NSObjectProtocol] = []
+    private nonisolated(unsafe) var keyEventMonitor: Any?
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
     private var pendingTerminalFocus = false
@@ -303,6 +304,7 @@ final class GhosttyTerminalContainerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         configureScrollView()
+        installKeyEventMonitor()
     }
 
     @available(*, unavailable)
@@ -312,6 +314,9 @@ final class GhosttyTerminalContainerView: NSView {
 
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+        if let keyEventMonitor {
+            NSEvent.removeMonitor(keyEventMonitor)
+        }
     }
 
     override var safeAreaInsets: NSEdgeInsets {
@@ -454,6 +459,34 @@ final class GhosttyTerminalContainerView: NSView {
                 self?.handleLiveScroll()
             }
         })
+    }
+
+    private func installKeyEventMonitor() {
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let handled = MainActor.assumeIsolated {
+                self.handleLocalKeyDown(event)
+            }
+            return handled ? nil : event
+        }
+    }
+
+    private func handleLocalKeyDown(_ event: NSEvent) -> Bool {
+        guard event.window === window,
+              let activeSession,
+              activeSession.acceptsInput,
+              window?.firstResponder === activeBridge?.terminalView,
+              let sequence = TerminalInputEncoder.shiftEnterSequence(
+                  keyCode: event.keyCode,
+                  modifiers: event.modifierFlags,
+                  isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive
+              )
+        else {
+            return false
+        }
+
+        activeSession.send(data: sequence)
+        return true
     }
 
     private func requestTerminalFocus() {

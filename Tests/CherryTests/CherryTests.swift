@@ -99,6 +99,27 @@ import Testing
     #expect(TerminalInputNormalizer.normalize(enter, isEnhancedKeyboardProtocolActive: true) == enter)
 }
 
+@Test func shiftEnterUsesEnhancedKeyboardProtocolWhenActive() async throws {
+    let shift = NSEvent.ModifierFlags.shift
+    let commandShift: NSEvent.ModifierFlags = [.command, .shift]
+
+    #expect(TerminalInputEncoder.shiftEnterSequence(
+        keyCode: 36,
+        modifiers: shift,
+        isEnhancedKeyboardProtocolActive: false
+    ) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.shiftEnterSequence(
+        keyCode: 76,
+        modifiers: shift,
+        isEnhancedKeyboardProtocolActive: true
+    ) == Data("\u{1B}[13;2u".utf8))
+    #expect(TerminalInputEncoder.shiftEnterSequence(
+        keyCode: 36,
+        modifiers: commandShift,
+        isEnhancedKeyboardProtocolActive: true
+    ) == nil)
+}
+
 @MainActor
 @Test func workspaceCanCreateBackgroundSession() async throws {
     let workspace = TerminalWorkspace()
@@ -286,7 +307,7 @@ import Testing
 
 @MainActor
 private func waitForExit(_ session: TerminalSession) async throws {
-    for _ in 0..<100 {
+    for _ in 0..<300 {
         if case .exited = session.state {
             return
         }

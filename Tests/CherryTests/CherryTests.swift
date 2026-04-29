@@ -633,6 +633,44 @@ import Testing
 }
 
 @MainActor
+@Test func workspaceUpdatesExistingCommandSessionAfterRename() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let session = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Tree", command: "/bin/cat"),
+        projectRoot: directory.path
+    )
+    workspace.select(session)
+
+    let renamedCommand = ProjectCommandDefinition(
+        name: "Tree App",
+        command: "/bin/echo",
+        arguments: "ok"
+    )
+    workspace.updateCommandSession(
+        named: "Tree",
+        with: renamedCommand,
+        projectRoot: directory.path
+    )
+
+    #expect(workspace.selectedSessionID == session.id)
+    #expect(workspace.commandSession(named: "Tree") == nil)
+    #expect(workspace.commandSession(named: "Tree App")?.id == session.id)
+    #expect(session.title == "Tree App")
+    #expect(session.subtitle == "/bin/echo ok")
+}
+
+@MainActor
 @Test func agentSessionExecsCommandAndKeepsFinalOutput() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -813,6 +851,48 @@ private final class ControlServerHarness {
 
     #expect(zshrc.contains("source \"${CHERRY_BOOTSTRAP_ZDOTDIR}/cherry-integration.zsh\""))
     #expect(zshrc.contains("CHERRY_ORIGINAL_ZDOTDIR"))
+}
+
+@Test func zshStartupCommandRunsAfterUserZshrcAliasesLoad() async throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: temporaryDirectory)
+    }
+
+    let userZdotdir = temporaryDirectory.appendingPathComponent("user-zdotdir", isDirectory: true)
+    try FileManager.default.createDirectory(at: userZdotdir, withIntermediateDirectories: true)
+    try "alias cherryalias='echo cherry-alias-expanded'\n"
+        .write(to: userZdotdir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+
+    let bootstrap = try #require(try ShellIntegrationBootstrap.prepare(
+        shellPath: "/bin/zsh",
+        homeDirectory: temporaryDirectory
+    ))
+
+    let outputPipe = Pipe()
+    let errorPipe = Pipe()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    process.arguments = ["-l", "-i"]
+    process.standardOutput = outputPipe
+    process.standardError = errorPipe
+    process.environment = [
+        "CHERRY_BOOTSTRAP_ZDOTDIR": bootstrap.zdotdir,
+        "CHERRY_ORIGINAL_ZDOTDIR": userZdotdir.path,
+        "CHERRY_STARTUP_COMMAND": "cherryalias",
+        "HOME": temporaryDirectory.path,
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "ZDOTDIR": bootstrap.zdotdir
+    ]
+
+    try process.run()
+    process.waitUntilExit()
+
+    let output = String(decoding: outputPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    let errorOutput = String(decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    #expect(process.terminationStatus == 0)
+    #expect(output.contains("cherry-alias-expanded"), Comment(rawValue: errorOutput))
 }
 
 @Test func scrollbackIsBounded() async throws {

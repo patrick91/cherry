@@ -144,6 +144,13 @@ struct ShellIntegrationBootstrap {
               add-zsh-hook chpwd _cherry_set_working_directory
               add-zsh-hook precmd _cherry_precmd
               _cherry_set_working_directory
+
+              if [[ -n "${CHERRY_STARTUP_COMMAND-}" ]]; then
+                _cherry_startup_command="$CHERRY_STARTUP_COMMAND"
+                unset CHERRY_STARTUP_COMMAND
+                eval "$_cherry_startup_command"
+                exit $?
+              fi
             fi
             """
         )
@@ -403,6 +410,11 @@ final class ShellProcessController: @unchecked Sendable {
             _ = setenv("INSIDE_CHERRY", "1", 1)
             if let shellIntegration {
                 _ = setenv("CHERRY_BOOTSTRAP_ZDOTDIR", shellIntegration.zdotdir, 1)
+                if let startupCommand, !startupCommand.isEmpty {
+                    _ = setenv("CHERRY_STARTUP_COMMAND", startupCommand, 1)
+                } else {
+                    _ = unsetenv("CHERRY_STARTUP_COMMAND")
+                }
                 if let originalZDOTDIR, !originalZDOTDIR.isEmpty {
                     _ = setenv("CHERRY_ORIGINAL_ZDOTDIR", originalZDOTDIR, 1)
                 } else {
@@ -411,7 +423,7 @@ final class ShellProcessController: @unchecked Sendable {
                 _ = setenv("ZDOTDIR", shellIntegration.zdotdir, 1)
             }
 
-            if let startupCommand {
+            if let startupCommand, shellIntegration == nil {
                 let command = "exec \(startupCommand)"
                 shellPath.withCString { shellPathPointer in
                     shellName.withCString { shellNamePointer in

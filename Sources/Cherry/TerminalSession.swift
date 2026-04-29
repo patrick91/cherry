@@ -720,6 +720,19 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    func updateCommandSession(
+        named originalName: String?,
+        with command: ProjectCommandDefinition,
+        projectRoot: String
+    ) {
+        let lookupName = originalName?.nilIfEmpty ?? command.name
+        guard let session = commandSession(named: lookupName) else { return }
+        session.updateManagedCommand(
+            command,
+            workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot)
+        )
+    }
+
     func close(_ session: TerminalSession) {
         guard sessions.count > 1 else { return }
 
@@ -876,19 +889,19 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     let id = UUID()
     @Published private(set) var title: String
+    @Published private(set) var subtitle: String
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
     private(set) var isEnhancedKeyboardProtocolActive = false
 
-    let subtitle: String
     let tint: NSColor
     let maxScrollback: Int?
-    let launchWorkingDirectory: String
+    private(set) var launchWorkingDirectory: String
     let kind: SessionKind
     let agentName: String?
-    let commandName: String?
-    private let launchCommand: String?
-    private let restartOnExit: Bool
+    private(set) var commandName: String?
+    private var launchCommand: String?
+    private var restartOnExit: Bool
 
     @Published private(set) var revision = 0
 
@@ -1063,6 +1076,19 @@ final class TerminalSession: ObservableObject, Identifiable {
         let hideCursor = Data("\u{1B}[?25l".utf8)
         rawOutputStore.append(hideCursor)
         processor.ingestTestingData(hideCursor)
+        bumpRevision()
+    }
+
+    func updateManagedCommand(_ command: ProjectCommandDefinition, workingDirectory: String) {
+        guard kind == .command else { return }
+
+        title = command.name.isEmpty ? title : command.name
+        subtitle = command.commandLine
+        self.workingDirectory = workingDirectory
+        launchWorkingDirectory = workingDirectory
+        commandName = command.name
+        launchCommand = command.commandLine.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        restartOnExit = command.autoRestart
         bumpRevision()
     }
 

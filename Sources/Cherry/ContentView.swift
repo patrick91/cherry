@@ -970,6 +970,11 @@ private struct SidebarCommandSection: View {
                             replacing: editingOriginalName,
                             storage: storage
                         )
+                        workspace.updateCommandSession(
+                            named: editingOriginalName,
+                            with: updatedCommand,
+                            projectRoot: projectRoot
+                        )
                         commandError = nil
                         editingOriginalName = nil
                         editingCommand = nil

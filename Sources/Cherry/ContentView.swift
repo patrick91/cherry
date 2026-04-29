@@ -11,6 +11,7 @@ struct ContentView: View {
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let openProject: (CherryProject) -> Void
     @Binding var isSidebarHidden: Bool
@@ -48,7 +49,11 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 dockedSidebarSlot
 
-                DetailPaneView(workspace: workspace, includeLeadingPadding: isSidebarHidden)
+                DetailPaneView(
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    includeLeadingPadding: isSidebarHidden
+                )
                     .ignoresSafeArea(.all, edges: .top)
             }
 
@@ -157,11 +162,13 @@ struct ContentView: View {
         .onChange(of: isSidebarRevealed) { _, _ in
             syncTrafficLights()
         }
-        .onChange(of: sidebarWidth) { _, _ in
+        .onChange(of: sidebarWidth) { _, newWidth in
             syncTrafficLights()
+            chromeState.dockedSidebarWidth = newWidth
         }
         .onAppear {
             storedSidebarWidth = Double(sidebarWidth)
+            chromeState.dockedSidebarWidth = sidebarWidth
             trafficLights.seedTarget(
                 docked: isSidebarHidden ? 0 : sidebarWidth,
                 floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
@@ -415,12 +422,13 @@ private struct WindowConfigurator: NSViewRepresentable {
 
 private struct DetailPaneView: View {
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let includeLeadingPadding: Bool
 
     var body: some View {
         Group {
             if let session = workspace.selectedSession {
-                TerminalSceneView(session: session)
+                TerminalSceneView(session: session, chromeState: chromeState)
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1903,7 +1911,7 @@ private struct SidebarThemeSample {
     }
 }
 
-private extension NSColor {
+extension NSColor {
     convenience init?(hexRGB: String) {
         let trimmed = hexRGB.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingPrefix("#")
@@ -1957,9 +1965,10 @@ private extension NSColor {
 private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var session: TerminalSession
+    @ObservedObject var chromeState: ProjectWindowChromeState
 
     var body: some View {
-        TerminalSurfaceView(session: session)
+        TerminalSurfaceView(session: session, chromeState: chromeState)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 LinearGradient(

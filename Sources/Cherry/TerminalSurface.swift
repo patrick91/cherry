@@ -277,15 +277,24 @@ enum TerminalInputEncoder {
 
 struct TerminalSurfaceView: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
+    @ObservedObject var chromeState: ProjectWindowChromeState
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
         let containerView = GhosttyTerminalContainerView()
         containerView.configure(with: session, colorScheme: context.environment.colorScheme)
+        containerView.applySidebarAnimationState(
+            isAnimating: chromeState.isSidebarAnimating,
+            postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta
+        )
         return containerView
     }
 
     func updateNSView(_ nsView: GhosttyTerminalContainerView, context: Context) {
         nsView.configure(with: session, colorScheme: context.environment.colorScheme)
+        nsView.applySidebarAnimationState(
+            isAnimating: chromeState.isSidebarAnimating,
+            postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta
+        )
     }
 }
 

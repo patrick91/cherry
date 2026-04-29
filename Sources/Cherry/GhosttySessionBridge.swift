@@ -3,6 +3,18 @@ import Foundation
 import GhosttyTerminal
 import SwiftUI
 
+// Set `CHERRY_DEBUG_SIDEBAR_RESIZE=1` in the environment to see the
+// terminal-resize diagnostics in stderr / Console.app. Off by default so
+// the logs don't pollute normal runs.
+private let sidebarResizeDebugEnabled =
+    ProcessInfo.processInfo.environment["CHERRY_DEBUG_SIDEBAR_RESIZE"] == "1"
+
+@inline(__always)
+private func sidebarResizeLog(_ message: @autoclosure () -> String) {
+    guard sidebarResizeDebugEnabled else { return }
+    print("[sidebar.resize] \(message())")
+}
+
 private final class GhosttyOutputSink: @unchecked Sendable {
     private let lock = NSLock()
     private var session: InMemoryTerminalSession
@@ -296,6 +308,12 @@ final class GhosttyTerminalContainerView: NSView {
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
     private var pendingTerminalFocus = false
+    private var isSidebarAnimating = false
+    private var isSyncFrozen = false
+    private var snapshotLayer: CALayer?
+    private var activeColorScheme: ColorScheme = .dark
+    private var pendingPostAnimationDelta: CGFloat = 0
+    private var didApplyEarlyFit = false
 
     override var acceptsFirstResponder: Bool {
         true
@@ -333,14 +351,49 @@ final class GhosttyTerminalContainerView: NSView {
             session.ghosttyBridge.attach(to: self)
         }
 
+        activeColorScheme = colorScheme
+        applyDocumentBackgroundColor(for: colorScheme)
         session.ghosttyBridge.applyTerminalSettings(colorScheme: colorScheme)
+    }
+
+    func applySidebarAnimationState(
+        isAnimating: Bool,
+        postAnimationDeltaWidth: CGFloat
+    ) {
+        let wasAnimating = isSidebarAnimating
+        isSidebarAnimating = isAnimating
+        pendingPostAnimationDelta = postAnimationDeltaWidth
+
+        if !wasAnimating, isAnimating {
+            sidebarResizeLog(
+                "begin animation delta=\(postAnimationDeltaWidth) " +
+                "scrollView.contentSize=\(scrollView.contentSize) bounds=\(bounds.size)"
+            )
+            beginSidebarAnimation()
+        } else if wasAnimating, !isAnimating {
+            sidebarResizeLog(
+                "end animation didEarlyFit=\(didApplyEarlyFit) " +
+                "scrollView.contentSize=\(scrollView.contentSize) " +
+                "terminalView.frame=\(activeBridge?.terminalView.frame ?? .zero)"
+            )
+            endSidebarAnimation()
+        }
     }
 
     override func layout() {
         super.layout()
         scrollView.frame = bounds
-        activeSession?.ghosttyBridge.attach(to: self)
+
+        // We deliberately *do not* call `bridge.attach(to: self)` here.
+        // `attach` calls `terminalView.fitToSize()` unconditionally, which
+        // would re-issue a Metal surface reconfigure on every layout pass —
+        // including the final post-animation one — undoing the work the
+        // freeze + early-fit are doing. Attachment is already handled in
+        // `configure(with:colorScheme:)` (session changes) and
+        // `viewDidMoveToWindow` (window changes), which is sufficient.
         synchronizeScrollState()
+
+        updateSnapshotLayerFrame()
     }
 
     override func viewDidMoveToWindow() {
@@ -391,13 +444,246 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         scrollView.reflectScrolledClipView(scrollView.contentView)
-        synchronizeTerminalFrame(terminalView)
+
+        // `synchronizeTerminalFrame` is the only path that calls
+        // `fitToSize`. While the sidebar is animating we want exactly zero
+        // re-fits — otherwise the terminal reflows on every scroll-bounds
+        // change and the prompt visibly walks up/down under the snapshot.
+        if !isSyncFrozen {
+            synchronizeTerminalFrame(terminalView)
+        }
     }
 
     func setTerminalPointerStyle(_ style: TerminalPointerStyle) {
         let cursor = style.nsCursor
         scrollView.documentCursor = cursor
         cursor.set()
+    }
+
+    private func beginSidebarAnimation() {
+        didApplyEarlyFit = false
+        captureSnapshotIfPossible()
+        isSyncFrozen = true
+        // Resize the live terminal to its post-animation width *now*, while
+        // the just-placed (fully opaque) snapshot is hiding the surface.
+        // The Metal reconfigure flash that Ghostty emits when the surface
+        // size changes happens here — under cover — so when the snapshot
+        // eventually fades there's no pending fit and no flash to reveal.
+        applyEarlyFitIfPossible()
+    }
+
+    private func endSidebarAnimation() {
+        let wasFrozen = isSyncFrozen
+        isSyncFrozen = false
+
+        if wasFrozen, !didApplyEarlyFit {
+            // Couldn't pre-fit (e.g. zero delta or no bridge yet) — fall
+            // back to a single end-of-animation sync.
+            synchronizeScrollState()
+        } else if wasFrozen {
+            // Pre-fit already brought the terminal to target. Just settle
+            // the document-view metrics + scroll offset.
+            updateDocumentViewMetrics()
+        }
+
+        // Hand a runloop tick to Core Animation / Metal so the live
+        // surface is fully painted behind the snapshot before opacity
+        // starts dropping.
+        DispatchQueue.main.async { [weak self] in
+            self?.crossfadeOutSnapshotLayer()
+        }
+
+        didApplyEarlyFit = false
+    }
+
+    private func applyEarlyFitIfPossible() {
+        guard let terminalView = activeBridge?.terminalView,
+              pendingPostAnimationDelta != 0 else {
+            sidebarResizeLog("applyEarlyFit skipped (no bridge or zero delta)")
+            return
+        }
+
+        let currentContentSize = scrollView.contentSize
+        guard currentContentSize.width > 0, currentContentSize.height > 0 else {
+            sidebarResizeLog("applyEarlyFit skipped (zero content size)")
+            return
+        }
+
+        let targetWidth = max(100, currentContentSize.width + pendingPostAnimationDelta)
+        let targetSize = CGSize(width: targetWidth, height: currentContentSize.height)
+
+        sidebarResizeLog(
+            "applyEarlyFit current=\(currentContentSize) delta=\(pendingPostAnimationDelta) " +
+            "target=\(targetSize)"
+        )
+
+        // Pre-grow the document view too so the surface has somewhere to
+        // live when the target is wider than the current scroll-view
+        // contents (the closing case). Without this the terminal's frame
+        // would extend past the document view and the right edge would be
+        // briefly clipped at the wrong width.
+        documentView.frame.size.width = max(documentView.frame.size.width, targetWidth)
+
+        terminalView.frame = NSRect(origin: .zero, size: targetSize)
+        terminalView.fitToSize()
+        didApplyEarlyFit = true
+    }
+
+    private func updateDocumentViewMetrics() {
+        documentView.frame.size.width = max(scrollView.contentSize.width, 1)
+        documentView.frame.size.height = documentHeight()
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func captureSnapshotIfPossible() {
+        // Best-effort screenshot of the live terminal area. Tries the
+        // window-list compositor first (captures Metal contents), then falls
+        // back to AppKit's `cacheDisplay` which won't capture the GPU surface
+        // but still provides the surrounding chrome. If both fail we just
+        // proceed without a snapshot — the freeze still suppresses the
+        // flicker, the cross-fade just becomes a no-op.
+        guard scrollView.frame.width > 0,
+              scrollView.frame.height > 0 else { return }
+
+        let captureRect = scrollView.frame
+        let cgImage = captureWindowSnapshot(of: scrollView, rect: captureRect)
+            ?? captureViewBitmap(scrollView, rect: scrollView.bounds)
+
+        guard let cgImage else { return }
+
+        snapshotLayer?.removeFromSuperlayer()
+
+        wantsLayer = true
+        let layer = CALayer()
+        layer.contents = cgImage
+        // Anchor the captured pixels at the layer's top-left without any
+        // scaling. The live terminal underneath is left-aligned in the
+        // scroll view, so an unscaled top-left snapshot tracks it
+        // pixel-for-pixel — otherwise (e.g. with `.resizeAspectFill`) the
+        // image would scale/crop from the center and snap visibly when the
+        // cross-fade reveals the live content.
+        layer.contentsGravity = .topLeft
+        layer.masksToBounds = true
+        // Ghostty's metal layer renders text on a *clear* background, so the
+        // captured CGImage has alpha holes wherever the terminal background
+        // would normally show. Without a layer background color, those
+        // holes (and the area beyond the image when the layer grows on a
+        // close) reveal the live terminal underneath — and the brief Metal
+        // reconfigure flash from the end-of-animation `fitToSize` is
+        // visible through them. Painting the layer with the active terminal
+        // background color closes every hole so the snapshot is fully
+        // opaque end-to-end.
+        layer.backgroundColor = terminalBackgroundCGColor()
+        layer.frame = captureRect
+        layer.zPosition = 1_000
+        // Disable implicit animations on layout-driven property changes so
+        // the snapshot's frame interpolates with SwiftUI's animation curve
+        // (driven from `layout()`) rather than running on Core Animation's
+        // separate clock and visibly desyncing.
+        layer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
+        if let scale = window?.backingScaleFactor {
+            layer.contentsScale = scale
+        }
+        self.layer?.addSublayer(layer)
+        snapshotLayer = layer
+    }
+
+    private func terminalBackgroundCGColor() -> CGColor {
+        let themeColors = TerminalSettings.shared.ghosttyThemeColors(for: activeColorScheme)
+        let resolved = NSColor(hexRGB: themeColors.background)
+            ?? (activeColorScheme == .light ? NSColor.white : NSColor.black)
+        return resolved.cgColor
+    }
+
+    private func captureWindowSnapshot(of view: NSView, rect: NSRect) -> CGImage? {
+        guard let window = view.window,
+              window.windowNumber > 0 else { return nil }
+
+        let viewRectInWindow = view.convert(rect, to: nil)
+        let screenRect = window.convertToScreen(viewRectInWindow)
+
+        // CGWindowListCreateImage takes screen coords with a top-left origin.
+        // AppKit screen coords have a bottom-left origin from the primary
+        // display, so flip the Y.
+        guard let primary = NSScreen.screens.first else { return nil }
+        let flipped = CGRect(
+            x: screenRect.origin.x,
+            y: primary.frame.maxY - screenRect.origin.y - screenRect.height,
+            width: screenRect.width,
+            height: screenRect.height
+        )
+
+        return CGWindowListCreateImage(
+            flipped,
+            .optionIncludingWindow,
+            CGWindowID(window.windowNumber),
+            [.bestResolution, .boundsIgnoreFraming]
+        )
+    }
+
+    private func captureViewBitmap(_ view: NSView, rect: NSRect) -> CGImage? {
+        guard rect.width > 0, rect.height > 0,
+              let bitmap = view.bitmapImageRepForCachingDisplay(in: rect) else { return nil }
+        view.cacheDisplay(in: rect, to: bitmap)
+        return bitmap.cgImage
+    }
+
+    private func crossfadeOutSnapshotLayer() {
+        guard let snapshotLayer else {
+            removeSnapshotLayer(animated: false)
+            return
+        }
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = snapshotLayer.opacity
+        fade.toValue = 0
+        fade.duration = 0.12
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            self?.snapshotLayer?.removeFromSuperlayer()
+            self?.snapshotLayer = nil
+        }
+        snapshotLayer.opacity = 0
+        snapshotLayer.add(fade, forKey: "fadeOut")
+        CATransaction.commit()
+    }
+
+    private func removeSnapshotLayer(animated: Bool) {
+        guard let snapshotLayer else { return }
+        if animated {
+            crossfadeOutSnapshotLayer()
+        } else {
+            snapshotLayer.removeFromSuperlayer()
+            self.snapshotLayer = nil
+        }
+    }
+
+    private func updateSnapshotLayerFrame() {
+        guard let snapshotLayer else { return }
+        // Track the current visible area so the snapshot stays aligned with
+        // the underlying scroll view as the container resizes during the
+        // animation. Disable implicit layer animations or the snapshot will
+        // animate independently from SwiftUI's frame interpolation.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        snapshotLayer.frame = scrollView.frame
+        CATransaction.commit()
+    }
+
+    // Painting the document background with the active terminal theme color
+    // means that when the deferred strategy freezes the live terminal at its
+    // pre-animation size, any newly exposed area on the right (sidebar
+    // closing) reads as terminal background instead of bleeding through to
+    // the scene's gradient.
+    private func applyDocumentBackgroundColor(for colorScheme: ColorScheme) {
+        let themeColors = TerminalSettings.shared.ghosttyThemeColors(for: colorScheme)
+        let resolved = NSColor(hexRGB: themeColors.background)
+            ?? (colorScheme == .light ? NSColor.white : NSColor.black)
+
+        documentView.wantsLayer = true
+        documentView.layer?.backgroundColor = resolved.cgColor
     }
 
     private func configureScrollView() {
@@ -517,7 +803,8 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func handleScrollBoundsChange() {
-        guard let terminalView = activeBridge?.terminalView else { return }
+        guard !isSyncFrozen,
+              let terminalView = activeBridge?.terminalView else { return }
         synchronizeTerminalFrame(terminalView)
     }
 
@@ -541,10 +828,27 @@ final class GhosttyTerminalContainerView: NSView {
 
     private func synchronizeTerminalFrame(_ terminalView: TerminalView) {
         let visibleRect = scrollView.contentView.documentVisibleRect
-        terminalView.frame = NSRect(
+        let targetFrame = NSRect(
             origin: visibleRect.origin,
             size: CGSize(width: scrollView.contentSize.width, height: scrollView.contentSize.height)
         )
+        // Skip when the terminal is essentially at the target size. The
+        // tolerance covers SwiftUI's sub-pixel layout rounding around the
+        // padding swap — observed deltas of ~0.7pt between our predicted
+        // post-animation width and the value scrollView actually settles
+        // on. A full point of tolerance is still well below one terminal
+        // cell (~9pt at the default font), so this never papers over a
+        // user-visible mis-size.
+        let widthDelta = abs(terminalView.frame.size.width - targetFrame.size.width)
+        let heightDelta = abs(terminalView.frame.size.height - targetFrame.size.height)
+        let originDelta = max(
+            abs(terminalView.frame.origin.x - targetFrame.origin.x),
+            abs(terminalView.frame.origin.y - targetFrame.origin.y)
+        )
+        guard widthDelta > 1.0 || heightDelta > 1.0 || originDelta > 1.0 else { return }
+
+        sidebarResizeLog("synchronizeTerminalFrame -> \(targetFrame.size)")
+        terminalView.frame = targetFrame
         terminalView.fitToSize()
     }
 

@@ -191,6 +191,7 @@ private struct ProjectWorkspaceView: View {
     var body: some View {
         ContentView(
             workspace: workspace,
+            chromeState: chromeState,
             projectRoot: workspace.projectRoot,
             openProject: openProject,
             isSidebarHidden: $chromeState.isSidebarHidden,

@@ -270,60 +270,23 @@ private struct AgentSettingsPane: View {
     @ObservedObject var settings: AgentSettings
 
     @State private var editingAgent: AgentToolDefinition?
-    @State private var editingSource: AgentToolSource?
     @State private var editingOriginalName: String?
     @State private var agentError: String?
-    @State private var selectedProjectRoot: String?
 
     var body: some View {
-        let project = settings.resolvedProject(for: selectedProjectRoot)
-        let selectedProject = settings.selectedProject(for: selectedProjectRoot)
-
         VStack(spacing: 0) {
             Form {
-                Section("Project") {
-                    HStack {
-                        Menu(selectedProject?.name ?? "Choose project") {
-                            ForEach(settings.projects) { project in
-                                Button(project.name) {
-                                    selectedProjectRoot = project.root
-                                }
-                            }
-                        }
-
-                        Spacer()
-
-                        Text(project.configState.message)
-                            .foregroundStyle(configMessageColor)
-                            .multilineTextAlignment(.trailing)
-                    }
-
-                    HStack {
-                        Text(project.validProjectRoot ?? "Add a project in Projects settings.")
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-
-                        if case .untrusted = project.configState {
-                            Button("Trust cherry.toml") {
-                                settings.trustSharedConfig(for: selectedProjectRoot)
-                            }
-                        }
-                    }
-                }
-
                 Section("Agent Tools") {
-                    if project.agents.isEmpty {
-                        Text("No agents configured for this project.")
+                    if settings.resolvedAgents.isEmpty {
+                        Text("No agents configured.")
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(project.agents) { agent in
+                        ForEach(settings.resolvedAgents) { agent in
                             AgentToolRow(agent: agent) {
                                 editingAgent = agent.definition
-                                editingSource = agent.source
                                 editingOriginalName = agent.name
                             } onReset: {
-                                settings.removeLocalAgent(named: agent.name, for: selectedProjectRoot)
+                                settings.removeAgent(named: agent.name)
                             }
                         }
                     }
@@ -333,12 +296,10 @@ private struct AgentSettingsPane: View {
                             ForEach(AgentConfiguration.presets) { preset in
                                 Button(preset.name) {
                                     editingAgent = preset
-                                    editingSource = .local
                                     editingOriginalName = nil
                                 }
                             }
                         }
-                        .disabled(project.validProjectRoot == nil)
 
                         Spacer()
                     }
@@ -347,28 +308,15 @@ private struct AgentSettingsPane: View {
             .formStyle(.grouped)
             .padding(20)
         }
-        .onAppear {
-            if selectedProjectRoot == nil {
-                selectedProjectRoot = ProjectWindowRegistry.shared.activeWorkspace?.projectRoot
-                    ?? settings.projects.first?.root
-            }
-        }
-        .onChange(of: settings.projects) { _, projects in
-            if let selectedProjectRoot, projects.contains(where: { $0.root == selectedProjectRoot }) {
-                return
-            }
-            selectedProjectRoot = projects.first?.root
-        }
         .sheet(item: $editingAgent) { agent in
             AgentToolEditor(
                 agent: agent,
-                canDelete: editingSource == .local,
+                canDelete: editingOriginalName != nil,
                 errorMessage: agentError,
                 onSave: { updatedAgent in
                     do {
-                        try settings.upsertLocalAgent(
+                        try settings.upsertAgent(
                             updatedAgent,
-                            for: selectedProjectRoot,
                             replacing: editingOriginalName
                         )
                         agentError = nil
@@ -379,7 +327,7 @@ private struct AgentSettingsPane: View {
                     }
                 },
                 onDelete: {
-                    settings.removeLocalAgent(named: agent.name, for: selectedProjectRoot)
+                    settings.removeAgent(named: agent.name)
                     agentError = nil
                     editingOriginalName = nil
                     editingAgent = nil
@@ -392,16 +340,6 @@ private struct AgentSettingsPane: View {
             )
         }
     }
-
-    private var configMessageColor: Color {
-        switch settings.resolvedProject(for: selectedProjectRoot).configState {
-        case .error, .untrusted:
-            .orange
-        default:
-            .secondary
-        }
-    }
-
 }
 
 private struct AgentToolRow: View {
@@ -435,23 +373,14 @@ private struct AgentToolRow: View {
                 .foregroundStyle(.secondary)
 
             Button("Edit", action: onEdit)
-
-            if agent.hasLocalOverride {
-                Button("Reset", action: onReset)
-            } else if agent.source == .local {
-                Button("Delete", role: .destructive, action: onReset)
-            }
+            Button("Delete", role: .destructive, action: onReset)
         }
     }
 
     private var sourceLabel: String {
         switch agent.source {
-        case .shared:
-            "Shared"
-        case .local:
-            "Local"
-        case .localOverride:
-            "Local override"
+        case .global:
+            "Global"
         }
     }
 }

@@ -130,20 +130,11 @@ import Testing
     #expect(workspace.sessions.map(\.id) == [firstSession.id, secondSession.id, thirdSession.id])
 }
 
-@Test func projectAgentTomlDecodesAndValidates() async throws {
-    let toml = """
-    [[agents]]
-    name = "Codex"
-    command = "codex"
-    arguments = "--yolo"
-    enabled = true
-
-    [[agents]]
-    name = "Claude"
-    command = "claude"
-    """
-
-    let agents = try AgentConfiguration.decodeSharedAgents(from: toml)
+@Test func agentDefinitionsValidateAndNormalize() async throws {
+    let agents = try AgentConfiguration.validated([
+        AgentToolDefinition(name: " Codex ", command: " codex ", arguments: " --yolo ", enabled: true),
+        AgentToolDefinition(name: "Claude", command: "claude")
+    ])
 
     #expect(agents == [
         AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo", enabled: true),
@@ -151,44 +142,17 @@ import Testing
     ])
 }
 
-@Test func projectAgentTomlRejectsDuplicateNames() async throws {
-    let toml = """
-    [[agents]]
-    name = "Codex"
-    command = "codex"
-
-    [[agents]]
-    name = " codex "
-    command = "other"
-    """
-
+@Test func agentDefinitionsRejectDuplicateNames() async throws {
     #expect(throws: AgentConfigurationError.duplicateName("codex")) {
-        try AgentConfiguration.decodeSharedAgents(from: toml)
+        try AgentConfiguration.validated([
+            AgentToolDefinition(name: "Codex", command: "codex"),
+            AgentToolDefinition(name: " codex ", command: "other")
+        ])
     }
 }
 
-@Test func localAgentDefinitionsOverrideSharedDefinitions() async throws {
-    let shared = [
-        AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"),
-        AgentToolDefinition(name: "Claude", command: "claude")
-    ]
-    let local = [
-        AgentToolDefinition(name: "codex", command: "custom-codex", arguments: "--model test", enabled: false),
-        AgentToolDefinition(name: "Pi", command: "pi")
-    ]
-
-    let merged = AgentConfiguration.merge(sharedAgents: shared, localAgents: local, isSharedConfigTrusted: true)
-
-    #expect(merged.map(\.name) == ["codex", "Claude", "Pi"])
-    #expect(merged[0].source == .localOverride)
-    #expect(merged[0].commandLine == "custom-codex --model test")
-    #expect(merged[0].isLaunchable == false)
-    #expect(merged[1].source == .shared)
-    #expect(merged[2].source == .local)
-}
-
 @MainActor
-@Test func sharedAgentConfigRequiresTrustAndInvalidatesWhenChanged() async throws {
+@Test func agentSettingsPersistGlobalAgentsAcrossProjects() async throws {
     let defaultsName = "CherryTests.AgentSettings.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
     defer {
@@ -202,35 +166,20 @@ import Testing
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let configURL = directory.appendingPathComponent(AgentConfiguration.fileName)
-    try """
-    [[agents]]
-    name = "Codex"
-    command = "codex"
-    """.write(to: configURL, atomically: true, encoding: .utf8)
-
     let settings = AgentSettings(defaults: defaults)
     settings.addProject(path: directory.path)
+    try settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo"))
 
-    var project = settings.resolvedProject(for: directory.path)
+    let project = settings.resolvedProject(for: directory.path)
     #expect(project.agents.count == 1)
-    #expect(project.agents[0].source == .shared)
-    #expect(project.agents[0].isLaunchable == false)
-
-    settings.trustSharedConfig(for: directory.path)
-
-    project = settings.resolvedProject(for: directory.path)
+    #expect(project.agents[0].source == .global)
     #expect(project.agents[0].isLaunchable == true)
 
-    try """
-    [[agents]]
-    name = "Codex"
-    command = "codex"
-    arguments = "--yolo"
-    """.write(to: configURL, atomically: true, encoding: .utf8)
-
-    project = settings.resolvedProject(for: directory.path)
-    #expect(project.agents[0].isLaunchable == false)
+    let reloadedSettings = AgentSettings(defaults: defaults)
+    #expect(reloadedSettings.agents == [
+        AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo")
+    ])
+    #expect(reloadedSettings.resolvedProject(for: directory.path).agents == project.agents)
 }
 
 @MainActor

@@ -416,17 +416,20 @@ final class ShellProcessController: @unchecked Sendable {
                 shellPath.withCString { shellPathPointer in
                     shellName.withCString { shellNamePointer in
                         "-l".withCString { loginFlagPointer in
-                            "-c".withCString { commandFlagPointer in
-                                command.withCString { commandPointer in
-                                    var arguments: [UnsafeMutablePointer<CChar>?] = [
-                                        UnsafeMutablePointer(mutating: shellNamePointer),
-                                        UnsafeMutablePointer(mutating: loginFlagPointer),
-                                        UnsafeMutablePointer(mutating: commandFlagPointer),
-                                        UnsafeMutablePointer(mutating: commandPointer),
-                                        nil
-                                    ]
+                            "-i".withCString { interactiveFlagPointer in
+                                "-c".withCString { commandFlagPointer in
+                                    command.withCString { commandPointer in
+                                        var arguments: [UnsafeMutablePointer<CChar>?] = [
+                                            UnsafeMutablePointer(mutating: shellNamePointer),
+                                            UnsafeMutablePointer(mutating: loginFlagPointer),
+                                            UnsafeMutablePointer(mutating: interactiveFlagPointer),
+                                            UnsafeMutablePointer(mutating: commandFlagPointer),
+                                            UnsafeMutablePointer(mutating: commandPointer),
+                                            nil
+                                        ]
 
-                                    execv(shellPathPointer, &arguments)
+                                        execv(shellPathPointer, &arguments)
+                                    }
                                 }
                             }
                         }

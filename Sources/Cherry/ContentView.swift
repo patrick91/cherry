@@ -1920,8 +1920,18 @@ extension NSColor {
             return nil
         }
 
+        // Hex colors from Ghostty themes (and basically every other
+        // source — web, design tools, terminal configs) are sRGB by
+        // convention. Parsing them as `calibratedRed:` puts the color
+        // in the deprecated NSCalibratedRGBColorSpace, which on a
+        // Display P3 panel converts to a subtly different on-screen
+        // pixel than Ghostty's own Metal renderer produces from the
+        // same hex. The result was a visible color seam between the
+        // terminal grid (Ghostty-painted) and any region we filled
+        // ourselves (document view background, sidebar-animation
+        // snapshot fill). Using `srgbRed:` matches Ghostty exactly.
         self.init(
-            calibratedRed: CGFloat((value >> 16) & 0xFF) / 255,
+            srgbRed: CGFloat((value >> 16) & 0xFF) / 255,
             green: CGFloat((value >> 8) & 0xFF) / 255,
             blue: CGFloat(value & 0xFF) / 255,
             alpha: 1

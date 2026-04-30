@@ -1464,6 +1464,24 @@ private final class ControlServerHarness {
     ) == nil)
 }
 
+@Test func appKitOptionLeftRightUseShellWordMotionOutsideTUI() async throws {
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7C,
+        modifiers: .option,
+        sendsModifiedArrowKeys: false
+    ) == Data("\u{1B}f".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7B,
+        modifiers: .option,
+        sendsModifiedArrowKeys: false
+    ) == Data("\u{1B}b".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7E,
+        modifiers: .option,
+        sendsModifiedArrowKeys: false
+    ) == Data("\u{1B}[1;3A".utf8))
+}
+
 @Test func pastedTextNormalizesLineEndings() async throws {
     let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
 

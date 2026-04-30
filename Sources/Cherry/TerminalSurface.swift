@@ -116,7 +116,8 @@ enum TerminalInputEncoder {
 
     static func appKitOptionArrowSequence(
         keyCode: UInt16,
-        modifiers: NSEvent.ModifierFlags
+        modifiers: NSEvent.ModifierFlags,
+        sendsModifiedArrowKeys: Bool = true
     ) -> Data? {
         let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
         guard modifiers.contains(.option),
@@ -125,6 +126,17 @@ enum TerminalInputEncoder {
               !modifiers.contains(.command)
         else {
             return nil
+        }
+
+        if !sendsModifiedArrowKeys {
+            switch keyCode {
+            case appKitRightArrowKeyCode:
+                return Data("\u{1B}f".utf8)
+            case appKitLeftArrowKeyCode:
+                return Data("\u{1B}b".utf8)
+            default:
+                break
+            }
         }
 
         let suffix: String

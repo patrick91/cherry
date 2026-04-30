@@ -806,7 +806,9 @@ final class GhosttyTerminalContainerView: NSView {
 
         if let sequence = TerminalInputEncoder.appKitOptionArrowSequence(
             keyCode: event.keyCode,
-            modifiers: event.modifierFlags
+            modifiers: event.modifierFlags,
+            sendsModifiedArrowKeys: activeSession.usesAlternateScreen ||
+                activeSession.isEnhancedKeyboardProtocolActive
         ) {
             activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: sequence)

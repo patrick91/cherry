@@ -599,6 +599,10 @@ final class TerminalWorkspace: ObservableObject {
         agentSessions + terminalSessions + commandSessions
     }
 
+    func sidebarOrderedSessions(visibleCommandNames: [String]) -> [TerminalSession] {
+        agentSessions + terminalSessions + commandSessions(orderedBy: visibleCommandNames)
+    }
+
     func select(_ session: TerminalSession) {
         selectedSessionID = session.id
     }
@@ -754,12 +758,12 @@ final class TerminalWorkspace: ObservableObject {
         close(selectedSession)
     }
 
-    func selectPreviousSession() {
-        selectSession(offset: -1)
+    func selectPreviousSession(visibleCommandNames: [String]? = nil) {
+        selectSession(offset: -1, visibleCommandNames: visibleCommandNames)
     }
 
-    func selectNextSession() {
-        selectSession(offset: 1)
+    func selectNextSession(visibleCommandNames: [String]? = nil) {
+        selectSession(offset: 1, visibleCommandNames: visibleCommandNames)
     }
 
     func interruptSelectedSession() {
@@ -774,8 +778,12 @@ final class TerminalWorkspace: ObservableObject {
         selectedSession?.clearScrollback()
     }
 
-    private func selectSession(offset: Int) {
-        let orderedSessions = sidebarOrderedSessions
+    private func selectSession(offset: Int, visibleCommandNames: [String]?) {
+        let orderedSessions = if let visibleCommandNames {
+            sidebarOrderedSessions(visibleCommandNames: visibleCommandNames)
+        } else {
+            sidebarOrderedSessions
+        }
         guard !orderedSessions.isEmpty else { return }
 
         let currentIndex = selectedSession
@@ -784,6 +792,15 @@ final class TerminalWorkspace: ObservableObject {
             } ?? 0
         let nextIndex = (currentIndex + offset + orderedSessions.count) % orderedSessions.count
         selectedSessionID = orderedSessions[nextIndex].id
+    }
+
+    private func commandSessions(orderedBy visibleCommandNames: [String]) -> [TerminalSession] {
+        let visibleNames = visibleCommandNames.map(AgentToolDefinition.normalizedName)
+        return visibleNames.compactMap { visibleName in
+            commandSessions.first {
+                $0.commandName.map { AgentToolDefinition.normalizedName($0) } == visibleName
+            }
+        }
     }
 
     func session(id terminalID: String) -> TerminalSession? {

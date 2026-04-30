@@ -2,11 +2,22 @@ import AppKit
 import SwiftUI
 
 struct AppShortcutMonitor: NSViewRepresentable {
+    @ObservedObject private var agentSettings = AgentSettings.shared
+
     @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
     let openSettings: () -> Void
 
+    private var visibleCommandNames: [String] {
+        agentSettings.launchableProjectCommands(for: projectRoot).map(\.name)
+    }
+
     func makeCoordinator() -> Coordinator {
-        Coordinator(workspace: workspace, openSettings: openSettings)
+        Coordinator(
+            workspace: workspace,
+            visibleCommandNames: visibleCommandNames,
+            openSettings: openSettings
+        )
     }
 
     func makeNSView(context: Context) -> ShortcutMonitorView {
@@ -17,6 +28,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
+        context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
@@ -33,12 +45,18 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         weak var workspace: TerminalWorkspace?
+        var visibleCommandNames: [String]
         var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
 
-        init(workspace: TerminalWorkspace, openSettings: @escaping () -> Void) {
+        init(
+            workspace: TerminalWorkspace,
+            visibleCommandNames: [String],
+            openSettings: @escaping () -> Void
+        ) {
             self.workspace = workspace
+            self.visibleCommandNames = visibleCommandNames
             self.openSettings = openSettings
             install()
         }
@@ -67,10 +85,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
             {
                 switch event.keyCode {
                 case 126:
-                    workspace?.selectPreviousSession()
+                    workspace?.selectPreviousSession(visibleCommandNames: visibleCommandNames)
                     return true
                 case 125:
-                    workspace?.selectNextSession()
+                    workspace?.selectNextSession(visibleCommandNames: visibleCommandNames)
                     return true
                 default:
                     break

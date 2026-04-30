@@ -355,6 +355,53 @@ import Testing
     #expect(workspace.selectedSessionID == command.id)
 }
 
+@MainActor
+@Test func workspaceShortcutSelectionFollowsVisibleCommandOrder() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let terminal = try #require(workspace.terminalSessions.first)
+    let tilt = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Tilt", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+    let web = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+
+    #expect(workspace.commandSessions.map(\.id) == [tilt.id, web.id])
+    #expect(workspace.sidebarOrderedSessions(visibleCommandNames: ["Web", "Tilt"]).map(\.id) == [
+        terminal.id,
+        web.id,
+        tilt.id
+    ])
+
+    workspace.select(terminal)
+    workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
+    #expect(workspace.selectedSessionID == web.id)
+
+    workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
+    #expect(workspace.selectedSessionID == tilt.id)
+
+    workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
+    #expect(workspace.selectedSessionID == terminal.id)
+
+    workspace.selectPreviousSession(visibleCommandNames: ["Web", "Tilt"])
+    #expect(workspace.selectedSessionID == tilt.id)
+}
+
 @Test func agentDefinitionsValidateAndNormalize() async throws {
     let agents = try AgentConfiguration.validated([
         AgentToolDefinition(name: " Codex ", command: " codex ", arguments: " --yolo ", enabled: true),

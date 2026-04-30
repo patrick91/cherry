@@ -141,7 +141,11 @@ struct ContentView: View {
             AppShellBackground()
                 .ignoresSafeArea(.all)
         }
-        .background(AppShortcutMonitor(workspace: workspace, openSettings: { openSettings() }))
+        .background(AppShortcutMonitor(
+            workspace: workspace,
+            projectRoot: projectRoot,
+            openSettings: { openSettings() }
+        ))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
         .modifier(ChromeWidthAnimator(

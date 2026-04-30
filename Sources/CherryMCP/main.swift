@@ -48,7 +48,7 @@ private enum CherryMCPTools {
         ),
         tool(
             "run_agent",
-            "Create a new configured Cherry agent session in the active project without selecting it.",
+            "Create a new configured Cherry agent session in the active project without selecting it. Always creates a new terminal; never use this to send input to an existing terminal.",
             properties: [
                 "agent_name": string("Configured Cherry agent name."),
                 "text": string("Optional text to send exactly as provided after launch."),
@@ -59,6 +59,16 @@ private enum CherryMCPTools {
             required: ["agent_name"]
         ),
         tool(
+            "press_enter",
+            "Press Enter in a running Cherry terminal. Use this to submit prompts or forms in existing TUIs; it sends carriage return (0x0d), not line feed (0x0a).",
+            properties: [
+                "terminal_id": string("Cherry terminal UUID."),
+                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
+                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
+            ],
+            required: ["terminal_id"]
+        ),
+        tool(
             "select_terminal",
             "Select a visible Cherry terminal tab.",
             properties: ["terminal_id": string("Cherry terminal UUID.")],
@@ -66,11 +76,11 @@ private enum CherryMCPTools {
         ),
         tool(
             "send_input",
-            "Send terminal text or raw bytes to a running Cherry terminal.",
+            "Send terminal text or raw bytes to a running Cherry terminal. Use this for existing terminals; use press_enter for Enter in TUIs.",
             properties: [
                 "terminal_id": string("Cherry terminal UUID."),
                 "text": string("Text to send exactly as provided."),
-                "raw_base64": string("Raw bytes to send, base64-encoded."),
+                "raw_base64": string("Raw bytes to send, base64-encoded. For Enter in TUIs, prefer press_enter or send carriage return as DQ==, not line feed Cg==."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -165,6 +175,14 @@ private enum CherryMCPTools {
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
                 select: false
+            ))
+        case "press_enter":
+            return .sendInput(.init(
+                terminalID: try requiredString("terminal_id", in: arguments),
+                text: nil,
+                rawBase64: "DQ==",
+                waitMilliseconds: intArgument("wait_ms", in: arguments),
+                lineLimit: intArgument("line_limit", in: arguments)
             ))
         case "select_terminal":
             return .selectTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))

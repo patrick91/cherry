@@ -114,6 +114,36 @@ enum TerminalInputEncoder {
         return Data(cursorKeySequence(key, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
     }
 
+    static func appKitOptionArrowSequence(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Data? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.option),
+              !modifiers.contains(.shift),
+              !modifiers.contains(.control),
+              !modifiers.contains(.command)
+        else {
+            return nil
+        }
+
+        let suffix: String
+        switch keyCode {
+        case appKitUpArrowKeyCode:
+            suffix = "A"
+        case appKitDownArrowKeyCode:
+            suffix = "B"
+        case appKitRightArrowKeyCode:
+            suffix = "C"
+        case appKitLeftArrowKeyCode:
+            suffix = "D"
+        default:
+            return nil
+        }
+
+        return Data("\u{1B}[1;3\(suffix)".utf8)
+    }
+
     static func shiftEnterSequence(
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,

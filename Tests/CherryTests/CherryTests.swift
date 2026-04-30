@@ -1436,6 +1436,34 @@ private final class ControlServerHarness {
     #expect(appKitArrowFlags == Data("\u{1B}OB".utf8))
 }
 
+@Test func appKitOptionArrowsPreserveOptionModifier() async throws {
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7E,
+        modifiers: .option
+    ) == Data("\u{1B}[1;3A".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7D,
+        modifiers: .option
+    ) == Data("\u{1B}[1;3B".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7C,
+        modifiers: .option
+    ) == Data("\u{1B}[1;3C".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7B,
+        modifiers: .option
+    ) == Data("\u{1B}[1;3D".utf8))
+    #expect(TerminalInputEncoder.appKitOptionArrowSequence(
+        keyCode: 0x7B,
+        modifiers: [.option, .shift]
+    ) == nil)
+    #expect(TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+        keyCode: 0x7B,
+        modifiers: .option,
+        usesApplicationCursorKeys: true
+    ) == nil)
+}
+
 @Test func pastedTextNormalizesLineEndings() async throws {
     let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
 

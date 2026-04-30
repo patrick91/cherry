@@ -775,6 +775,14 @@ final class GhosttyTerminalContainerView: NSView {
             return true
         }
 
+        if let sequence = TerminalInputEncoder.appKitOptionArrowSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags
+        ) {
+            activeSession.send(data: sequence)
+            return true
+        }
+
         if let sequence = TerminalInputEncoder.appKitUnmodifiedArrowSequence(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags,

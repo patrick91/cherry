@@ -58,7 +58,15 @@ Inside the prototype:
 
 ## MCP Control
 
-Cherry also builds a local MCP helper that controls the visible app:
+Cherry also bundles a local MCP helper that controls the visible app. After
+installing the local app, register the bundled helper with your harness:
+
+```bash
+codex mcp add cherry -- "$HOME/Applications/Cherry.app/Contents/Helpers/CherryMCP"
+claude mcp add --scope user cherry -- "$HOME/Applications/Cherry.app/Contents/Helpers/CherryMCP"
+```
+
+During development, you can also run the helper from SwiftPM:
 
 ```bash
 swift run CherryMCP

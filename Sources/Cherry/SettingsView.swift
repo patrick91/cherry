@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import GhosttyTheme
 import SwiftUI
 
@@ -27,8 +28,148 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Commands", systemImage: "play.rectangle")
                 }
+
+            MCPSettingsPane()
+                .tabItem {
+                    Label("MCP", systemImage: "network")
+                }
         }
         .frame(width: 680, height: 560)
+    }
+}
+
+private struct MCPSettingsPane: View {
+    @State private var copiedHarness: MCPHarness?
+    @State private var socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+
+    private var appBundleURL: URL? {
+        MCPInstallCommandBuilder.appBundleURL()
+    }
+
+    private var helperURL: URL? {
+        appBundleURL.map(MCPInstallCommandBuilder.helperURL(appBundleURL:))
+    }
+
+    private var helperExists: Bool {
+        guard let appBundleURL else { return false }
+        return MCPInstallCommandBuilder.helperExists(appBundleURL: appBundleURL)
+    }
+
+    private var commands: [MCPInstallCommand] {
+        guard let appBundleURL else { return [] }
+        return MCPInstallCommandBuilder.commands(appBundleURL: appBundleURL)
+    }
+
+    var body: some View {
+        Form {
+            Section("Status") {
+                LabeledContent("MCP server") {
+                    Text("Always available")
+                        .foregroundStyle(.secondary)
+                }
+
+                LabeledContent("Cherry control socket") {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(socketExists ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(socketExists ? "Listening" : "Waiting for Cherry")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                LabeledContent("Socket path") {
+                    Text(CherryControl.socketURL.path)
+                        .font(.callout.monospaced())
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Refresh") {
+                        socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+                    }
+                }
+            }
+
+            Section("Install Commands") {
+                if appBundleURL == nil {
+                    Text("Install commands are available when Cherry is running from a macOS app bundle.")
+                        .foregroundStyle(.secondary)
+                } else if !helperExists {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("CherryMCP is not bundled in this app.")
+                            .foregroundStyle(.primary)
+                        if let helperURL {
+                            Text(helperURL.path)
+                                .font(.callout.monospaced())
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Run the local app installer again to bundle the helper.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    ForEach(commands) { installCommand in
+                        MCPInstallCommandRow(
+                            installCommand: installCommand,
+                            isCopied: copiedHarness == installCommand.harness
+                        ) {
+                            copy(installCommand)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(20)
+        .onAppear {
+            socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+        }
+    }
+
+    private func copy(_ installCommand: MCPInstallCommand) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(installCommand.command, forType: .string)
+        copiedHarness = installCommand.harness
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1_500))
+            if copiedHarness == installCommand.harness {
+                copiedHarness = nil
+            }
+        }
+    }
+}
+
+private struct MCPInstallCommandRow: View {
+    let installCommand: MCPInstallCommand
+    let isCopied: Bool
+    let onCopy: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(installCommand.harness.name)
+                    .fontWeight(.medium)
+
+                Text(installCommand.command)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            Button(action: onCopy) {
+                Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+            }
+            .help(isCopied ? "Copied" : "Copy command")
+        }
+        .padding(.vertical, 4)
     }
 }
 

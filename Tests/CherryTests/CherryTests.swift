@@ -489,6 +489,48 @@ import Testing
     }
 }
 
+@Test func mcpInstallCommandsUseBundledHelperPath() async throws {
+    let appURL = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app", isDirectory: true)
+    let commands = MCPInstallCommandBuilder.commands(appBundleURL: appURL)
+
+    #expect(MCPInstallCommandBuilder.helperURL(appBundleURL: appURL).path == "/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP")
+    #expect(commands == [
+        MCPInstallCommand(
+            harness: .codex,
+            command: "codex mcp add cherry -- '/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP'"
+        ),
+        MCPInstallCommand(
+            harness: .claude,
+            command: "claude mcp add --scope user cherry -- '/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP'"
+        )
+    ])
+}
+
+@Test func mcpInstallCommandsShellQuoteApostrophes() async throws {
+    #expect(MCPInstallCommandBuilder.shellQuote("/tmp/Patrick's Apps/Cherry.app") == "'/tmp/Patrick'\\''s Apps/Cherry.app'")
+}
+
+@Test func mcpHelperExistsRequiresExecutableHelper() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let appURL = directory.appendingPathComponent("Cherry.app", isDirectory: true)
+    let helperURL = MCPInstallCommandBuilder.helperURL(appBundleURL: appURL)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    try FileManager.default.createDirectory(
+        at: helperURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try Data().write(to: helperURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: helperURL.path)
+    #expect(MCPInstallCommandBuilder.helperExists(appBundleURL: appURL) == false)
+
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperURL.path)
+    #expect(MCPInstallCommandBuilder.helperExists(appBundleURL: appURL) == true)
+}
+
 @MainActor
 @Test func agentSettingsPersistGlobalAgentsAcrossProjects() async throws {
     let defaultsName = "CherryTests.AgentSettings.\(UUID().uuidString)"

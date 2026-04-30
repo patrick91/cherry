@@ -109,6 +109,7 @@ struct ContentView: View {
             if chromeState.isCommandPalettePresented {
                 CommandPaletteOverlay(
                     settings: AgentSettings.shared,
+                    workspace: workspace,
                     selectedProjectRoot: projectRoot,
                     isPresented: $chromeState.isCommandPalettePresented,
                     openProject: openProject
@@ -545,22 +546,38 @@ private struct AppShellBackground: View {
 private enum CommandPaletteMode {
     case commands
     case projects
+    case agents
+    case agentPresets
 }
 
 private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case projects
+    case agents
+    case addAgent
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .projects: "Projects"
+        case .agents: "Agents"
+        case .addAgent: "Add Agent"
         }
     }
 
     var subtitle: String {
         switch self {
         case .projects: "Switch project"
+        case .agents: "Open a configured agent"
+        case .addAgent: "Configure a global agent tool"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .projects: "folder"
+        case .agents: "sparkles"
+        case .addAgent: "sparkles"
         }
     }
 
@@ -572,8 +589,50 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     }
 }
 
+private enum CommandPaletteRootItem: Identifiable {
+    case command(CommandPaletteCommand)
+    case agent(ResolvedAgentTool)
+
+    var id: String {
+        switch self {
+        case .command(let command):
+            "command:\(command.id)"
+        case .agent(let agent):
+            "agent:\(agent.id)"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .command(let command):
+            command.icon
+        case .agent:
+            "terminal"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .command(let command):
+            command.title
+        case .agent(let agent):
+            agent.name
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .command(let command):
+            command.subtitle
+        case .agent(let agent):
+            agent.commandLine
+        }
+    }
+}
+
 private struct CommandPaletteOverlay: View {
     @ObservedObject var settings: AgentSettings
+    @ObservedObject var workspace: TerminalWorkspace
     let selectedProjectRoot: String?
     @Binding var isPresented: Bool
     let openProject: (CherryProject) -> Void
@@ -581,6 +640,8 @@ private struct CommandPaletteOverlay: View {
     @State private var mode = CommandPaletteMode.commands
     @State private var query = ""
     @State private var selectedIndex = 0
+    @State private var editingAgent: AgentToolDefinition?
+    @State private var agentError: String?
     @FocusState private var isSearchFocused: Bool
 
     var body: some View {
@@ -608,15 +669,22 @@ private struct CommandPaletteOverlay: View {
 
                 Divider()
 
-                VStack(spacing: 4) {
-                    if mode == .commands {
-                        commandRows
-                    } else {
-                        projectRows
+                ScrollView {
+                    VStack(spacing: 4) {
+                        if mode == .commands {
+                            commandRows
+                        } else if mode == .projects {
+                            projectRows
+                        } else if mode == .agents {
+                            agentRows
+                        } else {
+                            agentPresetRows
+                        }
                     }
+                    .padding(7)
+                    .frame(maxWidth: .infinity, alignment: .top)
                 }
-                .padding(7)
-                .frame(maxHeight: 340, alignment: .top)
+                .frame(maxHeight: 340)
             }
             .frame(width: 560)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -640,17 +708,51 @@ private struct CommandPaletteOverlay: View {
             selectedIndex = 0
             isSearchFocused = true
         }
+        .sheet(item: $editingAgent) { agent in
+            AgentToolEditor(
+                agent: agent,
+                canDelete: false,
+                errorMessage: agentError,
+                onSave: { updatedAgent in
+                    do {
+                        try settings.upsertAgent(updatedAgent)
+                        agentError = nil
+                        editingAgent = nil
+                        dismiss()
+                    } catch {
+                        agentError = error.localizedDescription
+                    }
+                },
+                onDelete: {
+                    agentError = nil
+                    editingAgent = nil
+                    dismiss()
+                },
+                onCancel: {
+                    agentError = nil
+                    editingAgent = nil
+                    dismiss()
+                }
+            )
+        }
     }
 
     private var prompt: String {
         switch mode {
         case .commands: "Command"
         case .projects: "Project"
+        case .agents: "Agent"
+        case .agentPresets: "Agent"
         }
     }
 
     private var filteredCommands: [CommandPaletteCommand] {
         CommandPaletteCommand.allCases.filter { $0.matches(query) }
+    }
+
+    private var filteredRootItems: [CommandPaletteRootItem] {
+        filteredCommands.map(CommandPaletteRootItem.command) +
+            filteredAgents.map(CommandPaletteRootItem.agent)
     }
 
     private var filteredProjects: [CherryProject] {
@@ -662,16 +764,35 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
+    private var filteredAgents: [ResolvedAgentTool] {
+        let agents = settings.resolvedProject(for: selectedProjectRoot).launchableAgents
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return agents }
+        return agents.filter { agent in
+            agent.name.localizedCaseInsensitiveContains(normalizedQuery) ||
+                agent.commandLine.localizedCaseInsensitiveContains(normalizedQuery)
+        }
+    }
+
+    private var filteredAgentPresets: [AgentToolDefinition] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return AgentConfiguration.presets }
+        return AgentConfiguration.presets.filter { preset in
+            preset.name.localizedCaseInsensitiveContains(normalizedQuery) ||
+                preset.commandLine.localizedCaseInsensitiveContains(normalizedQuery)
+        }
+    }
+
     @ViewBuilder
     private var commandRows: some View {
-        if filteredCommands.isEmpty {
+        if filteredRootItems.isEmpty {
             CommandPaletteEmptyRow(title: "No commands")
         } else {
-            ForEach(Array(filteredCommands.enumerated()), id: \.element.id) { index, command in
+            ForEach(Array(filteredRootItems.enumerated()), id: \.element.id) { index, item in
                 CommandPaletteRow(
-                    icon: "folder",
-                    title: command.title,
-                    subtitle: command.subtitle,
+                    icon: item.icon,
+                    title: item.title,
+                    subtitle: item.subtitle,
                     isSelected: index == selectedIndex,
                     isCurrent: false
                 ) {
@@ -702,10 +823,55 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
+    @ViewBuilder
+    private var agentRows: some View {
+        let project = settings.resolvedProject(for: selectedProjectRoot)
+        if project.validProjectRoot == nil {
+            CommandPaletteEmptyRow(title: "Select a project first")
+        } else if filteredAgents.isEmpty {
+            CommandPaletteEmptyRow(title: "No launchable agents")
+        } else {
+            ForEach(Array(filteredAgents.enumerated()), id: \.element.id) { index, agent in
+                CommandPaletteRow(
+                    icon: "terminal",
+                    title: agent.name,
+                    subtitle: agent.commandLine,
+                    isSelected: index == selectedIndex,
+                    isCurrent: false
+                ) {
+                    selectedIndex = index
+                    commitSelection()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var agentPresetRows: some View {
+        if filteredAgentPresets.isEmpty {
+            CommandPaletteEmptyRow(title: "No agent presets")
+        } else {
+            ForEach(Array(filteredAgentPresets.enumerated()), id: \.element.id) { index, preset in
+                CommandPaletteRow(
+                    icon: preset.command.isEmpty ? "plus" : "terminal",
+                    title: preset.name,
+                    subtitle: preset.commandLine.isEmpty ? "Custom agent tool" : preset.commandLine,
+                    isSelected: index == selectedIndex,
+                    isCurrent: false
+                ) {
+                    selectedIndex = index
+                    commitSelection()
+                }
+            }
+        }
+    }
+
     private var resultCount: Int {
         switch mode {
-        case .commands: filteredCommands.count
+        case .commands: filteredRootItems.count
         case .projects: filteredProjects.count
+        case .agents: filteredAgents.count
+        case .agentPresets: filteredAgentPresets.count
         }
     }
 
@@ -737,21 +903,43 @@ private struct CommandPaletteOverlay: View {
     private func commitSelection() {
         switch mode {
         case .commands:
-            guard filteredCommands.indices.contains(selectedIndex) else { return }
-            switch filteredCommands[selectedIndex] {
-            case .projects:
-                mode = .projects
+            guard filteredRootItems.indices.contains(selectedIndex) else { return }
+            switch filteredRootItems[selectedIndex] {
+            case .command(let command):
+                switch command {
+                case .projects:
+                    mode = .projects
+                case .agents:
+                    mode = .agents
+                case .addAgent:
+                    mode = .agentPresets
+                }
+            case .agent(let agent):
+                launch(agent)
             }
         case .projects:
             guard filteredProjects.indices.contains(selectedIndex) else { return }
             let project = filteredProjects[selectedIndex]
             dismiss()
             openProject(project)
+        case .agents:
+            guard filteredAgents.indices.contains(selectedIndex) else { return }
+            launch(filteredAgents[selectedIndex])
+        case .agentPresets:
+            guard filteredAgentPresets.indices.contains(selectedIndex) else { return }
+            editingAgent = filteredAgentPresets[selectedIndex]
         }
     }
 
+    private func launch(_ agent: ResolvedAgentTool) {
+        let project = settings.resolvedProject(for: selectedProjectRoot)
+        guard let root = project.validProjectRoot else { return }
+        workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+        dismiss()
+    }
+
     private func handleEscape() {
-        if mode == .projects {
+        if mode != .commands {
             mode = .commands
         } else {
             dismiss()

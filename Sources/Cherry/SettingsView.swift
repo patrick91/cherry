@@ -919,7 +919,7 @@ private struct AgentToolRow: View {
     }
 }
 
-private struct AgentToolEditor: View {
+struct AgentToolEditor: View {
     @State private var draft: AgentToolDefinition
 
     let canDelete: Bool

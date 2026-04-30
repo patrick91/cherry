@@ -90,7 +90,20 @@ struct ContentView: View {
             .padding(.leading, 80)
             .padding(.top, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .offset(x: titlebarPickerTranslationX)
+            // Drive the picker's offset off the same animated
+            // (dockedWidth, floatingWidth) pair the traffic lights use,
+            // so it goes through the same `min(0, max(...) - sidebarWidth)`
+            // clamping each tick. With a plain `.offset(x:)` bound to a
+            // computed CGFloat, SwiftUI springs the offset directly and lets
+            // the value overshoot past `-sidebarWidth` — but the traffic
+            // lights are clamped by `max(docked, 0)`, so they pin at
+            // `-sidebarWidth` while the picker bounces. Same modifier,
+            // identical math: they slide in lockstep.
+            .modifier(ChromeOffsetModifier(
+                dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
+                floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+                sidebarWidth: sidebarWidth
+            ))
             .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
 
             if chromeState.isCommandPalettePresented {
@@ -281,16 +294,6 @@ struct ContentView: View {
 
     private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
         min(max(width, minimumSidebarWidth), maximumSidebarWidth)
-    }
-
-    // Mirrors `TrafficLightController.applyCurrent` so the project picker
-    // slides in lockstep with the native traffic-light buttons.
-    private var titlebarPickerTranslationX: CGFloat {
-        let chrome = max(
-            isSidebarHidden ? 0 : sidebarWidth,
-            isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0
-        )
-        return min(0, chrome - sidebarWidth)
     }
 }
 
@@ -1795,6 +1798,34 @@ private struct ChromeWidthAnimator: ViewModifier, @preconcurrency Animatable {
             sidebarWidth: sidebarWidth
         )
         return content
+    }
+}
+
+// Mirrors `ChromeWidthAnimator`'s interpolation so the project picker rides
+// the same `min(0, max(docked, floating) - sidebarWidth)` curve the
+// traffic-light controller does. A plain `.offset(x:)` bound to a CGFloat
+// computed off `isSidebarHidden` springs the raw offset and overshoots
+// past `-sidebarWidth`, while the traffic lights' `max(docked, 0)` clamps
+// the overshoot — so the two diverge at the tail of the animation. Going
+// through the same Animatable pair keeps them in lockstep.
+@MainActor
+private struct ChromeOffsetModifier: ViewModifier, @preconcurrency Animatable {
+    var dockedWidth: CGFloat
+    var floatingWidth: CGFloat
+    let sidebarWidth: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(dockedWidth, floatingWidth) }
+        set {
+            dockedWidth = newValue.first
+            floatingWidth = newValue.second
+        }
+    }
+
+    func body(content: Content) -> some View {
+        let chrome = max(dockedWidth, floatingWidth)
+        let translationX = min(0, chrome - sidebarWidth)
+        return content.offset(x: translationX)
     }
 }
 

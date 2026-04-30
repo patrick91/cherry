@@ -21,6 +21,16 @@ public protocol TerminalSurfaceGridResizeDelegate: TerminalSurfaceViewDelegate {
 }
 
 @MainActor
+public protocol TerminalSurfaceHostInputDelegate: TerminalSurfaceViewDelegate {
+    func terminalWillSendHostInput()
+}
+
+@MainActor
+public protocol TerminalSurfaceScrollInputDelegate: TerminalSurfaceViewDelegate {
+    func terminalShouldSuppressScrollInput(isMomentum: Bool) -> Bool
+}
+
+@MainActor
 public protocol TerminalSurfaceResizeDelegate: TerminalSurfaceViewDelegate {
     func terminalDidResize(columns: Int, rows: Int)
 }

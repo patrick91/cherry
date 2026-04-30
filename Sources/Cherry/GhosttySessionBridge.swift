@@ -81,7 +81,7 @@ private final class GhosttySessionProxy: @unchecked Sendable {
 @MainActor
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
-    TerminalSurfaceLinkHoverDelegate
+    TerminalSurfaceLinkHoverDelegate, TerminalSurfaceHostInputDelegate, TerminalSurfaceScrollInputDelegate
 {
     let terminalView: TerminalView
 
@@ -190,6 +190,20 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidHoverLink(_ url: String?) {
         hoveredLink = url
         updateTerminalPointerStyle()
+    }
+
+    func scrollToBottomForHostInput() {
+        scrollContainer?.beginHostInputScrollSuppression()
+        terminalView.performBindingAction("scroll_to_bottom")
+        scrollContainer?.synchronizeScrollState()
+    }
+
+    func terminalWillSendHostInput() {
+        scrollToBottomForHostInput()
+    }
+
+    func terminalShouldSuppressScrollInput(isMomentum: Bool) -> Bool {
+        scrollContainer?.shouldSuppressScrollInputForHostInput(isMomentum: isMomentum) ?? false
     }
 
     deinit {
@@ -314,6 +328,7 @@ final class GhosttyTerminalContainerView: NSView {
     private var activeColorScheme: ColorScheme = .dark
     private var pendingPostAnimationDelta: CGFloat = 0
     private var didApplyEarlyFit = false
+    private var shouldSuppressMomentumScrollAfterHostInput = false
 
     override var acceptsFirstResponder: Bool {
         true
@@ -458,6 +473,19 @@ final class GhosttyTerminalContainerView: NSView {
         let cursor = style.nsCursor
         scrollView.documentCursor = cursor
         cursor.set()
+    }
+
+    func beginHostInputScrollSuppression() {
+        shouldSuppressMomentumScrollAfterHostInput = true
+    }
+
+    func shouldSuppressScrollInputForHostInput(isMomentum: Bool) -> Bool {
+        guard shouldSuppressMomentumScrollAfterHostInput else { return false }
+        guard isMomentum else {
+            shouldSuppressMomentumScrollAfterHostInput = false
+            return false
+        }
+        return true
     }
 
     private func beginSidebarAnimation() {
@@ -771,6 +799,7 @@ final class GhosttyTerminalContainerView: NSView {
             modifiers: event.modifierFlags,
             isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive
         ) {
+            activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: sequence)
             return true
         }
@@ -779,6 +808,7 @@ final class GhosttyTerminalContainerView: NSView {
             keyCode: event.keyCode,
             modifiers: event.modifierFlags
         ) {
+            activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: sequence)
             return true
         }
@@ -788,6 +818,7 @@ final class GhosttyTerminalContainerView: NSView {
             modifiers: event.modifierFlags,
             usesApplicationCursorKeys: activeSession.usesApplicationCursorKeys
         ) {
+            activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: sequence)
             return true
         }

@@ -12,6 +12,11 @@
     public extension AppTerminalView {
         override func keyDown(with event: NSEvent) {
             core.requestImmediateTick()
+            if let delegate = delegate as? any TerminalSurfaceHostInputDelegate {
+                delegate.terminalWillSendHostInput()
+            } else {
+                surface?.performBindingAction("scroll_to_bottom")
+            }
             inputHandler?.handleKeyDown(with: event)
         }
 
@@ -198,6 +203,12 @@
 
         override func scrollWheel(with event: NSEvent) {
             core.requestImmediateTick()
+            if let delegate = delegate as? any TerminalSurfaceScrollInputDelegate,
+               delegate.terminalShouldSuppressScrollInput(isMomentum: event.momentumPhase != [])
+            {
+                return
+            }
+
             let precision = event.hasPreciseScrollingDeltas
             var x = event.scrollingDeltaX
             var y = event.scrollingDeltaY

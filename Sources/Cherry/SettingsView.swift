@@ -1,4 +1,5 @@
 import AppKit
+import GhosttyTheme
 import SwiftUI
 
 struct SettingsView: View {
@@ -172,16 +173,14 @@ private struct TerminalSettingsPane: View {
             }
 
             Section("Terminal Theme") {
-                GhosttyThemeNameField(
+                GhosttyThemePicker(
                     title: "Light",
-                    name: $settings.lightTerminalThemeName,
-                    isKnown: settings.isKnownGhosttyTheme(settings.lightTerminalThemeName)
+                    selection: $settings.lightTerminalThemeName
                 )
 
-                GhosttyThemeNameField(
+                GhosttyThemePicker(
                     title: "Dark",
-                    name: $settings.darkTerminalThemeName,
-                    isKnown: settings.isKnownGhosttyTheme(settings.darkTerminalThemeName)
+                    selection: $settings.darkTerminalThemeName
                 )
             }
 
@@ -221,23 +220,69 @@ private struct TerminalSettingsPane: View {
     }
 }
 
-private struct GhosttyThemeNameField: View {
+private struct GhosttyThemePicker: View {
     let title: String
-    @Binding var name: String
-    let isKnown: Bool
+    @Binding var selection: String
+
+    private var selectedTheme: GhosttyThemeDefinition? {
+        GhosttyThemeCatalog.theme(named: selection)
+    }
 
     var body: some View {
         HStack(spacing: 12) {
             Text(title)
                 .frame(width: 140, alignment: .leading)
 
-            TextField("Ghostty theme name", text: $name)
-                .textFieldStyle(.roundedBorder)
+            Picker("Ghostty theme", selection: $selection) {
+                if selectedTheme == nil {
+                    Text(selection.isEmpty ? "Select a theme" : "\(selection) (unknown)")
+                        .tag(selection)
+                }
 
-            Image(systemName: isKnown ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(isKnown ? .green : .orange)
-                .frame(width: 22)
+                ForEach(Self.themes) { theme in
+                    Text(theme.name)
+                        .tag(theme.name)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+
+            if let selectedTheme {
+                GhosttyThemeSwatch(theme: selectedTheme)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .frame(width: 42, alignment: .trailing)
+            }
         }
+    }
+
+    private static let themes = GhosttyThemeCatalog.allThemes.sorted {
+        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+    }
+}
+
+private struct GhosttyThemeSwatch: View {
+    let theme: GhosttyThemeDefinition
+
+    var body: some View {
+        HStack(spacing: 4) {
+            swatch(theme.background)
+            swatch(theme.foreground)
+            swatch(theme.selectionBackground ?? theme.palette[4] ?? theme.foreground)
+        }
+        .frame(width: 42, alignment: .trailing)
+        .help(theme.name)
+    }
+
+    private func swatch(_ hex: String) -> some View {
+        Circle()
+            .fill(Color(nsColor: NSColor(hexRGB: hex) ?? .clear))
+            .frame(width: 10, height: 10)
+            .overlay {
+                Circle()
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5)
+            }
     }
 }
 

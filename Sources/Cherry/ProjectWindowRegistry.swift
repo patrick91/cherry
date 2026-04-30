@@ -47,6 +47,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarRevealed = false
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
+    @Published var isCommandPalettePresented = false
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.
@@ -89,6 +90,10 @@ final class ProjectWindowChromeState: ObservableObject {
                 self.isSidebarHidden = true
             }
         }
+    }
+
+    func presentCommandPalette() {
+        isCommandPalettePresented = true
     }
 
     // Wraps the docked-sidebar resize animation with a start/end signal so the

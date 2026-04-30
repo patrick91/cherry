@@ -93,6 +93,16 @@ struct ContentView: View {
             .offset(x: titlebarPickerTranslationX)
             .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
 
+            if chromeState.isCommandPalettePresented {
+                CommandPaletteOverlay(
+                    settings: AgentSettings.shared,
+                    selectedProjectRoot: projectRoot,
+                    isPresented: $chromeState.isCommandPalettePresented,
+                    openProject: openProject
+                )
+                .zIndex(2_000)
+            }
+
             if isSidebarHidden {
                 // Wider hot-zone (24pt) avoids the macOS fullscreen edge
                 // gestures that reserve the leftmost few pixels. Using
@@ -522,6 +532,335 @@ struct ProjectOnboardingView: View {
 private struct AppShellBackground: View {
     var body: some View {
         SidebarBackground(presentation: .docked)
+    }
+}
+
+private enum CommandPaletteMode {
+    case commands
+    case projects
+}
+
+private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
+    case projects
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .projects: "Projects"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .projects: "Switch project"
+        }
+    }
+
+    func matches(_ query: String) -> Bool {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return true }
+        return title.localizedCaseInsensitiveContains(normalizedQuery) ||
+            subtitle.localizedCaseInsensitiveContains(normalizedQuery)
+    }
+}
+
+private struct CommandPaletteOverlay: View {
+    @ObservedObject var settings: AgentSettings
+    let selectedProjectRoot: String?
+    @Binding var isPresented: Bool
+    let openProject: (CherryProject) -> Void
+
+    @State private var mode = CommandPaletteMode.commands
+    @State private var query = ""
+    @State private var selectedIndex = 0
+    @FocusState private var isSearchFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(0.24)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    dismiss()
+                }
+
+            VStack(spacing: 0) {
+                HStack(spacing: 9) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.secondary)
+
+                    TextField(prompt, text: $query)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 17))
+                        .focused($isSearchFocused)
+                        .onSubmit(commitSelection)
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 48)
+
+                Divider()
+
+                VStack(spacing: 4) {
+                    if mode == .commands {
+                        commandRows
+                    } else {
+                        projectRows
+                    }
+                }
+                .padding(7)
+                .frame(maxHeight: 340, alignment: .top)
+            }
+            .frame(width: 560)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 28, y: 18)
+            .padding(.top, 86)
+        }
+        .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
+        .onAppear {
+            isSearchFocused = true
+            selectedIndex = 0
+        }
+        .onChange(of: query) { _, _ in
+            selectedIndex = 0
+        }
+        .onChange(of: mode) { _, _ in
+            query = ""
+            selectedIndex = 0
+            isSearchFocused = true
+        }
+    }
+
+    private var prompt: String {
+        switch mode {
+        case .commands: "Command"
+        case .projects: "Project"
+        }
+    }
+
+    private var filteredCommands: [CommandPaletteCommand] {
+        CommandPaletteCommand.allCases.filter { $0.matches(query) }
+    }
+
+    private var filteredProjects: [CherryProject] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return settings.projects }
+        return settings.projects.filter { project in
+            project.name.localizedCaseInsensitiveContains(normalizedQuery) ||
+                project.root.localizedCaseInsensitiveContains(normalizedQuery)
+        }
+    }
+
+    @ViewBuilder
+    private var commandRows: some View {
+        if filteredCommands.isEmpty {
+            CommandPaletteEmptyRow(title: "No commands")
+        } else {
+            ForEach(Array(filteredCommands.enumerated()), id: \.element.id) { index, command in
+                CommandPaletteRow(
+                    icon: "folder",
+                    title: command.title,
+                    subtitle: command.subtitle,
+                    isSelected: index == selectedIndex,
+                    isCurrent: false
+                ) {
+                    selectedIndex = index
+                    commitSelection()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var projectRows: some View {
+        if filteredProjects.isEmpty {
+            CommandPaletteEmptyRow(title: "No projects")
+        } else {
+            ForEach(Array(filteredProjects.enumerated()), id: \.element.id) { index, project in
+                CommandPaletteRow(
+                    icon: "folder.fill",
+                    title: project.name,
+                    subtitle: project.root,
+                    isSelected: index == selectedIndex,
+                    isCurrent: project.root == selectedProjectRoot
+                ) {
+                    selectedIndex = index
+                    commitSelection()
+                }
+            }
+        }
+    }
+
+    private var resultCount: Int {
+        switch mode {
+        case .commands: filteredCommands.count
+        case .projects: filteredProjects.count
+        }
+    }
+
+    private func handleKeyDown(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 53:
+            handleEscape()
+            return true
+        case 36, 76:
+            commitSelection()
+            return true
+        case 125:
+            moveSelection(by: 1)
+            return true
+        case 126:
+            moveSelection(by: -1)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func moveSelection(by delta: Int) {
+        let count = resultCount
+        guard count > 0 else { return }
+        selectedIndex = (selectedIndex + delta + count) % count
+    }
+
+    private func commitSelection() {
+        switch mode {
+        case .commands:
+            guard filteredCommands.indices.contains(selectedIndex) else { return }
+            switch filteredCommands[selectedIndex] {
+            case .projects:
+                mode = .projects
+            }
+        case .projects:
+            guard filteredProjects.indices.contains(selectedIndex) else { return }
+            let project = filteredProjects[selectedIndex]
+            dismiss()
+            openProject(project)
+        }
+    }
+
+    private func handleEscape() {
+        if mode == .projects {
+            mode = .commands
+        } else {
+            dismiss()
+        }
+    }
+
+    private func dismiss() {
+        isPresented = false
+    }
+}
+
+private struct CommandPaletteRow: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let isSelected: Bool
+    let isCurrent: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 22)
+                    .foregroundStyle(isSelected ? .white : .secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(isSelected ? .white : .primary)
+                        .lineLimit(1)
+
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(isSelected ? .white.opacity(0.72) : .secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 10)
+
+                if isCurrent {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(isSelected ? .white : .secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 50)
+            .background {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? Color.accentColor : Color.clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct CommandPaletteEmptyRow: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: 72)
+    }
+}
+
+private struct CommandPaletteKeyMonitor: NSViewRepresentable {
+    let handle: (NSEvent) -> Bool
+
+    func makeNSView(context: Context) -> CommandPaletteKeyMonitorView {
+        let view = CommandPaletteKeyMonitorView()
+        view.handle = handle
+        return view
+    }
+
+    func updateNSView(_ nsView: CommandPaletteKeyMonitorView, context: Context) {
+        nsView.handle = handle
+    }
+}
+
+private final class CommandPaletteKeyMonitorView: NSView {
+    var handle: ((NSEvent) -> Bool)?
+    private var monitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            removeMonitor()
+        } else {
+            installMonitor()
+        }
+    }
+
+    private func installMonitor() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            return self.handle?(event) == true ? nil : event
+        }
+    }
+
+    private func removeMonitor() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            removeMonitor()
+        }
     }
 }
 

@@ -73,6 +73,14 @@ struct CherryApp: App {
         .defaultSize(width: 1_340, height: 840)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(replacing: .printItem) {
+                Button("Command Palette") {
+                    focusedChromeState?.presentCommandPalette()
+                }
+                .keyboardShortcut("p")
+                .disabled(focusedChromeState == nil)
+            }
+
             CommandMenu("Prototype") {
                 Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
                     focusedChromeState?.toggleSidebar()

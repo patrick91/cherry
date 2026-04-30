@@ -59,6 +59,20 @@ enum TerminalHardwareKeyRouter {
         return .ghostty(ghosttyKeyForAppKit(keyCode: keyCode))
     }
 
+    static func routeAppKit(
+        keyCode: UInt16,
+        backend: TerminalSessionBackend,
+        modifiers: TerminalInputModifiers
+    ) -> TerminalHardwareKeyDelivery {
+        // Raw host-managed bytes only represent the unmodified control key.
+        // Modified keys need a real Ghostty key event so the backend can emit
+        // the correct escape sequence, such as Shift+Tab -> CSI Z.
+        guard modifiers.intersection([.shift, .ctrl, .alt, .super_]).isEmpty else {
+            return .ghostty(ghosttyKeyForAppKit(keyCode: keyCode))
+        }
+        return routeAppKit(keyCode: keyCode, backend: backend)
+    }
+
     private static func directControlInputForUIKit(usage: UInt16) -> Data? {
         switch usage {
         case 0x2A:

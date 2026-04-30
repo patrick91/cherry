@@ -215,25 +215,44 @@ import Testing
 
     session.ingestTestingData(Data("\u{1B}[>7u".utf8))
     #expect(session.isEnhancedKeyboardProtocolActive == true)
+    #expect(session.keyboardProtocolFlags == 7)
 
     session.ingestTestingData(Data("\u{1B}[<u".utf8))
     #expect(session.isEnhancedKeyboardProtocolActive == false)
+    #expect(session.keyboardProtocolFlags == 0)
 
     session.ingestTestingData(Data("\u{1B}[=1u".utf8))
     #expect(session.isEnhancedKeyboardProtocolActive == true)
+    #expect(session.keyboardProtocolFlags == 1)
 
     session.ingestTestingData(Data("\u{1B}[=0u".utf8))
     #expect(session.isEnhancedKeyboardProtocolActive == false)
+    #expect(session.keyboardProtocolFlags == 0)
+
+    session.ingestTestingData(Data("\u{1B}[=1u\u{1B}[=8;2u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == true)
+    #expect(session.keyboardProtocolFlags == 9)
+
+    session.ingestTestingData(Data("\u{1B}[=8;3u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive == true)
+    #expect(session.keyboardProtocolFlags == 1)
+
+    session.ingestTestingData(Data("\u{1B}[>8u".utf8))
+    #expect(session.keyboardProtocolFlags == 8)
+
+    session.ingestTestingData(Data("\u{1B}[<u".utf8))
+    #expect(session.keyboardProtocolFlags == 1)
 }
 
-@Test func tabInputIsOnlyRewrittenForEnhancedKeyboardProtocol() async throws {
+@Test func tabInputIsOnlyRewrittenWhenKeyboardProtocolReportsAllKeys() async throws {
     let tab = Data([0x09])
     let enter = Data("\r".utf8)
     let encodedTab = Data("\u{1B}[9u".utf8)
 
-    #expect(TerminalInputNormalizer.normalize(tab, isEnhancedKeyboardProtocolActive: false) == tab)
-    #expect(TerminalInputNormalizer.normalize(tab, isEnhancedKeyboardProtocolActive: true) == encodedTab)
-    #expect(TerminalInputNormalizer.normalize(enter, isEnhancedKeyboardProtocolActive: true) == enter)
+    #expect(TerminalInputNormalizer.normalize(tab, keyboardProtocolFlags: 0) == tab)
+    #expect(TerminalInputNormalizer.normalize(tab, keyboardProtocolFlags: 1) == tab)
+    #expect(TerminalInputNormalizer.normalize(tab, keyboardProtocolFlags: 8) == encodedTab)
+    #expect(TerminalInputNormalizer.normalize(enter, keyboardProtocolFlags: 8) == enter)
 }
 
 @Test func shiftEnterUsesEnhancedKeyboardProtocolWhenActive() async throws {
@@ -253,6 +272,32 @@ import Testing
     #expect(TerminalInputEncoder.shiftEnterSequence(
         keyCode: 36,
         modifiers: commandShift,
+        isEnhancedKeyboardProtocolActive: true
+    ) == nil)
+}
+
+@Test func shiftTabUsesReverseTabOrEnhancedKeyboardProtocol() async throws {
+    let shift = NSEvent.ModifierFlags.shift
+    let controlShift: NSEvent.ModifierFlags = [.control, .shift]
+
+    #expect(TerminalInputEncoder.shiftTabSequence(
+        keyCode: 48,
+        modifiers: shift,
+        isEnhancedKeyboardProtocolActive: false
+    ) == Data("\u{1B}[Z".utf8))
+    #expect(TerminalInputEncoder.shiftTabSequence(
+        keyCode: 48,
+        modifiers: shift,
+        isEnhancedKeyboardProtocolActive: true
+    ) == Data("\u{1B}[9;2u".utf8))
+    #expect(TerminalInputEncoder.shiftTabSequence(
+        keyCode: 48,
+        modifiers: controlShift,
+        isEnhancedKeyboardProtocolActive: true
+    ) == nil)
+    #expect(TerminalInputEncoder.shiftTabSequence(
+        keyCode: 36,
+        modifiers: shift,
         isEnhancedKeyboardProtocolActive: true
     ) == nil)
 }

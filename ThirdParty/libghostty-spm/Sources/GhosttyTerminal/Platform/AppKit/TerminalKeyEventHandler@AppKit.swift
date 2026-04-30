@@ -158,7 +158,8 @@
             }
             let delivery = TerminalHardwareKeyRouter.routeAppKit(
                 keyCode: event.keyCode,
-                backend: view.configuration.backend
+                backend: view.configuration.backend,
+                modifiers: TerminalInputModifiers(from: event.modifierFlags)
             )
             guard case let .data(sequence) = delivery else { return false }
             guard case let .inMemory(session) = view.configuration.backend else { return false }
@@ -171,7 +172,8 @@
             guard let view else { return false }
             return TerminalHardwareKeyRouter.routeAppKit(
                 keyCode: event.keyCode,
-                backend: view.configuration.backend
+                backend: view.configuration.backend,
+                modifiers: TerminalInputModifiers(from: event.modifierFlags)
             ).isDirectInput
         }
 

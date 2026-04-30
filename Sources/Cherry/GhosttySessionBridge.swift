@@ -804,6 +804,16 @@ final class GhosttyTerminalContainerView: NSView {
             return true
         }
 
+        if let sequence = TerminalInputEncoder.shiftTabSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive
+        ) {
+            activeBridge?.scrollToBottomForHostInput()
+            activeSession.send(data: sequence)
+            return true
+        }
+
         if let sequence = TerminalInputEncoder.appKitOptionArrowSequence(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags,

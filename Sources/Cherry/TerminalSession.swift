@@ -342,9 +342,9 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 private enum TerminalMetadataEvent: Equatable {
     case title(String)
     case workingDirectory(String)
-    case keyboardProtocolPush
+    case keyboardProtocolPush(Int)
     case keyboardProtocolPop(Int)
-    case keyboardProtocolSet(Bool)
+    case keyboardProtocolSet(flags: Int, mode: Int)
 }
 
 private final class TerminalMetadataParser {
@@ -536,16 +536,23 @@ private final class TerminalMetadataParser {
 
         switch prefix {
         case ">":
-            return .keyboardProtocolPush
+            return .keyboardProtocolPush(keyboardProtocolParameters(from: rawPayload).first ?? 0)
         case "<":
-            let count = Int(rawPayload.dropFirst().filter(\.isNumber)) ?? 1
+            let count = keyboardProtocolParameters(from: rawPayload).first ?? 1
             return .keyboardProtocolPop(max(1, count))
         case "=":
-            let flags = Int(rawPayload.dropFirst().filter(\.isNumber)) ?? 0
-            return .keyboardProtocolSet(flags > 0)
+            let parameters = keyboardProtocolParameters(from: rawPayload)
+            return .keyboardProtocolSet(flags: parameters.first ?? 0, mode: parameters.dropFirst().first ?? 1)
         default:
             return nil
         }
+    }
+
+    private static func keyboardProtocolParameters(from rawPayload: String) -> [Int] {
+        rawPayload
+            .dropFirst()
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map { Int($0.filter(\.isNumber)) ?? 0 }
     }
 
     private static func sanitized(_ value: String) -> String {
@@ -556,8 +563,12 @@ private final class TerminalMetadataParser {
 }
 
 enum TerminalInputNormalizer {
-    static func normalize(_ data: Data, isEnhancedKeyboardProtocolActive: Bool) -> Data {
-        guard isEnhancedKeyboardProtocolActive, data == Data([0x09]) else {
+    private static let reportAllKeysAsEscapeCodesFlag = 0b1000
+
+    static func normalize(_ data: Data, keyboardProtocolFlags: Int) -> Data {
+        guard keyboardProtocolFlags & reportAllKeysAsEscapeCodesFlag != 0,
+              data == Data([0x09])
+        else {
             return data
         }
 
@@ -910,6 +921,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
     private(set) var isEnhancedKeyboardProtocolActive = false
+    private(set) var keyboardProtocolFlags = 0
 
     let tint: NSColor
     let maxScrollback: Int?
@@ -931,7 +943,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var traceRecorder: TerminalTraceRecorder?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
-    private var keyboardProtocolStackDepth = 0
+    private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
 
     private static let defaultMaxScrollback = 50_000
@@ -1300,17 +1312,24 @@ final class TerminalSession: ObservableObject, Identifiable {
                 workingDirectory = nextWorkingDirectory
                 didChange = true
 
-            case .keyboardProtocolPush:
-                keyboardProtocolStackDepth += 1
-                isEnhancedKeyboardProtocolActive = true
+            case .keyboardProtocolPush(let flags):
+                keyboardProtocolFlagStack.append(keyboardProtocolFlags)
+                keyboardProtocolFlags = flags
+                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
 
             case .keyboardProtocolPop(let count):
-                keyboardProtocolStackDepth = max(0, keyboardProtocolStackDepth - count)
-                isEnhancedKeyboardProtocolActive = keyboardProtocolStackDepth > 0
+                if count > keyboardProtocolFlagStack.count {
+                    keyboardProtocolFlagStack.removeAll(keepingCapacity: true)
+                    keyboardProtocolFlags = 0
+                } else {
+                    keyboardProtocolFlagStack.removeLast(count - 1)
+                    keyboardProtocolFlags = keyboardProtocolFlagStack.removeLast()
+                }
+                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
 
-            case .keyboardProtocolSet(let isActive):
-                keyboardProtocolStackDepth = isActive ? max(1, keyboardProtocolStackDepth) : 0
-                isEnhancedKeyboardProtocolActive = isActive
+            case .keyboardProtocolSet(let flags, let mode):
+                keyboardProtocolFlags = keyboardProtocolFlagsByApplying(flags: flags, mode: mode)
+                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
             }
         }
 
@@ -1320,12 +1339,24 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func normalizedInputData(_ data: Data) -> Data {
-        TerminalInputNormalizer.normalize(data, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive)
+        TerminalInputNormalizer.normalize(data, keyboardProtocolFlags: keyboardProtocolFlags)
     }
 
     private func resetKeyboardProtocolState() {
-        keyboardProtocolStackDepth = 0
+        keyboardProtocolFlagStack.removeAll(keepingCapacity: true)
+        keyboardProtocolFlags = 0
         isEnhancedKeyboardProtocolActive = false
+    }
+
+    private func keyboardProtocolFlagsByApplying(flags: Int, mode: Int) -> Int {
+        switch mode {
+        case 2:
+            keyboardProtocolFlags | flags
+        case 3:
+            keyboardProtocolFlags & ~flags
+        default:
+            flags
+        }
     }
 
     private var lineSummary: String {

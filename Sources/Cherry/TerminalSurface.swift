@@ -9,6 +9,7 @@ enum TerminalInputEncoder {
     private static let terminalScrollRowsPerLine: CGFloat = 3
     private static let returnKeyCode: UInt16 = 36
     private static let keypadEnterKeyCode: UInt16 = 76
+    private static let tabKeyCode: UInt16 = 48
     private static let appKitLeftArrowKeyCode: UInt16 = 0x7B
     private static let appKitRightArrowKeyCode: UInt16 = 0x7C
     private static let appKitDownArrowKeyCode: UInt16 = 0x7D
@@ -175,6 +176,27 @@ enum TerminalInputEncoder {
             return Data("\u{1B}[13;2u".utf8)
         }
         return Data("\r".utf8)
+    }
+
+    static func shiftTabSequence(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isEnhancedKeyboardProtocolActive: Bool
+    ) -> Data? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.shift),
+              !modifiers.contains(.command),
+              !modifiers.contains(.control),
+              !modifiers.contains(.option),
+              keyCode == tabKeyCode
+        else {
+            return nil
+        }
+
+        if isEnhancedKeyboardProtocolActive {
+            return Data("\u{1B}[9;2u".utf8)
+        }
+        return Data("\u{1B}[Z".utf8)
     }
 
     static func pastedTextData(_ text: String) -> Data {

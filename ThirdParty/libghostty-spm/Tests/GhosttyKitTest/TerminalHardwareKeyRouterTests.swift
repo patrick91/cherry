@@ -128,6 +128,39 @@ struct TerminalHardwareKeyRouterTests {
         )
     }
 
+    @Test
+    func routesModifiedAppKitControlKeysToGhosttyForInMemoryBackends() {
+        let session = InMemoryTerminalSession(write: { _ in }, resize: { _ in })
+        #expect(
+            TerminalHardwareKeyRouter.routeAppKit(
+                keyCode: 0x30,
+                backend: .inMemory(session),
+                modifiers: .shift
+            ) == .ghostty(GHOSTTY_KEY_TAB)
+        )
+        #expect(
+            TerminalHardwareKeyRouter.routeAppKit(
+                keyCode: 0x33,
+                backend: .inMemory(session),
+                modifiers: .alt
+            ) == .ghostty(GHOSTTY_KEY_BACKSPACE)
+        )
+        #expect(
+            TerminalHardwareKeyRouter.routeAppKit(
+                keyCode: 0x7B,
+                backend: .inMemory(session),
+                modifiers: .ctrl
+            ) == .ghostty(GHOSTTY_KEY_ARROW_LEFT)
+        )
+        #expect(
+            TerminalHardwareKeyRouter.routeAppKit(
+                keyCode: 0x30,
+                backend: .inMemory(session),
+                modifiers: []
+            ) == .data(Data([0x09]))
+        )
+    }
+
     /// Quote HID 0x34 must translate to AppKit keycode 0x27, not fall
     /// through to `0` (which is AppKit's keycode for the `A` key) nor to
     /// `GHOSTTY_KEY_QUOTE.rawValue` (which happens to equal AppKit's

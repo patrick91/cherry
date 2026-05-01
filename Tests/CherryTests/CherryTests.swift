@@ -671,8 +671,16 @@ import Testing
     #expect(path.split(separator: ":").map(String.init) == [
         "/Users/patrick/.local/bin",
         "/Users/patrick/bin",
+        "/Users/patrick/.bun/bin",
+        "/Users/patrick/.cargo/bin",
+        "/Users/patrick/.deno/bin",
+        "/Users/patrick/.nix-profile/bin",
+        "/Users/patrick/.local/share/mise/shims",
+        "/Users/patrick/.asdf/shims",
         "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
         "/usr/local/bin",
+        "/usr/local/sbin",
         "/usr/bin",
         "/bin"
     ])

@@ -239,11 +239,11 @@ func summaryRunnerEnvironment(
 func summaryRunnerSearchPath(existingPath: String?, homeDirectory: String) -> String {
     let home = homeDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
     let defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    let candidates = [
-        home.isEmpty ? "" : "\(home)/.local/bin",
-        home.isEmpty ? "" : "\(home)/bin",
+    let candidates = summaryRunnerUserBinaryDirectories(homeDirectory: home) + [
         "/opt/homebrew/bin",
-        "/usr/local/bin"
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin"
     ]
     let inherited = (existingPath?.isEmpty == false ? existingPath! : defaultPath)
         .split(separator: ":")
@@ -255,6 +255,20 @@ func summaryRunnerSearchPath(existingPath: String?, homeDirectory: String) -> St
         paths.append(path)
     }
     return paths.joined(separator: ":")
+}
+
+func summaryRunnerUserBinaryDirectories(homeDirectory: String) -> [String] {
+    guard !homeDirectory.isEmpty else { return [] }
+    return [
+        "\(homeDirectory)/.local/bin",
+        "\(homeDirectory)/bin",
+        "\(homeDirectory)/.bun/bin",
+        "\(homeDirectory)/.cargo/bin",
+        "\(homeDirectory)/.deno/bin",
+        "\(homeDirectory)/.nix-profile/bin",
+        "\(homeDirectory)/.local/share/mise/shims",
+        "\(homeDirectory)/.asdf/shims"
+    ]
 }
 
 func sanitizedSummary(_ value: String, maxLength: Int = 120) -> String {

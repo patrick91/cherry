@@ -3,21 +3,24 @@ import Foundation
 
 final class CodexMCPSummaryRunner: @unchecked Sendable {
     enum RunnerError: LocalizedError, Equatable {
-        case launchFailed
+        case launchFailed(String)
         case timedOut
         case invalidResponse
         case toolError(String)
 
         var errorDescription: String? {
             switch self {
-            case .launchFailed:
-                "Could not launch codex mcp-server."
+            case .launchFailed(let details):
+                guard !details.isEmpty else {
+                    return "Could not launch codex mcp-server."
+                }
+                return "Could not launch codex mcp-server: \(details)"
             case .timedOut:
-                "Codex MCP summary timed out."
+                return "Codex MCP summary timed out."
             case .invalidResponse:
-                "Codex MCP returned an invalid response."
+                return "Codex MCP returned an invalid response."
             case .toolError(let message):
-                "Codex MCP failed: \(message)"
+                return "Codex MCP failed: \(message)"
             }
         }
     }
@@ -30,6 +33,7 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
     private var stdoutBuffer = Data()
+    private var stderrBuffer = Data()
     private var nextRequestID = 1
     private var initialized = false
 
@@ -126,7 +130,7 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         do {
             try nextProcess.run()
         } catch {
-            throw RunnerError.launchFailed
+            throw RunnerError.launchFailed(sanitizedSummary(error.localizedDescription, maxLength: 240))
         }
 
         process = nextProcess
@@ -134,7 +138,9 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         stdoutPipe = nextStdout
         stderrPipe = nextStderr
         stdoutBuffer.removeAll(keepingCapacity: true)
+        stderrBuffer.removeAll(keepingCapacity: true)
         setNonBlocking(nextStdout.fileHandleForReading.fileDescriptor)
+        setNonBlocking(nextStderr.fileHandleForReading.fileDescriptor)
         initialized = false
 
         let id = nextID()
@@ -170,6 +176,7 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             try drainStdout()
+            drainStderr()
             while let line = nextStdoutLine() {
                 guard let data = line.data(using: .utf8),
                       let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -183,6 +190,7 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.02)
         }
 
+        drainStderr()
         stopServer()
         throw RunnerError.timedOut
     }
@@ -192,14 +200,14 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
     }
 
     private func writeJSONLine(_ value: [String: Any]) throws {
-        guard let stdinPipe else { throw RunnerError.launchFailed }
+        guard let stdinPipe else { throw RunnerError.launchFailed("") }
         let data = try JSONSerialization.data(withJSONObject: value)
         stdinPipe.fileHandleForWriting.write(data)
         stdinPipe.fileHandleForWriting.write(Data([0x0A]))
     }
 
     private func drainStdout() throws {
-        guard let stdoutPipe else { throw RunnerError.launchFailed }
+        guard let stdoutPipe else { throw RunnerError.launchFailed("") }
         let fd = stdoutPipe.fileHandleForReading.fileDescriptor
         var buffer = [UInt8](repeating: 0, count: 16_384)
         while true {
@@ -212,7 +220,8 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
                 if process?.isRunning == true {
                     return
                 }
-                throw RunnerError.launchFailed
+                drainStderr()
+                throw RunnerError.launchFailed(launchFailureDetails())
             }
             if errno == EAGAIN || errno == EWOULDBLOCK {
                 return
@@ -220,8 +229,51 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
             if errno == EINTR {
                 continue
             }
-            throw RunnerError.launchFailed
+            drainStderr()
+            throw RunnerError.launchFailed(launchFailureDetails())
         }
+    }
+
+    private func drainStderr() {
+        guard let stderrPipe else { return }
+        let fd = stderrPipe.fileHandleForReading.fileDescriptor
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 {
+                stderrBuffer.append(contentsOf: buffer.prefix(count))
+                continue
+            }
+            if count == 0 || errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
+            if errno == EINTR {
+                continue
+            }
+            return
+        }
+    }
+
+    private func stderrText() -> String {
+        let output = String(decoding: stderrBuffer, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return sanitizedSummary(output, maxLength: 240)
+    }
+
+    private func launchFailureDetails() -> String {
+        let stderr = stderrText()
+        if !stderr.isEmpty {
+            return stderr
+        }
+        if let process {
+            return "process exited with status \(process.terminationStatus)"
+        }
+        return ""
     }
 
     private func nextStdoutLine() -> String? {
@@ -239,6 +291,7 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
     private func stopServer() {
         initialized = false
         stdoutBuffer.removeAll(keepingCapacity: true)
+        stderrBuffer.removeAll(keepingCapacity: true)
         try? stdinPipe?.fileHandleForWriting.close()
         try? stdoutPipe?.fileHandleForReading.close()
         try? stderrPipe?.fileHandleForReading.close()

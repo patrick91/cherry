@@ -1910,6 +1910,38 @@ private final class ControlServerHarness {
     #expect(String(decoding: data, as: UTF8.self) == "one\ntwo\nthree")
 }
 
+@Test func pasteboardURLContentsPasteEscapedPaths() async throws {
+    let pasteboard = NSPasteboard(name: .init("CherryTests.URLPaste.\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    let fileURL = URL(fileURLWithPath: "/tmp/cherry paste/image's test.png")
+    pasteboard.writeObjects([fileURL as NSURL])
+
+    #expect(TerminalPasteboardContent.urlPasteText(from: pasteboard) == "/tmp/cherry\\ paste/image\\'s\\ test.png")
+}
+
+@Test func pasteboardImageContentsAreSavedAndPastedAsPath() async throws {
+    let pasteboard = NSPasteboard(name: .init("CherryTests.ImagePaste.\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    let pngData = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="))
+    pasteboard.setData(pngData, forType: .png)
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryImagePasteTests-\(UUID().uuidString)", isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+    let imageID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000123"))
+    let data = try #require(TerminalPasteboardContent.nonTextPasteData(
+        from: pasteboard,
+        imageDirectory: directory,
+        imageID: imageID
+    ))
+    let path = directory.appendingPathComponent("cherry-paste-\(imageID.uuidString).png").path
+
+    #expect(String(decoding: data, as: UTF8.self) == TerminalPasteboardContent.shellEscaped(path))
+    #expect(FileManager.default.fileExists(atPath: path))
+}
+
 @Test func selectedTextSpansRows() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))

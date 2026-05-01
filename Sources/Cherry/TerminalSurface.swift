@@ -359,6 +359,91 @@ enum TerminalInputEncoder {
     }
 }
 
+enum TerminalPasteboardContent {
+    static var defaultImageDirectory: URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("CherryPastedImages", isDirectory: true)
+    }
+
+    static func nonTextPasteData(
+        from pasteboard: NSPasteboard,
+        imageDirectory: URL = defaultImageDirectory,
+        imageID: UUID = UUID()
+    ) -> Data? {
+        if let urlText = urlPasteText(from: pasteboard) {
+            return TerminalInputEncoder.pastedTextData(urlText)
+        }
+
+        guard let imageURL = pastedImageFileURL(
+            from: pasteboard,
+            imageDirectory: imageDirectory,
+            imageID: imageID
+        ) else {
+            return nil
+        }
+
+        return TerminalInputEncoder.pastedTextData(shellEscaped(imageURL.path))
+    }
+
+    static func urlPasteText(from pasteboard: NSPasteboard) -> String? {
+        guard let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
+              !urls.isEmpty else {
+            return nil
+        }
+
+        return urls
+            .map { $0.isFileURL ? shellEscaped($0.path) : $0.absoluteString }
+            .joined(separator: " ")
+    }
+
+    static func pastedImageFileURL(
+        from pasteboard: NSPasteboard,
+        imageDirectory: URL = defaultImageDirectory,
+        imageID: UUID = UUID()
+    ) -> URL? {
+        guard let pngData = pngData(from: pasteboard) else { return nil }
+
+        do {
+            try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
+            let url = imageDirectory.appendingPathComponent("cherry-paste-\(imageID.uuidString).png")
+            try pngData.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    static func shellEscaped(_ value: String) -> String {
+        var result = value
+        for character in "\\ ()[]{}<>\"'`!#$&;|*?\t" {
+            result = result.replacingOccurrences(of: String(character), with: "\\\(character)")
+        }
+        return result
+    }
+
+    private static func pngData(from pasteboard: NSPasteboard) -> Data? {
+        if let data = pasteboard.data(forType: .png) {
+            return data
+        }
+        if let data = pasteboard.data(forType: .tiff),
+           let image = NSImage(data: data) {
+            return pngData(from: image)
+        }
+        if let image = NSImage(pasteboard: pasteboard) {
+            return pngData(from: image)
+        }
+        return nil
+    }
+
+    private static func pngData(from image: NSImage) -> Data? {
+        guard let tiffData = image.tiffRepresentation,
+              let representation = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+        return representation.representation(using: .png, properties: [:])
+    }
+}
+
 struct TerminalSurfaceView: NSViewRepresentable {
     @ObservedObject var session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
@@ -1069,15 +1154,22 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
 
     @discardableResult
     func pasteFromPasteboard(_ pasteboard: NSPasteboard = .general) -> Bool {
-        guard session?.acceptsInput == true,
-              let text = pasteboard.string(forType: .string),
-              !text.isEmpty else {
+        guard session?.acceptsInput == true else {
             return false
         }
 
+        let pasteData: Data?
+        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            pasteData = TerminalInputEncoder.pastedTextData(text)
+        } else {
+            pasteData = TerminalPasteboardContent.nonTextPasteData(from: pasteboard)
+        }
+
+        guard let pasteData else { return false }
+
         clearSelection()
         resetCursorBlink()
-        sendInput?(TerminalInputEncoder.pastedTextData(text))
+        sendInput?(pasteData)
         return true
     }
 

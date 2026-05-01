@@ -794,6 +794,13 @@ final class GhosttyTerminalContainerView: NSView {
             return false
         }
 
+        if isPasteShortcut(event),
+           let pasteData = TerminalPasteboardContent.nonTextPasteData(from: .general) {
+            activeBridge?.scrollToBottomForHostInput()
+            activeSession.send(data: pasteData)
+            return true
+        }
+
         if let sequence = TerminalInputEncoder.shiftEnterSequence(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags,
@@ -845,6 +852,18 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         return false
+    }
+
+    private func isPasteShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command),
+              !modifiers.contains(.control),
+              !modifiers.contains(.option),
+              event.charactersIgnoringModifiers?.lowercased() == "v" else {
+            return false
+        }
+
+        return true
     }
 
     private func requestTerminalFocus() {

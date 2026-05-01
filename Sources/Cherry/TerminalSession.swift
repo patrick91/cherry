@@ -278,6 +278,14 @@ private final class ShellProcessBox: @unchecked Sendable {
     }
 }
 
+private struct SummaryTranscript {
+    let text: String
+    let inputLineCount: Int
+    let filteredLineCount: Int
+
+    static let empty = SummaryTranscript(text: "", inputLineCount: 0, filteredLineCount: 0)
+}
+
 private final class TerminalRawOutputStore: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumBytes: Int
@@ -685,16 +693,14 @@ final class TerminalWorkspace: ObservableObject {
     func addAgentSession(
         agent: AgentToolDefinition,
         projectRoot: String,
+        title: String? = nil,
         select: Bool = true
     ) -> TerminalSession {
-        let matchingAgentCount = agentSessions.filter {
-            $0.agentName.map { AgentToolDefinition.normalizedName($0) } == agent.normalizedName
-        }.count
         let session = Self.makeAgentSession(
             index: agentSessions.count + 1,
             agent: agent,
             workingDirectory: projectRoot,
-            duplicateIndex: matchingAgentCount + 1
+            title: title
         )
         sessions.append(session)
         if select {
@@ -820,8 +826,12 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     private static func makeSession(index: Int, title: String? = nil, workingDirectory: String? = nil) -> TerminalSession {
-        TerminalSession(
-            title: title?.isEmpty == false ? title! : "Shell \(index)",
+        let explicitTitle = title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        return TerminalSession(
+            title: explicitTitle ?? "Shell \(index)",
+            titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory)
@@ -832,11 +842,15 @@ final class TerminalWorkspace: ObservableObject {
         index: Int,
         agent: AgentToolDefinition,
         workingDirectory: String,
-        duplicateIndex: Int
+        title requestedTitle: String?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
+        let explicitTitle = requestedTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
         return TerminalSession(
-            title: duplicateIndex == 1 ? baseTitle : "\(baseTitle) \(duplicateIndex)",
+            title: explicitTitle ?? baseTitle,
+            titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: agent.commandLine,
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
@@ -894,6 +908,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         case command
     }
 
+    enum TitleSource: String, Codable, Equatable {
+        case system
+        case explicit
+        case automatic
+    }
+
     enum SessionState: Equatable {
         case launching
         case live
@@ -917,7 +937,9 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     let id = UUID()
     @Published private(set) var title: String
+    @Published private(set) var titleSource: TitleSource
     @Published private(set) var subtitle: String
+    @Published private(set) var summary: String?
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
     private(set) var isEnhancedKeyboardProtocolActive = false
@@ -931,6 +953,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var commandName: String?
     private var launchCommand: String?
     private var restartOnExit: Bool
+    private var systemTitle: String
+    private var automaticTitle: String?
 
     @Published private(set) var revision = 0
 
@@ -945,12 +969,24 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var isOutputPausedForInteraction = false
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
+    private var summaryDebounceTask: Task<Void, Never>?
+    private var summaryTask: Task<Void, Never>?
+    private var summaryGeneration = 0
+    private var lastSummaryOutputChangeDate: Date?
+    private var lastSummaryInput: String?
+    private var lastSummaryDate: Date?
+    private var lastHumanInputLine: Int?
 
     private static let defaultMaxScrollback = 50_000
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
+    private static let summaryIdleInterval: TimeInterval = 2
+    private static let summaryMaximumIdleWait: TimeInterval = 20
+    private static let summaryTailLineLimit = 80
+    private static let summaryMaximumCharacters = 6_000
 
     init(
         title: String,
+        titleSource: TitleSource = .system,
         subtitle: String,
         tint: NSColor,
         workingDirectory: String = NSHomeDirectory(),
@@ -964,6 +1000,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         restartOnExit: Bool = false
     ) {
         self.title = title
+        self.titleSource = titleSource
         self.subtitle = subtitle
         self.tint = tint
         self.workingDirectory = workingDirectory
@@ -974,6 +1011,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.restartOnExit = restartOnExit
+        self.systemTitle = title
         self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
@@ -1021,6 +1059,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         return false
     }
 
+    var hasExplicitTitle: Bool {
+        titleSource == .explicit
+    }
+
+    var sidebarDetail: String {
+        return summary?.nilIfEmpty ?? subtitle
+    }
+
     func snapshot(range: Range<Int>) -> [String] {
         processor.snapshot(range: range)
     }
@@ -1043,6 +1089,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func send(text: String) {
         guard acceptsInput else { return }
+        noteHumanInputIfNeeded()
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
@@ -1052,6 +1099,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     func send(data: Data) {
         guard acceptsInput else { return }
         let outboundData = normalizedInputData(data)
+        if !outboundData.isEmpty {
+            noteHumanInputIfNeeded()
+        }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
@@ -1074,6 +1124,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         rawOutputStore.clear()
         processor.clear()
         ghosttyBridgeStorage?.reset()
+        lastHumanInputLine = nil
         bumpRevision()
     }
 
@@ -1083,10 +1134,44 @@ final class TerminalSession: ObservableObject, Identifiable {
         startShell()
     }
 
+    func rename(to requestedTitle: String?) {
+        let trimmedTitle = requestedTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard let trimmedTitle else {
+            clearExplicitTitle()
+            return
+        }
+
+        title = trimmedTitle
+        titleSource = .explicit
+        bumpRevision()
+    }
+
+    func applyAutomaticSummary(_ nextSummary: String, useAsTitle: Bool) {
+        let sanitized = sanitizedSummary(nextSummary).nilIfEmpty
+        let shouldApplyTitle = kind != .agent && useAsTitle && titleSource != .explicit && sanitized != nil
+        guard summary != sanitized || (shouldApplyTitle && title != sanitized) else { return }
+        summary = sanitized
+
+        if shouldApplyTitle, let sanitized {
+            automaticTitle = sanitized
+            title = sanitized
+            titleSource = .automatic
+        }
+
+        bumpRevision()
+    }
+
     func stop() {
         let launchID = activeLaunchID
         activeLaunchID = nil
+        summaryDebounceTask?.cancel()
+        summaryDebounceTask = nil
+        summaryTask?.cancel()
+        summaryTask = nil
         resetKeyboardProtocolState()
+        lastHumanInputLine = nil
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
@@ -1111,7 +1196,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     func updateManagedCommand(_ command: ProjectCommandDefinition, workingDirectory: String) {
         guard kind == .command else { return }
 
-        title = command.name.isEmpty ? title : command.name
+        if !command.name.isEmpty {
+            updateSystemTitle(command.name)
+        }
         subtitle = command.commandLine
         self.workingDirectory = workingDirectory
         launchWorkingDirectory = workingDirectory
@@ -1294,6 +1381,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         if case .launching = state {
             state = .live
         }
+        if kind == .agent {
+            lastSummaryOutputChangeDate = Date()
+        }
+        scheduleSummaryIfNeeded()
         bumpRevision()
     }
 
@@ -1303,8 +1394,8 @@ final class TerminalSession: ObservableObject, Identifiable {
             switch event {
             case .title(let nextTitle):
                 guard kind != .agent else { continue }
-                guard title != nextTitle else { continue }
-                title = nextTitle
+                guard systemTitle != nextTitle else { continue }
+                updateSystemTitle(nextTitle)
                 didChange = true
 
             case .workingDirectory(let nextWorkingDirectory):
@@ -1346,6 +1437,191 @@ final class TerminalSession: ObservableObject, Identifiable {
         keyboardProtocolFlagStack.removeAll(keepingCapacity: true)
         keyboardProtocolFlags = 0
         isEnhancedKeyboardProtocolActive = false
+    }
+
+    private func clearExplicitTitle() {
+        guard titleSource == .explicit else { return }
+        if let automaticTitle {
+            title = automaticTitle
+            titleSource = .automatic
+        } else {
+            title = systemTitle
+            titleSource = .system
+        }
+        bumpRevision()
+    }
+
+    private func updateSystemTitle(_ nextTitle: String) {
+        let trimmedTitle = nextTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return }
+        systemTitle = trimmedTitle
+        if titleSource == .system {
+            title = trimmedTitle
+        }
+    }
+
+    private func scheduleSummaryIfNeeded() {
+        guard kind == .agent else { return }
+
+        let settings = AgentSettings.shared
+        let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let now = Date()
+        if let lastSummaryDate, now.timeIntervalSince(lastSummaryDate) < settings.agentSummaryCadence.interval {
+            return
+        }
+        guard summaryDebounceTask == nil, summaryTask == nil else { return }
+
+        summaryGeneration &+= 1
+        let generation = summaryGeneration
+        let scheduledAt = now
+        summaryDebounceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let waitSeconds = await MainActor.run {
+                    guard let self else { return 0.0 }
+                    let latestOutputDate = self.lastSummaryOutputChangeDate ?? scheduledAt
+                    let idleReadyDate = latestOutputDate.addingTimeInterval(Self.summaryIdleInterval)
+                    let maximumReadyDate = scheduledAt.addingTimeInterval(Self.summaryMaximumIdleWait)
+                    let readyDate = min(idleReadyDate, maximumReadyDate)
+                    return max(0, readyDate.timeIntervalSinceNow)
+                }
+                if waitSeconds <= 0 { break }
+                try? await Task.sleep(for: .milliseconds(Int(waitSeconds * 1_000)))
+            }
+            await MainActor.run {
+                guard let self, !Task.isCancelled else { return }
+                self.summaryDebounceTask = nil
+                self.startSummary(generation: generation, command: command)
+            }
+        }
+    }
+
+    private func startSummary(generation: Int, command: String) {
+        guard generation == summaryGeneration, kind == .agent else { return }
+        let transcript = summaryTranscript()
+        guard !transcript.text.isEmpty else {
+            recordSummaryDebug(command: command, transcript: transcript, prompt: "", summary: nil, error: "No summarizable terminal output yet.")
+            return
+        }
+        guard transcript.text != lastSummaryInput else {
+            lastSummaryDate = Date()
+            recordSummaryDebug(command: command, transcript: transcript, prompt: "", summary: nil, error: "Transcript unchanged.")
+            return
+        }
+
+        let settings = AgentSettings.shared
+        let useAsTitle = settings.useAgentSummaryAsTitle
+        let summaryModel = settings.agentSummaryModel
+        let prompt = summaryPrompt(for: transcript.text)
+        let summaryWorkingDirectory = workingDirectory
+        recordSummaryDebug(command: command, transcript: transcript, prompt: prompt, summary: nil, error: nil)
+        summaryTask = Task { [weak self] in
+            do {
+                let result = try await CodexMCPSummaryRunner.shared.run(
+                    transcript: transcript.text,
+                    workingDirectory: summaryWorkingDirectory,
+                    model: summaryModel
+                )
+                await MainActor.run {
+                    guard let self else { return }
+                    defer { self.summaryTask = nil }
+                    guard generation == self.summaryGeneration else { return }
+                    self.lastSummaryInput = transcript.text
+                    self.lastSummaryDate = Date()
+                    self.recordSummaryDebug(
+                        command: command,
+                        transcript: transcript,
+                        prompt: result.prompt,
+                        summary: result.summary,
+                        error: nil
+                    )
+                    self.applyAutomaticSummary(result.summary, useAsTitle: useAsTitle)
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    defer { self.summaryTask = nil }
+                    guard generation == self.summaryGeneration else { return }
+                    self.lastSummaryDate = Date()
+                    self.recordSummaryDebug(
+                        command: command,
+                        transcript: transcript,
+                        prompt: prompt,
+                        summary: nil,
+                        error: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+
+    private func recordSummaryDebug(
+        command: String,
+        transcript: SummaryTranscript,
+        prompt: String,
+        summary: String?,
+        error: String?
+    ) {
+        AgentSummaryDebugStore.shared.record(.init(
+            date: Date(),
+            sessionID: id,
+            sessionTitle: title,
+            command: command,
+            workingDirectory: workingDirectory,
+            inputLineCount: transcript.inputLineCount,
+            filteredLineCount: transcript.filteredLineCount,
+            charactersSent: prompt.count,
+            transcript: transcript.text,
+            prompt: prompt,
+            summary: summary,
+            error: error
+        ))
+    }
+
+    private func summaryTranscript() -> SummaryTranscript {
+        let lineCount = processor.lineCount
+        guard lineCount > 0 else { return .empty }
+        let recentStartLine = max(0, lineCount - Self.summaryTailLineLimit)
+        let inputLines = processor.snapshot(range: recentStartLine..<lineCount)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let lines = inputLines.filter { !Self.shouldDropSummaryLine($0) }
+        let text = lines.joined(separator: "\n")
+        let trimmedText = text.count > Self.summaryMaximumCharacters
+            ? String(text.suffix(Self.summaryMaximumCharacters))
+            : text
+        return SummaryTranscript(
+            text: trimmedText,
+            inputLineCount: inputLines.count,
+            filteredLineCount: lines.count
+        )
+    }
+
+    private func noteHumanInputIfNeeded() {
+        guard kind == .agent else { return }
+        lastHumanInputLine = processor.lineCount
+    }
+
+    private static func shouldDropSummaryLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if trimmed.allSatisfy({ "╭╮╰╯─│┌┐└┘═║ ".contains($0) }) {
+            return true
+        }
+        if trimmed.contains("OpenAI Codex")
+            || trimmed.contains("/model to change")
+            || trimmed.contains("permissions: YOLO mode")
+            || trimmed.contains("directory:") && trimmed.contains("~/")
+            || trimmed.contains("Tip: Try the Codex App")
+            || trimmed.hasPrefix("Tip: NEW:")
+            || trimmed.hasPrefix("›")
+            || trimmed.contains("gpt-5.") && trimmed.contains("· ~/") {
+            return true
+        }
+        if trimmed.contains("@filename") || trimmed.contains("{feature}") {
+            return true
+        }
+        return false
     }
 
     private func keyboardProtocolFlagsByApplying(flags: Int, mode: Int) -> Int {

@@ -215,6 +215,7 @@ final class CherryControlServer: @unchecked Sendable {
             let session = workspace.addAgentSession(
                 agent: agent.definition,
                 projectRoot: projectRoot,
+                title: request.title,
                 select: request.select ?? false
             )
             let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
@@ -233,10 +234,15 @@ final class CherryControlServer: @unchecked Sendable {
                 state: session.state.label,
                 kind: session.kind.rawValue,
                 agentName: session.agentName,
+                summary: session.summary,
                 projectRoot: projectRoot,
                 sentBytes: payload?.count ?? 0,
                 output: output
             )))
+        case .renameTerminal(let request):
+            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            session.rename(to: request.title)
+            return .init(result: .renameTerminal(summary(for: session)))
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
@@ -291,7 +297,8 @@ final class CherryControlServer: @unchecked Sendable {
                     workingDirectory: session.workingDirectory,
                     lineCount: session.lineCount,
                     kind: session.kind.rawValue,
-                    agentName: session.agentName
+                    agentName: session.agentName,
+                    summary: session.summary
                 )
             },
             selectedTerminalID: workspace.selectedSessionID?.uuidString
@@ -346,7 +353,8 @@ final class CherryControlServer: @unchecked Sendable {
             title: session.title,
             state: session.state.label,
             kind: session.kind.rawValue,
-            agentName: session.agentName
+            agentName: session.agentName,
+            summary: session.summary
         )
     }
 

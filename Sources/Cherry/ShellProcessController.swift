@@ -92,7 +92,9 @@ struct ShellIntegrationBootstrap {
             unset _cherry_original_zdotdir
 
             export ZDOTDIR="${CHERRY_BOOTSTRAP_ZDOTDIR}"
-            source "${CHERRY_BOOTSTRAP_ZDOTDIR}/cherry-integration.zsh"
+            if [[ "${CHERRY_DISABLE_SHELL_INTEGRATION-}" != "1" ]]; then
+              source "${CHERRY_BOOTSTRAP_ZDOTDIR}/cherry-integration.zsh"
+            fi
 
             if [[ -n "${CHERRY_ORIGINAL_ZDOTDIR-}" ]]; then
               export ZDOTDIR="${CHERRY_ORIGINAL_ZDOTDIR}"

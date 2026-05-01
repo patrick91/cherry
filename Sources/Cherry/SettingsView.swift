@@ -495,6 +495,8 @@ private struct AgentSettingsPane: View {
                         Spacer()
                     }
                 }
+
+                SummarySettingsSection(settings: settings)
             }
             .formStyle(.grouped)
             .padding(20)
@@ -529,6 +531,236 @@ private struct AgentSettingsPane: View {
                     editingAgent = nil
                 }
             )
+        }
+    }
+}
+
+private struct SummarySettingsSection: View {
+    @ObservedObject var settings: AgentSettings
+    @StateObject private var debugStore = AgentSummaryDebugStore.shared
+
+    @State private var testTask: Task<Void, Never>?
+    @State private var testStatus: SummaryTestStatus = .idle
+
+    private var commandPreview: String {
+        let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        return command
+    }
+
+    var body: some View {
+        Section("Auto-Summarization") {
+            SummarySettingsRow {
+                Text("Summary engine")
+                Text("Cherry keeps Codex MCP available for agent summaries and sends a compact rendered-text snapshot from recent terminal output, not the full raw transcript.")
+                    .foregroundStyle(.secondary)
+            } control: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 8, height: 8)
+                    Text("Codex MCP")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            SummarySettingsRow {
+                Text("Cadence")
+                Text("Minimum time between auto-summary attempts for the same session. Cherry still waits for a brief idle pause before requesting a summary.")
+                    .foregroundStyle(.secondary)
+            } control: {
+                Picker("Cadence", selection: $settings.agentSummaryCadence) {
+                    ForEach(AgentSummaryCadence.allCases) { cadence in
+                        Text(cadence.label)
+                            .tag(cadence)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 210)
+            }
+
+            SummarySettingsRow {
+                Text("Model")
+                Text(AgentSummaryTool.codex.modelFlagDescription)
+                    .foregroundStyle(.secondary)
+            } control: {
+                Picker("Model", selection: $settings.agentSummaryModel) {
+                    if !settings.agentSummaryModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !AgentSummaryTool.codex.modelOptions.contains(settings.agentSummaryModel) {
+                        Text("\(settings.agentSummaryModel) (custom)")
+                            .tag(settings.agentSummaryModel)
+                    }
+
+                    ForEach(AgentSummaryTool.codex.modelOptions, id: \.self) { model in
+                        Text(model)
+                            .tag(model)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 250)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Command preview")
+                    Text("The Codex MCP command path Cherry uses for summarization.")
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(commandPreview)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.65))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                    }
+            }
+            .padding(.vertical, 6)
+
+            HStack(alignment: .top, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Test summarizer")
+                        .font(.callout)
+                    Text(testStatus.message)
+                        .font(.callout)
+                        .foregroundStyle(testStatus.isError ? .red : .secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button(testStatus.isRunning ? "Testing" : "Test") {
+                    runTest()
+                }
+                .disabled(testStatus.isRunning)
+                .frame(width: 82)
+            }
+            .padding(.vertical, 6)
+
+            HStack(alignment: .top, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Debug")
+                        .font(.callout)
+                    Text(debugStore.lastRecord?.status ?? "No summary attempts recorded yet.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Text(debugStore.logURL.path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 8) {
+                    Button("Copy") {
+                        debugStore.copyLastRecord()
+                    }
+                    .disabled(debugStore.lastRecord == nil)
+
+                    Button("Reveal") {
+                        debugStore.revealLog()
+                    }
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .onDisappear {
+            testTask?.cancel()
+        }
+    }
+
+    private func runTest() {
+        testTask?.cancel()
+        testStatus = .running
+        testTask = Task {
+            do {
+                let transcript = """
+                User asked Cherry to summarize an agent session.
+                The agent inspected settings, changed SwiftUI, and ran tests.
+                """
+                let result = try await CodexMCPSummaryRunner.shared.run(
+                    transcript: transcript,
+                    workingDirectory: NSHomeDirectory(),
+                    model: settings.agentSummaryModel
+                )
+                await MainActor.run {
+                    testStatus = .success(result.summary)
+                }
+            } catch {
+                await MainActor.run {
+                    testStatus = .failure(error.localizedDescription)
+                }
+            }
+        }
+    }
+}
+
+private struct SummarySettingsRow<Description: View, Control: View>: View {
+    let description: () -> Description
+    let control: () -> Control
+
+    init(
+        @ViewBuilder description: @escaping () -> Description,
+        @ViewBuilder control: @escaping () -> Control
+    ) {
+        self.description = description
+        self.control = control
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 20) {
+            VStack(alignment: .leading, spacing: 4) {
+                description()
+            }
+            .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            control()
+                .frame(minWidth: 120, alignment: .trailing)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private enum SummaryTestStatus: Equatable {
+    case idle
+    case running
+    case success(String)
+    case failure(String)
+
+    var isRunning: Bool {
+        self == .running
+    }
+
+    var isError: Bool {
+        if case .failure = self {
+            return true
+        }
+        return false
+    }
+
+    var message: String {
+        switch self {
+        case .idle:
+            "Runs the selected tool directly to verify setup. Any OS permission prompts come from that tool."
+        case .running:
+            "Waiting for the summarizer to return one short line."
+        case .success(let summary):
+            "Returned: \(summary)"
+        case .failure(let message):
+            "Failed: \(message)"
         }
     }
 }

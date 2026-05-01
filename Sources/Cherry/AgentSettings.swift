@@ -120,6 +120,87 @@ enum AgentToolSource: Equatable {
     case global
 }
 
+enum AgentSummaryTool: String, CaseIterable, Identifiable {
+    case codex
+
+    var id: String { rawValue }
+
+    var name: String {
+        switch self {
+        case .codex:
+            "Codex MCP"
+        }
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .codex:
+            "gpt-5.3-codex-spark"
+        }
+    }
+
+    var modelOptions: [String] {
+        switch self {
+        case .codex:
+            [
+                "gpt-5.3-codex-spark",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.4",
+                "gpt-5.5",
+                "gpt-5.2"
+            ]
+        }
+    }
+
+    var modelFlagDescription: String {
+        switch self {
+        case .codex:
+            "Passed to the Codex MCP tool via -m"
+        }
+    }
+
+    func command(model: String) -> String {
+        let modelValue = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModel = modelValue.isEmpty ? defaultModel : modelValue
+
+        switch self {
+        case .codex:
+            let modelArgument = trimmedModel.isEmpty ? "" : " -m \(Self.shellQuoted(trimmedModel))"
+            return "codex mcp-server -> codex tool\(modelArgument) -c model_reasoning_effort=low"
+        }
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        let safeCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.=/:")
+        guard value.rangeOfCharacter(from: safeCharacters.inverted) != nil else { return value }
+        return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+}
+
+enum AgentSummaryCadence: Int, CaseIterable, Identifiable {
+    case fifteenSeconds = 15
+    case thirtySeconds = 30
+    case oneMinute = 60
+
+    var id: Int { rawValue }
+
+    var label: String {
+        switch self {
+        case .fifteenSeconds:
+            "15 sec"
+        case .thirtySeconds:
+            "30 sec"
+        case .oneMinute:
+            "1 min"
+        }
+    }
+
+    var interval: TimeInterval {
+        TimeInterval(rawValue)
+    }
+}
+
 struct ResolvedAgentTool: Equatable, Identifiable {
     let definition: AgentToolDefinition
     let source: AgentToolSource
@@ -251,6 +332,35 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var projects: [CherryProject] = []
     @Published private(set) var agents: [AgentToolDefinition] = []
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
+    @Published var agentSummaryTool: AgentSummaryTool {
+        didSet {
+            let currentModel = agentSummaryModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            if currentModel.isEmpty || currentModel == oldValue.defaultModel {
+                agentSummaryModel = agentSummaryTool.defaultModel
+            }
+            saveSummarySettings()
+        }
+    }
+    @Published var agentSummaryCadence: AgentSummaryCadence {
+        didSet {
+            saveSummarySettings()
+        }
+    }
+    @Published var agentSummaryModel: String {
+        didSet {
+            saveSummarySettings()
+        }
+    }
+    @Published var agentSummaryCommand: String {
+        didSet {
+            saveSummarySettings()
+        }
+    }
+    @Published var useAgentSummaryAsTitle: Bool {
+        didSet {
+            saveSummarySettings()
+        }
+    }
 
     private let defaults: UserDefaults
 
@@ -259,10 +369,21 @@ final class AgentSettings: ObservableObject {
         projects = Self.loadProjects(from: defaults)
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
+        let storedSummaryCommand = defaults.string(forKey: Keys.agentSummaryCommand) ?? ""
+        let storedSummaryTool = Self.loadAgentSummaryTool(from: defaults, command: storedSummaryCommand)
+        agentSummaryCommand = storedSummaryCommand
+        agentSummaryTool = storedSummaryTool
+        agentSummaryCadence = Self.loadAgentSummaryCadence(from: defaults)
+        agentSummaryModel = Self.loadAgentSummaryModel(from: defaults, tool: storedSummaryTool)
+        useAgentSummaryAsTitle = defaults.bool(forKey: Keys.useAgentSummaryAsTitle)
     }
 
     var resolvedAgents: [ResolvedAgentTool] {
         agents.map { ResolvedAgentTool(definition: $0, source: .global) }
+    }
+
+    var effectiveAgentSummaryCommand: String {
+        AgentSummaryTool.codex.command(model: agentSummaryModel)
     }
 
     func selectedProject(for root: String?) -> CherryProject? {
@@ -391,6 +512,14 @@ final class AgentSettings: ObservableObject {
         Self.saveCommandsByProject(commandsByProject, to: defaults)
     }
 
+    private func saveSummarySettings() {
+        defaults.set(agentSummaryTool.rawValue, forKey: Keys.agentSummaryTool)
+        defaults.set(agentSummaryCadence.rawValue, forKey: Keys.agentSummaryCadence)
+        defaults.set(agentSummaryModel, forKey: Keys.agentSummaryModel)
+        defaults.set(agentSummaryCommand, forKey: Keys.agentSummaryCommand)
+        defaults.set(useAgentSummaryAsTitle, forKey: Keys.useAgentSummaryAsTitle)
+    }
+
     private static func loadProjects(from defaults: UserDefaults) -> [CherryProject] {
         guard let data = defaults.data(forKey: Keys.projects),
               let decoded = try? JSONDecoder().decode([CherryProject].self, from: data)
@@ -450,6 +579,24 @@ final class AgentSettings: ObservableObject {
         return []
     }
 
+    private static func loadAgentSummaryTool(from _: UserDefaults, command _: String) -> AgentSummaryTool {
+        .codex
+    }
+
+    private static func loadAgentSummaryModel(from defaults: UserDefaults, tool: AgentSummaryTool) -> String {
+        let storedModel = defaults.string(forKey: Keys.agentSummaryModel)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if storedModel.isEmpty || storedModel == "gpt-5-codex" || storedModel == "haiku" {
+            return AgentSummaryTool.codex.defaultModel
+        }
+        return storedModel
+    }
+
+    private static func loadAgentSummaryCadence(from defaults: UserDefaults) -> AgentSummaryCadence {
+        let rawValue = defaults.integer(forKey: Keys.agentSummaryCadence)
+        return AgentSummaryCadence(rawValue: rawValue) ?? .thirtySeconds
+    }
+
     private static func saveProjects(_ projects: [CherryProject], to defaults: UserDefaults) {
         guard let data = try? JSONEncoder().encode(projects) else { return }
         defaults.set(data, forKey: Keys.projects)
@@ -490,6 +637,11 @@ final class AgentSettings: ObservableObject {
         static let projects = "projects.items"
         static let agents = "agents.global"
         static let commandsByProject = "commands.byProject"
+        static let agentSummaryTool = "agents.summaryTool"
+        static let agentSummaryCadence = "agents.summaryCadence"
+        static let agentSummaryModel = "agents.summaryModel"
+        static let agentSummaryCommand = "agents.summaryCommand"
+        static let useAgentSummaryAsTitle = "agents.summaryAsTitle"
         static let legacyLocalAgentsByProject = "agents.localByProject"
     }
 }

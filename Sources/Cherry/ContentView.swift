@@ -1336,6 +1336,12 @@ private struct SidebarAgentSessionSection: View {
                         onSelect: { workspace.select(session) }
                     )
                     .contextMenu {
+                        Button("Rename...") {
+                            promptRenameSession(session)
+                        }
+
+                        Divider()
+
                         Button("Restart") {
                             session.restart()
                         }
@@ -1470,6 +1476,10 @@ private struct SidebarCommandSection: View {
                         .disabled(session?.isRunningCommand != true)
 
                         if let session {
+                            Button("Rename...") {
+                                promptRenameSession(session)
+                            }
+
                             Button("Clear Scrollback") {
                                 session.clearScrollback()
                             }
@@ -1571,6 +1581,25 @@ private struct SidebarCommandSection: View {
         if let projectRoot {
             settings.removeCommand(named: command.name, for: projectRoot)
         }
+    }
+}
+
+@MainActor
+private func promptRenameSession(_ session: TerminalSession) {
+    let alert = NSAlert()
+    alert.messageText = "Rename Session"
+    alert.informativeText = "Leave the title empty to return to the automatic name."
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "Save")
+    alert.addButton(withTitle: "Cancel")
+
+    let field = NSTextField(string: session.hasExplicitTitle ? session.title : "")
+    field.placeholderString = session.title
+    field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+    alert.accessoryView = field
+
+    if alert.runModal() == .alertFirstButtonReturn {
+        session.rename(to: field.stringValue)
     }
 }
 
@@ -1742,6 +1771,12 @@ private struct SidebarSessionSection: View {
                     [session.id: anchor]
                 }
                 .contextMenu {
+                    Button("Rename...") {
+                        promptRenameSession(session)
+                    }
+
+                    Divider()
+
                     Button("Restart") {
                         session.restart()
                     }
@@ -2306,15 +2341,24 @@ private struct SidebarTabRow: View {
                     AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
                 }
 
-                Text(session.title)
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(session.title)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+
+                    if !session.sidebarDetail.isEmpty {
+                        Text(session.sidebarDetail)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                            .lineLimit(1)
+                    }
+                }
 
                 Spacer(minLength: 8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 42)
+            .frame(height: session.sidebarDetail.isEmpty ? 42 : 50)
             .padding(.leading, SidebarLayout.rowHorizontalInset)
             .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))

@@ -51,12 +51,22 @@ private enum CherryMCPTools {
             "Create a new configured Cherry agent session in the active project without selecting it. Always creates a new terminal; never use this to send input to an existing terminal.",
             properties: [
                 "agent_name": string("Configured Cherry agent name."),
+                "title": string("Optional custom session title."),
                 "text": string("Optional text to send exactly as provided after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
             required: ["agent_name"]
+        ),
+        tool(
+            "rename_terminal",
+            "Rename a Cherry terminal. Pass an empty title to return to Cherry's automatic title.",
+            properties: [
+                "terminal_id": string("Cherry terminal UUID."),
+                "title": string("New title. Empty clears the explicit title.")
+            ],
+            required: ["terminal_id"]
         ),
         tool(
             "press_enter",
@@ -170,11 +180,17 @@ private enum CherryMCPTools {
         case "run_agent":
             return .runAgent(.init(
                 agentName: try requiredString("agent_name", in: arguments),
+                title: stringArgument("title", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
                 select: false
+            ))
+        case "rename_terminal":
+            return .renameTerminal(.init(
+                terminalID: try requiredString("terminal_id", in: arguments),
+                title: stringArgument("title", in: arguments)
             ))
         case "press_enter":
             return .sendInput(.init(
@@ -232,6 +248,8 @@ private enum CherryMCPTools {
         case .createTerminal(let payload):
             return try encodedResult(payload)
         case .runAgent(let payload):
+            return try encodedResult(payload)
+        case .renameTerminal(let payload):
             return try encodedResult(payload)
         case .selectTerminal(let payload):
             return try encodedResult(payload)

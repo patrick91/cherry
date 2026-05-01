@@ -16,6 +16,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listAgents
     case createTerminal(CreateTerminalRequest)
     case runAgent(RunAgentRequest)
+    case renameTerminal(RenameTerminalRequest)
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
     case getTerminalOutput(GetTerminalOutputRequest)
@@ -48,6 +49,7 @@ public struct CreateTerminalRequest: Codable, Equatable, Sendable {
 
 public struct RunAgentRequest: Codable, Equatable, Sendable {
     public let agentName: String
+    public let title: String?
     public let text: String?
     public let rawBase64: String?
     public let waitMilliseconds: Int?
@@ -56,6 +58,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
 
     public init(
         agentName: String,
+        title: String? = nil,
         text: String? = nil,
         rawBase64: String? = nil,
         waitMilliseconds: Int? = nil,
@@ -63,11 +66,22 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         select: Bool? = nil
     ) {
         self.agentName = agentName
+        self.title = title
         self.text = text
         self.rawBase64 = rawBase64
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
         self.select = select
+    }
+}
+
+public struct RenameTerminalRequest: Codable, Equatable, Sendable {
+    public let terminalID: String
+    public let title: String?
+
+    public init(terminalID: String, title: String?) {
+        self.terminalID = terminalID
+        self.title = title
     }
 }
 
@@ -149,6 +163,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listAgents(ListAgentsResult)
     case createTerminal(TerminalSummaryResult)
     case runAgent(RunAgentResult)
+    case renameTerminal(TerminalSummaryResult)
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
     case getTerminalOutput(TerminalOutputResult)
@@ -178,6 +193,7 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
     public let lineCount: Int
     public let kind: String?
     public let agentName: String?
+    public let summary: String?
 
     public init(
         id: String,
@@ -187,7 +203,8 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         workingDirectory: String,
         lineCount: Int,
         kind: String? = nil,
-        agentName: String? = nil
+        agentName: String? = nil,
+        summary: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -197,6 +214,7 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         self.lineCount = lineCount
         self.kind = kind
         self.agentName = agentName
+        self.summary = summary
     }
 }
 
@@ -257,13 +275,15 @@ public struct TerminalSummaryResult: Codable, Equatable, Sendable {
     public let state: String
     public let kind: String?
     public let agentName: String?
+    public let summary: String?
 
-    public init(terminalID: String, title: String, state: String, kind: String? = nil, agentName: String? = nil) {
+    public init(terminalID: String, title: String, state: String, kind: String? = nil, agentName: String? = nil, summary: String? = nil) {
         self.terminalID = terminalID
         self.title = title
         self.state = state
         self.kind = kind
         self.agentName = agentName
+        self.summary = summary
     }
 }
 
@@ -273,6 +293,7 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
     public let state: String
     public let kind: String?
     public let agentName: String?
+    public let summary: String?
     public let projectRoot: String
     public let sentBytes: Int
     public let output: TerminalOutputResult?
@@ -283,6 +304,7 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
         state: String,
         kind: String?,
         agentName: String?,
+        summary: String?,
         projectRoot: String,
         sentBytes: Int,
         output: TerminalOutputResult?
@@ -292,6 +314,7 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
         self.state = state
         self.kind = kind
         self.agentName = agentName
+        self.summary = summary
         self.projectRoot = projectRoot
         self.sentBytes = sentBytes
         self.output = output

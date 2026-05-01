@@ -48,6 +48,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
+    @Published var isCommandKeyPressed = false
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.

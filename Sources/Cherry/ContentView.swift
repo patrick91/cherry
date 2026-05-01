@@ -216,6 +216,7 @@ struct ContentView: View {
     private var dockedSidebar: some View {
         SidebarTabsView(
             workspace: workspace,
+            chromeState: chromeState,
             projectRoot: projectRoot,
             presentation: .docked,
             openProject: openProject
@@ -260,6 +261,7 @@ struct ContentView: View {
     private var floatingSidebar: some View {
         SidebarTabsView(
             workspace: workspace,
+            chromeState: chromeState,
             projectRoot: projectRoot,
             presentation: .floating,
             openProject: openProject
@@ -1085,6 +1087,7 @@ private struct SidebarTabsView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
     let openProject: (CherryProject) -> Void
@@ -1098,6 +1101,7 @@ private struct SidebarTabsView: View {
                         workspace: workspace,
                         projectRoot: projectRoot,
                         presentation: presentation,
+                        showShortcutHints: chromeState.isCommandKeyPressed,
                         openSettings: { openSettings() }
                     )
 
@@ -1106,14 +1110,18 @@ private struct SidebarTabsView: View {
                         sessions: workspace.terminalSessions,
                         kind: .terminal,
                         workspace: workspace,
-                        presentation: presentation
+                        presentation: presentation,
+                        shortcutStartIndex: workspace.agentSessions.count,
+                        showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
                     SidebarCommandSection(
                         settings: agentSettings,
                         workspace: workspace,
                         projectRoot: projectRoot,
-                        presentation: presentation
+                        presentation: presentation,
+                        shortcutStartIndex: workspace.agentSessions.count + workspace.terminalSessions.count,
+                        showShortcutHints: chromeState.isCommandKeyPressed
                     )
                 }
                 // Keep the sidebar's text column aligned with the native
@@ -1310,6 +1318,7 @@ private struct SidebarAgentSessionSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let showShortcutHints: Bool
     let openSettings: () -> Void
 
     var body: some View {
@@ -1338,11 +1347,13 @@ private struct SidebarAgentSessionSection: View {
                     palette: palette
                 )
             } else {
-                ForEach(workspace.agentSessions) { session in
+                ForEach(Array(workspace.agentSessions.enumerated()), id: \.element.id) { index, session in
                     SidebarTabRow(
                         session: session,
                         isSelected: workspace.selectedSessionID == session.id,
                         presentation: presentation,
+                        shortcutNumber: index + 1,
+                        showShortcutHint: showShortcutHints,
                         onSelect: { workspace.select(session) }
                     )
                     .contextMenu {
@@ -1424,6 +1435,8 @@ private struct SidebarCommandSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let shortcutStartIndex: Int
+    let showShortcutHints: Bool
 
     @State private var editingCommand: ProjectCommandDefinition?
     @State private var editingOriginalName: String?
@@ -1459,13 +1472,15 @@ private struct SidebarCommandSection: View {
                     palette: palette
                 )
             } else {
-                ForEach(commands) { command in
+                ForEach(Array(commands.enumerated()), id: \.element.id) { index, command in
                     let session = workspace.commandSession(named: command.name)
                     SidebarCommandRow(
                         command: command,
                         session: session,
                         isSelected: session.map { workspace.selectedSessionID == $0.id } ?? false,
                         presentation: presentation,
+                        shortcutNumber: shortcutStartIndex + index + 1,
+                        showShortcutHint: showShortcutHints,
                         start: { start(command, existingSession: session) },
                         stop: { session?.stopManagedCommand() },
                         restart: { restart(command, existingSession: session) },
@@ -1621,6 +1636,8 @@ private struct SidebarCommandRow: View {
     let session: TerminalSession?
     let isSelected: Bool
     let presentation: SidebarPresentation
+    let shortcutNumber: Int
+    let showShortcutHint: Bool
     let start: () -> Void
     let stop: () -> Void
     let restart: () -> Void
@@ -1651,15 +1668,19 @@ private struct SidebarCommandRow: View {
 
                 Spacer(minLength: 8)
 
-                Button(action: session?.isRunningCommand == true ? stop : start) {
-                    Image(systemName: session?.isRunningCommand == true ? "stop.fill" : "play.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
+                if showShortcutHint, shortcutNumber <= 9 {
+                    SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+                } else {
+                    Button(action: session?.isRunningCommand == true ? stop : start) {
+                        Image(systemName: session?.isRunningCommand == true ? "stop.fill" : "play.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(session?.isRunningCommand == true ? "Stop" : "Start")
                 }
-                .buttonStyle(.plain)
-                .help(session?.isRunningCommand == true ? "Stop" : "Start")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 46)
@@ -1754,6 +1775,8 @@ private struct SidebarSessionSection: View {
     let kind: TerminalSession.SessionKind
     @ObservedObject var workspace: TerminalWorkspace
     let presentation: SidebarPresentation
+    let shortcutStartIndex: Int
+    let showShortcutHints: Bool
 
     @State private var draggedSessionID: UUID?
     @State private var draggedRowOffsetY: CGFloat = 0
@@ -1768,11 +1791,13 @@ private struct SidebarSessionSection: View {
         VStack(alignment: .leading, spacing: 4) {
             SidebarSectionHeader(title: title, count: sessions.count, palette: palette)
 
-            ForEach(sessions) { session in
+            ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                 SidebarTabRow(
                     session: session,
                     isSelected: workspace.selectedSessionID == session.id,
                     presentation: presentation,
+                    shortcutNumber: shortcutStartIndex + index + 1,
+                    showShortcutHint: showShortcutHints,
                     onSelect: { workspace.select(session) }
                 )
                 .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
@@ -2326,6 +2351,21 @@ private struct SidebarBackground: View {
     }
 }
 
+private struct SidebarShortcutHint: View {
+    let number: Int
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        Text("⌘\(number)")
+            .font(.system(size: 12, weight: .medium))
+            .monospacedDigit()
+            .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.52))
+            .frame(width: 26, alignment: .trailing)
+            .accessibilityHidden(true)
+    }
+}
+
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
@@ -2334,6 +2374,8 @@ private struct SidebarTabRow: View {
 
     let isSelected: Bool
     let presentation: SidebarPresentation
+    let shortcutNumber: Int
+    let showShortcutHint: Bool
     let onSelect: () -> Void
 
     @State private var isHovered = false
@@ -2366,6 +2408,10 @@ private struct SidebarTabRow: View {
                 }
 
                 Spacer(minLength: 8)
+
+                if showShortcutHint, shortcutNumber <= 9 {
+                    SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: session.sidebarDetail.isEmpty ? 42 : 50)

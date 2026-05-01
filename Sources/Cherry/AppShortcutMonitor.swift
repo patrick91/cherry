@@ -10,14 +10,20 @@ struct AppShortcutMonitor: NSViewRepresentable {
     let openSettings: () -> Void
 
     private var visibleCommandNames: [String] {
-        agentSettings.launchableProjectCommands(for: projectRoot).map(\.name)
+        visibleCommands.map(\.name)
+    }
+
+    private var visibleCommands: [ProjectCommandDefinition] {
+        agentSettings.launchableProjectCommands(for: projectRoot)
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             workspace: workspace,
             chromeState: chromeState,
+            projectRoot: projectRoot,
             visibleCommandNames: visibleCommandNames,
+            visibleCommands: visibleCommands,
             openSettings: openSettings
         )
     }
@@ -31,7 +37,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
         context.coordinator.chromeState = chromeState
+        context.coordinator.projectRoot = projectRoot
         context.coordinator.visibleCommandNames = visibleCommandNames
+        context.coordinator.visibleCommands = visibleCommands
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
@@ -49,7 +57,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
     final class Coordinator {
         weak var workspace: TerminalWorkspace?
         weak var chromeState: ProjectWindowChromeState?
+        var projectRoot: String?
         var visibleCommandNames: [String]
+        var visibleCommands: [ProjectCommandDefinition]
         var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
@@ -57,12 +67,16 @@ struct AppShortcutMonitor: NSViewRepresentable {
         init(
             workspace: TerminalWorkspace,
             chromeState: ProjectWindowChromeState,
+            projectRoot: String?,
             visibleCommandNames: [String],
+            visibleCommands: [ProjectCommandDefinition],
             openSettings: @escaping () -> Void
         ) {
             self.workspace = workspace
             self.chromeState = chromeState
+            self.projectRoot = projectRoot
             self.visibleCommandNames = visibleCommandNames
+            self.visibleCommands = visibleCommands
             self.openSettings = openSettings
             install()
         }
@@ -74,7 +88,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
         }
 
         private func install() {
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
                 let consumed = MainActor.assumeIsolated {
                     self?.handle(event) ?? false
                 }
@@ -83,9 +97,16 @@ struct AppShortcutMonitor: NSViewRepresentable {
         }
 
         private func handle(_ event: NSEvent) -> Bool {
-            guard event.window === window else { return false }
+            guard event.window === window else {
+                chromeState?.isCommandKeyPressed = false
+                return false
+            }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            chromeState?.isCommandKeyPressed = modifiers.contains(.command)
+
+            guard event.type == .keyDown else { return false }
+
             if modifiers.contains([.command, .option]),
                modifiers.isDisjoint(with: [.control, .shift])
             {
@@ -104,6 +125,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard modifiers == .command else { return false }
 
             switch event.charactersIgnoringModifiers?.lowercased() {
+            case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+                guard let number = event.charactersIgnoringModifiers.flatMap(Int.init) else { return false }
+                selectVisibleSidebarItem(number: number)
+                return true
             case "p":
                 chromeState?.presentCommandPalette()
                 return true
@@ -131,6 +156,35 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 workspace.closeSelectedSession()
             } else {
                 window?.performClose(nil)
+            }
+        }
+
+        private func selectVisibleSidebarItem(number: Int) {
+            guard let workspace else { return }
+            let zeroBasedIndex = number - 1
+            guard zeroBasedIndex >= 0 else { return }
+
+            let agentSessions = workspace.agentSessions
+            if zeroBasedIndex < agentSessions.count {
+                workspace.select(agentSessions[zeroBasedIndex])
+                return
+            }
+
+            let terminalIndex = zeroBasedIndex - agentSessions.count
+            let terminalSessions = workspace.terminalSessions
+            if terminalIndex < terminalSessions.count {
+                workspace.select(terminalSessions[terminalIndex])
+                return
+            }
+
+            let commandIndex = terminalIndex - terminalSessions.count
+            guard commandIndex >= 0, commandIndex < visibleCommands.count else { return }
+
+            let command = visibleCommands[commandIndex]
+            if let session = workspace.commandSession(named: command.name) {
+                workspace.select(session)
+            } else if let root = AgentSettings.shared.resolvedProject(for: projectRoot).validProjectRoot {
+                workspace.addCommandSession(command: command, projectRoot: root)
             }
         }
     }

@@ -14,8 +14,14 @@ public enum CherryControl {
 public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listTerminals
     case listAgents
+    case listNotes
     case createTerminal(CreateTerminalRequest)
     case runAgent(RunAgentRequest)
+    case createNote(CreateNoteRequest)
+    case getNote(NoteIDRequest)
+    case updateNote(UpdateNoteRequest)
+    case deleteNote(NoteIDRequest)
+    case selectNote(NoteIDRequest)
     case renameTerminal(RenameTerminalRequest)
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
@@ -32,6 +38,40 @@ public struct TerminalIDRequest: Codable, Equatable, Sendable {
 
     public init(terminalID: String) {
         self.terminalID = terminalID
+    }
+}
+
+public struct NoteIDRequest: Codable, Equatable, Sendable {
+    public let noteID: String
+
+    public init(noteID: String) {
+        self.noteID = noteID
+    }
+}
+
+public struct CreateNoteRequest: Codable, Equatable, Sendable {
+    public let title: String
+    public let markdown: String
+    public let open: Bool?
+
+    public init(title: String, markdown: String, open: Bool? = nil) {
+        self.title = title
+        self.markdown = markdown
+        self.open = open
+    }
+}
+
+public struct UpdateNoteRequest: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let title: String?
+    public let markdown: String?
+    public let open: Bool?
+
+    public init(noteID: String, title: String? = nil, markdown: String? = nil, open: Bool? = nil) {
+        self.noteID = noteID
+        self.title = title
+        self.markdown = markdown
+        self.open = open
     }
 }
 
@@ -161,8 +201,14 @@ public struct CherryControlResponse: Codable, Equatable, Sendable {
 public enum CherryControlResult: Codable, Equatable, Sendable {
     case listTerminals(ListTerminalsResult)
     case listAgents(ListAgentsResult)
+    case listNotes(ListNotesResult)
     case createTerminal(TerminalSummaryResult)
     case runAgent(RunAgentResult)
+    case createNote(NoteDetailResult)
+    case getNote(NoteDetailResult)
+    case updateNote(NoteDetailResult)
+    case deleteNote(DeleteNoteResult)
+    case selectNote(SelectNoteResult)
     case renameTerminal(TerminalSummaryResult)
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
@@ -266,6 +312,89 @@ public struct ListAgentsResult: Codable, Equatable, Sendable {
     public init(activeProjectRoot: String?, agents: [AgentInfo]) {
         self.activeProjectRoot = activeProjectRoot
         self.agents = agents
+    }
+}
+
+public struct ProjectNote: Codable, Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public let projectRoot: String
+    public var title: String
+    public var markdown: String
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID,
+        projectRoot: String,
+        title: String,
+        markdown: String,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.projectRoot = projectRoot
+        self.title = title
+        self.markdown = markdown
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct NoteInfo: Codable, Equatable, Sendable {
+    public let id: String
+    public let projectRoot: String
+    public let title: String
+    public let createdAt: Date
+    public let updatedAt: Date
+
+    public init(id: String, projectRoot: String, title: String, createdAt: Date, updatedAt: Date) {
+        self.id = id
+        self.projectRoot = projectRoot
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct ListNotesResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String
+    public let notes: [NoteInfo]
+    public let selectedNoteID: String?
+
+    public init(activeProjectRoot: String, notes: [NoteInfo], selectedNoteID: String?) {
+        self.activeProjectRoot = activeProjectRoot
+        self.notes = notes
+        self.selectedNoteID = selectedNoteID
+    }
+}
+
+public struct NoteDetailResult: Codable, Equatable, Sendable {
+    public let note: ProjectNote
+    public let selected: Bool
+
+    public init(note: ProjectNote, selected: Bool) {
+        self.note = note
+        self.selected = selected
+    }
+}
+
+public struct SelectNoteResult: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let selected: Bool
+
+    public init(noteID: String, selected: Bool) {
+        self.noteID = noteID
+        self.selected = selected
+    }
+}
+
+public struct DeleteNoteResult: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let deleted: Bool
+
+    public init(noteID: String, deleted: Bool) {
+        self.noteID = noteID
+        self.deleted = deleted
     }
 }
 

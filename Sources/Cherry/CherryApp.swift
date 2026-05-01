@@ -65,6 +65,10 @@ struct CherryApp: App {
                     guard controlServer == nil else { return }
                     let server = CherryControlServer(workspaceProvider: {
                         ProjectWindowRegistry.shared.activeWorkspace
+                    }, noteStoreProvider: {
+                        ProjectWindowRegistry.shared.activeNoteStore
+                    }, chromeStateProvider: {
+                        ProjectWindowRegistry.shared.activeChromeState
                     })
                     server.start()
                     controlServer = server
@@ -190,27 +194,37 @@ private struct ProjectWorkspaceView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     @StateObject private var workspace: TerminalWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
+    @StateObject private var noteStore: ProjectNoteStore
     @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
         _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
+        _noteStore = StateObject(wrappedValue: ProjectNoteStore(projectRoot: projectRoot))
     }
 
     var body: some View {
         ContentView(
             workspace: workspace,
             chromeState: chromeState,
+            noteStore: noteStore,
             projectRoot: workspace.projectRoot,
             openProject: openProject,
             isSidebarHidden: $chromeState.isSidebarHidden,
             isSidebarRevealed: $chromeState.isSidebarRevealed,
             isCursorOverSidebar: $chromeState.isCursorOverSidebar
         )
-        .background(ProjectWindowBinder(projectRoot: workspace.projectRoot, workspace: workspace))
+        .background(ProjectWindowBinder(
+            projectRoot: workspace.projectRoot,
+            workspace: workspace,
+            noteStore: noteStore,
+            chromeState: chromeState
+        ))
         .focusedValue(\.terminalWorkspace, workspace)
         .focusedValue(\.projectWindowChromeState, chromeState)
         .onAppear {
             ProjectWindowRegistry.shared.activeWorkspace = workspace
+            ProjectWindowRegistry.shared.activeNoteStore = noteStore
+            ProjectWindowRegistry.shared.activeChromeState = chromeState
             autoStartCommandsIfNeeded()
         }
     }

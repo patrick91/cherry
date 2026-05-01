@@ -166,6 +166,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
             let agentSessions = workspace.agentSessions
             if zeroBasedIndex < agentSessions.count {
+                chromeState?.selectNote(id: nil)
                 workspace.select(agentSessions[zeroBasedIndex])
                 return
             }
@@ -173,6 +174,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             let terminalIndex = zeroBasedIndex - agentSessions.count
             let terminalSessions = workspace.terminalSessions
             if terminalIndex < terminalSessions.count {
+                chromeState?.selectNote(id: nil)
                 workspace.select(terminalSessions[terminalIndex])
                 return
             }
@@ -182,8 +184,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
             let command = visibleCommands[commandIndex]
             if let session = workspace.commandSession(named: command.name) {
+                chromeState?.selectNote(id: nil)
                 workspace.select(session)
             } else if let root = AgentSettings.shared.resolvedProject(for: projectRoot).validProjectRoot {
+                chromeState?.selectNote(id: nil)
                 workspace.addCommandSession(command: command, projectRoot: root)
             }
         }

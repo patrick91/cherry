@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import Combine
 import SwiftUI
 
@@ -12,6 +13,7 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
     let projectRoot: String?
     let openProject: (CherryProject) -> Void
     @Binding var isSidebarHidden: Bool
@@ -52,6 +54,7 @@ struct ContentView: View {
                 DetailPaneView(
                     workspace: workspace,
                     chromeState: chromeState,
+                    noteStore: noteStore,
                     includeLeadingPadding: isSidebarHidden
                 )
                     .ignoresSafeArea(.all, edges: .top)
@@ -217,6 +220,7 @@ struct ContentView: View {
         SidebarTabsView(
             workspace: workspace,
             chromeState: chromeState,
+            noteStore: noteStore,
             projectRoot: projectRoot,
             presentation: .docked,
             openProject: openProject
@@ -262,6 +266,7 @@ struct ContentView: View {
         SidebarTabsView(
             workspace: workspace,
             chromeState: chromeState,
+            noteStore: noteStore,
             projectRoot: projectRoot,
             presentation: .floating,
             openProject: openProject
@@ -451,11 +456,14 @@ private struct WindowConfigurator: NSViewRepresentable {
 private struct DetailPaneView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
     let includeLeadingPadding: Bool
 
     var body: some View {
         Group {
-            if let session = workspace.selectedSession {
+            if let note = selectedNote {
+                NoteDetailView(note: note, noteStore: noteStore)
+            } else if let session = workspace.selectedSession {
                 TerminalSceneView(session: session, chromeState: chromeState)
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
@@ -468,6 +476,104 @@ private struct DetailPaneView: View {
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
+        .onChange(of: noteStore.notes) { _, notes in
+            guard let selectedID = chromeState.selectedNoteID,
+                  !notes.contains(where: { $0.id == selectedID })
+            else { return }
+            chromeState.selectNote(id: nil)
+        }
+    }
+
+    private var selectedNote: ProjectNote? {
+        guard let selectedID = chromeState.selectedNoteID else { return nil }
+        return noteStore.notes.first { $0.id == selectedID }
+    }
+}
+
+private struct NoteDetailView: View {
+    let note: ProjectNote
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @Environment(\.colorScheme) private var colorScheme
+
+    @State private var draftTitle: String
+    @State private var draftMarkdown: String
+    @State private var pendingSave: Task<Void, Never>?
+
+    init(note: ProjectNote, noteStore: ProjectNoteStore) {
+        self.note = note
+        self.noteStore = noteStore
+        _draftTitle = State(initialValue: note.title)
+        _draftMarkdown = State(initialValue: note.markdown)
+    }
+
+    private var themeColors: TerminalThemeColors {
+        terminalSettings.ghosttyThemeColors(for: colorScheme)
+    }
+
+    private var themeBackground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.background) ?? .windowBackgroundColor)
+    }
+
+    private var themeForeground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("Untitled", text: $draftTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 26, weight: .bold))
+                    .foregroundStyle(themeForeground)
+                    .onSubmit { saveNow() }
+
+                Text("Edited \(note.updatedAt.formatted(.relative(presentation: .named)))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(themeForeground.opacity(0.45))
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 24)
+            .padding(.bottom, 14)
+
+            MarkdownSourceEditor(text: $draftMarkdown, themeColors: themeColors)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 14)
+        }
+        .frame(maxWidth: 820, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(themeBackground)
+        .onChange(of: draftTitle) { _, _ in scheduleSave() }
+        .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
+        .onChange(of: note.id) { _, _ in
+            pendingSave?.cancel()
+            draftTitle = note.title
+            draftMarkdown = note.markdown
+        }
+        .onChange(of: note.updatedAt) { _, _ in
+            guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
+            pendingSave?.cancel()
+            draftTitle = note.title
+            draftMarkdown = note.markdown
+        }
+        .onDisappear {
+            saveNow()
+        }
+    }
+
+    private func scheduleSave() {
+        pendingSave?.cancel()
+        pendingSave = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            saveNow()
+        }
+    }
+
+    private func saveNow() {
+        pendingSave?.cancel()
+        pendingSave = nil
+        guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
+        _ = try? noteStore.update(id: note.id, title: draftTitle, markdown: draftMarkdown)
     }
 }
 
@@ -1088,6 +1194,7 @@ private struct SidebarTabsView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
     let projectRoot: String?
     let presentation: SidebarPresentation
     let openProject: (CherryProject) -> Void
@@ -1099,6 +1206,7 @@ private struct SidebarTabsView: View {
                     SidebarAgentSessionSection(
                         settings: agentSettings,
                         workspace: workspace,
+                        chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
                         showShortcutHints: chromeState.isCommandKeyPressed,
@@ -1110,6 +1218,7 @@ private struct SidebarTabsView: View {
                         sessions: workspace.terminalSessions,
                         kind: .terminal,
                         workspace: workspace,
+                        chromeState: chromeState,
                         presentation: presentation,
                         shortcutStartIndex: workspace.agentSessions.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
@@ -1118,10 +1227,17 @@ private struct SidebarTabsView: View {
                     SidebarCommandSection(
                         settings: agentSettings,
                         workspace: workspace,
+                        chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
                         shortcutStartIndex: workspace.agentSessions.count + workspace.terminalSessions.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
+                    )
+
+                    SidebarNotesSection(
+                        noteStore: noteStore,
+                        chromeState: chromeState,
+                        presentation: presentation
                     )
                 }
                 // Keep the sidebar's text column aligned with the native
@@ -1316,6 +1432,7 @@ private struct SidebarAgentSessionSection: View {
 
     @ObservedObject var settings: AgentSettings
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
     let showShortcutHints: Bool
@@ -1354,7 +1471,7 @@ private struct SidebarAgentSessionSection: View {
                         presentation: presentation,
                         shortcutNumber: index + 1,
                         showShortcutHint: showShortcutHints,
-                        onSelect: { workspace.select(session) }
+                        onSelect: { select(session) }
                     )
                     .contextMenu {
                         Button("Rename...") {
@@ -1386,7 +1503,13 @@ private struct SidebarAgentSessionSection: View {
     private func launch(_ agent: ResolvedAgentTool) {
         let project = settings.resolvedProject(for: projectRoot)
         guard agent.isLaunchable, let root = project.validProjectRoot else { return }
+        chromeState.selectNote(id: nil)
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+    }
+
+    private func select(_ session: TerminalSession) {
+        chromeState.selectNote(id: nil)
+        workspace.select(session)
     }
 }
 
@@ -1433,6 +1556,7 @@ private struct SidebarCommandSection: View {
 
     @ObservedObject var settings: AgentSettings
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
     let shortcutStartIndex: Int
@@ -1486,6 +1610,7 @@ private struct SidebarCommandSection: View {
                         restart: { restart(command, existingSession: session) },
                         select: {
                             if let session {
+                                chromeState.selectNote(id: nil)
                                 workspace.select(session)
                             }
                         }
@@ -1577,12 +1702,15 @@ private struct SidebarCommandSection: View {
         guard command.isLaunchable, let root = settings.resolvedProject(for: projectRoot).validProjectRoot else { return }
         if let existingSession {
             if existingSession.isRunningCommand {
+                chromeState.selectNote(id: nil)
                 workspace.select(existingSession)
             } else {
                 existingSession.restart()
+                chromeState.selectNote(id: nil)
                 workspace.select(existingSession)
             }
         } else {
+            chromeState.selectNote(id: nil)
             workspace.addCommandSession(command: command, projectRoot: root)
         }
     }
@@ -1591,6 +1719,7 @@ private struct SidebarCommandSection: View {
         guard command.isLaunchable else { return }
         if let existingSession {
             existingSession.restart()
+            chromeState.selectNote(id: nil)
             workspace.select(existingSession)
         } else {
             start(command, existingSession: nil)
@@ -1606,6 +1735,105 @@ private struct SidebarCommandSection: View {
         if let projectRoot {
             settings.removeCommand(named: command.name, for: projectRoot)
         }
+    }
+}
+
+private struct SidebarNotesSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let presentation: SidebarPresentation
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            presentation: presentation
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                SidebarSectionHeader(title: "Notes", count: noteStore.notes.count, palette: palette)
+
+                Button(action: createNote) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.headerText)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("New note")
+            }
+
+            if noteStore.notes.isEmpty {
+                SidebarEmptyRow(title: "No notes", palette: palette)
+            } else {
+                ForEach(noteStore.notes) { note in
+                    Button {
+                        chromeState.selectNote(id: note.id)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "note.text")
+                                .font(.system(size: 13, weight: .regular))
+                                .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
+                                .frame(width: 18)
+
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(note.title.isEmpty ? "Untitled Note" : note.title)
+                                    .font(.system(size: 15, weight: .regular))
+                                    .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
+                                    .lineLimit(1)
+
+                                Text(note.updatedAt, style: .relative)
+                                    .font(.system(size: 11, weight: .regular))
+                                    .foregroundStyle((isSelected(note) ? palette.selectedText : palette.rowText).opacity(0.56))
+                                    .lineLimit(1)
+                            }
+
+                            Spacer(minLength: 8)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(height: 46)
+                        .padding(.leading, SidebarLayout.rowHorizontalInset)
+                        .padding(.trailing, SidebarLayout.rowHorizontalInset)
+                        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .background {
+                            if isSelected(note) {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(palette.selectedFill)
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                                    }
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.leading, -SidebarLayout.rowHorizontalInset)
+                    .contextMenu {
+                        Button("Delete", role: .destructive) {
+                            try? noteStore.delete(id: note.id)
+                            if chromeState.selectedNoteID == note.id {
+                                chromeState.selectNote(id: nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func createNote() {
+        if let note = try? noteStore.create(title: "Untitled Note", markdown: "# Untitled Note\n") {
+            chromeState.selectNote(id: note.id)
+        }
+    }
+
+    private func isSelected(_ note: ProjectNote) -> Bool {
+        chromeState.selectedNoteID == note.id
     }
 }
 
@@ -1774,6 +2002,7 @@ private struct SidebarSessionSection: View {
     let sessions: [TerminalSession]
     let kind: TerminalSession.SessionKind
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let presentation: SidebarPresentation
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
@@ -1798,7 +2027,10 @@ private struct SidebarSessionSection: View {
                     presentation: presentation,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
-                    onSelect: { workspace.select(session) }
+                    onSelect: {
+                        chromeState.selectNote(id: nil)
+                        workspace.select(session)
+                    }
                 )
                 .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
                 .zIndex(draggedSessionID == session.id ? 1 : 0)
@@ -1839,6 +2071,7 @@ private struct SidebarSessionSection: View {
                     },
                     onSelect: { sessionID in
                         guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else { return }
+                        chromeState.selectNote(id: nil)
                         workspace.select(session)
                     },
                     onDragChanged: { sessionID, offsetY in

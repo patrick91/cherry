@@ -4,7 +4,11 @@ import Foundation
 
 final class CherryControlServer: @unchecked Sendable {
     private weak var workspace: TerminalWorkspace?
+    private weak var noteStore: ProjectNoteStore?
+    private weak var chromeState: ProjectWindowChromeState?
     private let workspaceProvider: @MainActor () -> TerminalWorkspace?
+    private let noteStoreProvider: @MainActor () -> ProjectNoteStore?
+    private let chromeStateProvider: @MainActor () -> ProjectWindowChromeState?
     private let agentSettings: AgentSettings
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
@@ -14,11 +18,17 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     init(
         workspace: TerminalWorkspace,
+        noteStore: ProjectNoteStore? = nil,
+        chromeState: ProjectWindowChromeState? = nil,
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared
     ) {
         self.workspace = workspace
+        self.noteStore = noteStore
+        self.chromeState = chromeState
         self.workspaceProvider = { workspace }
+        self.noteStoreProvider = { noteStore }
+        self.chromeStateProvider = { chromeState }
         self.agentSettings = agentSettings
         self.socketURL = socketURL
     }
@@ -26,11 +36,21 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     init(
         workspaceProvider: @escaping @MainActor () -> TerminalWorkspace?,
+        noteStoreProvider: @escaping @MainActor () -> ProjectNoteStore? = {
+            ProjectWindowRegistry.shared.activeNoteStore
+        },
+        chromeStateProvider: @escaping @MainActor () -> ProjectWindowChromeState? = {
+            ProjectWindowRegistry.shared.activeChromeState
+        },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared
     ) {
         self.workspace = nil
+        self.noteStore = nil
+        self.chromeState = nil
         self.workspaceProvider = workspaceProvider
+        self.noteStoreProvider = noteStoreProvider
+        self.chromeStateProvider = chromeStateProvider
         self.agentSettings = agentSettings
         self.socketURL = socketURL
     }
@@ -196,6 +216,9 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listTerminals(listTerminals(workspace: workspace)))
         case .listAgents:
             return .init(result: .listAgents(listAgents(workspace: workspace)))
+        case .listNotes:
+            let noteStore = try activeNoteStore(for: workspace)
+            return .init(result: .listNotes(listNotes(noteStore: noteStore)))
         case .createTerminal(let request):
             let session = workspace.addSession(
                 title: request.title,
@@ -239,6 +262,46 @@ final class CherryControlServer: @unchecked Sendable {
                 sentBytes: payload?.count ?? 0,
                 output: output
             )))
+        case .createNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let note = try noteStore.create(title: request.title, markdown: request.markdown)
+            if request.open ?? true {
+                select(note: note)
+            }
+            let selected = activeChromeState()?.selectedNoteID == note.id
+            return .init(result: .createNote(.init(note: note, selected: selected)))
+        case .getNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let note = try noteStore.note(id: try noteID(from: request.noteID))
+            let selected = activeChromeState()?.selectedNoteID == note.id
+            return .init(result: .getNote(.init(note: note, selected: selected)))
+        case .updateNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let note = try noteStore.update(
+                id: try noteID(from: request.noteID),
+                title: request.title,
+                markdown: request.markdown
+            )
+            if request.open ?? false {
+                select(note: note)
+            }
+            return .init(result: .updateNote(.init(
+                note: note,
+                selected: activeChromeState()?.selectedNoteID == note.id
+            )))
+        case .deleteNote(let request):
+            let id = try noteID(from: request.noteID)
+            let noteStore = try activeNoteStore(for: workspace)
+            try noteStore.delete(id: id)
+            if activeChromeState()?.selectedNoteID == id {
+                activeChromeState()?.selectNote(id: nil)
+            }
+            return .init(result: .deleteNote(.init(noteID: id.uuidString, deleted: true)))
+        case .selectNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let note = try noteStore.note(id: try noteID(from: request.noteID))
+            select(note: note)
+            return .init(result: .selectNote(.init(noteID: note.id.uuidString, selected: true)))
         case .renameTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             session.rename(to: request.title)
@@ -246,6 +309,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
+            activeChromeState()?.selectNote(id: nil)
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -330,6 +394,25 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func listNotes(noteStore: ProjectNoteStore) -> ListNotesResult {
+        ListNotesResult(
+            activeProjectRoot: noteStore.projectRoot,
+            notes: noteStore.notes.map(noteInfo),
+            selectedNoteID: activeChromeState()?.selectedNoteID?.uuidString
+        )
+    }
+
+    private func noteInfo(_ note: ProjectNote) -> NoteInfo {
+        NoteInfo(
+            id: note.id.uuidString,
+            projectRoot: note.projectRoot,
+            title: note.title,
+            createdAt: note.createdAt,
+            updatedAt: note.updatedAt
+        )
+    }
+
+    @MainActor
     private func findAgent(named requestedName: String) throws -> ResolvedAgentTool {
         let normalizedName = AgentToolDefinition.normalizedName(requestedName)
         guard let agent = agentSettings.resolvedAgents.first(where: { $0.definition.normalizedName == normalizedName }) else {
@@ -344,6 +427,34 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
         }
         return session
+    }
+
+    @MainActor
+    private func activeNoteStore(for workspace: TerminalWorkspace) throws -> ProjectNoteStore {
+        guard let projectRoot = workspace.projectRoot else {
+            throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+        }
+        guard let store = noteStore ?? noteStoreProvider(), store.projectRoot == projectRoot else {
+            throw CherryControlError(code: "notes_unavailable", message: "Cherry notes are unavailable for the active project.")
+        }
+        return store
+    }
+
+    @MainActor
+    private func activeChromeState() -> ProjectWindowChromeState? {
+        chromeState ?? chromeStateProvider()
+    }
+
+    @MainActor
+    private func select(note: ProjectNote) {
+        activeChromeState()?.selectNote(id: note.id)
+    }
+
+    private func noteID(from value: String) throws -> UUID {
+        guard let id = UUID(uuidString: value) else {
+            throw CherryControlError(code: "invalid_note_id", message: "Note id is not a valid UUID: \(value)")
+        }
+        return id
     }
 
     @MainActor

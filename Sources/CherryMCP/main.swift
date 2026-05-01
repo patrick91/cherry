@@ -38,6 +38,50 @@ private enum CherryMCPTools {
             properties: [:]
         ),
         tool(
+            "list_notes",
+            "List Cherry notes for the active project.",
+            properties: [:]
+        ),
+        tool(
+            "create_note",
+            "Create a project-scoped Markdown note in Cherry. Opens the note for review by default.",
+            properties: [
+                "title": string("Note title."),
+                "markdown": string("Markdown content."),
+                "open": boolean("Whether Cherry should open the note after creating it. Defaults to true.")
+            ],
+            required: ["title", "markdown"]
+        ),
+        tool(
+            "get_note",
+            "Read a Cherry Markdown note.",
+            properties: ["note_id": string("Cherry note UUID.")],
+            required: ["note_id"]
+        ),
+        tool(
+            "update_note",
+            "Update a Cherry Markdown note title and/or content.",
+            properties: [
+                "note_id": string("Cherry note UUID."),
+                "title": string("Optional replacement title."),
+                "markdown": string("Optional replacement Markdown content."),
+                "open": boolean("Whether Cherry should open the note after updating it. Defaults to false.")
+            ],
+            required: ["note_id"]
+        ),
+        tool(
+            "delete_note",
+            "Delete a Cherry Markdown note.",
+            properties: ["note_id": string("Cherry note UUID.")],
+            required: ["note_id"]
+        ),
+        tool(
+            "select_note",
+            "Open an existing Cherry Markdown note for review/editing.",
+            properties: ["note_id": string("Cherry note UUID.")],
+            required: ["note_id"]
+        ),
+        tool(
             "create_terminal",
             "Create and select a new visible Cherry terminal tab.",
             properties: [
@@ -171,6 +215,27 @@ private enum CherryMCPTools {
             return .listTerminals
         case "list_agents":
             return .listAgents
+        case "list_notes":
+            return .listNotes
+        case "create_note":
+            return .createNote(.init(
+                title: try requiredString("title", in: arguments),
+                markdown: try requiredString("markdown", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "get_note":
+            return .getNote(.init(noteID: try requiredString("note_id", in: arguments)))
+        case "update_note":
+            return .updateNote(.init(
+                noteID: try requiredString("note_id", in: arguments),
+                title: stringArgument("title", in: arguments),
+                markdown: stringArgument("markdown", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "delete_note":
+            return .deleteNote(.init(noteID: try requiredString("note_id", in: arguments)))
+        case "select_note":
+            return .selectNote(.init(noteID: try requiredString("note_id", in: arguments)))
         case "create_terminal":
             return .createTerminal(.init(
                 title: stringArgument("title", in: arguments),
@@ -245,9 +310,21 @@ private enum CherryMCPTools {
             return try encodedResult(payload)
         case .listAgents(let payload):
             return try encodedResult(payload)
+        case .listNotes(let payload):
+            return try encodedResult(payload)
         case .createTerminal(let payload):
             return try encodedResult(payload)
         case .runAgent(let payload):
+            return try encodedResult(payload)
+        case .createNote(let payload):
+            return try encodedResult(payload)
+        case .getNote(let payload):
+            return try encodedResult(payload)
+        case .updateNote(let payload):
+            return try encodedResult(payload)
+        case .deleteNote(let payload):
+            return try encodedResult(payload)
+        case .selectNote(let payload):
             return try encodedResult(payload)
         case .renameTerminal(let payload):
             return try encodedResult(payload)

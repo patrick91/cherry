@@ -7,11 +7,21 @@ final class ProjectWindowRegistry {
 
     private var windows: [String: WeakWindow] = [:]
     weak var activeWorkspace: TerminalWorkspace?
+    weak var activeNoteStore: ProjectNoteStore?
+    weak var activeChromeState: ProjectWindowChromeState?
 
     private init() {}
 
-    func register(window: NSWindow, projectRoot: String?, workspace: TerminalWorkspace) {
+    func register(
+        window: NSWindow,
+        projectRoot: String?,
+        workspace: TerminalWorkspace,
+        noteStore: ProjectNoteStore?,
+        chromeState: ProjectWindowChromeState?
+    ) {
         activeWorkspace = workspace
+        activeNoteStore = noteStore
+        activeChromeState = chromeState
         guard let projectRoot else { return }
         windows[projectRoot] = WeakWindow(window)
     }
@@ -49,6 +59,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
     @Published var isCommandKeyPressed = false
+    @Published var selectedNoteID: UUID?
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.
@@ -97,6 +108,10 @@ final class ProjectWindowChromeState: ObservableObject {
         isCommandPalettePresented = true
     }
 
+    func selectNote(id: UUID?) {
+        selectedNoteID = id
+    }
+
     // Wraps the docked-sidebar resize animation with a start/end signal so the
     // terminal can apply its resize strategy. The terminal listens to
     // `isSidebarAnimating` via the chrome state and freezes its `fitToSize`
@@ -121,11 +136,15 @@ final class ProjectWindowChromeState: ObservableObject {
 struct ProjectWindowBinder: NSViewRepresentable {
     let projectRoot: String?
     let workspace: TerminalWorkspace
+    let noteStore: ProjectNoteStore?
+    let chromeState: ProjectWindowChromeState?
 
     func makeNSView(context: Context) -> NSView {
         let view = ProjectWindowBinderView()
         view.projectRoot = projectRoot
         view.workspace = workspace
+        view.noteStore = noteStore
+        view.chromeState = chromeState
         return view
     }
 
@@ -133,6 +152,8 @@ struct ProjectWindowBinder: NSViewRepresentable {
         guard let view = nsView as? ProjectWindowBinderView else { return }
         view.projectRoot = projectRoot
         view.workspace = workspace
+        view.noteStore = noteStore
+        view.chromeState = chromeState
         view.registerIfPossible()
     }
 }
@@ -140,6 +161,8 @@ struct ProjectWindowBinder: NSViewRepresentable {
 @MainActor
 private final class ProjectWindowBinderView: NSView {
     weak var workspace: TerminalWorkspace?
+    weak var noteStore: ProjectNoteStore?
+    weak var chromeState: ProjectWindowChromeState?
     weak var boundWindow: NSWindow?
     var projectRoot: String?
     private nonisolated(unsafe) var notificationObserver: NSObjectProtocol?
@@ -153,7 +176,13 @@ private final class ProjectWindowBinderView: NSView {
     func registerIfPossible() {
         guard let window, let workspace else { return }
         boundWindow = window
-        ProjectWindowRegistry.shared.register(window: window, projectRoot: projectRoot, workspace: workspace)
+        ProjectWindowRegistry.shared.register(
+            window: window,
+            projectRoot: projectRoot,
+            workspace: workspace,
+            noteStore: noteStore,
+            chromeState: chromeState
+        )
     }
 
     private func installObserver() {
@@ -171,6 +200,8 @@ private final class ProjectWindowBinderView: NSView {
             Task { @MainActor [weak self] in
                 guard let self, let workspace = self.workspace else { return }
                 ProjectWindowRegistry.shared.activeWorkspace = workspace
+                ProjectWindowRegistry.shared.activeNoteStore = self.noteStore
+                ProjectWindowRegistry.shared.activeChromeState = self.chromeState
             }
         }
     }

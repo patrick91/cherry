@@ -34,6 +34,7 @@ struct TerminalThemeColors: Equatable {
     let background: String
     let foreground: String
     let selectionBackground: String?
+    let palette: [Int: String]
 }
 
 @MainActor
@@ -133,7 +134,8 @@ final class TerminalSettings: ObservableObject {
         return TerminalThemeColors(
             background: theme.background,
             foreground: theme.foreground,
-            selectionBackground: theme.selectionBackground
+            selectionBackground: theme.selectionBackground,
+            palette: theme.palette
         )
     }
 

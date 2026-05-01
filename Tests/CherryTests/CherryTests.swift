@@ -48,6 +48,47 @@ import Testing
     #expect(decoded == request)
 }
 
+@Test func cherryControlNoteRequestsRoundTrip() async throws {
+    let noteID = UUID().uuidString
+    let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review", open: true))
+    let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item", open: false))
+    let get = CherryControlRequest.getNote(.init(noteID: noteID))
+    let delete = CherryControlRequest.deleteNote(.init(noteID: noteID))
+    let select = CherryControlRequest.selectNote(.init(noteID: noteID))
+
+    for request in [create, update, get, delete, select] {
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+        #expect(decoded == request)
+    }
+}
+
+@MainActor
+@Test func projectNoteStorePersistsProjectNotes() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    let note = try store.create(title: " Review ", markdown: "# Review")
+    _ = try store.update(id: note.id, title: "Updated", markdown: "- done")
+
+    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    #expect(reloaded.notes.count == 1)
+    #expect(reloaded.notes[0].id == note.id)
+    #expect(reloaded.notes[0].title == "Updated")
+    #expect(reloaded.notes[0].markdown == "- done")
+
+    try reloaded.delete(id: note.id)
+    #expect(ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot).notes.isEmpty)
+}
+
 @MainActor
 @Test func controlServerListsConfiguredAgents() async throws {
     let harness = try ControlServerHarness()
@@ -132,6 +173,70 @@ import Testing
     #expect(firstResult.title == "Echo")
     #expect(secondResult.title == "Echo")
     #expect(harness.workspace.agentSessions.map(\.title) == ["Echo", "Echo"])
+}
+
+@MainActor
+@Test func controlServerManagesProjectNotes() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    harness.server.start()
+
+    let createResponse = try await harness.send(.createNote(.init(
+        title: "Review Notes",
+        markdown: "# Findings",
+        open: true
+    )))
+    guard case .createNote(let created)? = createResponse.result else {
+        Issue.record("Expected createNote result, got \(String(describing: createResponse))")
+        return
+    }
+
+    #expect(createResponse.error == nil)
+    #expect(created.note.title == "Review Notes")
+    #expect(created.note.markdown == "# Findings")
+    #expect(created.selected == true)
+    #expect(harness.chromeState.selectedNoteID == created.note.id)
+
+    let listResponse = try await harness.send(.listNotes)
+    guard case .listNotes(let list)? = listResponse.result else {
+        Issue.record("Expected listNotes result, got \(String(describing: listResponse))")
+        return
+    }
+    #expect(list.activeProjectRoot == harness.projectRoot.path)
+    #expect(list.notes.map(\.id) == [created.note.id.uuidString])
+    #expect(list.selectedNoteID == created.note.id.uuidString)
+
+    let updateResponse = try await harness.send(.updateNote(.init(
+        noteID: created.note.id.uuidString,
+        title: "Updated",
+        markdown: "- done",
+        open: false
+    )))
+    guard case .updateNote(let updated)? = updateResponse.result else {
+        Issue.record("Expected updateNote result, got \(String(describing: updateResponse))")
+        return
+    }
+    #expect(updated.note.title == "Updated")
+    #expect(updated.note.markdown == "- done")
+    #expect(updated.selected == true)
+
+    let getResponse = try await harness.send(.getNote(.init(noteID: created.note.id.uuidString)))
+    guard case .getNote(let fetched)? = getResponse.result else {
+        Issue.record("Expected getNote result, got \(String(describing: getResponse))")
+        return
+    }
+    #expect(fetched.note == updated.note)
+
+    let deleteResponse = try await harness.send(.deleteNote(.init(noteID: created.note.id.uuidString)))
+    guard case .deleteNote(let deleted)? = deleteResponse.result else {
+        Issue.record("Expected deleteNote result, got \(String(describing: deleteResponse))")
+        return
+    }
+    #expect(deleted.deleted == true)
+    #expect(harness.noteStore.notes.isEmpty)
+    #expect(harness.chromeState.selectedNoteID == nil)
 }
 
 @MainActor
@@ -1155,7 +1260,10 @@ private final class ControlServerHarness {
     let defaults: UserDefaults
     let settings: AgentSettings
     let projectRoot: URL
+    let notesRoot: URL
     let workspace: TerminalWorkspace
+    let noteStore: ProjectNoteStore
+    let chromeState: ProjectWindowChromeState
     let socketURL: URL
     let server: CherryControlServer
 
@@ -1166,6 +1274,8 @@ private final class ControlServerHarness {
         projectRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        notesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CherryControlNotes-\(UUID().uuidString)", isDirectory: true)
 
         let socketDirectory = URL(
             fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
@@ -1176,7 +1286,15 @@ private final class ControlServerHarness {
         settings = AgentSettings(defaults: defaults)
         _ = settings.addProject(path: projectRoot.path)
         workspace = TerminalWorkspace(projectRoot: projectRoot.path)
-        server = CherryControlServer(workspace: workspace, socketURL: socketURL, agentSettings: settings)
+        noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
+        chromeState = ProjectWindowChromeState()
+        server = CherryControlServer(
+            workspace: workspace,
+            noteStore: noteStore,
+            chromeState: chromeState,
+            socketURL: socketURL,
+            agentSettings: settings
+        )
     }
 
     func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
@@ -1188,6 +1306,7 @@ private final class ControlServerHarness {
         workspace.sessions.forEach { $0.stop() }
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: notesRoot)
         try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
     }
 

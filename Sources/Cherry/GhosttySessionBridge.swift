@@ -814,6 +814,15 @@ final class GhosttyTerminalContainerView: NSView {
             return true
         }
 
+        if let sequence = TerminalInputEncoder.appKitOptionBackspaceSequence(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags
+        ) {
+            activeBridge?.scrollToBottomForHostInput()
+            activeSession.send(data: sequence)
+            return true
+        }
+
         if let sequence = TerminalInputEncoder.appKitOptionArrowSequence(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags,

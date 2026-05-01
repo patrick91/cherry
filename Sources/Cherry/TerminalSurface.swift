@@ -10,6 +10,7 @@ enum TerminalInputEncoder {
     private static let returnKeyCode: UInt16 = 36
     private static let keypadEnterKeyCode: UInt16 = 76
     private static let tabKeyCode: UInt16 = 48
+    private static let backspaceKeyCode: UInt16 = 51
     private static let appKitLeftArrowKeyCode: UInt16 = 0x7B
     private static let appKitRightArrowKeyCode: UInt16 = 0x7C
     private static let appKitDownArrowKeyCode: UInt16 = 0x7D
@@ -46,6 +47,8 @@ enum TerminalInputEncoder {
             return Data("\u{1B}b".utf8)
         case #selector(NSResponder.moveWordRight(_:)):
             return Data("\u{1B}f".utf8)
+        case #selector(NSResponder.deleteWordBackward(_:)):
+            return Data([0x1B, 0x7F])
         case #selector(NSResponder.pageUp(_:)):
             return Data("\u{1B}[5~".utf8)
         case #selector(NSResponder.pageDown(_:)):
@@ -155,6 +158,23 @@ enum TerminalInputEncoder {
         }
 
         return Data("\u{1B}[1;3\(suffix)".utf8)
+    }
+
+    static func appKitOptionBackspaceSequence(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Data? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.option),
+              !modifiers.contains(.shift),
+              !modifiers.contains(.control),
+              !modifiers.contains(.command),
+              keyCode == backspaceKeyCode
+        else {
+            return nil
+        }
+
+        return Data([0x1B, 0x7F])
     }
 
     static func shiftEnterSequence(

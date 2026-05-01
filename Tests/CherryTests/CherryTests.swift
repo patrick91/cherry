@@ -1890,6 +1890,20 @@ private final class ControlServerHarness {
     ) == Data("\u{1B}[1;3A".utf8))
 }
 
+@Test func appKitOptionBackspaceUsesShellWordDeleteSequence() async throws {
+    #expect(TerminalInputEncoder.appKitOptionBackspaceSequence(
+        keyCode: 51,
+        modifiers: .option
+    ) == Data([0x1B, 0x7F]))
+    #expect(TerminalInputEncoder.appKitOptionBackspaceSequence(
+        keyCode: 51,
+        modifiers: [.option, .shift]
+    ) == nil)
+    #expect(TerminalInputEncoder.commandSequence(
+        for: #selector(NSResponder.deleteWordBackward(_:))
+    ) == Data([0x1B, 0x7F]))
+}
+
 @Test func pastedTextNormalizesLineEndings() async throws {
     let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
 

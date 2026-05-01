@@ -112,7 +112,8 @@ struct ContentView: View {
                     workspace: workspace,
                     selectedProjectRoot: projectRoot,
                     isPresented: $chromeState.isCommandPalettePresented,
-                    openProject: openProject
+                    openProject: openProject,
+                    restoreFocus: restoreTerminalFocus
                 )
                 .zIndex(2_000)
             }
@@ -144,6 +145,7 @@ struct ContentView: View {
         }
         .background(AppShortcutMonitor(
             workspace: workspace,
+            chromeState: chromeState,
             projectRoot: projectRoot,
             openSettings: { openSettings() }
         ))
@@ -202,6 +204,12 @@ struct ContentView: View {
                 floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
                 sidebarWidth: sidebarWidth
             )
+        }
+    }
+
+    private func restoreTerminalFocus() {
+        DispatchQueue.main.async {
+            workspace.selectedSession?.ghosttyBridge.focus(in: NSApp.keyWindow)
         }
     }
 
@@ -636,6 +644,7 @@ private struct CommandPaletteOverlay: View {
     let selectedProjectRoot: String?
     @Binding var isPresented: Bool
     let openProject: (CherryProject) -> Void
+    let restoreFocus: () -> Void
 
     @State private var mode = CommandPaletteMode.commands
     @State private var query = ""
@@ -948,6 +957,7 @@ private struct CommandPaletteOverlay: View {
 
     private func dismiss() {
         isPresented = false
+        restoreFocus()
     }
 }
 

@@ -5,6 +5,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @ObservedObject private var agentSettings = AgentSettings.shared
 
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let openSettings: () -> Void
 
@@ -15,6 +16,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             workspace: workspace,
+            chromeState: chromeState,
             visibleCommandNames: visibleCommandNames,
             openSettings: openSettings
         )
@@ -28,6 +30,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
+        context.coordinator.chromeState = chromeState
         context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
@@ -45,6 +48,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         weak var workspace: TerminalWorkspace?
+        weak var chromeState: ProjectWindowChromeState?
         var visibleCommandNames: [String]
         var openSettings: () -> Void
         weak var window: NSWindow?
@@ -52,10 +56,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
         init(
             workspace: TerminalWorkspace,
+            chromeState: ProjectWindowChromeState,
             visibleCommandNames: [String],
             openSettings: @escaping () -> Void
         ) {
             self.workspace = workspace
+            self.chromeState = chromeState
             self.visibleCommandNames = visibleCommandNames
             self.openSettings = openSettings
             install()
@@ -98,6 +104,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard modifiers == .command else { return false }
 
             switch event.charactersIgnoringModifiers?.lowercased() {
+            case "p":
+                chromeState?.presentCommandPalette()
+                return true
             case "t":
                 workspace?.addSession()
                 return true

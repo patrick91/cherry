@@ -196,6 +196,180 @@ final class ShellProcessController: @unchecked Sendable {
 
     static let defaultShellName = URL(fileURLWithPath: defaultShellPath).lastPathComponent
 
+    struct TerminfoSelection {
+        let term: String
+        // Colon-separated dir list to prepend to the child PTY's
+        // TERMINFO_DIRS so the spawned shell resolves the same terminfo
+        // entry the parent probe found.
+        let additionalDirs: String?
+    }
+
+    // Cherry's emulator implements the Kitty keyboard protocol, so we want a
+    // TERM that advertises it. TUIs like Claude Code probe terminfo to decide
+    // whether to push enhanced keyboard mode; "xterm-256color" doesn't say
+    // yes, which is why Shift+Enter would otherwise just be a bare \r.
+    static let preferredTerminfo: TerminfoSelection = resolvePreferredTerminfo()
+
+    private static let terminfoCandidates = ["xterm-ghostty", "xterm-kitty"]
+
+    private static func resolvePreferredTerminfo() -> TerminfoSelection {
+        for name in terminfoCandidates where isTerminfoEntryAvailable(name, environment: nil) {
+            return TerminfoSelection(term: name, additionalDirs: nil)
+        }
+
+        // Bundled apps launched from the Dock don't inherit the user's
+        // TERMINFO_DIRS, so re-probe through a login shell to pick it up
+        // (e.g. Nix-installed Ghostty exports its terminfo dir from .zshenv).
+        if let probe = loginShellTerminfoProbe() {
+            return TerminfoSelection(term: probe.name, additionalDirs: probe.terminfoDirs)
+        }
+
+        return TerminfoSelection(term: "xterm-256color", additionalDirs: nil)
+    }
+
+    private static func isTerminfoEntryAvailable(_ name: String, environment: [String: String]?) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/infocmp")
+        process.arguments = [name]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        if let environment {
+            process.environment = environment
+        }
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private static func loginShellTerminfoProbe() -> (name: String, terminfoDirs: String?)? {
+        let shellPath = defaultShellPath
+        guard FileManager.default.isExecutableFile(atPath: shellPath) else { return nil }
+
+        let probeScript = """
+        printf 'TERMINFO_DIRS=%s\\n' "${TERMINFO_DIRS-}"
+        for candidate in \(terminfoCandidates.joined(separator: " ")); do
+          if /usr/bin/infocmp "$candidate" >/dev/null 2>&1; then
+            printf 'MATCH=%s\\n' "$candidate"
+            exit 0
+          fi
+        done
+        exit 1
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shellPath)
+        process.arguments = ["-l", "-c", probeScript]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.environment = ProcessInfo.processInfo.environment
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        guard let data = readProbeOutput(
+            from: pipe.fileHandleForReading,
+            process: process,
+            timeout: 2
+        ) else {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+
+        let output = String(data: data, encoding: .utf8) ?? ""
+        var matched: String?
+        var terminfoDirs: String?
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("MATCH=") {
+                matched = String(line.dropFirst("MATCH=".count))
+            } else if line.hasPrefix("TERMINFO_DIRS=") {
+                let value = String(line.dropFirst("TERMINFO_DIRS=".count))
+                terminfoDirs = value.isEmpty ? nil : value
+            }
+        }
+        guard let matched else { return nil }
+        return (matched, terminfoDirs)
+    }
+
+    private static func readProbeOutput(
+        from handle: FileHandle,
+        process: Process,
+        timeout: TimeInterval
+    ) -> Data? {
+        let fd = handle.fileDescriptor
+        let originalFlags = fcntl(fd, F_GETFL)
+        if originalFlags >= 0 {
+            _ = fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK)
+        }
+        defer {
+            if originalFlags >= 0 {
+                _ = fcntl(fd, F_SETFL, originalFlags)
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var output = Data()
+
+        while process.isRunning {
+            drainAvailableProbeOutput(from: fd, into: &output)
+            if Date() >= deadline {
+                process.terminate()
+                let terminateDeadline = Date().addingTimeInterval(0.2)
+                while process.isRunning, Date() < terminateDeadline {
+                    usleep(10_000)
+                }
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+                process.waitUntilExit()
+                return nil
+            }
+            usleep(10_000)
+        }
+
+        drainAvailableProbeOutput(from: fd, into: &output)
+        return output
+    }
+
+    private static func drainAvailableProbeOutput(from fd: Int32, into output: inout Data) {
+        let maximumProbeOutputBytes = 64 * 1024
+        var buffer = [UInt8](repeating: 0, count: 4096)
+
+        while true {
+            let byteCount = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.read(fd, baseAddress, rawBuffer.count)
+            }
+
+            if byteCount > 0 {
+                let availableCapacity = max(0, maximumProbeOutputBytes - output.count)
+                if availableCapacity > 0 {
+                    output.append(contentsOf: buffer.prefix(min(byteCount, availableCapacity)))
+                }
+                continue
+            }
+
+            if byteCount == 0 {
+                return
+            }
+
+            let readError = errno
+            if readError == EINTR {
+                continue
+            }
+            return
+        }
+    }
+
     private let configuration: Configuration
     private let onData: (Data) -> Void
     private let onExit: (Int32) -> Void
@@ -395,6 +569,13 @@ final class ShellProcessController: @unchecked Sendable {
         let startupCommand = configuration.startupCommand
         let originalZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
         let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
+        let extraTerminfoDirs = Self.preferredTerminfo.additionalDirs
+        let inheritedTerminfoDirs = ProcessInfo.processInfo.environment["TERMINFO_DIRS"]
+        let mergedTerminfoDirs: String? = {
+            guard let extraTerminfoDirs, !extraTerminfoDirs.isEmpty else { return nil }
+            guard let inheritedTerminfoDirs, !inheritedTerminfoDirs.isEmpty else { return extraTerminfoDirs }
+            return "\(extraTerminfoDirs):\(inheritedTerminfoDirs)"
+        }()
 
         let pid = forkpty(&master, nil, nil, &size)
         if pid < 0 {
@@ -404,6 +585,9 @@ final class ShellProcessController: @unchecked Sendable {
         if pid == 0 {
             _ = chdir(workingDirectory)
             _ = setenv("TERM", term, 1)
+            if let mergedTerminfoDirs {
+                _ = setenv("TERMINFO_DIRS", mergedTerminfoDirs, 1)
+            }
             // Keep PWD aligned with the inherited cwd, matching Ghostty's
             // launch behavior so shells preserve user-facing directory text.
             _ = setenv("PWD", workingDirectory, 1)

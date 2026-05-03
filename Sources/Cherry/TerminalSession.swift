@@ -1270,7 +1270,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 configuration: .init(
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
-                    term: "xterm-256color",
+                    term: ShellProcessController.preferredTerminfo.term,
                     initialSize: viewportSize,
                     startupCommand: launchCommand
                 ),

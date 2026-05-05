@@ -1464,9 +1464,13 @@ final class TerminalSession: ObservableObject, Identifiable {
                 didChange = true
 
             case .workingDirectory(let nextWorkingDirectory):
-                guard workingDirectory != nextWorkingDirectory else { continue }
-                workingDirectory = nextWorkingDirectory
-                didChange = true
+                if workingDirectory != nextWorkingDirectory {
+                    workingDirectory = nextWorkingDirectory
+                    didChange = true
+                }
+                if restoreShellTitle(from: nextWorkingDirectory) {
+                    didChange = true
+                }
 
             case .notification(let notification):
                 handleTerminalNotification(notification)
@@ -1534,6 +1538,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         if titleSource == .system {
             title = trimmedTitle
         }
+    }
+
+    private func restoreShellTitle(from workingDirectory: String) -> Bool {
+        guard kind != .agent else { return false }
+
+        let shellTitle = NSString(string: workingDirectory).abbreviatingWithTildeInPath
+        guard systemTitle != shellTitle else { return false }
+        updateSystemTitle(shellTitle)
+        return true
     }
 
     private func scheduleSummaryIfNeeded() {

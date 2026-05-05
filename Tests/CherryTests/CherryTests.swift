@@ -329,6 +329,24 @@ import Testing
 }
 
 @MainActor
+@Test func terminalSessionRestoresShellTitleFromCwdReport() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        workingDirectory: "/tmp/cherry",
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data("\u{1B}]2;config (~/.aws) - Nvim\u{7}".utf8))
+    #expect(session.title == "config (~/.aws) - Nvim")
+
+    session.ingestTestingData(Data("\u{1B}]7;kitty-shell-cwd://localhost/tmp/cherry\u{7}".utf8))
+    #expect(session.title == "/tmp/cherry")
+    #expect(session.workingDirectory == "/tmp/cherry")
+}
+
+@MainActor
 @Test func terminalSessionTracksNotificationMetadata() async throws {
     TerminalNotificationCenter.shared.isDeliveryEnabled = false
     defer {

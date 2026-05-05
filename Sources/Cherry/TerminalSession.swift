@@ -1121,7 +1121,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     var sidebarDetail: String {
-        return summary?.nilIfEmpty ?? subtitle
+        if let summary = summary?.nilIfEmpty {
+            return summary
+        }
+
+        guard kind != .terminal else { return "" }
+        return subtitle
     }
 
     func snapshot(range: Range<Int>) -> [String] {

@@ -468,6 +468,18 @@ import Testing
 }
 
 @MainActor
+@Test func terminalSidebarOmitsGenericShellSubtitle() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "zsh login shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    #expect(session.sidebarDetail == "")
+}
+
+@MainActor
 @Test func terminalSessionTracksEnhancedKeyboardProtocol() async throws {
     let session = TerminalSession(
         title: "Shell 1",

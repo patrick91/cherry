@@ -591,7 +591,11 @@ final class ShellProcessController: @unchecked Sendable {
             // Keep PWD aligned with the inherited cwd, matching Ghostty's
             // launch behavior so shells preserve user-facing directory text.
             _ = setenv("PWD", workingDirectory, 1)
-            _ = setenv("TERM_PROGRAM", "Cherry", 1)
+            // Cherry embeds Ghostty's terminal core; advertise that
+            // compatibility so TUIs choose richer terminal protocols such as
+            // OSC 9 notifications instead of falling back to a bare BEL.
+            _ = setenv("TERM_PROGRAM", "Ghostty", 1)
+            _ = setenv("CHERRY_TERM_PROGRAM", "Cherry", 1)
             _ = setenv("COLORTERM", "truecolor", 1)
             _ = setenv("INSIDE_CHERRY", "1", 1)
             if let shellIntegration {

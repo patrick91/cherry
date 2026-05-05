@@ -669,6 +669,7 @@ private enum CommandPaletteMode {
 
 private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case projects
+    case addProject
     case agents
     case addAgent
 
@@ -677,6 +678,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .projects: "Projects"
+        case .addProject: "Add Project"
         case .agents: "Agents"
         case .addAgent: "Add Agent"
         }
@@ -685,6 +687,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .projects: "Switch project"
+        case .addProject: "Create a Cherry project"
         case .agents: "Open a configured agent"
         case .addAgent: "Configure a global agent tool"
         }
@@ -693,6 +696,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .projects: "folder"
+        case .addProject: "folder.badge.plus"
         case .agents: "sparkles"
         case .addAgent: "sparkles"
         }
@@ -928,7 +932,17 @@ private struct CommandPaletteOverlay: View {
     @ViewBuilder
     private var projectRows: some View {
         if filteredProjects.isEmpty {
-            CommandPaletteEmptyRow(title: "No projects")
+            VStack(spacing: 4) {
+                CommandPaletteEmptyRow(title: "No projects")
+                CommandPaletteRow(
+                    icon: CommandPaletteCommand.addProject.icon,
+                    title: CommandPaletteCommand.addProject.title,
+                    subtitle: CommandPaletteCommand.addProject.subtitle,
+                    isSelected: selectedIndex == 0,
+                    isCurrent: false,
+                    action: chooseProjectRoot
+                )
+            }
         } else {
             ForEach(Array(filteredProjects.enumerated()), id: \.element.id) { index, project in
                 CommandPaletteRow(
@@ -991,7 +1005,7 @@ private struct CommandPaletteOverlay: View {
     private var resultCount: Int {
         switch mode {
         case .commands: filteredRootItems.count
-        case .projects: filteredProjects.count
+        case .projects: max(1, filteredProjects.count)
         case .agents: filteredAgents.count
         case .agentPresets: filteredAgentPresets.count
         }
@@ -1031,6 +1045,8 @@ private struct CommandPaletteOverlay: View {
                 switch command {
                 case .projects:
                     mode = .projects
+                case .addProject:
+                    chooseProjectRoot()
                 case .agents:
                     mode = .agents
                 case .addAgent:
@@ -1040,6 +1056,10 @@ private struct CommandPaletteOverlay: View {
                 launch(agent)
             }
         case .projects:
+            if filteredProjects.isEmpty {
+                chooseProjectRoot()
+                return
+            }
             guard filteredProjects.indices.contains(selectedIndex) else { return }
             let project = filteredProjects[selectedIndex]
             dismiss()
@@ -1066,6 +1086,24 @@ private struct CommandPaletteOverlay: View {
         } else {
             dismiss()
         }
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK, let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            focusSearchField()
+            return
+        }
+
+        dismiss()
+        openProject(project)
     }
 
     private func dismiss() {

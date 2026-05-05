@@ -1,11 +1,13 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
-final class CherryAppDelegate: NSObject, NSApplicationDelegate {
+final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var isQuitConfirmed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        UNUserNotificationCenter.current().delegate = self
 
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
@@ -45,6 +47,29 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return .terminateCancel
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let userInfo = response.notification.request.content.userInfo
+        let sessionIDString = userInfo["sessionID"] as? String
+        let projectRoot = userInfo["projectRoot"] as? String
+
+        await MainActor.run {
+            TerminalNotificationCenter.shared.handleResponse(
+                sessionIDString: sessionIDString,
+                projectRoot: projectRoot
+            )
+        }
     }
 }
 

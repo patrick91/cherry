@@ -254,7 +254,7 @@ private extension NSLock {
     }
 }
 
-private extension String {
+extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
@@ -350,9 +350,22 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 private enum TerminalMetadataEvent: Equatable {
     case title(String)
     case workingDirectory(String)
+    case notification(TerminalNotificationRequest)
     case keyboardProtocolPush(Int)
     case keyboardProtocolPop(Int)
     case keyboardProtocolSet(flags: Int, mode: Int)
+}
+
+struct TerminalNotificationRequest: Equatable {
+    enum Source: Equatable {
+        case bel
+        case osc9
+        case osc777
+    }
+
+    let title: String?
+    let body: String
+    let source: Source
 }
 
 private final class TerminalMetadataParser {
@@ -378,6 +391,12 @@ private final class TerminalMetadataParser {
             case .ground:
                 if byte == 0x1B {
                     state = .afterEscape
+                } else if byte == 0x07 {
+                    events.append(.notification(TerminalNotificationRequest(
+                        title: nil,
+                        body: "",
+                        source: .bel
+                    )))
                 }
 
             case .afterEscape:
@@ -464,9 +483,32 @@ private final class TerminalMetadataParser {
             return .title(value)
         case "7":
             return workingDirectoryEvent(from: value)
+        case "9":
+            return .notification(TerminalNotificationRequest(
+                title: nil,
+                body: value,
+                source: .osc9
+            ))
+        case "777":
+            return osc777NotificationEvent(from: value)
         default:
             return nil
         }
+    }
+
+    private static func osc777NotificationEvent(from value: String) -> TerminalMetadataEvent? {
+        let parts = value.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3, parts[0] == "notify" else { return nil }
+
+        let title = sanitized(parts[1]).nilIfEmpty
+        let body = sanitized(parts.dropFirst(2).joined(separator: ";"))
+        guard !body.isEmpty else { return nil }
+
+        return .notification(TerminalNotificationRequest(
+            title: title,
+            body: body,
+            source: .osc777
+        ))
     }
 
     private static func workingDirectoryEvent(from value: String) -> TerminalMetadataEvent? {
@@ -587,7 +629,11 @@ enum TerminalInputNormalizer {
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
-    @Published var selectedSessionID: UUID?
+    @Published var selectedSessionID: UUID? {
+        didSet {
+            clearUnreadNotificationForSelectedSession()
+        }
+    }
     let projectRoot: String?
 
     init(projectRoot: String? = nil) {
@@ -811,6 +857,15 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = orderedSessions[nextIndex].id
     }
 
+    private func clearUnreadNotificationForSelectedSession() {
+        guard let selectedSessionID,
+              let session = sessions.first(where: { $0.id == selectedSessionID })
+        else {
+            return
+        }
+        session.clearUnreadNotification()
+    }
+
     private func commandSessions(orderedBy visibleCommandNames: [String]) -> [TerminalSession] {
         let visibleNames = visibleCommandNames.map(AgentToolDefinition.normalizedName)
         return visibleNames.compactMap { visibleName in
@@ -942,6 +997,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var summary: String?
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
+    @Published private(set) var hasUnreadNotification = false
+    @Published private(set) var lastNotification: TerminalNotificationRequest?
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
@@ -1125,6 +1182,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.clear()
         ghosttyBridgeStorage?.reset()
         lastHumanInputLine = nil
+        clearUnreadNotification()
+        bumpRevision()
+    }
+
+    func clearUnreadNotification() {
+        guard hasUnreadNotification || lastNotification != nil else { return }
+        hasUnreadNotification = false
+        lastNotification = nil
         bumpRevision()
     }
 
@@ -1403,6 +1468,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                 workingDirectory = nextWorkingDirectory
                 didChange = true
 
+            case .notification(let notification):
+                handleTerminalNotification(notification)
+                didChange = true
+
             case .keyboardProtocolPush(let flags):
                 keyboardProtocolFlagStack.append(keyboardProtocolFlags)
                 keyboardProtocolFlags = flags
@@ -1427,6 +1496,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         if didChange {
             bumpRevision()
         }
+    }
+
+    private func handleTerminalNotification(_ notification: TerminalNotificationRequest) {
+        guard !ProjectWindowRegistry.shared.isSessionActive(self) else { return }
+        lastNotification = notification
+        hasUnreadNotification = true
+        TerminalNotificationCenter.shared.post(notification, for: self)
     }
 
     private func normalizedInputData(_ data: Data) -> Data {

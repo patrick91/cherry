@@ -115,6 +115,7 @@ struct ContentView: View {
                     workspace: workspace,
                     selectedProjectRoot: projectRoot,
                     isPresented: $chromeState.isCommandPalettePresented,
+                    focusRequest: chromeState.commandPaletteFocusRequest,
                     openProject: openProject,
                     restoreFocus: restoreTerminalFocus
                 )
@@ -751,6 +752,7 @@ private struct CommandPaletteOverlay: View {
     @ObservedObject var workspace: TerminalWorkspace
     let selectedProjectRoot: String?
     @Binding var isPresented: Bool
+    let focusRequest: Int
     let openProject: (CherryProject) -> Void
     let restoreFocus: () -> Void
 
@@ -814,8 +816,11 @@ private struct CommandPaletteOverlay: View {
         }
         .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
         .onAppear {
-            isSearchFocused = true
+            focusSearchField()
             selectedIndex = 0
+        }
+        .onChange(of: focusRequest) { _, _ in
+            focusSearchField()
         }
         .onChange(of: query) { _, _ in
             selectedIndex = 0
@@ -823,7 +828,7 @@ private struct CommandPaletteOverlay: View {
         .onChange(of: mode) { _, _ in
             query = ""
             selectedIndex = 0
-            isSearchFocused = true
+            focusSearchField()
         }
         .sheet(item: $editingAgent) { agent in
             AgentToolEditor(
@@ -1066,6 +1071,16 @@ private struct CommandPaletteOverlay: View {
     private func dismiss() {
         isPresented = false
         restoreFocus()
+    }
+
+    private func focusSearchField() {
+        isSearchFocused = false
+        DispatchQueue.main.async {
+            isSearchFocused = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            isSearchFocused = true
+        }
     }
 }
 
@@ -2641,6 +2656,11 @@ private struct SidebarTabRow: View {
                 }
 
                 Spacer(minLength: 8)
+
+                Circle()
+                    .fill(Color(nsColor: session.tint))
+                    .frame(width: 7, height: 7)
+                    .opacity(session.hasUnreadNotification ? 1 : 0)
 
                 if showShortcutHint, shortcutNumber <= 9 {
                     SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)

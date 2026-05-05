@@ -329,6 +329,68 @@ import Testing
 }
 
 @MainActor
+@Test func terminalSessionTracksNotificationMetadata() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
+    #expect(session.hasUnreadNotification == true)
+    #expect(session.lastNotification == TerminalNotificationRequest(
+        title: nil,
+        body: "Agent turn complete",
+        source: .osc9
+    ))
+
+    session.clearUnreadNotification()
+    session.ingestTestingData(Data("\u{1B}]777;notify;Codex;Approval requested\u{7}".utf8))
+    #expect(session.hasUnreadNotification == true)
+    #expect(session.lastNotification == TerminalNotificationRequest(
+        title: "Codex",
+        body: "Approval requested",
+        source: .osc777
+    ))
+
+    session.clearUnreadNotification()
+    session.ingestTestingData(Data([0x07]))
+    #expect(session.hasUnreadNotification == true)
+    #expect(session.lastNotification == TerminalNotificationRequest(
+        title: nil,
+        body: "",
+        source: .bel
+    ))
+}
+
+@MainActor
+@Test func workspaceSelectionClearsUnreadNotification() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let workspace = TerminalWorkspace()
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let background = workspace.addSession(title: "Background", select: false)
+    background.ingestTestingData(Data("\u{1B}]9;Done\u{7}".utf8))
+    #expect(background.hasUnreadNotification == true)
+
+    workspace.select(background)
+    #expect(background.hasUnreadNotification == false)
+    #expect(background.lastNotification == nil)
+}
+
+@MainActor
 @Test func agentSessionIgnoresTitleMetadata() async throws {
     let session = TerminalSession(
         title: "Codex",

@@ -6,6 +6,8 @@ final class ProjectWindowRegistry {
     static let shared = ProjectWindowRegistry()
 
     private var windows: [String: WeakWindow] = [:]
+    private var workspaces: [String: WeakWorkspace] = [:]
+    private var chromeStates: [String: WeakChromeState] = [:]
     weak var activeWorkspace: TerminalWorkspace?
     weak var activeNoteStore: ProjectNoteStore?
     weak var activeChromeState: ProjectWindowChromeState?
@@ -24,11 +26,17 @@ final class ProjectWindowRegistry {
         activeChromeState = chromeState
         guard let projectRoot else { return }
         windows[projectRoot] = WeakWindow(window)
+        workspaces[projectRoot] = WeakWorkspace(workspace)
+        if let chromeState {
+            chromeStates[projectRoot] = WeakChromeState(chromeState)
+        }
     }
 
     func unregister(window: NSWindow, projectRoot: String?) {
         guard let projectRoot, windows[projectRoot]?.window === window else { return }
         windows.removeValue(forKey: projectRoot)
+        workspaces.removeValue(forKey: projectRoot)
+        chromeStates.removeValue(forKey: projectRoot)
     }
 
     func focus(projectRoot: String) -> Bool {
@@ -41,6 +49,72 @@ final class ProjectWindowRegistry {
         NSApp.activate(ignoringOtherApps: true)
         return true
     }
+
+    func projectRoot(containing sessionID: UUID) -> String? {
+        var staleProjectRoots: [String] = []
+        defer {
+            for projectRoot in staleProjectRoots {
+                windows.removeValue(forKey: projectRoot)
+                workspaces.removeValue(forKey: projectRoot)
+                chromeStates.removeValue(forKey: projectRoot)
+            }
+        }
+
+        for (projectRoot, workspace) in workspaces {
+            guard let workspace = workspace.workspace else {
+                staleProjectRoots.append(projectRoot)
+                continue
+            }
+            if workspace.sessions.contains(where: { $0.id == sessionID }) {
+                return projectRoot
+            }
+        }
+
+        return nil
+    }
+
+    func isSessionActive(_ session: TerminalSession) -> Bool {
+        guard NSApplication.shared.isActive,
+              let activeWorkspace,
+              activeWorkspace.sessions.contains(where: { $0.id == session.id })
+        else {
+            return false
+        }
+
+        return activeWorkspace.selectedSessionID == session.id
+    }
+
+    @discardableResult
+    func focusSession(sessionID: UUID, projectRoot requestedProjectRoot: String?) -> Bool {
+        let candidates: [(projectRoot: String?, workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState?)]
+        if let requestedProjectRoot, let workspace = workspaces[requestedProjectRoot]?.workspace {
+            candidates = [(requestedProjectRoot, workspace, chromeStates[requestedProjectRoot]?.chromeState)]
+        } else {
+            candidates = workspaces.compactMap { projectRoot, weakWorkspace in
+                weakWorkspace.workspace.map { (projectRoot, $0, chromeStates[projectRoot]?.chromeState) }
+            }
+        }
+
+        for candidate in candidates {
+            guard let session = candidate.workspace.sessions.first(where: { $0.id == sessionID }) else {
+                continue
+            }
+
+            candidate.workspace.select(session)
+            activeWorkspace = candidate.workspace
+            candidate.chromeState?.selectNote(id: nil)
+            activeChromeState = candidate.chromeState
+            if let projectRoot = candidate.projectRoot {
+                _ = focus(projectRoot: projectRoot)
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            }
+            return true
+        }
+
+        return false
+    }
 }
 
 private final class WeakWindow {
@@ -48,6 +122,22 @@ private final class WeakWindow {
 
     init(_ window: NSWindow) {
         self.window = window
+    }
+}
+
+private final class WeakWorkspace {
+    weak var workspace: TerminalWorkspace?
+
+    init(_ workspace: TerminalWorkspace) {
+        self.workspace = workspace
+    }
+}
+
+private final class WeakChromeState {
+    weak var chromeState: ProjectWindowChromeState?
+
+    init(_ chromeState: ProjectWindowChromeState) {
+        self.chromeState = chromeState
     }
 }
 
@@ -60,6 +150,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCommandPalettePresented = false
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
+    @Published var commandPaletteFocusRequest = 0
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.
@@ -106,6 +197,7 @@ final class ProjectWindowChromeState: ObservableObject {
 
     func presentCommandPalette() {
         isCommandPalettePresented = true
+        commandPaletteFocusRequest &+= 1
     }
 
     func selectNote(id: UUID?) {

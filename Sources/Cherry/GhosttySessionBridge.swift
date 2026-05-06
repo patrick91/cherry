@@ -199,7 +199,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func terminalWillSendHostInput() {
+        guard Self.shouldScrollToBottomForHostInput(currentEvent: NSApp.currentEvent) else { return }
         scrollToBottomForHostInput()
+    }
+
+    static func shouldScrollToBottomForHostInput(currentEvent event: NSEvent?) -> Bool {
+        guard let event, event.type == .keyDown else { return true }
+
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command) else { return true }
+        guard modifiers.isDisjoint(with: [.control, .option]) else { return false }
+
+        return event.charactersIgnoringModifiers?.lowercased() == "v"
     }
 
     func terminalShouldSuppressScrollInput(isMomentum: Bool) -> Bool {

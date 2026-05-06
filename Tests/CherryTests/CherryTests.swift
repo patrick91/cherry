@@ -2199,6 +2199,50 @@ private final class ControlServerHarness {
     ) == Data([0x1B, 0x7F]))
 }
 
+@MainActor
+@Test func ghosttyHostInputScrollIgnoresCommandCopyShortcut() async throws {
+    let copy = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.command],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: "c",
+        charactersIgnoringModifiers: "c",
+        isARepeat: false,
+        keyCode: 8
+    ))
+    let paste = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.command],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: "v",
+        charactersIgnoringModifiers: "v",
+        isARepeat: false,
+        keyCode: 9
+    ))
+    let text = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: "a",
+        charactersIgnoringModifiers: "a",
+        isARepeat: false,
+        keyCode: 0
+    ))
+
+    #expect(!GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: copy))
+    #expect(GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: paste))
+    #expect(GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: text))
+}
+
 @Test func pastedTextNormalizesLineEndings() async throws {
     let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
 

@@ -7,10 +7,25 @@ final class TerminalNotificationCenter {
 
     var isDeliveryEnabled = true
     private var didRequestAuthorization = false
+    private var didReportUnavailableDelivery = false
 
     private init() {}
 
+    func configure(delegate: UNUserNotificationCenterDelegate) {
+        guard canUseNativeNotifications else {
+            reportUnavailableDeliveryIfNeeded()
+            return
+        }
+
+        UNUserNotificationCenter.current().delegate = delegate
+    }
+
     func requestAuthorizationIfNeeded() {
+        guard canUseNativeNotifications else {
+            reportUnavailableDeliveryIfNeeded()
+            return
+        }
+
         guard !didRequestAuthorization else { return }
         didRequestAuthorization = true
 
@@ -24,6 +39,10 @@ final class TerminalNotificationCenter {
     func post(_ notification: TerminalNotificationRequest, for session: TerminalSession) {
         guard isDeliveryEnabled else { return }
         guard !ProjectWindowRegistry.shared.isSessionActive(session) else { return }
+        guard canUseNativeNotifications else {
+            reportUnavailableDeliveryIfNeeded()
+            return
+        }
 
         requestAuthorizationIfNeeded()
 
@@ -73,5 +92,17 @@ final class TerminalNotificationCenter {
 
     private func focusSession(sessionID: UUID, projectRoot: String?) {
         ProjectWindowRegistry.shared.focusSession(sessionID: sessionID, projectRoot: projectRoot)
+    }
+
+    private var canUseNativeNotifications: Bool {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return false }
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier?.nilIfEmpty else { return false }
+        return bundleIdentifier.contains(".")
+    }
+
+    private func reportUnavailableDeliveryIfNeeded() {
+        guard !didReportUnavailableDelivery else { return }
+        didReportUnavailableDelivery = true
+        fputs("[notification delivery] skipped because the app has no notification-capable bundle identifier\n", stderr)
     }
 }

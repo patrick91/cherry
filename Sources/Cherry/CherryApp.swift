@@ -7,7 +7,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        UNUserNotificationCenter.current().delegate = self
+        TerminalNotificationCenter.shared.configure(delegate: self)
 
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)

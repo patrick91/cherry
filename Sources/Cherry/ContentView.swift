@@ -1347,6 +1347,7 @@ private struct TitlebarProjectPicker: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -1505,6 +1506,7 @@ private struct SidebarAgentSessionSection: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -1633,6 +1635,7 @@ private struct SidebarCommandSection: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -1812,6 +1815,7 @@ private struct SidebarNotesSection: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -1939,6 +1943,7 @@ private struct SidebarCommandRow: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -2076,6 +2081,7 @@ private struct SidebarSessionSection: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -2627,6 +2633,7 @@ private struct SidebarBackground: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -2679,6 +2686,7 @@ private struct SidebarTabRow: View {
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
 
@@ -2897,19 +2905,22 @@ private struct SidebarPalette {
     init(
         themeColors: TerminalThemeColors,
         fallbackColorScheme: ColorScheme,
+        sidebarBackgroundDepth: Double,
         presentation: SidebarPresentation
     ) {
-        let sample = SidebarThemeSample(themeColors: themeColors, fallbackColorScheme: fallbackColorScheme)
+        let sample = SidebarThemeSample(
+            themeColors: themeColors,
+            fallbackColorScheme: fallbackColorScheme,
+            sidebarBackgroundDepth: sidebarBackgroundDepth
+        )
         let background = Color(nsColor: sample.background)
-        let shellBackground = Color(nsColor: sample.shellBackground)
+        let sidebarBackground = Color(nsColor: sample.sidebarBackground)
         let foreground = Color(nsColor: sample.foreground)
         let selection = sample.selectionBackground.map { Color(nsColor: $0) }
 
         if sample.isDark {
             self = Self(
-                backgroundMaterial: presentation == .floating
-                    ? AnyShapeStyle(shellBackground)
-                    : AnyShapeStyle(shellBackground),
+                backgroundMaterial: AnyShapeStyle(sidebarBackground),
                 backgroundTint: presentation == .floating ? background.opacity(0.10) : .clear,
                 backgroundOverlay: [
                     foreground.opacity(presentation == .floating ? 0.035 : 0),
@@ -2925,9 +2936,7 @@ private struct SidebarPalette {
             )
         } else {
             self = Self(
-                backgroundMaterial: presentation == .floating
-                    ? AnyShapeStyle(shellBackground)
-                    : AnyShapeStyle(shellBackground),
+                backgroundMaterial: AnyShapeStyle(sidebarBackground),
                 backgroundTint: presentation == .floating ? background.opacity(0.08) : .clear,
                 backgroundOverlay: [
                     Color.white.opacity(presentation == .floating ? 0.08 : 0),
@@ -2945,24 +2954,29 @@ private struct SidebarPalette {
     }
 }
 
-private struct SidebarThemeSample {
+struct SidebarThemeSample {
     let background: NSColor
     let foreground: NSColor
     let selectionBackground: NSColor?
+    let sidebarBackgroundDepth: CGFloat
 
     var isDark: Bool {
         background.relativeLuminance < 0.50
     }
 
-    var shellBackground: NSColor {
+    var sidebarBackground: NSColor {
         if isDark {
-            background.mixed(toward: foreground, amount: 0.10)
+            background.mixed(toward: foreground, amount: sidebarBackgroundDepth)
         } else {
-            background.mixed(toward: .white, amount: 0.08)
+            background.mixed(toward: .black, amount: sidebarBackgroundDepth)
         }
     }
 
-    init(themeColors: TerminalThemeColors, fallbackColorScheme: ColorScheme) {
+    init(
+        themeColors: TerminalThemeColors,
+        fallbackColorScheme: ColorScheme,
+        sidebarBackgroundDepth: Double
+    ) {
         let fallbackBackground: NSColor = switch fallbackColorScheme {
         case .light:
             NSColor(calibratedWhite: 0.96, alpha: 1)
@@ -2984,6 +2998,7 @@ private struct SidebarThemeSample {
         background = NSColor(hexRGB: themeColors.background) ?? fallbackBackground
         foreground = NSColor(hexRGB: themeColors.foreground) ?? fallbackForeground
         selectionBackground = themeColors.selectionBackground.flatMap(NSColor.init(hexRGB:))
+        self.sidebarBackgroundDepth = CGFloat(min(max(sidebarBackgroundDepth, 0), 0.40))
     }
 }
 
@@ -3030,6 +3045,15 @@ extension NSColor {
             + 0.0722 * channel(color.blueComponent)
     }
 
+    var hexRGBString: String {
+        guard let color = usingColorSpace(.sRGB) else { return "#000000" }
+
+        let red = Int((color.redComponent * 255).rounded())
+        let green = Int((color.greenComponent * 255).rounded())
+        let blue = Int((color.blueComponent * 255).rounded())
+        return String(format: "#%02X%02X%02X", red, green, blue)
+    }
+
     func mixed(toward otherColor: NSColor, amount: CGFloat) -> NSColor {
         guard let base = usingColorSpace(.sRGB),
               let other = otherColor.usingColorSpace(.sRGB)
@@ -3040,7 +3064,7 @@ extension NSColor {
         let clampedAmount = min(max(amount, 0), 1)
         let inverseAmount = 1 - clampedAmount
         return NSColor(
-            calibratedRed: base.redComponent * inverseAmount + other.redComponent * clampedAmount,
+            srgbRed: base.redComponent * inverseAmount + other.redComponent * clampedAmount,
             green: base.greenComponent * inverseAmount + other.greenComponent * clampedAmount,
             blue: base.blueComponent * inverseAmount + other.blueComponent * clampedAmount,
             alpha: base.alphaComponent * inverseAmount + other.alphaComponent * clampedAmount

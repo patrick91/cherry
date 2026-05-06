@@ -1,6 +1,7 @@
 import AppKit
 import CherryControl
 import Foundation
+import SwiftUI
 import Testing
 @testable import Cherry
 
@@ -484,6 +485,40 @@ import Testing
     #expect(CherryAppearancePreference.toggled(from: .dark, currentColorScheme: .dark) == .light)
     #expect(CherryAppearancePreference.toggled(from: .system, currentColorScheme: .dark) == .light)
     #expect(CherryAppearancePreference.toggled(from: .system, currentColorScheme: .light) == .dark)
+}
+
+@Test func sidebarThemeSampleContrastsTerminalBackgroundByAppearance() async throws {
+    let darkThemeColors = TerminalThemeColors(
+        background: "#303446",
+        foreground: "#c6d0f5",
+        selectionBackground: "#626880",
+        palette: [:]
+    )
+    let darkSample = SidebarThemeSample(
+        themeColors: darkThemeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0.08
+    )
+    #expect(darkSample.sidebarBackground.relativeLuminance > darkSample.background.relativeLuminance)
+
+    let lightSample = SidebarThemeSample(
+        themeColors: TerminalThemeColors(
+            background: "#F7F7F7",
+            foreground: "#101010",
+            selectionBackground: "#D0D0D0",
+            palette: [:]
+        ),
+        fallbackColorScheme: .light,
+        sidebarBackgroundDepth: 0.08
+    )
+    #expect(lightSample.sidebarBackground.relativeLuminance < lightSample.background.relativeLuminance)
+
+    let unchangedSample = SidebarThemeSample(
+        themeColors: darkThemeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0
+    )
+    #expect(unchangedSample.sidebarBackground.hexRGBString == unchangedSample.background.hexRGBString)
 }
 
 @MainActor

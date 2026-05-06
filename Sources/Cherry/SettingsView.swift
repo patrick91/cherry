@@ -347,6 +347,17 @@ private struct TerminalSettingsPane: View {
                     step: 0.05,
                     suffix: "x"
                 )
+
+                SettingsSlider(
+                    title: "Sidebar contrast",
+                    value: $settings.sidebarBackgroundDepth,
+                    range: 0...0.24,
+                    step: 0.01,
+                    suffix: "%",
+                    displayScale: 100
+                )
+
+                SidebarThemeDebugPanel(settings: settings)
             }
 
             HStack {
@@ -358,6 +369,73 @@ private struct TerminalSettingsPane: View {
         }
         .formStyle(.grouped)
         .padding(20)
+    }
+}
+
+private struct SidebarThemeDebugPanel: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject var settings: TerminalSettings
+
+    private var sample: SidebarThemeSample {
+        SidebarThemeSample(
+            themeColors: settings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: settings.sidebarBackgroundDepth
+        )
+    }
+
+    var body: some View {
+        let sample = sample
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                SidebarColorDebugSwatch(title: "Terminal", color: sample.background)
+                SidebarColorDebugSwatch(title: "Sidebar", color: sample.sidebarBackground)
+
+                if let selectionBackground = sample.selectionBackground {
+                    SidebarColorDebugSwatch(title: "Selection", color: selectionBackground)
+                }
+            }
+
+            Text("Luma delta \(luminanceDelta(for: sample))")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func luminanceDelta(for sample: SidebarThemeSample) -> String {
+        Double(abs(sample.background.relativeLuminance - sample.sidebarBackground.relativeLuminance))
+            .formatted(.number.precision(.fractionLength(3)))
+    }
+}
+
+private struct SidebarColorDebugSwatch: View {
+    let title: String
+    let color: NSColor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: color))
+                .frame(height: 28)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5)
+                }
+
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
+
+            Text(color.hexRGBString)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: 120, alignment: .leading)
     }
 }
 
@@ -433,6 +511,7 @@ private struct SettingsSlider: View {
     let range: ClosedRange<Double>
     let step: Double
     let suffix: String
+    var displayScale = 1.0
 
     var body: some View {
         HStack(spacing: 12) {
@@ -449,11 +528,18 @@ private struct SettingsSlider: View {
     }
 
     private var formattedValue: String {
-        if step >= 1 {
-            "\(Int(value.rounded())) \(suffix)"
+        let displayValue = value * displayScale
+
+        if step * displayScale >= 1 {
+            return "\(Int(displayValue.rounded()))\(formattedSuffix)"
         } else {
-            "\(value.formatted(.number.precision(.fractionLength(2))))\(suffix)"
+            return "\(displayValue.formatted(.number.precision(.fractionLength(2))))\(formattedSuffix)"
         }
+    }
+
+    private var formattedSuffix: String {
+        guard !suffix.isEmpty else { return "" }
+        return suffix == "pt" ? " \(suffix)" : suffix
     }
 }
 

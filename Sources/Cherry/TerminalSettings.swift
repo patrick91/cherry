@@ -67,6 +67,12 @@ final class TerminalSettings: ObservableObject {
         didSet { save(minimumContrast, forKey: Keys.minimumContrast) }
     }
 
+    @Published var sidebarBackgroundDepth: Double {
+        didSet {
+            save(sidebarBackgroundDepth, forKey: Keys.sidebarBackgroundDepth, notifyTerminal: false)
+        }
+    }
+
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -86,6 +92,8 @@ final class TerminalSettings: ObservableObject {
         fontSize = defaults.object(forKey: Keys.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = defaults.object(forKey: Keys.cursorBlink) as? Bool ?? Defaults.cursorBlink
         minimumContrast = defaults.object(forKey: Keys.minimumContrast) as? Double ?? Defaults.minimumContrast
+        sidebarBackgroundDepth = defaults.object(forKey: Keys.sidebarBackgroundDepth) as? Double
+            ?? Defaults.sidebarBackgroundDepth
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -98,6 +106,7 @@ final class TerminalSettings: ObservableObject {
         fontSize = Defaults.fontSize
         cursorBlink = Defaults.cursorBlink
         minimumContrast = Defaults.minimumContrast
+        sidebarBackgroundDepth = Defaults.sidebarBackgroundDepth
         lightTerminalThemeName = Defaults.lightTerminalThemeName
         darkTerminalThemeName = Defaults.darkTerminalThemeName
     }
@@ -164,9 +173,11 @@ final class TerminalSettings: ObservableObject {
         GhosttyThemeCatalog.theme(named: name.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
     }
 
-    private func save(_ value: Double, forKey key: String) {
+    private func save(_ value: Double, forKey key: String, notifyTerminal: Bool = true) {
         defaults.set(value, forKey: key)
-        notifyChanged()
+        if notifyTerminal {
+            notifyChanged()
+        }
     }
 
     private func save(_ value: Bool, forKey key: String) {
@@ -187,6 +198,7 @@ final class TerminalSettings: ObservableObject {
         static let fontSize = 14.0
         static let cursorBlink = true
         static let minimumContrast = 1.15
+        static let sidebarBackgroundDepth = 0.08
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
@@ -196,6 +208,7 @@ final class TerminalSettings: ObservableObject {
         static let fontSize = "terminal.fontSize"
         static let cursorBlink = "terminal.cursorBlink"
         static let minimumContrast = "terminal.minimumContrast"
+        static let sidebarBackgroundDepth = "sidebar.backgroundDepth"
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"

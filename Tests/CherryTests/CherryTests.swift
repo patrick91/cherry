@@ -905,6 +905,46 @@ import Testing
     ])
 }
 
+@Test func cherryControlSocketIsSharedByAppAndBundledHelper() {
+    let appExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app/Contents/MacOS/Cherry")
+    let helperExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP")
+
+    let appSocket = CherryControl.socketURL(environment: [:], executableURL: appExecutable)
+    let helperSocket = CherryControl.socketURL(environment: [:], executableURL: helperExecutable)
+
+    #expect(appSocket == helperSocket)
+    #expect(appSocket.path.contains("/Cherry-Local-"))
+    #expect(appSocket.lastPathComponent == "control.sock")
+}
+
+@Test func cherryControlSocketSeparatesInstalledAppFromSwiftPMBuild() {
+    let appExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry.app/Contents/MacOS/Cherry")
+    let swiftPMExecutable = URL(fileURLWithPath: "/Users/patrick/github/patrick91/cherry/.build/arm64-apple-macosx/debug/Cherry")
+    let swiftPMHelper = URL(fileURLWithPath: "/Users/patrick/github/patrick91/cherry/.build/arm64-apple-macosx/debug/CherryMCP")
+
+    let appSocket = CherryControl.socketURL(environment: [:], executableURL: appExecutable)
+    let swiftPMSocket = CherryControl.socketURL(environment: [:], executableURL: swiftPMExecutable)
+    let swiftPMHelperSocket = CherryControl.socketURL(environment: [:], executableURL: swiftPMHelper)
+
+    #expect(swiftPMSocket == swiftPMHelperSocket)
+    #expect(appSocket != swiftPMSocket)
+    #expect(swiftPMSocket.path.contains("/cherry-dev-"))
+}
+
+@Test func cherryControlSocketSupportsExplicitEnvironmentOverrides() {
+    let explicitSocket = CherryControl.socketURL(
+        environment: [CherryControl.socketEnvironmentKey: "/tmp/cherry-custom/control.sock"],
+        executableURL: nil
+    )
+    let explicitNamespaceSocket = CherryControl.socketURL(
+        environment: [CherryControl.socketNamespaceEnvironmentKey: "Cherry Dev/Preview"],
+        executableURL: nil
+    )
+
+    #expect(explicitSocket.path == "/tmp/cherry-custom/control.sock")
+    #expect(explicitNamespaceSocket.path.contains("/Cherry-Dev-Preview/control.sock"))
+}
+
 @Test func mcpInstallCommandsShellQuoteApostrophes() async throws {
     #expect(MCPInstallCommandBuilder.shellQuote("/tmp/Patrick's Apps/Cherry.app") == "'/tmp/Patrick'\\''s Apps/Cherry.app'")
 }

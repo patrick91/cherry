@@ -72,11 +72,13 @@ During development, you can also run the helper from SwiftPM:
 swift run CherryMCP
 ```
 
-Run the Cherry app first. The app listens on a per-user Unix socket at
-`/tmp/cherry-$UID/control.sock`; the MCP helper exposes tools for listing,
-creating, selecting, reading, searching, clearing, restarting, closing, and
-sending input to visible Cherry terminal tabs. It can also list configured
-agent tools and launch a new configured agent in the active project window.
+Run the Cherry app first. The app listens on an instance-scoped Unix socket
+under `/tmp/cherry-$UID/`; the bundled helper derives the same socket from the
+app bundle, while SwiftPM builds derive it from their build directory. The MCP
+helper exposes tools for listing, creating, selecting, reading, searching,
+clearing, restarting, closing, and sending input to visible Cherry terminal
+tabs. It can also list configured agent tools and launch a new configured agent
+in the active project window.
 
 ## Rendering Debug
 

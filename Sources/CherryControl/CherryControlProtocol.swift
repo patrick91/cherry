@@ -1,13 +1,97 @@
 import Foundation
 
 public enum CherryControl {
+    public static let socketEnvironmentKey = "CHERRY_CONTROL_SOCKET"
+    public static let socketNamespaceEnvironmentKey = "CHERRY_CONTROL_NAMESPACE"
+
     public static var socketURL: URL {
+        socketURL(
+            environment: ProcessInfo.processInfo.environment,
+            executableURL: Bundle.main.executableURL
+        )
+    }
+
+    public static func socketURL(
+        environment: [String: String],
+        executableURL: URL?
+    ) -> URL {
+        if let socketPath = environment[socketEnvironmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !socketPath.isEmpty {
+            return URL(fileURLWithPath: socketPath)
+        }
+
         let uid = getuid()
-        return URL(fileURLWithPath: "/tmp/cherry-\(uid)/control.sock")
+        return URL(fileURLWithPath: "/tmp/cherry-\(uid)", isDirectory: true)
+            .appendingPathComponent(socketNamespace(environment: environment, executableURL: executableURL), isDirectory: true)
+            .appendingPathComponent("control.sock", isDirectory: false)
     }
 
     public static var socketDirectoryURL: URL {
         socketURL.deletingLastPathComponent()
+    }
+
+    public static func socketNamespace(
+        environment: [String: String],
+        executableURL: URL?
+    ) -> String {
+        if let namespace = environment[socketNamespaceEnvironmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !namespace.isEmpty {
+            return sanitizedSocketComponent(namespace)
+        }
+
+        let identityURL = controlInstanceIdentityURL(executableURL: executableURL)
+        let label = controlInstanceLabel(identityURL: identityURL)
+        let hash = stableHexHash(identityURL.standardizedFileURL.path)
+        return "\(sanitizedSocketComponent(label))-\(hash.prefix(12))"
+    }
+
+    private static func controlInstanceIdentityURL(executableURL: URL?) -> URL {
+        guard let executableURL else {
+            return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+                .standardizedFileURL
+        }
+
+        let standardizedExecutableURL = executableURL.standardizedFileURL
+        let pathComponents = standardizedExecutableURL.pathComponents
+        if let appIndex = pathComponents.firstIndex(where: { $0.lowercased().hasSuffix(".app") }) {
+            let appPath = NSString.path(withComponents: Array(pathComponents.prefix(through: appIndex)))
+            return URL(fileURLWithPath: appPath, isDirectory: true).standardizedFileURL
+        }
+
+        return standardizedExecutableURL.deletingLastPathComponent().standardizedFileURL
+    }
+
+    private static func controlInstanceLabel(identityURL: URL) -> String {
+        if identityURL.pathExtension.lowercased() == "app" {
+            return identityURL.deletingPathExtension().lastPathComponent
+        }
+
+        return "cherry-dev"
+    }
+
+    private static func sanitizedSocketComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        var output = ""
+
+        for scalar in value.unicodeScalars {
+            if allowed.contains(scalar) {
+                output.unicodeScalars.append(scalar)
+            } else if !output.hasSuffix("-") {
+                output.append("-")
+            }
+        }
+
+        let trimmed = output.trimmingCharacters(in: CharacterSet(charactersIn: ".-_"))
+        return String(trimmed.prefix(48)).isEmpty ? "default" : String(trimmed.prefix(48))
+    }
+
+    private static func stableHexHash(_ value: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
     }
 }
 

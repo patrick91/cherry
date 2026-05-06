@@ -68,7 +68,7 @@ private struct MCPSettingsPane: View {
                         .foregroundStyle(.secondary)
                 }
 
-                LabeledContent("Cherry control socket") {
+                LabeledContent("Cherry instance socket") {
                     HStack(spacing: 8) {
                         Circle()
                             .fill(socketExists ? Color.green : Color.orange)
@@ -78,7 +78,7 @@ private struct MCPSettingsPane: View {
                     }
                 }
 
-                LabeledContent("Socket path") {
+                LabeledContent("Instance socket path") {
                     Text(CherryControl.socketURL.path)
                         .font(.callout.monospaced())
                         .textSelection(.enabled)

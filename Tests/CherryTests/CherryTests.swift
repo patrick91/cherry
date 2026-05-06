@@ -551,6 +551,85 @@ import Testing
     ))
 }
 
+@Test func sidebarTerminalProgramFormatterParsesEditorCommands() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "vim README.md",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "README.md",
+        detail: "vim README.md",
+        leadingIconResourceName: "vim",
+        leadingIconFallback: "Vi"
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "nvim \"Sources/Cherry/ContentView.swift\"",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "ContentView.swift",
+        detail: "nvim \"Sources/Cherry/ContentView.swift\"",
+        leadingIconResourceName: "neovim",
+        leadingIconFallback: "Nv"
+    ))
+}
+
+@Test func sidebarTerminalProgramFormatterParsesAppTitles() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "config (~/.aws) - Nvim",
+        workingDirectory: "/Users/patrick",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "config",
+        detail: "~/.aws · Nvim",
+        leadingIconResourceName: "neovim",
+        leadingIconFallback: "Nv"
+    ))
+}
+
+@Test func sidebarTerminalProgramFormatterPrefersRunnerTargets() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "bunx vite --host 0.0.0.0",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "Vite",
+        detail: "bunx vite --host 0.0.0.0",
+        leadingIconResourceName: "vite",
+        leadingIconFallback: "Vt"
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "npx --yes create-next-app@latest demo",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "create-next-app",
+        detail: "npx --yes create-next-app@latest demo",
+        leadingIconResourceName: "npm",
+        leadingIconFallback: "nx"
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "uvx ruff check .",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "Ruff",
+        detail: "uvx ruff check .",
+        leadingIconFallback: "Rf"
+    ))
+}
+
+@Test func sidebarTerminalProgramFormatterIgnoresUnknownCommands() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "unknown-tool --flag",
+        workingDirectory: "/Users/patrick",
+        homeDirectory: "/Users/patrick"
+    ) == nil)
+}
+
 @MainActor
 @Test func terminalSettingsPersistSidebarTerminalPathDisplayMode() async throws {
     let defaultsName = "CherryTests.TerminalSettings.\(UUID().uuidString)"

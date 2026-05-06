@@ -2759,11 +2759,14 @@ private struct SidebarTabRow: View {
             presentation: presentation
         )
         let label = sidebarLabel()
+        let hasLeadingIcon = AgentToolIconDescriptor(session: session) != nil || label.leadingIconResourceName != nil || label.leadingIconFallback != nil
 
         Button(action: onSelect) {
-            HStack(spacing: session.kind == .agent ? 8 : 0) {
+            HStack(spacing: hasLeadingIcon ? 8 : 0) {
                 if let icon = AgentToolIconDescriptor(session: session) {
                     AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+                } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+                    SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
@@ -2835,20 +2838,36 @@ private struct SidebarTabRow: View {
     }
 
     private func sidebarLabel() -> SidebarTerminalPathLabel {
-        guard session.kind == .terminal,
-              !session.hasExplicitTitle,
-              SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
-                  title: session.title,
-                  workingDirectory: session.workingDirectory
-              )
-        else {
+        guard session.kind == .terminal, !session.hasExplicitTitle else {
             return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
         }
 
-        return SidebarTerminalPathFormatter.label(
-            for: session.workingDirectory,
-            mode: terminalSettings.sidebarTerminalPathDisplayMode
-        )
+        let trimmedTitle = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedTitle == SidebarTerminalPathFormatter.displayPath(session.workingDirectory) {
+            return SidebarTerminalPathFormatter.label(
+                for: session.workingDirectory,
+                mode: terminalSettings.sidebarTerminalPathDisplayMode
+            )
+        }
+
+        if let programLabel = SidebarTerminalProgramFormatter.label(
+            for: session.title,
+            workingDirectory: session.workingDirectory
+        ) {
+            return programLabel
+        }
+
+        if SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+            title: session.title,
+            workingDirectory: session.workingDirectory
+        ) {
+            return SidebarTerminalPathFormatter.label(
+                for: session.workingDirectory,
+                mode: terminalSettings.sidebarTerminalPathDisplayMode
+            )
+        }
+
+        return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
     }
 }
 
@@ -2925,6 +2944,36 @@ private struct AgentToolIcon: View {
     }
 }
 
+private struct SidebarProgramIcon: View {
+    let label: SidebarTerminalPathLabel
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        ZStack {
+            if let resourceName = label.leadingIconResourceName {
+                AgentLogoImage(
+                    resourceName: resourceName,
+                    rendersAsTemplate: label.leadingIconRendersAsTemplate,
+                    fallbackLabel: label.leadingIconFallback ?? ""
+                )
+                .frame(width: 18, height: 18)
+            } else if let fallback = label.leadingIconFallback {
+                Circle()
+                    .fill(isSelected ? palette.selectedText.opacity(0.16) : palette.rowText.opacity(0.10))
+
+                Text(fallback)
+                    .font(.system(size: 8, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+            }
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct AgentLogoImage: View {
     let resourceName: String
     let rendersAsTemplate: Bool
@@ -2950,6 +2999,10 @@ private struct AgentLogoImage: View {
             forResource: name,
             withExtension: "svg",
             subdirectory: "AgentLogos"
+        ) ?? Bundle.module.url(
+            forResource: name,
+            withExtension: "svg",
+            subdirectory: "ProgramLogos"
         ) ?? Bundle.module.url(
             forResource: name,
             withExtension: "svg"

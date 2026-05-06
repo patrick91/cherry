@@ -4,11 +4,24 @@ struct SidebarTerminalPathLabel: Equatable {
     let title: String
     let detail: String?
     let detailIconResourceName: String?
+    let leadingIconResourceName: String?
+    let leadingIconFallback: String?
+    let leadingIconRendersAsTemplate: Bool
 
-    init(title: String, detail: String? = nil, detailIconResourceName: String? = nil) {
+    init(
+        title: String,
+        detail: String? = nil,
+        detailIconResourceName: String? = nil,
+        leadingIconResourceName: String? = nil,
+        leadingIconFallback: String? = nil,
+        leadingIconRendersAsTemplate: Bool = false
+    ) {
         self.title = title
         self.detail = detail
         self.detailIconResourceName = detailIconResourceName
+        self.leadingIconResourceName = leadingIconResourceName
+        self.leadingIconFallback = leadingIconFallback
+        self.leadingIconRendersAsTemplate = leadingIconRendersAsTemplate
     }
 }
 

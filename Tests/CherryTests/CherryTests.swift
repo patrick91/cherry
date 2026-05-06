@@ -1306,6 +1306,40 @@ import Testing
 }
 
 @MainActor
+@Test func stoppedCommandSessionRestartsWhenRequested() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let session = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat"),
+        projectRoot: directory.path
+    )
+    session.stopManagedCommand()
+
+    if case .exited = session.state {
+        session.restartManagedCommandIfNeeded()
+    } else {
+        Issue.record("Expected stopped command session to be exited")
+    }
+
+    #expect(session.kind == .command)
+    #expect(session.acceptsInput)
+    if case .live = session.state {
+    } else {
+        Issue.record("Expected stopped command session to restart")
+    }
+}
+
+@MainActor
 @Test func workspaceUpdatesExistingCommandSessionAfterRename() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

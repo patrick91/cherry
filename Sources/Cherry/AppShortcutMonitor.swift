@@ -186,6 +186,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             if let session = workspace.commandSession(named: command.name) {
                 chromeState?.selectNote(id: nil)
                 workspace.select(session)
+                session.restartManagedCommandIfNeeded()
             } else if let root = AgentSettings.shared.resolvedProject(for: projectRoot).validProjectRoot {
                 chromeState?.selectNote(id: nil)
                 workspace.addCommandSession(command: command, projectRoot: root)

@@ -1204,6 +1204,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         startShell()
     }
 
+    func restartManagedCommandIfNeeded() {
+        guard kind == .command else { return }
+
+        switch state {
+        case .launching, .live:
+            return
+        case .exited, .failed:
+            clearScrollback()
+            startShell()
+        }
+    }
+
     func rename(to requestedTitle: String?) {
         let trimmedTitle = requestedTitle?
             .trimmingCharacters(in: .whitespacesAndNewlines)

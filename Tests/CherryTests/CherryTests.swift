@@ -479,6 +479,13 @@ import Testing
     #expect(session.sidebarDetail == "")
 }
 
+@Test func appearancePreferenceTogglesLightAndDarkModes() async throws {
+    #expect(CherryAppearancePreference.toggled(from: .light, currentColorScheme: .light) == .dark)
+    #expect(CherryAppearancePreference.toggled(from: .dark, currentColorScheme: .dark) == .light)
+    #expect(CherryAppearancePreference.toggled(from: .system, currentColorScheme: .dark) == .light)
+    #expect(CherryAppearancePreference.toggled(from: .system, currentColorScheme: .light) == .dark)
+}
+
 @MainActor
 @Test func terminalSessionTracksEnhancedKeyboardProtocol() async throws {
     let session = TerminalSession(

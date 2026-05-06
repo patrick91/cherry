@@ -672,6 +672,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case addProject
     case agents
     case addAgent
+    case toggleAppearance
 
     var id: String { rawValue }
 
@@ -681,6 +682,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Add Project"
         case .agents: "Agents"
         case .addAgent: "Add Agent"
+        case .toggleAppearance: "Toggle Light/Dark Mode"
         }
     }
 
@@ -690,6 +692,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Create a Cherry project"
         case .agents: "Open a configured agent"
         case .addAgent: "Configure a global agent tool"
+        case .toggleAppearance: "Switch app appearance"
         }
     }
 
@@ -699,6 +702,7 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "folder.badge.plus"
         case .agents: "sparkles"
         case .addAgent: "sparkles"
+        case .toggleAppearance: "circle.lefthalf.filled"
         }
     }
 
@@ -752,7 +756,9 @@ private enum CommandPaletteRootItem: Identifiable {
 }
 
 private struct CommandPaletteOverlay: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var settings: AgentSettings
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     let selectedProjectRoot: String?
     @Binding var isPresented: Bool
@@ -1051,6 +1057,9 @@ private struct CommandPaletteOverlay: View {
                     mode = .agents
                 case .addAgent:
                     mode = .agentPresets
+                case .toggleAppearance:
+                    terminalSettings.toggleLightDarkAppearance(currentColorScheme: colorScheme)
+                    dismiss()
                 }
             case .agent(let agent):
                 launch(agent)

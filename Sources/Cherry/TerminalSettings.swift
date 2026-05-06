@@ -24,6 +24,20 @@ enum CherryAppearancePreference: String, CaseIterable, Identifiable {
         case .dark: .dark
         }
     }
+
+    static func toggled(
+        from appearance: CherryAppearancePreference,
+        currentColorScheme: ColorScheme
+    ) -> CherryAppearancePreference {
+        switch appearance {
+        case .system:
+            currentColorScheme == .dark ? .light : .dark
+        case .light:
+            .dark
+        case .dark:
+            .light
+        }
+    }
 }
 
 extension Notification.Name {
@@ -86,6 +100,13 @@ final class TerminalSettings: ObservableObject {
         minimumContrast = Defaults.minimumContrast
         lightTerminalThemeName = Defaults.lightTerminalThemeName
         darkTerminalThemeName = Defaults.darkTerminalThemeName
+    }
+
+    func toggleLightDarkAppearance(currentColorScheme: ColorScheme) {
+        appearance = CherryAppearancePreference.toggled(
+            from: appearance,
+            currentColorScheme: currentColorScheme
+        )
     }
 
     func ghosttyConfiguration() -> TerminalConfiguration {

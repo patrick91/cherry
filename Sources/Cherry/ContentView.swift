@@ -520,28 +520,27 @@ private struct NoteDetailView: View {
         Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                TextField("Untitled", text: $draftTitle)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 26, weight: .bold))
-                    .foregroundStyle(themeForeground)
-                    .onSubmit { saveNow() }
+    private var titleHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Untitled", text: $draftTitle)
+                .textFieldStyle(.plain)
+                .font(.system(size: 28, weight: .bold))
+                .foregroundStyle(themeForeground)
+                .onSubmit { saveNow() }
 
-                Text("Edited \(note.updatedAt.formatted(.relative(presentation: .named)))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(themeForeground.opacity(0.45))
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 24)
-            .padding(.bottom, 14)
-
-            MarkdownSourceEditor(text: $draftMarkdown, themeColors: themeColors)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 14)
+            Text("Edited \(note.updatedAt.formatted(.relative(presentation: .named)))")
+                .font(.system(size: 11))
+                .foregroundStyle(themeForeground.opacity(0.5))
         }
-        .frame(maxWidth: 820, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    var body: some View {
+        MarkdownSourceEditor(
+            text: $draftMarkdown,
+            themeColors: themeColors,
+            header: AnyView(titleHeader)
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(themeBackground)
         .onChange(of: draftTitle) { _, _ in scheduleSave() }

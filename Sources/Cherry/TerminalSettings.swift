@@ -40,6 +40,22 @@ enum CherryAppearancePreference: String, CaseIterable, Identifiable {
     }
 }
 
+enum SidebarTerminalPathDisplayMode: String, CaseIterable, Identifiable {
+    case repoFocused
+    case smartInitials
+    case fullPath
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .repoFocused: "Repo focused"
+        case .smartInitials: "Smart initials"
+        case .fullPath: "Full path"
+        }
+    }
+}
+
 extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
@@ -73,6 +89,12 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    @Published var sidebarTerminalPathDisplayMode: SidebarTerminalPathDisplayMode {
+        didSet {
+            save(sidebarTerminalPathDisplayMode.rawValue, forKey: Keys.sidebarTerminalPathDisplayMode, notifyTerminal: false)
+        }
+    }
+
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -87,13 +109,15 @@ final class TerminalSettings: ObservableObject {
 
     private let defaults: UserDefaults
 
-    private init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         fontSize = defaults.object(forKey: Keys.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = defaults.object(forKey: Keys.cursorBlink) as? Bool ?? Defaults.cursorBlink
         minimumContrast = defaults.object(forKey: Keys.minimumContrast) as? Double ?? Defaults.minimumContrast
         sidebarBackgroundDepth = defaults.object(forKey: Keys.sidebarBackgroundDepth) as? Double
             ?? Defaults.sidebarBackgroundDepth
+        sidebarTerminalPathDisplayMode = (defaults.object(forKey: Keys.sidebarTerminalPathDisplayMode) as? String)
+            .flatMap(SidebarTerminalPathDisplayMode.init(rawValue:)) ?? Defaults.sidebarTerminalPathDisplayMode
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -107,6 +131,7 @@ final class TerminalSettings: ObservableObject {
         cursorBlink = Defaults.cursorBlink
         minimumContrast = Defaults.minimumContrast
         sidebarBackgroundDepth = Defaults.sidebarBackgroundDepth
+        sidebarTerminalPathDisplayMode = Defaults.sidebarTerminalPathDisplayMode
         lightTerminalThemeName = Defaults.lightTerminalThemeName
         darkTerminalThemeName = Defaults.darkTerminalThemeName
     }
@@ -185,9 +210,11 @@ final class TerminalSettings: ObservableObject {
         notifyChanged()
     }
 
-    private func save(_ value: String, forKey key: String) {
+    private func save(_ value: String, forKey key: String, notifyTerminal: Bool = true) {
         defaults.set(value, forKey: key)
-        notifyChanged()
+        if notifyTerminal {
+            notifyChanged()
+        }
     }
 
     private func notifyChanged() {
@@ -199,6 +226,7 @@ final class TerminalSettings: ObservableObject {
         static let cursorBlink = true
         static let minimumContrast = 1.15
         static let sidebarBackgroundDepth = 0.08
+        static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
@@ -209,6 +237,7 @@ final class TerminalSettings: ObservableObject {
         static let cursorBlink = "terminal.cursorBlink"
         static let minimumContrast = "terminal.minimumContrast"
         static let sidebarBackgroundDepth = "sidebar.backgroundDepth"
+        static let sidebarTerminalPathDisplayMode = "sidebar.terminalPathDisplayMode"
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"

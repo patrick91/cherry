@@ -311,6 +311,14 @@ private struct TerminalSettingsPane: View {
                     }
                 }
                 .pickerStyle(.segmented)
+
+                Picker("Terminal path labels", selection: $settings.sidebarTerminalPathDisplayMode) {
+                    ForEach(SidebarTerminalPathDisplayMode.allCases) { mode in
+                        Text(mode.label)
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
             }
 
             Section("Terminal Theme") {

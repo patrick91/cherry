@@ -487,6 +487,88 @@ import Testing
     #expect(CherryAppearancePreference.toggled(from: .system, currentColorScheme: .light) == .dark)
 }
 
+@Test func sidebarTerminalPathFormatterCompactsGithubRepositories() async throws {
+    let home = "/Users/patrick"
+
+    #expect(SidebarTerminalPathFormatter.label(
+        for: "~/github/fastapilabs/cloud",
+        mode: .repoFocused,
+        homeDirectory: home
+    ) == SidebarTerminalPathLabel(title: "cloud", detail: "fastapilabs/cloud", detailIconResourceName: "github"))
+    #expect(SidebarTerminalPathFormatter.label(
+        for: "~/github/fastapilabs/cloud/backend/api",
+        mode: .repoFocused,
+        homeDirectory: home
+    ) == SidebarTerminalPathLabel(title: "cloud/backend/api", detail: "fastapilabs/cloud", detailIconResourceName: "github"))
+    #expect(SidebarTerminalPathFormatter.label(
+        for: "~/github/fastapilabs/cloud/backend/api",
+        mode: .smartInitials,
+        homeDirectory: home
+    ) == SidebarTerminalPathLabel(title: "~/g/f/cloud/backend/api", detail: nil))
+    #expect(SidebarTerminalPathFormatter.label(
+        for: "~/github/fastapilabs/cloud/backend/api",
+        mode: .fullPath,
+        homeDirectory: home
+    ) == SidebarTerminalPathLabel(title: "~/github/fastapilabs/cloud/backend/api", detail: nil))
+}
+
+@Test func sidebarTerminalPathFormatterFallsBackToSmartInitials() async throws {
+    #expect(SidebarTerminalPathFormatter.label(
+        for: "~/work/platform/services/api",
+        mode: .repoFocused,
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(title: "~/w/platform/services/api", detail: nil))
+}
+
+@Test func sidebarTerminalPathFormatterRecognizesPathLikeShellTitles() async throws {
+    let workingDirectory = "~/github/patrick91/cherry/Scripts"
+    let home = "/Users/patrick"
+
+    #expect(SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+        title: "~/github/patrick91/cherry/Scripts",
+        workingDirectory: workingDirectory,
+        homeDirectory: home
+    ))
+    #expect(SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+        title: ".../patrick91/cherry/Scripts",
+        workingDirectory: workingDirectory,
+        homeDirectory: home
+    ))
+    #expect(SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+        title: "…/patrick91/cherry/Scripts",
+        workingDirectory: workingDirectory,
+        homeDirectory: home
+    ))
+    #expect(!SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+        title: "vim README.md",
+        workingDirectory: workingDirectory,
+        homeDirectory: home
+    ))
+    #expect(!SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+        title: "config (~/.aws) - Nvim",
+        workingDirectory: workingDirectory,
+        homeDirectory: home
+    ))
+}
+
+@MainActor
+@Test func terminalSettingsPersistSidebarTerminalPathDisplayMode() async throws {
+    let defaultsName = "CherryTests.TerminalSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let settings = TerminalSettings(defaults: defaults)
+    #expect(settings.sidebarTerminalPathDisplayMode == .repoFocused)
+
+    settings.sidebarTerminalPathDisplayMode = .fullPath
+    #expect(TerminalSettings(defaults: defaults).sidebarTerminalPathDisplayMode == .fullPath)
+
+    settings.resetTerminalAppearance()
+    #expect(settings.sidebarTerminalPathDisplayMode == .repoFocused)
+}
+
 @Test func sidebarThemeSampleContrastsTerminalBackgroundByAppearance() async throws {
     let darkThemeColors = TerminalThemeColors(
         background: "#303446",

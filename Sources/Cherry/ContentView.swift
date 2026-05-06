@@ -2689,6 +2689,7 @@ private struct SidebarTabRow: View {
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
+        let label = sidebarLabel()
 
         Button(action: onSelect) {
             HStack(spacing: session.kind == .agent ? 8 : 0) {
@@ -2697,16 +2698,27 @@ private struct SidebarTabRow: View {
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(session.title)
+                    Text(label.title)
                         .font(.system(size: 15, weight: .regular))
                         .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                         .lineLimit(1)
 
-                    if !session.sidebarDetail.isEmpty {
-                        Text(session.sidebarDetail)
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
-                            .lineLimit(1)
+                    if let detail = label.detail {
+                        HStack(spacing: 4) {
+                            if let resourceName = label.detailIconResourceName {
+                                AgentLogoImage(
+                                    resourceName: resourceName,
+                                    rendersAsTemplate: true,
+                                    fallbackLabel: ""
+                                )
+                                .frame(width: 11, height: 11)
+                            }
+
+                            Text(detail)
+                                .lineLimit(1)
+                        }
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
                     }
                 }
 
@@ -2722,7 +2734,7 @@ private struct SidebarTabRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: session.sidebarDetail.isEmpty ? 42 : 50)
+            .frame(height: label.detail == nil ? 42 : 50)
             .padding(.leading, SidebarLayout.rowHorizontalInset)
             .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -2751,6 +2763,23 @@ private struct SidebarTabRow: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
+    }
+
+    private func sidebarLabel() -> SidebarTerminalPathLabel {
+        guard session.kind == .terminal,
+              !session.hasExplicitTitle,
+              SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+                  title: session.title,
+                  workingDirectory: session.workingDirectory
+              )
+        else {
+            return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
+        }
+
+        return SidebarTerminalPathFormatter.label(
+            for: session.workingDirectory,
+            mode: terminalSettings.sidebarTerminalPathDisplayMode
+        )
     }
 }
 

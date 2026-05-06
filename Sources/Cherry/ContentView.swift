@@ -769,6 +769,7 @@ private struct CommandPaletteOverlay: View {
     @State private var mode = CommandPaletteMode.commands
     @State private var query = ""
     @State private var selectedIndex = 0
+    @State private var scrollTopIndex = 0
     @State private var editingAgent: AgentToolDefinition?
     @State private var agentError: String?
     @FocusState private var isSearchFocused: Bool
@@ -798,22 +799,33 @@ private struct CommandPaletteOverlay: View {
 
                 Divider()
 
-                ScrollView {
-                    VStack(spacing: 4) {
-                        if mode == .commands {
-                            commandRows
-                        } else if mode == .projects {
-                            projectRows
-                        } else if mode == .agents {
-                            agentRows
-                        } else {
-                            agentPresetRows
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            if mode == .commands {
+                                commandRows
+                            } else if mode == .projects {
+                                projectRows
+                            } else if mode == .agents {
+                                agentRows
+                            } else {
+                                agentPresetRows
+                            }
                         }
+                        .padding(7)
+                        .frame(maxWidth: .infinity, alignment: .top)
                     }
-                    .padding(7)
-                    .frame(maxWidth: .infinity, alignment: .top)
+                    .frame(maxHeight: 340)
+                    .onChange(of: selectedIndex) { _, _ in
+                        scrollSelectionIntoView(proxy)
+                    }
+                    .onChange(of: mode) { _, _ in
+                        resetPaletteScroll(proxy)
+                    }
+                    .onChange(of: query) { _, _ in
+                        resetPaletteScroll(proxy)
+                    }
                 }
-                .frame(maxHeight: 340)
             }
             .frame(width: 560)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -834,10 +846,12 @@ private struct CommandPaletteOverlay: View {
         }
         .onChange(of: query) { _, _ in
             selectedIndex = 0
+            scrollTopIndex = 0
         }
         .onChange(of: mode) { _, _ in
             query = ""
             selectedIndex = 0
+            scrollTopIndex = 0
             focusSearchField()
         }
         .sheet(item: $editingAgent) { agent in
@@ -931,6 +945,7 @@ private struct CommandPaletteOverlay: View {
                     selectedIndex = index
                     commitSelection()
                 }
+                .id(rowID(for: index))
             }
         }
     }
@@ -948,6 +963,7 @@ private struct CommandPaletteOverlay: View {
                     isCurrent: false,
                     action: chooseProjectRoot
                 )
+                .id(rowID(for: 0))
             }
         } else {
             ForEach(Array(filteredProjects.enumerated()), id: \.element.id) { index, project in
@@ -961,6 +977,7 @@ private struct CommandPaletteOverlay: View {
                     selectedIndex = index
                     commitSelection()
                 }
+                .id(rowID(for: index))
             }
         }
     }
@@ -984,6 +1001,7 @@ private struct CommandPaletteOverlay: View {
                     selectedIndex = index
                     commitSelection()
                 }
+                .id(rowID(for: index))
             }
         }
     }
@@ -1004,6 +1022,7 @@ private struct CommandPaletteOverlay: View {
                     selectedIndex = index
                     commitSelection()
                 }
+                .id(rowID(for: index))
             }
         }
     }
@@ -1040,6 +1059,57 @@ private struct CommandPaletteOverlay: View {
         let count = resultCount
         guard count > 0 else { return }
         selectedIndex = (selectedIndex + delta + count) % count
+    }
+
+    private func rowID(for index: Int) -> String {
+        "\(rowIDPrefix)-\(index)"
+    }
+
+    private var visibleRowCount: Int {
+        6
+    }
+
+    private var rowIDPrefix: String {
+        switch mode {
+        case .commands: "commands"
+        case .projects: "projects"
+        case .agents: "agents"
+        case .agentPresets: "agentPresets"
+        }
+    }
+
+    private func scrollSelectionIntoView(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        guard resultCount > 0 else { return }
+        let lastPossibleTopIndex = max(0, resultCount - visibleRowCount)
+        let nextTopIndex: Int
+        if selectedIndex < scrollTopIndex {
+            nextTopIndex = selectedIndex
+        } else if selectedIndex >= scrollTopIndex + visibleRowCount {
+            nextTopIndex = selectedIndex - visibleRowCount + 1
+        } else {
+            return
+        }
+
+        scrollTopIndex = min(max(nextTopIndex, 0), lastPossibleTopIndex)
+        scrollToTopIndex(proxy, animated: animated)
+    }
+
+    private func resetPaletteScroll(_ proxy: ScrollViewProxy) {
+        scrollTopIndex = 0
+        scrollToTopIndex(proxy, animated: false)
+    }
+
+    private func scrollToTopIndex(_ proxy: ScrollViewProxy, animated: Bool) {
+        let id = rowID(for: scrollTopIndex)
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.snappy(duration: 0.12)) {
+                    proxy.scrollTo(id, anchor: .top)
+                }
+            } else {
+                proxy.scrollTo(id, anchor: .top)
+            }
+        }
     }
 
     private func commitSelection() {

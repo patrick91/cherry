@@ -21,9 +21,8 @@ await server.withMethodHandler(CallTool.self) { params in
 }
 
 try await server.start(transport: StdioTransport())
-while true {
-    try await Task.sleep(for: .seconds(3_600))
-}
+await server.waitUntilCompleted()
+await server.stop()
 
 private enum CherryMCPTools {
     static let all: [Tool] = [

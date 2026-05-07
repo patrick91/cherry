@@ -72,6 +72,20 @@ enum SidebarTerminalPathFormatter {
             trimmedTitle.hasPrefix("…/")
     }
 
+    static func githubRepositoryPath(
+        for path: String,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> String? {
+        let components = relativeComponents(for: path, homeDirectory: homeDirectory)
+        guard components.count >= 3,
+              components[0].caseInsensitiveCompare("github") == .orderedSame
+        else {
+            return nil
+        }
+
+        return components.dropFirst().joined(separator: "/")
+    }
+
     private static func githubRepositoryLabel(
         for path: String,
         homeDirectory: String

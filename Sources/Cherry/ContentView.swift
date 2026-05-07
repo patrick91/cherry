@@ -2508,6 +2508,7 @@ private struct SidebarCommandSection: View {
                     SidebarCommandRow(
                         command: command,
                         session: session,
+                        projectRoot: projectRoot,
                         isSelected: chromeState.focusedIdleCommandName == command.name
                             || (chromeState.isShowingTerminalContent && (session.map { workspace.selectedSessionID == $0.id } ?? false)),
                         presentation: presentation,
@@ -2871,6 +2872,7 @@ private struct SidebarCommandRow: View {
 
     let command: ProjectCommandDefinition
     let session: TerminalSession?
+    let projectRoot: String?
     let isSelected: Bool
     let presentation: SidebarPresentation
     let shortcutNumber: Int
@@ -2889,6 +2891,7 @@ private struct SidebarCommandRow: View {
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
             presentation: presentation
         )
+        let subtitle = sidebarSubtitle()
 
         Button(action: select) {
             HStack(spacing: 8) {
@@ -2898,10 +2901,23 @@ private struct SidebarCommandRow: View {
                         .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                         .lineLimit(1)
 
-                    Text(command.commandLine)
+                    if let subtitle {
+                        HStack(spacing: 4) {
+                            if let resourceName = subtitle.iconResourceName {
+                                AgentLogoImage(
+                                    resourceName: resourceName,
+                                    rendersAsTemplate: true,
+                                    fallbackLabel: ""
+                                )
+                                .frame(width: 11, height: 11)
+                            }
+
+                            Text(subtitle.text)
+                                .lineLimit(1)
+                        }
                         .font(.system(size: 11, weight: .regular))
                         .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
-                        .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -2921,7 +2937,7 @@ private struct SidebarCommandRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 46)
+            .frame(height: subtitle == nil ? 42 : 46)
             .padding(.leading, SidebarLayout.rowHorizontalInset)
             .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -2951,6 +2967,27 @@ private struct SidebarCommandRow: View {
                 .fill(palette.hoverFill)
         }
     }
+
+    private func sidebarSubtitle() -> SidebarCommandSubtitle? {
+        let hasArguments = !command.arguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasArguments,
+           let projectRoot,
+           let repoPath = SidebarTerminalPathFormatter.githubRepositoryPath(
+               for: command.resolvedWorkingDirectory(projectRoot: projectRoot)
+           ) {
+            return SidebarCommandSubtitle(text: repoPath, iconResourceName: "github")
+        }
+
+        return command.commandLine
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+            .map { SidebarCommandSubtitle(text: $0, iconResourceName: nil) }
+    }
+}
+
+private struct SidebarCommandSubtitle {
+    let text: String
+    let iconResourceName: String?
 }
 
 private extension TerminalSession {

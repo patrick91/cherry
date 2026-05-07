@@ -719,6 +719,14 @@ import Testing
         mode: .fullPath,
         homeDirectory: home
     ) == SidebarTerminalPathLabel(title: "~/github/fastapilabs/cloud/backend/api", detail: nil))
+    #expect(SidebarTerminalPathFormatter.githubRepositoryPath(
+        for: "~/github/fastapilabs/cloud/backend/api",
+        homeDirectory: home
+    ) == "fastapilabs/cloud/backend/api")
+    #expect(SidebarTerminalPathFormatter.githubRepositoryPath(
+        for: "~/work/fastapilabs/cloud/backend/api",
+        homeDirectory: home
+    ) == nil)
 }
 
 @Test func sidebarTerminalPathFormatterFallsBackToSmartInitials() async throws {

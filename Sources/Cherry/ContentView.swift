@@ -822,6 +822,7 @@ private struct TodoListPane: View {
                                 select: { chromeState.selectTodo(id: $0.id) },
                                 moveUp: moveUp,
                                 moveDown: moveDown,
+                                reorder: reorder(_:to:),
                                 moveToStatus: move(_:to:),
                                 delete: delete
                             )
@@ -870,6 +871,10 @@ private struct TodoListPane: View {
         _ = try? todoStore.move(id: todo.id, status: nil, afterTodoID: todos[index + 1].id)
     }
 
+    private func reorder(_ todo: ProjectTodo, to targetIndex: Int) {
+        _ = try? todoStore.move(id: todo.id, to: targetIndex, within: todo.status)
+    }
+
     private func move(_ todo: ProjectTodo, to status: TodoStatus) {
         _ = try? todoStore.move(id: todo.id, status: status, afterTodoID: nil)
     }
@@ -890,8 +895,12 @@ private struct TodoStatusGroup: View {
     let select: (ProjectTodo) -> Void
     let moveUp: (ProjectTodo) -> Void
     let moveDown: (ProjectTodo) -> Void
+    let reorder: (ProjectTodo, Int) -> Void
     let moveToStatus: (ProjectTodo, TodoStatus) -> Void
     let delete: (ProjectTodo) -> Void
+
+    @State private var draggedTodoID: UUID?
+    @State private var draggedRowOffsetY: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -918,6 +927,11 @@ private struct TodoStatusGroup: View {
                     themeForeground: themeForeground,
                     action: { select(todo) }
                 )
+                .offset(y: draggedTodoID == todo.id ? draggedRowOffsetY : 0)
+                .zIndex(draggedTodoID == todo.id ? 1 : 0)
+                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
+                    [todo.id: anchor]
+                }
                 .contextMenu {
                     Button("Move Up") { moveUp(todo) }
                     Button("Move Down") { moveDown(todo) }
@@ -937,6 +951,39 @@ private struct TodoStatusGroup: View {
                         delete(todo)
                     }
                 }
+            }
+        }
+        .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
+            GeometryReader { geometry in
+                SidebarInteractionOverlay(
+                    rows: todos.compactMap { todo in
+                        rowBounds[todo.id].map { anchor in
+                            SidebarRowFrame(id: todo.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
+                        }
+                    },
+                    onSelect: { todoID in
+                        guard let todo = todos.first(where: { $0.id == todoID }) else { return }
+                        select(todo)
+                    },
+                    onDragChanged: { todoID, offsetY in
+                        draggedTodoID = todoID
+                        draggedRowOffsetY = offsetY
+                    },
+                    onMove: { todoID, targetIndex in
+                        guard let todo = todos.first(where: { $0.id == todoID }) else { return }
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            reorder(todo, targetIndex)
+                        }
+                    },
+                    onDragEnded: {
+                        withAnimation(.snappy(duration: 0.16)) {
+                            draggedTodoID = nil
+                            draggedRowOffsetY = 0
+                        }
+                    }
+                )
             }
         }
     }

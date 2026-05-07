@@ -138,6 +138,31 @@ final class ProjectTodoStore: ObservableObject {
         return try self.todo(id: id)
     }
 
+    func move(id: UUID, to targetIndex: Int, within status: TodoStatus) throws -> ProjectTodo {
+        let statusTodos = todos
+            .filter { $0.status == status }
+            .sorted(by: Self.todoSort)
+        guard let currentIndex = statusTodos.firstIndex(where: { $0.id == id }) else {
+            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString) in \(status.rawValue).")
+        }
+
+        let clampedIndex = min(max(targetIndex, 0), statusTodos.count - 1)
+        guard currentIndex != clampedIndex else {
+            return try todo(id: id)
+        }
+
+        let afterTodoID: UUID?
+        if clampedIndex == 0 {
+            afterTodoID = nil
+        } else if currentIndex < clampedIndex {
+            afterTodoID = statusTodos[clampedIndex].id
+        } else {
+            afterTodoID = statusTodos[clampedIndex - 1].id
+        }
+
+        return try move(id: id, status: status, afterTodoID: afterTodoID)
+    }
+
     func addComment(
         id: UUID,
         markdown: String,

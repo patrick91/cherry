@@ -158,6 +158,32 @@ import Testing
 }
 
 @MainActor
+@Test func projectTodoStoreReordersTodosWithinStatus() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryTodos-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let store = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    let first = try store.create(title: "First", markdown: "", status: .ready)
+    let second = try store.create(title: "Second", markdown: "", status: .ready)
+    let third = try store.create(title: "Third", markdown: "", status: .ready)
+
+    _ = try store.move(id: third.id, to: 0, within: .ready)
+    #expect(store.todos.filter { $0.status == .ready }.map(\.id) == [third.id, first.id, second.id])
+    #expect(store.todos.filter { $0.status == .ready }.map(\.position) == [0, 1, 2])
+
+    _ = try store.move(id: third.id, to: 99, within: .ready)
+    #expect(store.todos.filter { $0.status == .ready }.map(\.id) == [first.id, second.id, third.id])
+    #expect(store.todos.filter { $0.status == .ready }.map(\.position) == [0, 1, 2])
+}
+
+@MainActor
 @Test func controlServerListsConfiguredAgents() async throws {
     let harness = try ControlServerHarness()
     defer {

@@ -64,6 +64,31 @@ import Testing
     }
 }
 
+@Test func cherryControlTodoRequestsRoundTrip() async throws {
+    let todoID = UUID().uuidString
+    let afterTodoID = UUID().uuidString
+    let terminalID = UUID().uuidString
+    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, open: true))
+    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, open: false))
+    let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID, open: true))
+    let get = CherryControlRequest.getTodo(.init(todoID: todoID))
+    let delete = CherryControlRequest.deleteTodo(.init(todoID: todoID))
+    let select = CherryControlRequest.selectTodo(.init(todoID: todoID))
+    let comment = CherryControlRequest.addTodoComment(.init(
+        todoID: todoID,
+        markdown: "Handing this off",
+        author: "Codex",
+        terminalID: terminalID,
+        open: true
+    ))
+
+    for request in [create, update, move, get, delete, select, comment] {
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+        #expect(decoded == request)
+    }
+}
+
 @MainActor
 @Test func projectNoteStorePersistsProjectNotes() async throws {
     let projectRoot = FileManager.default.temporaryDirectory
@@ -88,6 +113,48 @@ import Testing
 
     try reloaded.delete(id: note.id)
     #expect(ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot).notes.isEmpty)
+}
+
+@MainActor
+@Test func projectTodoStorePersistsProjectTodosAndComments() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryTodos-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let store = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    let first = try store.create(title: " First ", markdown: "A", status: .ready)
+    let second = try store.create(title: "Second", markdown: "B", status: .ready)
+    _ = try store.update(id: first.id, title: "Updated", markdown: "A+", status: .doing)
+    _ = try store.addComment(
+        id: first.id,
+        markdown: "Started",
+        authorLabel: "Codex",
+        authorTerminalID: "terminal-1",
+        authorAgentName: "Codex"
+    )
+    _ = try store.move(id: second.id, status: .doing, afterTodoID: first.id)
+
+    let reloaded = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    #expect(reloaded.todos.map(\.id) == [first.id, second.id])
+    #expect(reloaded.todos[0].title == "Updated")
+    #expect(reloaded.todos[0].markdown == "A+")
+    #expect(reloaded.todos[0].status == .doing)
+    #expect(reloaded.todos[0].position == 0)
+    #expect(reloaded.todos[0].comments.count == 1)
+    #expect(reloaded.todos[0].comments[0].authorLabel == "Codex")
+    #expect(reloaded.todos[0].comments[0].authorTerminalID == "terminal-1")
+    #expect(reloaded.todos[1].position == 1)
+
+    try reloaded.delete(id: first.id)
+    let afterDelete = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    #expect(afterDelete.todos.map(\.id) == [second.id])
+    #expect(afterDelete.todos[0].position == 0)
 }
 
 @MainActor
@@ -238,6 +305,122 @@ import Testing
     #expect(deleted.deleted == true)
     #expect(harness.noteStore.notes.isEmpty)
     #expect(harness.chromeState.selectedNoteID == nil)
+}
+
+@MainActor
+@Test func controlServerManagesProjectTodos() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/cat"))
+    harness.server.start()
+
+    let createResponse = try await harness.send(.createTodo(.init(
+        title: "Review Todo",
+        markdown: "# Findings",
+        status: .ready,
+        open: true
+    )))
+    guard case .createTodo(let created)? = createResponse.result else {
+        Issue.record("Expected createTodo result, got \(String(describing: createResponse))")
+        return
+    }
+
+    #expect(createResponse.error == nil)
+    #expect(created.todo.title == "Review Todo")
+    #expect(created.todo.markdown == "# Findings")
+    #expect(created.todo.status == .ready)
+    #expect(created.selected == true)
+    #expect(harness.chromeState.selectedTodoID == created.todo.id)
+    #expect(harness.chromeState.isTodoPanePresented == true)
+
+    let secondResponse = try await harness.send(.createTodo(.init(
+        title: "Second",
+        markdown: "",
+        status: .ready,
+        open: false
+    )))
+    guard case .createTodo(let second)? = secondResponse.result else {
+        Issue.record("Expected second createTodo result, got \(String(describing: secondResponse))")
+        return
+    }
+
+    let moveResponse = try await harness.send(.moveTodo(.init(
+        todoID: second.todo.id.uuidString,
+        status: .doing,
+        afterTodoID: nil,
+        open: false
+    )))
+    guard case .moveTodo(let moved)? = moveResponse.result else {
+        Issue.record("Expected moveTodo result, got \(String(describing: moveResponse))")
+        return
+    }
+    #expect(moved.todo.status == .doing)
+    #expect(moved.selected == false)
+
+    let agentSession = harness.workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "/bin/cat"),
+        projectRoot: harness.projectRoot.path,
+        select: false
+    )
+    let commentResponse = try await harness.send(.addTodoComment(.init(
+        todoID: created.todo.id.uuidString,
+        markdown: "Taking a look",
+        terminalID: agentSession.id.uuidString,
+        open: true
+    )))
+    guard case .addTodoComment(let commented)? = commentResponse.result else {
+        Issue.record("Expected addTodoComment result, got \(String(describing: commentResponse))")
+        return
+    }
+    #expect(commented.todo.comments.count == 1)
+    #expect(commented.todo.comments[0].authorLabel == "Codex")
+    #expect(commented.todo.comments[0].authorTerminalID == agentSession.id.uuidString)
+    #expect(commented.todo.comments[0].authorAgentName == "Codex")
+    #expect(commented.selected == true)
+
+    let listResponse = try await harness.send(.listTodos)
+    guard case .listTodos(let list)? = listResponse.result else {
+        Issue.record("Expected listTodos result, got \(String(describing: listResponse))")
+        return
+    }
+    #expect(list.activeProjectRoot == harness.projectRoot.path)
+    #expect(list.todos.map(\.id).contains(created.todo.id.uuidString))
+    #expect(list.selectedTodoID == created.todo.id.uuidString)
+
+    let updateResponse = try await harness.send(.updateTodo(.init(
+        todoID: created.todo.id.uuidString,
+        title: "Updated",
+        markdown: "- done",
+        status: .blocked,
+        open: false
+    )))
+    guard case .updateTodo(let updated)? = updateResponse.result else {
+        Issue.record("Expected updateTodo result, got \(String(describing: updateResponse))")
+        return
+    }
+    #expect(updated.todo.title == "Updated")
+    #expect(updated.todo.markdown == "- done")
+    #expect(updated.todo.status == .blocked)
+    #expect(updated.selected == true)
+
+    let getResponse = try await harness.send(.getTodo(.init(todoID: created.todo.id.uuidString)))
+    guard case .getTodo(let fetched)? = getResponse.result else {
+        Issue.record("Expected getTodo result, got \(String(describing: getResponse))")
+        return
+    }
+    #expect(fetched.todo == updated.todo)
+
+    let deleteResponse = try await harness.send(.deleteTodo(.init(todoID: created.todo.id.uuidString)))
+    guard case .deleteTodo(let deleted)? = deleteResponse.result else {
+        Issue.record("Expected deleteTodo result, got \(String(describing: deleteResponse))")
+        return
+    }
+    #expect(deleted.deleted == true)
+    #expect(harness.todoStore.todos.count == 1)
+    #expect(harness.chromeState.selectedTodoID == nil)
+    #expect(harness.chromeState.isTodoPanePresented == true)
 }
 
 @MainActor
@@ -1630,8 +1813,10 @@ private final class ControlServerHarness {
     let settings: AgentSettings
     let projectRoot: URL
     let notesRoot: URL
+    let todosRoot: URL
     let workspace: TerminalWorkspace
     let noteStore: ProjectNoteStore
+    let todoStore: ProjectTodoStore
     let chromeState: ProjectWindowChromeState
     let socketURL: URL
     let server: CherryControlServer
@@ -1645,6 +1830,8 @@ private final class ControlServerHarness {
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
         notesRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CherryControlNotes-\(UUID().uuidString)", isDirectory: true)
+        todosRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CherryControlTodos-\(UUID().uuidString)", isDirectory: true)
 
         let socketDirectory = URL(
             fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
@@ -1656,10 +1843,12 @@ private final class ControlServerHarness {
         _ = settings.addProject(path: projectRoot.path)
         workspace = TerminalWorkspace(projectRoot: projectRoot.path)
         noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
+        todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todosRoot)
         chromeState = ProjectWindowChromeState()
         server = CherryControlServer(
             workspace: workspace,
             noteStore: noteStore,
+            todoStore: todoStore,
             chromeState: chromeState,
             socketURL: socketURL,
             agentSettings: settings
@@ -1676,6 +1865,7 @@ private final class ControlServerHarness {
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRoot)
         try? FileManager.default.removeItem(at: notesRoot)
+        try? FileManager.default.removeItem(at: todosRoot)
         try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
     }
 

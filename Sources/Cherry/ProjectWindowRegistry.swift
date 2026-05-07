@@ -10,6 +10,7 @@ final class ProjectWindowRegistry {
     private var chromeStates: [String: WeakChromeState] = [:]
     weak var activeWorkspace: TerminalWorkspace?
     weak var activeNoteStore: ProjectNoteStore?
+    weak var activeTodoStore: ProjectTodoStore?
     weak var activeChromeState: ProjectWindowChromeState?
 
     private init() {}
@@ -19,10 +20,12 @@ final class ProjectWindowRegistry {
         projectRoot: String?,
         workspace: TerminalWorkspace,
         noteStore: ProjectNoteStore?,
+        todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
     ) {
         activeWorkspace = workspace
         activeNoteStore = noteStore
+        activeTodoStore = todoStore
         activeChromeState = chromeState
         guard let projectRoot else { return }
         windows[projectRoot] = WeakWindow(window)
@@ -102,7 +105,7 @@ final class ProjectWindowRegistry {
 
             candidate.workspace.select(session)
             activeWorkspace = candidate.workspace
-            candidate.chromeState?.selectNote(id: nil)
+            candidate.chromeState?.selectTerminal()
             activeChromeState = candidate.chromeState
             if let projectRoot = candidate.projectRoot {
                 _ = focus(projectRoot: projectRoot)
@@ -150,6 +153,9 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCommandPalettePresented = false
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
+    @Published var selectedTodoID: UUID?
+    @Published var isTodoPanePresented = false
+    @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
     // terminal container can predict its post-animation width without
@@ -202,6 +208,34 @@ final class ProjectWindowChromeState: ObservableObject {
 
     func selectNote(id: UUID?) {
         selectedNoteID = id
+        selectedTodoID = nil
+        isTodoPanePresented = false
+        focusedIdleCommandName = nil
+    }
+
+    func selectTodo(id: UUID?) {
+        selectedNoteID = nil
+        selectedTodoID = id
+        isTodoPanePresented = true
+        focusedIdleCommandName = nil
+    }
+
+    func selectTerminal() {
+        selectedNoteID = nil
+        selectedTodoID = nil
+        isTodoPanePresented = false
+        focusedIdleCommandName = nil
+    }
+
+    func focusIdleCommand(name: String) {
+        selectedNoteID = nil
+        selectedTodoID = nil
+        isTodoPanePresented = false
+        focusedIdleCommandName = name
+    }
+
+    var isShowingTerminalContent: Bool {
+        selectedNoteID == nil && !isTodoPanePresented && focusedIdleCommandName == nil
     }
 
     // Wraps the docked-sidebar resize animation with a start/end signal so the
@@ -229,6 +263,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
     let projectRoot: String?
     let workspace: TerminalWorkspace
     let noteStore: ProjectNoteStore?
+    let todoStore: ProjectTodoStore?
     let chromeState: ProjectWindowChromeState?
 
     func makeNSView(context: Context) -> NSView {
@@ -236,6 +271,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
         view.projectRoot = projectRoot
         view.workspace = workspace
         view.noteStore = noteStore
+        view.todoStore = todoStore
         view.chromeState = chromeState
         return view
     }
@@ -245,6 +281,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
         view.projectRoot = projectRoot
         view.workspace = workspace
         view.noteStore = noteStore
+        view.todoStore = todoStore
         view.chromeState = chromeState
         view.registerIfPossible()
     }
@@ -254,6 +291,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
 private final class ProjectWindowBinderView: NSView {
     weak var workspace: TerminalWorkspace?
     weak var noteStore: ProjectNoteStore?
+    weak var todoStore: ProjectTodoStore?
     weak var chromeState: ProjectWindowChromeState?
     weak var boundWindow: NSWindow?
     var projectRoot: String?
@@ -273,6 +311,7 @@ private final class ProjectWindowBinderView: NSView {
             projectRoot: projectRoot,
             workspace: workspace,
             noteStore: noteStore,
+            todoStore: todoStore,
             chromeState: chromeState
         )
     }
@@ -293,6 +332,7 @@ private final class ProjectWindowBinderView: NSView {
                 guard let self, let workspace = self.workspace else { return }
                 ProjectWindowRegistry.shared.activeWorkspace = workspace
                 ProjectWindowRegistry.shared.activeNoteStore = self.noteStore
+                ProjectWindowRegistry.shared.activeTodoStore = self.todoStore
                 ProjectWindowRegistry.shared.activeChromeState = self.chromeState
             }
         }

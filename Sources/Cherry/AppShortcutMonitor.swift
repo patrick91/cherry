@@ -6,6 +6,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let openSettings: () -> Void
 
@@ -21,6 +23,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
         Coordinator(
             workspace: workspace,
             chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
             projectRoot: projectRoot,
             visibleCommandNames: visibleCommandNames,
             visibleCommands: visibleCommands,
@@ -37,6 +41,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
         context.coordinator.chromeState = chromeState
+        context.coordinator.noteStore = noteStore
+        context.coordinator.todoStore = todoStore
         context.coordinator.projectRoot = projectRoot
         context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.visibleCommands = visibleCommands
@@ -53,10 +59,19 @@ struct AppShortcutMonitor: NSViewRepresentable {
         }
     }
 
+    enum SidebarItem {
+        case session(TerminalSession)
+        case command(ProjectCommandDefinition)
+        case todoBoard
+        case note(UUID)
+    }
+
     @MainActor
     final class Coordinator {
         weak var workspace: TerminalWorkspace?
         weak var chromeState: ProjectWindowChromeState?
+        weak var noteStore: ProjectNoteStore?
+        weak var todoStore: ProjectTodoStore?
         var projectRoot: String?
         var visibleCommandNames: [String]
         var visibleCommands: [ProjectCommandDefinition]
@@ -67,6 +82,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
         init(
             workspace: TerminalWorkspace,
             chromeState: ProjectWindowChromeState,
+            noteStore: ProjectNoteStore,
+            todoStore: ProjectTodoStore,
             projectRoot: String?,
             visibleCommandNames: [String],
             visibleCommands: [ProjectCommandDefinition],
@@ -74,6 +91,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
         ) {
             self.workspace = workspace
             self.chromeState = chromeState
+            self.noteStore = noteStore
+            self.todoStore = todoStore
             self.projectRoot = projectRoot
             self.visibleCommandNames = visibleCommandNames
             self.visibleCommands = visibleCommands
@@ -112,10 +131,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
             {
                 switch event.keyCode {
                 case 126:
-                    workspace?.selectPreviousSession(visibleCommandNames: visibleCommandNames)
+                    cycleSidebarSelection(offset: -1)
                     return true
                 case 125:
-                    workspace?.selectNextSession(visibleCommandNames: visibleCommandNames)
+                    cycleSidebarSelection(offset: 1)
                     return true
                 default:
                     break
@@ -160,36 +179,87 @@ struct AppShortcutMonitor: NSViewRepresentable {
         }
 
         private func selectVisibleSidebarItem(number: Int) {
-            guard let workspace else { return }
-            let zeroBasedIndex = number - 1
-            guard zeroBasedIndex >= 0 else { return }
+            let items = sidebarItems()
+            guard number >= 1, number - 1 < items.count else { return }
+            activate(items[number - 1])
+        }
 
-            let agentSessions = workspace.agentSessions
-            if zeroBasedIndex < agentSessions.count {
-                chromeState?.selectNote(id: nil)
-                workspace.select(agentSessions[zeroBasedIndex])
-                return
+        private func cycleSidebarSelection(offset: Int) {
+            let items = sidebarItems()
+            guard !items.isEmpty else { return }
+            let currentIndex = currentSidebarIndex(in: items) ?? 0
+            let nextIndex = (currentIndex + offset + items.count) % items.count
+            activate(items[nextIndex])
+        }
+
+        private func sidebarItems() -> [SidebarItem] {
+            guard let workspace else { return [] }
+            var items: [SidebarItem] = []
+            items += workspace.agentSessions.map { .session($0) }
+            items += workspace.terminalSessions.map { .session($0) }
+            items += visibleCommands.map { .command($0) }
+            items.append(.todoBoard)
+            if let noteStore {
+                items += noteStore.notes.map { .note($0.id) }
             }
+            return items
+        }
 
-            let terminalIndex = zeroBasedIndex - agentSessions.count
-            let terminalSessions = workspace.terminalSessions
-            if terminalIndex < terminalSessions.count {
-                chromeState?.selectNote(id: nil)
-                workspace.select(terminalSessions[terminalIndex])
-                return
+        private func currentSidebarIndex(in items: [SidebarItem]) -> Int? {
+            if let chromeState {
+                if let selectedNoteID = chromeState.selectedNoteID {
+                    return items.firstIndex {
+                        if case .note(let id) = $0 { return id == selectedNoteID }
+                        return false
+                    }
+                }
+                if chromeState.isTodoPanePresented {
+                    return items.firstIndex {
+                        if case .todoBoard = $0 { return true }
+                        return false
+                    }
+                }
+                if let idleName = chromeState.focusedIdleCommandName {
+                    return items.firstIndex {
+                        if case .command(let def) = $0 { return def.name == idleName }
+                        return false
+                    }
+                }
             }
+            if let selectedID = workspace?.selectedSessionID {
+                return items.firstIndex { item in
+                    switch item {
+                    case .session(let s):
+                        return s.id == selectedID
+                    case .command(let def):
+                        return workspace?.commandSession(named: def.name)?.id == selectedID
+                    case .todoBoard, .note:
+                        return false
+                    }
+                }
+            }
+            return nil
+        }
 
-            let commandIndex = terminalIndex - terminalSessions.count
-            guard commandIndex >= 0, commandIndex < visibleCommands.count else { return }
-
-            let command = visibleCommands[commandIndex]
-            if let session = workspace.commandSession(named: command.name) {
-                chromeState?.selectNote(id: nil)
+        private func activate(_ item: SidebarItem) {
+            guard let workspace, let chromeState else { return }
+            switch item {
+            case .session(let session):
+                chromeState.selectTerminal()
                 workspace.select(session)
-                session.restartManagedCommandIfNeeded()
-            } else if let root = AgentSettings.shared.resolvedProject(for: projectRoot).validProjectRoot {
-                chromeState?.selectNote(id: nil)
-                workspace.addCommandSession(command: command, projectRoot: root)
+            case .command(let command):
+                if let session = workspace.commandSession(named: command.name) {
+                    chromeState.selectTerminal()
+                    workspace.select(session)
+                } else {
+                    chromeState.focusIdleCommand(name: command.name)
+                }
+            case .todoBoard:
+                let firstSelectableTodoID = todoStore?.todos.first { $0.status != .done }?.id
+                    ?? todoStore?.todos.first?.id
+                chromeState.selectTodo(id: chromeState.selectedTodoID ?? firstSelectableTodoID)
+            case .note(let id):
+                chromeState.selectNote(id: id)
             }
         }
     }

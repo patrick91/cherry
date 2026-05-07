@@ -42,6 +42,11 @@ private enum CherryMCPTools {
             properties: [:]
         ),
         tool(
+            "list_todos",
+            "List Cherry todos for the active project.",
+            properties: [:]
+        ),
+        tool(
             "create_note",
             "Create a project-scoped Markdown note in Cherry. Opens the note for review by default.",
             properties: [
@@ -79,6 +84,70 @@ private enum CherryMCPTools {
             "Open an existing Cherry Markdown note for review/editing.",
             properties: ["note_id": string("Cherry note UUID.")],
             required: ["note_id"]
+        ),
+        tool(
+            "create_todo",
+            "Create a project-scoped Cherry todo. Opens the todo pane by default.",
+            properties: [
+                "title": string("Todo title."),
+                "markdown": string("Optional Markdown details."),
+                "status": string("Optional status: backlog, ready, doing, blocked, or done."),
+                "open": boolean("Whether Cherry should open the todo after creating it. Defaults to true.")
+            ],
+            required: ["title"]
+        ),
+        tool(
+            "get_todo",
+            "Read a Cherry todo, including comments.",
+            properties: ["todo_id": string("Cherry todo UUID.")],
+            required: ["todo_id"]
+        ),
+        tool(
+            "update_todo",
+            "Update a Cherry todo title, Markdown details, and/or status.",
+            properties: [
+                "todo_id": string("Cherry todo UUID."),
+                "title": string("Optional replacement title."),
+                "markdown": string("Optional replacement Markdown details."),
+                "status": string("Optional status: backlog, ready, doing, blocked, or done."),
+                "open": boolean("Whether Cherry should open the todo after updating it. Defaults to false.")
+            ],
+            required: ["todo_id"]
+        ),
+        tool(
+            "move_todo",
+            "Move a Cherry todo to another status and/or position. If status changes and after_todo_id is omitted, the todo is appended to the target status.",
+            properties: [
+                "todo_id": string("Cherry todo UUID."),
+                "status": string("Optional target status: backlog, ready, doing, blocked, or done."),
+                "after_todo_id": string("Optional todo UUID in the target status to place this todo after."),
+                "open": boolean("Whether Cherry should open the todo after moving it. Defaults to false.")
+            ],
+            required: ["todo_id"]
+        ),
+        tool(
+            "delete_todo",
+            "Delete a Cherry todo.",
+            properties: ["todo_id": string("Cherry todo UUID.")],
+            required: ["todo_id"]
+        ),
+        tool(
+            "select_todo",
+            "Open an existing Cherry todo in the todo pane.",
+            properties: ["todo_id": string("Cherry todo UUID.")],
+            required: ["todo_id"]
+        ),
+        tool(
+            "add_todo_comment",
+            "Append a comment to a Cherry todo. Pass terminal_id for agent attribution when commenting from a Cherry agent session.",
+            properties: [
+                "todo_id": string("Cherry todo UUID."),
+                "markdown": string("Comment Markdown."),
+                "author": string("Optional author label used when terminal_id is not provided."),
+                "terminal_id": string("Optional Cherry agent terminal UUID for attribution."),
+                "open": boolean("Whether Cherry should open the todo after adding the comment. Defaults to false.")
+            ],
+            required: ["todo_id", "markdown"]
         ),
         tool(
             "create_terminal",
@@ -216,6 +285,8 @@ private enum CherryMCPTools {
             return .listAgents
         case "list_notes":
             return .listNotes
+        case "list_todos":
+            return .listTodos
         case "create_note":
             return .createNote(.init(
                 title: try requiredString("title", in: arguments),
@@ -235,6 +306,42 @@ private enum CherryMCPTools {
             return .deleteNote(.init(noteID: try requiredString("note_id", in: arguments)))
         case "select_note":
             return .selectNote(.init(noteID: try requiredString("note_id", in: arguments)))
+        case "create_todo":
+            return .createTodo(.init(
+                title: try requiredString("title", in: arguments),
+                markdown: stringArgument("markdown", in: arguments) ?? "",
+                status: try todoStatusArgument("status", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "get_todo":
+            return .getTodo(.init(todoID: try requiredString("todo_id", in: arguments)))
+        case "update_todo":
+            return .updateTodo(.init(
+                todoID: try requiredString("todo_id", in: arguments),
+                title: stringArgument("title", in: arguments),
+                markdown: stringArgument("markdown", in: arguments),
+                status: try todoStatusArgument("status", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "move_todo":
+            return .moveTodo(.init(
+                todoID: try requiredString("todo_id", in: arguments),
+                status: try todoStatusArgument("status", in: arguments),
+                afterTodoID: stringArgument("after_todo_id", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "delete_todo":
+            return .deleteTodo(.init(todoID: try requiredString("todo_id", in: arguments)))
+        case "select_todo":
+            return .selectTodo(.init(todoID: try requiredString("todo_id", in: arguments)))
+        case "add_todo_comment":
+            return .addTodoComment(.init(
+                todoID: try requiredString("todo_id", in: arguments),
+                markdown: try requiredString("markdown", in: arguments),
+                author: stringArgument("author", in: arguments),
+                terminalID: stringArgument("terminal_id", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
         case "create_terminal":
             return .createTerminal(.init(
                 title: stringArgument("title", in: arguments),
@@ -311,6 +418,8 @@ private enum CherryMCPTools {
             return try encodedResult(payload)
         case .listNotes(let payload):
             return try encodedResult(payload)
+        case .listTodos(let payload):
+            return try encodedResult(payload)
         case .createTerminal(let payload):
             return try encodedResult(payload)
         case .runAgent(let payload):
@@ -324,6 +433,20 @@ private enum CherryMCPTools {
         case .deleteNote(let payload):
             return try encodedResult(payload)
         case .selectNote(let payload):
+            return try encodedResult(payload)
+        case .createTodo(let payload):
+            return try encodedResult(payload)
+        case .getTodo(let payload):
+            return try encodedResult(payload)
+        case .updateTodo(let payload):
+            return try encodedResult(payload)
+        case .moveTodo(let payload):
+            return try encodedResult(payload)
+        case .deleteTodo(let payload):
+            return try encodedResult(payload)
+        case .selectTodo(let payload):
+            return try encodedResult(payload)
+        case .addTodoComment(let payload):
             return try encodedResult(payload)
         case .renameTerminal(let payload):
             return try encodedResult(payload)
@@ -390,6 +513,18 @@ private enum CherryMCPTools {
 
     private static func boolArgument(_ key: String, in arguments: [String: Value]) -> Bool? {
         arguments[key]?.boolValue
+    }
+
+    private static func todoStatusArgument(_ key: String, in arguments: [String: Value]) throws -> TodoStatus? {
+        guard let value = stringArgument(key, in: arguments)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+            return nil
+        }
+        guard let status = TodoStatus(rawValue: value.lowercased()) else {
+            throw CherryControlError(code: "invalid_todo_status", message: "Unknown todo status: \(value)")
+        }
+        return status
     }
 
     private static func tool(_ name: String, _ description: String, properties: [String: Value], required: [String] = []) -> Tool {

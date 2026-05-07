@@ -92,6 +92,8 @@ struct CherryApp: App {
                         ProjectWindowRegistry.shared.activeWorkspace
                     }, noteStoreProvider: {
                         ProjectWindowRegistry.shared.activeNoteStore
+                    }, todoStoreProvider: {
+                        ProjectWindowRegistry.shared.activeTodoStore
                     }, chromeStateProvider: {
                         ProjectWindowRegistry.shared.activeChromeState
                     })
@@ -220,11 +222,13 @@ private struct ProjectWorkspaceView: View {
     @StateObject private var workspace: TerminalWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
+    @StateObject private var todoStore: ProjectTodoStore
     @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
         _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(projectRoot: projectRoot))
+        _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
     var body: some View {
@@ -232,6 +236,7 @@ private struct ProjectWorkspaceView: View {
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
+            todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: openProject,
             isSidebarHidden: $chromeState.isSidebarHidden,
@@ -242,6 +247,7 @@ private struct ProjectWorkspaceView: View {
             projectRoot: workspace.projectRoot,
             workspace: workspace,
             noteStore: noteStore,
+            todoStore: todoStore,
             chromeState: chromeState
         ))
         .focusedValue(\.terminalWorkspace, workspace)
@@ -249,6 +255,7 @@ private struct ProjectWorkspaceView: View {
         .onAppear {
             ProjectWindowRegistry.shared.activeWorkspace = workspace
             ProjectWindowRegistry.shared.activeNoteStore = noteStore
+            ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
             autoStartCommandsIfNeeded()
         }

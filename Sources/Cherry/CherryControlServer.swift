@@ -5,9 +5,11 @@ import Foundation
 final class CherryControlServer: @unchecked Sendable {
     private weak var workspace: TerminalWorkspace?
     private weak var noteStore: ProjectNoteStore?
+    private weak var todoStore: ProjectTodoStore?
     private weak var chromeState: ProjectWindowChromeState?
     private let workspaceProvider: @MainActor () -> TerminalWorkspace?
     private let noteStoreProvider: @MainActor () -> ProjectNoteStore?
+    private let todoStoreProvider: @MainActor () -> ProjectTodoStore?
     private let chromeStateProvider: @MainActor () -> ProjectWindowChromeState?
     private let agentSettings: AgentSettings
     private let socketURL: URL
@@ -19,15 +21,18 @@ final class CherryControlServer: @unchecked Sendable {
     init(
         workspace: TerminalWorkspace,
         noteStore: ProjectNoteStore? = nil,
+        todoStore: ProjectTodoStore? = nil,
         chromeState: ProjectWindowChromeState? = nil,
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared
     ) {
         self.workspace = workspace
         self.noteStore = noteStore
+        self.todoStore = todoStore
         self.chromeState = chromeState
         self.workspaceProvider = { workspace }
         self.noteStoreProvider = { noteStore }
+        self.todoStoreProvider = { todoStore }
         self.chromeStateProvider = { chromeState }
         self.agentSettings = agentSettings
         self.socketURL = socketURL
@@ -39,6 +44,9 @@ final class CherryControlServer: @unchecked Sendable {
         noteStoreProvider: @escaping @MainActor () -> ProjectNoteStore? = {
             ProjectWindowRegistry.shared.activeNoteStore
         },
+        todoStoreProvider: @escaping @MainActor () -> ProjectTodoStore? = {
+            ProjectWindowRegistry.shared.activeTodoStore
+        },
         chromeStateProvider: @escaping @MainActor () -> ProjectWindowChromeState? = {
             ProjectWindowRegistry.shared.activeChromeState
         },
@@ -47,9 +55,11 @@ final class CherryControlServer: @unchecked Sendable {
     ) {
         self.workspace = nil
         self.noteStore = nil
+        self.todoStore = nil
         self.chromeState = nil
         self.workspaceProvider = workspaceProvider
         self.noteStoreProvider = noteStoreProvider
+        self.todoStoreProvider = todoStoreProvider
         self.chromeStateProvider = chromeStateProvider
         self.agentSettings = agentSettings
         self.socketURL = socketURL
@@ -219,6 +229,9 @@ final class CherryControlServer: @unchecked Sendable {
         case .listNotes:
             let noteStore = try activeNoteStore(for: workspace)
             return .init(result: .listNotes(listNotes(noteStore: noteStore)))
+        case .listTodos:
+            let todoStore = try activeTodoStore(for: workspace)
+            return .init(result: .listTodos(listTodos(todoStore: todoStore)))
         case .createTerminal(let request):
             let session = workspace.addSession(
                 title: request.title,
@@ -302,6 +315,87 @@ final class CherryControlServer: @unchecked Sendable {
             let note = try noteStore.note(id: try noteID(from: request.noteID))
             select(note: note)
             return .init(result: .selectNote(.init(noteID: note.id.uuidString, selected: true)))
+        case .createTodo(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.create(
+                title: request.title,
+                markdown: request.markdown,
+                status: request.status ?? .backlog
+            )
+            if request.open ?? true {
+                select(todo: todo)
+            }
+            return .init(result: .createTodo(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .getTodo(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.todo(id: try todoID(from: request.todoID))
+            return .init(result: .getTodo(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .updateTodo(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.update(
+                id: try todoID(from: request.todoID),
+                title: request.title,
+                markdown: request.markdown,
+                status: request.status
+            )
+            if request.open ?? false {
+                select(todo: todo)
+            }
+            return .init(result: .updateTodo(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .moveTodo(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let afterTodoID = try request.afterTodoID.map { try todoID(from: $0) }
+            let todo = try todoStore.move(
+                id: try todoID(from: request.todoID),
+                status: request.status,
+                afterTodoID: afterTodoID
+            )
+            if request.open ?? false {
+                select(todo: todo)
+            }
+            return .init(result: .moveTodo(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .deleteTodo(let request):
+            let id = try todoID(from: request.todoID)
+            let todoStore = try activeTodoStore(for: workspace)
+            try todoStore.delete(id: id)
+            if activeChromeState()?.selectedTodoID == id {
+                activeChromeState()?.selectTodo(id: nil)
+            }
+            return .init(result: .deleteTodo(.init(todoID: id.uuidString, deleted: true)))
+        case .selectTodo(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.todo(id: try todoID(from: request.todoID))
+            select(todo: todo)
+            return .init(result: .selectTodo(.init(todoID: todo.id.uuidString, selected: true)))
+        case .addTodoComment(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let author = try todoCommentAuthor(from: request, workspace: workspace)
+            let todo = try todoStore.addComment(
+                id: try todoID(from: request.todoID),
+                markdown: request.markdown,
+                authorLabel: author.label,
+                authorTerminalID: author.terminalID,
+                authorAgentName: author.agentName
+            )
+            if request.open ?? false {
+                select(todo: todo)
+            }
+            return .init(result: .addTodoComment(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
         case .renameTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             session.rename(to: request.title)
@@ -309,7 +403,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
-            activeChromeState()?.selectNote(id: nil)
+            activeChromeState()?.selectTerminal()
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -413,6 +507,28 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func listTodos(todoStore: ProjectTodoStore) -> ListTodosResult {
+        ListTodosResult(
+            activeProjectRoot: todoStore.projectRoot,
+            todos: todoStore.todos.map(todoInfo),
+            selectedTodoID: activeChromeState()?.selectedTodoID?.uuidString
+        )
+    }
+
+    private func todoInfo(_ todo: ProjectTodo) -> TodoInfo {
+        TodoInfo(
+            id: todo.id.uuidString,
+            projectRoot: todo.projectRoot,
+            title: todo.title,
+            status: todo.status,
+            position: todo.position,
+            commentCount: todo.comments.count,
+            createdAt: todo.createdAt,
+            updatedAt: todo.updatedAt
+        )
+    }
+
+    @MainActor
     private func findAgent(named requestedName: String) throws -> ResolvedAgentTool {
         let normalizedName = AgentToolDefinition.normalizedName(requestedName)
         guard let agent = agentSettings.resolvedAgents.first(where: { $0.definition.normalizedName == normalizedName }) else {
@@ -441,6 +557,17 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func activeTodoStore(for workspace: TerminalWorkspace) throws -> ProjectTodoStore {
+        guard let projectRoot = workspace.projectRoot else {
+            throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+        }
+        guard let store = todoStore ?? todoStoreProvider(), store.projectRoot == projectRoot else {
+            throw CherryControlError(code: "todos_unavailable", message: "Cherry todos are unavailable for the active project.")
+        }
+        return store
+    }
+
+    @MainActor
     private func activeChromeState() -> ProjectWindowChromeState? {
         chromeState ?? chromeStateProvider()
     }
@@ -450,11 +577,44 @@ final class CherryControlServer: @unchecked Sendable {
         activeChromeState()?.selectNote(id: note.id)
     }
 
+    @MainActor
+    private func select(todo: ProjectTodo) {
+        activeChromeState()?.selectTodo(id: todo.id)
+    }
+
     private func noteID(from value: String) throws -> UUID {
         guard let id = UUID(uuidString: value) else {
             throw CherryControlError(code: "invalid_note_id", message: "Note id is not a valid UUID: \(value)")
         }
         return id
+    }
+
+    private func todoID(from value: String) throws -> UUID {
+        guard let id = UUID(uuidString: value) else {
+            throw CherryControlError(code: "invalid_todo_id", message: "Todo id is not a valid UUID: \(value)")
+        }
+        return id
+    }
+
+    @MainActor
+    private func todoCommentAuthor(
+        from request: AddTodoCommentRequest,
+        workspace: TerminalWorkspace
+    ) throws -> (label: String, terminalID: String?, agentName: String?) {
+        if let terminalID = request.terminalID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !terminalID.isEmpty {
+            let session = try findSession(workspace: workspace, terminalID: terminalID)
+            guard session.kind == .agent else {
+                throw CherryControlError(code: "invalid_comment_author_terminal", message: "terminal_id must refer to an agent terminal.")
+            }
+            let label = session.agentName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? session.title.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? "Agent"
+            return (label, session.id.uuidString, session.agentName)
+        }
+
+        let label = request.author?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "MCP"
+        return (label, nil, nil)
     }
 
     @MainActor

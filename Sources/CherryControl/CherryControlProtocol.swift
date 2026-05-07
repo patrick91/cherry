@@ -99,6 +99,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listTerminals
     case listAgents
     case listNotes
+    case listTodos
     case createTerminal(CreateTerminalRequest)
     case runAgent(RunAgentRequest)
     case createNote(CreateNoteRequest)
@@ -106,6 +107,13 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case updateNote(UpdateNoteRequest)
     case deleteNote(NoteIDRequest)
     case selectNote(NoteIDRequest)
+    case createTodo(CreateTodoRequest)
+    case getTodo(TodoIDRequest)
+    case updateTodo(UpdateTodoRequest)
+    case moveTodo(MoveTodoRequest)
+    case deleteTodo(TodoIDRequest)
+    case selectTodo(TodoIDRequest)
+    case addTodoComment(AddTodoCommentRequest)
     case renameTerminal(RenameTerminalRequest)
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
@@ -133,6 +141,14 @@ public struct NoteIDRequest: Codable, Equatable, Sendable {
     }
 }
 
+public struct TodoIDRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+
+    public init(todoID: String) {
+        self.todoID = todoID
+    }
+}
+
 public struct CreateNoteRequest: Codable, Equatable, Sendable {
     public let title: String
     public let markdown: String
@@ -155,6 +171,78 @@ public struct UpdateNoteRequest: Codable, Equatable, Sendable {
         self.noteID = noteID
         self.title = title
         self.markdown = markdown
+        self.open = open
+    }
+}
+
+public struct CreateTodoRequest: Codable, Equatable, Sendable {
+    public let title: String
+    public let markdown: String
+    public let status: TodoStatus?
+    public let open: Bool?
+
+    public init(title: String, markdown: String = "", status: TodoStatus? = nil, open: Bool? = nil) {
+        self.title = title
+        self.markdown = markdown
+        self.status = status
+        self.open = open
+    }
+}
+
+public struct UpdateTodoRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let title: String?
+    public let markdown: String?
+    public let status: TodoStatus?
+    public let open: Bool?
+
+    public init(
+        todoID: String,
+        title: String? = nil,
+        markdown: String? = nil,
+        status: TodoStatus? = nil,
+        open: Bool? = nil
+    ) {
+        self.todoID = todoID
+        self.title = title
+        self.markdown = markdown
+        self.status = status
+        self.open = open
+    }
+}
+
+public struct MoveTodoRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let status: TodoStatus?
+    public let afterTodoID: String?
+    public let open: Bool?
+
+    public init(todoID: String, status: TodoStatus? = nil, afterTodoID: String? = nil, open: Bool? = nil) {
+        self.todoID = todoID
+        self.status = status
+        self.afterTodoID = afterTodoID
+        self.open = open
+    }
+}
+
+public struct AddTodoCommentRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let markdown: String
+    public let author: String?
+    public let terminalID: String?
+    public let open: Bool?
+
+    public init(
+        todoID: String,
+        markdown: String,
+        author: String? = nil,
+        terminalID: String? = nil,
+        open: Bool? = nil
+    ) {
+        self.todoID = todoID
+        self.markdown = markdown
+        self.author = author
+        self.terminalID = terminalID
         self.open = open
     }
 }
@@ -286,6 +374,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listTerminals(ListTerminalsResult)
     case listAgents(ListAgentsResult)
     case listNotes(ListNotesResult)
+    case listTodos(ListTodosResult)
     case createTerminal(TerminalSummaryResult)
     case runAgent(RunAgentResult)
     case createNote(NoteDetailResult)
@@ -293,6 +382,13 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case updateNote(NoteDetailResult)
     case deleteNote(DeleteNoteResult)
     case selectNote(SelectNoteResult)
+    case createTodo(TodoDetailResult)
+    case getTodo(TodoDetailResult)
+    case updateTodo(TodoDetailResult)
+    case moveTodo(TodoDetailResult)
+    case deleteTodo(DeleteTodoResult)
+    case selectTodo(SelectTodoResult)
+    case addTodoComment(TodoDetailResult)
     case renameTerminal(TerminalSummaryResult)
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
@@ -478,6 +574,148 @@ public struct DeleteNoteResult: Codable, Equatable, Sendable {
 
     public init(noteID: String, deleted: Bool) {
         self.noteID = noteID
+        self.deleted = deleted
+    }
+}
+
+public enum TodoStatus: String, Codable, CaseIterable, Equatable, Identifiable, Sendable {
+    case backlog
+    case ready
+    case doing
+    case blocked
+    case done
+
+    public var id: String { rawValue }
+}
+
+public struct TodoComment: Codable, Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public var markdown: String
+    public var authorLabel: String
+    public var authorTerminalID: String?
+    public var authorAgentName: String?
+    public let createdAt: Date
+
+    public init(
+        id: UUID,
+        markdown: String,
+        authorLabel: String,
+        authorTerminalID: String? = nil,
+        authorAgentName: String? = nil,
+        createdAt: Date
+    ) {
+        self.id = id
+        self.markdown = markdown
+        self.authorLabel = authorLabel
+        self.authorTerminalID = authorTerminalID
+        self.authorAgentName = authorAgentName
+        self.createdAt = createdAt
+    }
+}
+
+public struct ProjectTodo: Codable, Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public let projectRoot: String
+    public var title: String
+    public var markdown: String
+    public var status: TodoStatus
+    public var position: Int
+    public let createdAt: Date
+    public var updatedAt: Date
+    public var comments: [TodoComment]
+
+    public init(
+        id: UUID,
+        projectRoot: String,
+        title: String,
+        markdown: String,
+        status: TodoStatus,
+        position: Int,
+        createdAt: Date,
+        updatedAt: Date,
+        comments: [TodoComment] = []
+    ) {
+        self.id = id
+        self.projectRoot = projectRoot
+        self.title = title
+        self.markdown = markdown
+        self.status = status
+        self.position = position
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.comments = comments
+    }
+}
+
+public struct TodoInfo: Codable, Equatable, Sendable {
+    public let id: String
+    public let projectRoot: String
+    public let title: String
+    public let status: TodoStatus
+    public let position: Int
+    public let commentCount: Int
+    public let createdAt: Date
+    public let updatedAt: Date
+
+    public init(
+        id: String,
+        projectRoot: String,
+        title: String,
+        status: TodoStatus,
+        position: Int,
+        commentCount: Int,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.projectRoot = projectRoot
+        self.title = title
+        self.status = status
+        self.position = position
+        self.commentCount = commentCount
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct ListTodosResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String
+    public let todos: [TodoInfo]
+    public let selectedTodoID: String?
+
+    public init(activeProjectRoot: String, todos: [TodoInfo], selectedTodoID: String?) {
+        self.activeProjectRoot = activeProjectRoot
+        self.todos = todos
+        self.selectedTodoID = selectedTodoID
+    }
+}
+
+public struct TodoDetailResult: Codable, Equatable, Sendable {
+    public let todo: ProjectTodo
+    public let selected: Bool
+
+    public init(todo: ProjectTodo, selected: Bool) {
+        self.todo = todo
+        self.selected = selected
+    }
+}
+
+public struct SelectTodoResult: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let selected: Bool
+
+    public init(todoID: String, selected: Bool) {
+        self.todoID = todoID
+        self.selected = selected
+    }
+}
+
+public struct DeleteTodoResult: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let deleted: Bool
+
+    public init(todoID: String, deleted: Bool) {
+        self.todoID = todoID
         self.deleted = deleted
     }
 }

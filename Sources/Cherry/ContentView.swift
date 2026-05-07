@@ -14,6 +14,7 @@ struct ContentView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let openProject: (CherryProject) -> Void
     @Binding var isSidebarHidden: Bool
@@ -55,6 +56,8 @@ struct ContentView: View {
                     workspace: workspace,
                     chromeState: chromeState,
                     noteStore: noteStore,
+                    todoStore: todoStore,
+                    projectRoot: projectRoot,
                     includeLeadingPadding: isSidebarHidden
                 )
                     .ignoresSafeArea(.all, edges: .top)
@@ -150,6 +153,8 @@ struct ContentView: View {
         .background(AppShortcutMonitor(
             workspace: workspace,
             chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
             projectRoot: projectRoot,
             openSettings: { openSettings() }
         ))
@@ -222,6 +227,7 @@ struct ContentView: View {
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
+            todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .docked,
             openProject: openProject
@@ -268,6 +274,7 @@ struct ContentView: View {
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
+            todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .floating,
             openProject: openProject
@@ -458,12 +465,23 @@ private struct DetailPaneView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    @ObservedObject private var agentSettings = AgentSettings.shared
+    let projectRoot: String?
     let includeLeadingPadding: Bool
 
     var body: some View {
         Group {
             if let note = selectedNote {
                 NoteDetailView(note: note, noteStore: noteStore)
+            } else if chromeState.isTodoPanePresented {
+                TodoPaneView(todoStore: todoStore, chromeState: chromeState)
+            } else if let idleCommand = focusedIdleCommand {
+                IdleCommandView(
+                    command: idleCommand,
+                    onStart: { startIdleCommand(idleCommand) },
+                    onClear: { chromeState.selectTerminal() }
+                )
             } else if let session = workspace.selectedSession {
                 TerminalSceneView(session: session, chromeState: chromeState)
             } else {
@@ -483,11 +501,96 @@ private struct DetailPaneView: View {
             else { return }
             chromeState.selectNote(id: nil)
         }
+        .onChange(of: todoStore.todos) { _, todos in
+            guard let selectedID = chromeState.selectedTodoID,
+                  !todos.contains(where: { $0.id == selectedID })
+            else { return }
+            chromeState.selectTodo(id: nil)
+        }
     }
 
     private var selectedNote: ProjectNote? {
         guard let selectedID = chromeState.selectedNoteID else { return nil }
         return noteStore.notes.first { $0.id == selectedID }
+    }
+
+    private var focusedIdleCommand: ProjectCommandDefinition? {
+        guard let name = chromeState.focusedIdleCommandName else { return nil }
+        return agentSettings.launchableProjectCommands(for: projectRoot)
+            .first { $0.name == name }
+    }
+
+    private func startIdleCommand(_ command: ProjectCommandDefinition) {
+        guard command.isLaunchable,
+              let root = agentSettings.resolvedProject(for: projectRoot).validProjectRoot
+        else { return }
+        chromeState.selectTerminal()
+        workspace.addCommandSession(command: command, projectRoot: root)
+    }
+}
+
+private struct IdleCommandView: View {
+    let command: ProjectCommandDefinition
+    let onStart: () -> Void
+    let onClear: () -> Void
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var themeColors: TerminalThemeColors {
+        terminalSettings.ghosttyThemeColors(for: colorScheme)
+    }
+
+    private var themeBackground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.background) ?? .windowBackgroundColor)
+    }
+
+    private var themeForeground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "terminal")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(themeForeground.opacity(0.55))
+
+            VStack(spacing: 4) {
+                Text(command.name.isEmpty ? "Command" : command.name)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(themeForeground)
+
+                Text("Not running")
+                    .font(.system(size: 12))
+                    .foregroundStyle(themeForeground.opacity(0.55))
+            }
+
+            if !command.commandLine.isEmpty {
+                Text(command.commandLine)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(themeForeground.opacity(0.7))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(themeForeground.opacity(0.06))
+                    }
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onStart) {
+                    Label("Start", systemImage: "play.fill")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(!command.isLaunchable)
+
+                Button("Cancel", action: onClear)
+                    .keyboardShortcut(.escape, modifiers: [])
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(themeBackground)
     }
 }
 
@@ -574,6 +677,611 @@ private struct NoteDetailView: View {
         pendingSave = nil
         guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
         _ = try? noteStore.update(id: note.id, title: draftTitle, markdown: draftMarkdown)
+    }
+}
+
+private struct TodoPaneView: View {
+    @ObservedObject var todoStore: ProjectTodoStore
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @Environment(\.colorScheme) private var colorScheme
+
+    private static let compactWidthThreshold: CGFloat = 640
+
+    private var themeColors: TerminalThemeColors {
+        terminalSettings.ghosttyThemeColors(for: colorScheme)
+    }
+
+    private var themeBackground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.background) ?? .windowBackgroundColor)
+    }
+
+    private var themeForeground: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let isCompact = geometry.size.width < Self.compactWidthThreshold
+            Group {
+                if isCompact {
+                    compactBody
+                } else {
+                    splitBody
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(themeBackground)
+        }
+        .onAppear {
+            if chromeState.selectedTodoID == nil {
+                chromeState.selectedTodoID = firstSelectableTodo?.id
+            }
+        }
+        .onChange(of: todoStore.todos) { _, todos in
+            guard let selectedID = chromeState.selectedTodoID,
+                  !todos.contains(where: { $0.id == selectedID })
+            else { return }
+            chromeState.selectedTodoID = firstSelectableTodo?.id
+        }
+    }
+
+    private var splitBody: some View {
+        HSplitView {
+            TodoListPane(
+                todoStore: todoStore,
+                chromeState: chromeState,
+                themeForeground: themeForeground
+            )
+            .frame(minWidth: 220, idealWidth: 300, maxWidth: 420)
+
+            Group {
+                if let todo = selectedTodo {
+                    TodoInspectorPane(
+                        todo: todo,
+                        todoStore: todoStore,
+                        themeForeground: themeForeground,
+                        isCompact: false,
+                        onBack: nil
+                    )
+                } else {
+                    ContentUnavailableView("No Todo Selected", systemImage: "checklist")
+                        .foregroundStyle(themeForeground)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(minWidth: 280)
+        }
+    }
+
+    @ViewBuilder
+    private var compactBody: some View {
+        if let todo = selectedTodo {
+            TodoInspectorPane(
+                todo: todo,
+                todoStore: todoStore,
+                themeForeground: themeForeground,
+                isCompact: true,
+                onBack: { chromeState.selectTodo(id: nil) }
+            )
+        } else {
+            TodoListPane(
+                todoStore: todoStore,
+                chromeState: chromeState,
+                themeForeground: themeForeground
+            )
+        }
+    }
+
+    private var selectedTodo: ProjectTodo? {
+        guard let selectedID = chromeState.selectedTodoID else { return nil }
+        return todoStore.todos.first { $0.id == selectedID }
+    }
+
+    private var firstSelectableTodo: ProjectTodo? {
+        todoStore.todos.first { $0.status != .done } ?? todoStore.todos.first
+    }
+}
+
+private struct TodoListPane: View {
+    @ObservedObject var todoStore: ProjectTodoStore
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let themeForeground: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Text("Todos")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(themeForeground)
+
+                Spacer()
+
+                Button(action: createTodo) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .help("New todo")
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    ForEach(TodoStatus.allCases) { status in
+                        let todos = todos(in: status)
+                        if !todos.isEmpty {
+                            TodoStatusGroup(
+                                status: status,
+                                todos: todos,
+                                selectedTodoID: chromeState.selectedTodoID,
+                                themeForeground: themeForeground,
+                                select: { chromeState.selectTodo(id: $0.id) },
+                                moveUp: moveUp,
+                                moveDown: moveDown,
+                                moveToStatus: move(_:to:),
+                                delete: delete
+                            )
+                        }
+                    }
+
+                    if todoStore.todos.isEmpty {
+                        ContentUnavailableView {
+                            Label("No Todos", systemImage: "checklist")
+                        } description: {
+                            Text("Create one with the + button above.")
+                        }
+                        .foregroundStyle(themeForeground.opacity(0.7))
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 18)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(themeForeground.opacity(0.035))
+    }
+
+    private func todos(in status: TodoStatus) -> [ProjectTodo] {
+        todoStore.todos.filter { $0.status == status }
+    }
+
+    private func createTodo() {
+        if let todo = try? todoStore.create(title: "Untitled Todo", markdown: "", status: .backlog) {
+            chromeState.selectTodo(id: todo.id)
+        }
+    }
+
+    private func moveUp(_ todo: ProjectTodo) {
+        let todos = todos(in: todo.status)
+        guard let index = todos.firstIndex(where: { $0.id == todo.id }), index > 0 else { return }
+        let afterID = index > 1 ? todos[index - 2].id : nil
+        _ = try? todoStore.move(id: todo.id, status: nil, afterTodoID: afterID)
+    }
+
+    private func moveDown(_ todo: ProjectTodo) {
+        let todos = todos(in: todo.status)
+        guard let index = todos.firstIndex(where: { $0.id == todo.id }), index < todos.count - 1 else { return }
+        _ = try? todoStore.move(id: todo.id, status: nil, afterTodoID: todos[index + 1].id)
+    }
+
+    private func move(_ todo: ProjectTodo, to status: TodoStatus) {
+        _ = try? todoStore.move(id: todo.id, status: status, afterTodoID: nil)
+    }
+
+    private func delete(_ todo: ProjectTodo) {
+        try? todoStore.delete(id: todo.id)
+        if chromeState.selectedTodoID == todo.id {
+            chromeState.selectedTodoID = todoStore.todos.first { $0.status != .done }?.id ?? todoStore.todos.first?.id
+        }
+    }
+}
+
+private struct TodoStatusGroup: View {
+    let status: TodoStatus
+    let todos: [ProjectTodo]
+    let selectedTodoID: UUID?
+    let themeForeground: Color
+    let select: (ProjectTodo) -> Void
+    let moveUp: (ProjectTodo) -> Void
+    let moveDown: (ProjectTodo) -> Void
+    let moveToStatus: (ProjectTodo, TodoStatus) -> Void
+    let delete: (ProjectTodo) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 7) {
+                Image(systemName: status.symbolName)
+                    .font(.system(size: 10.5, weight: .semibold))
+                Text(status.displayName.uppercased())
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .tracking(0.6)
+                Spacer(minLength: 4)
+                Text("\(todos.count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(themeForeground.opacity(0.45))
+            }
+            .foregroundStyle(themeForeground.opacity(0.6))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 2)
+
+            ForEach(todos) { todo in
+                TodoListRow(
+                    todo: todo,
+                    isSelected: selectedTodoID == todo.id,
+                    themeForeground: themeForeground,
+                    action: { select(todo) }
+                )
+                .contextMenu {
+                    Button("Move Up") { moveUp(todo) }
+                    Button("Move Down") { moveDown(todo) }
+
+                    Menu("Move to Status") {
+                        ForEach(TodoStatus.allCases) { targetStatus in
+                            Button(targetStatus.displayName) {
+                                moveToStatus(todo, targetStatus)
+                            }
+                            .disabled(targetStatus == todo.status)
+                        }
+                    }
+
+                    Divider()
+
+                    Button("Delete", role: .destructive) {
+                        delete(todo)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct TodoListRow: View {
+    let todo: ProjectTodo
+    let isSelected: Bool
+    let themeForeground: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(todo.title.isEmpty ? "Untitled Todo" : todo.title)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                HStack(spacing: 6) {
+                    Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
+                    if !todo.comments.isEmpty {
+                        Text("·")
+                        Image(systemName: "text.bubble")
+                            .font(.system(size: 10))
+                        Text("\(todo.comments.count)")
+                            .monospacedDigit()
+                    }
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(themeForeground.opacity(0.5))
+            }
+            .foregroundStyle(themeForeground)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isSelected ? themeForeground.opacity(0.13) : Color.clear)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    static func relativeTimeString(for date: Date) -> String {
+        let interval = Date().timeIntervalSince(date)
+        if interval < 60 { return "just now" }
+        if interval < 3_600 { return "\(Int(interval / 60))m ago" }
+        if interval < 86_400 { return "\(Int(interval / 3_600))h ago" }
+        if interval < 604_800 { return "\(Int(interval / 86_400))d ago" }
+        return date.formatted(date: .abbreviated, time: .omitted)
+    }
+}
+
+private struct TodoInspectorPane: View {
+    let todo: ProjectTodo
+    @ObservedObject var todoStore: ProjectTodoStore
+    let themeForeground: Color
+    let isCompact: Bool
+    let onBack: (() -> Void)?
+
+    @State private var draftTitle: String
+    @State private var draftMarkdown: String
+    @State private var draftStatus: TodoStatus
+    @State private var draftComment = ""
+    @State private var pendingSave: Task<Void, Never>?
+
+    init(
+        todo: ProjectTodo,
+        todoStore: ProjectTodoStore,
+        themeForeground: Color,
+        isCompact: Bool,
+        onBack: (() -> Void)?
+    ) {
+        self.todo = todo
+        self.todoStore = todoStore
+        self.themeForeground = themeForeground
+        self.isCompact = isCompact
+        self.onBack = onBack
+        _draftTitle = State(initialValue: todo.title)
+        _draftMarkdown = State(initialValue: todo.markdown)
+        _draftStatus = State(initialValue: todo.status)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let onBack {
+                    Button {
+                        onBack()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("Todos")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(themeForeground.opacity(0.7))
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Untitled Todo", text: $draftTitle)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: isCompact ? 22 : 26, weight: .bold))
+                        .foregroundStyle(themeForeground)
+                        .onSubmit { saveNow() }
+
+                    statusRow
+                }
+
+                detailsSection
+
+                commentsSection
+            }
+            .padding(.horizontal, isCompact ? 18 : 26)
+            .padding(.vertical, isCompact ? 18 : 24)
+            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .foregroundStyle(themeForeground)
+        .onChange(of: draftTitle) { _, _ in scheduleSave() }
+        .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
+        .onChange(of: draftStatus) { _, _ in saveNow() }
+        .onChange(of: todo.id) { _, _ in resetDrafts() }
+        .onChange(of: todo.updatedAt) { _, _ in
+            guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status else { return }
+            resetDrafts()
+        }
+        .onDisappear {
+            saveNow()
+        }
+    }
+
+    @ViewBuilder
+    private var statusRow: some View {
+        let editedText = "Edited \(todo.updatedAt.formatted(.relative(presentation: .named)))"
+        if isCompact {
+            VStack(alignment: .leading, spacing: 6) {
+                statusPicker
+                Text(editedText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(themeForeground.opacity(0.5))
+            }
+        } else {
+            HStack(spacing: 10) {
+                statusPicker
+                Text(editedText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(themeForeground.opacity(0.5))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var statusPicker: some View {
+        Picker("Status", selection: $draftStatus) {
+            ForEach(TodoStatus.allCases) { status in
+                Label(status.displayName, systemImage: status.symbolName)
+                    .tag(status)
+            }
+        }
+        .labelsHidden()
+        .fixedSize()
+    }
+
+    private var detailsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Details")
+
+            ZStack(alignment: .topLeading) {
+                if draftMarkdown.isEmpty {
+                    Text("Add notes, links, or context — Markdown supported.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(themeForeground.opacity(0.35))
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 13)
+                        .allowsHitTesting(false)
+                }
+
+                TextEditor(text: $draftMarkdown)
+                    .font(.system(size: 13.5, weight: .regular, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 160)
+                    .padding(8)
+            }
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(themeForeground.opacity(0.055))
+            }
+        }
+    }
+
+    private var commentsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                sectionHeader("Comments")
+                Text("\(todo.comments.count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(themeForeground.opacity(0.45))
+            }
+
+            if todo.comments.isEmpty {
+                Text("No comments yet.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(themeForeground.opacity(0.45))
+                    .padding(.vertical, 4)
+            } else {
+                ForEach(todo.comments) { comment in
+                    commentRow(comment)
+                }
+            }
+
+            commentComposer
+        }
+    }
+
+    private func commentRow(_ comment: TodoComment) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(comment.authorLabel)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(comment.createdAt.formatted(.relative(presentation: .named)))
+                    .font(.system(size: 11))
+                    .foregroundStyle(themeForeground.opacity(0.48))
+            }
+            Text(comment.markdown)
+                .font(.system(size: 13))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(themeForeground)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(themeForeground.opacity(0.05))
+        }
+    }
+
+    private var commentComposer: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                if draftComment.isEmpty {
+                    Text("Write a comment…")
+                        .font(.system(size: 13))
+                        .foregroundStyle(themeForeground.opacity(0.35))
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 13)
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $draftComment)
+                    .font(.system(size: 13))
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 64)
+                    .padding(8)
+            }
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(themeForeground.opacity(0.055))
+            }
+
+            Button("Add Comment", action: addComment)
+                .disabled(draftComment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text.uppercased())
+            .font(.system(size: 10.5, weight: .semibold))
+            .tracking(0.6)
+            .foregroundStyle(themeForeground.opacity(0.55))
+    }
+
+    private func scheduleSave() {
+        pendingSave?.cancel()
+        pendingSave = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            saveNow()
+        }
+    }
+
+    private func saveNow() {
+        pendingSave?.cancel()
+        pendingSave = nil
+        guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status else { return }
+        _ = try? todoStore.update(id: todo.id, title: draftTitle, markdown: draftMarkdown, status: draftStatus)
+    }
+
+    private func resetDrafts() {
+        pendingSave?.cancel()
+        pendingSave = nil
+        draftTitle = todo.title
+        draftMarkdown = todo.markdown
+        draftStatus = todo.status
+    }
+
+    private func addComment() {
+        let markdown = draftComment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !markdown.isEmpty else { return }
+        draftComment = ""
+        _ = try? todoStore.addComment(
+            id: todo.id,
+            markdown: markdown,
+            authorLabel: "You",
+            authorTerminalID: nil,
+            authorAgentName: nil
+        )
+    }
+}
+
+private extension TodoStatus {
+    var displayName: String {
+        switch self {
+        case .backlog:
+            "Backlog"
+        case .ready:
+            "Ready"
+        case .doing:
+            "Doing"
+        case .blocked:
+            "Blocked"
+        case .done:
+            "Done"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .backlog:
+            "tray"
+        case .ready:
+            "circle"
+        case .doing:
+            "play.circle"
+        case .blocked:
+            "exclamationmark.octagon"
+        case .done:
+            "checkmark.circle"
+        }
     }
 }
 
@@ -1326,6 +2034,7 @@ private struct SidebarTabsView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let presentation: SidebarPresentation
     let openProject: (CherryProject) -> Void
@@ -1365,10 +2074,20 @@ private struct SidebarTabsView: View {
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
+                    SidebarTodosSection(
+                        todoStore: todoStore,
+                        chromeState: chromeState,
+                        presentation: presentation,
+                        shortcutNumber: todoBoardShortcutNumber,
+                        showShortcutHint: chromeState.isCommandKeyPressed
+                    )
+
                     SidebarNotesSection(
                         noteStore: noteStore,
                         chromeState: chromeState,
-                        presentation: presentation
+                        presentation: presentation,
+                        shortcutStartIndex: todoBoardShortcutNumber,
+                        showShortcutHints: chromeState.isCommandKeyPressed
                     )
                 }
                 // Keep the sidebar's text column aligned with the native
@@ -1396,6 +2115,13 @@ private struct SidebarTabsView: View {
     // content at the same on-screen position across both presentations.
     private var dockedCompensation: CGFloat {
         presentation == .docked ? SidebarLayout.floatingOuterInset : 0
+    }
+
+    private var todoBoardShortcutNumber: Int {
+        workspace.agentSessions.count
+            + workspace.terminalSessions.count
+            + agentSettings.launchableProjectCommands(for: projectRoot).count
+            + 1
     }
 }
 
@@ -1600,7 +2326,7 @@ private struct SidebarAgentSessionSection: View {
                 ForEach(Array(workspace.agentSessions.enumerated()), id: \.element.id) { index, session in
                     SidebarTabRow(
                         session: session,
-                        isSelected: workspace.selectedSessionID == session.id,
+                        isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
                         presentation: presentation,
                         shortcutNumber: index + 1,
                         showShortcutHint: showShortcutHints,
@@ -1735,7 +2461,8 @@ private struct SidebarCommandSection: View {
                     SidebarCommandRow(
                         command: command,
                         session: session,
-                        isSelected: session.map { workspace.selectedSessionID == $0.id } ?? false,
+                        isSelected: chromeState.focusedIdleCommandName == command.name
+                            || (chromeState.isShowingTerminalContent && (session.map { workspace.selectedSessionID == $0.id } ?? false)),
                         presentation: presentation,
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
@@ -1879,6 +2606,8 @@ private struct SidebarNotesSection: View {
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var chromeState: ProjectWindowChromeState
     let presentation: SidebarPresentation
+    let shortcutStartIndex: Int
+    let showShortcutHints: Bool
 
     var body: some View {
         let palette = SidebarPalette(
@@ -1906,7 +2635,8 @@ private struct SidebarNotesSection: View {
             if noteStore.notes.isEmpty {
                 SidebarEmptyRow(title: "No notes", palette: palette)
             } else {
-                ForEach(noteStore.notes) { note in
+                ForEach(Array(noteStore.notes.enumerated()), id: \.element.id) { index, note in
+                    let shortcutNumber = shortcutStartIndex + index + 1
                     Button {
                         chromeState.selectNote(id: note.id)
                     } label: {
@@ -1929,6 +2659,10 @@ private struct SidebarNotesSection: View {
                             }
 
                             Spacer(minLength: 8)
+
+                            if showShortcutHints, shortcutNumber <= 9 {
+                                SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected(note), palette: palette)
+                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(height: 46)
@@ -1969,6 +2703,99 @@ private struct SidebarNotesSection: View {
 
     private func isSelected(_ note: ProjectNote) -> Bool {
         chromeState.selectedNoteID == note.id
+    }
+}
+
+private struct SidebarTodosSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var todoStore: ProjectTodoStore
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let presentation: SidebarPresentation
+    let shortcutNumber: Int
+    let showShortcutHint: Bool
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            presentation: presentation
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarSectionHeader(title: "Todos", count: openTodoCount, palette: palette)
+
+            Button {
+                chromeState.selectTodo(id: chromeState.selectedTodoID ?? firstSelectableTodo?.id)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .frame(width: 18)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Todo Board")
+                            .font(.system(size: 15, weight: .regular))
+                            .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                            .lineLimit(1)
+
+                        Text(openTodoSubtitle)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if showShortcutHint, shortcutNumber <= 9 {
+                        SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 46)
+                .padding(.leading, SidebarLayout.rowHorizontalInset)
+                .padding(.trailing, SidebarLayout.rowHorizontalInset)
+                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .background {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(palette.selectedFill)
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                            }
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, -SidebarLayout.rowHorizontalInset)
+        }
+    }
+
+    private var openTodoCount: Int {
+        todoStore.todos.filter { $0.status != .done }.count
+    }
+
+    private var openTodoSubtitle: String {
+        switch openTodoCount {
+        case 0:
+            "No open todos"
+        case 1:
+            "1 open todo"
+        default:
+            "\(openTodoCount) open todos"
+        }
+    }
+
+    private var firstSelectableTodo: ProjectTodo? {
+        todoStore.todos.first { $0.status != .done } ?? todoStore.todos.first
+    }
+
+    private var isSelected: Bool {
+        chromeState.isTodoPanePresented
     }
 }
 
@@ -2160,12 +2987,12 @@ private struct SidebarSessionSection: View {
             ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                 SidebarTabRow(
                     session: session,
-                    isSelected: workspace.selectedSessionID == session.id,
+                    isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
                     presentation: presentation,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
                     onSelect: {
-                        chromeState.selectNote(id: nil)
+                        chromeState.selectTerminal()
                         workspace.select(session)
                     }
                 )

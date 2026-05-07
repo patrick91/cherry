@@ -837,6 +837,16 @@ import Testing
         detail: "uvx ruff check .",
         leadingIconFallback: "Rf"
     ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "uv run fastapi dev",
+        workingDirectory: "/Users/patrick/github/farboon-dev/shot",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "FastAPI",
+        detail: "uv run fastapi dev",
+        leadingIconFallback: "Fa"
+    ))
 }
 
 @Test func sidebarTerminalProgramFormatterIgnoresUnknownCommands() async throws {

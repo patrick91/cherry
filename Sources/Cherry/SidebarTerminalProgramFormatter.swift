@@ -149,6 +149,13 @@ enum SidebarTerminalProgramFormatter {
                   let target = firstRunnableToken(from: Array(tokens.dropFirst()))
             else { return nil }
             return (runner, target)
+        case "uv":
+            guard tokens.count >= 2,
+                  tokens[1].lowercased() == "run",
+                  let runner = ProgramCatalog.descriptor(forExecutable: "uv"),
+                  let target = firstRunnableToken(from: Array(tokens.dropFirst(2)))
+            else { return nil }
+            return (runner, target)
         case "npm", "pnpm", "yarn":
             guard tokens.count >= 2 else { return nil }
             let subcommand = tokens[1].lowercased()
@@ -380,6 +387,7 @@ private enum ProgramCatalog {
         "swift": ProgramDescriptor(displayName: "Swift", logoResourceName: "swift", fallbackLabel: "Sw", prefersSubcommandTitle: true),
         "rust": ProgramDescriptor(displayName: "Rust", fallbackLabel: "Rs", prefersSubcommandTitle: true),
         "vite": ProgramDescriptor(displayName: "Vite", logoResourceName: "vite", fallbackLabel: "Vt"),
+        "fastapi": ProgramDescriptor(displayName: "FastAPI", fallbackLabel: "Fa"),
         "ruff": ProgramDescriptor(displayName: "Ruff", fallbackLabel: "Rf")
     ]
 }

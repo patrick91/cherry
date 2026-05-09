@@ -2152,6 +2152,51 @@ import Testing
 }
 
 @MainActor
+@Test func agentSettingsRestoresLastOpenedProject() async throws {
+    let defaultsName = "CherryTests.LastProject.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let firstDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let secondDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: firstDirectory)
+        try? FileManager.default.removeItem(at: secondDirectory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    let firstProject = try #require(settings.addProject(path: firstDirectory.path))
+    _ = settings.addProject(path: secondDirectory.path)
+    settings.markProjectOpened(secondDirectory.path)
+
+    let reloadedSettings = AgentSettings(defaults: defaults)
+    #expect(reloadedSettings.lastOpenedProjectRoot == secondDirectory.path)
+    #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)
+    #expect(defaults.string(forKey: "projects.lastOpenedRoot") == secondDirectory.path)
+    #expect(reloadedSettings.projectRootForWindow(
+        requestedRoot: firstDirectory.path,
+        onboardedRoot: nil
+    ) == firstDirectory.path)
+    #expect(reloadedSettings.projectRootForWindow(
+        requestedRoot: nil,
+        onboardedRoot: nil
+    ) == secondDirectory.path)
+
+    reloadedSettings.removeProject(firstProject)
+    #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)
+
+    let secondProject = try #require(reloadedSettings.selectedProject(for: secondDirectory.path))
+    reloadedSettings.removeProject(secondProject)
+    #expect(reloadedSettings.projectRoot(for: nil) == nil)
+}
+
+@MainActor
 @Test func workspaceCanCreateAgentSession() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -25,6 +25,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.markCurrentActiveProjectOpened()
+        }
+
         guard !isQuitConfirmed else { return .terminateNow }
 
         let alert = NSAlert()
@@ -193,6 +197,7 @@ struct CherryApp: App {
 private struct ProjectWindowView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     @State private var onboardedProjectRoot: String?
+    @State private var lockedProjectRoot: String?
 
     let requestedProjectRoot: String?
 
@@ -201,18 +206,38 @@ private struct ProjectWindowView: View {
     }
 
     var body: some View {
-        if let projectRoot {
-            ProjectWorkspaceView(projectRoot: projectRoot)
-                .id(projectRoot)
-        } else {
-            ProjectOnboardingView { project in
-                onboardedProjectRoot = project.root
+        Group {
+            if let projectRoot {
+                ProjectWorkspaceView(projectRoot: projectRoot)
+                    .id(projectRoot)
+            } else {
+                ProjectOnboardingView { project in
+                    onboardedProjectRoot = project.root
+                    lockedProjectRoot = project.root
+                }
             }
+        }
+        .onAppear {
+            lockProjectRootIfNeeded()
         }
     }
 
     private var projectRoot: String? {
-        agentSettings.projectRoot(for: requestedProjectRoot) ?? agentSettings.projectRoot(for: onboardedProjectRoot)
+        if let onboardedProjectRoot {
+            return onboardedProjectRoot
+        }
+        if let lockedProjectRoot {
+            return lockedProjectRoot
+        }
+        return agentSettings.projectRootForWindow(
+            requestedRoot: requestedProjectRoot,
+            onboardedRoot: onboardedProjectRoot
+        )
+    }
+
+    private func lockProjectRootIfNeeded() {
+        guard lockedProjectRoot == nil else { return }
+        lockedProjectRoot = projectRoot
     }
 }
 
@@ -257,11 +282,13 @@ private struct ProjectWorkspaceView: View {
             ProjectWindowRegistry.shared.activeNoteStore = noteStore
             ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
+            agentSettings.markProjectOpened(workspace.projectRoot)
             autoStartCommandsIfNeeded()
         }
     }
 
     private func openProject(_ project: CherryProject) {
+        agentSettings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
         openWindow(value: project.root)
     }

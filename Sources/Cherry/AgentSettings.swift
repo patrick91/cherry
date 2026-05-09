@@ -382,6 +382,7 @@ final class AgentSettings: ObservableObject {
     static let shared = AgentSettings()
 
     @Published private(set) var projects: [CherryProject] = []
+    @Published private(set) var lastOpenedProjectRoot: String?
     @Published private(set) var agents: [AgentToolDefinition] = []
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
     @Published var agentSummaryTool: AgentSummaryTool {
@@ -419,6 +420,7 @@ final class AgentSettings: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         projects = Self.loadProjects(from: defaults)
+        lastOpenedProjectRoot = Self.loadLastOpenedProjectRoot(from: defaults)
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
         let storedSummaryCommand = defaults.string(forKey: Keys.agentSummaryCommand) ?? ""
@@ -445,6 +447,25 @@ final class AgentSettings: ObservableObject {
 
     func projectRoot(for requestedRoot: String?) -> String? {
         if let root = Self.validDirectory(requestedRoot ?? "") {
+            return root
+        }
+        if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
+            return root
+        }
+        return projects.first?.root
+    }
+
+    func projectRootForWindow(
+        requestedRoot: String?,
+        onboardedRoot: String?
+    ) -> String? {
+        if let root = Self.validDirectory(onboardedRoot ?? "") {
+            return root
+        }
+        if let root = Self.validDirectory(requestedRoot ?? "") {
+            return root
+        }
+        if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
             return root
         }
         return projects.first?.root
@@ -486,8 +507,19 @@ final class AgentSettings: ObservableObject {
     func removeProject(_ project: CherryProject) {
         projects.removeAll { $0.root == project.root }
         commandsByProject.removeValue(forKey: project.root)
+        if lastOpenedProjectRoot == project.root {
+            lastOpenedProjectRoot = projects.first?.root
+            saveLastOpenedProjectRoot()
+        }
         saveProjects()
         saveCommands()
+    }
+
+    func markProjectOpened(_ projectRoot: String?) {
+        guard let root = Self.validDirectory(projectRoot ?? "") else { return }
+        guard lastOpenedProjectRoot != root else { return }
+        lastOpenedProjectRoot = root
+        saveLastOpenedProjectRoot()
     }
 
     func upsertAgent(_ agent: AgentToolDefinition, replacing originalName: String? = nil) throws {
@@ -558,6 +590,15 @@ final class AgentSettings: ObservableObject {
         Self.saveProjects(projects, to: defaults)
     }
 
+    private func saveLastOpenedProjectRoot() {
+        if let lastOpenedProjectRoot {
+            defaults.set(lastOpenedProjectRoot, forKey: Keys.lastOpenedProjectRoot)
+        } else {
+            defaults.removeObject(forKey: Keys.lastOpenedProjectRoot)
+        }
+        defaults.synchronize()
+    }
+
     private func saveAgents() {
         Self.saveAgents(agents, to: defaults)
     }
@@ -581,6 +622,10 @@ final class AgentSettings: ObservableObject {
             return []
         }
         return decoded.filter { validDirectory($0.root) != nil }
+    }
+
+    private static func loadLastOpenedProjectRoot(from defaults: UserDefaults) -> String? {
+        validDirectory(defaults.string(forKey: Keys.lastOpenedProjectRoot) ?? "")
     }
 
     private static func loadAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
@@ -689,6 +734,7 @@ final class AgentSettings: ObservableObject {
 
     private enum Keys {
         static let projects = "projects.items"
+        static let lastOpenedProjectRoot = "projects.lastOpenedRoot"
         static let agents = "agents.global"
         static let commandsByProject = "commands.byProject"
         static let agentSummaryTool = "agents.summaryTool"

@@ -7,7 +7,10 @@ final class ProjectWindowRegistry {
 
     private var windows: [String: WeakWindow] = [:]
     private var workspaces: [String: WeakWorkspace] = [:]
+    private var noteStores: [String: WeakNoteStore] = [:]
+    private var todoStores: [String: WeakTodoStore] = [:]
     private var chromeStates: [String: WeakChromeState] = [:]
+    private var activeProjectRoot: String?
     weak var activeWorkspace: TerminalWorkspace?
     weak var activeNoteStore: ProjectNoteStore?
     weak var activeTodoStore: ProjectTodoStore?
@@ -15,6 +18,17 @@ final class ProjectWindowRegistry {
 
     private init() {}
 
+    var hasRegisteredProjectWindow: Bool {
+        pruneStaleWindows()
+        return !workspaces.isEmpty
+    }
+
+    func hasWindow(for projectRoot: String) -> Bool {
+        pruneStaleWindows()
+        return windows[projectRoot]?.window != nil
+    }
+
+    @discardableResult
     func register(
         window: NSWindow,
         projectRoot: String?,
@@ -22,24 +36,60 @@ final class ProjectWindowRegistry {
         noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
-    ) {
-        activeWorkspace = workspace
-        activeNoteStore = noteStore
-        activeTodoStore = todoStore
-        activeChromeState = chromeState
-        guard let projectRoot else { return }
+    ) -> Bool {
+        guard let projectRoot else { return false }
+        pruneStaleWindows()
+        if let existing = windows[projectRoot]?.window, existing !== window {
+            // Another window already owns this project. Refuse to claim the
+            // slot so the caller can close this duplicate. SwiftUI's
+            // WindowGroup<Value> can spawn an extra default (value=nil)
+            // window alongside the persisted one during scene restoration —
+            // without this guard, the second registration overwrites the
+            // first and both windows fight for the same workspace state.
+            return false
+        }
         windows[projectRoot] = WeakWindow(window)
         workspaces[projectRoot] = WeakWorkspace(workspace)
+        if let noteStore {
+            noteStores[projectRoot] = WeakNoteStore(noteStore)
+        }
+        if let todoStore {
+            todoStores[projectRoot] = WeakTodoStore(todoStore)
+        }
         if let chromeState {
             chromeStates[projectRoot] = WeakChromeState(chromeState)
         }
+
+        if activeWorkspace == nil || window.isKeyWindow || window.isMainWindow {
+            activate(
+                projectRoot: projectRoot,
+                workspace: workspace,
+                noteStore: noteStore,
+                todoStore: todoStore,
+                chromeState: chromeState
+            )
+        }
+        return true
     }
 
     func unregister(window: NSWindow, projectRoot: String?) {
         guard let projectRoot, windows[projectRoot]?.window === window else { return }
         windows.removeValue(forKey: projectRoot)
         workspaces.removeValue(forKey: projectRoot)
+        noteStores.removeValue(forKey: projectRoot)
+        todoStores.removeValue(forKey: projectRoot)
         chromeStates.removeValue(forKey: projectRoot)
+        if activeProjectRoot == projectRoot {
+            activeProjectRoot = nil
+            activeWorkspace = nil
+            activeNoteStore = nil
+            activeTodoStore = nil
+            activeChromeState = nil
+            refreshActiveWindow()
+            Task { @MainActor in
+                ProjectWindowRegistry.shared.refreshActiveWindow()
+            }
+        }
     }
 
     func focus(projectRoot: String) -> Bool {
@@ -48,9 +98,42 @@ final class ProjectWindowRegistry {
             return false
         }
 
+        if let workspace = workspaces[projectRoot]?.workspace {
+            activate(
+                projectRoot: projectRoot,
+                workspace: workspace,
+                noteStore: noteStores[projectRoot]?.noteStore,
+                todoStore: todoStores[projectRoot]?.todoStore,
+                chromeState: chromeStates[projectRoot]?.chromeState
+            )
+        } else {
+            AgentSettings.shared.markProjectOpened(projectRoot)
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         return true
+    }
+
+    func markCurrentActiveProjectOpened() {
+        refreshActiveWindow()
+        AgentSettings.shared.markProjectOpened(activeProjectRoot)
+    }
+
+    func activateWindow(
+        projectRoot: String?,
+        workspace: TerminalWorkspace,
+        noteStore: ProjectNoteStore?,
+        todoStore: ProjectTodoStore?,
+        chromeState: ProjectWindowChromeState?
+    ) {
+        guard let projectRoot else { return }
+        activate(
+            projectRoot: projectRoot,
+            workspace: workspace,
+            noteStore: noteStore,
+            todoStore: todoStore,
+            chromeState: chromeState
+        )
     }
 
     func projectRoot(containing sessionID: UUID) -> String? {
@@ -59,7 +142,16 @@ final class ProjectWindowRegistry {
             for projectRoot in staleProjectRoots {
                 windows.removeValue(forKey: projectRoot)
                 workspaces.removeValue(forKey: projectRoot)
+                noteStores.removeValue(forKey: projectRoot)
+                todoStores.removeValue(forKey: projectRoot)
                 chromeStates.removeValue(forKey: projectRoot)
+                if activeProjectRoot == projectRoot {
+                    activeProjectRoot = nil
+                    activeWorkspace = nil
+                    activeNoteStore = nil
+                    activeTodoStore = nil
+                    activeChromeState = nil
+                }
             }
         }
 
@@ -104,10 +196,15 @@ final class ProjectWindowRegistry {
             }
 
             candidate.workspace.select(session)
-            activeWorkspace = candidate.workspace
             candidate.chromeState?.selectTerminal()
-            activeChromeState = candidate.chromeState
             if let projectRoot = candidate.projectRoot {
+                activate(
+                    projectRoot: projectRoot,
+                    workspace: candidate.workspace,
+                    noteStore: noteStores[projectRoot]?.noteStore,
+                    todoStore: todoStores[projectRoot]?.todoStore,
+                    chromeState: candidate.chromeState
+                )
                 _ = focus(projectRoot: projectRoot)
             } else {
                 NSApp.activate(ignoringOtherApps: true)
@@ -117,6 +214,65 @@ final class ProjectWindowRegistry {
         }
 
         return false
+    }
+
+    private func activate(
+        projectRoot: String,
+        workspace: TerminalWorkspace,
+        noteStore: ProjectNoteStore?,
+        todoStore: ProjectTodoStore?,
+        chromeState: ProjectWindowChromeState?
+    ) {
+        activeProjectRoot = projectRoot
+        activeWorkspace = workspace
+        activeNoteStore = noteStore
+        activeTodoStore = todoStore
+        activeChromeState = chromeState
+        AgentSettings.shared.markProjectOpened(projectRoot)
+    }
+
+    private func refreshActiveWindow() {
+        pruneStaleWindows()
+        guard let projectRoot = projectRoot(for: NSApp.keyWindow) ?? projectRoot(for: NSApp.mainWindow),
+              let workspace = workspaces[projectRoot]?.workspace
+        else {
+            return
+        }
+
+        activate(
+            projectRoot: projectRoot,
+            workspace: workspace,
+            noteStore: noteStores[projectRoot]?.noteStore,
+            todoStore: todoStores[projectRoot]?.todoStore,
+            chromeState: chromeStates[projectRoot]?.chromeState
+        )
+    }
+
+    private func projectRoot(for window: NSWindow?) -> String? {
+        guard let window else { return nil }
+        return windows.first { _, weakWindow in
+            weakWindow.window === window
+        }?.key
+    }
+
+    private func pruneStaleWindows() {
+        let staleProjectRoots = windows.compactMap { projectRoot, weakWindow in
+            weakWindow.window == nil || workspaces[projectRoot]?.workspace == nil ? projectRoot : nil
+        }
+        for projectRoot in staleProjectRoots {
+            windows.removeValue(forKey: projectRoot)
+            workspaces.removeValue(forKey: projectRoot)
+            noteStores.removeValue(forKey: projectRoot)
+            todoStores.removeValue(forKey: projectRoot)
+            chromeStates.removeValue(forKey: projectRoot)
+            if activeProjectRoot == projectRoot {
+                activeProjectRoot = nil
+                activeWorkspace = nil
+                activeNoteStore = nil
+                activeTodoStore = nil
+                activeChromeState = nil
+            }
+        }
     }
 }
 
@@ -133,6 +289,22 @@ private final class WeakWorkspace {
 
     init(_ workspace: TerminalWorkspace) {
         self.workspace = workspace
+    }
+}
+
+private final class WeakNoteStore {
+    weak var noteStore: ProjectNoteStore?
+
+    init(_ noteStore: ProjectNoteStore) {
+        self.noteStore = noteStore
+    }
+}
+
+private final class WeakTodoStore {
+    weak var todoStore: ProjectTodoStore?
+
+    init(_ todoStore: ProjectTodoStore) {
+        self.todoStore = todoStore
     }
 }
 
@@ -301,13 +473,11 @@ private final class ProjectWindowBinderView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         registerIfPossible()
-        installObserver()
     }
 
     func registerIfPossible() {
         guard let window, let workspace else { return }
-        boundWindow = window
-        ProjectWindowRegistry.shared.register(
+        let claimed = ProjectWindowRegistry.shared.register(
             window: window,
             projectRoot: projectRoot,
             workspace: workspace,
@@ -315,6 +485,22 @@ private final class ProjectWindowBinderView: NSView {
             todoStore: todoStore,
             chromeState: chromeState
         )
+        if !claimed {
+            // Another window already owns this project. Close this duplicate
+            // and bring the existing one forward.
+            if let projectRoot {
+                _ = ProjectWindowRegistry.shared.focus(projectRoot: projectRoot)
+            }
+            DispatchQueue.main.async { [weak window] in
+                window?.close()
+            }
+            return
+        }
+        let shouldInstallObserver = boundWindow !== window
+        boundWindow = window
+        if shouldInstallObserver {
+            installObserver()
+        }
     }
 
     private func installObserver() {
@@ -331,10 +517,13 @@ private final class ProjectWindowBinderView: NSView {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, let workspace = self.workspace else { return }
-                ProjectWindowRegistry.shared.activeWorkspace = workspace
-                ProjectWindowRegistry.shared.activeNoteStore = self.noteStore
-                ProjectWindowRegistry.shared.activeTodoStore = self.todoStore
-                ProjectWindowRegistry.shared.activeChromeState = self.chromeState
+                ProjectWindowRegistry.shared.activateWindow(
+                    projectRoot: self.projectRoot,
+                    workspace: workspace,
+                    noteStore: self.noteStore,
+                    todoStore: self.todoStore,
+                    chromeState: self.chromeState
+                )
             }
         }
     }

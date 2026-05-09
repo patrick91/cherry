@@ -788,6 +788,15 @@ private struct TodoListPane: View {
     @ObservedObject var chromeState: ProjectWindowChromeState
     let themeForeground: Color
 
+    @AppStorage("todos.listStyle") private var listStyleRaw: String = TodoListRowStyle.thingsLike.rawValue
+
+    private var listStyle: Binding<TodoListRowStyle> {
+        Binding(
+            get: { TodoListRowStyle(rawValue: listStyleRaw) ?? .thingsLike },
+            set: { listStyleRaw = $0.rawValue }
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
@@ -843,48 +852,55 @@ private struct TodoListPane: View {
                 }
             }
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    ForEach(TodoStatus.allCases) { status in
-                        let todos = todos(in: status)
-                        if !todos.isEmpty {
-                            TodoStatusGroup(
-                                status: status,
-                                todos: todos,
-                                selectedTodoID: chromeState.selectedTodoID,
-                                themeForeground: themeForeground,
-                                select: { chromeState.selectTodo(id: $0.id) },
-                                moveUp: moveUp,
-                                moveDown: moveDown,
-                                reorder: reorder(_:to:),
-                                moveToStatus: move(_:to:),
-                                delete: delete
-                            )
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(TodoStatus.allCases) { status in
+                            let todos = todos(in: status)
+                            if !todos.isEmpty {
+                                TodoStatusGroup(
+                                    status: status,
+                                    todos: todos,
+                                    selectedTodoID: chromeState.selectedTodoID,
+                                    themeForeground: themeForeground,
+                                    style: listStyle.wrappedValue,
+                                    select: { chromeState.selectTodo(id: $0.id) },
+                                    moveUp: moveUp,
+                                    moveDown: moveDown,
+                                    reorder: reorder(_:to:),
+                                    moveToStatus: move(_:to:),
+                                    delete: delete
+                                )
+                            }
                         }
-                    }
 
-                    if todoStore.todos.isEmpty {
-                        ContentUnavailableView {
-                            Label("No Todos", systemImage: "checklist")
-                        } description: {
-                            Text("Create one with the + button above.")
+                        if todoStore.todos.isEmpty {
+                            ContentUnavailableView {
+                                Label("No Todos", systemImage: "checklist")
+                            } description: {
+                                Text("Create one with the + button above.")
+                            }
+                            .foregroundStyle(themeForeground.opacity(0.7))
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 60)
+                        } else if filteredTodos.isEmpty {
+                            ContentUnavailableView {
+                                Label("No Matching Todos", systemImage: "tag")
+                            } description: {
+                                Text("Clear tag filters to show all todos.")
+                            }
+                            .foregroundStyle(themeForeground.opacity(0.7))
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 60)
                         }
-                        .foregroundStyle(themeForeground.opacity(0.7))
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 60)
-                    } else if filteredTodos.isEmpty {
-                        ContentUnavailableView {
-                            Label("No Matching Todos", systemImage: "tag")
-                        } description: {
-                            Text("Clear tag filters to show all todos.")
-                        }
-                        .foregroundStyle(themeForeground.opacity(0.7))
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 60)
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 56)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 18)
+
+                TodoListStylePicker(style: listStyle, themeForeground: themeForeground)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 12)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -957,11 +973,72 @@ private struct TodoListPane: View {
     }
 }
 
+private enum TodoListRowStyle: String, CaseIterable, Identifiable {
+    case thingsLike
+    case linearDense
+    case stripeCompact
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .thingsLike: "Things"
+        case .linearDense: "Linear"
+        case .stripeCompact: "Stripe"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .thingsLike: "circle"
+        case .linearDense: "list.bullet"
+        case .stripeCompact: "rectangle.lefthalf.inset.filled"
+        }
+    }
+}
+
+private struct TodoListStylePicker: View {
+    @Binding var style: TodoListRowStyle
+    let themeForeground: Color
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(TodoListRowStyle.allCases) { option in
+                Button {
+                    style = option
+                } label: {
+                    Image(systemName: option.symbol)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(style == option ? themeForeground : themeForeground.opacity(0.5))
+                        .frame(width: 26, height: 22)
+                        .background {
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(style == option ? themeForeground.opacity(0.15) : Color.clear)
+                        }
+                }
+                .buttonStyle(.plain)
+                .help(option.label)
+            }
+        }
+        .padding(3)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(.ultraThinMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(themeForeground.opacity(0.12), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+    }
+}
+
 private struct TodoStatusGroup: View {
     let status: TodoStatus
     let todos: [ProjectTodo]
     let selectedTodoID: UUID?
     let themeForeground: Color
+    let style: TodoListRowStyle
     let select: (ProjectTodo) -> Void
     let moveUp: (ProjectTodo) -> Void
     let moveDown: (ProjectTodo) -> Void
@@ -995,6 +1072,7 @@ private struct TodoStatusGroup: View {
                     todo: todo,
                     isSelected: selectedTodoID == todo.id,
                     themeForeground: themeForeground,
+                    style: style,
                     action: { select(todo) }
                 )
                 .offset(y: draggedTodoID == todo.id ? draggedRowOffsetY : 0)
@@ -1063,59 +1141,258 @@ private struct TodoListRow: View {
     let todo: ProjectTodo
     let isSelected: Bool
     let themeForeground: Color
+    let style: TodoListRowStyle
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(todo.title.isEmpty ? "Untitled Todo" : todo.title)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                if !todo.tags.isEmpty {
-                    HStack(spacing: 4) {
-                        ForEach(Array(todo.tags.prefix(2))) { tag in
-                            TodoTagChip(
-                                tag: tag,
-                                isSelected: false,
-                                showsRemoveButton: false,
-                                size: .small
-                            )
-                        }
-                        if todo.tags.count > 2 {
-                            Text("+\(todo.tags.count - 2)")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(themeForeground.opacity(0.5))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            content
+                .foregroundStyle(themeForeground)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? themeForeground.opacity(0.13) : Color.clear)
                 }
-
-                HStack(spacing: 6) {
-                    Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
-                    if !todo.comments.isEmpty {
-                        Text("·")
-                        Image(systemName: "text.bubble")
-                            .font(.system(size: 10))
-                        Text("\(todo.comments.count)")
-                            .monospacedDigit()
-                    }
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(themeForeground.opacity(0.5))
-            }
-            .foregroundStyle(themeForeground)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? themeForeground.opacity(0.13) : Color.clear)
-            }
         }
         .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch style {
+        case .thingsLike: thingsLikeRow
+        case .linearDense: linearDenseRow
+        case .stripeCompact: stripeCompactRow
+        }
+    }
+
+    // MARK: - Things-like row
+
+    private var thingsLikeRow: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: todo.status == .done ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(themeForeground.opacity(todo.status == .done ? 0.55 : 0.4))
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(displayTitle)
+                    .font(.system(size: 13.5, weight: .regular))
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .strikethrough(todo.status == .done, color: themeForeground.opacity(0.4))
+                    .opacity(todo.status == .done ? 0.6 : 1)
+
+                if !todo.tags.isEmpty {
+                    HStack(spacing: 10) {
+                        ForEach(Array(todo.tags.prefix(3))) { tag in
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(tagColor(for: tag))
+                                    .frame(width: 6, height: 6)
+                                Text(tag.name.lowercased())
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(themeForeground.opacity(0.65))
+                                    .lineLimit(1)
+                            }
+                        }
+                        if todo.tags.count > 3 {
+                            Text("+\(todo.tags.count - 3)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(themeForeground.opacity(0.45))
+                        }
+                    }
+                }
+
+                metaRow(opacity: 0.45)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - Linear-dense row
+
+    private var linearDenseRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: linearStatusSymbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(themeForeground.opacity(0.55))
+                .frame(width: 14)
+
+            Text(displayTitle)
+                .font(.system(size: 12.5, weight: .regular))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .strikethrough(todo.status == .done, color: themeForeground.opacity(0.4))
+                .opacity(todo.status == .done ? 0.55 : 1)
+
+            Spacer(minLength: 6)
+
+            if !todo.comments.isEmpty {
+                HStack(spacing: 2) {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 9))
+                    Text("\(todo.comments.count)")
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                }
+                .foregroundStyle(themeForeground.opacity(0.45))
+            }
+
+            if !todo.tags.isEmpty {
+                HStack(spacing: 3) {
+                    ForEach(Array(todo.tags.prefix(3))) { tag in
+                        Circle()
+                            .fill(tagColor(for: tag))
+                            .frame(width: 7, height: 7)
+                    }
+                    if todo.tags.count > 3 {
+                        Text("·")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(themeForeground.opacity(0.55))
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .help(linearTooltip)
+    }
+
+    private var linearStatusSymbol: String {
+        switch todo.status {
+        case .backlog: "circle"
+        case .ready: "circle.dotted"
+        case .doing: "circle.lefthalf.filled"
+        case .blocked: "exclamationmark.circle"
+        case .done: "checkmark.circle.fill"
+        }
+    }
+
+    private var linearTooltip: String {
+        let tagNames = todo.tags.map(\.name).joined(separator: ", ")
+        let time = TodoListRow.relativeTimeString(for: todo.updatedAt)
+        if tagNames.isEmpty {
+            return "\(displayTitle)\nUpdated \(time)"
+        }
+        return "\(displayTitle)\n\(tagNames)\nUpdated \(time)"
+    }
+
+    // MARK: - Stripe + compact row
+
+    private var stripeCompactRow: some View {
+        HStack(alignment: .top, spacing: 0) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(stripeColor)
+                .frame(width: 3)
+                .padding(.vertical, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(displayTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .strikethrough(todo.status == .done, color: themeForeground.opacity(0.4))
+                    .opacity(todo.status == .done ? 0.6 : 1)
+
+                HStack(spacing: 8) {
+                    if !todo.tags.isEmpty {
+                        HStack(spacing: 8) {
+                            ForEach(Array(todo.tags.prefix(2))) { tag in
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(softenedTagColor(for: tag))
+                                        .frame(width: 6, height: 6)
+                                    Text(tag.name.lowercased())
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(themeForeground.opacity(0.65))
+                                        .lineLimit(1)
+                                }
+                            }
+                            if todo.tags.count > 2 {
+                                Text("+\(todo.tags.count - 2)")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(themeForeground.opacity(0.45))
+                            }
+                        }
+                        Text("·")
+                            .font(.system(size: 11))
+                            .foregroundStyle(themeForeground.opacity(0.3))
+                    }
+                    Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
+                        .font(.system(size: 11))
+                        .foregroundStyle(themeForeground.opacity(0.5))
+                    if !todo.comments.isEmpty {
+                        Text("·")
+                            .font(.system(size: 11))
+                            .foregroundStyle(themeForeground.opacity(0.3))
+                        HStack(spacing: 2) {
+                            Image(systemName: "text.bubble")
+                                .font(.system(size: 10))
+                            Text("\(todo.comments.count)")
+                                .font(.system(size: 11))
+                                .monospacedDigit()
+                        }
+                        .foregroundStyle(themeForeground.opacity(0.5))
+                    }
+                }
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 10)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var stripeColor: Color {
+        if let firstTag = todo.tags.first {
+            return softenedTagColor(for: firstTag)
+        }
+        return themeForeground.opacity(0.2)
+    }
+
+    // MARK: - Shared helpers
+
+    private var displayTitle: String {
+        todo.title.isEmpty ? "Untitled Todo" : todo.title
+    }
+
+    private func tagColor(for tag: TodoTag) -> Color {
+        Color(nsColor: NSColor(hexRGB: tag.colorHex) ?? .controlAccentColor)
+    }
+
+    private func softenedTagColor(for tag: TodoTag) -> Color {
+        let base = (NSColor(hexRGB: tag.colorHex) ?? .controlAccentColor)
+            .usingColorSpace(.deviceRGB) ?? .controlAccentColor
+        var h: CGFloat = 0
+        var s: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        base.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        let softened = NSColor(
+            hue: h,
+            saturation: min(s, 0.55),
+            brightness: min(b, 0.78),
+            alpha: a
+        )
+        return Color(nsColor: softened)
+    }
+
+    @ViewBuilder
+    private func metaRow(opacity: Double) -> some View {
+        HStack(spacing: 6) {
+            Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
+            if !todo.comments.isEmpty {
+                Text("·")
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 10))
+                Text("\(todo.comments.count)")
+                    .monospacedDigit()
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(themeForeground.opacity(opacity))
     }
 
     static func relativeTimeString(for date: Date) -> String {

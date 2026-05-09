@@ -155,6 +155,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
     @Published var isTodoPanePresented = false
+    @Published var selectedTodoTagFilterIDs: Set<String> = []
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the

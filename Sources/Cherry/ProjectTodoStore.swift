@@ -5,11 +5,27 @@ import Foundation
 @MainActor
 final class ProjectTodoStore: ObservableObject {
     @Published private(set) var todos: [ProjectTodo] = []
+    @Published private(set) var tagCatalog: [TodoTag] = []
 
     let projectRoot: String
     private let fileURL: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private static let storageVersion = 1
+    private static let tagColorPalette = [
+        "#D73A49",
+        "#E36209",
+        "#B08800",
+        "#22863A",
+        "#0086B3",
+        "#0366D6",
+        "#5A32A3",
+        "#B31D8C",
+        "#6F42C1",
+        "#1B7F79",
+        "#CB2431",
+        "#735C0F"
+    ]
 
     init(
         projectRoot: String,
@@ -39,7 +55,7 @@ final class ProjectTodoStore: ObservableObject {
         return "\(hex).json"
     }
 
-    func create(title: String, markdown: String, status: TodoStatus = .backlog) throws -> ProjectTodo {
+    func create(title: String, markdown: String, status: TodoStatus = .backlog, tags: [String] = []) throws -> ProjectTodo {
         let now = Date()
         let todo = ProjectTodo(
             id: UUID(),
@@ -49,7 +65,8 @@ final class ProjectTodoStore: ObservableObject {
             status: status,
             position: nextPosition(in: status),
             createdAt: now,
-            updatedAt: now
+            updatedAt: now,
+            tags: resolvedTags(for: tags)
         )
         todos.append(todo)
         sortTodos()
@@ -57,7 +74,7 @@ final class ProjectTodoStore: ObservableObject {
         return todo
     }
 
-    func update(id: UUID, title: String?, markdown: String?, status: TodoStatus?) throws -> ProjectTodo {
+    func update(id: UUID, title: String?, markdown: String?, status: TodoStatus?, tags: [String]? = nil) throws -> ProjectTodo {
         guard let index = todos.firstIndex(where: { $0.id == id }) else {
             throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
         }
@@ -73,6 +90,9 @@ final class ProjectTodoStore: ObservableObject {
         if let status, status != todo.status {
             todo.status = status
             todo.position = nextPosition(in: status)
+        }
+        if let tags {
+            todo.tags = resolvedTags(for: tags)
         }
         todo.updatedAt = Date()
         todos[index] = todo
@@ -242,13 +262,25 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? decoder.decode([ProjectTodo].self, from: data)
-        else {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            todos = []
+            tagCatalog = []
+            return
+        }
+
+        if let decoded = try? decoder.decode(ProjectTodoFile.self, from: data) {
+            tagCatalog = decoded.tagCatalog
+            todos = decoded.todos.filter { $0.projectRoot == projectRoot }
+        } else if let decoded = try? decoder.decode([ProjectTodo].self, from: data) {
+            tagCatalog = []
+            todos = decoded.filter { $0.projectRoot == projectRoot }
+        } else {
+            tagCatalog = []
             todos = []
             return
         }
-        todos = decoded.filter { $0.projectRoot == projectRoot }
+
+        reconcileTagsAfterLoad()
         for status in TodoStatus.allCases {
             normalizePositions(in: status)
         }
@@ -257,7 +289,12 @@ final class ProjectTodoStore: ObservableObject {
 
     private func save() throws {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try encoder.encode(todos)
+        let data = try encoder.encode(ProjectTodoFile(
+            version: Self.storageVersion,
+            projectRoot: projectRoot,
+            tagCatalog: tagCatalog,
+            todos: todos
+        ))
         try data.write(to: fileURL, options: .atomic)
     }
 
@@ -302,4 +339,103 @@ final class ProjectTodoStore: ObservableObject {
         let trimmed = author.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "MCP" : trimmed
     }
+
+    private func resolvedTags(for names: [String]) -> [TodoTag] {
+        var resolved: [TodoTag] = []
+        var seen = Set<String>()
+
+        for rawName in names {
+            guard let name = normalizedTagName(rawName) else { continue }
+            let id = tagID(forNormalizedName: name)
+            guard seen.insert(id).inserted else { continue }
+
+            if let existing = tagCatalog.first(where: { $0.id == id }) {
+                resolved.append(existing)
+            } else {
+                let tag = TodoTag(id: id, name: name, colorHex: Self.randomTagColor())
+                tagCatalog.append(tag)
+                sortTagCatalog()
+                resolved.append(tag)
+            }
+        }
+
+        return resolved
+    }
+
+    private func reconcileTagsAfterLoad() {
+        var catalogByID: [String: TodoTag] = [:]
+        for tag in tagCatalog {
+            guard let name = normalizedTagName(tag.name) else { continue }
+            let id = tagID(forNormalizedName: name)
+            if catalogByID[id] == nil {
+                catalogByID[id] = TodoTag(
+                    id: id,
+                    name: name,
+                    colorHex: Self.normalizedColorHex(tag.colorHex) ?? Self.randomTagColor()
+                )
+            }
+        }
+
+        for todoIndex in todos.indices {
+            var resolved: [TodoTag] = []
+            var seen = Set<String>()
+            for tag in todos[todoIndex].tags {
+                guard let name = normalizedTagName(tag.name) else { continue }
+                let id = tagID(forNormalizedName: name)
+                guard seen.insert(id).inserted else { continue }
+
+                if let catalogTag = catalogByID[id] {
+                    resolved.append(catalogTag)
+                } else {
+                    let catalogTag = TodoTag(
+                        id: id,
+                        name: name,
+                        colorHex: Self.normalizedColorHex(tag.colorHex) ?? Self.randomTagColor()
+                    )
+                    catalogByID[id] = catalogTag
+                    resolved.append(catalogTag)
+                }
+            }
+            todos[todoIndex].tags = resolved
+        }
+
+        tagCatalog = catalogByID.values.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func sortTagCatalog() {
+        tagCatalog.sort {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func normalizedTagName(_ name: String) -> String? {
+        let parts = name.split(whereSeparator: \.isWhitespace)
+        let normalized = parts.joined(separator: " ")
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func tagID(forNormalizedName name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .lowercased()
+    }
+
+    private static func randomTagColor() -> String {
+        tagColorPalette.randomElement() ?? "#0366D6"
+    }
+
+    private static func normalizedColorHex(_ colorHex: String) -> String? {
+        let trimmed = colorHex.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let hex = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard hex.count == 6, hex.allSatisfy(\.isHexDigit) else { return nil }
+        return "#\(hex)"
+    }
+}
+
+private struct ProjectTodoFile: Codable {
+    var version: Int
+    var projectRoot: String
+    var tagCatalog: [TodoTag]
+    var todos: [ProjectTodo]
 }

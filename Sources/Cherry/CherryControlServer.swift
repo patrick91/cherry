@@ -445,7 +445,8 @@ final class CherryControlServer: @unchecked Sendable {
             let todo = try todoStore.create(
                 title: request.title,
                 markdown: request.markdown,
-                status: request.status ?? .backlog
+                status: request.status ?? .backlog,
+                tags: request.tags ?? []
             )
             if request.open ?? false {
                 select(todo: todo)
@@ -467,7 +468,8 @@ final class CherryControlServer: @unchecked Sendable {
                 id: try todoID(from: request.todoID),
                 title: request.title,
                 markdown: request.markdown,
-                status: request.status
+                status: request.status,
+                tags: request.tags
             )
             if request.open ?? false {
                 select(todo: todo)
@@ -1060,6 +1062,7 @@ final class CherryControlServer: @unchecked Sendable {
             title: todo.title,
             status: todo.status,
             position: todo.position,
+            tags: todo.tags,
             commentCount: todo.comments.count,
             createdAt: todo.createdAt,
             updatedAt: todo.updatedAt

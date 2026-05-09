@@ -797,6 +797,16 @@ private struct TodoListPane: View {
 
                 Spacer()
 
+                if !chromeState.selectedTodoTagFilterIDs.isEmpty {
+                    Button(action: clearTagFilters) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 26, height: 26)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Clear tag filters")
+                }
+
                 Button(action: createTodo) {
                     Image(systemName: "plus")
                         .font(.system(size: 13, weight: .semibold))
@@ -807,7 +817,31 @@ private struct TodoListPane: View {
             }
             .padding(.horizontal, 18)
             .padding(.top, 18)
-            .padding(.bottom, 12)
+            .padding(.bottom, availableFilterTags.isEmpty ? 12 : 8)
+
+            if !availableFilterTags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(availableFilterTags) { tag in
+                            let isSelected = chromeState.selectedTodoTagFilterIDs.contains(tag.id)
+                            Button {
+                                toggleTagFilter(tag)
+                            } label: {
+                                TodoTagChip(
+                                    tag: tag,
+                                    isSelected: isSelected,
+                                    showsRemoveButton: false,
+                                    size: .regular
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .help(isSelected ? "Remove tag filter" : "Filter by tag")
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 10)
+                }
+            }
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
@@ -838,6 +872,15 @@ private struct TodoListPane: View {
                         .foregroundStyle(themeForeground.opacity(0.7))
                         .frame(maxWidth: .infinity)
                         .padding(.top, 60)
+                    } else if filteredTodos.isEmpty {
+                        ContentUnavailableView {
+                            Label("No Matching Todos", systemImage: "tag")
+                        } description: {
+                            Text("Clear tag filters to show all todos.")
+                        }
+                        .foregroundStyle(themeForeground.opacity(0.7))
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -849,7 +892,22 @@ private struct TodoListPane: View {
     }
 
     private func todos(in status: TodoStatus) -> [ProjectTodo] {
-        todoStore.todos.filter { $0.status == status }
+        filteredTodos.filter { $0.status == status }
+    }
+
+    private var filteredTodos: [ProjectTodo] {
+        let filterIDs = chromeState.selectedTodoTagFilterIDs
+        guard !filterIDs.isEmpty else { return todoStore.todos }
+
+        return todoStore.todos.filter { todo in
+            todo.tags.contains { filterIDs.contains($0.id) }
+        }
+    }
+
+    private var availableFilterTags: [TodoTag] {
+        let usedIDs = Set(todoStore.todos.flatMap { $0.tags.map(\.id) })
+        let visibleIDs = usedIDs.union(chromeState.selectedTodoTagFilterIDs)
+        return todoStore.tagCatalog.filter { visibleIDs.contains($0.id) }
     }
 
     private func createTodo() {
@@ -884,6 +942,18 @@ private struct TodoListPane: View {
         if chromeState.selectedTodoID == todo.id {
             chromeState.selectedTodoID = todoStore.todos.first { $0.status != .done }?.id ?? todoStore.todos.first?.id
         }
+    }
+
+    private func toggleTagFilter(_ tag: TodoTag) {
+        if chromeState.selectedTodoTagFilterIDs.contains(tag.id) {
+            chromeState.selectedTodoTagFilterIDs.remove(tag.id)
+        } else {
+            chromeState.selectedTodoTagFilterIDs.insert(tag.id)
+        }
+    }
+
+    private func clearTagFilters() {
+        chromeState.selectedTodoTagFilterIDs.removeAll()
     }
 }
 
@@ -1003,6 +1073,25 @@ private struct TodoListRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
 
+                if !todo.tags.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(Array(todo.tags.prefix(2))) { tag in
+                            TodoTagChip(
+                                tag: tag,
+                                isSelected: false,
+                                showsRemoveButton: false,
+                                size: .small
+                            )
+                        }
+                        if todo.tags.count > 2 {
+                            Text("+\(todo.tags.count - 2)")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(themeForeground.opacity(0.5))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 HStack(spacing: 6) {
                     Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
                     if !todo.comments.isEmpty {
@@ -1039,6 +1128,99 @@ private struct TodoListRow: View {
     }
 }
 
+private enum TodoTagChipSize {
+    case small
+    case regular
+
+    var fontSize: CGFloat {
+        switch self {
+        case .small:
+            10
+        case .regular:
+            11.5
+        }
+    }
+
+    var horizontalPadding: CGFloat {
+        switch self {
+        case .small:
+            7
+        case .regular:
+            9
+        }
+    }
+
+    var verticalPadding: CGFloat {
+        switch self {
+        case .small:
+            2
+        case .regular:
+            3
+        }
+    }
+
+    var maxWidth: CGFloat {
+        switch self {
+        case .small:
+            110
+        case .regular:
+            160
+        }
+    }
+}
+
+private struct TodoTagChip: View {
+    let tag: TodoTag
+    let isSelected: Bool
+    let showsRemoveButton: Bool
+    let size: TodoTagChipSize
+
+    private var nsColor: NSColor {
+        NSColor(hexRGB: tag.colorHex) ?? .controlAccentColor
+    }
+
+    private var color: Color {
+        Color(nsColor: nsColor)
+    }
+
+    private var textColor: Color {
+        Color(nsColor: nsColor.relativeLuminance > 0.55 ? .black : .white)
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(tag.name)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: true, vertical: false)
+
+            if showsRemoveButton {
+                Image(systemName: "xmark")
+                    .font(.system(size: size.fontSize - 1, weight: .bold))
+                    .opacity(0.75)
+            }
+        }
+        .font(.system(size: size.fontSize, weight: .semibold))
+        .foregroundStyle(textColor)
+        .padding(.horizontal, size.horizontalPadding)
+        .padding(.vertical, size.verticalPadding)
+        .frame(maxWidth: size.maxWidth)
+        .background {
+            Capsule(style: .continuous)
+                .fill(color)
+        }
+        .opacity(dimsWhenInactive && !isSelected ? 0.55 : 1)
+        .contentShape(Capsule(style: .continuous))
+    }
+
+    private var dimsWhenInactive: Bool {
+        // Filter-row chips (regular size) act as toggles; the small variant in
+        // list rows is purely informational and should always render at full
+        // strength.
+        size == .regular && showsRemoveButton == false
+    }
+}
+
 private struct TodoInspectorPane: View {
     let todo: ProjectTodo
     @ObservedObject var todoStore: ProjectTodoStore
@@ -1049,6 +1231,8 @@ private struct TodoInspectorPane: View {
     @State private var draftTitle: String
     @State private var draftMarkdown: String
     @State private var draftStatus: TodoStatus
+    @State private var draftTagNames: [String]
+    @State private var draftTagInput = ""
     @State private var draftComment = ""
     @State private var pendingSave: Task<Void, Never>?
 
@@ -1067,6 +1251,7 @@ private struct TodoInspectorPane: View {
         _draftTitle = State(initialValue: todo.title)
         _draftMarkdown = State(initialValue: todo.markdown)
         _draftStatus = State(initialValue: todo.status)
+        _draftTagNames = State(initialValue: todo.tags.map(\.name))
     }
 
     var body: some View {
@@ -1097,6 +1282,8 @@ private struct TodoInspectorPane: View {
                     statusRow
                 }
 
+                tagsSection
+
                 detailsSection
 
                 commentsSection
@@ -1112,7 +1299,7 @@ private struct TodoInspectorPane: View {
         .onChange(of: draftStatus) { _, _ in saveNow() }
         .onChange(of: todo.id) { _, _ in resetDrafts() }
         .onChange(of: todo.updatedAt) { _, _ in
-            guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status else { return }
+            guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status || draftTagNames != todo.tags.map(\.name) else { return }
             resetDrafts()
         }
         .onDisappear {
@@ -1177,6 +1364,73 @@ private struct TodoInspectorPane: View {
             .background {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(themeForeground.opacity(0.055))
+            }
+        }
+    }
+
+    private var tagsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                sectionHeader("Tags")
+                Spacer(minLength: 8)
+                if !availableTagSuggestions.isEmpty {
+                    Menu {
+                        ForEach(availableTagSuggestions) { tag in
+                            Button(tag.name) {
+                                addTag(tag.name)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "tag")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Add existing tag")
+                }
+            }
+
+            if displayTags.isEmpty {
+                Text("No tags.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(themeForeground.opacity(0.45))
+                    .padding(.vertical, 2)
+            } else {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 78), spacing: 6, alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 6
+                ) {
+                    ForEach(displayTags) { tag in
+                        Button {
+                            removeTag(tag)
+                        } label: {
+                            TodoTagChip(
+                                tag: tag,
+                                isSelected: false,
+                                showsRemoveButton: true,
+                                size: .regular
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove tag")
+                    }
+                }
+            }
+
+            HStack(spacing: 6) {
+                TextField("Add tag", text: $draftTagInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13))
+                    .onSubmit(addTagFromInput)
+
+                Button(action: addTagFromInput) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .buttonStyle(.borderless)
+                .disabled(normalizedDraftTagName(draftTagInput) == nil)
+                .help("Add tag")
             }
         }
     }
@@ -1274,8 +1528,14 @@ private struct TodoInspectorPane: View {
     private func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
-        guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status else { return }
-        _ = try? todoStore.update(id: todo.id, title: draftTitle, markdown: draftMarkdown, status: draftStatus)
+        guard draftTitle != todo.title || draftMarkdown != todo.markdown || draftStatus != todo.status || draftTagNames != todo.tags.map(\.name) else { return }
+        _ = try? todoStore.update(
+            id: todo.id,
+            title: draftTitle,
+            markdown: draftMarkdown,
+            status: draftStatus,
+            tags: draftTagNames
+        )
     }
 
     private func resetDrafts() {
@@ -1284,6 +1544,58 @@ private struct TodoInspectorPane: View {
         draftTitle = todo.title
         draftMarkdown = todo.markdown
         draftStatus = todo.status
+        draftTagNames = todo.tags.map(\.name)
+        draftTagInput = ""
+    }
+
+    private var displayTags: [TodoTag] {
+        draftTagNames.compactMap { name in
+            guard let normalized = normalizedDraftTagName(name) else { return nil }
+            let id = draftTagID(forNormalizedName: normalized)
+            if let existing = todoStore.tagCatalog.first(where: { $0.id == id }) {
+                return existing
+            }
+            return TodoTag(id: id, name: normalized, colorHex: "#0366D6")
+        }
+    }
+
+    private var availableTagSuggestions: [TodoTag] {
+        let selectedIDs = Set(displayTags.map(\.id))
+        return todoStore.tagCatalog.filter { !selectedIDs.contains($0.id) }
+    }
+
+    private func addTagFromInput() {
+        addTag(draftTagInput)
+    }
+
+    private func addTag(_ name: String) {
+        guard let normalized = normalizedDraftTagName(name) else { return }
+        let id = draftTagID(forNormalizedName: normalized)
+        guard !displayTags.contains(where: { $0.id == id }) else {
+            draftTagInput = ""
+            return
+        }
+        draftTagNames.append(normalized)
+        draftTagInput = ""
+        saveNow()
+    }
+
+    private func removeTag(_ tag: TodoTag) {
+        draftTagNames.removeAll { name in
+            guard let normalized = normalizedDraftTagName(name) else { return true }
+            return draftTagID(forNormalizedName: normalized) == tag.id
+        }
+        saveNow()
+    }
+
+    private func normalizedDraftTagName(_ name: String) -> String? {
+        let normalized = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func draftTagID(forNormalizedName name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .lowercased()
     }
 
     private func addComment() {

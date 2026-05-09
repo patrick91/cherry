@@ -73,8 +73,8 @@ import Testing
     let afterTodoID = UUID().uuidString
     let terminalID = UUID().uuidString
     let commentID = UUID().uuidString
-    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, open: true))
-    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, open: false))
+    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, tags: ["UI", "Bug"], open: true))
+    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, tags: ["Docs"], open: false))
     let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID, open: true))
     let get = CherryControlRequest.getTodo(.init(todoID: todoID))
     let delete = CherryControlRequest.deleteTodo(.init(todoID: todoID))
@@ -325,7 +325,7 @@ import Testing
     }
 
     let store = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    let first = try store.create(title: " First ", markdown: "A", status: .ready)
+    let first = try store.create(title: " First ", markdown: "A", status: .ready, tags: ["Bug", "UI"])
     let second = try store.create(title: "Second", markdown: "B", status: .ready)
     _ = try store.update(id: first.id, title: "Updated", markdown: "A+", status: .doing)
     _ = try store.addComment(
@@ -345,6 +345,8 @@ import Testing
     #expect(reloaded.todos[0].markdown == "A+")
     #expect(reloaded.todos[0].status == .doing)
     #expect(reloaded.todos[0].position == 0)
+    #expect(reloaded.todos[0].tags.map(\.name) == ["Bug", "UI"])
+    #expect(reloaded.tagCatalog.map(\.name) == ["Bug", "UI"])
     #expect(reloaded.todos[0].comments.count == 1)
     #expect(reloaded.todos[0].comments[0].markdown == "Updated comment")
     #expect(reloaded.todos[0].comments[0].authorLabel == "Codex")
@@ -358,6 +360,39 @@ import Testing
     let afterDelete = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
     #expect(afterDelete.todos.map(\.id) == [second.id])
     #expect(afterDelete.todos[0].position == 0)
+    #expect(afterDelete.tagCatalog.map(\.name) == ["Bug", "UI"])
+}
+
+@MainActor
+@Test func projectTodoStoreNormalizesAndReusesTodoTags() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryTodos-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let store = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    let first = try store.create(title: "First", markdown: "", status: .ready, tags: [" Bug ", "bug", "Needs   Review"])
+
+    #expect(first.tags.map(\.id) == ["bug", "needs review"])
+    #expect(first.tags.map(\.name) == ["Bug", "Needs Review"])
+    let bugColor = try #require(first.tags.first { $0.id == "bug" }?.colorHex)
+
+    let second = try store.create(title: "Second", markdown: "", status: .ready, tags: ["BUG"])
+    #expect(second.tags.map(\.name) == ["Bug"])
+    #expect(second.tags.first?.colorHex == bugColor)
+
+    let cleared = try store.update(id: first.id, title: nil, markdown: nil, status: nil, tags: [])
+    #expect(cleared.tags.isEmpty)
+    #expect(store.tagCatalog.map(\.name) == ["Bug", "Needs Review"])
+
+    let reloaded = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    #expect(reloaded.tagCatalog.map(\.name) == ["Bug", "Needs Review"])
+    #expect(try reloaded.todo(id: second.id).tags.first?.colorHex == bugColor)
 }
 
 @MainActor
@@ -577,6 +612,7 @@ import Testing
         title: "Review Todo",
         markdown: "# Findings",
         status: .ready,
+        tags: ["Bug", "UI"],
         open: true
     )))
     guard case .createTodo(let created)? = createResponse.result else {
@@ -588,6 +624,7 @@ import Testing
     #expect(created.todo.title == "Review Todo")
     #expect(created.todo.markdown == "# Findings")
     #expect(created.todo.status == .ready)
+    #expect(created.todo.tags.map(\.name) == ["Bug", "UI"])
     #expect(created.selected == true)
     #expect(harness.chromeState.selectedTodoID == created.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
@@ -673,6 +710,7 @@ import Testing
     }
     #expect(list.activeProjectRoot == harness.projectRoot.path)
     #expect(list.todos.map(\.id).contains(created.todo.id.uuidString))
+    #expect(list.todos.first { $0.id == created.todo.id.uuidString }?.tags.map(\.name) == ["Bug", "UI"])
     #expect(list.selectedTodoID == created.todo.id.uuidString)
 
     let updateResponse = try await harness.send(.updateTodo(.init(
@@ -680,6 +718,7 @@ import Testing
         title: "Updated",
         markdown: "- done",
         status: .blocked,
+        tags: ["Docs"],
         open: false
     )))
     guard case .updateTodo(let updated)? = updateResponse.result else {
@@ -689,6 +728,7 @@ import Testing
     #expect(updated.todo.title == "Updated")
     #expect(updated.todo.markdown == "- done")
     #expect(updated.todo.status == .blocked)
+    #expect(updated.todo.tags.map(\.name) == ["Docs"])
     #expect(updated.selected == true)
 
     let getResponse = try await harness.send(.getTodo(.init(todoID: created.todo.id.uuidString)))

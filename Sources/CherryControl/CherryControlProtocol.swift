@@ -453,12 +453,14 @@ public struct CreateTodoRequest: Codable, Equatable, Sendable {
     public let title: String
     public let markdown: String
     public let status: TodoStatus?
+    public let tags: [String]?
     public let open: Bool?
 
-    public init(title: String, markdown: String = "", status: TodoStatus? = nil, open: Bool? = nil) {
+    public init(title: String, markdown: String = "", status: TodoStatus? = nil, tags: [String]? = nil, open: Bool? = nil) {
         self.title = title
         self.markdown = markdown
         self.status = status
+        self.tags = tags
         self.open = open
     }
 }
@@ -468,6 +470,7 @@ public struct UpdateTodoRequest: Codable, Equatable, Sendable {
     public let title: String?
     public let markdown: String?
     public let status: TodoStatus?
+    public let tags: [String]?
     public let open: Bool?
 
     public init(
@@ -475,12 +478,14 @@ public struct UpdateTodoRequest: Codable, Equatable, Sendable {
         title: String? = nil,
         markdown: String? = nil,
         status: TodoStatus? = nil,
+        tags: [String]? = nil,
         open: Bool? = nil
     ) {
         self.todoID = todoID
         self.title = title
         self.markdown = markdown
         self.status = status
+        self.tags = tags
         self.open = open
     }
 }
@@ -1204,6 +1209,18 @@ public enum TodoStatus: String, Codable, CaseIterable, Equatable, Identifiable, 
     public var id: String { rawValue }
 }
 
+public struct TodoTag: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public var name: String
+    public var colorHex: String
+
+    public init(id: String, name: String, colorHex: String) {
+        self.id = id
+        self.name = name
+        self.colorHex = colorHex
+    }
+}
+
 public struct TodoComment: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public var markdown: String
@@ -1238,6 +1255,7 @@ public struct ProjectTodo: Codable, Equatable, Identifiable, Sendable {
     public var position: Int
     public let createdAt: Date
     public var updatedAt: Date
+    public var tags: [TodoTag]
     public var comments: [TodoComment]
 
     public init(
@@ -1249,6 +1267,7 @@ public struct ProjectTodo: Codable, Equatable, Identifiable, Sendable {
         position: Int,
         createdAt: Date,
         updatedAt: Date,
+        tags: [TodoTag] = [],
         comments: [TodoComment] = []
     ) {
         self.id = id
@@ -1259,7 +1278,35 @@ public struct ProjectTodo: Codable, Equatable, Identifiable, Sendable {
         self.position = position
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.tags = tags
         self.comments = comments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case projectRoot
+        case title
+        case markdown
+        case status
+        case position
+        case createdAt
+        case updatedAt
+        case tags
+        case comments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        projectRoot = try container.decode(String.self, forKey: .projectRoot)
+        title = try container.decode(String.self, forKey: .title)
+        markdown = try container.decode(String.self, forKey: .markdown)
+        status = try container.decode(TodoStatus.self, forKey: .status)
+        position = try container.decode(Int.self, forKey: .position)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        tags = try container.decodeIfPresent([TodoTag].self, forKey: .tags) ?? []
+        comments = try container.decodeIfPresent([TodoComment].self, forKey: .comments) ?? []
     }
 }
 
@@ -1269,6 +1316,7 @@ public struct TodoInfo: Codable, Equatable, Sendable {
     public let title: String
     public let status: TodoStatus
     public let position: Int
+    public let tags: [TodoTag]
     public let commentCount: Int
     public let createdAt: Date
     public let updatedAt: Date
@@ -1279,6 +1327,7 @@ public struct TodoInfo: Codable, Equatable, Sendable {
         title: String,
         status: TodoStatus,
         position: Int,
+        tags: [TodoTag] = [],
         commentCount: Int,
         createdAt: Date,
         updatedAt: Date
@@ -1288,6 +1337,7 @@ public struct TodoInfo: Codable, Equatable, Sendable {
         self.title = title
         self.status = status
         self.position = position
+        self.tags = tags
         self.commentCount = commentCount
         self.createdAt = createdAt
         self.updatedAt = updatedAt

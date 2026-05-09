@@ -1,0 +1,4 @@
+- nice to have, restore the older convo automatically after closing the terminal
+- better icons
+- hyperlink support cherry://project/1234/terminal/5678
+- open last project

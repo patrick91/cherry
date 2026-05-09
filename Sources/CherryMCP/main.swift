@@ -259,7 +259,8 @@ private enum CherryMCPTools {
             properties: [
                 "title": string("Todo title."),
                 "markdown": string("Optional Markdown details."),
-                "status": string("Optional status: backlog, ready, doing, blocked, or done.")
+                "status": string("Optional status: backlog, ready, doing, blocked, or done."),
+                "tags": stringArray("Optional todo tag names.")
             ],
             required: ["title"]
         ),
@@ -276,7 +277,8 @@ private enum CherryMCPTools {
                 "todo_id": string("Cherry todo UUID."),
                 "title": string("Optional replacement title."),
                 "markdown": string("Optional replacement Markdown details."),
-                "status": string("Optional status: backlog, ready, doing, blocked, or done.")
+                "status": string("Optional status: backlog, ready, doing, blocked, or done."),
+                "tags": stringArray("Optional replacement todo tag names. Empty array clears tags.")
             ],
             required: ["todo_id"]
         ),
@@ -664,6 +666,7 @@ private enum CherryMCPTools {
                 title: try requiredString("title", in: arguments),
                 markdown: stringArgument("markdown", in: arguments) ?? "",
                 status: try todoStatusArgument("status", in: arguments),
+                tags: try stringArrayArgument("tags", in: arguments),
                 open: false
             ))
         case "get_todo":
@@ -674,6 +677,7 @@ private enum CherryMCPTools {
                 title: stringArgument("title", in: arguments),
                 markdown: stringArgument("markdown", in: arguments),
                 status: try todoStatusArgument("status", in: arguments),
+                tags: try stringArrayArgument("tags", in: arguments),
                 open: false
             ))
         case "move_todo":
@@ -933,6 +937,21 @@ private enum CherryMCPTools {
         arguments[key]?.boolValue
     }
 
+    private static func stringArrayArgument(_ key: String, in arguments: [String: Value]) throws -> [String]? {
+        guard let value = arguments[key] else { return nil }
+        guard let array = value.arrayValue else {
+            throw CherryControlError(code: "invalid_argument", message: "\(key) must be an array of strings.")
+        }
+        var strings: [String] = []
+        for item in array {
+            guard let string = item.stringValue else {
+                throw CherryControlError(code: "invalid_argument", message: "\(key) must be an array of strings.")
+            }
+            strings.append(string)
+        }
+        return strings
+    }
+
     private static func todoStatusArgument(_ key: String, in arguments: [String: Value]) throws -> TodoStatus? {
         guard let value = stringArgument(key, in: arguments)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty
@@ -991,6 +1010,14 @@ private enum CherryMCPTools {
 
     private static func boolean(_ description: String) -> Value {
         .object(["type": .string("boolean"), "description": .string(description)])
+    }
+
+    private static func stringArray(_ description: String) -> Value {
+        .object([
+            "type": .string("array"),
+            "description": .string(description),
+            "items": .object(["type": .string("string")])
+        ])
     }
 
     private static func processSelectorProperties(_ extra: [String: Value] = [:]) -> [String: Value] {

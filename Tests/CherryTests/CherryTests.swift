@@ -750,6 +750,35 @@ import Testing
 }
 
 @MainActor
+@Test func controlServerReturnsLargeTodoListsWithoutTruncation() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    for index in 0..<60 {
+        _ = try harness.todoStore.create(
+            title: "Large todo \(index) \(String(repeating: "response payload ", count: 4))",
+            markdown: "",
+            status: .ready,
+            tags: ["regression", "socket"]
+        )
+    }
+
+    harness.server.start()
+    let response = try await harness.send(.listTodos)
+    guard case .listTodos(let list)? = response.result else {
+        Issue.record("Expected listTodos result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(response.error == nil)
+    #expect(list.todos.count == 60)
+    #expect(list.todos.first?.title.hasPrefix("Large todo 0") == true)
+    #expect(list.todos.last?.title.hasPrefix("Large todo 59") == true)
+}
+
+@MainActor
 @Test func controlServerDoesNotSelectNotesOrTodosByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {

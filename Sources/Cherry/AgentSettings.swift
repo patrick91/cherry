@@ -97,7 +97,7 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
     }
 
     func resolvedWorkingDirectory(projectRoot: String) -> String {
-        let normalized = NSString(string: workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)).expandingTildeInPath
+        let normalized = Self.absoluteWorkingDirectoryPath(workingDirectory, projectRoot: projectRoot)
         guard !normalized.isEmpty else { return projectRoot }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: normalized, isDirectory: &isDirectory),
@@ -105,7 +105,59 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
         else {
             return projectRoot
         }
-        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+        return normalized
+    }
+
+    func withPortableWorkingDirectory(projectRoot: String) -> ProjectCommandDefinition {
+        var command = self
+        command.workingDirectory = Self.portableWorkingDirectory(workingDirectory, projectRoot: projectRoot)
+        return command
+    }
+
+    static func portableWorkingDirectory(_ workingDirectory: String, projectRoot: String) -> String {
+        let trimmed = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !projectRoot.isEmpty else { return trimmed }
+
+        let absolutePath = absoluteWorkingDirectoryPath(trimmed, projectRoot: projectRoot)
+        guard !absolutePath.isEmpty else { return trimmed }
+        if let relativePath = relativePathIfContained(absolutePath, in: projectRoot) {
+            return relativePath
+        }
+        return absolutePath
+    }
+
+    private static func absoluteWorkingDirectoryPath(_ workingDirectory: String, projectRoot: String) -> String {
+        let trimmed = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let expanded = NSString(string: trimmed).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+        }
+
+        let rootURL = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL
+        return rootURL
+            .appendingPathComponent(expanded, isDirectory: true)
+            .standardizedFileURL
+            .path
+    }
+
+    private static func relativePathIfContained(_ path: String, in projectRoot: String) -> String? {
+        let rootComponents = URL(fileURLWithPath: projectRoot, isDirectory: true)
+            .standardizedFileURL
+            .pathComponents
+        let pathComponents = URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL
+            .pathComponents
+
+        guard rootComponents.count <= pathComponents.count,
+              Array(pathComponents.prefix(rootComponents.count)) == rootComponents
+        else {
+            return nil
+        }
+
+        let relativeComponents = pathComponents.dropFirst(rootComponents.count)
+        return relativeComponents.isEmpty ? "" : relativeComponents.joined(separator: "/")
     }
 }
 
@@ -462,7 +514,9 @@ final class AgentSettings: ObservableObject {
         storage: ProjectCommandStorage = .local
     ) throws {
         guard let root = Self.validDirectory(requestedRoot) else { return }
-        let validatedCommand = try ProjectCommandConfiguration.validated([command]).first!
+        let validatedCommand = try ProjectCommandConfiguration.validated([
+            command.withPortableWorkingDirectory(projectRoot: root)
+        ]).first!
         switch storage {
         case .local:
             var nextCommands = commandsByProject[root] ?? []

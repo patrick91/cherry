@@ -1614,6 +1614,27 @@ import Testing
     ])
 }
 
+@Test func projectCommandWorkingDirectoryCanBeProjectRelative() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let webDirectory = directory.appendingPathComponent("web", isDirectory: true)
+    let siblingDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: webDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: siblingDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: siblingDirectory)
+    }
+
+    let relativeCommand = ProjectCommandDefinition(name: "Web", command: "npm", workingDirectory: "web")
+    #expect(relativeCommand.resolvedWorkingDirectory(projectRoot: directory.path) == webDirectory.standardizedFileURL.path)
+
+    #expect(ProjectCommandDefinition.portableWorkingDirectory(webDirectory.path, projectRoot: directory.path) == "web")
+    #expect(ProjectCommandDefinition.portableWorkingDirectory(directory.path, projectRoot: directory.path) == "")
+    #expect(ProjectCommandDefinition.portableWorkingDirectory(siblingDirectory.path, projectRoot: directory.path) == siblingDirectory.standardizedFileURL.path)
+}
+
 @Test func projectCommandDefinitionsRejectDuplicateNames() async throws {
     #expect(throws: ProjectCommandConfigurationError.duplicateName("web")) {
         try ProjectCommandConfiguration.validated([
@@ -1952,8 +1973,10 @@ import Testing
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     let secondDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let firstWebDirectory = firstDirectory.appendingPathComponent("web", isDirectory: true)
     try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: firstWebDirectory, withIntermediateDirectories: true)
     defer {
         try? FileManager.default.removeItem(at: firstDirectory)
         try? FileManager.default.removeItem(at: secondDirectory)
@@ -1967,7 +1990,7 @@ import Testing
             name: "Web",
             command: "npm",
             arguments: "run dev",
-            workingDirectory: firstDirectory.path,
+            workingDirectory: firstWebDirectory.path,
             autoStart: true,
             autoRestart: true
         ),
@@ -1984,7 +2007,7 @@ import Testing
             name: "Web",
             command: "npm",
             arguments: "run dev",
-            workingDirectory: firstDirectory.path,
+            workingDirectory: "web",
             autoStart: true,
             autoRestart: true
         )
@@ -2005,7 +2028,9 @@ import Testing
 
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let workerDirectory = directory.appendingPathComponent("workers", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workerDirectory, withIntermediateDirectories: true)
     defer {
         try? FileManager.default.removeItem(at: directory)
     }
@@ -2020,6 +2045,7 @@ import Testing
             name: "Web",
             command: "npm",
             arguments: "run dev",
+            workingDirectory: workerDirectory.path,
             autoStart: true,
             autoRestart: true
         ),
@@ -2031,6 +2057,8 @@ import Testing
     #expect(contents.contains("[project]"))
     #expect(contents.contains("[[commands]]"))
     #expect(contents.contains("name = \"Web\""))
+    #expect(contents.contains("workingDirectory = \"workers\""))
+    #expect(!contents.contains(workerDirectory.path))
 
     let reloadedSettings = AgentSettings(defaults: defaults)
     #expect(reloadedSettings.projectCommands(for: directory.path) == [
@@ -2038,6 +2066,7 @@ import Testing
             name: "Web",
             command: "npm",
             arguments: "run dev",
+            workingDirectory: "workers",
             autoStart: true,
             autoRestart: true
         )
@@ -2137,7 +2166,7 @@ import Testing
     try FileManager.default.createDirectory(at: customDirectory, withIntermediateDirectories: true)
 
     let session = workspace.addCommandSession(
-        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat", workingDirectory: customDirectory.path),
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat", workingDirectory: "web"),
         projectRoot: directory.path
     )
     let duplicate = workspace.addCommandSession(

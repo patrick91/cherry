@@ -1044,14 +1044,14 @@ struct ProjectCommandEditor: View {
                         .foregroundStyle(.secondary)
 
                     HStack(spacing: 10) {
-                        TextField(projectRoot, text: $draft.workingDirectory)
+                        TextField("e.g., ., web, packages/api", text: $draft.workingDirectory)
 
                         Button("Browse") {
                             chooseWorkingDirectory()
                         }
                     }
 
-                    Text("Leave empty to use project root")
+                    Text("Leave empty to use project root. Relative paths resolve from the project root.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -1117,13 +1117,16 @@ struct ProjectCommandEditor: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
         if !draft.workingDirectory.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: NSString(string: draft.workingDirectory).expandingTildeInPath)
+            panel.directoryURL = URL(
+                fileURLWithPath: draft.definition.resolvedWorkingDirectory(projectRoot: projectRoot),
+                isDirectory: true
+            )
         } else if !projectRoot.isEmpty {
             panel.directoryURL = URL(fileURLWithPath: projectRoot, isDirectory: true)
         }
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        draft.workingDirectory = url.path
+        draft.workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(url.path, projectRoot: projectRoot)
     }
 }
 
@@ -1163,15 +1166,20 @@ private struct ProjectCommandDraft {
     var autoRestart: Bool
     var enabled: Bool
     var storage: ProjectCommandStorage
+    let projectRoot: String
 
     init(command: ProjectCommandDefinition, projectRoot: String) {
         name = command.name
         commandLine = command.commandLine
-        workingDirectory = command.workingDirectory.isEmpty ? "" : command.workingDirectory
+        workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(
+            command.workingDirectory,
+            projectRoot: projectRoot
+        )
         autoStart = command.autoStart
         autoRestart = command.autoRestart
         enabled = command.enabled
         storage = .local
+        self.projectRoot = projectRoot
         if name.isEmpty, commandLine.isEmpty, workingDirectory.isEmpty {
             self.workingDirectory = ""
         }
@@ -1183,7 +1191,10 @@ private struct ProjectCommandDraft {
             name: name,
             command: parts.command,
             arguments: parts.arguments,
-            workingDirectory: workingDirectory,
+            workingDirectory: ProjectCommandDefinition.portableWorkingDirectory(
+                workingDirectory,
+                projectRoot: projectRoot
+            ),
             autoStart: autoStart,
             autoRestart: autoRestart,
             enabled: enabled

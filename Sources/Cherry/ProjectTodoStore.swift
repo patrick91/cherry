@@ -190,6 +190,37 @@ final class ProjectTodoStore: ObservableObject {
         return todo
     }
 
+    func updateComment(todoID: UUID, commentID: UUID, markdown: String) throws -> ProjectTodo {
+        guard let todoIndex = todos.firstIndex(where: { $0.id == todoID }) else {
+            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(todoID.uuidString).")
+        }
+        guard let commentIndex = todos[todoIndex].comments.firstIndex(where: { $0.id == commentID }) else {
+            throw CherryControlError(code: "todo_comment_not_found", message: "No Cherry todo comment exists with id \(commentID.uuidString).")
+        }
+
+        todos[todoIndex].comments[commentIndex].markdown = markdown
+        todos[todoIndex].updatedAt = Date()
+        sortTodos()
+        try save()
+        return try todo(id: todoID)
+    }
+
+    func deleteComment(todoID: UUID, commentID: UUID) throws -> ProjectTodo {
+        guard let todoIndex = todos.firstIndex(where: { $0.id == todoID }) else {
+            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(todoID.uuidString).")
+        }
+        let originalCount = todos[todoIndex].comments.count
+        todos[todoIndex].comments.removeAll { $0.id == commentID }
+        guard todos[todoIndex].comments.count != originalCount else {
+            throw CherryControlError(code: "todo_comment_not_found", message: "No Cherry todo comment exists with id \(commentID.uuidString).")
+        }
+
+        todos[todoIndex].updatedAt = Date()
+        sortTodos()
+        try save()
+        return try todo(id: todoID)
+    }
+
     func delete(id: UUID) throws {
         let originalCount = todos.count
         todos.removeAll { $0.id == id }

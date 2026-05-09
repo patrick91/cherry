@@ -12,6 +12,7 @@ final class CherryControlServer: @unchecked Sendable {
     private let todoStoreProvider: @MainActor () -> ProjectTodoStore?
     private let chromeStateProvider: @MainActor () -> ProjectWindowChromeState?
     private let agentSettings: AgentSettings
+    private let serviceDetector: any ServiceDetecting
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
     private var listenFileDescriptor: Int32 = -1
@@ -24,7 +25,8 @@ final class CherryControlServer: @unchecked Sendable {
         todoStore: ProjectTodoStore? = nil,
         chromeState: ProjectWindowChromeState? = nil,
         socketURL: URL = CherryControl.socketURL,
-        agentSettings: AgentSettings = .shared
+        agentSettings: AgentSettings = .shared,
+        serviceDetector: any ServiceDetecting = MacOSServiceDetector()
     ) {
         self.workspace = workspace
         self.noteStore = noteStore
@@ -35,6 +37,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.todoStoreProvider = { todoStore }
         self.chromeStateProvider = { chromeState }
         self.agentSettings = agentSettings
+        self.serviceDetector = serviceDetector
         self.socketURL = socketURL
     }
 
@@ -51,7 +54,8 @@ final class CherryControlServer: @unchecked Sendable {
             ProjectWindowRegistry.shared.activeChromeState
         },
         socketURL: URL = CherryControl.socketURL,
-        agentSettings: AgentSettings = .shared
+        agentSettings: AgentSettings = .shared,
+        serviceDetector: any ServiceDetecting = MacOSServiceDetector()
     ) {
         self.workspace = nil
         self.noteStore = nil
@@ -62,6 +66,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.todoStoreProvider = todoStoreProvider
         self.chromeStateProvider = chromeStateProvider
         self.agentSettings = agentSettings
+        self.serviceDetector = serviceDetector
         self.socketURL = socketURL
     }
 
@@ -222,6 +227,107 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         switch request {
+        case .listProjects:
+            return .init(result: .listProjects(listProjects(workspace: workspace)))
+        case .getProjectStatus:
+            return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
+        case .listProcesses(let request):
+            return .init(result: .listProcesses(try listProcesses(workspace: workspace, kind: request.kind)))
+        case .getProcessStatus(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: workspace))))
+        case .getProcessOutput(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .getProcessOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
+        case .getProcessRawOutput(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .getProcessRawOutput(rawOutput(for: session, maxBytes: request.maxBytes)))
+        case .searchProcessOutput(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .searchProcessOutput(searchOutput(
+                for: session,
+                query: request.query,
+                caseSensitive: request.caseSensitive,
+                maxMatches: request.maxMatches
+            )))
+        case .getProcessPorts(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .getProcessPorts(try servicesResult(
+                workspace: workspace,
+                sessions: [session],
+                includeUnattributed: request.includeUnattributed ?? false
+            )))
+        case .servicesList(let request):
+            let kind = try processKind(from: request.kind)
+            let sessions = workspace.sessions.filter { session in
+                guard let kind else { return true }
+                return session.kind == kind
+            }
+            return .init(result: .servicesList(try servicesResult(
+                workspace: workspace,
+                sessions: sessions,
+                includeUnattributed: request.includeUnattributed ?? false
+            )))
+        case .waitForBoundPort(let request):
+            let service = try await waitForBoundPort(request, workspace: workspace)
+            return .init(result: .waitForBoundPort(.init(service: service)))
+        case .spawnProcess(let request):
+            let (session, sentBytes) = try spawnProcess(request, workspace: workspace)
+            let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+            return .init(result: .spawnProcess(.init(
+                process: processInfo(for: session, workspace: workspace),
+                sentBytes: sentBytes,
+                output: output
+            )))
+        case .startProcess(let request):
+            let session = try startProcess(request, workspace: workspace)
+            let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+            return .init(result: .startProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+        case .stopProcess(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            stopProcess(session)
+            let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+            return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+        case .restartProcess(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            restartProcess(session)
+            let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+            return .init(result: .restartProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+        case .closeProcess(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            guard workspace.sessions.count > 1 else {
+                throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
+            }
+            workspace.close(session)
+            return .init(result: .closeProcess(.init(processID: session.id.uuidString, closed: true)))
+        case .renameProcess(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            session.rename(to: request.title)
+            return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: workspace))))
+        case .sendProcessInput(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let payload = try inputPayload(text: request.text, rawBase64: request.rawBase64)
+            session.send(data: payload)
+            let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: payload.count, output: output)))
+        case .startAllCommands(let request):
+            _ = try startAllCommands(workspace: workspace)
+            if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
+            }
+            return .init(result: .startAllCommands(try listProcesses(workspace: workspace, kind: nil)))
+        case .stopAllCommands(let request):
+            workspace.commandSessions.forEach { $0.stopManagedCommand() }
+            if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
+            }
+            return .init(result: .stopAllCommands(try listProcesses(workspace: workspace, kind: nil)))
+        case .restartAllCommands(let request):
+            try restartAllCommands(workspace: workspace)
+            if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
+            }
+            return .init(result: .restartAllCommands(try listProcesses(workspace: workspace, kind: nil)))
         case .listTerminals:
             return .init(result: .listTerminals(listTerminals(workspace: workspace)))
         case .listAgents:
@@ -278,7 +384,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .createNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.create(title: request.title, markdown: request.markdown)
-            if request.open ?? true {
+            if request.open ?? false {
                 select(note: note)
             }
             let selected = activeChromeState()?.selectedNoteID == note.id
@@ -302,6 +408,25 @@ final class CherryControlServer: @unchecked Sendable {
                 note: note,
                 selected: activeChromeState()?.selectedNoteID == note.id
             )))
+        case .appendNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let existing = try noteStore.note(id: try noteID(from: request.noteID))
+            let separator = existing.markdown.isEmpty || request.markdown.isEmpty ? "" : "\n"
+            let note = try noteStore.update(id: existing.id, title: nil, markdown: existing.markdown + separator + request.markdown)
+            return .init(result: .appendNote(.init(
+                note: note,
+                selected: activeChromeState()?.selectedNoteID == note.id
+            )))
+        case .renameNote(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            let note = try noteStore.update(id: try noteID(from: request.noteID), title: request.title, markdown: nil)
+            return .init(result: .renameNote(.init(
+                note: note,
+                selected: activeChromeState()?.selectedNoteID == note.id
+            )))
+        case .searchNotes(let request):
+            let noteStore = try activeNoteStore(for: workspace)
+            return .init(result: .searchNotes(searchNotes(noteStore: noteStore, request: request)))
         case .deleteNote(let request):
             let id = try noteID(from: request.noteID)
             let noteStore = try activeNoteStore(for: workspace)
@@ -322,7 +447,7 @@ final class CherryControlServer: @unchecked Sendable {
                 markdown: request.markdown,
                 status: request.status ?? .backlog
             )
-            if request.open ?? true {
+            if request.open ?? false {
                 select(todo: todo)
             }
             return .init(result: .createTodo(.init(
@@ -393,6 +518,31 @@ final class CherryControlServer: @unchecked Sendable {
                 select(todo: todo)
             }
             return .init(result: .addTodoComment(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .listTodoComments(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.todo(id: try todoID(from: request.todoID))
+            return .init(result: .listTodoComments(.init(todoID: todo.id.uuidString, comments: todo.comments)))
+        case .updateTodoComment(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.updateComment(
+                todoID: try todoID(from: request.todoID),
+                commentID: try commentID(from: request.commentID),
+                markdown: request.markdown
+            )
+            return .init(result: .updateTodoComment(.init(
+                todo: todo,
+                selected: activeChromeState()?.selectedTodoID == todo.id
+            )))
+        case .deleteTodoComment(let request):
+            let todoStore = try activeTodoStore(for: workspace)
+            let todo = try todoStore.deleteComment(
+                todoID: try todoID(from: request.todoID),
+                commentID: try commentID(from: request.commentID)
+            )
+            return .init(result: .deleteTodoComment(.init(
                 todo: todo,
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
@@ -488,6 +638,366 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func listProjects(workspace: TerminalWorkspace) -> ListProjectsResult {
+        let activeRoot = workspace.projectRoot
+        var roots = agentSettings.projects.map(\.root)
+        if let activeRoot, !roots.contains(activeRoot) {
+            roots.insert(activeRoot, at: 0)
+        }
+
+        return ListProjectsResult(
+            activeProjectRoot: activeRoot,
+            projects: roots.map { root in
+                ProjectInfo(
+                    root: root,
+                    name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
+                    active: root == activeRoot,
+                    open: root == activeRoot
+                )
+            }
+        )
+    }
+
+    @MainActor
+    private func projectStatus(workspace: TerminalWorkspace) -> ProjectStatusResult {
+        let selectedSession = workspace.selectedSession
+        let noteStore = try? activeNoteStore(for: workspace)
+        let todoStore = try? activeTodoStore(for: workspace)
+        return ProjectStatusResult(
+            projectRoot: workspace.projectRoot,
+            processCounts: .init(
+                total: workspace.sessions.count,
+                terminals: workspace.terminalSessions.count,
+                agents: workspace.agentSessions.count,
+                commands: workspace.commandSessions.count
+            ),
+            noteCount: noteStore?.notes.count,
+            todoCount: todoStore?.todos.count,
+            selectedProcessID: selectedSession?.id.uuidString,
+            selectedProcessName: selectedSession.map(processName),
+            health: workspace.projectRoot == nil ? "no_project" : "ok"
+        )
+    }
+
+    @MainActor
+    private func listProcesses(workspace: TerminalWorkspace, kind requestedKind: String?) throws -> ListProcessesResult {
+        let kind = try processKind(from: requestedKind)
+        let sessions = workspace.sessions.filter { session in
+            guard let kind else { return true }
+            return session.kind == kind
+        }
+        return ListProcessesResult(
+            activeProjectRoot: workspace.projectRoot,
+            processes: sessions.map { processInfo(for: $0, workspace: workspace) },
+            selectedProcessID: workspace.selectedSessionID?.uuidString
+        )
+    }
+
+    @MainActor
+    private func processInfo(for session: TerminalSession, workspace: TerminalWorkspace) -> ProcessSummary {
+        ProcessSummary(
+            id: session.id.uuidString,
+            name: processName(for: session),
+            kind: session.kind.rawValue,
+            state: session.state.label,
+            pid: session.childProcessID,
+            startedAt: session.startedAt,
+            exitedAt: session.exitedAt,
+            lastOutputAt: session.lastOutputAt,
+            acceptsInput: session.acceptsInput,
+            exitCode: session.exitCode,
+            restartPolicy: session.restartPolicy,
+            workingDirectory: session.workingDirectory,
+            commandLine: session.kind == .terminal ? nil : session.subtitle,
+            lineCount: session.lineCount,
+            summary: session.summary,
+            selected: workspace.selectedSessionID == session.id,
+            agentName: session.agentName,
+            commandName: session.commandName
+        )
+    }
+
+    @MainActor
+    private func processName(for session: TerminalSession) -> String {
+        session.commandName?.nilIfEmpty ?? session.agentName?.nilIfEmpty ?? session.title
+    }
+
+    @MainActor
+    private func resolveProcess(
+        workspace: TerminalWorkspace,
+        processID: String?,
+        processName: String?
+    ) throws -> TerminalSession {
+        if let processID = processID?.trimmingCharacters(in: .whitespacesAndNewlines), !processID.isEmpty {
+            return try findSession(workspace: workspace, terminalID: processID)
+        }
+
+        guard let requestedName = processName?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedName.isEmpty else {
+            throw CherryControlError(code: "missing_process_selector", message: "Provide process_id or process_name.")
+        }
+
+        let normalizedName = AgentToolDefinition.normalizedName(requestedName)
+        let matches = workspace.sessions.filter { session in
+            self.processName(for: session).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
+                || session.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
+        }
+        guard let session = matches.first else {
+            throw CherryControlError(code: "process_not_found", message: "No Cherry process exists with name \(requestedName).")
+        }
+        guard matches.count == 1 else {
+            throw CherryControlError(code: "ambiguous_process_name", message: "Multiple Cherry processes match name \(requestedName); use process_id.")
+        }
+        return session
+    }
+
+    @MainActor
+    private func spawnProcess(_ request: SpawnProcessRequest, workspace: TerminalWorkspace) throws -> (TerminalSession, Int) {
+        let kind = try requiredProcessKind(from: request.kind)
+        let session: TerminalSession
+        switch kind {
+        case .terminal:
+            guard request.name == nil else {
+                throw CherryControlError(code: "invalid_process_request", message: "Terminal processes do not use name; pass title instead.")
+            }
+            session = workspace.addSession(title: request.title, workingDirectory: request.workingDirectory, select: false)
+        case .agent:
+            guard let projectRoot = workspace.projectRoot else {
+                throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+            }
+            let agent = try findAgent(named: request.name ?? "")
+            guard agent.isLaunchable else {
+                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
+            }
+            session = workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot, title: request.title, select: false)
+        case .command:
+            guard let projectRoot = workspace.projectRoot else {
+                throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+            }
+            let command = try findProjectCommand(named: request.name ?? "", projectRoot: projectRoot)
+            session = workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
+        }
+
+        let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
+        if let payload, !payload.isEmpty {
+            session.send(data: payload)
+        }
+        return (session, payload?.count ?? 0)
+    }
+
+    @MainActor
+    private func startProcess(_ request: ProcessLifecycleRequest, workspace: TerminalWorkspace) throws -> TerminalSession {
+        if let session = try? resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName) {
+            switch session.state {
+            case .launching, .live:
+                return session
+            case .exited, .failed:
+                if session.kind == .command {
+                    session.restartManagedCommandIfNeeded()
+                } else {
+                    session.restart()
+                }
+                return session
+            }
+        }
+
+        guard let projectRoot = workspace.projectRoot else {
+            throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+        }
+        let kind = try processKind(from: request.kind)
+        switch kind {
+        case .agent:
+            let agent = try findAgent(named: request.processName ?? "")
+            guard agent.isLaunchable else {
+                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
+            }
+            return workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot, select: false)
+        case .command, nil:
+            let command = try findProjectCommand(named: request.processName ?? "", projectRoot: projectRoot)
+            return workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
+        case .terminal:
+            throw CherryControlError(code: "process_not_found", message: "No stopped terminal process matched the requested selector.")
+        }
+    }
+
+    @MainActor
+    private func servicesResult(
+        workspace: TerminalWorkspace,
+        sessions: [TerminalSession],
+        includeUnattributed: Bool
+    ) throws -> ServicesResult {
+        let records = try detectedServices(
+            workspace: workspace,
+            sessions: sessions,
+            includeUnattributed: includeUnattributed
+        )
+        return ServicesResult(
+            activeProjectRoot: workspace.projectRoot,
+            services: records.filter { $0.attribution == .processTree },
+            unattributed: records.filter { $0.attribution == .unattributed }
+        )
+    }
+
+    @MainActor
+    private func detectedServices(
+        workspace: TerminalWorkspace,
+        sessions: [TerminalSession],
+        includeUnattributed: Bool
+    ) throws -> [ServiceRecord] {
+        let inspectable = sessions.map { session in
+            InspectableProcess(
+                id: session.id.uuidString,
+                name: processName(for: session),
+                kind: session.kind.rawValue,
+                rootPID: session.childProcessID,
+                commandName: session.commandName,
+                agentName: session.agentName
+            )
+        }
+        return try serviceDetector.detectServices(processes: inspectable, includeUnattributed: includeUnattributed)
+    }
+
+    @MainActor
+    private func waitForBoundPort(_ request: WaitForBoundPortRequest, workspace: TerminalWorkspace) async throws -> ServiceRecord {
+        let deadline = Date().addingTimeInterval(TimeInterval(min(max(request.timeoutMilliseconds ?? 10_000, 1), 60_000)) / 1_000)
+        let includeUnattributed = request.includeUnattributed ?? false
+        let sessions: [TerminalSession]
+        if request.processID != nil || request.processName != nil {
+            sessions = [try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)]
+        } else {
+            sessions = workspace.sessions
+        }
+
+        var lastCandidates: [ServiceRecord] = []
+        repeat {
+            let candidates = try detectedServices(
+                workspace: workspace,
+                sessions: sessions,
+                includeUnattributed: includeUnattributed
+            )
+            .filter { service in
+                request.port.map { $0 == service.port } ?? true
+            }
+
+            if candidates.count > 1 {
+                throw CherryControlError(
+                    code: "ambiguous_service",
+                    message: "Multiple services match the requested filters; retry with process_id, process_name, or port.",
+                    serviceCandidates: candidates
+                )
+            }
+
+            if var service = candidates.first {
+                if request.probeHTTP ?? false {
+                    service.readiness = await httpReadiness(for: service, path: request.path)
+                    if service.readiness == .httpOK {
+                        return service
+                    }
+                } else {
+                    return service
+                }
+                lastCandidates = [service]
+            } else {
+                lastCandidates = []
+            }
+
+            try? await Task.sleep(for: .milliseconds(150))
+        } while Date() < deadline
+
+        throw CherryControlError(
+            code: "port_wait_timed_out",
+            message: "Timed out waiting for a matching bound port.",
+            serviceCandidates: lastCandidates.isEmpty ? nil : lastCandidates
+        )
+    }
+
+    private func httpReadiness(for service: ServiceRecord, path requestedPath: String?) async -> ServiceReadiness {
+        let path = requestedPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "/"
+        guard var components = URLComponents(string: service.url) else {
+            return .httpFailed
+        }
+        components.path = path.hasPrefix("/") ? path : "/\(path)"
+        guard let url = components.url else {
+            return .httpFailed
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        request.httpMethod = "GET"
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if response is HTTPURLResponse {
+                return .httpOK
+            }
+            return .httpFailed
+        } catch {
+            return .httpFailed
+        }
+    }
+
+    @MainActor
+    private func stopProcess(_ session: TerminalSession) {
+        if session.kind == .command {
+            session.stopManagedCommand()
+        } else {
+            session.stop()
+        }
+    }
+
+    @MainActor
+    private func restartProcess(_ session: TerminalSession) {
+        if session.kind == .command {
+            session.restart()
+        } else {
+            session.restart()
+        }
+    }
+
+    @MainActor
+    private func startAllCommands(workspace: TerminalWorkspace) throws -> [TerminalSession] {
+        guard let projectRoot = workspace.projectRoot else {
+            throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
+        }
+        return agentSettings.launchableProjectCommands(for: projectRoot).map {
+            workspace.addCommandSession(command: $0, projectRoot: projectRoot, select: false)
+        }
+    }
+
+    @MainActor
+    private func restartAllCommands(workspace: TerminalWorkspace) throws {
+        let sessions = try startAllCommands(workspace: workspace)
+        for session in sessions {
+            session.restart()
+        }
+    }
+
+    @MainActor
+    private func findProjectCommand(named requestedName: String, projectRoot: String) throws -> ProjectCommandDefinition {
+        let normalizedName = AgentToolDefinition.normalizedName(requestedName)
+        guard !normalizedName.isEmpty else {
+            throw CherryControlError(code: "missing_process_name", message: "Provide a configured project command name.")
+        }
+        guard let command = agentSettings.launchableProjectCommands(for: projectRoot).first(where: { $0.normalizedName == normalizedName }) else {
+            throw CherryControlError(code: "command_not_found", message: "No launchable Cherry project command is configured with name \(requestedName).")
+        }
+        return command
+    }
+
+    private func processKind(from rawValue: String?) throws -> TerminalSession.SessionKind? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return nil
+        }
+        return try requiredProcessKind(from: rawValue)
+    }
+
+    private func requiredProcessKind(from rawValue: String) throws -> TerminalSession.SessionKind {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let kind = TerminalSession.SessionKind(rawValue: normalized) else {
+            throw CherryControlError(code: "invalid_process_kind", message: "Unknown process kind: \(rawValue)")
+        }
+        return kind
+    }
+
+    @MainActor
     private func listNotes(noteStore: ProjectNoteStore) -> ListNotesResult {
         ListNotesResult(
             activeProjectRoot: noteStore.projectRoot,
@@ -504,6 +1014,34 @@ final class CherryControlServer: @unchecked Sendable {
             createdAt: note.createdAt,
             updatedAt: note.updatedAt
         )
+    }
+
+    @MainActor
+    private func searchNotes(noteStore: ProjectNoteStore, request: SearchNotesRequest) -> SearchNotesResult {
+        let query = request.query
+        let caseSensitive = request.caseSensitive ?? false
+        let maxMatches = min(max(request.maxMatches ?? 50, 1), 500)
+        guard !query.isEmpty else {
+            return SearchNotesResult(activeProjectRoot: noteStore.projectRoot, matches: [])
+        }
+
+        var matches: [NoteSearchMatch] = []
+        for note in noteStore.notes {
+            if textMatches(note.title, query: query, caseSensitive: caseSensitive) {
+                matches.append(.init(noteID: note.id.uuidString, title: note.title, lineNumber: nil, text: note.title))
+                if matches.count >= maxMatches { break }
+            }
+
+            let lines = note.markdown.components(separatedBy: .newlines)
+            for (index, line) in lines.enumerated() where textMatches(line, query: query, caseSensitive: caseSensitive) {
+                matches.append(.init(noteID: note.id.uuidString, title: note.title, lineNumber: index, text: line))
+                if matches.count >= maxMatches { break }
+            }
+
+            if matches.count >= maxMatches { break }
+        }
+
+        return SearchNotesResult(activeProjectRoot: noteStore.projectRoot, matches: matches)
     }
 
     @MainActor
@@ -596,6 +1134,13 @@ final class CherryControlServer: @unchecked Sendable {
         return id
     }
 
+    private func commentID(from value: String) throws -> UUID {
+        guard let id = UUID(uuidString: value) else {
+            throw CherryControlError(code: "invalid_todo_comment_id", message: "Todo comment id is not a valid UUID: \(value)")
+        }
+        return id
+    }
+
     @MainActor
     private func todoCommentAuthor(
         from request: AddTodoCommentRequest,
@@ -630,7 +1175,11 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     private func inputPayload(from request: SendInputRequest) throws -> Data {
-        switch (request.text, request.rawBase64) {
+        try inputPayload(text: request.text, rawBase64: request.rawBase64)
+    }
+
+    private func inputPayload(text: String?, rawBase64: String?) throws -> Data {
+        switch (text, rawBase64) {
         case let (text?, nil):
             return Data(text.utf8)
         case let (nil, rawBase64?):
@@ -641,6 +1190,18 @@ final class CherryControlServer: @unchecked Sendable {
         default:
             throw CherryControlError(code: "invalid_input", message: "Provide exactly one of text or raw_base64.")
         }
+    }
+
+    @MainActor
+    private func lifecycleOutput(
+        for session: TerminalSession,
+        waitMilliseconds requestedWaitMilliseconds: Int?,
+        lineLimit: Int?
+    ) async throws -> TerminalOutputResult? {
+        let waitMilliseconds = min(max(requestedWaitMilliseconds ?? 0, 0), 5_000)
+        guard waitMilliseconds > 0 else { return nil }
+        try? await Task.sleep(for: .milliseconds(waitMilliseconds))
+        return terminalOutput(for: session, startLine: nil, lineLimit: lineLimit)
     }
 
     private func optionalInputPayload(text: String?, rawBase64: String?) throws -> Data? {
@@ -689,9 +1250,23 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func searchOutput(for session: TerminalSession, request: SearchOutputRequest) -> SearchOutputResult {
-        let query = request.query
-        let caseSensitive = request.caseSensitive ?? false
-        let maxMatches = min(max(request.maxMatches ?? 50, 1), 500)
+        searchOutput(
+            for: session,
+            query: request.query,
+            caseSensitive: request.caseSensitive,
+            maxMatches: request.maxMatches
+        )
+    }
+
+    @MainActor
+    private func searchOutput(
+        for session: TerminalSession,
+        query: String,
+        caseSensitive requestedCaseSensitive: Bool?,
+        maxMatches requestedMaxMatches: Int?
+    ) -> SearchOutputResult {
+        let caseSensitive = requestedCaseSensitive ?? false
+        let maxMatches = min(max(requestedMaxMatches ?? 50, 1), 500)
         guard !query.isEmpty else {
             return SearchOutputResult(terminalID: session.id.uuidString, matches: [])
         }
@@ -699,10 +1274,7 @@ final class CherryControlServer: @unchecked Sendable {
         var matches: [SearchOutputMatch] = []
         let lines = session.snapshot(range: 0..<session.lineCount)
         for (index, line) in lines.enumerated() {
-            let didMatch = caseSensitive
-                ? line.contains(query)
-                : line.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
-            if didMatch {
+            if textMatches(line, query: query, caseSensitive: caseSensitive) {
                 matches.append(.init(lineNumber: index, text: line))
                 if matches.count >= maxMatches {
                     break
@@ -711,6 +1283,12 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         return SearchOutputResult(terminalID: session.id.uuidString, matches: matches)
+    }
+
+    private func textMatches(_ text: String, query: String, caseSensitive: Bool) -> Bool {
+        caseSensitive
+            ? text.contains(query)
+            : text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
     }
 
     private nonisolated static func readRequest(fileDescriptor fd: Int32) throws -> Data {

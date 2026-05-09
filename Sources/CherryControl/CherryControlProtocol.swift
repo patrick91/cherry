@@ -96,6 +96,26 @@ public enum CherryControl {
 }
 
 public enum CherryControlRequest: Codable, Equatable, Sendable {
+    case listProjects
+    case getProjectStatus
+    case listProcesses(ListProcessesRequest)
+    case getProcessStatus(ProcessSelectorRequest)
+    case getProcessOutput(GetProcessOutputRequest)
+    case getProcessRawOutput(GetProcessRawOutputRequest)
+    case searchProcessOutput(SearchProcessOutputRequest)
+    case getProcessPorts(GetProcessPortsRequest)
+    case servicesList(ServicesListRequest)
+    case waitForBoundPort(WaitForBoundPortRequest)
+    case spawnProcess(SpawnProcessRequest)
+    case startProcess(ProcessLifecycleRequest)
+    case stopProcess(ProcessLifecycleRequest)
+    case restartProcess(ProcessLifecycleRequest)
+    case closeProcess(ProcessSelectorRequest)
+    case renameProcess(RenameProcessRequest)
+    case sendProcessInput(SendProcessInputRequest)
+    case startAllCommands(ProcessBulkCommandRequest)
+    case stopAllCommands(ProcessBulkCommandRequest)
+    case restartAllCommands(ProcessBulkCommandRequest)
     case listTerminals
     case listAgents
     case listNotes
@@ -105,6 +125,9 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case createNote(CreateNoteRequest)
     case getNote(NoteIDRequest)
     case updateNote(UpdateNoteRequest)
+    case appendNote(AppendNoteRequest)
+    case renameNote(RenameNoteRequest)
+    case searchNotes(SearchNotesRequest)
     case deleteNote(NoteIDRequest)
     case selectNote(NoteIDRequest)
     case createTodo(CreateTodoRequest)
@@ -114,6 +137,9 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case deleteTodo(TodoIDRequest)
     case selectTodo(TodoIDRequest)
     case addTodoComment(AddTodoCommentRequest)
+    case listTodoComments(TodoIDRequest)
+    case updateTodoComment(UpdateTodoCommentRequest)
+    case deleteTodoComment(DeleteTodoCommentRequest)
     case renameTerminal(RenameTerminalRequest)
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
@@ -123,6 +149,222 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case clearOutput(TerminalIDRequest)
     case restartTerminal(TerminalIDRequest)
     case closeTerminal(TerminalIDRequest)
+}
+
+public struct ListProcessesRequest: Codable, Equatable, Sendable {
+    public let kind: String?
+
+    public init(kind: String? = nil) {
+        self.kind = kind
+    }
+}
+
+public struct ProcessSelectorRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+
+    public init(processID: String? = nil, processName: String? = nil) {
+        self.processID = processID
+        self.processName = processName
+    }
+}
+
+public struct GetProcessOutputRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let startLine: Int?
+    public let lineLimit: Int?
+
+    public init(processID: String? = nil, processName: String? = nil, startLine: Int? = nil, lineLimit: Int? = nil) {
+        self.processID = processID
+        self.processName = processName
+        self.startLine = startLine
+        self.lineLimit = lineLimit
+    }
+}
+
+public struct GetProcessRawOutputRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let maxBytes: Int?
+
+    public init(processID: String? = nil, processName: String? = nil, maxBytes: Int? = nil) {
+        self.processID = processID
+        self.processName = processName
+        self.maxBytes = maxBytes
+    }
+}
+
+public struct SearchProcessOutputRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let query: String
+    public let caseSensitive: Bool?
+    public let maxMatches: Int?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        query: String,
+        caseSensitive: Bool? = nil,
+        maxMatches: Int? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.query = query
+        self.caseSensitive = caseSensitive
+        self.maxMatches = maxMatches
+    }
+}
+
+public struct GetProcessPortsRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let includeUnattributed: Bool?
+
+    public init(processID: String? = nil, processName: String? = nil, includeUnattributed: Bool? = nil) {
+        self.processID = processID
+        self.processName = processName
+        self.includeUnattributed = includeUnattributed
+    }
+}
+
+public struct ServicesListRequest: Codable, Equatable, Sendable {
+    public let kind: String?
+    public let includeUnattributed: Bool?
+
+    public init(kind: String? = nil, includeUnattributed: Bool? = nil) {
+        self.kind = kind
+        self.includeUnattributed = includeUnattributed
+    }
+}
+
+public struct WaitForBoundPortRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let port: Int?
+    public let timeoutMilliseconds: Int?
+    public let includeUnattributed: Bool?
+    public let probeHTTP: Bool?
+    public let path: String?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        port: Int? = nil,
+        timeoutMilliseconds: Int? = nil,
+        includeUnattributed: Bool? = nil,
+        probeHTTP: Bool? = nil,
+        path: String? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.port = port
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.includeUnattributed = includeUnattributed
+        self.probeHTTP = probeHTTP
+        self.path = path
+    }
+}
+
+public struct SpawnProcessRequest: Codable, Equatable, Sendable {
+    public let kind: String
+    public let name: String?
+    public let title: String?
+    public let workingDirectory: String?
+    public let text: String?
+    public let rawBase64: String?
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(
+        kind: String,
+        name: String? = nil,
+        title: String? = nil,
+        workingDirectory: String? = nil,
+        text: String? = nil,
+        rawBase64: String? = nil,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
+    ) {
+        self.kind = kind
+        self.name = name
+        self.title = title
+        self.workingDirectory = workingDirectory
+        self.text = text
+        self.rawBase64 = rawBase64
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+    }
+}
+
+public struct ProcessLifecycleRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let kind: String?
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        kind: String? = nil,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.kind = kind
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+    }
+}
+
+public struct RenameProcessRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let title: String?
+
+    public init(processID: String? = nil, processName: String? = nil, title: String? = nil) {
+        self.processID = processID
+        self.processName = processName
+        self.title = title
+    }
+}
+
+public struct SendProcessInputRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let text: String?
+    public let rawBase64: String?
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        text: String? = nil,
+        rawBase64: String? = nil,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.text = text
+        self.rawBase64 = rawBase64
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+    }
+}
+
+public struct ProcessBulkCommandRequest: Codable, Equatable, Sendable {
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(waitMilliseconds: Int? = nil, lineLimit: Int? = nil) {
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+    }
 }
 
 public struct TerminalIDRequest: Codable, Equatable, Sendable {
@@ -172,6 +414,38 @@ public struct UpdateNoteRequest: Codable, Equatable, Sendable {
         self.title = title
         self.markdown = markdown
         self.open = open
+    }
+}
+
+public struct AppendNoteRequest: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let markdown: String
+
+    public init(noteID: String, markdown: String) {
+        self.noteID = noteID
+        self.markdown = markdown
+    }
+}
+
+public struct RenameNoteRequest: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let title: String
+
+    public init(noteID: String, title: String) {
+        self.noteID = noteID
+        self.title = title
+    }
+}
+
+public struct SearchNotesRequest: Codable, Equatable, Sendable {
+    public let query: String
+    public let caseSensitive: Bool?
+    public let maxMatches: Int?
+
+    public init(query: String, caseSensitive: Bool? = nil, maxMatches: Int? = nil) {
+        self.query = query
+        self.caseSensitive = caseSensitive
+        self.maxMatches = maxMatches
     }
 }
 
@@ -244,6 +518,28 @@ public struct AddTodoCommentRequest: Codable, Equatable, Sendable {
         self.author = author
         self.terminalID = terminalID
         self.open = open
+    }
+}
+
+public struct UpdateTodoCommentRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let commentID: String
+    public let markdown: String
+
+    public init(todoID: String, commentID: String, markdown: String) {
+        self.todoID = todoID
+        self.commentID = commentID
+        self.markdown = markdown
+    }
+}
+
+public struct DeleteTodoCommentRequest: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let commentID: String
+
+    public init(todoID: String, commentID: String) {
+        self.todoID = todoID
+        self.commentID = commentID
     }
 }
 
@@ -371,6 +667,26 @@ public struct CherryControlResponse: Codable, Equatable, Sendable {
 }
 
 public enum CherryControlResult: Codable, Equatable, Sendable {
+    case listProjects(ListProjectsResult)
+    case getProjectStatus(ProjectStatusResult)
+    case listProcesses(ListProcessesResult)
+    case getProcessStatus(ProcessStatusResult)
+    case getProcessOutput(TerminalOutputResult)
+    case getProcessRawOutput(TerminalRawOutputResult)
+    case searchProcessOutput(SearchOutputResult)
+    case getProcessPorts(ServicesResult)
+    case servicesList(ServicesResult)
+    case waitForBoundPort(WaitForBoundPortResult)
+    case spawnProcess(SpawnProcessResult)
+    case startProcess(ProcessLifecycleResult)
+    case stopProcess(ProcessLifecycleResult)
+    case restartProcess(ProcessLifecycleResult)
+    case closeProcess(CloseProcessResult)
+    case renameProcess(ProcessStatusResult)
+    case sendProcessInput(SendProcessInputResult)
+    case startAllCommands(ListProcessesResult)
+    case stopAllCommands(ListProcessesResult)
+    case restartAllCommands(ListProcessesResult)
     case listTerminals(ListTerminalsResult)
     case listAgents(ListAgentsResult)
     case listNotes(ListNotesResult)
@@ -380,6 +696,9 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case createNote(NoteDetailResult)
     case getNote(NoteDetailResult)
     case updateNote(NoteDetailResult)
+    case appendNote(NoteDetailResult)
+    case renameNote(NoteDetailResult)
+    case searchNotes(SearchNotesResult)
     case deleteNote(DeleteNoteResult)
     case selectNote(SelectNoteResult)
     case createTodo(TodoDetailResult)
@@ -389,6 +708,9 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case deleteTodo(DeleteTodoResult)
     case selectTodo(SelectTodoResult)
     case addTodoComment(TodoDetailResult)
+    case listTodoComments(ListTodoCommentsResult)
+    case updateTodoComment(TodoDetailResult)
+    case deleteTodoComment(TodoDetailResult)
     case renameTerminal(TerminalSummaryResult)
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
@@ -403,10 +725,12 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
 public struct CherryControlError: Codable, Equatable, Error, Sendable {
     public let code: String
     public let message: String
+    public let serviceCandidates: [ServiceRecord]?
 
-    public init(code: String, message: String) {
+    public init(code: String, message: String, serviceCandidates: [ServiceRecord]? = nil) {
         self.code = code
         self.message = message
+        self.serviceCandidates = serviceCandidates
     }
 }
 
@@ -451,6 +775,274 @@ public struct ListTerminalsResult: Codable, Equatable, Sendable {
     public init(terminals: [TerminalInfo], selectedTerminalID: String?) {
         self.terminals = terminals
         self.selectedTerminalID = selectedTerminalID
+    }
+}
+
+public struct ProjectInfo: Codable, Equatable, Sendable {
+    public let root: String
+    public let name: String
+    public let active: Bool
+    public let open: Bool
+
+    public init(root: String, name: String, active: Bool, open: Bool) {
+        self.root = root
+        self.name = name
+        self.active = active
+        self.open = open
+    }
+}
+
+public struct ListProjectsResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String?
+    public let projects: [ProjectInfo]
+
+    public init(activeProjectRoot: String?, projects: [ProjectInfo]) {
+        self.activeProjectRoot = activeProjectRoot
+        self.projects = projects
+    }
+}
+
+public struct ProcessCounts: Codable, Equatable, Sendable {
+    public let total: Int
+    public let terminals: Int
+    public let agents: Int
+    public let commands: Int
+
+    public init(total: Int, terminals: Int, agents: Int, commands: Int) {
+        self.total = total
+        self.terminals = terminals
+        self.agents = agents
+        self.commands = commands
+    }
+}
+
+public struct ProjectStatusResult: Codable, Equatable, Sendable {
+    public let projectRoot: String?
+    public let processCounts: ProcessCounts
+    public let noteCount: Int?
+    public let todoCount: Int?
+    public let selectedProcessID: String?
+    public let selectedProcessName: String?
+    public let health: String
+
+    public init(
+        projectRoot: String?,
+        processCounts: ProcessCounts,
+        noteCount: Int?,
+        todoCount: Int?,
+        selectedProcessID: String?,
+        selectedProcessName: String?,
+        health: String
+    ) {
+        self.projectRoot = projectRoot
+        self.processCounts = processCounts
+        self.noteCount = noteCount
+        self.todoCount = todoCount
+        self.selectedProcessID = selectedProcessID
+        self.selectedProcessName = selectedProcessName
+        self.health = health
+    }
+}
+
+public struct ProcessSummary: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let kind: String
+    public let state: String
+    public let pid: Int32?
+    public let startedAt: Date?
+    public let exitedAt: Date?
+    public let lastOutputAt: Date?
+    public let acceptsInput: Bool
+    public let exitCode: Int32?
+    public let restartPolicy: String?
+    public let workingDirectory: String
+    public let commandLine: String?
+    public let lineCount: Int
+    public let summary: String?
+    public let selected: Bool
+    public let agentName: String?
+    public let commandName: String?
+
+    public init(
+        id: String,
+        name: String,
+        kind: String,
+        state: String,
+        pid: Int32? = nil,
+        startedAt: Date? = nil,
+        exitedAt: Date? = nil,
+        lastOutputAt: Date? = nil,
+        acceptsInput: Bool = false,
+        exitCode: Int32? = nil,
+        restartPolicy: String? = nil,
+        workingDirectory: String,
+        commandLine: String?,
+        lineCount: Int,
+        summary: String?,
+        selected: Bool,
+        agentName: String?,
+        commandName: String?
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.state = state
+        self.pid = pid
+        self.startedAt = startedAt
+        self.exitedAt = exitedAt
+        self.lastOutputAt = lastOutputAt
+        self.acceptsInput = acceptsInput
+        self.exitCode = exitCode
+        self.restartPolicy = restartPolicy
+        self.workingDirectory = workingDirectory
+        self.commandLine = commandLine
+        self.lineCount = lineCount
+        self.summary = summary
+        self.selected = selected
+        self.agentName = agentName
+        self.commandName = commandName
+    }
+}
+
+public enum ServiceAttribution: String, Codable, Equatable, Sendable {
+    case processTree = "process_tree"
+    case unattributed
+}
+
+public enum ServiceReadiness: String, Codable, Equatable, Sendable {
+    case bound
+    case httpOK = "http_ok"
+    case httpFailed = "http_failed"
+}
+
+public struct ServiceRecord: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let kind: String?
+    public let pid: Int32?
+    public let port: Int
+    public let host: String
+    public let url: String
+    public let attribution: ServiceAttribution
+    public let protocolGuess: String?
+    public var readiness: ServiceReadiness
+    public let lastSeenAt: Date
+    public let commandName: String?
+    public let agentName: String?
+
+    public init(
+        processID: String?,
+        processName: String?,
+        kind: String?,
+        pid: Int32?,
+        port: Int,
+        host: String,
+        url: String,
+        attribution: ServiceAttribution,
+        protocolGuess: String?,
+        readiness: ServiceReadiness,
+        lastSeenAt: Date,
+        commandName: String?,
+        agentName: String?
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.kind = kind
+        self.pid = pid
+        self.port = port
+        self.host = host
+        self.url = url
+        self.attribution = attribution
+        self.protocolGuess = protocolGuess
+        self.readiness = readiness
+        self.lastSeenAt = lastSeenAt
+        self.commandName = commandName
+        self.agentName = agentName
+    }
+}
+
+public struct ServicesResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String?
+    public let services: [ServiceRecord]
+    public let unattributed: [ServiceRecord]
+
+    public init(activeProjectRoot: String?, services: [ServiceRecord], unattributed: [ServiceRecord]) {
+        self.activeProjectRoot = activeProjectRoot
+        self.services = services
+        self.unattributed = unattributed
+    }
+}
+
+public struct WaitForBoundPortResult: Codable, Equatable, Sendable {
+    public let service: ServiceRecord
+
+    public init(service: ServiceRecord) {
+        self.service = service
+    }
+}
+
+public struct ListProcessesResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String?
+    public let processes: [ProcessSummary]
+    public let selectedProcessID: String?
+
+    public init(activeProjectRoot: String?, processes: [ProcessSummary], selectedProcessID: String?) {
+        self.activeProjectRoot = activeProjectRoot
+        self.processes = processes
+        self.selectedProcessID = selectedProcessID
+    }
+}
+
+public struct ProcessStatusResult: Codable, Equatable, Sendable {
+    public let process: ProcessSummary
+
+    public init(process: ProcessSummary) {
+        self.process = process
+    }
+}
+
+public struct SpawnProcessResult: Codable, Equatable, Sendable {
+    public let process: ProcessSummary
+    public let sentBytes: Int
+    public let output: TerminalOutputResult?
+
+    public init(process: ProcessSummary, sentBytes: Int, output: TerminalOutputResult?) {
+        self.process = process
+        self.sentBytes = sentBytes
+        self.output = output
+    }
+}
+
+public struct ProcessLifecycleResult: Codable, Equatable, Sendable {
+    public let process: ProcessSummary
+    public let output: TerminalOutputResult?
+
+    public init(process: ProcessSummary, output: TerminalOutputResult?) {
+        self.process = process
+        self.output = output
+    }
+}
+
+public struct SendProcessInputResult: Codable, Equatable, Sendable {
+    public let processID: String
+    public let sentBytes: Int
+    public let output: TerminalOutputResult?
+
+    public init(processID: String, sentBytes: Int, output: TerminalOutputResult?) {
+        self.processID = processID
+        self.sentBytes = sentBytes
+        self.output = output
+    }
+}
+
+public struct CloseProcessResult: Codable, Equatable, Sendable {
+    public let processID: String
+    public let closed: Bool
+
+    public init(processID: String, closed: Bool) {
+        self.processID = processID
+        self.closed = closed
     }
 }
 
@@ -555,6 +1147,30 @@ public struct NoteDetailResult: Codable, Equatable, Sendable {
     public init(note: ProjectNote, selected: Bool) {
         self.note = note
         self.selected = selected
+    }
+}
+
+public struct NoteSearchMatch: Codable, Equatable, Sendable {
+    public let noteID: String
+    public let title: String
+    public let lineNumber: Int?
+    public let text: String
+
+    public init(noteID: String, title: String, lineNumber: Int?, text: String) {
+        self.noteID = noteID
+        self.title = title
+        self.lineNumber = lineNumber
+        self.text = text
+    }
+}
+
+public struct SearchNotesResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String
+    public let matches: [NoteSearchMatch]
+
+    public init(activeProjectRoot: String, matches: [NoteSearchMatch]) {
+        self.activeProjectRoot = activeProjectRoot
+        self.matches = matches
     }
 }
 
@@ -697,6 +1313,16 @@ public struct TodoDetailResult: Codable, Equatable, Sendable {
     public init(todo: ProjectTodo, selected: Bool) {
         self.todo = todo
         self.selected = selected
+    }
+}
+
+public struct ListTodoCommentsResult: Codable, Equatable, Sendable {
+    public let todoID: String
+    public let comments: [TodoComment]
+
+    public init(todoID: String, comments: [TodoComment]) {
+        self.todoID = todoID
+        self.comments = comments
     }
 }
 

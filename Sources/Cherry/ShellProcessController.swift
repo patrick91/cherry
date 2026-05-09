@@ -392,6 +392,13 @@ final class ShellProcessController: @unchecked Sendable {
     private var isTerminating = false
     private var retainedUntilExit: ShellProcessController?
 
+    var processIdentifier: pid_t? {
+        ioQueue.sync {
+            guard childPID > 0, !exitReported else { return nil }
+            return childPID
+        }
+    }
+
     init(
         configuration: Configuration,
         onData: @escaping (Data) -> Void,

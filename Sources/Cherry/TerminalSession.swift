@@ -999,6 +999,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var state: SessionState = .launching
     @Published private(set) var hasUnreadNotification = false
     @Published private(set) var lastNotification: TerminalNotificationRequest?
+    @Published private(set) var startedAt: Date?
+    @Published private(set) var exitedAt: Date?
+    @Published private(set) var lastOutputAt: Date?
+    @Published private(set) var childProcessID: Int32?
+    @Published private(set) var exitCode: Int32?
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
@@ -1114,6 +1119,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         return false
+    }
+
+    var restartPolicy: String? {
+        guard kind == .command else { return nil }
+        return restartOnExit ? "auto_restart" : "manual"
     }
 
     var hasExplicitTitle: Bool {
@@ -1342,6 +1352,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.beginLaunch(launchID)
         resumeOutputIfPausedForInteraction()
         state = .launching
+        startedAt = Date()
+        exitedAt = nil
+        lastOutputAt = nil
+        childProcessID = nil
+        exitCode = nil
         bumpRevision()
 
         do {
@@ -1360,6 +1375,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     traceRecorder?.recordOutput(data)
                     self.rawOutputStore.append(data)
                     DispatchQueue.main.async { [weak self] in
+                        self?.lastOutputAt = Date()
                         self?.ingestTerminalMetadata(data)
                     }
                     processor.enqueueOutput(data, launchID: launchID, responseWriter: { _ in })
@@ -1372,6 +1388,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             )
             processBox.set(process)
             shellProcess = process
+            childProcessID = process.processIdentifier.map { Int32($0) }
 
             state = .live
             bumpRevision()
@@ -1396,6 +1413,9 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         activeLaunchID = nil
         shellProcess = nil
+        childProcessID = nil
+        exitCode = status
+        exitedAt = Date()
         resetKeyboardProtocolState()
         outputHoldUntil = nil
         processor.endLaunch(launchID)

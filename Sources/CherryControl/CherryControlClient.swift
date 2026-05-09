@@ -3,9 +3,11 @@ import Foundation
 
 public struct CherryControlClient: Sendable {
     public let socketURL: URL
+    public let timeout: TimeInterval
 
-    public init(socketURL: URL = CherryControl.socketURL) {
+    public init(socketURL: URL = CherryControl.socketURL, timeout: TimeInterval = 10) {
         self.socketURL = socketURL
+        self.timeout = max(timeout, 0.1)
     }
 
     public func send(_ request: CherryControlRequest) throws -> CherryControlResponse {
@@ -19,6 +21,7 @@ public struct CherryControlClient: Sendable {
             close(fd)
         }
 
+        try configureTimeouts(fileDescriptor: fd)
         try connect(fileDescriptor: fd)
         try writeAll(payload, to: fd)
         _ = shutdown(fd, SHUT_WR)
@@ -36,6 +39,8 @@ public struct CherryControlClient: Sendable {
                 break
             } else if errno == EINTR {
                 continue
+            } else if errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT {
+                throw CherryControlError(code: "request_timed_out", message: "Timed out waiting for Cherry response.")
             } else {
                 throw CherryControlError(code: "read_failed", message: "Failed to read Cherry response.")
             }
@@ -50,6 +55,18 @@ public struct CherryControlClient: Sendable {
         }
 
         return try JSONDecoder().decode(CherryControlResponse.self, from: response)
+    }
+
+    private func configureTimeouts(fileDescriptor fd: Int32) throws {
+        let wholeSeconds = Int(timeout.rounded(.towardZero))
+        let microseconds = Int((timeout - Double(wholeSeconds)) * 1_000_000)
+        var value = timeval(tv_sec: wholeSeconds, tv_usec: Int32(microseconds))
+        let length = socklen_t(MemoryLayout<timeval>.size)
+        guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, length) == 0,
+              setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, length) == 0
+        else {
+            throw CherryControlError(code: "socket_failed", message: "Failed to configure Cherry control socket timeout.")
+        }
     }
 
     private func connect(fileDescriptor fd: Int32) throws {
@@ -94,6 +111,8 @@ public struct CherryControlClient: Sendable {
                     offset += written
                 } else if written < 0, errno == EINTR {
                     continue
+                } else if written < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT {
+                    throw CherryControlError(code: "request_timed_out", message: "Timed out writing Cherry control request.")
                 } else {
                     throw CherryControlError(code: "write_failed", message: "Failed to write Cherry control request.")
                 }

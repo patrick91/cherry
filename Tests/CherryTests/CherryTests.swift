@@ -1,5 +1,6 @@
 import AppKit
 import CherryControl
+import Darwin
 import Foundation
 import SwiftUI
 import Testing
@@ -53,11 +54,14 @@ import Testing
     let noteID = UUID().uuidString
     let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review", open: true))
     let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item", open: false))
+    let append = CherryControlRequest.appendNote(.init(noteID: noteID, markdown: "- more"))
+    let rename = CherryControlRequest.renameNote(.init(noteID: noteID, title: "Renamed"))
+    let search = CherryControlRequest.searchNotes(.init(query: "Review", caseSensitive: false, maxMatches: 10))
     let get = CherryControlRequest.getNote(.init(noteID: noteID))
     let delete = CherryControlRequest.deleteNote(.init(noteID: noteID))
     let select = CherryControlRequest.selectNote(.init(noteID: noteID))
 
-    for request in [create, update, get, delete, select] {
+    for request in [create, update, append, rename, search, get, delete, select] {
         let data = try JSONEncoder().encode(request)
         let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
         #expect(decoded == request)
@@ -68,6 +72,7 @@ import Testing
     let todoID = UUID().uuidString
     let afterTodoID = UUID().uuidString
     let terminalID = UUID().uuidString
+    let commentID = UUID().uuidString
     let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, open: true))
     let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, open: false))
     let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID, open: true))
@@ -81,12 +86,204 @@ import Testing
         terminalID: terminalID,
         open: true
     ))
+    let comments = CherryControlRequest.listTodoComments(.init(todoID: todoID))
+    let updateComment = CherryControlRequest.updateTodoComment(.init(
+        todoID: todoID,
+        commentID: commentID,
+        markdown: "Updated comment"
+    ))
+    let deleteComment = CherryControlRequest.deleteTodoComment(.init(todoID: todoID, commentID: commentID))
 
-    for request in [create, update, move, get, delete, select, comment] {
+    for request in [create, update, move, get, delete, select, comment, comments, updateComment, deleteComment] {
         let data = try JSONEncoder().encode(request)
         let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
         #expect(decoded == request)
     }
+}
+
+@Test func cherryControlProcessRequestsRoundTrip() async throws {
+    let processID = UUID().uuidString
+    let requests: [CherryControlRequest] = [
+        .listProjects,
+        .getProjectStatus,
+        .listProcesses(.init(kind: "agent")),
+        .getProcessStatus(.init(processID: processID)),
+        .getProcessOutput(.init(processID: processID, startLine: 1, lineLimit: 20)),
+        .getProcessRawOutput(.init(processName: "Web", maxBytes: 1024)),
+        .searchProcessOutput(.init(processID: processID, query: "ready", caseSensitive: true, maxMatches: 5)),
+        .getProcessPorts(.init(processID: processID, includeUnattributed: true)),
+        .servicesList(.init(kind: "command", includeUnattributed: false)),
+        .waitForBoundPort(.init(processID: processID, port: 5173, timeoutMilliseconds: 500, probeHTTP: true, path: "/health")),
+        .spawnProcess(.init(kind: "command", name: "Web", waitMilliseconds: 100, lineLimit: 20)),
+        .startProcess(.init(processName: "Web", kind: "command", waitMilliseconds: 100, lineLimit: 20)),
+        .stopProcess(.init(processID: processID)),
+        .restartProcess(.init(processID: processID)),
+        .closeProcess(.init(processID: processID)),
+        .renameProcess(.init(processID: processID, title: "Build")),
+        .sendProcessInput(.init(processID: processID, text: "status\n", rawBase64: nil, waitMilliseconds: 100, lineLimit: 20)),
+        .startAllCommands(.init(waitMilliseconds: 100, lineLimit: 20)),
+        .stopAllCommands(.init()),
+        .restartAllCommands(.init())
+    ]
+
+    for request in requests {
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+        #expect(decoded == request)
+    }
+}
+
+@Test func cherryControlClientTimesOutWhenServerDoesNotRespond() async throws {
+    let directory = URL(
+        fileURLWithPath: "/tmp/ct-\(UUID().uuidString.prefix(8))",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let socketURL = directory.appendingPathComponent("control.sock")
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(fd >= 0)
+    defer {
+        close(fd)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let path = socketURL.path
+    let maximumPathLength = MemoryLayout.size(ofValue: address.sun_path)
+    try #require(path.utf8.count < maximumPathLength)
+    withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+        path.withCString { pathPointer in
+            let rawPointer = UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self)
+            strncpy(rawPointer, pathPointer, maximumPathLength)
+        }
+    }
+    let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
+    let bound = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(fd, socketAddress, length)
+        }
+    }
+    try #require(bound == 0)
+    try #require(listen(fd, 1) == 0)
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        let clientFD = accept(fd, nil, nil)
+        if clientFD >= 0 {
+            Thread.sleep(forTimeInterval: 0.5)
+            close(clientFD)
+        }
+    }
+
+    let client = CherryControlClient(socketURL: socketURL, timeout: 0.1)
+    do {
+        _ = try client.send(.listTerminals)
+        Issue.record("Expected CherryControlClient to time out")
+    } catch let error as CherryControlError {
+        #expect(error.code == "request_timed_out")
+    }
+}
+
+@Test func macOSServiceDetectorParsesLsofOutputAndAttributesDescendants() async throws {
+    let output = """
+    p100
+    czsh
+    f3
+    PTCP
+    n127.0.0.1:5173
+    TST=LISTEN
+    p200
+    cnode
+    f4
+    PTCP
+    n*:3000
+    TST=LISTEN
+    p300
+    cRemote
+    f5
+    PTCP
+    n192.168.1.10:9000
+    TST=LISTEN
+    """
+
+    let listeners = MacOSServiceDetector.parseLsofOutput(output)
+    #expect(listeners.map(\.port) == [5173, 3000, 9000])
+
+    let detector = MacOSServiceDetector(
+        processTreeProvider: { [200: 100] },
+        lsofOutputProvider: { output }
+    )
+    let services = try detector.detectServices(
+        processes: [InspectableProcess(
+            id: "process-1",
+            name: "Web",
+            kind: "command",
+            rootPID: 100,
+            commandName: "Web",
+            agentName: nil
+        )],
+        includeUnattributed: true
+    )
+
+    #expect(services.map(\.port) == [3000, 5173])
+    #expect(services.allSatisfy { $0.attribution == .processTree })
+    #expect(services.allSatisfy { $0.processID == "process-1" })
+}
+
+@Test func macOSServiceDetectorFindsLocalListeningSocket() async throws {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    try #require(fd >= 0)
+    defer { close(fd) }
+
+    var reuse: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+    var address = sockaddr_in(
+        sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+        sin_family: sa_family_t(AF_INET),
+        sin_port: 0,
+        sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")),
+        sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+    )
+    let bindResult = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    try #require(bindResult == 0)
+    try #require(listen(fd, 1) == 0)
+
+    var boundAddress = sockaddr_in()
+    var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            getsockname(fd, socketAddress, &boundLength)
+        }
+    }
+    try #require(nameResult == 0)
+    let port = Int(UInt16(bigEndian: boundAddress.sin_port))
+
+    let detector = MacOSServiceDetector()
+    let process = InspectableProcess(
+        id: "test-runner",
+        name: "Tests",
+        kind: "terminal",
+        rootPID: getpid(),
+        commandName: nil,
+        agentName: nil
+    )
+
+    var services: [ServiceRecord] = []
+    let deadline = Date(timeIntervalSinceNow: 2)
+    repeat {
+        services = (try? detector.detectServices(processes: [process], includeUnattributed: false)) ?? []
+        if services.contains(where: { $0.port == port && $0.processID == "test-runner" }) {
+            break
+        }
+        try await Task.sleep(for: .milliseconds(100))
+    } while Date() < deadline
+
+    #expect(services.contains(where: { $0.port == port && $0.processID == "test-runner" }))
 }
 
 @MainActor
@@ -138,6 +335,8 @@ import Testing
         authorTerminalID: "terminal-1",
         authorAgentName: "Codex"
     )
+    let commentID = try #require(store.todo(id: first.id).comments.first?.id)
+    _ = try store.updateComment(todoID: first.id, commentID: commentID, markdown: "Updated comment")
     _ = try store.move(id: second.id, status: .doing, afterTodoID: first.id)
 
     let reloaded = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
@@ -147,9 +346,13 @@ import Testing
     #expect(reloaded.todos[0].status == .doing)
     #expect(reloaded.todos[0].position == 0)
     #expect(reloaded.todos[0].comments.count == 1)
+    #expect(reloaded.todos[0].comments[0].markdown == "Updated comment")
     #expect(reloaded.todos[0].comments[0].authorLabel == "Codex")
     #expect(reloaded.todos[0].comments[0].authorTerminalID == "terminal-1")
     #expect(reloaded.todos[1].position == 1)
+
+    _ = try reloaded.deleteComment(todoID: first.id, commentID: commentID)
+    #expect(try reloaded.todo(id: first.id).comments.isEmpty)
 
     try reloaded.delete(id: first.id)
     let afterDelete = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
@@ -316,12 +519,40 @@ import Testing
     #expect(updated.note.markdown == "- done")
     #expect(updated.selected == true)
 
+    let appendResponse = try await harness.send(.appendNote(.init(
+        noteID: created.note.id.uuidString,
+        markdown: "- appended"
+    )))
+    guard case .appendNote(let appended)? = appendResponse.result else {
+        Issue.record("Expected appendNote result, got \(String(describing: appendResponse))")
+        return
+    }
+    #expect(appended.note.markdown == "- done\n- appended")
+
+    let renameResponse = try await harness.send(.renameNote(.init(
+        noteID: created.note.id.uuidString,
+        title: "Renamed"
+    )))
+    guard case .renameNote(let renamed)? = renameResponse.result else {
+        Issue.record("Expected renameNote result, got \(String(describing: renameResponse))")
+        return
+    }
+    #expect(renamed.note.title == "Renamed")
+
+    let searchResponse = try await harness.send(.searchNotes(.init(query: "appended")))
+    guard case .searchNotes(let search)? = searchResponse.result else {
+        Issue.record("Expected searchNotes result, got \(String(describing: searchResponse))")
+        return
+    }
+    #expect(search.matches.map(\.noteID) == [created.note.id.uuidString])
+    #expect(search.matches.first?.lineNumber == 1)
+
     let getResponse = try await harness.send(.getNote(.init(noteID: created.note.id.uuidString)))
     guard case .getNote(let fetched)? = getResponse.result else {
         Issue.record("Expected getNote result, got \(String(describing: getResponse))")
         return
     }
-    #expect(fetched.note == updated.note)
+    #expect(fetched.note == renamed.note)
 
     let deleteResponse = try await harness.send(.deleteNote(.init(noteID: created.note.id.uuidString)))
     guard case .deleteNote(let deleted)? = deleteResponse.result else {
@@ -405,6 +636,35 @@ import Testing
     #expect(commented.todo.comments[0].authorTerminalID == agentSession.id.uuidString)
     #expect(commented.todo.comments[0].authorAgentName == "Codex")
     #expect(commented.selected == true)
+    let commentID = commented.todo.comments[0].id.uuidString
+
+    let commentsResponse = try await harness.send(.listTodoComments(.init(todoID: created.todo.id.uuidString)))
+    guard case .listTodoComments(let comments)? = commentsResponse.result else {
+        Issue.record("Expected listTodoComments result, got \(String(describing: commentsResponse))")
+        return
+    }
+    #expect(comments.comments.map(\.id.uuidString) == [commentID])
+
+    let updateCommentResponse = try await harness.send(.updateTodoComment(.init(
+        todoID: created.todo.id.uuidString,
+        commentID: commentID,
+        markdown: "Updated handoff"
+    )))
+    guard case .updateTodoComment(let updatedComment)? = updateCommentResponse.result else {
+        Issue.record("Expected updateTodoComment result, got \(String(describing: updateCommentResponse))")
+        return
+    }
+    #expect(updatedComment.todo.comments[0].markdown == "Updated handoff")
+
+    let deleteCommentResponse = try await harness.send(.deleteTodoComment(.init(
+        todoID: created.todo.id.uuidString,
+        commentID: commentID
+    )))
+    guard case .deleteTodoComment(let deletedComment)? = deleteCommentResponse.result else {
+        Issue.record("Expected deleteTodoComment result, got \(String(describing: deleteCommentResponse))")
+        return
+    }
+    #expect(deletedComment.todo.comments.isEmpty)
 
     let listResponse = try await harness.send(.listTodos)
     guard case .listTodos(let list)? = listResponse.result else {
@@ -447,6 +707,175 @@ import Testing
     #expect(harness.todoStore.todos.count == 1)
     #expect(harness.chromeState.selectedTodoID == nil)
     #expect(harness.chromeState.isTodoPanePresented == true)
+}
+
+@MainActor
+@Test func controlServerDoesNotSelectNotesOrTodosByDefault() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    harness.server.start()
+
+    let noteResponse = try await harness.send(.createNote(.init(
+        title: "Quiet Note",
+        markdown: "No focus change"
+    )))
+    guard case .createNote(let createdNote)? = noteResponse.result else {
+        Issue.record("Expected createNote result, got \(String(describing: noteResponse))")
+        return
+    }
+
+    #expect(noteResponse.error == nil)
+    #expect(createdNote.selected == false)
+    #expect(harness.chromeState.selectedNoteID == nil)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
+
+    let todoResponse = try await harness.send(.createTodo(.init(
+        title: "Quiet Todo",
+        markdown: "No focus change",
+        status: .ready
+    )))
+    guard case .createTodo(let createdTodo)? = todoResponse.result else {
+        Issue.record("Expected createTodo result, got \(String(describing: todoResponse))")
+        return
+    }
+
+    #expect(todoResponse.error == nil)
+    #expect(createdTodo.selected == false)
+    #expect(harness.chromeState.selectedTodoID == nil)
+    #expect(harness.chromeState.isTodoPanePresented == false)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
+}
+
+@MainActor
+@Test func controlServerExposesProcessLayerWithoutChangingSelection() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Echo", command: "/bin/cat"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+    let initialSelection = harness.workspace.selectedSessionID
+
+    let projectsResponse = try await harness.send(.listProjects)
+    guard case .listProjects(let projects)? = projectsResponse.result else {
+        Issue.record("Expected listProjects result, got \(String(describing: projectsResponse))")
+        return
+    }
+    #expect(projects.activeProjectRoot == harness.projectRoot.path)
+    #expect(projects.projects.first?.active == true)
+
+    let statusResponse = try await harness.send(.getProjectStatus)
+    guard case .getProjectStatus(let status)? = statusResponse.result else {
+        Issue.record("Expected getProjectStatus result, got \(String(describing: statusResponse))")
+        return
+    }
+    #expect(status.projectRoot == harness.projectRoot.path)
+    #expect(status.processCounts.terminals == 1)
+    #expect(status.noteCount == 0)
+    #expect(status.todoCount == 0)
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Echo",
+        kind: "command"
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+    #expect(started.process.kind == "command")
+    #expect(started.process.commandName == "Echo")
+    #expect(started.process.selected == false)
+    #expect(harness.workspace.selectedSessionID == initialSelection)
+
+    let listResponse = try await harness.send(.listProcesses(.init(kind: nil)))
+    guard case .listProcesses(let processes)? = listResponse.result else {
+        Issue.record("Expected listProcesses result, got \(String(describing: listResponse))")
+        return
+    }
+    #expect(processes.processes.map(\.kind).contains("command"))
+    #expect(processes.selectedProcessID == initialSelection?.uuidString)
+
+    let sendResponse = try await harness.send(.sendProcessInput(.init(
+        processName: "Echo",
+        text: "process-input\n",
+        rawBase64: nil,
+        waitMilliseconds: 250,
+        lineLimit: 20
+    )))
+    guard case .sendProcessInput(let sent)? = sendResponse.result else {
+        Issue.record("Expected sendProcessInput result, got \(String(describing: sendResponse))")
+        return
+    }
+    #expect(sent.sentBytes == Data("process-input\n".utf8).count)
+    #expect(sent.output?.lines.joined(separator: "\n").contains("process-input") == true)
+
+    let stopResponse = try await harness.send(.stopProcess(.init(processName: "Echo")))
+    guard case .stopProcess(let stopped)? = stopResponse.result else {
+        Issue.record("Expected stopProcess result, got \(String(describing: stopResponse))")
+        return
+    }
+    #expect(stopped.process.kind == "command")
+    #expect(stopped.process.state == "exit 0")
+    #expect(harness.workspace.selectedSessionID == initialSelection)
+}
+
+@MainActor
+@Test func controlServerListsAndWaitsForServices() async throws {
+    let detector = FakeServiceDetector()
+    let harness = try ControlServerHarness(serviceDetector: detector)
+    defer {
+        harness.stop()
+    }
+    harness.server.start()
+    let processID = try #require(harness.workspace.selectedSessionID?.uuidString)
+
+    detector.services = [
+        serviceRecord(processID: processID, processName: "Shell 1", kind: "terminal", port: 5173),
+        serviceRecord(processID: nil, processName: nil, kind: nil, port: 3000, attribution: .unattributed)
+    ]
+
+    let servicesResponse = try await harness.send(.servicesList(.init()))
+    guard case .servicesList(let services)? = servicesResponse.result else {
+        Issue.record("Expected servicesList result, got \(String(describing: servicesResponse))")
+        return
+    }
+    #expect(services.services.map(\.port) == [5173])
+    #expect(services.unattributed.isEmpty)
+
+    let processPortsResponse = try await harness.send(.getProcessPorts(.init(processID: processID)))
+    guard case .getProcessPorts(let processPorts)? = processPortsResponse.result else {
+        Issue.record("Expected getProcessPorts result, got \(String(describing: processPortsResponse))")
+        return
+    }
+    #expect(processPorts.services.map(\.port) == [5173])
+
+    let waitResponse = try await harness.send(.waitForBoundPort(.init(
+        processID: processID,
+        port: 5173,
+        timeoutMilliseconds: 200
+    )))
+    guard case .waitForBoundPort(let waited)? = waitResponse.result else {
+        Issue.record("Expected waitForBoundPort result, got \(String(describing: waitResponse))")
+        return
+    }
+    #expect(waited.service.port == 5173)
+    #expect(waited.service.readiness == .bound)
+
+    detector.services = [
+        serviceRecord(processID: processID, processName: "Shell 1", kind: "terminal", port: 5173),
+        serviceRecord(processID: processID, processName: "Shell 1", kind: "terminal", port: 5174)
+    ]
+    let ambiguousResponse = try await harness.send(.waitForBoundPort(.init(
+        processID: processID,
+        timeoutMilliseconds: 200
+    )))
+    #expect(ambiguousResponse.error?.code == "ambiguous_service")
+    #expect(ambiguousResponse.error?.serviceCandidates?.map(\.port) == [5173, 5174])
 }
 
 @MainActor
@@ -1865,7 +2294,7 @@ private final class ControlServerHarness {
     let socketURL: URL
     let server: CherryControlServer
 
-    init() throws {
+    init(serviceDetector: (any ServiceDetecting)? = nil) throws {
         defaultsName = "CherryTests.ControlServer.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: defaultsName))
 
@@ -1895,7 +2324,8 @@ private final class ControlServerHarness {
             todoStore: todoStore,
             chromeState: chromeState,
             socketURL: socketURL,
-            agentSettings: settings
+            agentSettings: settings,
+            serviceDetector: serviceDetector ?? MacOSServiceDetector()
         )
     }
 
@@ -1928,6 +2358,45 @@ private final class ControlServerHarness {
             }
         }
     }
+}
+
+private final class FakeServiceDetector: ServiceDetecting {
+    var services: [ServiceRecord] = []
+
+    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) throws -> [ServiceRecord] {
+        let processIDs = Set(processes.map(\.id))
+        return services.filter { service in
+            if service.attribution == .unattributed {
+                return includeUnattributed
+            }
+            guard let processID = service.processID else { return false }
+            return processIDs.contains(processID)
+        }
+    }
+}
+
+private func serviceRecord(
+    processID: String?,
+    processName: String?,
+    kind: String?,
+    port: Int,
+    attribution: ServiceAttribution = .processTree
+) -> ServiceRecord {
+    ServiceRecord(
+        processID: processID,
+        processName: processName,
+        kind: kind,
+        pid: attribution == .processTree ? 123 : nil,
+        port: port,
+        host: "127.0.0.1",
+        url: "http://localhost:\(port)",
+        attribution: attribution,
+        protocolGuess: "http",
+        readiness: .bound,
+        lastSeenAt: Date(timeIntervalSince1970: 1_800_000_000),
+        commandName: kind == "command" ? processName : nil,
+        agentName: kind == "agent" ? processName : nil
+    )
 }
 
 @MainActor

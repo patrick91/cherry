@@ -11,6 +11,10 @@ final class CherryControlServer: @unchecked Sendable {
     private let noteStoreProvider: @MainActor () -> ProjectNoteStore?
     private let todoStoreProvider: @MainActor () -> ProjectTodoStore?
     private let chromeStateProvider: @MainActor () -> ProjectWindowChromeState?
+    private let workspaceForProjectRootProvider: @MainActor (String) -> TerminalWorkspace?
+    private let noteStoreForProjectRootProvider: @MainActor (String) -> ProjectNoteStore?
+    private let todoStoreForProjectRootProvider: @MainActor (String) -> ProjectTodoStore?
+    private let chromeStateForProjectRootProvider: @MainActor (String) -> ProjectWindowChromeState?
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
     private let socketURL: URL
@@ -36,6 +40,18 @@ final class CherryControlServer: @unchecked Sendable {
         self.noteStoreProvider = { noteStore }
         self.todoStoreProvider = { todoStore }
         self.chromeStateProvider = { chromeState }
+        self.workspaceForProjectRootProvider = { projectRoot in
+            workspace.projectRoot == projectRoot ? workspace : nil
+        }
+        self.noteStoreForProjectRootProvider = { projectRoot in
+            noteStore?.projectRoot == projectRoot ? noteStore : nil
+        }
+        self.todoStoreForProjectRootProvider = { projectRoot in
+            todoStore?.projectRoot == projectRoot ? todoStore : nil
+        }
+        self.chromeStateForProjectRootProvider = { projectRoot in
+            workspace.projectRoot == projectRoot ? chromeState : nil
+        }
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -53,6 +69,18 @@ final class CherryControlServer: @unchecked Sendable {
         chromeStateProvider: @escaping @MainActor () -> ProjectWindowChromeState? = {
             ProjectWindowRegistry.shared.activeChromeState
         },
+        workspaceForProjectRootProvider: @escaping @MainActor (String) -> TerminalWorkspace? = {
+            ProjectWindowRegistry.shared.workspace(for: $0)
+        },
+        noteStoreForProjectRootProvider: @escaping @MainActor (String) -> ProjectNoteStore? = {
+            ProjectWindowRegistry.shared.noteStore(for: $0)
+        },
+        todoStoreForProjectRootProvider: @escaping @MainActor (String) -> ProjectTodoStore? = {
+            ProjectWindowRegistry.shared.todoStore(for: $0)
+        },
+        chromeStateForProjectRootProvider: @escaping @MainActor (String) -> ProjectWindowChromeState? = {
+            ProjectWindowRegistry.shared.chromeState(for: $0)
+        },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector()
@@ -65,6 +93,10 @@ final class CherryControlServer: @unchecked Sendable {
         self.noteStoreProvider = noteStoreProvider
         self.todoStoreProvider = todoStoreProvider
         self.chromeStateProvider = chromeStateProvider
+        self.workspaceForProjectRootProvider = workspaceForProjectRootProvider
+        self.noteStoreForProjectRootProvider = noteStoreForProjectRootProvider
+        self.todoStoreForProjectRootProvider = todoStoreForProjectRootProvider
+        self.chromeStateForProjectRootProvider = chromeStateForProjectRootProvider
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -223,11 +255,24 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func handle(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+        if case .scoped(let scopedRequest) = request {
+            let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
+            return try await handleUnscoped(scopedRequest.request, workspace: workspace)
+        }
+
         guard let workspace = workspace ?? workspaceProvider() else {
             throw CherryControlError(code: "workspace_unavailable", message: "Cherry workspace is unavailable.")
         }
 
+        return try await handleUnscoped(request, workspace: workspace)
+    }
+
+    @MainActor
+    private func handleUnscoped(_ request: CherryControlRequest, workspace: TerminalWorkspace) async throws -> CherryControlResponse {
         switch request {
+        case .scoped(let scopedRequest):
+            let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
+            return try await handleUnscoped(scopedRequest.request, workspace: workspace)
         case .listProjects:
             return .init(result: .listProjects(listProjects(workspace: workspace)))
         case .getProjectStatus:
@@ -364,7 +409,7 @@ final class CherryControlServer: @unchecked Sendable {
                 select: request.select ?? false
             )
             if request.select ?? false {
-                activeChromeState()?.selectTerminal()
+                chromeState(for: workspace)?.selectTerminal()
             }
             let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
             if let payload, !payload.isEmpty {
@@ -392,14 +437,14 @@ final class CherryControlServer: @unchecked Sendable {
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.create(title: request.title, markdown: request.markdown)
             if request.open ?? false {
-                select(note: note)
+                select(note: note, workspace: workspace)
             }
-            let selected = activeChromeState()?.selectedNoteID == note.id
+            let selected = chromeState(for: workspace)?.selectedNoteID == note.id
             return .init(result: .createNote(.init(note: note, link: link(for: note), selected: selected)))
         case .getNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.note(id: try noteID(from: request.noteID))
-            let selected = activeChromeState()?.selectedNoteID == note.id
+            let selected = chromeState(for: workspace)?.selectedNoteID == note.id
             return .init(result: .getNote(.init(note: note, link: link(for: note), selected: selected)))
         case .updateNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
@@ -409,12 +454,12 @@ final class CherryControlServer: @unchecked Sendable {
                 markdown: request.markdown
             )
             if request.open ?? false {
-                select(note: note)
+                select(note: note, workspace: workspace)
             }
             return .init(result: .updateNote(.init(
                 note: note,
                 link: link(for: note),
-                selected: activeChromeState()?.selectedNoteID == note.id
+                selected: chromeState(for: workspace)?.selectedNoteID == note.id
             )))
         case .appendNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
@@ -424,7 +469,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .appendNote(.init(
                 note: note,
                 link: link(for: note),
-                selected: activeChromeState()?.selectedNoteID == note.id
+                selected: chromeState(for: workspace)?.selectedNoteID == note.id
             )))
         case .renameNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
@@ -432,7 +477,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .renameNote(.init(
                 note: note,
                 link: link(for: note),
-                selected: activeChromeState()?.selectedNoteID == note.id
+                selected: chromeState(for: workspace)?.selectedNoteID == note.id
             )))
         case .searchNotes(let request):
             let noteStore = try activeNoteStore(for: workspace)
@@ -441,14 +486,14 @@ final class CherryControlServer: @unchecked Sendable {
             let id = try noteID(from: request.noteID)
             let noteStore = try activeNoteStore(for: workspace)
             try noteStore.delete(id: id)
-            if activeChromeState()?.selectedNoteID == id {
-                activeChromeState()?.selectNote(id: nil)
+            if chromeState(for: workspace)?.selectedNoteID == id {
+                chromeState(for: workspace)?.selectNote(id: nil)
             }
             return .init(result: .deleteNote(.init(noteID: id.uuidString, deleted: true)))
         case .selectNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.note(id: try noteID(from: request.noteID))
-            select(note: note)
+            select(note: note, workspace: workspace)
             return .init(result: .selectNote(.init(noteID: note.id.uuidString, selected: true)))
         case .createTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -459,12 +504,12 @@ final class CherryControlServer: @unchecked Sendable {
                 tags: request.tags ?? []
             )
             if request.open ?? false {
-                select(todo: todo)
+                select(todo: todo, workspace: workspace)
             }
             return .init(result: .createTodo(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .getTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -472,7 +517,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .getTodo(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .updateTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -484,12 +529,12 @@ final class CherryControlServer: @unchecked Sendable {
                 tags: request.tags
             )
             if request.open ?? false {
-                select(todo: todo)
+                select(todo: todo, workspace: workspace)
             }
             return .init(result: .updateTodo(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .moveTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -500,25 +545,25 @@ final class CherryControlServer: @unchecked Sendable {
                 afterTodoID: afterTodoID
             )
             if request.open ?? false {
-                select(todo: todo)
+                select(todo: todo, workspace: workspace)
             }
             return .init(result: .moveTodo(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .deleteTodo(let request):
             let id = try todoID(from: request.todoID)
             let todoStore = try activeTodoStore(for: workspace)
             try todoStore.delete(id: id)
-            if activeChromeState()?.selectedTodoID == id {
-                activeChromeState()?.selectTodo(id: nil)
+            if chromeState(for: workspace)?.selectedTodoID == id {
+                chromeState(for: workspace)?.selectTodo(id: nil)
             }
             return .init(result: .deleteTodo(.init(todoID: id.uuidString, deleted: true)))
         case .selectTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.todo(id: try todoID(from: request.todoID))
-            select(todo: todo)
+            select(todo: todo, workspace: workspace)
             return .init(result: .selectTodo(.init(todoID: todo.id.uuidString, selected: true)))
         case .addTodoComment(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -531,12 +576,12 @@ final class CherryControlServer: @unchecked Sendable {
                 authorAgentName: author.agentName
             )
             if request.open ?? false {
-                select(todo: todo)
+                select(todo: todo, workspace: workspace)
             }
             return .init(result: .addTodoComment(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .listTodoComments(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -552,7 +597,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .updateTodoComment(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .deleteTodoComment(let request):
             let todoStore = try activeTodoStore(for: workspace)
@@ -563,7 +608,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .deleteTodoComment(.init(
                 todo: todo,
                 link: link(for: todo),
-                selected: activeChromeState()?.selectedTodoID == todo.id
+                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .renameTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -572,7 +617,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
-            activeChromeState()?.selectTerminal()
+            chromeState(for: workspace)?.selectTerminal()
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -1160,7 +1205,7 @@ final class CherryControlServer: @unchecked Sendable {
         ListNotesResult(
             activeProjectRoot: noteStore.projectRoot,
             notes: noteStore.notes.map(noteInfo),
-            selectedNoteID: activeChromeState()?.selectedNoteID?.uuidString
+            selectedNoteID: chromeState(forProjectRoot: noteStore.projectRoot)?.selectedNoteID?.uuidString
         )
     }
 
@@ -1208,7 +1253,7 @@ final class CherryControlServer: @unchecked Sendable {
         ListTodosResult(
             activeProjectRoot: todoStore.projectRoot,
             todos: todoStore.todos.map(todoInfo),
-            selectedTodoID: activeChromeState()?.selectedTodoID?.uuidString
+            selectedTodoID: chromeState(forProjectRoot: todoStore.projectRoot)?.selectedTodoID?.uuidString
         )
     }
 
@@ -1245,14 +1290,46 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func scopedWorkspace(projectRoot rawProjectRoot: String) throws -> TerminalWorkspace {
+        let projectRoot = standardizedProjectRoot(rawProjectRoot)
+        if let workspace, workspace.projectRoot.map(standardizedProjectRoot) == projectRoot {
+            return workspace
+        }
+        if let activeWorkspace = workspaceProvider(),
+           activeWorkspace.projectRoot.map(standardizedProjectRoot) == projectRoot {
+            return activeWorkspace
+        }
+        if let registeredWorkspace = workspaceForProjectRootProvider(rawProjectRoot)
+            ?? workspaceForProjectRootProvider(projectRoot) {
+            return registeredWorkspace
+        }
+
+        throw CherryControlError(
+            code: "project_unavailable",
+            message: "Cherry project is not open for scoped request: \(rawProjectRoot)."
+        )
+    }
+
+    private func standardizedProjectRoot(_ projectRoot: String) -> String {
+        URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
+    }
+
+    @MainActor
     private func activeNoteStore(for workspace: TerminalWorkspace) throws -> ProjectNoteStore {
         guard let projectRoot = workspace.projectRoot else {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
-        guard let store = noteStore ?? noteStoreProvider(), store.projectRoot == projectRoot else {
-            throw CherryControlError(code: "notes_unavailable", message: "Cherry notes are unavailable for the active project.")
+        if let store = noteStore, store.projectRoot == projectRoot {
+            return store
         }
-        return store
+        if let store = noteStoreForProjectRootProvider(projectRoot) {
+            return store
+        }
+        if let store = noteStoreProvider(), store.projectRoot == projectRoot {
+            return store
+        }
+
+        throw CherryControlError(code: "notes_unavailable", message: "Cherry notes are unavailable for the requested project.")
     }
 
     @MainActor
@@ -1260,25 +1337,49 @@ final class CherryControlServer: @unchecked Sendable {
         guard let projectRoot = workspace.projectRoot else {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
-        guard let store = todoStore ?? todoStoreProvider(), store.projectRoot == projectRoot else {
-            throw CherryControlError(code: "todos_unavailable", message: "Cherry todos are unavailable for the active project.")
+        if let store = todoStore, store.projectRoot == projectRoot {
+            return store
         }
-        return store
+        if let store = todoStoreForProjectRootProvider(projectRoot) {
+            return store
+        }
+        if let store = todoStoreProvider(), store.projectRoot == projectRoot {
+            return store
+        }
+
+        throw CherryControlError(code: "todos_unavailable", message: "Cherry todos are unavailable for the requested project.")
     }
 
     @MainActor
-    private func activeChromeState() -> ProjectWindowChromeState? {
-        chromeState ?? chromeStateProvider()
+    private func chromeState(forProjectRoot projectRoot: String) -> ProjectWindowChromeState? {
+        if let state = chromeStateForProjectRootProvider(projectRoot) {
+            return state
+        }
+        if let workspace, workspace.projectRoot == projectRoot {
+            return chromeState ?? chromeStateProvider()
+        }
+        if let activeWorkspace = workspaceProvider(), activeWorkspace.projectRoot == projectRoot {
+            return chromeStateProvider()
+        }
+        return nil
     }
 
     @MainActor
-    private func select(note: ProjectNote) {
-        activeChromeState()?.selectNote(id: note.id)
+    private func chromeState(for workspace: TerminalWorkspace) -> ProjectWindowChromeState? {
+        guard let projectRoot = workspace.projectRoot else {
+            return nil
+        }
+        return chromeState(forProjectRoot: projectRoot)
     }
 
     @MainActor
-    private func select(todo: ProjectTodo) {
-        activeChromeState()?.selectTodo(id: todo.id)
+    private func select(note: ProjectNote, workspace: TerminalWorkspace) {
+        chromeState(for: workspace)?.selectNote(id: note.id)
+    }
+
+    @MainActor
+    private func select(todo: ProjectTodo, workspace: TerminalWorkspace) {
+        chromeState(for: workspace)?.selectTodo(id: todo.id)
     }
 
     private func noteID(from value: String) throws -> UUID {

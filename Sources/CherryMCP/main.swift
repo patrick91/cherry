@@ -465,7 +465,7 @@ private enum CherryMCPTools {
             if name == "get_status" {
                 return try statusResult()
             }
-            let request = try controlRequest(name: name, arguments: arguments)
+            let request = scopedRequest(try controlRequest(name: name, arguments: arguments))
             let response = try client.send(request)
             if let error = response.error {
                 return try toolError(error)
@@ -482,12 +482,23 @@ private enum CherryMCPTools {
         }
     }
 
+    private static func scopedRequest(_ request: CherryControlRequest) -> CherryControlRequest {
+        guard let projectRoot = ProcessInfo.processInfo.environment[CherryControl.projectRootEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !projectRoot.isEmpty
+        else {
+            return request
+        }
+
+        return .scoped(.init(projectRoot: projectRoot, request: request))
+    }
+
     private static func statusResult() throws -> CallTool.Result {
         let socketURL = CherryControl.socketURL
         let socketExists = FileManager.default.fileExists(atPath: socketURL.path)
 
         do {
-            let response = try client.send(.listTerminals)
+            let response = try client.send(scopedRequest(.listTerminals))
             if let error = response.error {
                 return try encodedResult(MCPStatusPayload(
                     socketPath: socketURL.path,

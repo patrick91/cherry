@@ -21,6 +21,18 @@ import Testing
     #expect(decoded == request)
 }
 
+@Test func scopedCherryControlRequestRoundTrips() async throws {
+    let request = CherryControlRequest.scoped(.init(
+        projectRoot: "/tmp/project-b",
+        request: .createNote(.init(title: "Scoped", markdown: "Project B"))
+    ))
+
+    let data = try JSONEncoder().encode(request)
+    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+
+    #expect(decoded == request)
+}
+
 @Test func cherryDeepLinksRoundTrip() throws {
     let projectRoot = "/tmp/Cherry Project"
     let noteID = UUID()
@@ -654,6 +666,112 @@ import Testing
     #expect(deleted.deleted == true)
     #expect(harness.noteStore.notes.isEmpty)
     #expect(harness.chromeState.selectedNoteID == nil)
+}
+
+@MainActor
+@Test func controlServerScopesNotesToRequestedProject() async throws {
+    let defaultsName = "CherryTests.ScopedControlServer.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let settings = AgentSettings(defaults: defaults)
+
+    let projectRootA = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let projectRootB = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let notesRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryScopedNotes-\(UUID().uuidString)", isDirectory: true)
+    let todosRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryScopedTodos-\(UUID().uuidString)", isDirectory: true)
+    let socketDirectory = URL(
+        fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
+        isDirectory: true
+    )
+    let socketURL = socketDirectory.appendingPathComponent("control.sock")
+
+    try FileManager.default.createDirectory(at: projectRootA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
+    _ = settings.addProject(path: projectRootA.path)
+    _ = settings.addProject(path: projectRootB.path)
+
+    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path)
+    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path)
+    let noteStoreA = ProjectNoteStore(projectRoot: projectRootA.path, storageDirectory: notesRoot)
+    let noteStoreB = ProjectNoteStore(projectRoot: projectRootB.path, storageDirectory: notesRoot)
+    let todoStoreA = ProjectTodoStore(projectRoot: projectRootA.path, storageDirectory: todosRoot)
+    let todoStoreB = ProjectTodoStore(projectRoot: projectRootB.path, storageDirectory: todosRoot)
+    let chromeStateA = ProjectWindowChromeState()
+    let chromeStateB = ProjectWindowChromeState()
+
+    let activeWorkspace = workspaceA
+    let activeNoteStore = noteStoreA
+    let activeTodoStore = todoStoreA
+    let activeChromeState = chromeStateA
+    let workspaces = [projectRootA.path: workspaceA, projectRootB.path: workspaceB]
+    let noteStores = [projectRootA.path: noteStoreA, projectRootB.path: noteStoreB]
+    let todoStores = [projectRootA.path: todoStoreA, projectRootB.path: todoStoreB]
+    let chromeStates = [projectRootA.path: chromeStateA, projectRootB.path: chromeStateB]
+
+    let server = CherryControlServer(
+        workspaceProvider: { activeWorkspace },
+        noteStoreProvider: { activeNoteStore },
+        todoStoreProvider: { activeTodoStore },
+        chromeStateProvider: { activeChromeState },
+        workspaceForProjectRootProvider: { workspaces[$0] },
+        noteStoreForProjectRootProvider: { noteStores[$0] },
+        todoStoreForProjectRootProvider: { todoStores[$0] },
+        chromeStateForProjectRootProvider: { chromeStates[$0] },
+        socketURL: socketURL,
+        agentSettings: settings
+    )
+    defer {
+        server.stop()
+        workspaceA.sessions.forEach { $0.stop() }
+        workspaceB.sessions.forEach { $0.stop() }
+        defaults.removePersistentDomain(forName: defaultsName)
+        try? FileManager.default.removeItem(at: projectRootA)
+        try? FileManager.default.removeItem(at: projectRootB)
+        try? FileManager.default.removeItem(at: notesRoot)
+        try? FileManager.default.removeItem(at: todosRoot)
+        try? FileManager.default.removeItem(at: socketDirectory)
+    }
+    server.start()
+
+    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try CherryControlClient(socketURL: socketURL).send(request)
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    let unscopedResponse = try await send(.createNote(.init(title: "Active A", markdown: "A")))
+    #expect(unscopedResponse.error == nil)
+
+    let scopedResponse = try await send(.scoped(.init(
+        projectRoot: projectRootB.path,
+        request: .createNote(.init(title: "Scoped B", markdown: "B"))
+    )))
+    #expect(scopedResponse.error == nil)
+
+    #expect(noteStoreA.notes.map(\.title) == ["Active A"])
+    #expect(noteStoreB.notes.map(\.title) == ["Scoped B"])
+    #expect(activeWorkspace === workspaceA)
+    #expect(activeNoteStore === noteStoreA)
+    #expect(activeTodoStore === todoStoreA)
+    #expect(activeChromeState === chromeStateA)
+
+    let listResponse = try await send(.scoped(.init(projectRoot: projectRootB.path, request: .listNotes)))
+    guard case .listNotes(let list)? = listResponse.result else {
+        Issue.record("Expected scoped listNotes result, got \(String(describing: listResponse))")
+        return
+    }
+    #expect(list.activeProjectRoot == projectRootB.path)
+    #expect(list.notes.map(\.title) == ["Scoped B"])
 }
 
 @MainActor

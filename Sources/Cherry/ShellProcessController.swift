@@ -1,3 +1,4 @@
+import CherryControl
 import Darwin
 import Dispatch
 import Foundation
@@ -163,6 +164,7 @@ final class ShellProcessController: @unchecked Sendable {
     struct Configuration {
         let shellPath: String
         let workingDirectory: String
+        let projectRoot: String?
         let term: String
         let initialSize: TerminalViewportSize
         let startupCommand: String?
@@ -170,12 +172,14 @@ final class ShellProcessController: @unchecked Sendable {
         init(
             shellPath: String,
             workingDirectory: String,
+            projectRoot: String? = nil,
             term: String,
             initialSize: TerminalViewportSize,
             startupCommand: String? = nil
         ) {
             self.shellPath = shellPath
             self.workingDirectory = workingDirectory
+            self.projectRoot = projectRoot
             self.term = term
             self.initialSize = initialSize
             self.startupCommand = startupCommand
@@ -572,6 +576,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellPath = configuration.shellPath
         let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
         let workingDirectory = configuration.workingDirectory
+        let projectRoot = configuration.projectRoot
         let term = configuration.term
         let startupCommand = configuration.startupCommand
         let originalZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
@@ -605,6 +610,11 @@ final class ShellProcessController: @unchecked Sendable {
             _ = setenv("CHERRY_TERM_PROGRAM", "Cherry", 1)
             _ = setenv("COLORTERM", "truecolor", 1)
             _ = setenv("INSIDE_CHERRY", "1", 1)
+            if let projectRoot, !projectRoot.isEmpty {
+                _ = setenv(CherryControl.projectRootEnvironmentKey, projectRoot, 1)
+            } else {
+                _ = unsetenv(CherryControl.projectRootEnvironmentKey)
+            }
             if let shellIntegration {
                 _ = setenv("CHERRY_BOOTSTRAP_ZDOTDIR", shellIntegration.zdotdir, 1)
                 if let startupCommand, !startupCommand.isEmpty {

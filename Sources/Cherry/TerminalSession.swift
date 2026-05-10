@@ -638,7 +638,7 @@ final class TerminalWorkspace: ObservableObject {
 
     init(projectRoot: String? = nil) {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
-        let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot)
+        let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot, projectRoot: self.projectRoot)
         sessions = [firstSession]
         selectedSessionID = firstSession.id
     }
@@ -721,7 +721,8 @@ final class TerminalWorkspace: ObservableObject {
         let session = Self.makeSession(
             index: sessions.count + 1,
             title: title,
-            workingDirectory: resolvedWorkingDirectory
+            workingDirectory: resolvedWorkingDirectory,
+            projectRoot: projectRoot
         )
         sessions.append(session)
         if select {
@@ -771,7 +772,8 @@ final class TerminalWorkspace: ObservableObject {
         let session = Self.makeCommandSession(
             index: commandSessions.count + 1,
             command: command,
-            workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot)
+            workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot),
+            projectRoot: projectRoot
         )
         sessions.append(session)
         if select {
@@ -880,7 +882,12 @@ final class TerminalWorkspace: ObservableObject {
         return sessions.first(where: { $0.id == uuid })
     }
 
-    private static func makeSession(index: Int, title: String? = nil, workingDirectory: String? = nil) -> TerminalSession {
+    private static func makeSession(
+        index: Int,
+        title: String? = nil,
+        workingDirectory: String? = nil,
+        projectRoot: String? = nil
+    ) -> TerminalSession {
         let explicitTitle = title?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
@@ -889,7 +896,8 @@ final class TerminalWorkspace: ObservableObject {
             titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
             tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory)
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: projectRoot
         )
     }
 
@@ -909,6 +917,7 @@ final class TerminalWorkspace: ObservableObject {
             subtitle: agent.commandLine,
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: workingDirectory,
             kind: .agent,
             agentName: agent.name,
             launchCommand: agent.commandLine
@@ -918,13 +927,15 @@ final class TerminalWorkspace: ObservableObject {
     private static func makeCommandSession(
         index: Int,
         command: ProjectCommandDefinition,
-        workingDirectory: String
+        workingDirectory: String,
+        projectRoot: String
     ) -> TerminalSession {
         TerminalSession(
             title: command.name.isEmpty ? "Command \(index)" : command.name,
             subtitle: command.commandLine,
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: projectRoot,
             kind: .command,
             commandName: command.name,
             launchCommand: command.commandLine,
@@ -1007,6 +1018,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
+    let projectRoot: String?
     let tint: NSColor
     let maxScrollback: Int?
     private(set) var launchWorkingDirectory: String
@@ -1052,6 +1064,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         subtitle: String,
         tint: NSColor,
         workingDirectory: String = NSHomeDirectory(),
+        projectRoot: String? = nil,
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
         buffer: (any TerminalBuffering)? = nil,
         launchShell: Bool = true,
@@ -1067,6 +1080,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.tint = tint
         self.workingDirectory = workingDirectory
         self.launchWorkingDirectory = workingDirectory
+        self.projectRoot = projectRoot
         self.maxScrollback = maxScrollback
         self.kind = kind
         self.agentName = agentName
@@ -1367,6 +1381,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 configuration: .init(
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
+                    projectRoot: projectRoot,
                     term: ShellProcessController.preferredTerminfo.term,
                     initialSize: viewportSize,
                     startupCommand: launchCommand

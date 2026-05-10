@@ -3,6 +3,7 @@ import Foundation
 public enum CherryControl {
     public static let socketEnvironmentKey = "CHERRY_CONTROL_SOCKET"
     public static let socketNamespaceEnvironmentKey = "CHERRY_CONTROL_NAMESPACE"
+    public static let projectRootEnvironmentKey = "CHERRY_PROJECT_ROOT"
 
     public static var socketURL: URL {
         socketURL(
@@ -96,6 +97,7 @@ public enum CherryControl {
 }
 
 public enum CherryControlRequest: Codable, Equatable, Sendable {
+    indirect case scoped(ScopedControlRequest)
     case listProjects
     case getProjectStatus
     case resolveLink(ResolveDeepLinkRequest)
@@ -150,6 +152,16 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case clearOutput(TerminalIDRequest)
     case restartTerminal(TerminalIDRequest)
     case closeTerminal(TerminalIDRequest)
+}
+
+public struct ScopedControlRequest: Codable, Equatable, Sendable {
+    public let projectRoot: String
+    public let request: CherryControlRequest
+
+    public init(projectRoot: String, request: CherryControlRequest) {
+        self.projectRoot = projectRoot
+        self.request = request
+    }
 }
 
 public struct ListProcessesRequest: Codable, Equatable, Sendable {

@@ -747,6 +747,7 @@ private struct TodoPaneView: View {
                         todo: todo,
                         todoStore: todoStore,
                         themeForeground: themeForeground,
+                        themeColors: themeColors,
                         isCompact: false,
                         onBack: nil
                     )
@@ -767,6 +768,7 @@ private struct TodoPaneView: View {
                 todo: todo,
                 todoStore: todoStore,
                 themeForeground: themeForeground,
+                themeColors: themeColors,
                 isCompact: true,
                 onBack: { chromeState.selectTodo(id: nil) }
             )
@@ -805,18 +807,26 @@ private struct TodoListPane: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Text("Todos")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(themeForeground)
+                    .font(.system(size: 13, weight: .semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(themeForeground.opacity(0.58))
 
-                Spacer()
+                Rectangle()
+                    .fill(themeForeground.opacity(0.18))
+                    .frame(height: 1)
+
+                Text("\(openTodoCount)")
+                    .font(.system(size: 12, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(themeForeground.opacity(0.58))
 
                 if !chromeState.selectedTodoTagFilterIDs.isEmpty {
                     Button(action: clearTagFilters) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
-                            .font(.system(size: 13, weight: .semibold))
-                            .frame(width: 26, height: 26)
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(width: 22, height: 22)
                     }
                     .buttonStyle(.borderless)
                     .help("Clear tag filters")
@@ -824,19 +834,19 @@ private struct TodoListPane: View {
 
                 Button(action: createTodo) {
                     Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 26, height: 26)
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.borderless)
                 .help("New todo")
             }
             .padding(.horizontal, 18)
-            .padding(.top, 18)
-            .padding(.bottom, availableFilterTags.isEmpty ? 12 : 8)
+            .padding(.top, 4)
+            .padding(.bottom, availableFilterTags.isEmpty ? 10 : 6)
 
             if !availableFilterTags.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         ForEach(availableFilterTags) { tag in
                             let isSelected = chromeState.selectedTodoTagFilterIDs.contains(tag.id)
                             Button {
@@ -846,7 +856,7 @@ private struct TodoListPane: View {
                                     tag: tag,
                                     isSelected: isSelected,
                                     showsRemoveButton: false,
-                                    size: .regular
+                                    size: .small
                                 )
                             }
                             .buttonStyle(.plain)
@@ -930,6 +940,10 @@ private struct TodoListPane: View {
         let usedIDs = Set(todoStore.todos.flatMap { $0.tags.map(\.id) })
         let visibleIDs = usedIDs.union(chromeState.selectedTodoTagFilterIDs)
         return todoStore.tagCatalog.filter { visibleIDs.contains($0.id) }
+    }
+
+    private var openTodoCount: Int {
+        todoStore.todos.filter { $0.status != .done }.count
     }
 
     private func createTodo() {
@@ -1196,32 +1210,44 @@ private struct TodoListRow: View {
                     .strikethrough(todo.status == .done, color: themeForeground.opacity(0.4))
                     .opacity(todo.status == .done ? 0.6 : 1)
 
-                if !todo.tags.isEmpty {
-                    HStack(spacing: 10) {
-                        ForEach(Array(todo.tags.prefix(3))) { tag in
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(tagColor(for: tag))
-                                    .frame(width: 6, height: 6)
-                                Text(tag.name.lowercased())
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(themeForeground.opacity(0.65))
-                                    .lineLimit(1)
-                            }
-                        }
-                        if todo.tags.count > 3 {
-                            Text("+\(todo.tags.count - 3)")
-                                .font(.system(size: 11))
-                                .foregroundStyle(themeForeground.opacity(0.45))
-                        }
-                    }
-                }
-
-                metaRow(opacity: 0.45)
+                inlineMetaRow
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var inlineMetaRow: some View {
+        HStack(spacing: 7) {
+            if !todo.tags.isEmpty {
+                HStack(spacing: 3) {
+                    ForEach(Array(todo.tags.prefix(4))) { tag in
+                        Circle()
+                            .fill(tagColor(for: tag))
+                            .frame(width: 6, height: 6)
+                    }
+                    if todo.tags.count > 4 {
+                        Text("+\(todo.tags.count - 4)")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(themeForeground.opacity(0.45))
+                            .padding(.leading, 1)
+                    }
+                }
+                .help(todo.tags.map(\.name).joined(separator: ", "))
+            }
+
+            Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
+
+            if !todo.comments.isEmpty {
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 10))
+                Text("\(todo.comments.count)")
+                    .monospacedDigit()
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(themeForeground.opacity(0.5))
     }
 
     // MARK: - Linear-dense row
@@ -1391,22 +1417,6 @@ private struct TodoListRow: View {
         return Color(nsColor: softened)
     }
 
-    @ViewBuilder
-    private func metaRow(opacity: Double) -> some View {
-        HStack(spacing: 6) {
-            Text(TodoListRow.relativeTimeString(for: todo.updatedAt))
-            if !todo.comments.isEmpty {
-                Text("·")
-                Image(systemName: "text.bubble")
-                    .font(.system(size: 10))
-                Text("\(todo.comments.count)")
-                    .monospacedDigit()
-            }
-        }
-        .font(.system(size: 11))
-        .foregroundStyle(themeForeground.opacity(opacity))
-    }
-
     static func relativeTimeString(for date: Date) -> String {
         let interval = Date().timeIntervalSince(date)
         if interval < 60 { return "just now" }
@@ -1514,6 +1524,7 @@ private struct TodoInspectorPane: View {
     let todo: ProjectTodo
     @ObservedObject var todoStore: ProjectTodoStore
     let themeForeground: Color
+    let themeColors: TerminalThemeColors
     let isCompact: Bool
     let onBack: (() -> Void)?
 
@@ -1524,17 +1535,20 @@ private struct TodoInspectorPane: View {
     @State private var draftTagInput = ""
     @State private var draftComment = ""
     @State private var pendingSave: Task<Void, Never>?
+    @State private var detailsContentHeight: CGFloat = 0
 
     init(
         todo: ProjectTodo,
         todoStore: ProjectTodoStore,
         themeForeground: Color,
+        themeColors: TerminalThemeColors,
         isCompact: Bool,
         onBack: (() -> Void)?
     ) {
         self.todo = todo
         self.todoStore = todoStore
         self.themeForeground = themeForeground
+        self.themeColors = themeColors
         self.isCompact = isCompact
         self.onBack = onBack
         _draftTitle = State(initialValue: todo.title)
@@ -1578,7 +1592,8 @@ private struct TodoInspectorPane: View {
                 commentsSection
             }
             .padding(.horizontal, isCompact ? 18 : 26)
-            .padding(.vertical, isCompact ? 18 : 24)
+            .padding(.top, 4)
+            .padding(.bottom, isCompact ? 18 : 24)
             .frame(maxWidth: 760, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -1603,25 +1618,45 @@ private struct TodoInspectorPane: View {
 
     @ViewBuilder
     private var statusRow: some View {
-        let editedText = "Edited \(todo.updatedAt.formatted(.relative(presentation: .named)))"
         if isCompact {
             VStack(alignment: .leading, spacing: 6) {
                 statusPicker
-                Text(editedText)
-                    .font(.system(size: 11))
-                    .foregroundStyle(themeForeground.opacity(0.5))
+                timestampLabel
             }
         } else {
             HStack(spacing: 10) {
                 statusPicker
-                Text(editedText)
-                    .font(.system(size: 11))
-                    .foregroundStyle(themeForeground.opacity(0.5))
+                timestampLabel
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
             }
         }
+    }
+
+    private var timestampLabel: some View {
+        Text(timestampText)
+            .font(.system(size: 11))
+            .foregroundStyle(themeForeground.opacity(0.5))
+            .help(timestampTooltip)
+    }
+
+    private var timestampText: String {
+        let createdText = "Created \(todo.createdAt.formatted(.relative(presentation: .named)))"
+        let updatedAt = todo.updatedAt
+        let createdAt = todo.createdAt
+        let sameMinute = abs(updatedAt.timeIntervalSince(createdAt)) < 60
+        if sameMinute {
+            return createdText
+        }
+        let editedText = "Edited \(updatedAt.formatted(.relative(presentation: .named)))"
+        return "\(createdText) · \(editedText)"
+    }
+
+    private var timestampTooltip: String {
+        let createdAbs = todo.createdAt.formatted(date: .abbreviated, time: .shortened)
+        let updatedAbs = todo.updatedAt.formatted(date: .abbreviated, time: .shortened)
+        return "Created \(createdAbs)\nEdited \(updatedAbs)"
     }
 
     private var statusPicker: some View {
@@ -1642,22 +1677,25 @@ private struct TodoInspectorPane: View {
             ZStack(alignment: .topLeading) {
                 if draftMarkdown.isEmpty {
                     Text("Add notes, links, or context — Markdown supported.")
-                        .font(.system(size: 13))
+                        .font(.system(size: 15))
                         .foregroundStyle(themeForeground.opacity(0.35))
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 13)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 4)
                         .allowsHitTesting(false)
                 }
 
-                TextEditor(text: $draftMarkdown)
-                    .font(.system(size: 13.5, weight: .regular, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .frame(minHeight: 160)
-                    .padding(8)
-            }
-            .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(themeForeground.opacity(0.055))
+                MarkdownSourceEditor(
+                    text: $draftMarkdown,
+                    themeColors: themeColors,
+                    maxContentWidth: .greatestFiniteMagnitude,
+                    minHorizontalInset: 0,
+                    verticalInset: 4,
+                    headerSpacing: 0,
+                    bodyFontSize: 15,
+                    useMonospacedFont: false,
+                    onContentHeightChange: { detailsContentHeight = $0 }
+                )
+                .frame(height: max(120, detailsContentHeight))
             }
         }
     }
@@ -1733,18 +1771,15 @@ private struct TodoInspectorPane: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 sectionHeader("Comments")
-                Text("\(todo.comments.count)")
-                    .font(.system(size: 11, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(themeForeground.opacity(0.45))
+                if !todo.comments.isEmpty {
+                    Text("\(todo.comments.count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(themeForeground.opacity(0.45))
+                }
             }
 
-            if todo.comments.isEmpty {
-                Text("No comments yet.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(themeForeground.opacity(0.45))
-                    .padding(.vertical, 4)
-            } else {
+            if !todo.comments.isEmpty {
                 ForEach(todo.comments) { comment in
                     commentRow(comment)
                 }

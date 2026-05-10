@@ -9,9 +9,17 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     var verticalInset: CGFloat = 24
     var headerSpacing: CGFloat = 24
     var header: AnyView? = nil
+    var bodyFontSize: CGFloat = 13.5
+    var useMonospacedFont: Bool = true
+    var onContentHeightChange: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, themeColors: themeColors)
+        Coordinator(
+            text: $text,
+            themeColors: themeColors,
+            bodyFontSize: bodyFontSize,
+            useMonospacedFont: useMonospacedFont
+        )
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -45,6 +53,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         documentView.minHorizontalInset = minHorizontalInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
+        documentView.onContentHeightChange = onContentHeightChange
         documentView.autoresizingMask = .width
         documentView.setHeader(rootView: header)
 
@@ -64,11 +73,14 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         documentView.minHorizontalInset = minHorizontalInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
+        documentView.onContentHeightChange = onContentHeightChange
         documentView.setHeader(rootView: header)
         documentView.needsLayout = true
 
         let textView = documentView.textView
         context.coordinator.themeColors = themeColors
+        context.coordinator.bodyFontSize = bodyFontSize
+        context.coordinator.useMonospacedFont = useMonospacedFont
         textView.typingAttributes = context.coordinator.baseAttributes
         context.coordinator.applyInsertionPoint(to: textView)
         context.coordinator.applySelectionColors(to: textView)
@@ -85,11 +97,20 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         weak var textView: NSTextView?
         weak var documentView: MarkdownDocumentView?
         var themeColors: TerminalThemeColors?
+        var bodyFontSize: CGFloat
+        var useMonospacedFont: Bool
         private var isApplyingText = false
 
-        init(text: Binding<String>, themeColors: TerminalThemeColors?) {
+        init(
+            text: Binding<String>,
+            themeColors: TerminalThemeColors?,
+            bodyFontSize: CGFloat,
+            useMonospacedFont: Bool
+        ) {
             _text = text
             self.themeColors = themeColors
+            self.bodyFontSize = bodyFontSize
+            self.useMonospacedFont = useMonospacedFont
         }
 
         func textDidChange(_ notification: Notification) {
@@ -214,16 +235,34 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         var baseAttributes: [NSAttributedString.Key: Any] {
             [
-                .font: NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular),
+                .font: bodyFont(weight: .regular),
                 .foregroundColor: foregroundColor,
                 .kern: 0.1,
                 .paragraphStyle: Coordinator.defaultParagraphStyle
             ]
         }
 
+        private func bodyFont(weight: NSFont.Weight) -> NSFont {
+            if useMonospacedFont {
+                return NSFont.monospacedSystemFont(ofSize: bodyFontSize, weight: weight)
+            }
+            return NSFont.systemFont(ofSize: bodyFontSize, weight: weight)
+        }
+
+        private func headingFont(size: CGFloat) -> NSFont {
+            if useMonospacedFont {
+                return NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
+            }
+            return NSFont.systemFont(ofSize: size, weight: .semibold)
+        }
+
+        private func codeFont(weight: NSFont.Weight = .regular) -> NSFont {
+            NSFont.monospacedSystemFont(ofSize: bodyFontSize, weight: weight)
+        }
+
         private func headingAttributes(size: CGFloat, color: NSColor) -> [NSAttributedString.Key: Any] {
             [
-                .font: NSFont.monospacedSystemFont(ofSize: size, weight: .semibold),
+                .font: headingFont(size: size),
                 .foregroundColor: color,
                 .paragraphStyle: Coordinator.headingParagraphStyle
             ]
@@ -246,19 +285,24 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 let attributes: [NSAttributedString.Key: Any]
             }
 
+            let h1Size = bodyFontSize * 1.55
+            let h2Size = bodyFontSize * 1.32
+            let h3Size = bodyFontSize * 1.15
+            let h4Size = bodyFontSize
+
             let rules: [Rule] = [
-                Rule(pattern: #"(?m)^#\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: 18, color: headingColor)),
-                Rule(pattern: #"(?m)^##\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: 16, color: headingColor)),
-                Rule(pattern: #"(?m)^###\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: 14.5, color: headingColor)),
-                Rule(pattern: #"(?m)^#{4,6}\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: 13.5, color: headingColor)),
+                Rule(pattern: #"(?m)^#\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h1Size, color: headingColor)),
+                Rule(pattern: #"(?m)^##\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h2Size, color: headingColor)),
+                Rule(pattern: #"(?m)^###\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h3Size, color: headingColor)),
+                Rule(pattern: #"(?m)^#{4,6}\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h4Size, color: headingColor)),
                 Rule(pattern: #"(?m)^>\s?.*$"#, captureGroup: 0, attributes: [.foregroundColor: quoteColor, .obliqueness: 0.12]),
                 Rule(pattern: #"(?m)^\s*([-*+])(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
                 Rule(pattern: #"(?m)^\s*(\d+\.)(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
                 Rule(pattern: #"(?m)^\s*[-*+]\s+(\[[ xX]\])"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
-                Rule(pattern: #"`[^`\n]+`"#, captureGroup: 0, attributes: [.foregroundColor: codeColor]),
-                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .paragraphStyle: Coordinator.codeBlockParagraphStyle]),
+                Rule(pattern: #"`[^`\n]+`"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont()]),
+                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont(), .paragraphStyle: Coordinator.codeBlockParagraphStyle]),
                 Rule(pattern: #"\[[^\]\n]+\]\([^\)\n]+\)"#, captureGroup: 0, attributes: [.foregroundColor: linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]),
-                Rule(pattern: #"(\*\*|__)[^\n]+?(\*\*|__)"#, captureGroup: 0, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13.5, weight: .semibold)]),
+                Rule(pattern: #"(\*\*|__)[^\n]+?(\*\*|__)"#, captureGroup: 0, attributes: [.font: bodyFont(weight: .semibold)]),
                 Rule(pattern: #"(?<!\*)\*[^\n*]+?\*(?!\*)"#, captureGroup: 0, attributes: [.obliqueness: 0.16])
             ]
 
@@ -277,11 +321,13 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 final class MarkdownDocumentView: NSView {
     let textView: NSTextView
     private var headerHost: NSHostingView<AnyView>?
+    private var lastReportedContentHeight: CGFloat = 0
 
     var maxContentWidth: CGFloat = 740
     var minHorizontalInset: CGFloat = 32
     var verticalInset: CGFloat = 24
     var headerSpacing: CGFloat = 24
+    var onContentHeightChange: ((CGFloat) -> Void)?
 
     override var isFlipped: Bool { true }
 
@@ -359,6 +405,14 @@ final class MarkdownDocumentView: NSView {
         let target = max(bottom, scrollHeight)
         if abs(frame.size.height - target) > 0.5 {
             setFrameSize(NSSize(width: frame.size.width, height: target))
+        }
+        if abs(bottom - lastReportedContentHeight) > 0.5 {
+            lastReportedContentHeight = bottom
+            if let callback = onContentHeightChange {
+                DispatchQueue.main.async {
+                    callback(bottom)
+                }
+            }
         }
     }
 }

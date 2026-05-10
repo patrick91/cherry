@@ -24,6 +24,11 @@ final class ProjectWindowRegistry {
         return !workspaces.isEmpty
     }
 
+    var projectRoots: [String] {
+        pruneStaleWindows()
+        return Array(workspaces.keys)
+    }
+
     func hasWindow(for projectRoot: String) -> Bool {
         pruneStaleWindows()
         return windows[projectRoot]?.window != nil

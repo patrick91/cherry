@@ -710,6 +710,7 @@ import Testing
     let noteStores = [projectRootA.path: noteStoreA, projectRootB.path: noteStoreB]
     let todoStores = [projectRootA.path: todoStoreA, projectRootB.path: todoStoreB]
     let chromeStates = [projectRootA.path: chromeStateA, projectRootB.path: chromeStateB]
+    let openProjectRoots = [projectRootA.path, projectRootB.path]
 
     let server = CherryControlServer(
         workspaceProvider: { activeWorkspace },
@@ -720,6 +721,7 @@ import Testing
         noteStoreForProjectRootProvider: { noteStores[$0] },
         todoStoreForProjectRootProvider: { todoStores[$0] },
         chromeStateForProjectRootProvider: { chromeStates[$0] },
+        openProjectRootsProvider: { openProjectRoots },
         socketURL: socketURL,
         agentSettings: settings
     )
@@ -750,7 +752,9 @@ import Testing
     }
 
     let unscopedResponse = try await send(.createNote(.init(title: "Active A", markdown: "A")))
-    #expect(unscopedResponse.error == nil)
+    #expect(unscopedResponse.error?.code == "project_scope_required")
+    #expect(noteStoreA.notes.isEmpty)
+    #expect(noteStoreB.notes.isEmpty)
 
     let scopedResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.path,
@@ -758,7 +762,7 @@ import Testing
     )))
     #expect(scopedResponse.error == nil)
 
-    #expect(noteStoreA.notes.map(\.title) == ["Active A"])
+    #expect(noteStoreA.notes.isEmpty)
     #expect(noteStoreB.notes.map(\.title) == ["Scoped B"])
     #expect(activeWorkspace === workspaceA)
     #expect(activeNoteStore === noteStoreA)

@@ -15,6 +15,7 @@ final class CherryControlServer: @unchecked Sendable {
     private let noteStoreForProjectRootProvider: @MainActor (String) -> ProjectNoteStore?
     private let todoStoreForProjectRootProvider: @MainActor (String) -> ProjectTodoStore?
     private let chromeStateForProjectRootProvider: @MainActor (String) -> ProjectWindowChromeState?
+    private let openProjectRootsProvider: @MainActor () -> [String]
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
     private let socketURL: URL
@@ -52,6 +53,9 @@ final class CherryControlServer: @unchecked Sendable {
         self.chromeStateForProjectRootProvider = { projectRoot in
             workspace.projectRoot == projectRoot ? chromeState : nil
         }
+        self.openProjectRootsProvider = {
+            workspace.projectRoot.map { [$0] } ?? []
+        }
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -81,6 +85,9 @@ final class CherryControlServer: @unchecked Sendable {
         chromeStateForProjectRootProvider: @escaping @MainActor (String) -> ProjectWindowChromeState? = {
             ProjectWindowRegistry.shared.chromeState(for: $0)
         },
+        openProjectRootsProvider: @escaping @MainActor () -> [String] = {
+            ProjectWindowRegistry.shared.projectRoots
+        },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector()
@@ -97,6 +104,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.noteStoreForProjectRootProvider = noteStoreForProjectRootProvider
         self.todoStoreForProjectRootProvider = todoStoreForProjectRootProvider
         self.chromeStateForProjectRootProvider = chromeStateForProjectRootProvider
+        self.openProjectRootsProvider = openProjectRootsProvider
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -257,22 +265,30 @@ final class CherryControlServer: @unchecked Sendable {
     private func handle(_ request: CherryControlRequest) async throws -> CherryControlResponse {
         if case .scoped(let scopedRequest) = request {
             let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
-            return try await handleUnscoped(scopedRequest.request, workspace: workspace)
+            return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
         }
 
         guard let workspace = workspace ?? workspaceProvider() else {
             throw CherryControlError(code: "workspace_unavailable", message: "Cherry workspace is unavailable.")
         }
 
-        return try await handleUnscoped(request, workspace: workspace)
+        return try await handleUnscoped(request, workspace: workspace, isProjectScoped: false)
     }
 
     @MainActor
-    private func handleUnscoped(_ request: CherryControlRequest, workspace: TerminalWorkspace) async throws -> CherryControlResponse {
+    private func handleUnscoped(
+        _ request: CherryControlRequest,
+        workspace: TerminalWorkspace,
+        isProjectScoped: Bool
+    ) async throws -> CherryControlResponse {
+        if !isProjectScoped {
+            try rejectAmbiguousUnscopedProjectMutation(request)
+        }
+
         switch request {
         case .scoped(let scopedRequest):
             let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
-            return try await handleUnscoped(scopedRequest.request, workspace: workspace)
+            return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
         case .listProjects:
             return .init(result: .listProjects(listProjects(workspace: workspace)))
         case .getProjectStatus:
@@ -1198,6 +1214,38 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "invalid_process_kind", message: "Unknown process kind: \(rawValue)")
         }
         return kind
+    }
+
+    @MainActor
+    private func rejectAmbiguousUnscopedProjectMutation(_ request: CherryControlRequest) throws {
+        guard requestRequiresProjectScope(request) else { return }
+        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
+        guard openRoots.count > 1 else { return }
+
+        throw CherryControlError(
+            code: "project_scope_required",
+            message: "This Cherry tool mutates project-scoped data, but multiple Cherry projects are open and the request did not include a project scope. Relaunch the agent in an updated Cherry terminal or pass a scoped Cherry control request."
+        )
+    }
+
+    private func requestRequiresProjectScope(_ request: CherryControlRequest) -> Bool {
+        switch request {
+        case .createNote,
+             .updateNote,
+             .appendNote,
+             .renameNote,
+             .deleteNote,
+             .createTodo,
+             .updateTodo,
+             .moveTodo,
+             .deleteTodo,
+             .addTodoComment,
+             .updateTodoComment,
+             .deleteTodoComment:
+            true
+        default:
+            false
+        }
     }
 
     @MainActor

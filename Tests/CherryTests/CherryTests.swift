@@ -501,6 +501,45 @@ import Testing
 }
 
 @MainActor
+@Test func controlServerRunAgentSelectionFocusesTerminalPane() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let todoResponse = try await harness.send(.createTodo(.init(
+        title: "Focused launch",
+        markdown: "",
+        open: true
+    )))
+    guard case .createTodo(let createdTodo)? = todoResponse.result else {
+        Issue.record("Expected createTodo result, got \(String(describing: todoResponse))")
+        return
+    }
+    #expect(harness.chromeState.selectedTodoID == createdTodo.todo.id)
+    #expect(harness.chromeState.isTodoPanePresented == true)
+
+    let response = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        select: true
+    )))
+    guard case .runAgent(let result)? = response.result,
+          let terminalID = UUID(uuidString: result.terminalID)
+    else {
+        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(harness.workspace.selectedSessionID == terminalID)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
+    #expect(harness.chromeState.selectedTodoID == nil)
+    #expect(harness.chromeState.selectedNoteID == nil)
+}
+
+@MainActor
 @Test func controlServerCreatesDuplicateAgentSessions() async throws {
     let harness = try ControlServerHarness()
     defer {

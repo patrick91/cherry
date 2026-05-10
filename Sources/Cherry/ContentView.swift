@@ -116,6 +116,7 @@ struct ContentView: View {
                 CommandPaletteOverlay(
                     settings: AgentSettings.shared,
                     workspace: workspace,
+                    chromeState: chromeState,
                     selectedProjectRoot: projectRoot,
                     isPresented: $chromeState.isCommandPalettePresented,
                     focusRequest: chromeState.commandPaletteFocusRequest,
@@ -2119,6 +2120,7 @@ private struct CommandPaletteOverlay: View {
     @ObservedObject var settings: AgentSettings
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
     let selectedProjectRoot: String?
     @Binding var isPresented: Bool
     let focusRequest: Int
@@ -2514,6 +2516,7 @@ private struct CommandPaletteOverlay: View {
     private func launch(_ agent: ResolvedAgentTool) {
         let project = settings.resolvedProject(for: selectedProjectRoot)
         guard let root = project.validProjectRoot else { return }
+        chromeState.selectTerminal()
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
         dismiss()
     }
@@ -3041,12 +3044,12 @@ private struct SidebarAgentSessionSection: View {
     private func launch(_ agent: ResolvedAgentTool) {
         let project = settings.resolvedProject(for: projectRoot)
         guard agent.isLaunchable, let root = project.validProjectRoot else { return }
-        chromeState.selectNote(id: nil)
+        chromeState.selectTerminal()
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
     }
 
     private func select(_ session: TerminalSession) {
-        chromeState.selectNote(id: nil)
+        chromeState.selectTerminal()
         workspace.select(session)
     }
 }
@@ -3251,15 +3254,15 @@ private struct SidebarCommandSection: View {
         guard command.isLaunchable, let root = settings.resolvedProject(for: projectRoot).validProjectRoot else { return }
         if let existingSession {
             if existingSession.isRunningCommand {
-                chromeState.selectNote(id: nil)
+                chromeState.selectTerminal()
                 workspace.select(existingSession)
             } else {
                 existingSession.restart()
-                chromeState.selectNote(id: nil)
+                chromeState.selectTerminal()
                 workspace.select(existingSession)
             }
         } else {
-            chromeState.selectNote(id: nil)
+            chromeState.selectTerminal()
             workspace.addCommandSession(command: command, projectRoot: root)
         }
     }
@@ -3268,7 +3271,7 @@ private struct SidebarCommandSection: View {
         guard command.isLaunchable else { return }
         if let existingSession {
             existingSession.restart()
-            chromeState.selectNote(id: nil)
+            chromeState.selectTerminal()
             workspace.select(existingSession)
         } else {
             start(command, existingSession: nil)

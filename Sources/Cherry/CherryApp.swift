@@ -181,6 +181,7 @@ struct CherryApp: App {
                     ForEach(project.launchableAgents) { agent in
                         Button(agent.name) {
                             guard let workspace = focusedWorkspace, let projectRoot = project.validProjectRoot else { return }
+                            focusedChromeState?.selectTerminal()
                             workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot)
                         }
                     }

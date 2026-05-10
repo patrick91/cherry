@@ -363,6 +363,9 @@ final class CherryControlServer: @unchecked Sendable {
                 title: request.title,
                 select: request.select ?? false
             )
+            if request.select ?? false {
+                activeChromeState()?.selectTerminal()
+            }
             let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
             if let payload, !payload.isEmpty {
                 session.send(data: payload)

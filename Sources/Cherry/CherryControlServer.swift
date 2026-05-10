@@ -232,6 +232,8 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listProjects(listProjects(workspace: workspace)))
         case .getProjectStatus:
             return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
+        case .resolveLink(let request):
+            return .init(result: .resolveLink(try resolveDeepLink(request, fallbackWorkspace: workspace)))
         case .listProcesses(let request):
             return .init(result: .listProcesses(try listProcesses(workspace: workspace, kind: request.kind)))
         case .getProcessStatus(let request):
@@ -346,7 +348,7 @@ final class CherryControlServer: @unchecked Sendable {
                 command: request.command,
                 select: false
             )
-            return .init(result: .createTerminal(summary(for: session)))
+            return .init(result: .createTerminal(summary(for: session, workspace: workspace)))
         case .runAgent(let request):
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
@@ -373,6 +375,7 @@ final class CherryControlServer: @unchecked Sendable {
             let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
             return .init(result: .runAgent(.init(
                 terminalID: session.id.uuidString,
+                link: link(for: session, workspace: workspace),
                 title: session.title,
                 state: session.state.label,
                 kind: session.kind.rawValue,
@@ -389,12 +392,12 @@ final class CherryControlServer: @unchecked Sendable {
                 select(note: note)
             }
             let selected = activeChromeState()?.selectedNoteID == note.id
-            return .init(result: .createNote(.init(note: note, selected: selected)))
+            return .init(result: .createNote(.init(note: note, link: link(for: note), selected: selected)))
         case .getNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.note(id: try noteID(from: request.noteID))
             let selected = activeChromeState()?.selectedNoteID == note.id
-            return .init(result: .getNote(.init(note: note, selected: selected)))
+            return .init(result: .getNote(.init(note: note, link: link(for: note), selected: selected)))
         case .updateNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.update(
@@ -407,6 +410,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .updateNote(.init(
                 note: note,
+                link: link(for: note),
                 selected: activeChromeState()?.selectedNoteID == note.id
             )))
         case .appendNote(let request):
@@ -416,6 +420,7 @@ final class CherryControlServer: @unchecked Sendable {
             let note = try noteStore.update(id: existing.id, title: nil, markdown: existing.markdown + separator + request.markdown)
             return .init(result: .appendNote(.init(
                 note: note,
+                link: link(for: note),
                 selected: activeChromeState()?.selectedNoteID == note.id
             )))
         case .renameNote(let request):
@@ -423,6 +428,7 @@ final class CherryControlServer: @unchecked Sendable {
             let note = try noteStore.update(id: try noteID(from: request.noteID), title: request.title, markdown: nil)
             return .init(result: .renameNote(.init(
                 note: note,
+                link: link(for: note),
                 selected: activeChromeState()?.selectedNoteID == note.id
             )))
         case .searchNotes(let request):
@@ -454,6 +460,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .createTodo(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .getTodo(let request):
@@ -461,6 +468,7 @@ final class CherryControlServer: @unchecked Sendable {
             let todo = try todoStore.todo(id: try todoID(from: request.todoID))
             return .init(result: .getTodo(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .updateTodo(let request):
@@ -477,6 +485,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .updateTodo(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .moveTodo(let request):
@@ -492,6 +501,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .moveTodo(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .deleteTodo(let request):
@@ -522,6 +532,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .addTodoComment(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .listTodoComments(let request):
@@ -537,6 +548,7 @@ final class CherryControlServer: @unchecked Sendable {
             )
             return .init(result: .updateTodoComment(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .deleteTodoComment(let request):
@@ -547,12 +559,13 @@ final class CherryControlServer: @unchecked Sendable {
             )
             return .init(result: .deleteTodoComment(.init(
                 todo: todo,
+                link: link(for: todo),
                 selected: activeChromeState()?.selectedTodoID == todo.id
             )))
         case .renameTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             session.rename(to: request.title)
-            return .init(result: .renameTerminal(summary(for: session)))
+            return .init(result: .renameTerminal(summary(for: session, workspace: workspace)))
         case .selectTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             workspace.select(session)
@@ -585,7 +598,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .restartTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             session.restart()
-            return .init(result: .restartTerminal(summary(for: session)))
+            return .init(result: .restartTerminal(summary(for: session, workspace: workspace)))
         case .closeTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             guard workspace.sessions.count > 1 else {
@@ -594,6 +607,143 @@ final class CherryControlServer: @unchecked Sendable {
             workspace.close(session)
             return .init(result: .closeTerminal(.init(terminalID: session.id.uuidString, closed: true)))
         }
+    }
+
+    @MainActor
+    private func resolveDeepLink(
+        _ request: ResolveDeepLinkRequest,
+        fallbackWorkspace workspace: TerminalWorkspace
+    ) throws -> ResolveDeepLinkResult {
+        let deepLink = try CherryDeepLink.parse(request.link)
+        let projectRoot = projectRoot(forProjectKey: deepLink.projectKey, fallbackWorkspace: workspace)
+        let normalizedLink = deepLink.absoluteString
+
+        guard let projectRoot else {
+            return ResolveDeepLinkResult(
+                link: normalizedLink,
+                projectKey: deepLink.projectKey,
+                kind: deepLink.kind,
+                targetID: deepLink.targetID,
+                found: false,
+                projectRoot: nil
+            )
+        }
+
+        switch deepLink.kind {
+        case .note:
+            let noteID = try noteID(from: deepLink.targetID)
+            guard let note = try? noteStore(forProjectRoot: projectRoot, fallbackWorkspace: workspace).note(id: noteID) else {
+                return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
+            }
+            return ResolveDeepLinkResult(
+                link: normalizedLink,
+                projectKey: deepLink.projectKey,
+                kind: deepLink.kind,
+                targetID: deepLink.targetID,
+                found: true,
+                projectRoot: projectRoot,
+                note: note,
+                noteLink: link(for: note)
+            )
+        case .todo:
+            let todoID = try todoID(from: deepLink.targetID)
+            guard let todo = try? todoStore(forProjectRoot: projectRoot, fallbackWorkspace: workspace).todo(id: todoID) else {
+                return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
+            }
+            return ResolveDeepLinkResult(
+                link: normalizedLink,
+                projectKey: deepLink.projectKey,
+                kind: deepLink.kind,
+                targetID: deepLink.targetID,
+                found: true,
+                projectRoot: projectRoot,
+                todo: todo,
+                todoLink: link(for: todo)
+            )
+        case .terminal:
+            guard let terminalID = UUID(uuidString: deepLink.targetID),
+                  let linkedWorkspace = workspaceForProjectRoot(projectRoot, fallbackWorkspace: workspace),
+                  let session = linkedWorkspace.session(id: terminalID.uuidString)
+            else {
+                return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
+            }
+            let output = request.includeOutput == true
+                ? terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)
+                : nil
+            return ResolveDeepLinkResult(
+                link: normalizedLink,
+                projectKey: deepLink.projectKey,
+                kind: deepLink.kind,
+                targetID: deepLink.targetID,
+                found: true,
+                projectRoot: projectRoot,
+                process: processInfo(for: session, workspace: linkedWorkspace),
+                output: output
+            )
+        }
+    }
+
+    private func missingDeepLinkResult(
+        _ deepLink: CherryDeepLink,
+        projectRoot: String?,
+        link: String
+    ) -> ResolveDeepLinkResult {
+        ResolveDeepLinkResult(
+            link: link,
+            projectKey: deepLink.projectKey,
+            kind: deepLink.kind,
+            targetID: deepLink.targetID,
+            found: false,
+            projectRoot: projectRoot
+        )
+    }
+
+    @MainActor
+    private func projectRoot(forProjectKey projectKey: String, fallbackWorkspace workspace: TerminalWorkspace) -> String? {
+        if let projectRoot = workspace.projectRoot,
+           CherryDeepLink.projectKey(forProjectRoot: projectRoot) == projectKey {
+            return projectRoot
+        }
+        if let projectRoot = ProjectWindowRegistry.shared.projectRoot(forProjectKey: projectKey) {
+            return projectRoot
+        }
+        return agentSettings.projects
+            .map(\.root)
+            .first { CherryDeepLink.projectKey(forProjectRoot: $0) == projectKey }
+    }
+
+    @MainActor
+    private func workspaceForProjectRoot(_ projectRoot: String, fallbackWorkspace workspace: TerminalWorkspace) -> TerminalWorkspace? {
+        if workspace.projectRoot == projectRoot {
+            return workspace
+        }
+        return ProjectWindowRegistry.shared.workspace(for: projectRoot)
+    }
+
+    @MainActor
+    private func noteStore(forProjectRoot projectRoot: String, fallbackWorkspace workspace: TerminalWorkspace) -> ProjectNoteStore {
+        if workspace.projectRoot == projectRoot,
+           let store = noteStore ?? noteStoreProvider(),
+           store.projectRoot == projectRoot {
+            return store
+        }
+        if let store = ProjectWindowRegistry.shared.noteStore(for: projectRoot) {
+            return store
+        }
+        return ProjectNoteStore(projectRoot: projectRoot)
+    }
+
+    @MainActor
+    private func todoStore(forProjectRoot projectRoot: String, fallbackWorkspace workspace: TerminalWorkspace) -> ProjectTodoStore {
+        if workspace.projectRoot == projectRoot,
+           let store = todoStore ?? todoStoreProvider(),
+           store.projectRoot == projectRoot {
+            return store
+        }
+        if let store = ProjectWindowRegistry.shared.todoStore(for: projectRoot) {
+            return store
+        }
+        return ProjectTodoStore(projectRoot: projectRoot)
     }
 
     @MainActor
@@ -607,6 +757,7 @@ final class CherryControlServer: @unchecked Sendable {
                     selected: workspace.selectedSessionID == session.id,
                     workingDirectory: session.workingDirectory,
                     lineCount: session.lineCount,
+                    link: link(for: session, workspace: workspace),
                     kind: session.kind.rawValue,
                     agentName: session.agentName,
                     summary: session.summary
@@ -700,6 +851,7 @@ final class CherryControlServer: @unchecked Sendable {
     private func processInfo(for session: TerminalSession, workspace: TerminalWorkspace) -> ProcessSummary {
         ProcessSummary(
             id: session.id.uuidString,
+            link: link(for: session, workspace: workspace),
             name: processName(for: session),
             kind: session.kind.rawValue,
             state: session.state.label,
@@ -1012,6 +1164,7 @@ final class CherryControlServer: @unchecked Sendable {
     private func noteInfo(_ note: ProjectNote) -> NoteInfo {
         NoteInfo(
             id: note.id.uuidString,
+            link: link(for: note),
             projectRoot: note.projectRoot,
             title: note.title,
             createdAt: note.createdAt,
@@ -1059,6 +1212,7 @@ final class CherryControlServer: @unchecked Sendable {
     private func todoInfo(_ todo: ProjectTodo) -> TodoInfo {
         TodoInfo(
             id: todo.id.uuidString,
+            link: link(for: todo),
             projectRoot: todo.projectRoot,
             title: todo.title,
             status: todo.status,
@@ -1166,10 +1320,31 @@ final class CherryControlServer: @unchecked Sendable {
         return (label, nil, nil)
     }
 
+    private func link(for note: ProjectNote) -> String {
+        CherryDeepLink.noteURL(projectRoot: note.projectRoot, noteID: note.id)
+    }
+
+    private func link(for todo: ProjectTodo) -> String {
+        CherryDeepLink.todoURL(projectRoot: todo.projectRoot, todoID: todo.id)
+    }
+
     @MainActor
-    private func summary(for session: TerminalSession) -> TerminalSummaryResult {
+    private func link(for session: TerminalSession, workspace: TerminalWorkspace) -> String? {
+        guard let projectRoot = workspace.projectRoot else { return nil }
+        return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
+    }
+
+    @MainActor
+    private func link(for session: TerminalSession) -> String? {
+        guard let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id) else { return nil }
+        return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
+    }
+
+    @MainActor
+    private func summary(for session: TerminalSession, workspace: TerminalWorkspace) -> TerminalSummaryResult {
         TerminalSummaryResult(
             terminalID: session.id.uuidString,
+            link: link(for: session, workspace: workspace),
             title: session.title,
             state: session.state.label,
             kind: session.kind.rawValue,

@@ -21,6 +21,23 @@ import Testing
     #expect(decoded == request)
 }
 
+@Test func cherryDeepLinksRoundTrip() throws {
+    let projectRoot = "/tmp/Cherry Project"
+    let noteID = UUID()
+    let link = CherryDeepLink(projectRoot: projectRoot, kind: .note, targetID: noteID.uuidString)
+    let parsed = try CherryDeepLink.parse(link.absoluteString)
+
+    #expect(parsed == link)
+    #expect(parsed.absoluteString == "cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/note/\(noteID.uuidString)")
+
+    #expect(throws: CherryControlError(code: "invalid_deep_link", message: "Cherry link must start with cherry://project/.")) {
+        try CherryDeepLink.parse("https://example.com")
+    }
+    #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")) {
+        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(noteID.uuidString)")
+    }
+}
+
 @Test func cherryControlRunAgentRequestRoundTrips() async throws {
     let request = CherryControlRequest.runAgent(.init(
         agentName: "Codex",
@@ -106,6 +123,7 @@ import Testing
     let requests: [CherryControlRequest] = [
         .listProjects,
         .getProjectStatus,
+        .resolveLink(.init(link: CherryDeepLink.terminalURL(projectRoot: "/tmp/project", terminalID: UUID()), includeOutput: true, startLine: 0, lineLimit: 20)),
         .listProcesses(.init(kind: "agent")),
         .getProcessStatus(.init(processID: processID)),
         .getProcessOutput(.init(processID: processID, startLine: 1, lineLimit: 20)),
@@ -814,6 +832,86 @@ import Testing
     #expect(createdTodo.selected == false)
     #expect(harness.chromeState.selectedTodoID == nil)
     #expect(harness.chromeState.isTodoPanePresented == false)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
+}
+
+@MainActor
+@Test func controlServerResolvesDeepLinksWithoutSelection() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    harness.server.start()
+
+    let initialSessionID = try #require(harness.workspace.selectedSessionID)
+
+    let noteResponse = try await harness.send(.createNote(.init(title: "Link Note", markdown: "note body")))
+    guard case .createNote(let createdNote)? = noteResponse.result,
+          let noteLink = createdNote.link
+    else {
+        Issue.record("Expected createNote result with link, got \(String(describing: noteResponse))")
+        return
+    }
+
+    let todoResponse = try await harness.send(.createTodo(.init(title: "Link Todo", markdown: "todo body")))
+    guard case .createTodo(let createdTodo)? = todoResponse.result,
+          let todoLink = createdTodo.link
+    else {
+        Issue.record("Expected createTodo result with link, got \(String(describing: todoResponse))")
+        return
+    }
+
+    let terminalLink = CherryDeepLink.terminalURL(projectRoot: harness.projectRoot.path, terminalID: initialSessionID)
+
+    let noteResolveResponse = try await harness.send(.resolveLink(.init(link: noteLink)))
+    guard case .resolveLink(let noteResult)? = noteResolveResponse.result else {
+        Issue.record("Expected resolveLink note result, got \(String(describing: noteResolveResponse))")
+        return
+    }
+    #expect(noteResult.found == true)
+    #expect(noteResult.projectRoot == harness.projectRoot.path)
+    #expect(noteResult.kind == .note)
+    #expect(noteResult.note?.id == createdNote.note.id)
+    #expect(noteResult.noteLink == noteLink)
+
+    let todoResolveResponse = try await harness.send(.resolveLink(.init(link: todoLink)))
+    guard case .resolveLink(let todoResult)? = todoResolveResponse.result else {
+        Issue.record("Expected resolveLink todo result, got \(String(describing: todoResolveResponse))")
+        return
+    }
+    #expect(todoResult.found == true)
+    #expect(todoResult.kind == .todo)
+    #expect(todoResult.todo?.id == createdTodo.todo.id)
+    #expect(todoResult.todoLink == todoLink)
+
+    let terminalResolveResponse = try await harness.send(.resolveLink(.init(
+        link: terminalLink,
+        includeOutput: true,
+        startLine: 0,
+        lineLimit: 5
+    )))
+    guard case .resolveLink(let terminalResult)? = terminalResolveResponse.result else {
+        Issue.record("Expected resolveLink terminal result, got \(String(describing: terminalResolveResponse))")
+        return
+    }
+    #expect(terminalResult.found == true)
+    #expect(terminalResult.kind == .terminal)
+    #expect(terminalResult.process?.id == initialSessionID.uuidString)
+    #expect(terminalResult.process?.link == terminalLink)
+    #expect(terminalResult.output?.terminalID == initialSessionID.uuidString)
+
+    let staleLink = CherryDeepLink.terminalURL(projectRoot: harness.projectRoot.path, terminalID: UUID())
+    let staleResponse = try await harness.send(.resolveLink(.init(link: staleLink)))
+    guard case .resolveLink(let staleResult)? = staleResponse.result else {
+        Issue.record("Expected stale resolveLink result, got \(String(describing: staleResponse))")
+        return
+    }
+    #expect(staleResult.found == false)
+    #expect(staleResult.projectRoot == harness.projectRoot.path)
+
+    #expect(harness.workspace.selectedSessionID == initialSessionID)
+    #expect(harness.chromeState.selectedNoteID == nil)
+    #expect(harness.chromeState.selectedTodoID == nil)
     #expect(harness.chromeState.isShowingTerminalContent == true)
 }
 

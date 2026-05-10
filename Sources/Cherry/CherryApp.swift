@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import SwiftUI
 import UserNotifications
 
@@ -195,6 +196,7 @@ struct CherryApp: App {
 }
 
 private struct ProjectWindowView: View {
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
     @State private var onboardedProjectRoot: String?
     @State private var lockedProjectRoot: String?
@@ -220,6 +222,7 @@ private struct ProjectWindowView: View {
         .onAppear {
             lockProjectRootIfNeeded()
         }
+        .onOpenURL(perform: openDeepLink)
     }
 
     private var projectRoot: String? {
@@ -238,6 +241,24 @@ private struct ProjectWindowView: View {
     private func lockProjectRootIfNeeded() {
         guard lockedProjectRoot == nil else { return }
         lockedProjectRoot = projectRoot
+    }
+
+    private func openDeepLink(_ url: URL) {
+        guard let deepLink = try? CherryDeepLink.parse(url.absoluteString),
+              let projectRoot = ProjectWindowRegistry.shared.projectRoot(forProjectKey: deepLink.projectKey)
+        else {
+            return
+        }
+
+        agentSettings.markProjectOpened(projectRoot)
+        if ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) {
+            if !ProjectWindowRegistry.shared.select(deepLink, projectRoot: projectRoot) {
+                CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
+            }
+        } else {
+            CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
+            openWindow(value: projectRoot)
+        }
     }
 }
 
@@ -284,6 +305,7 @@ private struct ProjectWorkspaceView: View {
             ProjectWindowRegistry.shared.activeChromeState = chromeState
             agentSettings.markProjectOpened(workspace.projectRoot)
             autoStartCommandsIfNeeded()
+            openPendingDeepLinks()
         }
     }
 
@@ -299,5 +321,72 @@ private struct ProjectWorkspaceView: View {
         for command in agentSettings.launchableProjectCommands(for: projectRoot) where command.autoStart {
             workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
         }
+    }
+
+    private func openPendingDeepLinks() {
+        guard let projectRoot = workspace.projectRoot else { return }
+        let links = CherryDeepLinkOpenQueue.shared.consume(projectRoot: projectRoot)
+        guard !links.isEmpty else { return }
+        DispatchQueue.main.async {
+            for link in links {
+                if !selectDeepLink(link) {
+                    _ = ProjectWindowRegistry.shared.select(link, projectRoot: projectRoot)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func selectDeepLink(_ link: CherryDeepLink) -> Bool {
+        guard let projectRoot = workspace.projectRoot,
+              CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey
+        else {
+            return false
+        }
+
+        switch link.kind {
+        case .note:
+            guard let noteID = UUID(uuidString: link.targetID),
+                  noteStore.notes.contains(where: { $0.id == noteID })
+            else {
+                return false
+            }
+            chromeState.selectNote(id: noteID)
+            return true
+        case .todo:
+            guard let todoID = UUID(uuidString: link.targetID),
+                  todoStore.todos.contains(where: { $0.id == todoID })
+            else {
+                return false
+            }
+            chromeState.selectTodo(id: todoID)
+            return true
+        case .terminal:
+            guard let sessionID = UUID(uuidString: link.targetID),
+                  let session = workspace.sessions.first(where: { $0.id == sessionID })
+            else {
+                return false
+            }
+            workspace.select(session)
+            chromeState.selectTerminal()
+            return true
+        }
+    }
+}
+
+@MainActor
+private final class CherryDeepLinkOpenQueue {
+    static let shared = CherryDeepLinkOpenQueue()
+
+    private var linksByProjectRoot: [String: [CherryDeepLink]] = [:]
+
+    private init() {}
+
+    func enqueue(_ link: CherryDeepLink, projectRoot: String) {
+        linksByProjectRoot[projectRoot, default: []].append(link)
+    }
+
+    func consume(projectRoot: String) -> [CherryDeepLink] {
+        linksByProjectRoot.removeValue(forKey: projectRoot) ?? []
     }
 }

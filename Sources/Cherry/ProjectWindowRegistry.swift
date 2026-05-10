@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import SwiftUI
 
 @MainActor
@@ -26,6 +27,44 @@ final class ProjectWindowRegistry {
     func hasWindow(for projectRoot: String) -> Bool {
         pruneStaleWindows()
         return windows[projectRoot]?.window != nil
+    }
+
+    func projectRoot(forProjectKey projectKey: String) -> String? {
+        pruneStaleWindows()
+        let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var roots = Array(workspaces.keys)
+        roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
+        if let activeProjectRoot {
+            roots.append(activeProjectRoot)
+        }
+
+        var seen = Set<String>()
+        for root in roots where seen.insert(root).inserted {
+            if CherryDeepLink.projectKey(forProjectRoot: root) == normalizedKey {
+                return root
+            }
+        }
+        return nil
+    }
+
+    func workspace(for projectRoot: String) -> TerminalWorkspace? {
+        pruneStaleWindows()
+        return workspaces[projectRoot]?.workspace
+    }
+
+    func noteStore(for projectRoot: String) -> ProjectNoteStore? {
+        pruneStaleWindows()
+        return noteStores[projectRoot]?.noteStore
+    }
+
+    func todoStore(for projectRoot: String) -> ProjectTodoStore? {
+        pruneStaleWindows()
+        return todoStores[projectRoot]?.todoStore
+    }
+
+    func chromeState(for projectRoot: String) -> ProjectWindowChromeState? {
+        pruneStaleWindows()
+        return chromeStates[projectRoot]?.chromeState
     }
 
     @discardableResult
@@ -112,6 +151,44 @@ final class ProjectWindowRegistry {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         return true
+    }
+
+    @discardableResult
+    func select(_ deepLink: CherryDeepLink, projectRoot: String) -> Bool {
+        guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == deepLink.projectKey,
+              let chromeState = chromeStates[projectRoot]?.chromeState
+        else {
+            return false
+        }
+
+        switch deepLink.kind {
+        case .note:
+            guard let noteID = UUID(uuidString: deepLink.targetID),
+                  noteStores[projectRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
+            else {
+                return false
+            }
+            chromeState.selectNote(id: noteID)
+            return true
+        case .todo:
+            guard let todoID = UUID(uuidString: deepLink.targetID),
+                  todoStores[projectRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
+            else {
+                return false
+            }
+            chromeState.selectTodo(id: todoID)
+            return true
+        case .terminal:
+            guard let sessionID = UUID(uuidString: deepLink.targetID),
+                  let workspace = workspaces[projectRoot]?.workspace,
+                  let session = workspace.sessions.first(where: { $0.id == sessionID })
+            else {
+                return false
+            }
+            workspace.select(session)
+            chromeState.selectTerminal()
+            return true
+        }
     }
 
     func markCurrentActiveProjectOpened() {

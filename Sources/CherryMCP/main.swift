@@ -42,6 +42,17 @@ private enum CherryMCPTools {
             properties: [:]
         ),
         tool(
+            "resolve_link",
+            "Resolve a cherry://project/... link for a note, todo, or live terminal without changing the Cherry UI.",
+            properties: [
+                "link": string("Cherry deep link to resolve."),
+                "include_output": boolean("For terminal links, include rendered output. Defaults to false."),
+                "start_line": integer("Optional zero-based terminal output start line when include_output is true."),
+                "line_limit": integer("Maximum rendered terminal output lines when include_output is true. Max 2000.")
+            ],
+            required: ["link"]
+        ),
+        tool(
             "list_processes",
             "List terminal, agent, and command processes in the active project without changing the Cherry UI.",
             properties: ["kind": string("Optional process kind filter: terminal, agent, or command.")]
@@ -532,6 +543,13 @@ private enum CherryMCPTools {
             return .listProjects
         case "get_project_status":
             return .getProjectStatus
+        case "resolve_link":
+            return .resolveLink(.init(
+                link: try requiredString("link", in: arguments),
+                includeOutput: boolArgument("include_output", in: arguments),
+                startLine: intArgument("start_line", in: arguments),
+                lineLimit: intArgument("line_limit", in: arguments)
+            ))
         case "list_processes":
             return .listProcesses(.init(kind: stringArgument("kind", in: arguments)))
         case "get_process_status":
@@ -785,6 +803,8 @@ private enum CherryMCPTools {
         case .listProjects(let payload):
             return try encodedResult(payload)
         case .getProjectStatus(let payload):
+            return try encodedResult(payload)
+        case .resolveLink(let payload):
             return try encodedResult(payload)
         case .listProcesses(let payload):
             return try encodedResult(payload)

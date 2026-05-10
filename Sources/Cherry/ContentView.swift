@@ -646,6 +646,11 @@ private struct NoteDetailView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(themeBackground)
+        .contextMenu {
+            Button("Copy Link") {
+                copyCherryLink(cherryLink(for: note))
+            }
+        }
         .onChange(of: draftTitle) { _, _ in scheduleSave() }
         .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
         .onChange(of: note.id) { _, _ in
@@ -1081,6 +1086,12 @@ private struct TodoStatusGroup: View {
                     [todo.id: anchor]
                 }
                 .contextMenu {
+                    Button("Copy Link") {
+                        copyCherryLink(cherryLink(for: todo))
+                    }
+
+                    Divider()
+
                     Button("Move Up") { moveUp(todo) }
                     Button("Move Down") { moveDown(todo) }
 
@@ -1571,6 +1582,11 @@ private struct TodoInspectorPane: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .foregroundStyle(themeForeground)
+        .contextMenu {
+            Button("Copy Link") {
+                copyCherryLink(cherryLink(for: todo))
+            }
+        }
         .onChange(of: draftTitle) { _, _ in scheduleSave() }
         .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
         .onChange(of: draftStatus) { _, _ in saveNow() }
@@ -2664,6 +2680,26 @@ private enum SidebarLayout {
     static let rowHorizontalInset: CGFloat = 12
 }
 
+@MainActor
+private func copyCherryLink(_ link: String?) {
+    guard let link, !link.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(link, forType: .string)
+}
+
+private func cherryLink(for note: ProjectNote) -> String {
+    CherryDeepLink.noteURL(projectRoot: note.projectRoot, noteID: note.id)
+}
+
+private func cherryLink(for todo: ProjectTodo) -> String {
+    CherryDeepLink.todoURL(projectRoot: todo.projectRoot, todoID: todo.id)
+}
+
+private func cherryLink(for session: TerminalSession, projectRoot: String?) -> String? {
+    guard let projectRoot else { return nil }
+    return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
+}
+
 private struct SidebarTabsView: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
@@ -2969,6 +3005,13 @@ private struct SidebarAgentSessionSection: View {
                         onSelect: { select(session) }
                     )
                     .contextMenu {
+                        Button("Copy Link") {
+                            copyCherryLink(cherryLink(for: session, projectRoot: projectRoot))
+                        }
+                        .disabled(projectRoot == nil)
+
+                        Divider()
+
                         Button("Rename...") {
                             promptRenameSession(session)
                         }
@@ -3114,6 +3157,14 @@ private struct SidebarCommandSection: View {
                         }
                     )
                     .contextMenu {
+                        if let session {
+                            Button("Copy Link") {
+                                copyCherryLink(cherryLink(for: session, projectRoot: projectRoot))
+                            }
+
+                            Divider()
+                        }
+
                         Button(session == nil ? "Start" : "Restart") {
                             restart(command, existingSession: session)
                         }
@@ -3320,6 +3371,12 @@ private struct SidebarNotesSection: View {
                     .buttonStyle(.plain)
                     .padding(.leading, -SidebarLayout.rowHorizontalInset)
                     .contextMenu {
+                        Button("Copy Link") {
+                            copyCherryLink(cherryLink(for: note))
+                        }
+
+                        Divider()
+
                         Button("Delete", role: .destructive) {
                             try? noteStore.delete(id: note.id)
                             if chromeState.selectedNoteID == note.id {
@@ -3675,6 +3732,13 @@ private struct SidebarSessionSection: View {
                     [session.id: anchor]
                 }
                 .contextMenu {
+                    Button("Copy Link") {
+                        copyCherryLink(cherryLink(for: session, projectRoot: workspace.projectRoot))
+                    }
+                    .disabled(workspace.projectRoot == nil)
+
+                    Divider()
+
                     Button("Rename...") {
                         promptRenameSession(session)
                     }

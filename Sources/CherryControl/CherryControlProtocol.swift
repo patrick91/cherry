@@ -98,6 +98,7 @@ public enum CherryControl {
 public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listProjects
     case getProjectStatus
+    case resolveLink(ResolveDeepLinkRequest)
     case listProcesses(ListProcessesRequest)
     case getProcessStatus(ProcessSelectorRequest)
     case getProcessOutput(GetProcessOutputRequest)
@@ -391,6 +392,20 @@ public struct TodoIDRequest: Codable, Equatable, Sendable {
     }
 }
 
+public struct ResolveDeepLinkRequest: Codable, Equatable, Sendable {
+    public let link: String
+    public let includeOutput: Bool?
+    public let startLine: Int?
+    public let lineLimit: Int?
+
+    public init(link: String, includeOutput: Bool? = nil, startLine: Int? = nil, lineLimit: Int? = nil) {
+        self.link = link
+        self.includeOutput = includeOutput
+        self.startLine = startLine
+        self.lineLimit = lineLimit
+    }
+}
+
 public struct CreateNoteRequest: Codable, Equatable, Sendable {
     public let title: String
     public let markdown: String
@@ -674,6 +689,7 @@ public struct CherryControlResponse: Codable, Equatable, Sendable {
 public enum CherryControlResult: Codable, Equatable, Sendable {
     case listProjects(ListProjectsResult)
     case getProjectStatus(ProjectStatusResult)
+    case resolveLink(ResolveDeepLinkResult)
     case listProcesses(ListProcessesResult)
     case getProcessStatus(ProcessStatusResult)
     case getProcessOutput(TerminalOutputResult)
@@ -741,6 +757,7 @@ public struct CherryControlError: Codable, Equatable, Error, Sendable {
 
 public struct TerminalInfo: Codable, Equatable, Sendable {
     public let id: String
+    public let link: String?
     public let title: String
     public let state: String
     public let selected: Bool
@@ -757,11 +774,13 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         selected: Bool,
         workingDirectory: String,
         lineCount: Int,
+        link: String? = nil,
         kind: String? = nil,
         agentName: String? = nil,
         summary: String? = nil
     ) {
         self.id = id
+        self.link = link
         self.title = title
         self.state = state
         self.selected = selected
@@ -851,6 +870,7 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
 
 public struct ProcessSummary: Codable, Equatable, Sendable {
     public let id: String
+    public let link: String?
     public let name: String
     public let kind: String
     public let state: String
@@ -871,6 +891,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
 
     public init(
         id: String,
+        link: String? = nil,
         name: String,
         kind: String,
         state: String,
@@ -890,6 +911,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         commandName: String?
     ) {
         self.id = id
+        self.link = link
         self.name = name
         self.kind = kind
         self.state = state
@@ -1119,13 +1141,15 @@ public struct ProjectNote: Codable, Equatable, Identifiable, Sendable {
 
 public struct NoteInfo: Codable, Equatable, Sendable {
     public let id: String
+    public let link: String?
     public let projectRoot: String
     public let title: String
     public let createdAt: Date
     public let updatedAt: Date
 
-    public init(id: String, projectRoot: String, title: String, createdAt: Date, updatedAt: Date) {
+    public init(id: String, link: String? = nil, projectRoot: String, title: String, createdAt: Date, updatedAt: Date) {
         self.id = id
+        self.link = link
         self.projectRoot = projectRoot
         self.title = title
         self.createdAt = createdAt
@@ -1147,10 +1171,12 @@ public struct ListNotesResult: Codable, Equatable, Sendable {
 
 public struct NoteDetailResult: Codable, Equatable, Sendable {
     public let note: ProjectNote
+    public let link: String?
     public let selected: Bool
 
-    public init(note: ProjectNote, selected: Bool) {
+    public init(note: ProjectNote, link: String? = nil, selected: Bool) {
         self.note = note
+        self.link = link
         self.selected = selected
     }
 }
@@ -1312,6 +1338,7 @@ public struct ProjectTodo: Codable, Equatable, Identifiable, Sendable {
 
 public struct TodoInfo: Codable, Equatable, Sendable {
     public let id: String
+    public let link: String?
     public let projectRoot: String
     public let title: String
     public let status: TodoStatus
@@ -1323,6 +1350,7 @@ public struct TodoInfo: Codable, Equatable, Sendable {
 
     public init(
         id: String,
+        link: String? = nil,
         projectRoot: String,
         title: String,
         status: TodoStatus,
@@ -1333,6 +1361,7 @@ public struct TodoInfo: Codable, Equatable, Sendable {
         updatedAt: Date
     ) {
         self.id = id
+        self.link = link
         self.projectRoot = projectRoot
         self.title = title
         self.status = status
@@ -1358,10 +1387,12 @@ public struct ListTodosResult: Codable, Equatable, Sendable {
 
 public struct TodoDetailResult: Codable, Equatable, Sendable {
     public let todo: ProjectTodo
+    public let link: String?
     public let selected: Bool
 
-    public init(todo: ProjectTodo, selected: Bool) {
+    public init(todo: ProjectTodo, link: String? = nil, selected: Bool) {
         self.todo = todo
+        self.link = link
         self.selected = selected
     }
 }
@@ -1398,14 +1429,16 @@ public struct DeleteTodoResult: Codable, Equatable, Sendable {
 
 public struct TerminalSummaryResult: Codable, Equatable, Sendable {
     public let terminalID: String
+    public let link: String?
     public let title: String
     public let state: String
     public let kind: String?
     public let agentName: String?
     public let summary: String?
 
-    public init(terminalID: String, title: String, state: String, kind: String? = nil, agentName: String? = nil, summary: String? = nil) {
+    public init(terminalID: String, link: String? = nil, title: String, state: String, kind: String? = nil, agentName: String? = nil, summary: String? = nil) {
         self.terminalID = terminalID
+        self.link = link
         self.title = title
         self.state = state
         self.kind = kind
@@ -1416,6 +1449,7 @@ public struct TerminalSummaryResult: Codable, Equatable, Sendable {
 
 public struct RunAgentResult: Codable, Equatable, Sendable {
     public let terminalID: String
+    public let link: String?
     public let title: String
     public let state: String
     public let kind: String?
@@ -1427,6 +1461,7 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
 
     public init(
         terminalID: String,
+        link: String? = nil,
         title: String,
         state: String,
         kind: String?,
@@ -1437,6 +1472,7 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
         output: TerminalOutputResult?
     ) {
         self.terminalID = terminalID
+        self.link = link
         self.title = title
         self.state = state
         self.kind = kind
@@ -1489,6 +1525,49 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
         self.endLineExclusive = endLineExclusive
         self.totalLines = totalLines
         self.lines = lines
+    }
+}
+
+public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
+    public let link: String
+    public let projectKey: String
+    public let kind: CherryDeepLink.TargetKind
+    public let targetID: String
+    public let found: Bool
+    public let projectRoot: String?
+    public let note: ProjectNote?
+    public let noteLink: String?
+    public let todo: ProjectTodo?
+    public let todoLink: String?
+    public let process: ProcessSummary?
+    public let output: TerminalOutputResult?
+
+    public init(
+        link: String,
+        projectKey: String,
+        kind: CherryDeepLink.TargetKind,
+        targetID: String,
+        found: Bool,
+        projectRoot: String?,
+        note: ProjectNote? = nil,
+        noteLink: String? = nil,
+        todo: ProjectTodo? = nil,
+        todoLink: String? = nil,
+        process: ProcessSummary? = nil,
+        output: TerminalOutputResult? = nil
+    ) {
+        self.link = link
+        self.projectKey = projectKey
+        self.kind = kind
+        self.targetID = targetID
+        self.found = found
+        self.projectRoot = projectRoot
+        self.note = note
+        self.noteLink = noteLink
+        self.todo = todo
+        self.todoLink = todoLink
+        self.process = process
+        self.output = output
     }
 }
 

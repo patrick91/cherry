@@ -104,6 +104,8 @@ actor CherryMCPHTTPApp {
     private let serverFactory: ServerFactory
     private let validationPipeline: (any HTTPRequestValidationPipeline)?
     private var channel: Channel?
+    private var eventLoopGroup: MultiThreadedEventLoopGroup?
+    private var cleanupTask: Task<Void, Never>?
     private var sessions: [String: SessionContext] = [:]
 
     nonisolated let logger: Logger
@@ -162,7 +164,8 @@ actor CherryMCPHTTPApp {
     /// This starts the NIO HTTP server and begins accepting connections.
     /// The call blocks until the server is shut down via ``stop()``.
     func start() async throws {
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        eventLoopGroup = group
 
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
@@ -184,19 +187,34 @@ actor CherryMCPHTTPApp {
             ]
         )
 
-        let channel = try await bootstrap.bind(host: configuration.host, port: configuration.port).get()
-        self.channel = channel
+        do {
+            let channel = try await bootstrap.bind(host: configuration.host, port: configuration.port).get()
+            self.channel = channel
+            fputs("[mcp-http] listening on http://\(configuration.host):\(configuration.port)\(configuration.endpoint)\n", stderr)
 
-        Task { await sessionCleanupLoop() }
+            cleanupTask = Task { await sessionCleanupLoop() }
 
-        try await channel.closeFuture.get()
+            try await channel.closeFuture.get()
+            try? await group.shutdownGracefully()
+            if eventLoopGroup === group {
+                eventLoopGroup = nil
+            }
+        } catch {
+            try? await group.shutdownGracefully()
+            eventLoopGroup = nil
+            throw error
+        }
     }
 
     /// Stops the HTTP application gracefully, closing all sessions.
     func stop() async {
+        cleanupTask?.cancel()
+        cleanupTask = nil
         await closeAllSessions()
         try? await channel?.close()
         channel = nil
+        try? await eventLoopGroup?.shutdownGracefully()
+        eventLoopGroup = nil
         logger.info("MCP HTTP application stopped")
     }
 
@@ -305,8 +323,9 @@ actor CherryMCPHTTPApp {
     }
 
     private func sessionCleanupLoop() async {
-        while true {
+        while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled else { return }
 
             let now = Date()
             let expired = sessions.filter { _, context in

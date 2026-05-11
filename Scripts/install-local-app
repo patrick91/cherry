@@ -14,18 +14,14 @@ INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
 cd "$ROOT"
 
 swift build -c "$CONFIGURATION" --product Cherry
-swift build -c "$CONFIGURATION" --product CherryMCP
 
 BINARY_PATH="$(swift build -c "$CONFIGURATION" --show-bin-path)/Cherry"
-MCP_BINARY_PATH="$(swift build -c "$CONFIGURATION" --show-bin-path)/CherryMCP"
 GIT_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
 BUILD_NUMBER="$(date +%Y%m%d%H%M%S)"
 
 rm -rf "$APP_PATH"
-mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources" "$APP_PATH/Contents/Helpers"
+mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/Cherry"
-cp "$MCP_BINARY_PATH" "$APP_PATH/Contents/Helpers/CherryMCP"
-chmod 755 "$APP_PATH/Contents/Helpers/CherryMCP"
 
 cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

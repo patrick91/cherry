@@ -42,22 +42,8 @@ private struct MCPSettingsPane: View {
     @State private var copiedHarness: MCPHarness?
     @State private var socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
 
-    private var appBundleURL: URL? {
-        MCPInstallCommandBuilder.appBundleURL()
-    }
-
-    private var helperURL: URL? {
-        appBundleURL.map(MCPInstallCommandBuilder.helperURL(appBundleURL:))
-    }
-
-    private var helperExists: Bool {
-        guard let appBundleURL else { return false }
-        return MCPInstallCommandBuilder.helperExists(appBundleURL: appBundleURL)
-    }
-
     private var commands: [MCPInstallCommand] {
-        guard let appBundleURL else { return [] }
-        return MCPInstallCommandBuilder.commands(appBundleURL: appBundleURL)
+        MCPInstallCommandBuilder.commands()
     }
 
     var body: some View {
@@ -65,6 +51,13 @@ private struct MCPSettingsPane: View {
             Section("Status") {
                 LabeledContent("MCP server") {
                     Text("Always available")
+                        .foregroundStyle(.secondary)
+                }
+
+                LabeledContent("MCP URL") {
+                    Text(MCPInstallCommandBuilder.serverURL)
+                        .font(.callout.monospaced())
+                        .textSelection(.enabled)
                         .foregroundStyle(.secondary)
                 }
 
@@ -94,31 +87,12 @@ private struct MCPSettingsPane: View {
             }
 
             Section("Install Commands") {
-                if appBundleURL == nil {
-                    Text("Install commands are available when Cherry is running from a macOS app bundle.")
-                        .foregroundStyle(.secondary)
-                } else if !helperExists {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("CherryMCP is not bundled in this app.")
-                            .foregroundStyle(.primary)
-                        if let helperURL {
-                            Text(helperURL.path)
-                                .font(.callout.monospaced())
-                                .textSelection(.enabled)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text("Run the local app installer again to bundle the helper.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    ForEach(commands) { installCommand in
-                        MCPInstallCommandRow(
-                            installCommand: installCommand,
-                            isCopied: copiedHarness == installCommand.harness
-                        ) {
-                            copy(installCommand)
-                        }
+                ForEach(commands) { installCommand in
+                    MCPInstallCommandRow(
+                        installCommand: installCommand,
+                        isCopied: copiedHarness == installCommand.harness
+                    ) {
+                        copy(installCommand)
                     }
                 }
             }

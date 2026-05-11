@@ -84,6 +84,7 @@ struct CherryApp: App {
     @StateObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var agentSettings = AgentSettings.shared
     @State private var controlServer: CherryControlServer?
+    @State private var mcpHTTPServer: CherryMCPHTTPServer?
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
@@ -103,7 +104,10 @@ struct CherryApp: App {
                         ProjectWindowRegistry.shared.activeChromeState
                     })
                     server.start()
+                    let mcpServer = CherryMCPHTTPServer()
+                    mcpServer.start()
                     controlServer = server
+                    mcpHTTPServer = mcpServer
                 }
         }
         .defaultSize(width: 1_340, height: 840)

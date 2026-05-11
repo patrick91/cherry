@@ -2,29 +2,9 @@ import CherryControl
 import Foundation
 import MCP
 
-private let client = CherryControlClient()
+private let cherryMCPClient = CherryControlClient()
 
-let server = Server(
-    name: "cherry",
-    version: "0.1.0",
-    title: "Cherry",
-    instructions: "Control the visible Cherry terminal app through local-only IPC. Tools do not change Cherry's visible selection unless the tool name starts with select_.",
-    capabilities: .init(tools: .init(listChanged: false))
-)
-
-await server.withMethodHandler(ListTools.self) { _ in
-    ListTools.Result(tools: CherryMCPTools.all)
-}
-
-await server.withMethodHandler(CallTool.self) { params in
-    await CherryMCPTools.call(name: params.name, arguments: params.arguments ?? [:])
-}
-
-try await server.start(transport: StdioTransport())
-await server.waitUntilCompleted()
-await server.stop()
-
-private enum CherryMCPTools {
+enum CherryMCPTools {
     static let all: [Tool] = [
         tool(
             "get_status",
@@ -466,7 +446,7 @@ private enum CherryMCPTools {
                 return try statusResult()
             }
             let request = scopedRequest(try controlRequest(name: name, arguments: arguments), arguments: arguments)
-            let response = try client.send(request)
+            let response = try cherryMCPClient.send(request)
             if let error = response.error {
                 return try toolError(error)
             }
@@ -517,7 +497,7 @@ private enum CherryMCPTools {
 
     private static func inferredProjectRootFromWorkingDirectory() -> String? {
         let workingDirectory = standardizedPath(FileManager.default.currentDirectoryPath)
-        guard let response = try? client.send(.listProjects),
+        guard let response = try? cherryMCPClient.send(.listProjects),
               case .listProjects(let payload)? = response.result
         else {
             return nil
@@ -543,7 +523,7 @@ private enum CherryMCPTools {
         let socketExists = FileManager.default.fileExists(atPath: socketURL.path)
 
         do {
-            let response = try client.send(scopedRequest(.listTerminals))
+            let response = try cherryMCPClient.send(scopedRequest(.listTerminals))
             if let error = response.error {
                 return try encodedResult(MCPStatusPayload(
                     socketPath: socketURL.path,

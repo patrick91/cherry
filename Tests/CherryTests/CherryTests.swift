@@ -1980,45 +1980,28 @@ import Testing
     }
 }
 
-@Test func mcpInstallCommandsUseBundledHelperPath() async throws {
-    let appURL = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app", isDirectory: true)
-    let commands = MCPInstallCommandBuilder.commands(appBundleURL: appURL)
+@Test func mcpInstallCommandsUseHTTPServerURL() async throws {
+    let commands = MCPInstallCommandBuilder.commands()
 
-    #expect(MCPInstallCommandBuilder.helperURL(appBundleURL: appURL).path == "/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP")
     #expect(commands == [
         MCPInstallCommand(
             harness: .codex,
-            command: "codex mcp add cherry -- '/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP'"
+            command: "codex mcp add cherry --url http://127.0.0.1:61234/mcp"
         ),
         MCPInstallCommand(
             harness: .claude,
-            command: "claude mcp add --scope user cherry -- '/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP'"
+            command: "claude mcp add --transport http --scope user cherry http://127.0.0.1:61234/mcp"
         )
     ])
-}
-
-@Test func cherryControlSocketIsSharedByAppAndBundledHelper() {
-    let appExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app/Contents/MacOS/Cherry")
-    let helperExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry Local.app/Contents/Helpers/CherryMCP")
-
-    let appSocket = CherryControl.socketURL(environment: [:], executableURL: appExecutable)
-    let helperSocket = CherryControl.socketURL(environment: [:], executableURL: helperExecutable)
-
-    #expect(appSocket == helperSocket)
-    #expect(appSocket.path.contains("/Cherry-Local-"))
-    #expect(appSocket.lastPathComponent == "control.sock")
 }
 
 @Test func cherryControlSocketSeparatesInstalledAppFromSwiftPMBuild() {
     let appExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry.app/Contents/MacOS/Cherry")
     let swiftPMExecutable = URL(fileURLWithPath: "/Users/patrick/github/patrick91/cherry/.build/arm64-apple-macosx/debug/Cherry")
-    let swiftPMHelper = URL(fileURLWithPath: "/Users/patrick/github/patrick91/cherry/.build/arm64-apple-macosx/debug/CherryMCP")
 
     let appSocket = CherryControl.socketURL(environment: [:], executableURL: appExecutable)
     let swiftPMSocket = CherryControl.socketURL(environment: [:], executableURL: swiftPMExecutable)
-    let swiftPMHelperSocket = CherryControl.socketURL(environment: [:], executableURL: swiftPMHelper)
 
-    #expect(swiftPMSocket == swiftPMHelperSocket)
     #expect(appSocket != swiftPMSocket)
     #expect(swiftPMSocket.path.contains("/cherry-dev-"))
 }
@@ -2035,31 +2018,6 @@ import Testing
 
     #expect(explicitSocket.path == "/tmp/cherry-custom/control.sock")
     #expect(explicitNamespaceSocket.path.contains("/Cherry-Dev-Preview/control.sock"))
-}
-
-@Test func mcpInstallCommandsShellQuoteApostrophes() async throws {
-    #expect(MCPInstallCommandBuilder.shellQuote("/tmp/Patrick's Apps/Cherry.app") == "'/tmp/Patrick'\\''s Apps/Cherry.app'")
-}
-
-@Test func mcpHelperExistsRequiresExecutableHelper() async throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let appURL = directory.appendingPathComponent("Cherry.app", isDirectory: true)
-    let helperURL = MCPInstallCommandBuilder.helperURL(appBundleURL: appURL)
-    defer {
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    try FileManager.default.createDirectory(
-        at: helperURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-    )
-    try Data().write(to: helperURL)
-    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: helperURL.path)
-    #expect(MCPInstallCommandBuilder.helperExists(appBundleURL: appURL) == false)
-
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperURL.path)
-    #expect(MCPInstallCommandBuilder.helperExists(appBundleURL: appURL) == true)
 }
 
 @Test func agentSummaryRunnerSanitizesOutput() async throws {

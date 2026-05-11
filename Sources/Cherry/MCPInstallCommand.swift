@@ -24,39 +24,20 @@ struct MCPInstallCommand: Identifiable, Equatable {
 }
 
 enum MCPInstallCommandBuilder {
-    static func appBundleURL(bundle: Bundle = .main) -> URL? {
-        let bundleURL = bundle.bundleURL
-        guard bundleURL.pathExtension == "app" else { return nil }
-        return bundleURL
+    static var serverURL: String {
+        CherryMCPHTTPServer.url
     }
 
-    static func helperURL(appBundleURL: URL) -> URL {
-        appBundleURL
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("Helpers", isDirectory: true)
-            .appendingPathComponent("CherryMCP", isDirectory: false)
-    }
-
-    static func helperExists(appBundleURL: URL, fileManager: FileManager = .default) -> Bool {
-        let path = helperURL(appBundleURL: appBundleURL).path
-        return fileManager.isExecutableFile(atPath: path)
-    }
-
-    static func commands(appBundleURL: URL) -> [MCPInstallCommand] {
-        let helperPath = shellQuote(helperURL(appBundleURL: appBundleURL).path)
+    static func commands() -> [MCPInstallCommand] {
         return [
             MCPInstallCommand(
                 harness: .codex,
-                command: "codex mcp add cherry -- \(helperPath)"
+                command: "codex mcp add cherry --url \(serverURL)"
             ),
             MCPInstallCommand(
                 harness: .claude,
-                command: "claude mcp add --scope user cherry -- \(helperPath)"
+                command: "claude mcp add --transport http --scope user cherry \(serverURL)"
             )
         ]
-    }
-
-    static func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }

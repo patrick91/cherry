@@ -58,24 +58,17 @@ Inside the prototype:
 
 ## MCP Control
 
-Cherry also bundles a local MCP helper that controls the visible app. After
-installing the local app, register the bundled helper with your harness:
+Cherry serves a local HTTP MCP endpoint from the running app. After installing
+and opening the local app, register that endpoint with your harness:
 
 ```bash
-codex mcp add cherry -- "$HOME/Applications/Cherry.app/Contents/Helpers/CherryMCP"
-claude mcp add --scope user cherry -- "$HOME/Applications/Cherry.app/Contents/Helpers/CherryMCP"
+codex mcp add cherry --url http://127.0.0.1:61234/mcp
+claude mcp add --transport http --scope user cherry http://127.0.0.1:61234/mcp
 ```
 
-During development, you can also run the helper from SwiftPM:
-
-```bash
-swift run CherryMCP
-```
-
-Run the Cherry app first. The app listens on an instance-scoped Unix socket
-under `/tmp/cherry-$UID/`; the bundled helper derives the same socket from the
-app bundle, while SwiftPM builds derive it from their build directory. The MCP
-helper exposes tools for listing, creating, selecting, reading, searching,
+Run the Cherry app first. The app listens on `127.0.0.1:61234` and forwards MCP
+tool calls to Cherry's instance-scoped Unix control socket under `/tmp/cherry-$UID/`.
+The MCP server exposes tools for listing, creating, selecting, reading, searching,
 clearing, restarting, closing, and sending input to visible Cherry terminal
 tabs. It can also list configured agent tools and launch a new configured agent
 in the active project window.

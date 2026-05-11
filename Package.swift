@@ -10,11 +10,12 @@ let package = Package(
     ],
     products: [
         .executable(name: "Cherry", targets: ["Cherry"]),
-        .executable(name: "CherryMCP", targets: ["CherryMCP"]),
     ],
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
     targets: [
         .target(
@@ -26,16 +27,14 @@ let package = Package(
                 "CherryControl",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ],
             resources: [
                 .process("Resources")
-            ]
-        ),
-        .executableTarget(
-            name: "CherryMCP",
-            dependencies: [
-                "CherryControl",
-                .product(name: "MCP", package: "swift-sdk"),
             ]
         ),
         .testTarget(

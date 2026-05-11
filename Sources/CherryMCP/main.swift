@@ -191,164 +191,164 @@ private enum CherryMCPTools {
         ),
         tool(
             "list_notes",
-            "List Cherry notes for the active project.",
-            properties: [:]
+            "List Cherry notes for the current or specified project.",
+            properties: projectScopedProperties()
         ),
         tool(
             "list_todos",
-            "List Cherry todos for the active project.",
-            properties: [:]
+            "List Cherry todos for the current or specified project.",
+            properties: projectScopedProperties()
         ),
         tool(
             "create_note",
             "Create a project-scoped Markdown note in Cherry without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "title": string("Note title."),
                 "markdown": string("Markdown content.")
-            ],
+            ]),
             required: ["title", "markdown"]
         ),
         tool(
             "get_note",
             "Read a Cherry Markdown note.",
-            properties: ["note_id": string("Cherry note UUID.")],
+            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "update_note",
             "Update a Cherry Markdown note title and/or content without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "title": string("Optional replacement title."),
                 "markdown": string("Optional replacement Markdown content.")
-            ],
+            ]),
             required: ["note_id"]
         ),
         tool(
             "append_note",
             "Append Markdown to a Cherry note without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "markdown": string("Markdown content to append.")
-            ],
+            ]),
             required: ["note_id", "markdown"]
         ),
         tool(
             "rename_note",
             "Rename a Cherry note without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "title": string("Replacement note title.")
-            ],
+            ]),
             required: ["note_id", "title"]
         ),
         tool(
             "search_notes",
-            "Search Cherry note titles and Markdown for the active project without changing the Cherry UI.",
-            properties: [
+            "Search Cherry note titles and Markdown for the current or specified project without changing the Cherry UI.",
+            properties: projectScopedProperties([
                 "query": string("Text to search for."),
                 "case_sensitive": boolean("Whether matching is case-sensitive."),
                 "max_matches": integer("Maximum matches. Max 500.")
-            ],
+            ]),
             required: ["query"]
         ),
         tool(
             "delete_note",
             "Delete a Cherry Markdown note.",
-            properties: ["note_id": string("Cherry note UUID.")],
+            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "select_note",
             "Explicitly open an existing Cherry Markdown note for review/editing. Use only when the user asks to switch the Cherry UI.",
-            properties: ["note_id": string("Cherry note UUID.")],
+            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "create_todo",
             "Create a project-scoped Cherry todo without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "title": string("Todo title."),
                 "markdown": string("Optional Markdown details."),
                 "status": string("Optional status: backlog, ready, doing, blocked, or done."),
                 "tags": stringArray("Optional todo tag names.")
-            ],
+            ]),
             required: ["title"]
         ),
         tool(
             "get_todo",
             "Read a Cherry todo, including comments.",
-            properties: ["todo_id": string("Cherry todo UUID.")],
+            properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "update_todo",
             "Update a Cherry todo title, Markdown details, and/or status without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "title": string("Optional replacement title."),
                 "markdown": string("Optional replacement Markdown details."),
                 "status": string("Optional status: backlog, ready, doing, blocked, or done."),
                 "tags": stringArray("Optional replacement todo tag names. Empty array clears tags.")
-            ],
+            ]),
             required: ["todo_id"]
         ),
         tool(
             "move_todo",
             "Move a Cherry todo to another status and/or position without opening or selecting it. If status changes and after_todo_id is omitted, the todo is appended to the target status.",
-            properties: [
+            properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "status": string("Optional target status: backlog, ready, doing, blocked, or done."),
                 "after_todo_id": string("Optional todo UUID in the target status to place this todo after.")
-            ],
+            ]),
             required: ["todo_id"]
         ),
         tool(
             "delete_todo",
             "Delete a Cherry todo.",
-            properties: ["todo_id": string("Cherry todo UUID.")],
+            properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "select_todo",
             "Explicitly open an existing Cherry todo in the todo pane. Use only when the user asks to switch the Cherry UI.",
-            properties: ["todo_id": string("Cherry todo UUID.")],
+            properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "add_todo_comment",
             "Append a comment to a Cherry todo without opening or selecting it. Pass terminal_id for agent attribution when commenting from a Cherry agent session.",
-            properties: [
+            properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "markdown": string("Comment Markdown."),
                 "author": string("Optional author label used when terminal_id is not provided."),
                 "terminal_id": string("Optional Cherry agent terminal UUID for attribution.")
-            ],
+            ]),
             required: ["todo_id", "markdown"]
         ),
         tool(
             "list_todo_comments",
             "List comments for a Cherry todo without opening or selecting it.",
-            properties: ["todo_id": string("Cherry todo UUID.")],
+            properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "update_todo_comment",
             "Update a Cherry todo comment without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "comment_id": string("Cherry todo comment UUID."),
                 "markdown": string("Replacement comment Markdown.")
-            ],
+            ]),
             required: ["todo_id", "comment_id", "markdown"]
         ),
         tool(
             "delete_todo_comment",
             "Delete a Cherry todo comment without opening or selecting it.",
-            properties: [
+            properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "comment_id": string("Cherry todo comment UUID.")
-            ],
+            ]),
             required: ["todo_id", "comment_id"]
         ),
         tool(
@@ -465,7 +465,7 @@ private enum CherryMCPTools {
             if name == "get_status" {
                 return try statusResult()
             }
-            let request = scopedRequest(try controlRequest(name: name, arguments: arguments))
+            let request = scopedRequest(try controlRequest(name: name, arguments: arguments), arguments: arguments)
             let response = try client.send(request)
             if let error = response.error {
                 return try toolError(error)
@@ -482,15 +482,60 @@ private enum CherryMCPTools {
         }
     }
 
-    private static func scopedRequest(_ request: CherryControlRequest) -> CherryControlRequest {
-        guard let projectRoot = ProcessInfo.processInfo.environment[CherryControl.projectRootEnvironmentKey]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !projectRoot.isEmpty
+    private static func scopedRequest(_ request: CherryControlRequest, arguments: [String: Value] = [:]) -> CherryControlRequest {
+        if case .scoped = request {
+            return request
+        }
+
+        guard let projectRoot = explicitProjectRoot(in: arguments)
+            ?? environmentProjectRoot()
+            ?? inferredProjectRootFromWorkingDirectory()
         else {
             return request
         }
 
         return .scoped(.init(projectRoot: projectRoot, request: request))
+    }
+
+    private static func explicitProjectRoot(in arguments: [String: Value]) -> String? {
+        trimmedProjectRoot(stringArgument("project_root", in: arguments))
+    }
+
+    private static func environmentProjectRoot() -> String? {
+        trimmedProjectRoot(ProcessInfo.processInfo.environment[CherryControl.projectRootEnvironmentKey])
+    }
+
+    private static func trimmedProjectRoot(_ value: String?) -> String? {
+        guard let projectRoot = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !projectRoot.isEmpty
+        else {
+            return nil
+        }
+        return projectRoot
+    }
+
+    private static func inferredProjectRootFromWorkingDirectory() -> String? {
+        let workingDirectory = standardizedPath(FileManager.default.currentDirectoryPath)
+        guard let response = try? client.send(.listProjects),
+              case .listProjects(let payload)? = response.result
+        else {
+            return nil
+        }
+
+        return payload.projects
+            .map(\.root)
+            .map(standardizedPath)
+            .filter { contains(path: workingDirectory, inProjectRoot: $0) }
+            .max { $0.count < $1.count }
+    }
+
+    private static func standardizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+
+    private static func contains(path: String, inProjectRoot projectRoot: String) -> Bool {
+        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
     }
 
     private static func statusResult() throws -> CallTool.Result {
@@ -1055,6 +1100,16 @@ private enum CherryMCPTools {
         var properties: [String: Value] = [
             "process_id": string("Stable Cherry process UUID. Preferred when known."),
             "process_name": string("Process name/title when process_id is not known.")
+        ]
+        for (key, value) in extra {
+            properties[key] = value
+        }
+        return properties
+    }
+
+    private static func projectScopedProperties(_ extra: [String: Value] = [:]) -> [String: Value] {
+        var properties: [String: Value] = [
+            "project_root": string("Optional Cherry project root. Defaults to CHERRY_PROJECT_ROOT or the MCP helper's current working directory when it is inside an open Cherry project.")
         ]
         for (key, value) in extra {
             properties[key] = value

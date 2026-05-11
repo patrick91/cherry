@@ -1351,11 +1351,27 @@ final class CherryControlServer: @unchecked Sendable {
             ?? workspaceForProjectRootProvider(projectRoot) {
             return registeredWorkspace
         }
+        if let containingProjectRoot = containingOpenProjectRoot(for: projectRoot),
+           let registeredWorkspace = workspaceForProjectRootProvider(containingProjectRoot) {
+            return registeredWorkspace
+        }
 
         throw CherryControlError(
             code: "project_unavailable",
             message: "Cherry project is not open for scoped request: \(rawProjectRoot)."
         )
+    }
+
+    @MainActor
+    private func containingOpenProjectRoot(for path: String) -> String? {
+        openProjectRootsProvider()
+            .map(standardizedProjectRoot)
+            .filter { contains(path: path, inProjectRoot: $0) }
+            .max { $0.count < $1.count }
+    }
+
+    private func contains(path: String, inProjectRoot projectRoot: String) -> Bool {
+        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
     }
 
     private func standardizedProjectRoot(_ projectRoot: String) -> String {

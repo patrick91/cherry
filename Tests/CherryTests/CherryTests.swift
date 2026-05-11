@@ -776,6 +776,14 @@ import Testing
     }
     #expect(list.activeProjectRoot == projectRootB.path)
     #expect(list.notes.map(\.title) == ["Scoped B"])
+
+    let scopedSubdirectoryResponse = try await send(.scoped(.init(
+        projectRoot: projectRootB.appendingPathComponent("Sources").path,
+        request: .createNote(.init(title: "Scoped B Subdir", markdown: "B subdir"))
+    )))
+    #expect(scopedSubdirectoryResponse.error == nil)
+    #expect(noteStoreA.notes.isEmpty)
+    #expect(Set(noteStoreB.notes.map(\.title)) == ["Scoped B", "Scoped B Subdir"])
 }
 
 @MainActor

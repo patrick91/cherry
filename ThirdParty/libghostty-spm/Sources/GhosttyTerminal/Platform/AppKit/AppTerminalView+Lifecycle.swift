@@ -51,6 +51,7 @@
             super.viewDidMoveToWindow()
             removeWindowObservers()
             if window != nil {
+                updateSurfaceVisibility()
                 // SwiftUI/AppKit can temporarily detach and reattach the terminal view while
                 // diffing the view hierarchy. Rebuilding on every reattach discards Ghostty's
                 // scrollback/state, so only create a new surface when one does not already exist.
@@ -61,8 +62,7 @@
                 }
                 updateMetalLayerMetrics()
                 updateColorScheme()
-                core.startDisplayLink()
-                core.requestImmediateTick()
+                updateSurfaceVisibility()
 
                 NotificationCenter.default.addObserver(
                     self,
@@ -76,13 +76,33 @@
                     name: NSWindow.didResignKeyNotification,
                     object: window
                 )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowVisibilityDidChange),
+                    name: NSWindow.didMiniaturizeNotification,
+                    object: window
+                )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowVisibilityDidChange),
+                    name: NSWindow.didDeminiaturizeNotification,
+                    object: window
+                )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowVisibilityDidChange),
+                    name: NSWindow.didChangeOcclusionStateNotification,
+                    object: window
+                )
             } else {
                 core.stopDisplayLink()
                 core.setFocus(false)
+                core.setDisplayVisible(false)
             }
         }
 
         @objc internal func windowDidBecomeKey(_: Notification) {
+            updateSurfaceVisibility()
             let focused = window?.isKeyWindow == true
                 && window?.firstResponder === self
             core.setFocus(focused)
@@ -90,6 +110,11 @@
 
         @objc internal func windowDidResignKey(_: Notification) {
             core.setFocus(false)
+            updateSurfaceVisibility()
+        }
+
+        @objc internal func windowVisibilityDidChange(_: Notification) {
+            updateSurfaceVisibility()
         }
 
         private func removeWindowObservers() {
@@ -106,6 +131,37 @@
                 name: NSWindow.didResignKeyNotification,
                 object: nil
             )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.didMiniaturizeNotification,
+                object: nil
+            )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.didDeminiaturizeNotification,
+                object: nil
+            )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: nil
+            )
+        }
+
+        private func updateSurfaceVisibility() {
+            guard let window else {
+                core.setDisplayVisible(false)
+                return
+            }
+
+            let isRenderable = window.isKeyWindow
+                && window.isVisible
+                && !window.isMiniaturized
+                && window.occlusionState.contains(.visible)
+            core.setDisplayVisible(isRenderable)
+            if isRenderable {
+                core.requestImmediateTick()
+            }
         }
 
         override func setFrameSize(_ newSize: NSSize) {

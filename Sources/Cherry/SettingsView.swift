@@ -620,7 +620,7 @@ private struct SummarySettingsSection: View {
         Section("Auto-Summarization") {
             SummarySettingsRow {
                 Text("Summary engine")
-                Text("Cherry keeps Codex MCP available for agent summaries and sends a compact rendered-text snapshot from recent terminal output, not the full raw transcript.")
+                Text("Cherry uses Codex MCP for background agent summaries and sends a compact rendered-text snapshot from recent terminal output, not the full raw transcript.")
                     .foregroundStyle(.secondary)
             } control: {
                 HStack(spacing: 8) {

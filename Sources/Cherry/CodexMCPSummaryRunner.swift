@@ -63,6 +63,8 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         timeout: TimeInterval
     ) throws -> AgentSummaryRunner.Result {
         try ensureServer()
+        defer { stopServer() }
+
         let id = nextID()
         let summaryModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? AgentSummaryTool.codex.defaultModel

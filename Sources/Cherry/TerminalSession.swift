@@ -1603,6 +1603,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func scheduleSummaryIfNeeded() {
         guard kind == .agent else { return }
+        guard !ProjectWindowRegistry.shared.isSessionActive(self) else { return }
 
         let settings = AgentSettings.shared
         let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)

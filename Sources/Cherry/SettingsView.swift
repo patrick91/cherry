@@ -174,16 +174,22 @@ private struct ProjectSettingsPane: View {
 
             VStack(spacing: 0) {
                 ForEach(settings.projects) { project in
-                    Button {
-                        openProject(project)
-                    } label: {
-                        ProjectRow(project: project)
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button("Remove Project", role: .destructive) {
-                            settings.removeProject(project)
+                    VStack(spacing: 0) {
+                        Button {
+                            openProject(project)
+                        } label: {
+                            ProjectRow(project: project)
                         }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Remove Project", role: .destructive) {
+                                settings.removeProject(project)
+                            }
+                        }
+
+                        ProjectFeatureControls(settings: settings, project: project)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
                     }
 
                     Divider()
@@ -270,6 +276,69 @@ private struct ProjectRow: View {
         .frame(height: 62)
         .padding(.horizontal, 16)
         .contentShape(Rectangle())
+    }
+}
+
+private struct ProjectFeatureControls: View {
+    @ObservedObject var settings: AgentSettings
+    let project: CherryProject
+
+    @State private var storage: ProjectFeatureStorage = .local
+    @State private var errorMessage: String?
+
+    private var features: ProjectFeatureSettings {
+        settings.projectFeatures(for: project.root)
+    }
+
+    private var hasLocalOverrides: Bool {
+        !settings.projectFeatureOverrides(for: project.root).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Toggle("Notes", isOn: featureBinding(\.notesEnabled))
+                Toggle("Todos", isOn: featureBinding(\.todosEnabled))
+
+                Spacer()
+
+                Picker("Storage", selection: $storage) {
+                    Text("Local").tag(ProjectFeatureStorage.local)
+                    Text("cherry.toml").tag(ProjectFeatureStorage.projectFile)
+                }
+                .labelsHidden()
+                .frame(width: 130)
+
+                if hasLocalOverrides {
+                    Button("Clear Local") {
+                        settings.clearLocalProjectFeatureOverrides(for: project.root)
+                    }
+                    .help("Use cherry.toml feature settings for this project")
+                }
+            }
+            .toggleStyle(.checkbox)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func featureBinding(_ keyPath: WritableKeyPath<ProjectFeatureSettings, Bool>) -> Binding<Bool> {
+        Binding {
+            features[keyPath: keyPath]
+        } set: { newValue in
+            var next = features
+            next[keyPath: keyPath] = newValue
+            do {
+                try settings.setProjectFeatures(next, for: project.root, storage: storage)
+                errorMessage = nil
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 

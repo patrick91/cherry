@@ -669,6 +669,38 @@ import Testing
 }
 
 @MainActor
+@Test func controlServerRejectsDisabledProjectNoteAndTodoTools() async throws {
+    let harness = try ControlServerHarness(enableProjectFeatures: false)
+    defer {
+        harness.stop()
+    }
+    harness.server.start()
+
+    let noteResponse = try await harness.send(.createNote(.init(
+        title: "Disabled Note",
+        markdown: "No write"
+    )))
+    #expect(noteResponse.error?.code == "feature_disabled")
+    #expect(harness.noteStore.notes.isEmpty)
+
+    let todoResponse = try await harness.send(.createTodo(.init(
+        title: "Disabled Todo",
+        markdown: "No write"
+    )))
+    #expect(todoResponse.error?.code == "feature_disabled")
+    #expect(harness.todoStore.todos.isEmpty)
+
+    let statusResponse = try await harness.send(.getProjectStatus)
+    guard case .getProjectStatus(let status)? = statusResponse.result else {
+        Issue.record("Expected getProjectStatus result, got \(String(describing: statusResponse))")
+        return
+    }
+    #expect(status.features == ProjectFeatureAvailability(notesEnabled: false, todosEnabled: false))
+    #expect(status.noteCount == nil)
+    #expect(status.todoCount == nil)
+}
+
+@MainActor
 @Test func controlServerScopesNotesToRequestedProject() async throws {
     let defaultsName = "CherryTests.ScopedControlServer.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
@@ -692,6 +724,8 @@ import Testing
     try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
     _ = settings.addProject(path: projectRootA.path)
     _ = settings.addProject(path: projectRootB.path)
+    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootA.path, storage: .local)
+    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootB.path, storage: .local)
 
     let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path)
     let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path)
@@ -1381,6 +1415,27 @@ import Testing
     workspace.select(background)
     #expect(background.hasUnreadNotification == false)
     #expect(background.lastNotification == nil)
+}
+
+@MainActor
+@Test func workspaceCloseReleasesGhosttyBridge() async throws {
+    let workspace = TerminalWorkspace()
+    defer {
+        workspace.sessions.forEach {
+            $0.releaseGhosttyBridge()
+            $0.stop()
+        }
+    }
+
+    let session = workspace.addSession(title: "Bridge", select: false)
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    _ = session.ghosttyBridge
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    workspace.close(session)
+
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount)
+    #expect(session.rawOutputObserverCount == 0)
 }
 
 @MainActor
@@ -2373,6 +2428,63 @@ import Testing
 }
 
 @MainActor
+@Test func projectFeaturesDefaultDisabledAndLocalOverridesWin() async throws {
+    let defaultsName = "CherryTests.ProjectFeatures.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: false))
+
+    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+
+    try settings.setProjectFeatures(.init(notesEnabled: false, todosEnabled: true), for: directory.path, storage: .local)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    #expect(AgentSettings(defaults: defaults).projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+
+    settings.clearLocalProjectFeatureOverrides(for: directory.path)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+}
+
+@MainActor
+@Test func cherryTomlFeatureSettingsPreserveManagedCommands() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
+        projectRoot: directory.path
+    )
+    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: false, todosEnabled: true), projectRoot: directory.path)
+
+    let contents = try String(contentsOf: CherryProjectFile.fileURL(projectRoot: directory.path), encoding: .utf8)
+    #expect(contents.contains("[features]"))
+    #expect(contents.contains("notes = false"))
+    #expect(contents.contains("todos = true"))
+    #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
+    #expect(contents.contains("[[commands]]"))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
+}
+
+@MainActor
 @Test func agentSettingsCanAddProjectsWithoutGlobalSelection() async throws {
     let defaultsName = "CherryTests.Projects.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
@@ -2662,7 +2774,7 @@ private final class ControlServerHarness {
     let socketURL: URL
     let server: CherryControlServer
 
-    init(serviceDetector: (any ServiceDetecting)? = nil) throws {
+    init(serviceDetector: (any ServiceDetecting)? = nil, enableProjectFeatures: Bool = true) throws {
         defaultsName = "CherryTests.ControlServer.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: defaultsName))
 
@@ -2682,6 +2794,13 @@ private final class ControlServerHarness {
 
         settings = AgentSettings(defaults: defaults)
         _ = settings.addProject(path: projectRoot.path)
+        if enableProjectFeatures {
+            try settings.setProjectFeatures(
+                ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+                for: projectRoot.path,
+                storage: .local
+            )
+        }
         workspace = TerminalWorkspace(projectRoot: projectRoot.path)
         noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
         todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todosRoot)

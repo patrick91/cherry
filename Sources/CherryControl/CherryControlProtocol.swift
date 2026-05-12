@@ -819,12 +819,30 @@ public struct ProjectInfo: Codable, Equatable, Sendable {
     public let name: String
     public let active: Bool
     public let open: Bool
+    public let features: ProjectFeatureAvailability
 
-    public init(root: String, name: String, active: Bool, open: Bool) {
+    public init(
+        root: String,
+        name: String,
+        active: Bool,
+        open: Bool,
+        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false)
+    ) {
         self.root = root
         self.name = name
         self.active = active
         self.open = open
+        self.features = features
+    }
+}
+
+public struct ProjectFeatureAvailability: Codable, Equatable, Sendable {
+    public let notesEnabled: Bool
+    public let todosEnabled: Bool
+
+    public init(notesEnabled: Bool, todosEnabled: Bool) {
+        self.notesEnabled = notesEnabled
+        self.todosEnabled = todosEnabled
     }
 }
 
@@ -857,6 +875,7 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
     public let processCounts: ProcessCounts
     public let noteCount: Int?
     public let todoCount: Int?
+    public let features: ProjectFeatureAvailability
     public let selectedProcessID: String?
     public let selectedProcessName: String?
     public let health: String
@@ -866,6 +885,7 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
         processCounts: ProcessCounts,
         noteCount: Int?,
         todoCount: Int?,
+        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false),
         selectedProcessID: String?,
         selectedProcessName: String?,
         health: String
@@ -874,6 +894,7 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
         self.processCounts = processCounts
         self.noteCount = noteCount
         self.todoCount = todoCount
+        self.features = features
         self.selectedProcessID = selectedProcessID
         self.selectedProcessName = selectedProcessName
         self.health = health

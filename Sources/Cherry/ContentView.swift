@@ -11,6 +11,7 @@ struct ContentView: View {
     private let floatingSidebarBottomInset: CGFloat = 3
 
     @Environment(\.openSettings) private var openSettings
+    @ObservedObject private var agentSettings = AgentSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
@@ -206,9 +207,13 @@ struct ContentView: View {
             syncTrafficLights()
             chromeState.dockedSidebarWidth = newWidth
         }
+        .onChange(of: agentSettings.projectFeatures(for: projectRoot)) { _, features in
+            syncDisabledFeatureSelection(features: features)
+        }
         .onAppear {
             storedSidebarWidth = Double(sidebarWidth)
             chromeState.dockedSidebarWidth = sidebarWidth
+            syncDisabledFeatureSelection(features: agentSettings.projectFeatures(for: projectRoot))
             trafficLights.seedTarget(
                 docked: isSidebarHidden ? 0 : sidebarWidth,
                 floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
@@ -319,6 +324,15 @@ struct ContentView: View {
             floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
             sidebarWidth: sidebarWidth
         )
+    }
+
+    private func syncDisabledFeatureSelection(features: ProjectFeatureSettings) {
+        if !features.notesEnabled, chromeState.selectedNoteID != nil {
+            chromeState.selectTerminal()
+        }
+        if !features.todosEnabled, chromeState.isTodoPanePresented {
+            chromeState.selectTerminal()
+        }
     }
 
     private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
@@ -472,10 +486,11 @@ private struct DetailPaneView: View {
     let includeLeadingPadding: Bool
 
     var body: some View {
+        let features = agentSettings.projectFeatures(for: projectRoot)
         Group {
-            if let note = selectedNote {
+            if features.notesEnabled, let note = selectedNote {
                 NoteDetailView(note: note, noteStore: noteStore)
-            } else if chromeState.isTodoPanePresented {
+            } else if features.todosEnabled, chromeState.isTodoPanePresented {
                 TodoPaneView(todoStore: todoStore, chromeState: chromeState)
             } else if let idleCommand = focusedIdleCommand {
                 IdleCommandView(
@@ -2750,6 +2765,7 @@ private struct SidebarTabsView: View {
     let openProject: (CherryProject) -> Void
 
     var body: some View {
+        let features = agentSettings.projectFeatures(for: projectRoot)
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -2784,21 +2800,25 @@ private struct SidebarTabsView: View {
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
-                    SidebarTodosSection(
-                        todoStore: todoStore,
-                        chromeState: chromeState,
-                        presentation: presentation,
-                        shortcutNumber: todoBoardShortcutNumber,
-                        showShortcutHint: chromeState.isCommandKeyPressed
-                    )
+                    if features.todosEnabled {
+                        SidebarTodosSection(
+                            todoStore: todoStore,
+                            chromeState: chromeState,
+                            presentation: presentation,
+                            shortcutNumber: todoBoardShortcutNumber,
+                            showShortcutHint: chromeState.isCommandKeyPressed
+                        )
+                    }
 
-                    SidebarNotesSection(
-                        noteStore: noteStore,
-                        chromeState: chromeState,
-                        presentation: presentation,
-                        shortcutStartIndex: todoBoardShortcutNumber,
-                        showShortcutHints: chromeState.isCommandKeyPressed
-                    )
+                    if features.notesEnabled {
+                        SidebarNotesSection(
+                            noteStore: noteStore,
+                            chromeState: chromeState,
+                            presentation: presentation,
+                            shortcutStartIndex: notesShortcutStartIndex(features: features),
+                            showShortcutHints: chromeState.isCommandKeyPressed
+                        )
+                    }
                 }
                 // Keep the sidebar's text column aligned with the native
                 // traffic-light leading edge in both docked and floating
@@ -2832,6 +2852,13 @@ private struct SidebarTabsView: View {
             + workspace.terminalSessions.count
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + 1
+    }
+
+    private func notesShortcutStartIndex(features: ProjectFeatureSettings) -> Int {
+        workspace.agentSessions.count
+            + workspace.terminalSessions.count
+            + agentSettings.launchableProjectCommands(for: projectRoot).count
+            + (features.todosEnabled ? 1 : 0)
     }
 }
 

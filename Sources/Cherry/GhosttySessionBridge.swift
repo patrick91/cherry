@@ -83,6 +83,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
     TerminalSurfaceLinkHoverDelegate, TerminalSurfaceHostInputDelegate, TerminalSurfaceScrollInputDelegate
 {
+    private(set) static var liveBridgeCount = 0
+    private(set) static var installedOutputObserverCount = 0
+
     let terminalView: TerminalView
 
     private let proxy: GhosttySessionProxy
@@ -98,6 +101,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private weak var scrollContainer: GhosttyTerminalContainerView?
     private var pointerStyle: TerminalPointerStyle = .text
     private var hoveredLink: String?
+    private var isReleased = false
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -111,6 +115,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         super.init()
 
+        Self.liveBridgeCount += 1
         terminalView.delegate = self
         terminalView.controller = controller
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
@@ -118,6 +123,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func attach(to container: GhosttyTerminalContainerView) {
+        guard !isReleased else { return }
         scrollContainer = container
         container.install(terminalView: terminalView, bridge: self)
         terminalView.setSurfaceVisible(true)
@@ -128,6 +134,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func detach(from container: GhosttyTerminalContainerView) {
+        guard !isReleased || scrollContainer === container else { return }
         terminalView.setSurfaceVisible(false)
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
@@ -147,6 +154,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func reset() {
+        guard !isReleased else { return }
         uninstallOutputObserver()
 
         let nextSession = Self.makeInMemorySession(proxy: proxy)
@@ -158,6 +166,24 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.fitToSize()
         activateOutputFeedWhenSurfaceIsReady()
+    }
+
+    func releaseResources() {
+        guard !isReleased else { return }
+        isReleased = true
+        pendingFeedActivation = false
+        uninstallOutputObserver()
+        if let scrollContainer {
+            terminalView.setSurfaceVisible(false)
+            scrollContainer.uninstall(terminalView: terminalView)
+            self.scrollContainer = nil
+        } else {
+            terminalView.setSurfaceVisible(false)
+            terminalView.removeFromSuperview()
+        }
+        terminalView.delegate = nil
+        terminalView.freeSurface()
+        terminalView.controller = nil
     }
 
     func finish(exitCode: UInt32) {
@@ -218,24 +244,29 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     deinit {
-        if let settingsObserver {
-            NotificationCenter.default.removeObserver(settingsObserver)
+        MainActor.assumeIsolated {
+            releaseResources()
+            if let settingsObserver {
+                NotificationCenter.default.removeObserver(settingsObserver)
+            }
+            Self.liveBridgeCount -= 1
         }
     }
 
     private func activateOutputFeedWhenSurfaceIsReady() {
-        guard outputObserverID == nil, !pendingFeedActivation else { return }
+        guard !isReleased, outputObserverID == nil, !pendingFeedActivation else { return }
         pendingFeedActivation = true
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingFeedActivation = false
+            guard !self.isReleased else { return }
             self.installOutputObserver()
         }
     }
 
     private func installOutputObserver() {
-        guard outputObserverID == nil, let session = proxy.session else { return }
+        guard !isReleased, outputObserverID == nil, let session = proxy.session else { return }
 
         let existingOutput = session.rawOutput(maxBytes: 1_048_576).data
         if !existingOutput.isEmpty {
@@ -247,16 +278,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
             outputSink.receive(data)
         }
+        Self.installedOutputObserverCount += 1
     }
 
     private func uninstallOutputObserver() {
-        guard let outputObserverID, let session = proxy.session else {
-            self.outputObserverID = nil
-            return
-        }
-
-        session.removeRawOutputObserver(id: outputObserverID)
+        guard let outputObserverID else { return }
+        proxy.session?.removeRawOutputObserver(id: outputObserverID)
         self.outputObserverID = nil
+        Self.installedOutputObserverCount -= 1
     }
 
     private static func makeInMemorySession(proxy: GhosttySessionProxy) -> InMemoryTerminalSession {
@@ -357,9 +386,12 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     deinit {
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
-        if let keyEventMonitor {
-            NSEvent.removeMonitor(keyEventMonitor)
+        MainActor.assumeIsolated {
+            detachActiveSession()
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+            if let keyEventMonitor {
+                NSEvent.removeMonitor(keyEventMonitor)
+            }
         }
     }
 
@@ -424,8 +456,12 @@ final class GhosttyTerminalContainerView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        activeSession?.ghosttyBridge.attach(to: self)
-        requestTerminalFocus()
+        if window == nil {
+            detachActiveSession(clearsSession: false)
+        } else {
+            activeSession?.ghosttyBridge.attach(to: self)
+            requestTerminalFocus()
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -455,6 +491,21 @@ final class GhosttyTerminalContainerView: NSView {
         if activeBridge?.terminalView === terminalView {
             activeBridge = nil
         }
+    }
+
+    func detachActiveSession(clearsSession: Bool = true) {
+        guard let session = activeSession else {
+            activeBridge = nil
+            return
+        }
+
+        session.ghosttyBridge.detach(from: self)
+        if clearsSession {
+            activeSession = nil
+        }
+        activeBridge = nil
+        pendingTerminalFocus = false
+        removeSnapshotLayer(animated: false)
     }
 
     func synchronizeScrollState() {

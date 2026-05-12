@@ -465,6 +465,10 @@ struct TerminalSurfaceView: NSViewRepresentable {
             postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta
         )
     }
+
+    static func dismantleNSView(_ nsView: GhosttyTerminalContainerView, coordinator: ()) {
+        nsView.detachActiveSession()
+    }
 }
 
 final class TerminalScrollView: NSScrollView {

@@ -35,6 +35,10 @@
             core.setDisplayVisible(visible)
         }
 
+        public func freeSurface() {
+            core.freeSurface()
+        }
+
         @discardableResult
         public func performBindingAction(_ action: String) -> Bool {
             surface?.performBindingAction(action) ?? false

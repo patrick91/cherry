@@ -168,6 +168,29 @@ enum ProjectCommandStorage: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum ProjectFeatureStorage: String, CaseIterable, Identifiable {
+    case projectFile
+    case local
+
+    var id: String { rawValue }
+}
+
+struct ProjectFeatureSettings: Codable, Equatable {
+    var notesEnabled: Bool
+    var todosEnabled: Bool
+
+    static let disabled = ProjectFeatureSettings(notesEnabled: false, todosEnabled: false)
+}
+
+struct ProjectFeatureOverrides: Codable, Equatable {
+    var notesEnabled: Bool?
+    var todosEnabled: Bool?
+
+    var isEmpty: Bool {
+        notesEnabled == nil && todosEnabled == nil
+    }
+}
+
 enum AgentToolSource: Equatable {
     case global
 }
@@ -385,6 +408,7 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var lastOpenedProjectRoot: String?
     @Published private(set) var agents: [AgentToolDefinition] = []
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
+    @Published private(set) var featureOverridesByProject: [String: ProjectFeatureOverrides] = [:]
     @Published var agentSummaryTool: AgentSummaryTool {
         didSet {
             let currentModel = agentSummaryModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -423,6 +447,7 @@ final class AgentSettings: ObservableObject {
         lastOpenedProjectRoot = Self.loadLastOpenedProjectRoot(from: defaults)
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
+        featureOverridesByProject = Self.loadFeatureOverridesByProject(from: defaults)
         let storedSummaryCommand = defaults.string(forKey: Keys.agentSummaryCommand) ?? ""
         let storedSummaryTool = Self.loadAgentSummaryTool(from: defaults, command: storedSummaryCommand)
         agentSummaryCommand = storedSummaryCommand
@@ -493,6 +518,48 @@ final class AgentSettings: ObservableObject {
         projectCommands(for: requestedRoot).filter(\.isLaunchable)
     }
 
+    func projectFeatures(for requestedRoot: String?) -> ProjectFeatureSettings {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else {
+            return .disabled
+        }
+
+        let shared = CherryProjectFile.loadFeatureSettings(projectRoot: root) ?? .disabled
+        guard let local = featureOverridesByProject[root] else {
+            return shared
+        }
+
+        return ProjectFeatureSettings(
+            notesEnabled: local.notesEnabled ?? shared.notesEnabled,
+            todosEnabled: local.todosEnabled ?? shared.todosEnabled
+        )
+    }
+
+    func projectFeatureOverrides(for requestedRoot: String?) -> ProjectFeatureOverrides {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else {
+            return ProjectFeatureOverrides()
+        }
+        return featureOverridesByProject[root] ?? ProjectFeatureOverrides()
+    }
+
+    func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectFeatureStorage) throws {
+        guard let root = Self.validDirectory(requestedRoot) else { return }
+        switch storage {
+        case .local:
+            var overrides = featureOverridesByProject[root] ?? ProjectFeatureOverrides()
+            overrides.notesEnabled = features.notesEnabled
+            overrides.todosEnabled = features.todosEnabled
+            try setFeatureOverrides(overrides, for: root)
+        case .projectFile:
+            try CherryProjectFile.writeFeatureSettings(features, projectRoot: root)
+        }
+    }
+
+    func clearLocalProjectFeatureOverrides(for requestedRoot: String) {
+        guard let root = Self.validDirectory(requestedRoot) else { return }
+        featureOverridesByProject.removeValue(forKey: root)
+        saveFeatureOverrides()
+    }
+
     @discardableResult
     func addProject(path: String) -> CherryProject? {
         guard let root = Self.validDirectory(path) else { return nil }
@@ -507,12 +574,14 @@ final class AgentSettings: ObservableObject {
     func removeProject(_ project: CherryProject) {
         projects.removeAll { $0.root == project.root }
         commandsByProject.removeValue(forKey: project.root)
+        featureOverridesByProject.removeValue(forKey: project.root)
         if lastOpenedProjectRoot == project.root {
             lastOpenedProjectRoot = projects.first?.root
             saveLastOpenedProjectRoot()
         }
         saveProjects()
         saveCommands()
+        saveFeatureOverrides()
     }
 
     func markProjectOpened(_ projectRoot: String?) {
@@ -586,6 +655,15 @@ final class AgentSettings: ObservableObject {
         saveCommands()
     }
 
+    private func setFeatureOverrides(_ overrides: ProjectFeatureOverrides, for root: String) throws {
+        if overrides.isEmpty {
+            featureOverridesByProject.removeValue(forKey: root)
+        } else {
+            featureOverridesByProject[root] = overrides
+        }
+        saveFeatureOverrides()
+    }
+
     private func saveProjects() {
         Self.saveProjects(projects, to: defaults)
     }
@@ -605,6 +683,10 @@ final class AgentSettings: ObservableObject {
 
     private func saveCommands() {
         Self.saveCommandsByProject(commandsByProject, to: defaults)
+    }
+
+    private func saveFeatureOverrides() {
+        Self.saveFeatureOverridesByProject(featureOverridesByProject, to: defaults)
     }
 
     private func saveSummarySettings() {
@@ -656,6 +738,23 @@ final class AgentSettings: ObservableObject {
             commandsByProject[validRoot] = validatedCommands
         }
         return commandsByProject
+    }
+
+    private static func loadFeatureOverridesByProject(from defaults: UserDefaults) -> [String: ProjectFeatureOverrides] {
+        guard let data = defaults.data(forKey: Keys.featureOverridesByProject),
+              let decoded = try? JSONDecoder().decode([String: ProjectFeatureOverrides].self, from: data)
+        else {
+            return [:]
+        }
+
+        var overridesByProject: [String: ProjectFeatureOverrides] = [:]
+        for (root, overrides) in decoded {
+            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
+                continue
+            }
+            overridesByProject[validRoot] = overrides
+        }
+        return overridesByProject
     }
 
     private static func migratedProjectAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
@@ -714,6 +813,14 @@ final class AgentSettings: ObservableObject {
         defaults.set(data, forKey: Keys.commandsByProject)
     }
 
+    private static func saveFeatureOverridesByProject(
+        _ overridesByProject: [String: ProjectFeatureOverrides],
+        to defaults: UserDefaults
+    ) {
+        guard let data = try? JSONEncoder().encode(overridesByProject) else { return }
+        defaults.set(data, forKey: Keys.featureOverridesByProject)
+    }
+
     static func normalizedPath(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -737,6 +844,7 @@ final class AgentSettings: ObservableObject {
         static let lastOpenedProjectRoot = "projects.lastOpenedRoot"
         static let agents = "agents.global"
         static let commandsByProject = "commands.byProject"
+        static let featureOverridesByProject = "features.byProject"
         static let agentSummaryTool = "agents.summaryTool"
         static let agentSummaryCadence = "agents.summaryCadence"
         static let agentSummaryModel = "agents.summaryModel"
@@ -764,6 +872,41 @@ enum CherryProjectFile {
         guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         let source = managedSection(in: contents) ?? contents
         return (try? ProjectCommandConfiguration.validated(parseCommands(from: source))) ?? []
+    }
+
+    static func loadFeatureSettings(projectRoot: String) -> ProjectFeatureSettings? {
+        let url = fileURL(projectRoot: projectRoot)
+        guard let contents = try? String(contentsOf: url, encoding: .utf8),
+              let source = tableSection(named: "features", in: contents)
+        else {
+            return nil
+        }
+
+        let fields = parseKeyValues(from: source)
+        return ProjectFeatureSettings(
+            notesEnabled: boolValue(fields["notes"]) ?? false,
+            todosEnabled: boolValue(fields["todos"]) ?? false
+        )
+    }
+
+    static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
+        let url = fileURL(projectRoot: projectRoot)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let nextSection = renderFeatureSection(features)
+        let nextContents: String
+
+        if let range = tableSectionRange(named: "features", in: existing) {
+            let replacement = range.upperBound == existing.endIndex ? nextSection : nextSection + "\n"
+            nextContents = existing.replacingCharacters(in: range, with: replacement)
+        } else if existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            nextContents = nextSection
+        } else {
+            nextContents = existing.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + nextSection
+        }
+
+        try nextContents.trimmingCharacters(in: .whitespacesAndNewlines)
+            .appending("\n")
+            .write(to: url, atomically: true, encoding: .utf8)
     }
 
     static func upsertCommand(
@@ -824,6 +967,14 @@ enum CherryProjectFile {
         return lines.joined(separator: "\n")
     }
 
+    private static func renderFeatureSection(_ features: ProjectFeatureSettings) -> String {
+        [
+            "[features]",
+            "notes = \(features.notesEnabled ? "true" : "false")",
+            "todos = \(features.todosEnabled ? "true" : "false")"
+        ].joined(separator: "\n")
+    }
+
     private static func parseCommands(from source: String) -> [ProjectCommandDefinition] {
         var commands: [ProjectCommandDefinition] = []
         var fields: [String: String] = [:]
@@ -871,6 +1022,51 @@ enum CherryProjectFile {
             return nil
         }
         return begin.lowerBound..<end.upperBound
+    }
+
+    private static func tableSection(named tableName: String, in contents: String) -> String? {
+        guard let range = tableSectionRange(named: tableName, in: contents) else {
+            return nil
+        }
+        return String(contents[range])
+    }
+
+    private static func tableSectionRange(named tableName: String, in contents: String) -> Range<String.Index>? {
+        let header = "[\(tableName)]"
+        guard let headerRange = contents.range(of: header) else {
+            return nil
+        }
+
+        var end = contents.endIndex
+        var searchStart = headerRange.upperBound
+        while let newlineRange = contents.range(of: "\n", range: searchStart..<contents.endIndex) {
+            let lineStart = newlineRange.upperBound
+            let nextNewline = contents.range(of: "\n", range: lineStart..<contents.endIndex)?.lowerBound ?? contents.endIndex
+            let line = contents[lineStart..<nextNewline].trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("[") || line == beginMarker {
+                end = lineStart
+                break
+            }
+            searchStart = nextNewline
+            if searchStart == contents.endIndex {
+                break
+            }
+        }
+
+        return headerRange.lowerBound..<end
+    }
+
+    private static func parseKeyValues(from source: String) -> [String: String] {
+        var fields: [String: String] = [:]
+        for rawLine in source.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix("[") else { continue }
+            guard let separator = line.firstIndex(of: "=") else { continue }
+            let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            fields[key] = tomlValue(value)
+        }
+        return fields
     }
 
     private static func tomlString(_ value: String) -> String {

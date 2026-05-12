@@ -168,6 +168,9 @@ final class ProjectWindowRegistry {
 
         switch deepLink.kind {
         case .note:
+            guard AgentSettings.shared.projectFeatures(for: projectRoot).notesEnabled else {
+                return false
+            }
             guard let noteID = UUID(uuidString: deepLink.targetID),
                   noteStores[projectRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
             else {
@@ -176,6 +179,9 @@ final class ProjectWindowRegistry {
             chromeState.selectNote(id: noteID)
             return true
         case .todo:
+            guard AgentSettings.shared.projectFeatures(for: projectRoot).todosEnabled else {
+                return false
+            }
             guard let todoID = UUID(uuidString: deepLink.targetID),
                   todoStores[projectRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
             else {

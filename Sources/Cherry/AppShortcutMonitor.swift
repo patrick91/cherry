@@ -19,6 +19,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
         agentSettings.launchableProjectCommands(for: projectRoot)
     }
 
+    private var projectFeatures: ProjectFeatureSettings {
+        agentSettings.projectFeatures(for: projectRoot)
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             workspace: workspace,
@@ -28,6 +32,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             projectRoot: projectRoot,
             visibleCommandNames: visibleCommandNames,
             visibleCommands: visibleCommands,
+            projectFeatures: projectFeatures,
             openSettings: openSettings
         )
     }
@@ -46,6 +51,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
         context.coordinator.projectRoot = projectRoot
         context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.visibleCommands = visibleCommands
+        context.coordinator.projectFeatures = projectFeatures
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
@@ -75,6 +81,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
         var projectRoot: String?
         var visibleCommandNames: [String]
         var visibleCommands: [ProjectCommandDefinition]
+        var projectFeatures: ProjectFeatureSettings
         var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
@@ -87,6 +94,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             projectRoot: String?,
             visibleCommandNames: [String],
             visibleCommands: [ProjectCommandDefinition],
+            projectFeatures: ProjectFeatureSettings,
             openSettings: @escaping () -> Void
         ) {
             self.workspace = workspace
@@ -96,6 +104,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             self.projectRoot = projectRoot
             self.visibleCommandNames = visibleCommandNames
             self.visibleCommands = visibleCommands
+            self.projectFeatures = projectFeatures
             self.openSettings = openSettings
             install()
         }
@@ -198,8 +207,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
             items += workspace.agentSessions.map { .session($0) }
             items += workspace.terminalSessions.map { .session($0) }
             items += visibleCommands.map { .command($0) }
-            items.append(.todoBoard)
-            if let noteStore {
+            if projectFeatures.todosEnabled {
+                items.append(.todoBoard)
+            }
+            if projectFeatures.notesEnabled, let noteStore {
                 items += noteStore.notes.map { .note($0.id) }
             }
             return items

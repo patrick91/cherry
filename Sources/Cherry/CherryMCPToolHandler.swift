@@ -171,17 +171,17 @@ enum CherryMCPTools {
         ),
         tool(
             "list_notes",
-            "List Cherry notes for the current or specified project.",
+            "List Cherry notes for the current or specified project. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties()
         ),
         tool(
             "list_todos",
-            "List Cherry todos for the current or specified project.",
+            "List Cherry todos for the current or specified project. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties()
         ),
         tool(
             "create_note",
-            "Create a project-scoped Markdown note in Cherry without opening or selecting it.",
+            "Create a project-scoped Markdown note in Cherry without opening or selecting it. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties([
                 "title": string("Note title."),
                 "markdown": string("Markdown content.")
@@ -190,13 +190,13 @@ enum CherryMCPTools {
         ),
         tool(
             "get_note",
-            "Read a Cherry Markdown note.",
+            "Read a Cherry Markdown note. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "update_note",
-            "Update a Cherry Markdown note title and/or content without opening or selecting it.",
+            "Update a Cherry Markdown note title and/or content without opening or selecting it. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "title": string("Optional replacement title."),
@@ -206,7 +206,7 @@ enum CherryMCPTools {
         ),
         tool(
             "append_note",
-            "Append Markdown to a Cherry note without opening or selecting it.",
+            "Append Markdown to a Cherry note without opening or selecting it. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "markdown": string("Markdown content to append.")
@@ -215,7 +215,7 @@ enum CherryMCPTools {
         ),
         tool(
             "rename_note",
-            "Rename a Cherry note without opening or selecting it.",
+            "Rename a Cherry note without opening or selecting it. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties([
                 "note_id": string("Cherry note UUID."),
                 "title": string("Replacement note title.")
@@ -224,7 +224,7 @@ enum CherryMCPTools {
         ),
         tool(
             "search_notes",
-            "Search Cherry note titles and Markdown for the current or specified project without changing the Cherry UI.",
+            "Search Cherry note titles and Markdown for the current or specified project without changing the Cherry UI. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties([
                 "query": string("Text to search for."),
                 "case_sensitive": boolean("Whether matching is case-sensitive."),
@@ -234,19 +234,19 @@ enum CherryMCPTools {
         ),
         tool(
             "delete_note",
-            "Delete a Cherry Markdown note.",
+            "Delete a Cherry Markdown note. Requires Notes to be enabled for the project.",
             properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "select_note",
-            "Explicitly open an existing Cherry Markdown note for review/editing. Use only when the user asks to switch the Cherry UI.",
+            "Explicitly open an existing Cherry Markdown note for review/editing. Requires Notes to be enabled for the project. Use only when the user asks to switch the Cherry UI.",
             properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
             required: ["note_id"]
         ),
         tool(
             "create_todo",
-            "Create a project-scoped Cherry todo without opening or selecting it.",
+            "Create a project-scoped Cherry todo without opening or selecting it. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties([
                 "title": string("Todo title."),
                 "markdown": string("Optional Markdown details."),
@@ -257,13 +257,13 @@ enum CherryMCPTools {
         ),
         tool(
             "get_todo",
-            "Read a Cherry todo, including comments.",
+            "Read a Cherry todo, including comments. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "update_todo",
-            "Update a Cherry todo title, Markdown details, and/or status without opening or selecting it.",
+            "Update a Cherry todo title, Markdown details, and/or status without opening or selecting it. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "title": string("Optional replacement title."),
@@ -275,7 +275,7 @@ enum CherryMCPTools {
         ),
         tool(
             "move_todo",
-            "Move a Cherry todo to another status and/or position without opening or selecting it. If status changes and after_todo_id is omitted, the todo is appended to the target status.",
+            "Move a Cherry todo to another status and/or position without opening or selecting it. Requires Todos to be enabled for the project. If status changes and after_todo_id is omitted, the todo is appended to the target status.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "status": string("Optional target status: backlog, ready, doing, blocked, or done."),
@@ -285,19 +285,19 @@ enum CherryMCPTools {
         ),
         tool(
             "delete_todo",
-            "Delete a Cherry todo.",
+            "Delete a Cherry todo. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "select_todo",
-            "Explicitly open an existing Cherry todo in the todo pane. Use only when the user asks to switch the Cherry UI.",
+            "Explicitly open an existing Cherry todo in the todo pane. Requires Todos to be enabled for the project. Use only when the user asks to switch the Cherry UI.",
             properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "add_todo_comment",
-            "Append a comment to a Cherry todo without opening or selecting it. Pass terminal_id for agent attribution when commenting from a Cherry agent session.",
+            "Append a comment to a Cherry todo without opening or selecting it. Requires Todos to be enabled for the project. Pass terminal_id for agent attribution when commenting from a Cherry agent session.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "markdown": string("Comment Markdown."),
@@ -308,13 +308,13 @@ enum CherryMCPTools {
         ),
         tool(
             "list_todo_comments",
-            "List comments for a Cherry todo without opening or selecting it.",
+            "List comments for a Cherry todo without opening or selecting it. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties(["todo_id": string("Cherry todo UUID.")]),
             required: ["todo_id"]
         ),
         tool(
             "update_todo_comment",
-            "Update a Cherry todo comment without opening or selecting it.",
+            "Update a Cherry todo comment without opening or selecting it. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "comment_id": string("Cherry todo comment UUID."),
@@ -324,7 +324,7 @@ enum CherryMCPTools {
         ),
         tool(
             "delete_todo_comment",
-            "Delete a Cherry todo comment without opening or selecting it.",
+            "Delete a Cherry todo comment without opening or selecting it. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "comment_id": string("Cherry todo comment UUID.")

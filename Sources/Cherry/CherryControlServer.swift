@@ -695,6 +695,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         switch deepLink.kind {
         case .note:
+            try requireNotesEnabled(projectRoot: projectRoot)
             let noteID = try noteID(from: deepLink.targetID)
             guard let note = try? noteStore(forProjectRoot: projectRoot, fallbackWorkspace: workspace).note(id: noteID) else {
                 return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
@@ -710,6 +711,7 @@ final class CherryControlServer: @unchecked Sendable {
                 noteLink: link(for: note)
             )
         case .todo:
+            try requireTodosEnabled(projectRoot: projectRoot)
             let todoID = try todoID(from: deepLink.targetID)
             guard let todo = try? todoStore(forProjectRoot: projectRoot, fallbackWorkspace: workspace).todo(id: todoID) else {
                 return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
@@ -870,7 +872,8 @@ final class CherryControlServer: @unchecked Sendable {
                     root: root,
                     name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
                     active: root == activeRoot,
-                    open: root == activeRoot
+                    open: root == activeRoot,
+                    features: projectFeatureAvailability(for: root)
                 )
             }
         )
@@ -881,6 +884,7 @@ final class CherryControlServer: @unchecked Sendable {
         let selectedSession = workspace.selectedSession
         let noteStore = try? activeNoteStore(for: workspace)
         let todoStore = try? activeTodoStore(for: workspace)
+        let features = projectFeatureAvailability(for: workspace.projectRoot)
         return ProjectStatusResult(
             projectRoot: workspace.projectRoot,
             processCounts: .init(
@@ -891,6 +895,7 @@ final class CherryControlServer: @unchecked Sendable {
             ),
             noteCount: noteStore?.notes.count,
             todoCount: todoStore?.todos.count,
+            features: features,
             selectedProcessID: selectedSession?.id.uuidString,
             selectedProcessName: selectedSession.map(processName),
             health: workspace.projectRoot == nil ? "no_project" : "ok"
@@ -1383,6 +1388,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard let projectRoot = workspace.projectRoot else {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
+        try requireNotesEnabled(projectRoot: projectRoot)
         if let store = noteStore, store.projectRoot == projectRoot {
             return store
         }
@@ -1401,6 +1407,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard let projectRoot = workspace.projectRoot else {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
+        try requireTodosEnabled(projectRoot: projectRoot)
         if let store = todoStore, store.projectRoot == projectRoot {
             return store
         }
@@ -1412,6 +1419,35 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         throw CherryControlError(code: "todos_unavailable", message: "Cherry todos are unavailable for the requested project.")
+    }
+
+    @MainActor
+    private func projectFeatureAvailability(for projectRoot: String?) -> ProjectFeatureAvailability {
+        let features = agentSettings.projectFeatures(for: projectRoot)
+        return ProjectFeatureAvailability(
+            notesEnabled: features.notesEnabled,
+            todosEnabled: features.todosEnabled
+        )
+    }
+
+    @MainActor
+    private func requireNotesEnabled(projectRoot: String) throws {
+        guard agentSettings.projectFeatures(for: projectRoot).notesEnabled else {
+            throw CherryControlError(
+                code: "feature_disabled",
+                message: "Cherry notes are disabled for this project. Enable Notes in project settings before using note tools."
+            )
+        }
+    }
+
+    @MainActor
+    private func requireTodosEnabled(projectRoot: String) throws {
+        guard agentSettings.projectFeatures(for: projectRoot).todosEnabled else {
+            throw CherryControlError(
+                code: "feature_disabled",
+                message: "Cherry todos are disabled for this project. Enable Todos in project settings before using todo tools."
+            )
+        }
     }
 
     @MainActor

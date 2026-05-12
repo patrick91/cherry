@@ -351,6 +351,9 @@ private struct ProjectWorkspaceView: View {
 
         switch link.kind {
         case .note:
+            guard agentSettings.projectFeatures(for: projectRoot).notesEnabled else {
+                return false
+            }
             guard let noteID = UUID(uuidString: link.targetID),
                   noteStore.notes.contains(where: { $0.id == noteID })
             else {
@@ -359,6 +362,9 @@ private struct ProjectWorkspaceView: View {
             chromeState.selectNote(id: noteID)
             return true
         case .todo:
+            guard agentSettings.projectFeatures(for: projectRoot).todosEnabled else {
+                return false
+            }
             guard let todoID = UUID(uuidString: link.targetID),
                   todoStore.todos.contains(where: { $0.id == todoID })
             else {

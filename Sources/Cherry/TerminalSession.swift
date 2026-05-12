@@ -329,6 +329,12 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         }
     }
 
+    var observerCount: Int {
+        lock.withLock {
+            observers.count
+        }
+    }
+
     func snapshot(maxBytes requestedMaxBytes: Int) -> (data: Data, truncated: Bool) {
         lock.withLock {
             let maxBytes = max(0, min(requestedMaxBytes, maximumBytes))
@@ -807,6 +813,7 @@ final class TerminalWorkspace: ObservableObject {
 
         let removedIndex = sessions.firstIndex(where: { $0.id == session.id })
         sessions.removeAll(where: { $0.id == session.id })
+        session.releaseGhosttyBridge()
         session.stop()
 
         guard selectedSessionID == session.id else { return }
@@ -1285,6 +1292,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         shellProcess = nil
     }
 
+    func releaseGhosttyBridge() {
+        guard let ghosttyBridgeStorage else { return }
+        ghosttyBridgeStorage.releaseResources()
+        self.ghosttyBridgeStorage = nil
+    }
+
     func stopManagedCommand() {
         guard kind == .command else {
             stop()
@@ -1346,6 +1359,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func removeRawOutputObserver(id: UUID) {
         rawOutputStore.removeObserver(id: id)
+    }
+
+    var rawOutputObserverCount: Int {
+        rawOutputStore.observerCount
     }
 
     var ghosttyBridge: GhosttySessionBridge {

@@ -54,4 +54,18 @@ struct TerminalLifecycleTests {
 
         #expect(controller.retainedBridgeCount == 0)
     }
+
+    @Test
+    func appTerminalViewFreeSurfaceRemovesRetainedBridge() {
+        let controller = TerminalController()
+        let view = TerminalView(frame: .zero)
+
+        view.controller = controller
+        controller.retain(view.core.bridge)
+        #expect(controller.retainedBridgeCount == 1)
+
+        view.freeSurface()
+
+        #expect(controller.retainedBridgeCount == 0)
+    }
 }

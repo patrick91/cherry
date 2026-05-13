@@ -25,6 +25,12 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         return true
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.handleApplicationDidBecomeActive()
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.markCurrentActiveProjectOpened()

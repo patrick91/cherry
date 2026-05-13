@@ -264,7 +264,16 @@ final class ProjectWindowRegistry {
             return false
         }
 
-        return activeWorkspace.selectedSessionID == session.id
+        guard activeWorkspace.selectedSessionID == session.id else {
+            return false
+        }
+
+        return activeChromeState?.isShowingTerminalContent ?? true
+    }
+
+    func handleApplicationDidBecomeActive() {
+        refreshActiveWindow()
+        clearUnreadNotificationForActiveVisibleSession()
     }
 
     @discardableResult
@@ -317,6 +326,21 @@ final class ProjectWindowRegistry {
         activeTodoStore = todoStore
         activeChromeState = chromeState
         AgentSettings.shared.markProjectOpened(projectRoot)
+
+        if NSApplication.shared.isActive,
+           chromeState?.isShowingTerminalContent ?? true {
+            workspace.clearUnreadNotificationForSelectedSession()
+        }
+    }
+
+    private func clearUnreadNotificationForActiveVisibleSession() {
+        guard NSApplication.shared.isActive,
+              activeChromeState?.isShowingTerminalContent ?? true
+        else {
+            return
+        }
+
+        activeWorkspace?.clearUnreadNotificationForSelectedSession()
     }
 
     private func refreshActiveWindow() {

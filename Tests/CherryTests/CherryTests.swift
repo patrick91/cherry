@@ -1600,12 +1600,8 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 
     session.clearUnreadNotification()
     session.ingestTestingData(Data([0x07]))
-    #expect(session.hasUnreadNotification == true)
-    #expect(session.lastNotification == TerminalNotificationRequest(
-        title: nil,
-        body: "",
-        source: .bel
-    ))
+    #expect(session.hasUnreadNotification == false)
+    #expect(session.lastNotification == nil)
 }
 
 @MainActor

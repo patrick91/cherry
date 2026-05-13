@@ -523,6 +523,10 @@ private struct DetailPaneView: View {
             else { return }
             chromeState.selectTodo(id: nil)
         }
+        .onChange(of: chromeState.isShowingTerminalContent) { _, isShowingTerminalContent in
+            guard isShowingTerminalContent else { return }
+            workspace.clearUnreadNotificationForSelectedSession()
+        }
     }
 
     private var selectedNote: ProjectNote? {

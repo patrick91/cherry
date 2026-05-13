@@ -397,12 +397,6 @@ private final class TerminalMetadataParser {
             case .ground:
                 if byte == 0x1B {
                     state = .afterEscape
-                } else if byte == 0x07 {
-                    events.append(.notification(TerminalNotificationRequest(
-                        title: nil,
-                        body: "",
-                        source: .bel
-                    )))
                 }
 
             case .afterEscape:
@@ -866,7 +860,7 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = orderedSessions[nextIndex].id
     }
 
-    private func clearUnreadNotificationForSelectedSession() {
+    func clearUnreadNotificationForSelectedSession() {
         guard let selectedSessionID,
               let session = sessions.first(where: { $0.id == selectedSessionID })
         else {

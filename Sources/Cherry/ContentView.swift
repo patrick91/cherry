@@ -766,6 +766,7 @@ private struct TodoPaneView: View {
                         isCompact: false,
                         onBack: nil
                     )
+                    .id(todo.id)
                 } else {
                     ContentUnavailableView("No Todo Selected", systemImage: "checklist")
                         .foregroundStyle(themeForeground)
@@ -787,6 +788,7 @@ private struct TodoPaneView: View {
                 isCompact: true,
                 onBack: { chromeState.selectTodo(id: nil) }
             )
+            .id(todo.id)
         } else {
             TodoListPane(
                 todoStore: todoStore,

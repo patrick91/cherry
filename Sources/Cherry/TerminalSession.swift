@@ -626,6 +626,13 @@ enum TerminalInputNormalizer {
     }
 }
 
+struct AgentSessionTreeItem: Identifiable {
+    let session: TerminalSession
+    let depth: Int
+
+    var id: UUID { session.id }
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
@@ -652,6 +659,13 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .agent }
     }
 
+    var rootAgentSessions: [TerminalSession] {
+        agentSessions.filter { session in
+            guard let parentAgentID = session.parentAgentID else { return true }
+            return !agentSessions.contains { $0.id == parentAgentID }
+        }
+    }
+
     var terminalSessions: [TerminalSession] {
         sessions.filter { $0.kind == .terminal }
     }
@@ -661,11 +675,38 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     var sidebarOrderedSessions: [TerminalSession] {
-        agentSessions + terminalSessions + commandSessions
+        visibleAgentSessions() + terminalSessions + commandSessions
     }
 
     func sidebarOrderedSessions(visibleCommandNames: [String]) -> [TerminalSession] {
-        agentSessions + terminalSessions + commandSessions(orderedBy: visibleCommandNames)
+        visibleAgentSessions() + terminalSessions + commandSessions(orderedBy: visibleCommandNames)
+    }
+
+    func childAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
+        childAgentSessions(parentID: parent.id)
+    }
+
+    func childAgentCount(of parent: TerminalSession) -> Int {
+        childAgentSessions(of: parent).count
+    }
+
+    func descendantAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
+        guard parent.kind == .agent else { return [] }
+        var descendants: [TerminalSession] = []
+        appendAgentDescendants(parentID: parent.id, to: &descendants)
+        return descendants
+    }
+
+    func visibleAgentTreeItems(collapsedIDs: Set<UUID> = []) -> [AgentSessionTreeItem] {
+        var items: [AgentSessionTreeItem] = []
+        for session in rootAgentSessions {
+            appendAgentTreeItems(parent: session, depth: 0, collapsedIDs: collapsedIDs, to: &items)
+        }
+        return items
+    }
+
+    func visibleAgentSessions(collapsedIDs: Set<UUID> = []) -> [TerminalSession] {
+        visibleAgentTreeItems(collapsedIDs: collapsedIDs).map(\.session)
     }
 
     func select(_ session: TerminalSession) {
@@ -741,13 +782,15 @@ final class TerminalWorkspace: ObservableObject {
         agent: AgentToolDefinition,
         projectRoot: String,
         title: String? = nil,
+        parentAgentID: UUID? = nil,
         select: Bool = true
     ) -> TerminalSession {
         let session = Self.makeAgentSession(
             index: agentSessions.count + 1,
             agent: agent,
             workingDirectory: projectRoot,
-            title: title
+            title: title,
+            parentAgentID: parentAgentID
         )
         sessions.append(session)
         if select {
@@ -782,6 +825,61 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
+    @discardableResult
+    func installPreviewAgentTree() -> [TerminalSession] {
+        guard agentSessions.isEmpty else { return [] }
+
+        let workingDirectory = projectRoot ?? NSHomeDirectory()
+        let parent = Self.makePreviewAgentSession(
+            index: 1,
+            title: "Claude",
+            subtitle: "Investigate Profile Cache Loading",
+            agentName: "Claude",
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot
+        )
+        let child = Self.makePreviewAgentSession(
+            index: 2,
+            title: "Codex",
+            subtitle: "Patch Apollo cache policy",
+            agentName: "Codex",
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot,
+            parentAgentID: parent.id
+        )
+        let sibling = Self.makePreviewAgentSession(
+            index: 3,
+            title: "Gemini",
+            subtitle: "Check auth and profile flows",
+            agentName: "Gemini",
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot,
+            parentAgentID: parent.id
+        )
+        let grandchild = Self.makePreviewAgentSession(
+            index: 4,
+            title: "Amp",
+            subtitle: "Verify sidebar close behavior",
+            agentName: "Amp",
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot,
+            parentAgentID: child.id
+        )
+        let secondRoot = Self.makePreviewAgentSession(
+            index: 5,
+            title: "Codex Design",
+            subtitle: "Tune agent tree visuals",
+            agentName: "Codex",
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot
+        )
+
+        let previewSessions = [parent, child, sibling, grandchild, secondRoot]
+        sessions.append(contentsOf: previewSessions)
+        selectedSessionID = parent.id
+        return previewSessions
+    }
+
     func commandSession(named name: String) -> TerminalSession? {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         return commandSessions.first {
@@ -803,20 +901,20 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func close(_ session: TerminalSession) {
-        guard sessions.count > 1 else { return }
-
-        let removedIndex = sessions.firstIndex(where: { $0.id == session.id })
-        sessions.removeAll(where: { $0.id == session.id })
-        session.releaseGhosttyBridge()
-        session.stop()
-
-        guard selectedSessionID == session.id else { return }
-
-        if let removedIndex, sessions.indices.contains(removedIndex) {
-            selectedSessionID = sessions[removedIndex].id
-        } else {
-            selectedSessionID = sessions.last?.id
+        if session.kind == .agent {
+            promoteChildAgents(of: session)
         }
+        closeSessions(withIDs: Set([session.id]))
+    }
+
+    func closeAgentGroup(_ session: TerminalSession) {
+        let groupIDs = Set(([session] + descendantAgentSessions(of: session)).map(\.id))
+        closeSessions(withIDs: groupIDs)
+    }
+
+    func closeAgentPromotingChildren(_ session: TerminalSession) {
+        promoteChildAgents(of: session)
+        closeSessions(withIDs: Set([session.id]))
     }
 
     func closeSelectedSession() {
@@ -883,6 +981,58 @@ final class TerminalWorkspace: ObservableObject {
         return sessions.first(where: { $0.id == uuid })
     }
 
+    private func childAgentSessions(parentID: UUID) -> [TerminalSession] {
+        agentSessions.filter { $0.parentAgentID == parentID }
+    }
+
+    private func appendAgentDescendants(parentID: UUID, to descendants: inout [TerminalSession]) {
+        for child in childAgentSessions(parentID: parentID) {
+            descendants.append(child)
+            appendAgentDescendants(parentID: child.id, to: &descendants)
+        }
+    }
+
+    private func appendAgentTreeItems(
+        parent: TerminalSession,
+        depth: Int,
+        collapsedIDs: Set<UUID>,
+        to items: inout [AgentSessionTreeItem]
+    ) {
+        items.append(AgentSessionTreeItem(session: parent, depth: depth))
+        guard !collapsedIDs.contains(parent.id) else { return }
+        for child in childAgentSessions(parentID: parent.id) {
+            appendAgentTreeItems(parent: child, depth: depth + 1, collapsedIDs: collapsedIDs, to: &items)
+        }
+    }
+
+    private func promoteChildAgents(of parent: TerminalSession) {
+        for child in childAgentSessions(of: parent) {
+            child.setParentAgentID(nil)
+        }
+    }
+
+    private func closeSessions(withIDs removedIDs: Set<UUID>) {
+        guard !removedIDs.isEmpty, sessions.count > removedIDs.count else { return }
+
+        let removedIndex = sessions.firstIndex { removedIDs.contains($0.id) }
+        let removedSessions = sessions.filter { removedIDs.contains($0.id) }
+        sessions.removeAll { removedIDs.contains($0.id) }
+        removedSessions.forEach { session in
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
+
+        guard let currentSelectedSessionID = selectedSessionID,
+              removedIDs.contains(currentSelectedSessionID)
+        else { return }
+
+        if let removedIndex, sessions.indices.contains(removedIndex) {
+            selectedSessionID = sessions[removedIndex].id
+        } else {
+            selectedSessionID = sessions.last?.id
+        }
+    }
+
     private static func makeSession(
         index: Int,
         title: String? = nil,
@@ -906,7 +1056,8 @@ final class TerminalWorkspace: ObservableObject {
         index: Int,
         agent: AgentToolDefinition,
         workingDirectory: String,
-        title requestedTitle: String?
+        title requestedTitle: String?,
+        parentAgentID: UUID?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
@@ -921,6 +1072,7 @@ final class TerminalWorkspace: ObservableObject {
             projectRoot: workingDirectory,
             kind: .agent,
             agentName: agent.name,
+            parentAgentID: parentAgentID,
             launchCommand: agent.commandLine
         )
     }
@@ -942,6 +1094,35 @@ final class TerminalWorkspace: ObservableObject {
             launchCommand: command.commandLine,
             restartOnExit: command.autoRestart
         )
+    }
+
+    private static func makePreviewAgentSession(
+        index: Int,
+        title: String,
+        subtitle: String,
+        agentName: String,
+        workingDirectory: String,
+        projectRoot: String?,
+        parentAgentID: UUID? = nil
+    ) -> TerminalSession {
+        let session = TerminalSession(
+            title: title,
+            subtitle: subtitle,
+            tint: palette[(index - 1) % palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: projectRoot,
+            launchShell: false,
+            kind: .agent,
+            agentName: agentName,
+            parentAgentID: parentAgentID
+        )
+        session.ingestTestingData(Data("""
+        Agent tree preview
+
+        No agent process is running for this row.
+        Use CHERRY_PREVIEW_AGENT_TREE=1 to keep this fake tree visible while tuning the sidebar UI.
+        """.utf8))
+        return session
     }
 
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
@@ -1025,6 +1206,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var launchWorkingDirectory: String
     let kind: SessionKind
     let agentName: String?
+    @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
     private var launchCommand: String?
     private var restartOnExit: Bool
@@ -1071,6 +1253,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchShell: Bool = true,
         kind: SessionKind = .terminal,
         agentName: String? = nil,
+        parentAgentID: UUID? = nil,
         commandName: String? = nil,
         launchCommand: String? = nil,
         restartOnExit: Bool = false
@@ -1085,6 +1268,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.maxScrollback = maxScrollback
         self.kind = kind
         self.agentName = agentName
+        self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.restartOnExit = restartOnExit
@@ -1172,6 +1356,11 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func selectedText(in selection: TerminalSelectionRange) -> String {
         processor.selectedText(in: selection)
+    }
+
+    func setParentAgentID(_ parentAgentID: UUID?) {
+        guard kind == .agent else { return }
+        self.parentAgentID = parentAgentID
     }
 
     func send(text: String) {
@@ -1393,6 +1582,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
                     projectRoot: projectRoot,
+                    agentID: kind == .agent ? id.uuidString : nil,
                     term: ShellProcessController.preferredTerminfo.term,
                     initialSize: viewportSize,
                     startupCommand: launchCommand

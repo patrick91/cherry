@@ -162,6 +162,34 @@ struct ContentView: View {
         ))
         .background(WindowConfigurator())
         .frame(minWidth: 320, minHeight: 460)
+        .confirmationDialog(
+            "Close Agent Group?",
+            isPresented: pendingAgentGroupCloseBinding,
+            titleVisibility: .visible
+        ) {
+            if let session = pendingAgentGroupCloseSession {
+                if canCloseAgentGroup(session) {
+                    Button("Close Parent and Sub-Agents", role: .destructive) {
+                        workspace.closeAgentGroup(session)
+                        chromeState.pendingAgentGroupCloseSessionID = nil
+                    }
+                }
+
+                Button("Close Parent Only") {
+                    workspace.closeAgentPromotingChildren(session)
+                    chromeState.pendingAgentGroupCloseSessionID = nil
+                }
+            }
+
+            Button("Cancel", role: .cancel) {
+                chromeState.pendingAgentGroupCloseSessionID = nil
+            }
+        } message: {
+            if let session = pendingAgentGroupCloseSession {
+                let count = workspace.descendantAgentSessions(of: session).count
+                Text("\"\(session.title)\" has \(count) sub-agent\(count == 1 ? "" : "s").")
+            }
+        }
         .modifier(ChromeWidthAnimator(
             dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
             floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
@@ -226,6 +254,25 @@ struct ContentView: View {
         DispatchQueue.main.async {
             workspace.selectedSession?.ghosttyBridge.focus(in: NSApp.keyWindow)
         }
+    }
+
+    private var pendingAgentGroupCloseBinding: Binding<Bool> {
+        Binding {
+            chromeState.pendingAgentGroupCloseSessionID != nil
+        } set: { isPresented in
+            if !isPresented {
+                chromeState.pendingAgentGroupCloseSessionID = nil
+            }
+        }
+    }
+
+    private var pendingAgentGroupCloseSession: TerminalSession? {
+        guard let id = chromeState.pendingAgentGroupCloseSessionID else { return nil }
+        return workspace.sessions.first { $0.id == id }
+    }
+
+    private func canCloseAgentGroup(_ session: TerminalSession) -> Bool {
+        workspace.sessions.count > workspace.descendantAgentSessions(of: session).count + 1
     }
 
     private var dockedSidebar: some View {
@@ -2774,6 +2821,9 @@ private struct SidebarTabsView: View {
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
+        let visibleAgentCount = workspace.visibleAgentSessions(
+            collapsedIDs: chromeState.collapsedAgentGroupIDs
+        ).count
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -2795,7 +2845,7 @@ private struct SidebarTabsView: View {
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutStartIndex: workspace.agentSessions.count,
+                        shortcutStartIndex: visibleAgentCount,
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
@@ -2805,7 +2855,7 @@ private struct SidebarTabsView: View {
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutStartIndex: workspace.agentSessions.count + workspace.terminalSessions.count,
+                        shortcutStartIndex: visibleAgentCount + workspace.terminalSessions.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
@@ -2859,14 +2909,14 @@ private struct SidebarTabsView: View {
     }
 
     private var todoBoardShortcutNumber: Int {
-        workspace.agentSessions.count
+        workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
             + workspace.terminalSessions.count
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + 1
     }
 
     private func notesShortcutStartIndex(features: ProjectFeatureSettings) -> Int {
-        workspace.agentSessions.count
+        workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
             + workspace.terminalSessions.count
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + (features.todosEnabled ? 1 : 0)
@@ -3083,7 +3133,11 @@ private struct SidebarAgentSessionSection: View {
                     palette: palette
                 )
             } else {
-                ForEach(Array(workspace.agentSessions.enumerated()), id: \.element.id) { index, session in
+                let items = workspace.visibleAgentTreeItems(collapsedIDs: chromeState.collapsedAgentGroupIDs)
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    let session = item.session
+                    let children = workspace.childAgentSessions(of: session)
+                    let isCollapsed = chromeState.collapsedAgentGroupIDs.contains(session.id)
                     SidebarTabRow(
                         session: session,
                         isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
@@ -3091,6 +3145,12 @@ private struct SidebarAgentSessionSection: View {
                         presentation: presentation,
                         shortcutNumber: index + 1,
                         showShortcutHint: showShortcutHints,
+                        nestingDepth: item.depth,
+                        showsDisclosure: !children.isEmpty,
+                        isDisclosureExpanded: !isCollapsed,
+                        onToggleDisclosure: {
+                            chromeState.toggleAgentGroupCollapsed(session.id)
+                        },
                         onSelect: { select(session) }
                     )
                     .contextMenu {
@@ -3118,7 +3178,7 @@ private struct SidebarAgentSessionSection: View {
                         Divider()
 
                         Button("Close", role: .destructive) {
-                            workspace.close(session)
+                            close(session)
                         }
                         .disabled(workspace.sessions.count <= 1)
                     }
@@ -3137,6 +3197,14 @@ private struct SidebarAgentSessionSection: View {
     private func select(_ session: TerminalSession) {
         chromeState.selectTerminal()
         workspace.select(session)
+    }
+
+    private func close(_ session: TerminalSession) {
+        if !workspace.descendantAgentSessions(of: session).isEmpty {
+            chromeState.requestAgentGroupClose(sessionID: session.id)
+        } else {
+            workspace.close(session)
+        }
     }
 }
 
@@ -4432,9 +4500,39 @@ private struct SidebarTabRow: View {
     let presentation: SidebarPresentation
     let shortcutNumber: Int
     let showShortcutHint: Bool
+    let nestingDepth: Int
+    let showsDisclosure: Bool
+    let isDisclosureExpanded: Bool
+    let onToggleDisclosure: (() -> Void)?
     let onSelect: () -> Void
 
     @State private var isHovered = false
+
+    init(
+        session: TerminalSession,
+        isSelected: Bool,
+        projectRoot: String?,
+        presentation: SidebarPresentation,
+        shortcutNumber: Int,
+        showShortcutHint: Bool,
+        nestingDepth: Int = 0,
+        showsDisclosure: Bool = false,
+        isDisclosureExpanded: Bool = true,
+        onToggleDisclosure: (() -> Void)? = nil,
+        onSelect: @escaping () -> Void
+    ) {
+        self.session = session
+        self.isSelected = isSelected
+        self.projectRoot = projectRoot
+        self.presentation = presentation
+        self.shortcutNumber = shortcutNumber
+        self.showShortcutHint = showShortcutHint
+        self.nestingDepth = nestingDepth
+        self.showsDisclosure = showsDisclosure
+        self.isDisclosureExpanded = isDisclosureExpanded
+        self.onToggleDisclosure = onToggleDisclosure
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         let palette = SidebarPalette(
@@ -4446,63 +4544,87 @@ private struct SidebarTabRow: View {
             presentation: presentation
         )
         let label = sidebarLabel()
-        let hasLeadingIcon = AgentToolIconDescriptor(session: session) != nil || label.leadingIconResourceName != nil || label.leadingIconFallback != nil
 
-        Button(action: onSelect) {
-            HStack(spacing: hasLeadingIcon ? 8 : 0) {
-                if let icon = AgentToolIconDescriptor(session: session) {
-                    AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
-                } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
-                    SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
-                }
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(label.title)
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                        .lineLimit(1)
-
-                    if let detail = label.detail {
-                        HStack(spacing: 4) {
-                            if let resourceName = label.detailIconResourceName {
-                                AgentLogoImage(
-                                    resourceName: resourceName,
-                                    rendersAsTemplate: true,
-                                    fallbackLabel: ""
-                                )
-                                .frame(width: 11, height: 11)
-                            }
-
-                            Text(detail)
-                                .lineLimit(1)
-                        }
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+        HStack(spacing: 8) {
+            if nestingDepth > 0 {
+                HStack(spacing: 0) {
+                    ForEach(0..<nestingDepth, id: \.self) { _ in
+                        Rectangle()
+                            .fill(palette.rowText.opacity(0.14))
+                            .frame(width: 1, height: label.detail == nil ? 24 : 32)
+                            .frame(width: 14)
                     }
                 }
+            }
 
-                Spacer(minLength: 8)
+            if showsDisclosure {
+                Button(action: { onToggleDisclosure?() }) {
+                    Image(systemName: isDisclosureExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.54))
+                        .frame(width: 14, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help(isDisclosureExpanded ? "Collapse sub-agents" : "Expand sub-agents")
+            } else if nestingDepth > 0 {
+                Color.clear
+                    .frame(width: 14, height: 22)
+            }
 
-                Circle()
-                    .fill(Color(nsColor: session.tint))
-                    .frame(width: 7, height: 7)
-                    .opacity(session.hasUnreadNotification ? 1 : 0)
+            if let icon = AgentToolIconDescriptor(session: session) {
+                AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+            } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+                SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+            }
 
-                if showShortcutHint, shortcutNumber <= 9 {
-                    SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label.title)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+
+                if let detail = label.detail {
+                    HStack(spacing: 4) {
+                        if let resourceName = label.detailIconResourceName {
+                            AgentLogoImage(
+                                resourceName: resourceName,
+                                rendersAsTemplate: true,
+                                fallbackLabel: ""
+                            )
+                            .frame(width: 11, height: 11)
+                        }
+
+                        Text(detail)
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: label.detail == nil ? 42 : 50)
-            .padding(.leading, SidebarLayout.rowHorizontalInset)
-            .padding(.trailing, SidebarLayout.rowHorizontalInset)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .background {
-                rowBackground(palette: palette)
+
+            Spacer(minLength: 8)
+
+            Circle()
+                .fill(Color(nsColor: session.tint))
+                .frame(width: 7, height: 7)
+                .opacity(session.hasUnreadNotification ? 1 : 0)
+
+            if showShortcutHint, shortcutNumber <= 9 {
+                SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
             }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: label.detail == nil ? 42 : 50)
+        .padding(.leading, SidebarLayout.rowHorizontalInset)
+        .padding(.trailing, SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background {
+            rowBackground(palette: palette)
+        }
         .padding(.leading, -SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onTapGesture(perform: onSelect)
+        .accessibilityAddTraits(.isButton)
         .onHover { hovering in
             isHovered = hovering
         }

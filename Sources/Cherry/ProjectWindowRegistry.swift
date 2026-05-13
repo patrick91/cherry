@@ -440,6 +440,8 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var selectedTodoID: UUID?
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
+    @Published var collapsedAgentGroupIDs: Set<UUID> = []
+    @Published var pendingAgentGroupCloseSessionID: UUID?
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
     // Mirrored from ContentView's @AppStorage("sidebar.width") so the
@@ -510,6 +512,18 @@ final class ProjectWindowChromeState: ObservableObject {
         selectedTodoID = nil
         isTodoPanePresented = false
         focusedIdleCommandName = nil
+    }
+
+    func toggleAgentGroupCollapsed(_ id: UUID) {
+        if collapsedAgentGroupIDs.contains(id) {
+            collapsedAgentGroupIDs.remove(id)
+        } else {
+            collapsedAgentGroupIDs.insert(id)
+        }
+    }
+
+    func requestAgentGroupClose(sessionID: UUID) {
+        pendingAgentGroupCloseSessionID = sessionID
     }
 
     func focusIdleCommand(name: String) {

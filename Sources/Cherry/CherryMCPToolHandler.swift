@@ -104,6 +104,7 @@ enum CherryMCPTools {
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to send exactly as provided after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
+                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Pass CHERRY_AGENT_ID from a running Cherry agent to nest the new agent as a sub-agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -126,8 +127,10 @@ enum CherryMCPTools {
         ),
         tool(
             "close_process",
-            "Close one process by process_id or process_name without selecting another UI pane.",
-            properties: processSelectorProperties()
+            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy.",
+            properties: processSelectorProperties([
+                "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
+            ])
         ),
         tool(
             "rename_process",
@@ -349,6 +352,7 @@ enum CherryMCPTools {
                 "text": string("Optional initial prompt to send after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
                 "submit": boolean("Whether to press Enter after the initial prompt. Defaults to true when text or raw_base64 is provided."),
+                "parent_agent_id": string("Optional parent Cherry agent UUID. When called from a Cherry agent, pass CHERRY_AGENT_ID unless the user asks for a separate top-level tab."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -435,8 +439,11 @@ enum CherryMCPTools {
         ),
         tool(
             "close_terminal",
-            "Close a Cherry terminal tab.",
-            properties: ["terminal_id": string("Cherry terminal UUID.")],
+            "Close a Cherry terminal tab. Parent agents with sub-agents require agent_close_policy.",
+            properties: [
+                "terminal_id": string("Cherry terminal UUID."),
+                "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
+            ],
             required: ["terminal_id"]
         )
     ]
@@ -641,6 +648,7 @@ enum CherryMCPTools {
                 workingDirectory: stringArgument("working_directory", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
+                parentAgentID: stringArgument("parent_agent_id", in: arguments),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
             ))
@@ -651,7 +659,11 @@ enum CherryMCPTools {
         case "restart_process":
             return .restartProcess(processLifecycle(in: arguments))
         case "close_process":
-            return .closeProcess(processSelector(in: arguments))
+            return .closeProcess(.init(
+                processID: stringArgument("process_id", in: arguments),
+                processName: stringArgument("process_name", in: arguments),
+                agentClosePolicy: try agentClosePolicyArgument("agent_close_policy", in: arguments)
+            ))
         case "rename_process":
             return .renameProcess(.init(
                 processID: stringArgument("process_id", in: arguments),
@@ -782,6 +794,7 @@ enum CherryMCPTools {
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
                 submit: boolArgument("submit", in: arguments),
+                parentAgentID: stringArgument("parent_agent_id", in: arguments),
                 select: false
             ))
         case "rename_terminal":
@@ -830,7 +843,10 @@ enum CherryMCPTools {
         case "restart_terminal":
             return .restartTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))
         case "close_terminal":
-            return .closeTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))
+            return .closeTerminal(.init(
+                terminalID: try requiredString("terminal_id", in: arguments),
+                agentClosePolicy: try agentClosePolicyArgument("agent_close_policy", in: arguments)
+            ))
         default:
             throw CherryControlError(code: "unknown_tool", message: "Unknown Cherry MCP tool: \(name)")
         }
@@ -1020,6 +1036,21 @@ enum CherryMCPTools {
             throw CherryControlError(code: "invalid_todo_status", message: "Unknown todo status: \(value)")
         }
         return status
+    }
+
+    private static func agentClosePolicyArgument(_ key: String, in arguments: [String: Value]) throws -> AgentClosePolicy? {
+        guard let value = stringArgument(key, in: arguments)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+            return nil
+        }
+        guard let policy = AgentClosePolicy(rawValue: value.lowercased()) else {
+            throw CherryControlError(
+                code: "invalid_agent_close_policy",
+                message: "Unknown agent close policy: \(value)"
+            )
+        }
+        return policy
     }
 
     private static func processSelector(in arguments: [String: Value]) -> ProcessSelectorRequest {

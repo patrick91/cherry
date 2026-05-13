@@ -4,6 +4,7 @@ public enum CherryControl {
     public static let socketEnvironmentKey = "CHERRY_CONTROL_SOCKET"
     public static let socketNamespaceEnvironmentKey = "CHERRY_CONTROL_NAMESPACE"
     public static let projectRootEnvironmentKey = "CHERRY_PROJECT_ROOT"
+    public static let agentIDEnvironmentKey = "CHERRY_AGENT_ID"
 
     public static var socketURL: URL {
         socketURL(
@@ -113,7 +114,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case startProcess(ProcessLifecycleRequest)
     case stopProcess(ProcessLifecycleRequest)
     case restartProcess(ProcessLifecycleRequest)
-    case closeProcess(ProcessSelectorRequest)
+    case closeProcess(CloseProcessRequest)
     case renameProcess(RenameProcessRequest)
     case sendProcessInput(SendProcessInputRequest)
     case startAllCommands(ProcessBulkCommandRequest)
@@ -151,7 +152,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case searchOutput(SearchOutputRequest)
     case clearOutput(TerminalIDRequest)
     case restartTerminal(TerminalIDRequest)
-    case closeTerminal(TerminalIDRequest)
+    case closeTerminal(CloseTerminalRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -287,6 +288,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let workingDirectory: String?
     public let text: String?
     public let rawBase64: String?
+    public let parentAgentID: String?
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
 
@@ -297,6 +299,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         workingDirectory: String? = nil,
         text: String? = nil,
         rawBase64: String? = nil,
+        parentAgentID: String? = nil,
         waitMilliseconds: Int? = nil,
         lineLimit: Int? = nil
     ) {
@@ -306,8 +309,31 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.workingDirectory = workingDirectory
         self.text = text
         self.rawBase64 = rawBase64
+        self.parentAgentID = parentAgentID
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
+    }
+}
+
+public enum AgentClosePolicy: String, Codable, Equatable, Sendable {
+    case reject
+    case closeSubAgents = "close_sub_agents"
+    case promoteSubAgents = "promote_sub_agents"
+}
+
+public struct CloseProcessRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let agentClosePolicy: AgentClosePolicy?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        agentClosePolicy: AgentClosePolicy? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.agentClosePolicy = agentClosePolicy
     }
 }
 
@@ -595,6 +621,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
     public let submit: Bool?
+    public let parentAgentID: String?
     public let select: Bool?
 
     public init(
@@ -605,6 +632,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         waitMilliseconds: Int? = nil,
         lineLimit: Int? = nil,
         submit: Bool? = nil,
+        parentAgentID: String? = nil,
         select: Bool? = nil
     ) {
         self.agentName = agentName
@@ -614,7 +642,18 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
         self.submit = submit
+        self.parentAgentID = parentAgentID
         self.select = select
+    }
+}
+
+public struct CloseTerminalRequest: Codable, Equatable, Sendable {
+    public let terminalID: String
+    public let agentClosePolicy: AgentClosePolicy?
+
+    public init(terminalID: String, agentClosePolicy: AgentClosePolicy? = nil) {
+        self.terminalID = terminalID
+        self.agentClosePolicy = agentClosePolicy
     }
 }
 
@@ -781,6 +820,8 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
     public let kind: String?
     public let agentName: String?
     public let summary: String?
+    public let parentAgentID: String?
+    public let childAgentCount: Int?
 
     public init(
         id: String,
@@ -792,7 +833,9 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         link: String? = nil,
         kind: String? = nil,
         agentName: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        parentAgentID: String? = nil,
+        childAgentCount: Int? = nil
     ) {
         self.id = id
         self.link = link
@@ -804,6 +847,8 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         self.kind = kind
         self.agentName = agentName
         self.summary = summary
+        self.parentAgentID = parentAgentID
+        self.childAgentCount = childAgentCount
     }
 }
 
@@ -924,6 +969,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let selected: Bool
     public let agentName: String?
     public let commandName: String?
+    public let parentAgentID: String?
+    public let childAgentCount: Int?
 
     public init(
         id: String,
@@ -944,7 +991,9 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         summary: String?,
         selected: Bool,
         agentName: String?,
-        commandName: String?
+        commandName: String?,
+        parentAgentID: String? = nil,
+        childAgentCount: Int? = nil
     ) {
         self.id = id
         self.link = link
@@ -965,6 +1014,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.selected = selected
         self.agentName = agentName
         self.commandName = commandName
+        self.parentAgentID = parentAgentID
+        self.childAgentCount = childAgentCount
     }
 }
 
@@ -1471,8 +1522,20 @@ public struct TerminalSummaryResult: Codable, Equatable, Sendable {
     public let kind: String?
     public let agentName: String?
     public let summary: String?
+    public let parentAgentID: String?
+    public let childAgentCount: Int?
 
-    public init(terminalID: String, link: String? = nil, title: String, state: String, kind: String? = nil, agentName: String? = nil, summary: String? = nil) {
+    public init(
+        terminalID: String,
+        link: String? = nil,
+        title: String,
+        state: String,
+        kind: String? = nil,
+        agentName: String? = nil,
+        summary: String? = nil,
+        parentAgentID: String? = nil,
+        childAgentCount: Int? = nil
+    ) {
         self.terminalID = terminalID
         self.link = link
         self.title = title
@@ -1480,6 +1543,8 @@ public struct TerminalSummaryResult: Codable, Equatable, Sendable {
         self.kind = kind
         self.agentName = agentName
         self.summary = summary
+        self.parentAgentID = parentAgentID
+        self.childAgentCount = childAgentCount
     }
 }
 
@@ -1491,6 +1556,8 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
     public let kind: String?
     public let agentName: String?
     public let summary: String?
+    public let parentAgentID: String?
+    public let childAgentCount: Int?
     public let projectRoot: String
     public let sentBytes: Int
     public let output: TerminalOutputResult?
@@ -1503,6 +1570,8 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
         kind: String?,
         agentName: String?,
         summary: String?,
+        parentAgentID: String? = nil,
+        childAgentCount: Int? = nil,
         projectRoot: String,
         sentBytes: Int,
         output: TerminalOutputResult?
@@ -1514,6 +1583,8 @@ public struct RunAgentResult: Codable, Equatable, Sendable {
         self.kind = kind
         self.agentName = agentName
         self.summary = summary
+        self.parentAgentID = parentAgentID
+        self.childAgentCount = childAgentCount
         self.projectRoot = projectRoot
         self.sentBytes = sentBytes
         self.output = output

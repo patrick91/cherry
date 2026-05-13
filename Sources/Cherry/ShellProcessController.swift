@@ -165,6 +165,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellPath: String
         let workingDirectory: String
         let projectRoot: String?
+        let agentID: String?
         let term: String
         let initialSize: TerminalViewportSize
         let startupCommand: String?
@@ -173,6 +174,7 @@ final class ShellProcessController: @unchecked Sendable {
             shellPath: String,
             workingDirectory: String,
             projectRoot: String? = nil,
+            agentID: String? = nil,
             term: String,
             initialSize: TerminalViewportSize,
             startupCommand: String? = nil
@@ -180,6 +182,7 @@ final class ShellProcessController: @unchecked Sendable {
             self.shellPath = shellPath
             self.workingDirectory = workingDirectory
             self.projectRoot = projectRoot
+            self.agentID = agentID
             self.term = term
             self.initialSize = initialSize
             self.startupCommand = startupCommand
@@ -577,6 +580,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
         let workingDirectory = configuration.workingDirectory
         let projectRoot = configuration.projectRoot
+        let agentID = configuration.agentID
         let term = configuration.term
         let startupCommand = configuration.startupCommand
         let originalZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
@@ -615,6 +619,11 @@ final class ShellProcessController: @unchecked Sendable {
                 _ = setenv(CherryControl.projectRootEnvironmentKey, projectRoot, 1)
             } else {
                 _ = unsetenv(CherryControl.projectRootEnvironmentKey)
+            }
+            if let agentID, !agentID.isEmpty {
+                _ = setenv(CherryControl.agentIDEnvironmentKey, agentID, 1)
+            } else {
+                _ = unsetenv(CherryControl.agentIDEnvironmentKey)
             }
             if let shellIntegration {
                 _ = setenv("CHERRY_BOOTSTRAP_ZDOTDIR", shellIntegration.zdotdir, 1)

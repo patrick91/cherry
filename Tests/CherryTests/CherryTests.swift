@@ -126,6 +126,7 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 }
 
 @Test func cherryControlRunAgentRequestRoundTrips() async throws {
+    let parentAgentID = UUID().uuidString
     let request = CherryControlRequest.runAgent(.init(
         agentName: "Codex",
         title: "Review workflow",
@@ -134,6 +135,7 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
         waitMilliseconds: 100,
         lineLimit: 20,
         submit: true,
+        parentAgentID: parentAgentID,
         select: true
     ))
 
@@ -220,11 +222,11 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
         .getProcessPorts(.init(processID: processID, includeUnattributed: true)),
         .servicesList(.init(kind: "command", includeUnattributed: false)),
         .waitForBoundPort(.init(processID: processID, port: 5173, timeoutMilliseconds: 500, probeHTTP: true, path: "/health")),
-        .spawnProcess(.init(kind: "command", name: "Web", waitMilliseconds: 100, lineLimit: 20)),
+        .spawnProcess(.init(kind: "agent", name: "Codex", parentAgentID: processID, waitMilliseconds: 100, lineLimit: 20)),
         .startProcess(.init(processName: "Web", kind: "command", waitMilliseconds: 100, lineLimit: 20)),
         .stopProcess(.init(processID: processID)),
         .restartProcess(.init(processID: processID)),
-        .closeProcess(.init(processID: processID)),
+        .closeProcess(.init(processID: processID, agentClosePolicy: .promoteSubAgents)),
         .renameProcess(.init(processID: processID, title: "Build")),
         .sendProcessInput(.init(processID: processID, text: "status\n", rawBase64: nil, waitMilliseconds: 100, lineLimit: 20)),
         .startAllCommands(.init(waitMilliseconds: 100, lineLimit: 20)),
@@ -722,6 +724,110 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(response.error == nil)
     #expect(result.sentBytes == Data("agent-input\r".utf8).count)
     #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
+}
+
+@MainActor
+@Test func controlServerNestsMCPSpawnedAgentsAndRequiresClosePolicy() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
+    guard case .runAgent(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.terminalID)
+    else {
+        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        return
+    }
+
+    let childResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: parent.terminalID
+    )))
+    guard case .runAgent(let child)? = childResponse.result,
+          let childID = UUID(uuidString: child.terminalID)
+    else {
+        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+        return
+    }
+
+    #expect(child.parentAgentID == parent.terminalID)
+    #expect(child.childAgentCount == 0)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+
+    let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.terminalID)))
+    guard case .getProcessStatus(let parentStatus)? = parentStatusResponse.result else {
+        Issue.record("Expected parent process status, got \(String(describing: parentStatusResponse))")
+        return
+    }
+    #expect(parentStatus.process.childAgentCount == 1)
+
+    let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.terminalID)))
+    #expect(rejectCloseResponse.error?.code == "agent_has_sub_agents")
+
+    let terminalID = try #require(harness.workspace.terminalSessions.first?.id.uuidString)
+    let invalidParentResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: terminalID
+    )))
+    #expect(invalidParentResponse.error?.code == "parent_agent_not_agent")
+
+    let promoteResponse = try await harness.send(.closeProcess(.init(
+        processID: parent.terminalID,
+        agentClosePolicy: .promoteSubAgents
+    )))
+    guard case .closeProcess(_)? = promoteResponse.result else {
+        Issue.record("Expected promoted close result, got \(String(describing: promoteResponse))")
+        return
+    }
+    #expect(!harness.workspace.sessions.contains { $0.id == parentID })
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.sessions.contains { $0.id == childID })
+}
+
+@MainActor
+@Test func controlServerClosesAgentGroupsWhenPolicyAllows() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let parent)? = parentResponse.result else {
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
+        return
+    }
+
+    let childResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: parent.process.id
+    )))
+    guard case .spawnProcess(let child)? = childResponse.result else {
+        Issue.record("Expected child spawnProcess result, got \(String(describing: childResponse))")
+        return
+    }
+
+    #expect(child.process.parentAgentID == parent.process.id)
+
+    let closeResponse = try await harness.send(.closeProcess(.init(
+        processID: parent.process.id,
+        agentClosePolicy: .closeSubAgents
+    )))
+    guard case .closeProcess(_)? = closeResponse.result else {
+        Issue.record("Expected group close result, got \(String(describing: closeResponse))")
+        return
+    }
+
+    #expect(harness.workspace.session(id: parent.process.id) == nil)
+    #expect(harness.workspace.session(id: child.process.id) == nil)
 }
 
 @MainActor
@@ -2933,6 +3039,104 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 }
 
 @MainActor
+@Test func workspaceNestsAgentSessionsAndPromotesChildren() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
+    let parent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
+    let child = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: parent.id, select: false)
+    let grandchild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
+
+    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id])
+    #expect(workspace.childAgentSessions(of: parent).map(\.id) == [child.id])
+    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == [child.id, grandchild.id])
+    #expect(workspace.visibleAgentTreeItems().map { "\($0.session.id.uuidString):\($0.depth)" } == [
+        "\(parent.id.uuidString):0",
+        "\(child.id.uuidString):1",
+        "\(grandchild.id.uuidString):2"
+    ])
+    #expect(workspace.visibleAgentTreeItems(collapsedIDs: [parent.id]).map { "\($0.session.id.uuidString):\($0.depth)" } == [
+        "\(parent.id.uuidString):0"
+    ])
+
+    workspace.closeAgentPromotingChildren(parent)
+
+    #expect(!workspace.sessions.contains { $0.id == parent.id })
+    #expect(child.parentAgentID == nil)
+    #expect(grandchild.parentAgentID == child.id)
+    #expect(workspace.rootAgentSessions.map(\.id) == [child.id])
+}
+
+@MainActor
+@Test func workspaceClosesAgentGroupsWithDescendants() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
+    let parent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
+    let child = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: parent.id, select: false)
+    let grandchild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
+
+    workspace.closeAgentGroup(parent)
+
+    #expect(!workspace.sessions.contains { $0.id == parent.id })
+    #expect(!workspace.sessions.contains { $0.id == child.id })
+    #expect(!workspace.sessions.contains { $0.id == grandchild.id })
+    #expect(workspace.agentSessions.isEmpty)
+    #expect(workspace.terminalSessions.count == 1)
+}
+
+@MainActor
+@Test func workspaceInstallsPreviewAgentTreeWithoutLaunchingAgents() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let previewSessions = workspace.installPreviewAgentTree()
+    let parent = try #require(previewSessions.first)
+    let child = try #require(previewSessions.dropFirst().first)
+
+    #expect(previewSessions.count == 5)
+    #expect(workspace.agentSessions.map(\.id) == previewSessions.map(\.id))
+    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id, previewSessions[4].id])
+    #expect(workspace.childAgentSessions(of: parent).map(\.id) == [child.id, previewSessions[2].id])
+    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == [child.id, previewSessions[3].id, previewSessions[2].id])
+    #expect(previewSessions.allSatisfy { session in
+        session.kind == .agent &&
+        session.childProcessID == nil &&
+        session.state == .exited(0)
+    })
+    #expect(workspace.installPreviewAgentTree().isEmpty)
+}
+
+@MainActor
 @Test func workspaceCanCreateCommandSession() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -3079,6 +3283,32 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(!rawOutput.contains("exec /bin/echo agent-done"))
     #expect(!rawOutput.contains("[agent exited with status 0]"))
     #expect(session.cursorState.isVisible == false)
+}
+
+@MainActor
+@Test func agentSessionExportsCherryAgentID() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let session = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Env", command: "/usr/bin/env"),
+        projectRoot: directory.path
+    )
+
+    try await waitForExit(session)
+
+    let rawOutput = String(decoding: session.rawOutput(maxBytes: 16 * 1024).data, as: UTF8.self)
+    #expect(rawOutput.contains("\(CherryControl.agentIDEnvironmentKey)=\(session.id.uuidString)"))
+    #expect(rawOutput.contains("\(CherryControl.projectRootEnvironmentKey)=\(directory.path)"))
 }
 
 @MainActor

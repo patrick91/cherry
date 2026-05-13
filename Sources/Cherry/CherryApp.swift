@@ -143,7 +143,16 @@ struct CherryApp: App {
                 Button("Close Tab") {
                     guard let workspace = focusedWorkspace else { return }
                     if workspace.sessions.count > 1 {
-                        workspace.closeSelectedSession()
+                        guard let session = workspace.selectedSession else { return }
+                        if !workspace.descendantAgentSessions(of: session).isEmpty {
+                            if let focusedChromeState {
+                                focusedChromeState.requestAgentGroupClose(sessionID: session.id)
+                            } else {
+                                workspace.close(session)
+                            }
+                        } else {
+                            workspace.close(session)
+                        }
                     } else {
                         NSApp.keyWindow?.performClose(nil)
                     }
@@ -314,10 +323,20 @@ private struct ProjectWorkspaceView: View {
             ProjectWindowRegistry.shared.activeNoteStore = noteStore
             ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
+            if Self.isAgentTreePreviewEnabled {
+                _ = workspace.installPreviewAgentTree()
+            }
             agentSettings.markProjectOpened(workspace.projectRoot)
             autoStartCommandsIfNeeded()
             openPendingDeepLinks()
         }
+    }
+
+    private static var isAgentTreePreviewEnabled: Bool {
+        let value = ProcessInfo.processInfo.environment["CHERRY_PREVIEW_AGENT_TREE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return value == "1" || value == "true" || value == "yes" || value == "on"
     }
 
     private func openProject(_ project: CherryProject) {

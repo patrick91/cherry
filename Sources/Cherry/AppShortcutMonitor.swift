@@ -181,7 +181,16 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard let workspace else { return }
 
             if workspace.sessions.count > 1 {
-                workspace.closeSelectedSession()
+                guard let session = workspace.selectedSession else { return }
+                if !workspace.descendantAgentSessions(of: session).isEmpty {
+                    if let chromeState {
+                        chromeState.requestAgentGroupClose(sessionID: session.id)
+                    } else {
+                        workspace.close(session)
+                    }
+                } else {
+                    workspace.close(session)
+                }
             } else {
                 window?.performClose(nil)
             }
@@ -204,7 +213,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
         private func sidebarItems() -> [SidebarItem] {
             guard let workspace else { return [] }
             var items: [SidebarItem] = []
-            items += workspace.agentSessions.map { .session($0) }
+            items += workspace.visibleAgentSessions(
+                collapsedIDs: chromeState?.collapsedAgentGroupIDs ?? []
+            ).map { .session($0) }
             items += workspace.terminalSessions.map { .session($0) }
             items += visibleCommands.map { .command($0) }
             if projectFeatures.todosEnabled {

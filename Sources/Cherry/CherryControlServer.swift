@@ -361,10 +361,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .restartProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
         case .closeProcess(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            guard workspace.sessions.count > 1 else {
-                throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
-            }
-            workspace.close(session)
+            try closeFromControl(session, workspace: workspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeProcess(.init(processID: session.id.uuidString, closed: true)))
         case .renameProcess(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
@@ -424,6 +421,7 @@ final class CherryControlServer: @unchecked Sendable {
                 agent: agent.definition,
                 projectRoot: projectRoot,
                 title: request.title,
+                parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
                 select: request.select ?? false
             )
             if request.select ?? false {
@@ -451,6 +449,8 @@ final class CherryControlServer: @unchecked Sendable {
                 kind: session.kind.rawValue,
                 agentName: session.agentName,
                 summary: session.summary,
+                parentAgentID: session.parentAgentID?.uuidString,
+                childAgentCount: workspace.childAgentCount(of: session),
                 projectRoot: projectRoot,
                 sentBytes: payload?.count ?? 0,
                 output: output
@@ -671,10 +671,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .restartTerminal(summary(for: session, workspace: workspace)))
         case .closeTerminal(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            guard workspace.sessions.count > 1 else {
-                throw CherryControlError(code: "last_terminal", message: "Cherry cannot close the last remaining terminal.")
-            }
-            workspace.close(session)
+            try closeFromControl(session, workspace: workspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeTerminal(.init(terminalID: session.id.uuidString, closed: true)))
         }
     }
@@ -832,7 +829,9 @@ final class CherryControlServer: @unchecked Sendable {
                     link: link(for: session, workspace: workspace),
                     kind: session.kind.rawValue,
                     agentName: session.agentName,
-                    summary: session.summary
+                    summary: session.summary,
+                    parentAgentID: session.parentAgentID?.uuidString,
+                    childAgentCount: workspace.childAgentCount(of: session)
                 )
             },
             selectedTerminalID: workspace.selectedSessionID?.uuidString
@@ -943,7 +942,9 @@ final class CherryControlServer: @unchecked Sendable {
             summary: session.summary,
             selected: workspace.selectedSessionID == session.id,
             agentName: session.agentName,
-            commandName: session.commandName
+            commandName: session.commandName,
+            parentAgentID: session.parentAgentID?.uuidString,
+            childAgentCount: workspace.childAgentCount(of: session)
         )
     }
 
@@ -998,7 +999,13 @@ final class CherryControlServer: @unchecked Sendable {
             guard agent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
             }
-            session = workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot, title: request.title, select: false)
+            session = workspace.addAgentSession(
+                agent: agent.definition,
+                projectRoot: projectRoot,
+                title: request.title,
+                parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
+                select: false
+            )
         case .command:
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
@@ -1174,12 +1181,62 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func closeFromControl(
+        _ session: TerminalSession,
+        workspace: TerminalWorkspace,
+        agentClosePolicy: AgentClosePolicy?
+    ) throws {
+        let descendants = workspace.descendantAgentSessions(of: session)
+        guard !descendants.isEmpty else {
+            guard workspace.sessions.count > 1 else {
+                throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
+            }
+            workspace.close(session)
+            return
+        }
+
+        switch agentClosePolicy ?? .reject {
+        case .reject:
+            throw CherryControlError(
+                code: "agent_has_sub_agents",
+                message: "Agent '\(session.title)' has sub-agents. Pass agent_close_policy as close_sub_agents or promote_sub_agents."
+            )
+        case .closeSubAgents:
+            guard workspace.sessions.count > descendants.count + 1 else {
+                throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
+            }
+            workspace.closeAgentGroup(session)
+        case .promoteSubAgents:
+            workspace.closeAgentPromotingChildren(session)
+        }
+    }
+
+    @MainActor
     private func restartProcess(_ session: TerminalSession) {
         if session.kind == .command {
             session.restart()
         } else {
             session.restart()
         }
+    }
+
+    @MainActor
+    private func parentAgentID(from rawValue: String?, workspace: TerminalWorkspace) throws -> UUID? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawValue.isEmpty
+        else {
+            return nil
+        }
+        guard let parentID = UUID(uuidString: rawValue) else {
+            throw CherryControlError(code: "invalid_parent_agent_id", message: "parent_agent_id must be a Cherry agent UUID.")
+        }
+        guard let parent = workspace.sessions.first(where: { $0.id == parentID }) else {
+            throw CherryControlError(code: "parent_agent_not_found", message: "No Cherry agent exists with parent_agent_id \(rawValue).")
+        }
+        guard parent.kind == .agent else {
+            throw CherryControlError(code: "parent_agent_not_agent", message: "parent_agent_id must refer to an agent session.")
+        }
+        return parentID
     }
 
     @MainActor
@@ -1559,7 +1616,9 @@ final class CherryControlServer: @unchecked Sendable {
             state: session.state.label,
             kind: session.kind.rawValue,
             agentName: session.agentName,
-            summary: session.summary
+            summary: session.summary,
+            parentAgentID: session.parentAgentID?.uuidString,
+            childAgentCount: workspace.childAgentCount(of: session)
         )
     }
 

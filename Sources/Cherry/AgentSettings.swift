@@ -175,11 +175,69 @@ enum ProjectFeatureStorage: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum ProjectAppearanceStorage: String, CaseIterable, Identifiable {
+    case projectFile
+    case local
+
+    var id: String { rawValue }
+}
+
+enum ProjectIdentityColor: String, CaseIterable, Codable, Equatable, Identifiable {
+    case red
+    case orange
+    case amber
+    case green
+    case teal
+    case cyan
+    case blue
+    case indigo
+    case violet
+    case pink
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .red: "Red"
+        case .orange: "Orange"
+        case .amber: "Amber"
+        case .green: "Green"
+        case .teal: "Teal"
+        case .cyan: "Cyan"
+        case .blue: "Blue"
+        case .indigo: "Indigo"
+        case .violet: "Violet"
+        case .pink: "Pink"
+        }
+    }
+
+    var hexRGB: String {
+        switch self {
+        case .red: "#E5484D"
+        case .orange: "#F76B15"
+        case .amber: "#F5A524"
+        case .green: "#30A46C"
+        case .teal: "#12A594"
+        case .cyan: "#00A2C7"
+        case .blue: "#3B82F6"
+        case .indigo: "#6366F1"
+        case .violet: "#8B5CF6"
+        case .pink: "#D946EF"
+        }
+    }
+}
+
 struct ProjectFeatureSettings: Codable, Equatable {
     var notesEnabled: Bool
     var todosEnabled: Bool
 
     static let disabled = ProjectFeatureSettings(notesEnabled: false, todosEnabled: false)
+}
+
+struct ProjectAppearanceSettings: Codable, Equatable {
+    var color: ProjectIdentityColor?
+
+    static let none = ProjectAppearanceSettings(color: nil)
 }
 
 struct ProjectFeatureOverrides: Codable, Equatable {
@@ -188,6 +246,42 @@ struct ProjectFeatureOverrides: Codable, Equatable {
 
     var isEmpty: Bool {
         notesEnabled == nil && todosEnabled == nil
+    }
+}
+
+struct ProjectAppearanceOverrides: Codable, Equatable {
+    var color: ProjectIdentityColor?? = nil
+
+    var isEmpty: Bool {
+        color == nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case color
+    }
+
+    init(color: ProjectIdentityColor?? = nil) {
+        self.color = color
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.color) {
+            let decodedColor = try container.decodeIfPresent(ProjectIdentityColor.self, forKey: .color)
+            color = .some(decodedColor)
+        } else {
+            color = nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        guard let color else { return }
+        if let color {
+            try container.encode(color, forKey: .color)
+        } else {
+            try container.encodeNil(forKey: .color)
+        }
     }
 }
 
@@ -409,6 +503,7 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var agents: [AgentToolDefinition] = []
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
     @Published private(set) var featureOverridesByProject: [String: ProjectFeatureOverrides] = [:]
+    @Published private(set) var appearanceOverridesByProject: [String: ProjectAppearanceOverrides] = [:]
     @Published var agentSummaryTool: AgentSummaryTool {
         didSet {
             let currentModel = agentSummaryModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -448,6 +543,7 @@ final class AgentSettings: ObservableObject {
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
         featureOverridesByProject = Self.loadFeatureOverridesByProject(from: defaults)
+        appearanceOverridesByProject = Self.loadAppearanceOverridesByProject(from: defaults)
         let storedSummaryCommand = defaults.string(forKey: Keys.agentSummaryCommand) ?? ""
         let storedSummaryTool = Self.loadAgentSummaryTool(from: defaults, command: storedSummaryCommand)
         agentSummaryCommand = storedSummaryCommand
@@ -541,6 +637,28 @@ final class AgentSettings: ObservableObject {
         return featureOverridesByProject[root] ?? ProjectFeatureOverrides()
     }
 
+    func projectAppearance(for requestedRoot: String?) -> ProjectAppearanceSettings {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else {
+            return .none
+        }
+
+        let shared = CherryProjectFile.loadAppearanceSettings(projectRoot: root) ?? .none
+        guard let local = appearanceOverridesByProject[root],
+              let localColor = local.color
+        else {
+            return shared
+        }
+
+        return ProjectAppearanceSettings(color: localColor)
+    }
+
+    func projectAppearanceOverrides(for requestedRoot: String?) -> ProjectAppearanceOverrides {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else {
+            return ProjectAppearanceOverrides()
+        }
+        return appearanceOverridesByProject[root] ?? ProjectAppearanceOverrides()
+    }
+
     func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectFeatureStorage) throws {
         guard let root = Self.validDirectory(requestedRoot) else { return }
         switch storage {
@@ -554,10 +672,26 @@ final class AgentSettings: ObservableObject {
         }
     }
 
+    func setProjectAppearance(_ appearance: ProjectAppearanceSettings, for requestedRoot: String, storage: ProjectAppearanceStorage) throws {
+        guard let root = Self.validDirectory(requestedRoot) else { return }
+        switch storage {
+        case .local:
+            try setAppearanceOverrides(ProjectAppearanceOverrides(color: appearance.color), for: root)
+        case .projectFile:
+            try CherryProjectFile.writeAppearanceSettings(appearance, projectRoot: root)
+        }
+    }
+
     func clearLocalProjectFeatureOverrides(for requestedRoot: String) {
         guard let root = Self.validDirectory(requestedRoot) else { return }
         featureOverridesByProject.removeValue(forKey: root)
         saveFeatureOverrides()
+    }
+
+    func clearLocalProjectAppearanceOverrides(for requestedRoot: String) {
+        guard let root = Self.validDirectory(requestedRoot) else { return }
+        appearanceOverridesByProject.removeValue(forKey: root)
+        saveAppearanceOverrides()
     }
 
     @discardableResult
@@ -575,6 +709,7 @@ final class AgentSettings: ObservableObject {
         projects.removeAll { $0.root == project.root }
         commandsByProject.removeValue(forKey: project.root)
         featureOverridesByProject.removeValue(forKey: project.root)
+        appearanceOverridesByProject.removeValue(forKey: project.root)
         if lastOpenedProjectRoot == project.root {
             lastOpenedProjectRoot = projects.first?.root
             saveLastOpenedProjectRoot()
@@ -582,6 +717,7 @@ final class AgentSettings: ObservableObject {
         saveProjects()
         saveCommands()
         saveFeatureOverrides()
+        saveAppearanceOverrides()
     }
 
     func markProjectOpened(_ projectRoot: String?) {
@@ -664,6 +800,15 @@ final class AgentSettings: ObservableObject {
         saveFeatureOverrides()
     }
 
+    private func setAppearanceOverrides(_ overrides: ProjectAppearanceOverrides, for root: String) throws {
+        if overrides.isEmpty {
+            appearanceOverridesByProject.removeValue(forKey: root)
+        } else {
+            appearanceOverridesByProject[root] = overrides
+        }
+        saveAppearanceOverrides()
+    }
+
     private func saveProjects() {
         Self.saveProjects(projects, to: defaults)
     }
@@ -687,6 +832,10 @@ final class AgentSettings: ObservableObject {
 
     private func saveFeatureOverrides() {
         Self.saveFeatureOverridesByProject(featureOverridesByProject, to: defaults)
+    }
+
+    private func saveAppearanceOverrides() {
+        Self.saveAppearanceOverridesByProject(appearanceOverridesByProject, to: defaults)
     }
 
     private func saveSummarySettings() {
@@ -748,6 +897,23 @@ final class AgentSettings: ObservableObject {
         }
 
         var overridesByProject: [String: ProjectFeatureOverrides] = [:]
+        for (root, overrides) in decoded {
+            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
+                continue
+            }
+            overridesByProject[validRoot] = overrides
+        }
+        return overridesByProject
+    }
+
+    private static func loadAppearanceOverridesByProject(from defaults: UserDefaults) -> [String: ProjectAppearanceOverrides] {
+        guard let data = defaults.data(forKey: Keys.appearanceOverridesByProject),
+              let decoded = try? JSONDecoder().decode([String: ProjectAppearanceOverrides].self, from: data)
+        else {
+            return [:]
+        }
+
+        var overridesByProject: [String: ProjectAppearanceOverrides] = [:]
         for (root, overrides) in decoded {
             guard let validRoot = validDirectory(root), !overrides.isEmpty else {
                 continue
@@ -821,6 +987,14 @@ final class AgentSettings: ObservableObject {
         defaults.set(data, forKey: Keys.featureOverridesByProject)
     }
 
+    private static func saveAppearanceOverridesByProject(
+        _ overridesByProject: [String: ProjectAppearanceOverrides],
+        to defaults: UserDefaults
+    ) {
+        guard let data = try? JSONEncoder().encode(overridesByProject) else { return }
+        defaults.set(data, forKey: Keys.appearanceOverridesByProject)
+    }
+
     static func normalizedPath(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -845,6 +1019,7 @@ final class AgentSettings: ObservableObject {
         static let agents = "agents.global"
         static let commandsByProject = "commands.byProject"
         static let featureOverridesByProject = "features.byProject"
+        static let appearanceOverridesByProject = "appearance.byProject"
         static let agentSummaryTool = "agents.summaryTool"
         static let agentSummaryCadence = "agents.summaryCadence"
         static let agentSummaryModel = "agents.summaryModel"
@@ -889,6 +1064,20 @@ enum CherryProjectFile {
         )
     }
 
+    static func loadAppearanceSettings(projectRoot: String) -> ProjectAppearanceSettings? {
+        let url = fileURL(projectRoot: projectRoot)
+        guard let contents = try? String(contentsOf: url, encoding: .utf8),
+              let source = tableSection(named: "appearance", in: contents)
+        else {
+            return nil
+        }
+
+        let fields = parseKeyValues(from: source)
+        return ProjectAppearanceSettings(
+            color: fields["color"].flatMap(ProjectIdentityColor.init(rawValue:))
+        )
+    }
+
     static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
@@ -896,6 +1085,26 @@ enum CherryProjectFile {
         let nextContents: String
 
         if let range = tableSectionRange(named: "features", in: existing) {
+            let replacement = range.upperBound == existing.endIndex ? nextSection : nextSection + "\n"
+            nextContents = existing.replacingCharacters(in: range, with: replacement)
+        } else if existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            nextContents = nextSection
+        } else {
+            nextContents = existing.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + nextSection
+        }
+
+        try nextContents.trimmingCharacters(in: .whitespacesAndNewlines)
+            .appending("\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    static func writeAppearanceSettings(_ appearance: ProjectAppearanceSettings, projectRoot: String) throws {
+        let url = fileURL(projectRoot: projectRoot)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let nextSection = renderAppearanceSection(appearance)
+        let nextContents: String
+
+        if let range = tableSectionRange(named: "appearance", in: existing) {
             let replacement = range.upperBound == existing.endIndex ? nextSection : nextSection + "\n"
             nextContents = existing.replacingCharacters(in: range, with: replacement)
         } else if existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -972,6 +1181,13 @@ enum CherryProjectFile {
             "[features]",
             "notes = \(features.notesEnabled ? "true" : "false")",
             "todos = \(features.todosEnabled ? "true" : "false")"
+        ].joined(separator: "\n")
+    }
+
+    private static func renderAppearanceSection(_ appearance: ProjectAppearanceSettings) -> String {
+        [
+            "[appearance]",
+            "color = \(tomlString(appearance.color?.rawValue ?? "none"))"
         ].joined(separator: "\n")
     }
 

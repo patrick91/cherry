@@ -1879,6 +1879,24 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(settings.sidebarTerminalPathDisplayMode == .repoFocused)
 }
 
+@MainActor
+@Test func terminalSettingsPersistProjectColorDisplayMode() async throws {
+    let defaultsName = "CherryTests.TerminalSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let settings = TerminalSettings(defaults: defaults)
+    #expect(settings.projectColorDisplayMode == .accent)
+
+    settings.projectColorDisplayMode = .tinted
+    #expect(TerminalSettings(defaults: defaults).projectColorDisplayMode == .tinted)
+
+    settings.resetTerminalAppearance()
+    #expect(settings.projectColorDisplayMode == .accent)
+}
+
 @Test func sidebarThemeSampleContrastsTerminalBackgroundByAppearance() async throws {
     let darkThemeColors = TerminalThemeColors(
         background: "#303446",
@@ -1911,6 +1929,45 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
         sidebarBackgroundDepth: 0
     )
     #expect(unchangedSample.sidebarBackground.hexRGBString == unchangedSample.background.hexRGBString)
+}
+
+@Test func sidebarThemeSampleAppliesProjectColorOnlyInTintedMode() async throws {
+    let themeColors = TerminalThemeColors(
+        background: "#303446",
+        foreground: "#c6d0f5",
+        selectionBackground: "#626880",
+        palette: [:]
+    )
+    let plainSample = SidebarThemeSample(
+        themeColors: themeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0.08
+    )
+    let accentSample = SidebarThemeSample(
+        themeColors: themeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0.08,
+        projectColor: .blue,
+        projectColorDisplayMode: .accent
+    )
+    let tintedSample = SidebarThemeSample(
+        themeColors: themeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0.08,
+        projectColor: .blue,
+        projectColorDisplayMode: .tinted
+    )
+    let offSample = SidebarThemeSample(
+        themeColors: themeColors,
+        fallbackColorScheme: .dark,
+        sidebarBackgroundDepth: 0.08,
+        projectColor: .blue,
+        projectColorDisplayMode: .off
+    )
+
+    #expect(accentSample.sidebarBackground.hexRGBString == plainSample.sidebarBackground.hexRGBString)
+    #expect(tintedSample.sidebarBackground.hexRGBString != plainSample.sidebarBackground.hexRGBString)
+    #expect(offSample.projectAccent == nil)
 }
 
 @MainActor
@@ -2666,6 +2723,74 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(contents.contains("[[commands]]"))
     #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
     #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
+}
+
+@MainActor
+@Test func projectAppearanceDefaultNoneAndLocalOverridesWin() async throws {
+    let defaultsName = "CherryTests.ProjectAppearance.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+
+    #expect(settings.projectAppearance(for: directory.path) == ProjectAppearanceSettings.none)
+
+    try CherryProjectFile.writeAppearanceSettings(.init(color: .blue), projectRoot: directory.path)
+    #expect(settings.projectAppearance(for: directory.path) == ProjectAppearanceSettings(color: .blue))
+
+    try settings.setProjectAppearance(.init(color: .pink), for: directory.path, storage: .local)
+    #expect(settings.projectAppearance(for: directory.path) == ProjectAppearanceSettings(color: .pink))
+    #expect(AgentSettings(defaults: defaults).projectAppearance(for: directory.path) == ProjectAppearanceSettings(color: .pink))
+
+    try settings.setProjectAppearance(.none, for: directory.path, storage: .local)
+    #expect(settings.projectAppearance(for: directory.path) == ProjectAppearanceSettings.none)
+    #expect(AgentSettings(defaults: defaults).projectAppearance(for: directory.path) == ProjectAppearanceSettings.none)
+
+    settings.clearLocalProjectAppearanceOverrides(for: directory.path)
+    #expect(settings.projectAppearance(for: directory.path) == ProjectAppearanceSettings(color: .blue))
+}
+
+@MainActor
+@Test func cherryTomlAppearanceSettingsPreserveFeatureSettingsAndManagedCommands() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
+        projectRoot: directory.path
+    )
+    try CherryProjectFile.writeAppearanceSettings(.init(color: .teal), projectRoot: directory.path)
+
+    let contents = try String(contentsOf: CherryProjectFile.fileURL(projectRoot: directory.path), encoding: .utf8)
+    #expect(contents.contains("[features]"))
+    #expect(contents.contains("[appearance]"))
+    #expect(contents.contains("color = \"teal\""))
+    #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings(color: .teal))
+    #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
+
+    try String("[appearance]\ncolor = \"mystery\"\n").write(
+        to: CherryProjectFile.fileURL(projectRoot: directory.path),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings.none)
 }
 
 @MainActor

@@ -152,80 +152,85 @@ private struct ProjectSettingsPane: View {
     @ObservedObject var settings: AgentSettings
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(.secondary)
-
-                    Text("Projects")
-                        .font(.system(size: 24, weight: .semibold))
-                }
-
-                Text("All the projects loaded in Cherry.")
-                    .font(.system(size: 17))
-                    .foregroundStyle(.secondary)
-            }
-
-            Text("\(settings.projects.count) \(settings.projects.count == 1 ? "project" : "projects")")
-                .font(.system(size: 15))
-                .foregroundStyle(.secondary)
-
-            VStack(spacing: 0) {
-                ForEach(settings.projects) { project in
-                    VStack(spacing: 0) {
-                        Button {
-                            openProject(project)
-                        } label: {
-                            ProjectRow(project: project)
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button("Remove Project", role: .destructive) {
-                                settings.removeProject(project)
-                            }
-                        }
-
-                        ProjectFeatureControls(settings: settings, project: project)
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 12)
-                    }
-
-                    Divider()
-                }
-
-                Button {
-                    chooseProjectRoot()
-                } label: {
-                    HStack(spacing: 16) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 18, weight: .regular))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 18, weight: .medium))
                             .foregroundStyle(.secondary)
-                            .frame(width: 24)
 
-                        Text("Add project")
-                            .font(.system(size: 17))
-                            .foregroundStyle(.primary)
-
-                        Spacer()
+                        Text("Projects")
+                            .font(.system(size: 24, weight: .semibold))
                     }
-                    .frame(height: 46)
-                    .padding(.horizontal, 16)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
-            }
 
-            Spacer()
+                    Text("All the projects loaded in Cherry.")
+                        .font(.system(size: 17))
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("\(settings.projects.count) \(settings.projects.count == 1 ? "project" : "projects")")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 0) {
+                    ForEach(settings.projects) { project in
+                        VStack(spacing: 0) {
+                            Button {
+                                openProject(project)
+                            } label: {
+                                ProjectRow(project: project)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Remove Project", role: .destructive) {
+                                    settings.removeProject(project)
+                                }
+                            }
+
+                            ProjectFeatureControls(settings: settings, project: project)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 8)
+
+                            ProjectAppearanceControls(settings: settings, project: project)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 12)
+                        }
+
+                        Divider()
+                    }
+
+                    Button {
+                        chooseProjectRoot()
+                    } label: {
+                        HStack(spacing: 16) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 18, weight: .regular))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 24)
+
+                            Text("Add project")
+                                .font(.system(size: 17))
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+                        }
+                        .frame(height: 46)
+                        .padding(.horizontal, 16)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                }
+            }
+            .padding(32)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -342,6 +347,92 @@ private struct ProjectFeatureControls: View {
     }
 }
 
+private struct ProjectAppearanceControls: View {
+    @ObservedObject var settings: AgentSettings
+    let project: CherryProject
+
+    @State private var storage: ProjectAppearanceStorage = .local
+    @State private var errorMessage: String?
+
+    private var appearance: ProjectAppearanceSettings {
+        settings.projectAppearance(for: project.root)
+    }
+
+    private var hasLocalOverrides: Bool {
+        !settings.projectAppearanceOverrides(for: project.root).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Picker("Color", selection: colorBinding) {
+                    Label("None", systemImage: "slash.circle")
+                        .tag(Optional<ProjectIdentityColor>.none)
+
+                    ForEach(ProjectIdentityColor.allCases) { color in
+                        ProjectColorPickerLabel(color: color)
+                            .tag(Optional(color))
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 150)
+
+                Spacer()
+
+                Picker("Storage", selection: $storage) {
+                    Text("Local").tag(ProjectAppearanceStorage.local)
+                    Text("cherry.toml").tag(ProjectAppearanceStorage.projectFile)
+                }
+                .labelsHidden()
+                .frame(width: 130)
+
+                if hasLocalOverrides {
+                    Button("Clear Local") {
+                        settings.clearLocalProjectAppearanceOverrides(for: project.root)
+                    }
+                    .help("Use cherry.toml appearance settings for this project")
+                }
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var colorBinding: Binding<ProjectIdentityColor?> {
+        Binding {
+            appearance.color
+        } set: { newColor in
+            do {
+                try settings.setProjectAppearance(
+                    ProjectAppearanceSettings(color: newColor),
+                    for: project.root,
+                    storage: storage
+                )
+                errorMessage = nil
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct ProjectColorPickerLabel: View {
+    let color: ProjectIdentityColor
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(Color(nsColor: NSColor(hexRGB: color.hexRGB) ?? .controlAccentColor))
+                .frame(width: 10, height: 10)
+            Text(color.label)
+        }
+    }
+}
+
 private struct TerminalSettingsPane: View {
     @ObservedObject var settings: TerminalSettings
 
@@ -363,6 +454,14 @@ private struct TerminalSettingsPane: View {
                     }
                 }
                 .pickerStyle(.menu)
+
+                Picker("Project colors", selection: $settings.projectColorDisplayMode) {
+                    ForEach(ProjectColorDisplayMode.allCases) { mode in
+                        Text(mode.label)
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
             }
 
             Section("Terminal Theme") {

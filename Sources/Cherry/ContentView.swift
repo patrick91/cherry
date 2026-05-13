@@ -149,7 +149,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.all, edges: .top)
         .background {
-            AppShellBackground()
+            AppShellBackground(projectRoot: projectRoot)
                 .ignoresSafeArea(.all)
         }
         .background(AppShortcutMonitor(
@@ -2034,7 +2034,7 @@ struct ProjectOnboardingView: View {
         }
         .frame(minWidth: 560, minHeight: 420)
         .background {
-            AppShellBackground()
+            AppShellBackground(projectRoot: nil)
                 .ignoresSafeArea(.all)
         }
         .background(WindowConfigurator())
@@ -2067,8 +2067,10 @@ struct ProjectOnboardingView: View {
 }
 
 private struct AppShellBackground: View {
+    let projectRoot: String?
+
     var body: some View {
-        SidebarBackground(presentation: .docked)
+        SidebarBackground(projectRoot: projectRoot, presentation: .docked)
     }
 }
 
@@ -2787,6 +2789,7 @@ private struct SidebarTabsView: View {
                         kind: .terminal,
                         workspace: workspace,
                         chromeState: chromeState,
+                        projectRoot: projectRoot,
                         presentation: presentation,
                         shortcutStartIndex: workspace.agentSessions.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
@@ -2806,6 +2809,7 @@ private struct SidebarTabsView: View {
                         SidebarTodosSection(
                             todoStore: todoStore,
                             chromeState: chromeState,
+                            projectRoot: projectRoot,
                             presentation: presentation,
                             shortcutNumber: todoBoardShortcutNumber,
                             showShortcutHint: chromeState.isCommandKeyPressed
@@ -2816,6 +2820,7 @@ private struct SidebarTabsView: View {
                         SidebarNotesSection(
                             noteStore: noteStore,
                             chromeState: chromeState,
+                            projectRoot: projectRoot,
                             presentation: presentation,
                             shortcutStartIndex: notesShortcutStartIndex(features: features),
                             showShortcutHints: chromeState.isCommandKeyPressed
@@ -2834,7 +2839,7 @@ private struct SidebarTabsView: View {
         }
         .background {
             if presentation == .floating {
-                SidebarBackground(presentation: presentation)
+                SidebarBackground(projectRoot: projectRoot, presentation: presentation)
             }
         }
     }
@@ -2882,6 +2887,8 @@ private struct TitlebarProjectPicker: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -2890,17 +2897,25 @@ private struct TitlebarProjectPicker: View {
         // A plain Button has no such interference — we present an NSMenu
         // programmatically on click.
         Button(action: presentMenu) {
-            Text(selectedProject?.name ?? "No Project")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(palette.rowText)
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(palette.hoverFill.opacity(isHovering ? 1 : 0))
+            HStack(spacing: 6) {
+                if palette.showsProjectAccent {
+                    Circle()
+                        .fill(palette.projectAccent)
+                        .frame(width: 7, height: 7)
                 }
-                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                Text(selectedProject?.name ?? "No Project")
+                    .lineLimit(1)
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(palette.rowText)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(palette.hoverFill.opacity(isHovering ? 1 : 0))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
         .background(TitlebarProjectMenuAnchor(ref: anchorRef))
@@ -3041,6 +3056,8 @@ private struct SidebarAgentSessionSection: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -3066,6 +3083,7 @@ private struct SidebarAgentSessionSection: View {
                     SidebarTabRow(
                         session: session,
                         isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+                        projectRoot: projectRoot,
                         presentation: presentation,
                         shortcutNumber: index + 1,
                         showShortcutHint: showShortcutHints,
@@ -3177,6 +3195,8 @@ private struct SidebarCommandSection: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -3357,9 +3377,11 @@ private struct SidebarCommandSection: View {
 private struct SidebarNotesSection: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let projectRoot: String?
     let presentation: SidebarPresentation
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
@@ -3369,6 +3391,8 @@ private struct SidebarNotesSection: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -3470,9 +3494,11 @@ private struct SidebarNotesSection: View {
 private struct SidebarTodosSection: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
     @ObservedObject var todoStore: ProjectTodoStore
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let projectRoot: String?
     let presentation: SidebarPresentation
     let shortcutNumber: Int
     let showShortcutHint: Bool
@@ -3482,6 +3508,8 @@ private struct SidebarTodosSection: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -3582,6 +3610,7 @@ private func promptRenameSession(_ session: TerminalSession) {
 private struct SidebarCommandRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
     let command: ProjectCommandDefinition
     let session: TerminalSession?
@@ -3602,6 +3631,8 @@ private struct SidebarCommandRow: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
         let subtitle = sidebarSubtitle()
@@ -3757,12 +3788,14 @@ private struct SidebarEmptyRow: View {
 private struct SidebarSessionSection: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
     let title: String
     let sessions: [TerminalSession]
     let kind: TerminalSession.SessionKind
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let projectRoot: String?
     let presentation: SidebarPresentation
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
@@ -3775,6 +3808,8 @@ private struct SidebarSessionSection: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
@@ -3785,6 +3820,7 @@ private struct SidebarSessionSection: View {
                 SidebarTabRow(
                     session: session,
                     isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+                    projectRoot: projectRoot,
                     presentation: presentation,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
@@ -4326,7 +4362,9 @@ private final class TrafficLightOverlayView: NSView {
 private struct SidebarBackground: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
+    let projectRoot: String?
     let presentation: SidebarPresentation
 
     var body: some View {
@@ -4334,11 +4372,21 @@ private struct SidebarBackground: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
 
         Rectangle()
             .fill(palette.backgroundMaterial)
+            .overlay(alignment: .leading) {
+                if palette.showsProjectAccent {
+                    Rectangle()
+                        .fill(palette.projectAccent)
+                        .frame(width: 3)
+                        .opacity(presentation == .floating ? 0.75 : 0.62)
+                }
+            }
             .overlay {
                 Rectangle()
                     .fill(palette.backgroundTint)
@@ -4371,10 +4419,12 @@ private struct SidebarShortcutHint: View {
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
 
     @ObservedObject var session: TerminalSession
 
     let isSelected: Bool
+    let projectRoot: String?
     let presentation: SidebarPresentation
     let shortcutNumber: Int
     let showShortcutHint: Bool
@@ -4387,6 +4437,8 @@ private struct SidebarTabRow: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
         let label = sidebarLabel()
@@ -4652,6 +4704,8 @@ private struct SidebarPalette {
     let backgroundMaterial: AnyShapeStyle
     let backgroundTint: Color
     let backgroundOverlay: [Color]
+    let projectAccent: Color
+    let showsProjectAccent: Bool
     let headerText: Color
     let rowText: Color
     let selectedText: Color
@@ -4664,6 +4718,8 @@ private struct SidebarPalette {
         backgroundMaterial: AnyShapeStyle,
         backgroundTint: Color,
         backgroundOverlay: [Color],
+        projectAccent: Color,
+        showsProjectAccent: Bool,
         headerText: Color,
         rowText: Color,
         selectedText: Color,
@@ -4675,6 +4731,8 @@ private struct SidebarPalette {
         self.backgroundMaterial = backgroundMaterial
         self.backgroundTint = backgroundTint
         self.backgroundOverlay = backgroundOverlay
+        self.projectAccent = projectAccent
+        self.showsProjectAccent = showsProjectAccent
         self.headerText = headerText
         self.rowText = rowText
         self.selectedText = selectedText
@@ -4688,17 +4746,27 @@ private struct SidebarPalette {
         themeColors: TerminalThemeColors,
         fallbackColorScheme: ColorScheme,
         sidebarBackgroundDepth: Double,
+        projectColor: ProjectIdentityColor? = nil,
+        projectColorDisplayMode: ProjectColorDisplayMode = .accent,
         presentation: SidebarPresentation
     ) {
         let sample = SidebarThemeSample(
             themeColors: themeColors,
             fallbackColorScheme: fallbackColorScheme,
-            sidebarBackgroundDepth: sidebarBackgroundDepth
+            sidebarBackgroundDepth: sidebarBackgroundDepth,
+            projectColor: projectColor,
+            projectColorDisplayMode: projectColorDisplayMode
         )
         let background = Color(nsColor: sample.background)
         let sidebarBackground = Color(nsColor: sample.sidebarBackground)
         let foreground = Color(nsColor: sample.foreground)
         let selection = sample.selectionBackground.map { Color(nsColor: $0) }
+        let projectAccent = sample.projectAccent.map { Color(nsColor: $0) } ?? foreground.opacity(0)
+        let useAccentChrome = sample.projectColorDisplayMode == .accent
+        let selectedFill = useAccentChrome
+            ? sample.projectAccent.map { Color(nsColor: $0).opacity(sample.isDark ? 0.24 : 0.18) }
+            ?? selection?.opacity(sample.isDark ? 0.44 : 0.34)
+            : selection?.opacity(sample.isDark ? 0.44 : 0.34)
 
         if sample.isDark {
             self = Self(
@@ -4708,12 +4776,16 @@ private struct SidebarPalette {
                     foreground.opacity(presentation == .floating ? 0.035 : 0),
                     .clear
                 ],
+                projectAccent: projectAccent,
+                showsProjectAccent: useAccentChrome && sample.projectAccent != nil,
                 headerText: foreground.opacity(0.58),
                 rowText: foreground.opacity(0.78),
                 selectedText: foreground.opacity(0.96),
                 hoverFill: foreground.opacity(0.08),
-                selectedFill: selection?.opacity(0.44) ?? foreground.opacity(0.13),
-                selectedStroke: foreground.opacity(0.16),
+                selectedFill: selectedFill ?? foreground.opacity(0.13),
+                selectedStroke: useAccentChrome
+                    ? sample.projectAccent.map { Color(nsColor: $0).opacity(0.42) } ?? foreground.opacity(0.16)
+                    : foreground.opacity(0.16),
                 selectedShadow: Color.black.opacity(presentation == .floating ? 0.22 : 0.16)
             )
         } else {
@@ -4724,12 +4796,16 @@ private struct SidebarPalette {
                     Color.white.opacity(presentation == .floating ? 0.08 : 0),
                     .clear
                 ],
+                projectAccent: projectAccent,
+                showsProjectAccent: useAccentChrome && sample.projectAccent != nil,
                 headerText: foreground.opacity(0.52),
                 rowText: foreground.opacity(0.74),
                 selectedText: foreground.opacity(0.92),
                 hoverFill: foreground.opacity(0.06),
-                selectedFill: selection?.opacity(0.34) ?? Color.white.opacity(0.64),
-                selectedStroke: foreground.opacity(0.10),
+                selectedFill: selectedFill ?? Color.white.opacity(0.64),
+                selectedStroke: useAccentChrome
+                    ? sample.projectAccent.map { Color(nsColor: $0).opacity(0.34) } ?? foreground.opacity(0.10)
+                    : foreground.opacity(0.10),
                 selectedShadow: Color.black.opacity(presentation == .floating ? 0.12 : 0.07)
             )
         }
@@ -4740,24 +4816,31 @@ struct SidebarThemeSample {
     let background: NSColor
     let foreground: NSColor
     let selectionBackground: NSColor?
+    let projectAccent: NSColor?
     let sidebarBackgroundDepth: CGFloat
+    let projectColorDisplayMode: ProjectColorDisplayMode
 
     var isDark: Bool {
         background.relativeLuminance < 0.50
     }
 
     var sidebarBackground: NSColor {
+        let base: NSColor
         if isDark {
-            background.mixed(toward: foreground, amount: sidebarBackgroundDepth)
+            base = background.mixed(toward: foreground, amount: sidebarBackgroundDepth)
         } else {
-            background.mixed(toward: .black, amount: sidebarBackgroundDepth)
+            base = background.mixed(toward: .black, amount: sidebarBackgroundDepth)
         }
+        guard projectColorDisplayMode == .tinted, let projectAccent else { return base }
+        return base.mixed(toward: projectAccent, amount: isDark ? 0.12 : 0.09)
     }
 
     init(
         themeColors: TerminalThemeColors,
         fallbackColorScheme: ColorScheme,
-        sidebarBackgroundDepth: Double
+        sidebarBackgroundDepth: Double,
+        projectColor: ProjectIdentityColor? = nil,
+        projectColorDisplayMode: ProjectColorDisplayMode = .accent
     ) {
         let fallbackBackground: NSColor = switch fallbackColorScheme {
         case .light:
@@ -4780,7 +4863,13 @@ struct SidebarThemeSample {
         background = NSColor(hexRGB: themeColors.background) ?? fallbackBackground
         foreground = NSColor(hexRGB: themeColors.foreground) ?? fallbackForeground
         selectionBackground = themeColors.selectionBackground.flatMap(NSColor.init(hexRGB:))
+        if projectColorDisplayMode == .off {
+            projectAccent = nil
+        } else {
+            projectAccent = projectColor.flatMap { NSColor(hexRGB: $0.hexRGB) }
+        }
         self.sidebarBackgroundDepth = CGFloat(min(max(sidebarBackgroundDepth, 0), 0.40))
+        self.projectColorDisplayMode = projectColorDisplayMode
     }
 }
 

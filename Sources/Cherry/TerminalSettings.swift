@@ -56,6 +56,22 @@ enum SidebarTerminalPathDisplayMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum ProjectColorDisplayMode: String, CaseIterable, Identifiable {
+    case off
+    case accent
+    case tinted
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .accent: "Accent"
+        case .tinted: "Tinted"
+        }
+    }
+}
+
 extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
@@ -95,6 +111,12 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    @Published var projectColorDisplayMode: ProjectColorDisplayMode {
+        didSet {
+            save(projectColorDisplayMode.rawValue, forKey: Keys.projectColorDisplayMode, notifyTerminal: false)
+        }
+    }
+
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -118,6 +140,8 @@ final class TerminalSettings: ObservableObject {
             ?? Defaults.sidebarBackgroundDepth
         sidebarTerminalPathDisplayMode = (defaults.object(forKey: Keys.sidebarTerminalPathDisplayMode) as? String)
             .flatMap(SidebarTerminalPathDisplayMode.init(rawValue:)) ?? Defaults.sidebarTerminalPathDisplayMode
+        projectColorDisplayMode = (defaults.object(forKey: Keys.projectColorDisplayMode) as? String)
+            .flatMap(ProjectColorDisplayMode.init(rawValue:)) ?? Defaults.projectColorDisplayMode
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -132,6 +156,7 @@ final class TerminalSettings: ObservableObject {
         minimumContrast = Defaults.minimumContrast
         sidebarBackgroundDepth = Defaults.sidebarBackgroundDepth
         sidebarTerminalPathDisplayMode = Defaults.sidebarTerminalPathDisplayMode
+        projectColorDisplayMode = Defaults.projectColorDisplayMode
         lightTerminalThemeName = Defaults.lightTerminalThemeName
         darkTerminalThemeName = Defaults.darkTerminalThemeName
     }
@@ -227,6 +252,7 @@ final class TerminalSettings: ObservableObject {
         static let minimumContrast = 1.15
         static let sidebarBackgroundDepth = 0.08
         static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
+        static let projectColorDisplayMode = ProjectColorDisplayMode.accent
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
@@ -238,6 +264,7 @@ final class TerminalSettings: ObservableObject {
         static let minimumContrast = "terminal.minimumContrast"
         static let sidebarBackgroundDepth = "sidebar.backgroundDepth"
         static let sidebarTerminalPathDisplayMode = "sidebar.terminalPathDisplayMode"
+        static let projectColorDisplayMode = "sidebar.projectColorDisplayMode"
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"

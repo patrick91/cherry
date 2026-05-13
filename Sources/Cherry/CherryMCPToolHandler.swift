@@ -346,8 +346,9 @@ enum CherryMCPTools {
             properties: [
                 "agent_name": string("Configured Cherry agent name."),
                 "title": string("Optional custom session title."),
-                "text": string("Optional text to send exactly as provided after launch."),
+                "text": string("Optional initial prompt to send after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
+                "submit": boolean("Whether to press Enter after the initial prompt. Defaults to true when text or raw_base64 is provided."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -780,6 +781,7 @@ enum CherryMCPTools {
                 rawBase64: stringArgument("raw_base64", in: arguments),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
+                submit: boolArgument("submit", in: arguments),
                 select: false
             ))
         case "rename_terminal":

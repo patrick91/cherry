@@ -594,6 +594,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
     public let rawBase64: String?
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
+    public let submit: Bool?
     public let select: Bool?
 
     public init(
@@ -603,6 +604,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         rawBase64: String? = nil,
         waitMilliseconds: Int? = nil,
         lineLimit: Int? = nil,
+        submit: Bool? = nil,
         select: Bool? = nil
     ) {
         self.agentName = agentName
@@ -611,6 +613,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         self.rawBase64 = rawBase64
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
+        self.submit = submit
         self.select = select
     }
 }

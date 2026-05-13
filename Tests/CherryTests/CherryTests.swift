@@ -133,6 +133,7 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
         rawBase64: nil,
         waitMilliseconds: 100,
         lineLimit: 20,
+        submit: true,
         select: true
     ))
 
@@ -694,6 +695,33 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
     #expect(harness.workspace.agentSessions.count == 1)
     #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.terminalID))
+}
+
+@MainActor
+@Test func controlServerRunAgentSubmitsPlainTextPromptByDefault() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let response = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        text: "agent-input",
+        waitMilliseconds: 250,
+        lineLimit: 20
+    )))
+
+    guard case .runAgent(let result)? = response.result else {
+        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(response.error == nil)
+    #expect(result.sentBytes == Data("agent-input\r".utf8).count)
+    #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
 }
 
 @MainActor

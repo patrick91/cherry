@@ -429,7 +429,11 @@ final class CherryControlServer: @unchecked Sendable {
             if request.select ?? false {
                 chromeState(for: workspace)?.selectTerminal()
             }
-            let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
+            let payload = try runAgentInputPayload(
+                text: request.text,
+                rawBase64: request.rawBase64,
+                submit: request.submit
+            )
             if let payload, !payload.isEmpty {
                 session.send(data: payload)
             }
@@ -1603,6 +1607,16 @@ final class CherryControlServer: @unchecked Sendable {
         case (_?, _?):
             throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
         }
+    }
+
+    private func runAgentInputPayload(text: String?, rawBase64: String?, submit: Bool?) throws -> Data? {
+        guard var payload = try optionalInputPayload(text: text, rawBase64: rawBase64) else {
+            return nil
+        }
+        if submit != false, payload.last != 0x0d, payload.last != 0x0a {
+            payload.append(0x0d)
+        }
+        return payload
     }
 
     @MainActor

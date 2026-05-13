@@ -147,6 +147,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        Self.setCloseOnExec(fileDescriptor: fd)
 
         let currentFlags = fcntl(fd, F_GETFL)
         if currentFlags >= 0 {
@@ -204,6 +205,7 @@ final class CherryControlServer: @unchecked Sendable {
         while true {
             let clientFD = accept(listenFileDescriptor, nil, nil)
             if clientFD >= 0 {
+                Self.setCloseOnExec(fileDescriptor: clientFD)
                 Self.configureBlocking(fileDescriptor: clientFD)
                 handleConnection(fileDescriptor: clientFD)
                 continue
@@ -1699,6 +1701,12 @@ final class CherryControlServer: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0 else { return }
         _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+    }
+
+    private nonisolated static func setCloseOnExec(fileDescriptor fd: Int32) {
+        let flags = fcntl(fd, F_GETFD)
+        guard flags >= 0 else { return }
+        _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
     }
 
     private nonisolated static func writeResponse(_ response: CherryControlResponse, to fd: Int32) {

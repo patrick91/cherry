@@ -17,6 +17,7 @@ public struct CherryControlClient: Sendable {
         guard fd >= 0 else {
             throw CherryControlError(code: "socket_failed", message: "Failed to create local socket.")
         }
+        setCloseOnExec(fileDescriptor: fd)
         defer {
             close(fd)
         }
@@ -118,6 +119,12 @@ public struct CherryControlClient: Sendable {
                 }
             }
         }
+    }
+
+    private func setCloseOnExec(fileDescriptor fd: Int32) {
+        let flags = fcntl(fd, F_GETFD)
+        guard flags >= 0 else { return }
+        _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
     }
 }
 

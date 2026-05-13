@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Logging
 import MCP
 @preconcurrency import NIOCore
@@ -171,7 +172,8 @@ actor CherryMCPHTTPApp {
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
-                channel.pipeline.configureHTTPServerPipeline().flatMap {
+                Self.setCloseOnExecIfSocketBacked(channel)
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
                     channel.pipeline.addHandler(CherryMCPHTTPHandler(app: self))
                 }
             }
@@ -189,6 +191,9 @@ actor CherryMCPHTTPApp {
 
         do {
             let channel = try await bootstrap.bind(host: configuration.host, port: configuration.port).get()
+            try await channel.eventLoop.submit {
+                Self.setCloseOnExecIfSocketBacked(channel)
+            }.get()
             self.channel = channel
             fputs("[mcp-http] listening on http://\(configuration.host):\(configuration.port)\(configuration.endpoint)\n", stderr)
 
@@ -337,6 +342,24 @@ actor CherryMCPHTTPApp {
                 await closeSession(sessionID)
             }
         }
+    }
+
+    private nonisolated static func setCloseOnExecIfSocketBacked(_ channel: Channel) {
+        do {
+            _ = try channel.pipeline.syncOperations.withUnsafeTransportIfAvailable(
+                of: NIOBSDSocket.Handle.self
+            ) { fileDescriptor in
+                setCloseOnExec(fileDescriptor: fileDescriptor)
+            }
+        } catch {
+            return
+        }
+    }
+
+    private nonisolated static func setCloseOnExec(fileDescriptor: Int32) {
+        let flags = fcntl(fileDescriptor, F_GETFD)
+        guard flags >= 0 else { return }
+        _ = fcntl(fileDescriptor, F_SETFD, flags | FD_CLOEXEC)
     }
 }
 

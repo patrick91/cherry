@@ -595,6 +595,7 @@ final class ShellProcessController: @unchecked Sendable {
         }
 
         if pid == 0 {
+            Self.closeInheritedFileDescriptorsForChild()
             _ = chdir(workingDirectory)
             _ = setenv("TERM", term, 1)
             if let mergedTerminfoDirs {
@@ -675,6 +676,8 @@ final class ShellProcessController: @unchecked Sendable {
 
         setMasterFD(master)
         childPID = pid
+
+        Self.setCloseOnExec(fileDescriptor: master)
 
         let currentFlags = fcntl(master, F_GETFL)
         if currentFlags >= 0 {
@@ -999,5 +1002,54 @@ final class ShellProcessController: @unchecked Sendable {
         }
 
         return 128 + signal
+    }
+
+    private static func closeInheritedFileDescriptorsForChild() {
+        let descriptorCapacity = 4096
+        let descriptorSize = MemoryLayout<proc_fdinfo>.stride
+        var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: descriptorCapacity)
+        let byteCount = descriptors.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            guard let baseAddress = buffer.baseAddress else { return -1 }
+            return proc_pidinfo(
+                getpid(),
+                PROC_PIDLISTFDS,
+                0,
+                baseAddress,
+                Int32(descriptorSize * buffer.count)
+            )
+        }
+
+        guard byteCount > 0 else {
+            closeInheritedFileDescriptorsByLimit()
+            return
+        }
+
+        let descriptorCount = min(Int(byteCount) / descriptorSize, descriptors.count)
+        for index in 0..<descriptorCount {
+            let fileDescriptor = descriptors[index].proc_fd
+            if fileDescriptor >= 3 {
+                _ = close(fileDescriptor)
+            }
+        }
+
+        if descriptorCount == descriptors.count {
+            closeInheritedFileDescriptorsByLimit()
+        }
+    }
+
+    private static func closeInheritedFileDescriptorsByLimit() {
+        let openMax = sysconf(_SC_OPEN_MAX)
+        let maximumDescriptor = openMax > 0 ? min(openMax, 16_384) : 16_384
+        guard maximumDescriptor > 3 else { return }
+
+        for fileDescriptor in 3..<Int32(maximumDescriptor) {
+            _ = close(fileDescriptor)
+        }
+    }
+
+    private static func setCloseOnExec(fileDescriptor: Int32) {
+        let flags = fcntl(fileDescriptor, F_GETFD)
+        guard flags >= 0 else { return }
+        _ = fcntl(fileDescriptor, F_SETFD, flags | FD_CLOEXEC)
     }
 }

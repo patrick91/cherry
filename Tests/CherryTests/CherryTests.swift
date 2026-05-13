@@ -6,6 +6,81 @@ import SwiftUI
 import Testing
 @testable import Cherry
 
+private func availableLocalTCPPort() throws -> Int {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    try #require(fd >= 0)
+    defer { close(fd) }
+
+    var address = sockaddr_in(
+        sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+        sin_family: sa_family_t(AF_INET),
+        sin_port: 0,
+        sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")),
+        sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+    )
+    let bindResult = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    try #require(bindResult == 0)
+
+    var boundAddress = sockaddr_in()
+    var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            getsockname(fd, socketAddress, &boundLength)
+        }
+    }
+    try #require(nameResult == 0)
+    return Int(UInt16(bigEndian: boundAddress.sin_port))
+}
+
+private func waitForLocalTCPPort(_ port: Int) async -> Bool {
+    let deadline = Date(timeIntervalSinceNow: 2)
+    repeat {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd >= 0 {
+            var address = sockaddr_in(
+                sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+                sin_family: sa_family_t(AF_INET),
+                sin_port: UInt16(port).bigEndian,
+                sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")),
+                sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+            )
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                    Darwin.connect(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            close(fd)
+            if result == 0 {
+                return true
+            }
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+    } while Date() < deadline
+
+    return false
+}
+
+private func runProcessOutput(executable: String, arguments: [String]) throws -> String {
+    let outputPipe = Pipe()
+    let errorPipe = Pipe()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.standardOutput = outputPipe
+    process.standardError = errorPipe
+
+    try process.run()
+    process.waitUntilExit()
+
+    let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
+    return String(decoding: output + errorOutput, as: UTF8.self)
+}
+
 @Test func cherryControlRequestRoundTrips() async throws {
     let request = CherryControlRequest.sendInput(.init(
         terminalID: UUID().uuidString,
@@ -314,6 +389,115 @@ import Testing
     } while Date() < deadline
 
     #expect(services.contains(where: { $0.port == port && $0.processID == "test-runner" }))
+}
+
+@Test func shellProcessClosesInheritedListeningSocketsBeforeExec() throws {
+    let listenerFD = socket(AF_INET, SOCK_STREAM, 0)
+    try #require(listenerFD >= 0)
+    defer { close(listenerFD) }
+
+    var reuse: Int32 = 1
+    setsockopt(listenerFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+    var address = sockaddr_in(
+        sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+        sin_family: sa_family_t(AF_INET),
+        sin_port: 0,
+        sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")),
+        sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+    )
+    let bindResult = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(listenerFD, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    try #require(bindResult == 0)
+    try #require(listen(listenerFD, 1) == 0)
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let outputLock = NSLock()
+    var output = Data()
+    var exitCode: Int32?
+    let exitSemaphore = DispatchSemaphore(value: 0)
+    let startupCommand = "/bin/sh -c 'if ( : <&\(listenerFD) ) 2>/dev/null; then echo inherited-fd; else echo fd-closed; fi'"
+    let process = try ShellProcessController(
+        configuration: .init(
+            shellPath: "/bin/bash",
+            workingDirectory: directory.path,
+            term: "xterm-256color",
+            initialSize: TerminalViewportSize(columns: 80, rows: 24),
+            startupCommand: startupCommand
+        ),
+        onData: { data in
+            outputLock.lock()
+            output.append(data)
+            outputLock.unlock()
+        },
+        onExit: { status in
+            outputLock.lock()
+            exitCode = status
+            outputLock.unlock()
+            exitSemaphore.signal()
+        }
+    )
+    defer {
+        process.terminate()
+    }
+
+    let waitResult = exitSemaphore.wait(timeout: .now() + 5)
+    outputLock.lock()
+    let capturedOutput = String(decoding: output, as: UTF8.self)
+    let capturedExitCode = exitCode
+    outputLock.unlock()
+
+    #expect(waitResult == .success)
+    #expect(capturedExitCode == 0, Comment(rawValue: capturedOutput))
+    #expect(capturedOutput.contains("fd-closed"), Comment(rawValue: capturedOutput))
+    #expect(!capturedOutput.contains("inherited-fd"), Comment(rawValue: capturedOutput))
+}
+
+@Test func mcpHTTPServerListeningSocketIsCloseOnExec() async throws {
+    let port = try availableLocalTCPPort()
+    let app = CherryMCPHTTPApp(
+        configuration: .init(host: "127.0.0.1", port: port, endpoint: "/mcp"),
+        serverFactory: { _, _ in
+            throw CherryControlError(code: "unexpected_server_creation", message: "Test did not expect MCP session creation.")
+        }
+    )
+    let serverTask = Task {
+        try await app.start()
+    }
+
+    do {
+        #expect(await waitForLocalTCPPort(port), "MCP HTTP server did not start listening on \(port).")
+
+        let output = try runProcessOutput(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-nP", "-a", "-p", "\(getpid())", "-iTCP:\(port)", "-sTCP:LISTEN"]
+        )
+        #expect(output.contains("LISTEN"), Comment(rawValue: output))
+
+        let inheritedOutput = try runProcessOutput(
+            executable: "/bin/sh",
+            arguments: ["-c", "/usr/sbin/lsof -nP -a -p $$ -iTCP:\(port) -sTCP:LISTEN"]
+        )
+        #expect(!inheritedOutput.contains("LISTEN"), Comment(rawValue: inheritedOutput))
+
+        await app.stop()
+        serverTask.cancel()
+        _ = try? await serverTask.value
+    } catch {
+        await app.stop()
+        serverTask.cancel()
+        _ = try? await serverTask.value
+        throw error
+    }
 }
 
 @MainActor

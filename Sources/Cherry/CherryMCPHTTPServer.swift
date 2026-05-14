@@ -32,7 +32,7 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
                     name: "cherry",
                     version: "0.1.0",
                     title: "Cherry",
-                    instructions: "Control the visible Cherry terminal app through local-only IPC. Tools do not change Cherry's visible selection unless the tool name starts with select_.",
+                    instructions: "Control the visible Cherry terminal app through local-only IPC. Tools do not change Cherry's visible selection unless the tool name starts with select_. Agent creation must stay nested under the current, selected, or latest root agent unless the human explicitly asks for a root-level agent.",
                     capabilities: .init(tools: .init(listChanged: false))
                 )
 

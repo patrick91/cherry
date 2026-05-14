@@ -82,6 +82,18 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     return String(decoding: output + errorOutput, as: UTF8.self)
 }
 
+private func environmentValue(_ key: String) -> String? {
+    getenv(key).map { String(cString: $0) }
+}
+
+private func setEnvironmentValue(_ value: String?, for key: String) {
+    if let value {
+        setenv(key, value, 1)
+    } else {
+        unsetenv(key)
+    }
+}
+
 private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallTool.Result) throws -> T {
     guard let text = result.content.compactMap({ content -> String? in
         if case .text(let text, _, _) = content {
@@ -106,6 +118,20 @@ private struct MCPRunAgentPayload: Decodable {
         case terminalID = "terminal_id"
         case parentAgentID = "parent_agent_id"
     }
+}
+
+private struct MCPSpawnProcessPayload: Decodable {
+    struct Process: Decodable {
+        let id: String
+        let parentAgentID: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case parentAgentID = "parent_agent_id"
+        }
+    }
+
+    let process: Process
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
@@ -948,14 +974,13 @@ private struct MCPRunAgentPayload: Decodable {
         harness.stop()
     }
 
-    let previousSocket = getenv(CherryControl.socketEnvironmentKey).map { String(cString: $0) }
-    setenv(CherryControl.socketEnvironmentKey, harness.socketURL.path, 1)
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
     defer {
-        if let previousSocket {
-            setenv(CherryControl.socketEnvironmentKey, previousSocket, 1)
-        } else {
-            unsetenv(CherryControl.socketEnvironmentKey)
-        }
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
     }
 
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
@@ -1018,14 +1043,13 @@ private struct MCPRunAgentPayload: Decodable {
         harness.stop()
     }
 
-    let previousSocket = getenv(CherryControl.socketEnvironmentKey).map { String(cString: $0) }
-    setenv(CherryControl.socketEnvironmentKey, harness.socketURL.path, 1)
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
     defer {
-        if let previousSocket {
-            setenv(CherryControl.socketEnvironmentKey, previousSocket, 1)
-        } else {
-            unsetenv(CherryControl.socketEnvironmentKey)
-        }
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
     }
 
     let previousWorkspace = ProjectWindowRegistry.shared.activeWorkspace
@@ -1101,6 +1125,130 @@ private struct MCPRunAgentPayload: Decodable {
 
     #expect(secondChild.parentAgentID == second.terminalID)
     #expect(harness.workspace.session(id: secondChild.terminalID)?.parentAgentID == secondID)
+}
+
+@Test func mcpAgentCreationToolsDoNotAdvertiseTopLevelOverride() throws {
+    for toolName in ["run_agent", "spawn_process"] {
+        let tool = try #require(CherryMCPTools.all.first { $0.name == toolName })
+        let schema = try #require(tool.inputSchema.objectValue)
+        let properties = try #require(schema["properties"]?.objectValue)
+
+        #expect(properties["parent_agent_id"] != nil)
+        #expect(properties["top_level"] == nil)
+    }
+}
+
+@MainActor
+@Test func mcpAgentCreationDefaultsToLatestRootAgentWhenSessionHasNoBoundParent() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
+    guard case .runAgent(let first)? = firstResponse.result else {
+        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        return
+    }
+
+    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
+    guard case .runAgent(let second)? = secondResponse.result,
+          let secondID = UUID(uuidString: second.terminalID)
+    else {
+        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        return
+    }
+
+    #expect(first.parentAgentID == nil)
+    #expect(second.parentAgentID == nil)
+
+    let sessionContext = CherryMCPToolContext.bound(defaultParentAgentID: nil)
+    let childResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("Implicit child")
+        ],
+        context: sessionContext
+    )
+    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+
+    #expect(child.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == secondID)
+
+    let spawnResult = await CherryMCPTools.call(
+        name: "spawn_process",
+        arguments: [
+            "kind": .string("agent"),
+            "name": .string("Echo"),
+            "title": .string("Implicit spawn child")
+        ],
+        context: sessionContext
+    )
+    let spawned = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: spawnResult)
+
+    #expect(spawned.process.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: spawned.process.id)?.parentAgentID == secondID)
+}
+
+@MainActor
+@Test func mcpAgentCreationPrefersCherryAgentEnvironmentParent() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
+    guard case .runAgent(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.terminalID)
+    else {
+        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        return
+    }
+
+    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
+    guard case .runAgent(let second)? = secondResponse.result else {
+        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        return
+    }
+
+    setEnvironmentValue(first.terminalID, for: CherryControl.agentIDEnvironmentKey)
+
+    let childResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("Env child")
+        ]
+    )
+    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+
+    #expect(second.parentAgentID == nil)
+    #expect(child.parentAgentID == first.terminalID)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == firstID)
 }
 
 @MainActor
@@ -2035,6 +2183,44 @@ private struct MCPRunAgentPayload: Decodable {
     session.ingestTestingData(Data([0x07]))
     #expect(session.hasUnreadNotification == false)
     #expect(session.lastNotification == nil)
+}
+
+@MainActor
+@Test func nestedAgentSessionsSuppressNotificationMetadata() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let parent = TerminalSession(
+        title: "Parent",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    let child = TerminalSession(
+        title: "Child",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        parentAgentID: parent.id
+    )
+
+    child.ingestTestingData(Data("\u{1B}]9;Nested complete\u{7}".utf8))
+    #expect(child.hasUnreadNotification == false)
+    #expect(child.lastNotification == nil)
+
+    parent.ingestTestingData(Data("\u{1B}]9;Parent complete\u{7}".utf8))
+    #expect(parent.hasUnreadNotification == true)
+    #expect(parent.lastNotification == TerminalNotificationRequest(
+        title: nil,
+        body: "Parent complete",
+        source: .osc9
+    ))
 }
 
 @MainActor

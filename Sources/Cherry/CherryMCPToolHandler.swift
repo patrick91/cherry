@@ -114,8 +114,7 @@ enum CherryMCPTools {
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to send exactly as provided after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
-                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. HTTP MCP sessions default to the agent selected when the MCP session opened."),
-                "top_level": boolean("For kind=agent, create a root-level agent even when the MCP session has a bound parent agent."),
+                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -363,8 +362,7 @@ enum CherryMCPTools {
                 "text": string("Optional initial prompt to send after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
                 "submit": boolean("Whether to press Enter after the initial prompt. Defaults to true when text or raw_base64 is provided."),
-                "parent_agent_id": string("Optional parent Cherry agent UUID. HTTP MCP sessions default to the agent selected when the MCP session opened."),
-                "top_level": boolean("Create a root-level agent even when the MCP session has a bound parent agent."),
+                "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -498,11 +496,7 @@ enum CherryMCPTools {
             return selectedSession.id.uuidString
         }
 
-        let rootAgents = workspace.rootAgentSessions
-        guard rootAgents.count == 1 else {
-            return nil
-        }
-        return rootAgents[0].id.uuidString
+        return workspace.rootAgentSessions.last?.id.uuidString
     }
 
     private static func scopedRequest(_ request: CherryControlRequest, arguments: [String: Value] = [:]) -> CherryControlRequest {
@@ -1066,9 +1060,23 @@ enum CherryMCPTools {
             return CherryControl.topLevelAgentParentID
         }
         if let context {
-            return explicitParentAgentID ?? context.defaultParentAgentID
+            return explicitParentAgentID ?? context.defaultParentAgentID ?? CherryControl.selectedAgentParentID
+        }
+        if let environmentAgentID = environmentAgentID() {
+            return explicitParentAgentID ?? environmentAgentID
         }
         return explicitParentAgentID ?? CherryControl.selectedAgentParentID
+    }
+
+    private static func environmentAgentID() -> String? {
+        guard let agentID = ProcessInfo.processInfo.environment[CherryControl.agentIDEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !agentID.isEmpty,
+            UUID(uuidString: agentID) != nil
+        else {
+            return nil
+        }
+        return agentID
     }
 
     private static func stringArrayArgument(_ key: String, in arguments: [String: Value]) throws -> [String]? {

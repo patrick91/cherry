@@ -1793,6 +1793,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func handleTerminalNotification(_ notification: TerminalNotificationRequest) {
         guard !ProjectWindowRegistry.shared.isSessionActive(self) else { return }
+        guard !(kind == .agent && parentAgentID != nil) else { return }
         lastNotification = notification
         hasUnreadNotification = true
         TerminalNotificationCenter.shared.post(notification, for: self)

@@ -1263,18 +1263,19 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func selectedAgentParentID(workspace: TerminalWorkspace) -> UUID? {
         if let chromeState = chromeState(for: workspace),
-           !chromeState.isShowingTerminalContent {
-            return nil
-        }
-        if let selectedSession = workspace.selectedSession,
+           chromeState.isShowingTerminalContent,
+           let selectedSession = workspace.selectedSession,
            selectedSession.kind == .agent {
             return selectedSession.id
         }
-        let rootAgents = workspace.rootAgentSessions
-        guard rootAgents.count == 1 else {
-            return nil
+
+        if chromeState(for: workspace) == nil,
+           let selectedSession = workspace.selectedSession,
+           selectedSession.kind == .agent {
+            return selectedSession.id
         }
-        return rootAgents[0].id
+
+        return workspace.rootAgentSessions.last?.id
     }
 
     @MainActor

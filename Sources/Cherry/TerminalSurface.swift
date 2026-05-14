@@ -450,7 +450,11 @@ struct TerminalSurfaceView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
         let containerView = GhosttyTerminalContainerView()
-        containerView.configure(with: session, colorScheme: context.environment.colorScheme)
+        containerView.configure(
+            with: session,
+            colorScheme: context.environment.colorScheme,
+            allowsAutoFocus: !chromeState.isCommandPalettePresented
+        )
         containerView.applySidebarAnimationState(
             isAnimating: chromeState.isSidebarAnimating,
             postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta
@@ -459,7 +463,11 @@ struct TerminalSurfaceView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: GhosttyTerminalContainerView, context: Context) {
-        nsView.configure(with: session, colorScheme: context.environment.colorScheme)
+        nsView.configure(
+            with: session,
+            colorScheme: context.environment.colorScheme,
+            allowsAutoFocus: !chromeState.isCommandPalettePresented
+        )
         nsView.applySidebarAnimationState(
             isAnimating: chromeState.isSidebarAnimating,
             postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta

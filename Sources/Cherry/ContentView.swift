@@ -2238,7 +2238,7 @@ private struct CommandPaletteOverlay: View {
     @State private var scrollTopIndex = 0
     @State private var editingAgent: AgentToolDefinition?
     @State private var agentError: String?
-    @FocusState private var isSearchFocused: Bool
+    @State private var searchFocusRequest = 0
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -2254,11 +2254,13 @@ private struct CommandPaletteOverlay: View {
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(.secondary)
 
-                    TextField(prompt, text: $query)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 17))
-                        .focused($isSearchFocused)
-                        .onSubmit(commitSelection)
+                    CommandPaletteSearchField(
+                        text: $query,
+                        placeholder: prompt,
+                        focusRequest: searchFocusRequest,
+                        onSubmit: commitSelection
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .padding(.horizontal, 14)
                 .frame(height: 48)
@@ -2304,11 +2306,11 @@ private struct CommandPaletteOverlay: View {
         }
         .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
         .onAppear {
-            focusSearchField()
+            requestSearchFocus()
             selectedIndex = 0
         }
         .onChange(of: focusRequest) { _, _ in
-            focusSearchField()
+            requestSearchFocus()
         }
         .onChange(of: query) { _, _ in
             selectedIndex = 0
@@ -2318,7 +2320,7 @@ private struct CommandPaletteOverlay: View {
             query = ""
             selectedIndex = 0
             scrollTopIndex = 0
-            focusSearchField()
+            requestSearchFocus()
         }
         .sheet(item: $editingAgent) { agent in
             AgentToolEditor(
@@ -2644,7 +2646,7 @@ private struct CommandPaletteOverlay: View {
         guard panel.runModal() == .OK, let url = panel.url,
               let project = settings.addProject(path: url.path)
         else {
-            focusSearchField()
+            requestSearchFocus()
             return
         }
 
@@ -2657,14 +2659,132 @@ private struct CommandPaletteOverlay: View {
         restoreFocus()
     }
 
-    private func focusSearchField() {
-        isSearchFocused = false
-        DispatchQueue.main.async {
-            isSearchFocused = true
+    private func requestSearchFocus() {
+        searchFocusRequest &+= 1
+    }
+}
+
+private struct CommandPaletteSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let focusRequest: Int
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, onSubmit: onSubmit)
+    }
+
+    func makeNSView(context: Context) -> CommandPaletteSearchTextField {
+        let textField = CommandPaletteSearchTextField()
+        textField.delegate = context.coordinator
+        textField.target = context.coordinator
+        textField.action = #selector(Coordinator.submit(_:))
+        textField.onMoveToWindow = { [weak coordinator = context.coordinator] textField in
+            coordinator?.requestFocus(for: textField)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            isSearchFocused = true
+        configure(textField)
+        return textField
+    }
+
+    func updateNSView(_ nsView: CommandPaletteSearchTextField, context: Context) {
+        context.coordinator.text = $text
+        context.coordinator.onSubmit = onSubmit
+        configure(nsView)
+
+        if nsView.stringValue != text {
+            nsView.stringValue = text
         }
+
+        if context.coordinator.lastFocusRequest != focusRequest {
+            context.coordinator.lastFocusRequest = focusRequest
+            context.coordinator.requestFocus(for: nsView)
+        }
+    }
+
+    private func configure(_ textField: NSTextField) {
+        textField.placeholderString = placeholder
+        textField.font = .systemFont(ofSize: 17)
+        textField.isBordered = false
+        textField.isBezeled = false
+        textField.drawsBackground = false
+        textField.backgroundColor = .clear
+        textField.focusRingType = .none
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.usesSingleLineMode = true
+        textField.lineBreakMode = .byTruncatingTail
+        textField.cell?.sendsActionOnEndEditing = false
+        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textField.setAccessibilityLabel("Command Palette Search")
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+        var onSubmit: () -> Void
+        var lastFocusRequest: Int?
+
+        init(text: Binding<String>, onSubmit: @escaping () -> Void) {
+            self.text = text
+            self.onSubmit = onSubmit
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let textField = notification.object as? NSTextField,
+                  text.wrappedValue != textField.stringValue
+            else {
+                return
+            }
+
+            text.wrappedValue = textField.stringValue
+        }
+
+        @objc func submit(_ sender: NSTextField) {
+            onSubmit()
+        }
+
+        func requestFocus(for textField: NSTextField, remainingAttempts: Int = 5) {
+            DispatchQueue.main.async { [weak self, weak textField] in
+                guard let self, let textField else { return }
+                guard let window = textField.window else {
+                    retryFocus(for: textField, remainingAttempts: remainingAttempts)
+                    return
+                }
+
+                if !window.isKeyWindow {
+                    window.makeKeyAndOrderFront(nil)
+                }
+
+                window.makeFirstResponder(textField)
+                if let editor = textField.currentEditor() {
+                    editor.selectedRange = NSRange(location: textField.stringValue.utf16.count, length: 0)
+                } else {
+                    retryFocus(for: textField, remainingAttempts: remainingAttempts)
+                }
+            }
+        }
+
+        private func retryFocus(for textField: NSTextField, remainingAttempts: Int) {
+            guard remainingAttempts > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak textField] in
+                guard let self, let textField else { return }
+                requestFocus(for: textField, remainingAttempts: remainingAttempts - 1)
+            }
+        }
+    }
+}
+
+private final class CommandPaletteSearchTextField: NSTextField {
+    var onMoveToWindow: ((CommandPaletteSearchTextField) -> Void)?
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        onMoveToWindow?(self)
     }
 }
 

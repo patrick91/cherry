@@ -361,6 +361,7 @@ final class GhosttyTerminalContainerView: NSView {
     private nonisolated(unsafe) var keyEventMonitor: Any?
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
+    private var allowsAutoFocus = true
     private var pendingTerminalFocus = false
     private var isSidebarAnimating = false
     private var isSyncFrozen = false
@@ -399,7 +400,16 @@ final class GhosttyTerminalContainerView: NSView {
         NSEdgeInsetsZero
     }
 
-    func configure(with session: TerminalSession, colorScheme: ColorScheme) {
+    func configure(
+        with session: TerminalSession,
+        colorScheme: ColorScheme,
+        allowsAutoFocus: Bool = true
+    ) {
+        self.allowsAutoFocus = allowsAutoFocus
+        if !allowsAutoFocus {
+            pendingTerminalFocus = false
+        }
+
         if activeSession !== session {
             activeSession?.ghosttyBridge.detach(from: self)
             activeSession = session
@@ -929,12 +939,14 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func requestTerminalFocus() {
+        guard allowsAutoFocus else { return }
         guard !pendingTerminalFocus else { return }
         pendingTerminalFocus = true
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingTerminalFocus = false
+            guard self.allowsAutoFocus else { return }
             guard let window = self.window else { return }
             if !window.isKeyWindow {
                 window.makeKeyAndOrderFront(nil)

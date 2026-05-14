@@ -1227,6 +1227,16 @@ final class CherryControlServer: @unchecked Sendable {
         else {
             return nil
         }
+        let normalizedValue = rawValue.lowercased()
+        if normalizedValue == CherryControl.topLevelAgentParentID
+            || normalizedValue == "root"
+            || normalizedValue == "none" {
+            return nil
+        }
+        if normalizedValue == CherryControl.selectedAgentParentID
+            || normalizedValue == "current" {
+            return selectedAgentParentID(workspace: workspace)
+        }
         guard let parentID = UUID(uuidString: rawValue) else {
             throw CherryControlError(code: "invalid_parent_agent_id", message: "parent_agent_id must be a Cherry agent UUID.")
         }
@@ -1237,6 +1247,23 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "parent_agent_not_agent", message: "parent_agent_id must refer to an agent session.")
         }
         return parentID
+    }
+
+    @MainActor
+    private func selectedAgentParentID(workspace: TerminalWorkspace) -> UUID? {
+        if let chromeState = chromeState(for: workspace),
+           !chromeState.isShowingTerminalContent {
+            return nil
+        }
+        if let selectedSession = workspace.selectedSession,
+           selectedSession.kind == .agent {
+            return selectedSession.id
+        }
+        let rootAgents = workspace.rootAgentSessions
+        guard rootAgents.count == 1 else {
+            return nil
+        }
+        return rootAgents[0].id
     }
 
     @MainActor

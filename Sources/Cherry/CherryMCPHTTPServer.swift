@@ -25,6 +25,9 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
         let app = CherryMCPHTTPApp(
             configuration: .init(host: Self.host, port: Self.port, endpoint: Self.endpoint),
             serverFactory: { _, _ in
+                let toolContext = CherryMCPToolContext.bound(
+                    defaultParentAgentID: await CherryMCPTools.defaultParentAgentIDForHTTPSession()
+                )
                 let server = Server(
                     name: "cherry",
                     version: "0.1.0",
@@ -38,7 +41,11 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
                 }
 
                 await server.withMethodHandler(CallTool.self) { params in
-                    await CherryMCPTools.call(name: params.name, arguments: params.arguments ?? [:])
+                    await CherryMCPTools.call(
+                        name: params.name,
+                        arguments: params.arguments ?? [:],
+                        context: toolContext
+                    )
                 }
 
                 return server

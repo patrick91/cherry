@@ -2,6 +2,7 @@ import AppKit
 import CherryControl
 import Darwin
 import Foundation
+import MCP
 import SwiftUI
 import Testing
 @testable import Cherry
@@ -79,6 +80,32 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
     let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
     return String(decoding: output + errorOutput, as: UTF8.self)
+}
+
+private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallTool.Result) throws -> T {
+    guard let text = result.content.compactMap({ content -> String? in
+        if case .text(let text, _, _) = content {
+            return text
+        }
+        return nil
+    }).first else {
+        throw CherryControlError(code: "missing_tool_text", message: "MCP tool result did not include text content.")
+    }
+    if result.isError == true {
+        throw CherryControlError(code: "mcp_tool_error", message: text)
+    }
+    let decoder = JSONDecoder()
+    return try decoder.decode(T.self, from: Data(text.utf8))
+}
+
+private struct MCPRunAgentPayload: Decodable {
+    let terminalID: String
+    let parentAgentID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case terminalID = "terminal_id"
+        case parentAgentID = "parent_agent_id"
+    }
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
@@ -803,6 +830,232 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(harness.workspace.sessions.contains { $0.id == childID })
     #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == nestedChildID })
+}
+
+@MainActor
+@Test func controlServerCanUseSelectedAgentAsImplicitParent() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let parentResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        select: true
+    )))
+    guard case .runAgent(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.terminalID)
+    else {
+        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        return
+    }
+    #expect(harness.workspace.selectedSessionID == parentID)
+
+    let childResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: CherryControl.selectedAgentParentID
+    )))
+    guard case .runAgent(let child)? = childResponse.result else {
+        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+        return
+    }
+
+    #expect(child.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(harness.workspace.selectedSessionID == parentID)
+
+    let terminal = harness.workspace.addSession(select: false)
+    harness.workspace.select(terminal)
+    harness.chromeState.selectTerminal()
+
+    let fallbackChildResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: CherryControl.selectedAgentParentID
+    )))
+    guard case .runAgent(let fallbackChild)? = fallbackChildResponse.result else {
+        Issue.record("Expected fallback child runAgent result, got \(String(describing: fallbackChildResponse))")
+        return
+    }
+
+    #expect(fallbackChild.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: fallbackChild.terminalID)?.parentAgentID == parentID)
+
+    let topLevelResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: CherryControl.topLevelAgentParentID
+    )))
+    guard case .runAgent(let topLevel)? = topLevelResponse.result else {
+        Issue.record("Expected top-level runAgent result, got \(String(describing: topLevelResponse))")
+        return
+    }
+
+    #expect(topLevel.parentAgentID == nil)
+    #expect(harness.workspace.session(id: topLevel.terminalID)?.parentAgentID == nil)
+}
+
+@MainActor
+@Test func mcpRunAgentDefaultsToSelectedAgentParent() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = getenv(CherryControl.socketEnvironmentKey).map { String(cString: $0) }
+    setenv(CherryControl.socketEnvironmentKey, harness.socketURL.path, 1)
+    defer {
+        if let previousSocket {
+            setenv(CherryControl.socketEnvironmentKey, previousSocket, 1)
+        } else {
+            unsetenv(CherryControl.socketEnvironmentKey)
+        }
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let parentResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        select: true
+    )))
+    guard case .runAgent(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.terminalID)
+    else {
+        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        return
+    }
+
+    let childResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("MCP child")
+        ]
+    )
+    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+
+    #expect(child.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+
+    let emptyParentResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("MCP empty parent"),
+            "parent_agent_id": .string("")
+        ]
+    )
+    let emptyParentChild = try decodeMCPToolResult(MCPRunAgentPayload.self, from: emptyParentResult)
+
+    #expect(emptyParentChild.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: emptyParentChild.terminalID)?.parentAgentID == parentID)
+
+    let topLevelResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("MCP root"),
+            "top_level": .bool(true)
+        ]
+    )
+    let topLevel = try decodeMCPToolResult(MCPRunAgentPayload.self, from: topLevelResult)
+
+    #expect(topLevel.parentAgentID == nil)
+    #expect(harness.workspace.session(id: topLevel.terminalID)?.parentAgentID == nil)
+}
+
+@MainActor
+@Test func mcpRunAgentKeepsHTTPSessionParentAfterSelectionChanges() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = getenv(CherryControl.socketEnvironmentKey).map { String(cString: $0) }
+    setenv(CherryControl.socketEnvironmentKey, harness.socketURL.path, 1)
+    defer {
+        if let previousSocket {
+            setenv(CherryControl.socketEnvironmentKey, previousSocket, 1)
+        } else {
+            unsetenv(CherryControl.socketEnvironmentKey)
+        }
+    }
+
+    let previousWorkspace = ProjectWindowRegistry.shared.activeWorkspace
+    let previousChromeState = ProjectWindowRegistry.shared.activeChromeState
+    ProjectWindowRegistry.shared.activeWorkspace = harness.workspace
+    ProjectWindowRegistry.shared.activeChromeState = harness.chromeState
+    defer {
+        ProjectWindowRegistry.shared.activeWorkspace = previousWorkspace
+        ProjectWindowRegistry.shared.activeChromeState = previousChromeState
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let firstResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        title: "First",
+        select: true
+    )))
+    guard case .runAgent(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.terminalID)
+    else {
+        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        return
+    }
+
+    let secondResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        title: "Second",
+        select: true
+    )))
+    guard case .runAgent(let second)? = secondResponse.result,
+          let secondID = UUID(uuidString: second.terminalID)
+    else {
+        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        return
+    }
+    #expect(harness.workspace.selectedSessionID == secondID)
+
+    let sessionContext = CherryMCPToolContext.bound(
+        defaultParentAgentID: CherryMCPTools.defaultParentAgentIDForHTTPSession()
+    )
+    #expect(sessionContext.defaultParentAgentID == second.terminalID)
+
+    if let firstSession = harness.workspace.session(id: first.terminalID) {
+        harness.workspace.select(firstSession)
+    }
+    harness.chromeState.selectTerminal()
+    #expect(harness.workspace.selectedSessionID == firstID)
+
+    let childResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("Bound child")
+        ],
+        context: sessionContext
+    )
+    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+
+    #expect(child.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == secondID)
+
+    let secondChildResult = await CherryMCPTools.call(
+        name: "run_agent",
+        arguments: [
+            "agent_name": .string("Echo"),
+            "title": .string("Second bound child")
+        ],
+        context: sessionContext
+    )
+    let secondChild = try decodeMCPToolResult(MCPRunAgentPayload.self, from: secondChildResult)
+
+    #expect(secondChild.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: secondChild.terminalID)?.parentAgentID == secondID)
 }
 
 @MainActor

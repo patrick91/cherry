@@ -5,6 +5,8 @@ public enum CherryControl {
     public static let socketNamespaceEnvironmentKey = "CHERRY_CONTROL_NAMESPACE"
     public static let projectRootEnvironmentKey = "CHERRY_PROJECT_ROOT"
     public static let agentIDEnvironmentKey = "CHERRY_AGENT_ID"
+    public static let selectedAgentParentID = "selected"
+    public static let topLevelAgentParentID = "top_level"
 
     public static var socketURL: URL {
         socketURL(

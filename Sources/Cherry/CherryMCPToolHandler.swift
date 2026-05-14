@@ -2,7 +2,17 @@ import CherryControl
 import Foundation
 import MCP
 
-private let cherryMCPClient = CherryControlClient()
+private func cherryMCPClient() -> CherryControlClient {
+    CherryControlClient()
+}
+
+struct CherryMCPToolContext: Sendable {
+    let defaultParentAgentID: String?
+
+    static func bound(defaultParentAgentID: String?) -> CherryMCPToolContext {
+        CherryMCPToolContext(defaultParentAgentID: defaultParentAgentID)
+    }
+}
 
 enum CherryMCPTools {
     static let all: [Tool] = [
@@ -104,7 +114,8 @@ enum CherryMCPTools {
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to send exactly as provided after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
-                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Pass CHERRY_AGENT_ID from a running Cherry agent to nest the new agent as a sub-agent."),
+                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. HTTP MCP sessions default to the agent selected when the MCP session opened."),
+                "top_level": boolean("For kind=agent, create a root-level agent even when the MCP session has a bound parent agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -352,7 +363,8 @@ enum CherryMCPTools {
                 "text": string("Optional initial prompt to send after launch."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
                 "submit": boolean("Whether to press Enter after the initial prompt. Defaults to true when text or raw_base64 is provided."),
-                "parent_agent_id": string("Optional parent Cherry agent UUID. When called from a Cherry agent, pass CHERRY_AGENT_ID unless the user asks for a separate top-level tab."),
+                "parent_agent_id": string("Optional parent Cherry agent UUID. HTTP MCP sessions default to the agent selected when the MCP session opened."),
+                "top_level": boolean("Create a root-level agent even when the MCP session has a bound parent agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -448,13 +460,17 @@ enum CherryMCPTools {
         )
     ]
 
-    static func call(name: String, arguments: [String: Value]) async -> CallTool.Result {
+    static func call(
+        name: String,
+        arguments: [String: Value],
+        context: CherryMCPToolContext? = nil
+    ) async -> CallTool.Result {
         do {
             if name == "get_status" {
                 return try statusResult()
             }
-            let request = scopedRequest(try controlRequest(name: name, arguments: arguments), arguments: arguments)
-            let response = try cherryMCPClient.send(request)
+            let request = scopedRequest(try controlRequest(name: name, arguments: arguments, context: context), arguments: arguments)
+            let response = try cherryMCPClient().send(request)
             if let error = response.error {
                 return try toolError(error)
             }
@@ -468,6 +484,25 @@ enum CherryMCPTools {
             let controlError = CherryControlError(code: "tool_error", message: error.localizedDescription)
             return (try? toolError(controlError)) ?? .init(content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)], isError: true)
         }
+    }
+
+    @MainActor
+    static func defaultParentAgentIDForHTTPSession() -> String? {
+        guard let workspace = ProjectWindowRegistry.shared.activeWorkspace else {
+            return nil
+        }
+
+        if ProjectWindowRegistry.shared.activeChromeState?.isShowingTerminalContent ?? true,
+           let selectedSession = workspace.selectedSession,
+           selectedSession.kind == .agent {
+            return selectedSession.id.uuidString
+        }
+
+        let rootAgents = workspace.rootAgentSessions
+        guard rootAgents.count == 1 else {
+            return nil
+        }
+        return rootAgents[0].id.uuidString
     }
 
     private static func scopedRequest(_ request: CherryControlRequest, arguments: [String: Value] = [:]) -> CherryControlRequest {
@@ -505,7 +540,7 @@ enum CherryMCPTools {
 
     private static func inferredProjectRootFromWorkingDirectory() -> String? {
         let workingDirectory = standardizedPath(FileManager.default.currentDirectoryPath)
-        guard let response = try? cherryMCPClient.send(.listProjects),
+        guard let response = try? cherryMCPClient().send(.listProjects),
               case .listProjects(let payload)? = response.result
         else {
             return nil
@@ -531,7 +566,7 @@ enum CherryMCPTools {
         let socketExists = FileManager.default.fileExists(atPath: socketURL.path)
 
         do {
-            let response = try cherryMCPClient.send(scopedRequest(.listTerminals))
+            let response = try cherryMCPClient().send(scopedRequest(.listTerminals))
             if let error = response.error {
                 return try encodedResult(MCPStatusPayload(
                     socketPath: socketURL.path,
@@ -581,7 +616,11 @@ enum CherryMCPTools {
         }
     }
 
-    private static func controlRequest(name: String, arguments: [String: Value]) throws -> CherryControlRequest {
+    private static func controlRequest(
+        name: String,
+        arguments: [String: Value],
+        context: CherryMCPToolContext? = nil
+    ) throws -> CherryControlRequest {
         switch name {
         case "list_projects":
             return .listProjects
@@ -641,14 +680,15 @@ enum CherryMCPTools {
                 path: stringArgument("path", in: arguments)
             ))
         case "spawn_process":
+            let kind = try requiredString("kind", in: arguments)
             return .spawnProcess(.init(
-                kind: try requiredString("kind", in: arguments),
+                kind: kind,
                 name: stringArgument("name", in: arguments),
                 title: stringArgument("title", in: arguments),
                 workingDirectory: stringArgument("working_directory", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
-                parentAgentID: stringArgument("parent_agent_id", in: arguments),
+                parentAgentID: parentAgentIDArgument(forKind: kind, in: arguments, context: context),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
             ))
@@ -794,7 +834,7 @@ enum CherryMCPTools {
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments),
                 submit: boolArgument("submit", in: arguments),
-                parentAgentID: stringArgument("parent_agent_id", in: arguments),
+                parentAgentID: parentAgentIDArgument(forKind: "agent", in: arguments, context: context),
                 select: false
             ))
         case "rename_terminal":
@@ -1009,6 +1049,26 @@ enum CherryMCPTools {
 
     private static func boolArgument(_ key: String, in arguments: [String: Value]) -> Bool? {
         arguments[key]?.boolValue
+    }
+
+    private static func parentAgentIDArgument(
+        forKind kind: String,
+        in arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) -> String? {
+        let explicitParentAgentID = stringArgument("parent_agent_id", in: arguments)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "agent" else {
+            return explicitParentAgentID
+        }
+        if boolArgument("top_level", in: arguments) == true {
+            return CherryControl.topLevelAgentParentID
+        }
+        if let context {
+            return explicitParentAgentID ?? context.defaultParentAgentID
+        }
+        return explicitParentAgentID ?? CherryControl.selectedAgentParentID
     }
 
     private static func stringArrayArgument(_ key: String, in arguments: [String: Value]) throws -> [String]? {

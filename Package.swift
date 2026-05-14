@@ -42,6 +42,7 @@ let package = Package(
             dependencies: [
                 "Cherry",
                 "CherryControl",
+                .product(name: "MCP", package: "swift-sdk"),
             ]
         ),
     ],

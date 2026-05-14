@@ -2786,6 +2786,50 @@ private enum SidebarLayout {
     static let floatingOuterInset: CGFloat = 3
     static let trailingInset: CGFloat = 8
     static let rowHorizontalInset: CGFloat = 12
+    static let agentTreeRowSpacing: CGFloat = 4
+}
+
+private enum AgentTreeLayout {
+    static let tuningEnvironmentKey = "CHERRY_AGENT_TREE_TUNING"
+
+    static let guideXKey = "agentTree.guideX"
+    static let guideElbowWidthKey = "agentTree.guideElbowWidth"
+    static let guideElbowStartInsetKey = "agentTree.guideElbowStartInset"
+    static let guideConnectorLengthKey = "agentTree.guideConnectorLength"
+    static let guideConnectorDashLengthKey = "agentTree.guideConnectorDashLength"
+    static let guideConnectorDashGapKey = "agentTree.guideConnectorDashGap"
+    static let guideConnectorOffsetXKey = "agentTree.guideConnectorOffsetX"
+    static let guideConnectorOffsetYKey = "agentTree.guideConnectorOffsetY"
+    static let disclosureOffsetKey = "agentTree.disclosureOffset"
+    static let guideTopOverlapKey = "agentTree.guideTopOverlap"
+    static let guideBottomOverlapKey = "agentTree.guideBottomOverlap"
+    static let childRowHeightKey = "agentTree.childRowHeight"
+    static let childDetailRowHeightKey = "agentTree.childDetailRowHeight"
+
+    static let defaultGuideX = 0.0
+    static let defaultGuideElbowWidth = 5.5
+    static let defaultGuideElbowStartInset = 1.0
+    static let defaultGuideConnectorLength = 10.0
+    static let defaultGuideConnectorDashLength = 1.5
+    static let defaultGuideConnectorDashGap = 3.0
+    static let defaultGuideConnectorOffsetX = 0.5
+    static let defaultGuideConnectorOffsetY = -11.0
+    static let defaultDisclosureOffset = -6.0
+    static let defaultGuideTopOverlap = 0.0
+    static let defaultGuideBottomOverlap = 1.0
+    static let defaultChildRowHeight = 32.0
+    static let defaultChildDetailRowHeight = 38.0
+
+    static var isTuningEnabled: Bool {
+        truthyEnvironmentValue(for: tuningEnvironmentKey)
+    }
+
+    private static func truthyEnvironmentValue(for key: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return value == "1" || value == "true" || value == "yes" || value == "on"
+    }
 }
 
 @MainActor
@@ -3134,54 +3178,42 @@ private struct SidebarAgentSessionSection: View {
                 )
             } else {
                 let items = workspace.visibleAgentTreeItems(collapsedIDs: chromeState.collapsedAgentGroupIDs)
-                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                    let session = item.session
+                let shortcutNumbers = Dictionary(uniqueKeysWithValues: items.enumerated().map { index, item in
+                    (item.session.id, index + 1)
+                })
+                ForEach(workspace.rootAgentSessions) { session in
                     let children = workspace.childAgentSessions(of: session)
                     let isCollapsed = chromeState.collapsedAgentGroupIDs.contains(session.id)
-                    SidebarTabRow(
+                    let isActiveGroup = chromeState.isShowingTerminalContent
+                        && (workspace.selectedSessionID == session.id
+                            || children.contains { $0.id == workspace.selectedSessionID })
+                    agentRow(
                         session: session,
-                        isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
-                        shortcutNumber: index + 1,
-                        showShortcutHint: showShortcutHints,
-                        nestingDepth: item.depth,
+                        shortcutNumber: shortcutNumbers[session.id] ?? 1,
+                        nestingDepth: 0,
                         showsDisclosure: !children.isEmpty,
-                        isDisclosureExpanded: !isCollapsed,
-                        onToggleDisclosure: {
-                            chromeState.toggleAgentGroupCollapsed(session.id)
-                        },
-                        onSelect: { select(session) }
+                        isDisclosureExpanded: !isCollapsed
                     )
-                    .contextMenu {
-                        Button("Copy Link") {
-                            copyCherryLink(cherryLink(for: session, projectRoot: projectRoot))
+
+                    if !children.isEmpty && !isCollapsed {
+                        SidebarAgentChildrenGroup(
+                            children: children,
+                            palette: palette,
+                            isActive: isActiveGroup
+                        ) { child in
+                            agentRow(
+                                session: child,
+                                shortcutNumber: shortcutNumbers[child.id] ?? 1,
+                                nestingDepth: 1,
+                                showsDisclosure: false,
+                                isDisclosureExpanded: true
+                            )
                         }
-                        .disabled(projectRoot == nil)
-
-                        Divider()
-
-                        Button("Rename...") {
-                            promptRenameSession(session)
-                        }
-
-                        Divider()
-
-                        Button("Restart") {
-                            session.restart()
-                        }
-
-                        Button("Clear Scrollback") {
-                            session.clearScrollback()
-                        }
-
-                        Divider()
-
-                        Button("Close", role: .destructive) {
-                            close(session)
-                        }
-                        .disabled(workspace.sessions.count <= 1)
                     }
+                }
+
+                if AgentTreeLayout.isTuningEnabled {
+                    AgentTreeTuningPanel(palette: palette)
                 }
             }
         }
@@ -3204,6 +3236,59 @@ private struct SidebarAgentSessionSection: View {
             chromeState.requestAgentGroupClose(sessionID: session.id)
         } else {
             workspace.close(session)
+        }
+    }
+
+    private func agentRow(
+        session: TerminalSession,
+        shortcutNumber: Int,
+        nestingDepth: Int,
+        showsDisclosure: Bool,
+        isDisclosureExpanded: Bool
+    ) -> some View {
+        SidebarTabRow(
+            session: session,
+            isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+            projectRoot: projectRoot,
+            presentation: presentation,
+            shortcutNumber: shortcutNumber,
+            showShortcutHint: showShortcutHints,
+            nestingDepth: nestingDepth,
+            showsDisclosure: showsDisclosure,
+            isDisclosureExpanded: isDisclosureExpanded,
+            onToggleDisclosure: showsDisclosure ? {
+                chromeState.toggleAgentGroupCollapsed(session.id)
+            } : nil,
+            onSelect: { select(session) }
+        )
+        .contextMenu {
+            Button("Copy Link") {
+                copyCherryLink(cherryLink(for: session, projectRoot: projectRoot))
+            }
+            .disabled(projectRoot == nil)
+
+            Divider()
+
+            Button("Rename...") {
+                promptRenameSession(session)
+            }
+
+            Divider()
+
+            Button("Restart") {
+                session.restart()
+            }
+
+            Button("Clear Scrollback") {
+                session.clearScrollback()
+            }
+
+            Divider()
+
+            Button("Close", role: .destructive) {
+                close(session)
+            }
+            .disabled(workspace.sessions.count <= 1)
         }
     }
 }
@@ -3242,6 +3327,234 @@ private struct AgentLaunchMenu: View {
         .menuStyle(.borderlessButton)
         .buttonStyle(.plain)
         .help("New agent")
+    }
+}
+
+private struct SidebarAgentChildrenGroup<RowContent: View>: View {
+    let children: [TerminalSession]
+    let palette: SidebarPalette
+    let isActive: Bool
+    let rowContent: (TerminalSession) -> RowContent
+
+    init(
+        children: [TerminalSession],
+        palette: SidebarPalette,
+        isActive: Bool,
+        @ViewBuilder rowContent: @escaping (TerminalSession) -> RowContent
+    ) {
+        self.children = children
+        self.palette = palette
+        self.isActive = isActive
+        self.rowContent = rowContent
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            SidebarAgentChildrenGuide(
+                children: children,
+                palette: palette,
+                isActive: isActive
+            )
+
+            VStack(alignment: .leading, spacing: SidebarLayout.agentTreeRowSpacing) {
+                ForEach(children) { child in
+                    rowContent(child)
+                }
+            }
+        }
+    }
+}
+
+private struct SidebarAgentChildrenGuide: View {
+    let children: [TerminalSession]
+    let palette: SidebarPalette
+    let isActive: Bool
+
+    @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
+    @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+    @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+    @AppStorage(AgentTreeLayout.guideConnectorLengthKey) private var guideConnectorLength = AgentTreeLayout.defaultGuideConnectorLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashLengthKey) private var guideConnectorDashLength = AgentTreeLayout.defaultGuideConnectorDashLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashGapKey) private var guideConnectorDashGap = AgentTreeLayout.defaultGuideConnectorDashGap
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetXKey) private var guideConnectorOffsetX = AgentTreeLayout.defaultGuideConnectorOffsetX
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetYKey) private var guideConnectorOffsetY = AgentTreeLayout.defaultGuideConnectorOffsetY
+    @AppStorage(AgentTreeLayout.guideTopOverlapKey) private var guideTopOverlap = AgentTreeLayout.defaultGuideTopOverlap
+    @AppStorage(AgentTreeLayout.guideBottomOverlapKey) private var guideBottomOverlap = AgentTreeLayout.defaultGuideBottomOverlap
+    @AppStorage(AgentTreeLayout.childRowHeightKey) private var childRowHeight = AgentTreeLayout.defaultChildRowHeight
+    @AppStorage(AgentTreeLayout.childDetailRowHeightKey) private var childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
+
+    var body: some View {
+        let x = CGFloat(guideX)
+        let elbowWidth = CGFloat(guideElbowWidth)
+        let elbowX = x + CGFloat(guideElbowStartInset)
+        let connectorLength = CGFloat(guideConnectorLength)
+        let connectorDashLength = CGFloat(guideConnectorDashLength)
+        let connectorDashGap = CGFloat(guideConnectorDashGap)
+        let connectorX = x + CGFloat(guideConnectorOffsetX)
+        let connectorY = CGFloat(guideConnectorOffsetY)
+        let topOverlap = CGFloat(guideTopOverlap)
+        let bottomOverlap = CGFloat(guideBottomOverlap)
+        let color = palette.rowText.opacity(isActive ? 0.16 : 0.08)
+        let lastCenterY = centerY(forChildAt: max(children.count - 1, 0))
+
+        ZStack(alignment: .topLeading) {
+            Path { path in
+                path.move(to: CGPoint(x: connectorX, y: connectorY - connectorLength))
+                path.addLine(to: CGPoint(x: connectorX, y: connectorY + connectorLength))
+            }
+            .stroke(
+                color,
+                style: StrokeStyle(lineWidth: 1, lineCap: .round, dash: [connectorDashLength, connectorDashGap])
+            )
+
+            Rectangle()
+                .fill(color)
+                .frame(width: 1, height: lastCenterY + topOverlap + bottomOverlap)
+                .offset(x: x, y: -topOverlap)
+
+            ForEach(Array(children.enumerated()), id: \.element.id) { index, _ in
+                Rectangle()
+                    .fill(color)
+                    .frame(width: elbowWidth, height: 1)
+                    .offset(x: elbowX, y: centerY(forChildAt: index))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func centerY(forChildAt index: Int) -> CGFloat {
+        guard index > 0 else {
+            return rowHeight(for: children.first) / 2
+        }
+
+        let precedingRowsHeight = children.prefix(index).reduce(CGFloat.zero) { partialResult, session in
+            partialResult + rowHeight(for: session)
+        }
+        return precedingRowsHeight
+            + SidebarLayout.agentTreeRowSpacing * CGFloat(index)
+            + rowHeight(for: children[index]) / 2
+    }
+
+    private func rowHeight(for session: TerminalSession?) -> CGFloat {
+        guard let session else { return CGFloat(childDetailRowHeight) }
+        return CGFloat(session.sidebarDetail.nilIfEmpty == nil ? childRowHeight : childDetailRowHeight)
+    }
+}
+
+private struct AgentTreeTuningPanel: View {
+    let palette: SidebarPalette
+
+    @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
+    @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+    @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+    @AppStorage(AgentTreeLayout.guideConnectorLengthKey) private var guideConnectorLength = AgentTreeLayout.defaultGuideConnectorLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashLengthKey) private var guideConnectorDashLength = AgentTreeLayout.defaultGuideConnectorDashLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashGapKey) private var guideConnectorDashGap = AgentTreeLayout.defaultGuideConnectorDashGap
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetXKey) private var guideConnectorOffsetX = AgentTreeLayout.defaultGuideConnectorOffsetX
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetYKey) private var guideConnectorOffsetY = AgentTreeLayout.defaultGuideConnectorOffsetY
+    @AppStorage(AgentTreeLayout.disclosureOffsetKey) private var disclosureOffset = AgentTreeLayout.defaultDisclosureOffset
+    @AppStorage(AgentTreeLayout.guideTopOverlapKey) private var guideTopOverlap = AgentTreeLayout.defaultGuideTopOverlap
+    @AppStorage(AgentTreeLayout.guideBottomOverlapKey) private var guideBottomOverlap = AgentTreeLayout.defaultGuideBottomOverlap
+    @AppStorage(AgentTreeLayout.childRowHeightKey) private var childRowHeight = AgentTreeLayout.defaultChildRowHeight
+    @AppStorage(AgentTreeLayout.childDetailRowHeightKey) private var childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("Tree Tune")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.headerText)
+
+                Spacer()
+
+                Button("Reset") {
+                    reset()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(palette.headerText.opacity(0.72))
+            }
+
+            tuningHeader("Guide")
+            tuningRow("x", value: $guideX, range: 0...12, step: 0.5)
+            tuningRow("stem", value: $guideConnectorLength, range: 0...24, step: 1)
+            tuningRow("top", value: $guideTopOverlap, range: 0...12, step: 0.5)
+            tuningRow("bottom", value: $guideBottomOverlap, range: 0...12, step: 0.5)
+
+            tuningHeader("Elbows")
+            tuningRow("width", value: $guideElbowWidth, range: 0...16, step: 0.5)
+            tuningRow("join", value: $guideElbowStartInset, range: 0...4, step: 0.5)
+
+            tuningHeader("Dash")
+            tuningRow("length", value: $guideConnectorDashLength, range: 1...8, step: 0.5)
+            tuningRow("gap", value: $guideConnectorDashGap, range: 1...8, step: 0.5)
+            tuningRow("x", value: $guideConnectorOffsetX, range: -12...12, step: 0.5)
+            tuningRow("y", value: $guideConnectorOffsetY, range: -24...24, step: 1)
+
+            tuningHeader("Rows")
+            tuningRow("arrow", value: $disclosureOffset, range: -10...4, step: 0.5)
+            tuningRow("row", value: $childRowHeight, range: 32...46, step: 1)
+            tuningRow("detail", value: $childDetailRowHeight, range: 36...52, step: 1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(palette.rowText.opacity(0.06))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(palette.rowText.opacity(0.10), lineWidth: 1)
+                }
+        }
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
+        .padding(.top, 3)
+    }
+
+    private func tuningHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(palette.rowText.opacity(0.46))
+            .textCase(.uppercase)
+            .padding(.top, 3)
+    }
+
+    private func tuningRow(
+        _ title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double
+    ) -> some View {
+        HStack(spacing: 7) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(palette.rowText.opacity(0.62))
+                .frame(width: 38, alignment: .leading)
+
+            Slider(value: value, in: range, step: step)
+
+            Text(value.wrappedValue, format: .number.precision(.fractionLength(step < 1 ? 1 : 0)))
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .frame(width: 30, alignment: .trailing)
+        }
+    }
+
+    private func reset() {
+        guideX = AgentTreeLayout.defaultGuideX
+        guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+        guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+        guideConnectorLength = AgentTreeLayout.defaultGuideConnectorLength
+        guideConnectorDashLength = AgentTreeLayout.defaultGuideConnectorDashLength
+        guideConnectorDashGap = AgentTreeLayout.defaultGuideConnectorDashGap
+        guideConnectorOffsetX = AgentTreeLayout.defaultGuideConnectorOffsetX
+        guideConnectorOffsetY = AgentTreeLayout.defaultGuideConnectorOffsetY
+        disclosureOffset = AgentTreeLayout.defaultDisclosureOffset
+        guideTopOverlap = AgentTreeLayout.defaultGuideTopOverlap
+        guideBottomOverlap = AgentTreeLayout.defaultGuideBottomOverlap
+        childRowHeight = AgentTreeLayout.defaultChildRowHeight
+        childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
     }
 }
 
@@ -4506,6 +4819,12 @@ private struct SidebarTabRow: View {
     let onToggleDisclosure: (() -> Void)?
     let onSelect: () -> Void
 
+    @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
+    @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+    @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+    @AppStorage(AgentTreeLayout.disclosureOffsetKey) private var disclosureOffset = AgentTreeLayout.defaultDisclosureOffset
+    @AppStorage(AgentTreeLayout.childRowHeightKey) private var childRowHeight = AgentTreeLayout.defaultChildRowHeight
+    @AppStorage(AgentTreeLayout.childDetailRowHeightKey) private var childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
     @State private var isHovered = false
 
     init(
@@ -4544,17 +4863,21 @@ private struct SidebarTabRow: View {
             presentation: presentation
         )
         let label = sidebarLabel()
+        let nested = nestingDepth > 0
+        let nestedGuideReservationWidth = CGFloat(guideX + guideElbowStartInset + guideElbowWidth + 2)
+        let nestedBackgroundLeadingInset = nested
+            ? SidebarLayout.rowHorizontalInset + nestedGuideReservationWidth + 2
+            : 0
+        let rowHeight: CGFloat = if nested {
+            CGFloat(label.detail == nil ? childRowHeight : childDetailRowHeight)
+        } else {
+            label.detail == nil ? 42 : 50
+        }
 
-        HStack(spacing: 8) {
-            if nestingDepth > 0 {
-                HStack(spacing: 0) {
-                    ForEach(0..<nestingDepth, id: \.self) { _ in
-                        Rectangle()
-                            .fill(palette.rowText.opacity(0.14))
-                            .frame(width: 1, height: label.detail == nil ? 24 : 32)
-                            .frame(width: 14)
-                    }
-                }
+        HStack(spacing: nested ? 6 : 8) {
+            if nested {
+                Color.clear
+                    .frame(width: nestedGuideReservationWidth, height: rowHeight)
             }
 
             if showsDisclosure {
@@ -4566,9 +4889,8 @@ private struct SidebarTabRow: View {
                 }
                 .buttonStyle(.plain)
                 .help(isDisclosureExpanded ? "Collapse sub-agents" : "Expand sub-agents")
-            } else if nestingDepth > 0 {
-                Color.clear
-                    .frame(width: 14, height: 22)
+                .offset(x: CGFloat(disclosureOffset))
+                .padding(.trailing, -6)
             }
 
             if let icon = AgentToolIconDescriptor(session: session) {
@@ -4614,12 +4936,13 @@ private struct SidebarTabRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: label.detail == nil ? 42 : 50)
+        .frame(height: rowHeight)
         .padding(.leading, SidebarLayout.rowHorizontalInset)
         .padding(.trailing, SidebarLayout.rowHorizontalInset)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .background {
+        .background(alignment: .leading) {
             rowBackground(palette: palette)
+                .padding(.leading, nestedBackgroundLeadingInset)
         }
         .padding(.leading, -SidebarLayout.rowHorizontalInset)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))

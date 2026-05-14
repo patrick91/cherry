@@ -759,12 +759,26 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(child.childAgentCount == 0)
     #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
 
+    let nestedChildResponse = try await harness.send(.runAgent(.init(
+        agentName: "Echo",
+        parentAgentID: child.terminalID
+    )))
+    guard case .runAgent(let nestedChild)? = nestedChildResponse.result,
+          let nestedChildID = UUID(uuidString: nestedChild.terminalID)
+    else {
+        Issue.record("Expected nested child runAgent result, got \(String(describing: nestedChildResponse))")
+        return
+    }
+
+    #expect(nestedChild.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == parentID)
+
     let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.terminalID)))
     guard case .getProcessStatus(let parentStatus)? = parentStatusResponse.result else {
         Issue.record("Expected parent process status, got \(String(describing: parentStatusResponse))")
         return
     }
-    #expect(parentStatus.process.childAgentCount == 1)
+    #expect(parentStatus.process.childAgentCount == 2)
 
     let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.terminalID)))
     #expect(rejectCloseResponse.error?.code == "agent_has_sub_agents")
@@ -787,6 +801,8 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     #expect(!harness.workspace.sessions.contains { $0.id == parentID })
     #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == childID })
+    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.sessions.contains { $0.id == nestedChildID })
 }
 
 @MainActor
@@ -817,6 +833,18 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 
     #expect(child.process.parentAgentID == parent.process.id)
 
+    let nestedChildResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: child.process.id
+    )))
+    guard case .spawnProcess(let nestedChild)? = nestedChildResponse.result else {
+        Issue.record("Expected nested child spawnProcess result, got \(String(describing: nestedChildResponse))")
+        return
+    }
+
+    #expect(nestedChild.process.parentAgentID == parent.process.id)
+
     let closeResponse = try await harness.send(.closeProcess(.init(
         processID: parent.process.id,
         agentClosePolicy: .closeSubAgents
@@ -828,6 +856,7 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 
     #expect(harness.workspace.session(id: parent.process.id) == nil)
     #expect(harness.workspace.session(id: child.process.id) == nil)
+    #expect(harness.workspace.session(id: nestedChild.process.id) == nil)
 }
 
 @MainActor
@@ -3039,7 +3068,7 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 }
 
 @MainActor
-@Test func workspaceNestsAgentSessionsAndPromotesChildren() async throws {
+@Test func workspaceKeepsAgentTreeToOneNestingLevelAndPromotesChildren() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -3055,15 +3084,17 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
     let parent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
     let child = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: parent.id, select: false)
-    let grandchild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
+    let nestedChild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
 
     #expect(workspace.rootAgentSessions.map(\.id) == [parent.id])
-    #expect(workspace.childAgentSessions(of: parent).map(\.id) == [child.id])
-    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == [child.id, grandchild.id])
+    #expect(workspace.childAgentSessions(of: parent).map(\.id) == [child.id, nestedChild.id])
+    #expect(workspace.childAgentSessions(of: child).isEmpty)
+    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == [child.id, nestedChild.id])
+    #expect(nestedChild.parentAgentID == parent.id)
     #expect(workspace.visibleAgentTreeItems().map { "\($0.session.id.uuidString):\($0.depth)" } == [
         "\(parent.id.uuidString):0",
         "\(child.id.uuidString):1",
-        "\(grandchild.id.uuidString):2"
+        "\(nestedChild.id.uuidString):1"
     ])
     #expect(workspace.visibleAgentTreeItems(collapsedIDs: [parent.id]).map { "\($0.session.id.uuidString):\($0.depth)" } == [
         "\(parent.id.uuidString):0"
@@ -3073,8 +3104,8 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 
     #expect(!workspace.sessions.contains { $0.id == parent.id })
     #expect(child.parentAgentID == nil)
-    #expect(grandchild.parentAgentID == child.id)
-    #expect(workspace.rootAgentSessions.map(\.id) == [child.id])
+    #expect(nestedChild.parentAgentID == nil)
+    #expect(workspace.rootAgentSessions.map(\.id) == [child.id, nestedChild.id])
 }
 
 @MainActor
@@ -3094,13 +3125,13 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
     let parent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
     let child = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: parent.id, select: false)
-    let grandchild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
+    let nestedChild = workspace.addAgentSession(agent: definition, projectRoot: directory.path, parentAgentID: child.id, select: false)
 
     workspace.closeAgentGroup(parent)
 
     #expect(!workspace.sessions.contains { $0.id == parent.id })
     #expect(!workspace.sessions.contains { $0.id == child.id })
-    #expect(!workspace.sessions.contains { $0.id == grandchild.id })
+    #expect(!workspace.sessions.contains { $0.id == nestedChild.id })
     #expect(workspace.agentSessions.isEmpty)
     #expect(workspace.terminalSessions.count == 1)
 }
@@ -3121,13 +3152,15 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
 
     let previewSessions = workspace.installPreviewAgentTree()
     let parent = try #require(previewSessions.first)
-    let child = try #require(previewSessions.dropFirst().first)
 
-    #expect(previewSessions.count == 5)
+    #expect(previewSessions.count == 20)
     #expect(workspace.agentSessions.map(\.id) == previewSessions.map(\.id))
-    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id, previewSessions[4].id])
-    #expect(workspace.childAgentSessions(of: parent).map(\.id) == [child.id, previewSessions[2].id])
-    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == [child.id, previewSessions[3].id, previewSessions[2].id])
+    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id, previewSessions[13].id, previewSessions[19].id])
+    #expect(workspace.childAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
+    #expect(workspace.childAgentSessions(of: previewSessions[13]).map(\.id) == previewSessions[14...18].map(\.id))
+    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
+    #expect(workspace.visibleAgentTreeItems().allSatisfy { $0.depth <= 1 })
+    #expect(previewSessions.contains { $0.sidebarDetail.isEmpty })
     #expect(previewSessions.allSatisfy { session in
         session.kind == .agent &&
         session.childProcessID == nil &&

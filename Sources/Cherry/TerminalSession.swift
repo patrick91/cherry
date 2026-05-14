@@ -692,9 +692,7 @@ final class TerminalWorkspace: ObservableObject {
 
     func descendantAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
         guard parent.kind == .agent else { return [] }
-        var descendants: [TerminalSession] = []
-        appendAgentDescendants(parentID: parent.id, to: &descendants)
-        return descendants
+        return childAgentSessions(of: parent)
     }
 
     func visibleAgentTreeItems(collapsedIDs: Set<UUID> = []) -> [AgentSessionTreeItem] {
@@ -785,12 +783,13 @@ final class TerminalWorkspace: ObservableObject {
         parentAgentID: UUID? = nil,
         select: Bool = true
     ) -> TerminalSession {
+        let normalizedParentAgentID = normalizedParentAgentID(parentAgentID)
         let session = Self.makeAgentSession(
             index: agentSessions.count + 1,
             agent: agent,
             workingDirectory: projectRoot,
             title: title,
-            parentAgentID: parentAgentID
+            parentAgentID: normalizedParentAgentID
         )
         sessions.append(session)
         if select {
@@ -830,51 +829,79 @@ final class TerminalWorkspace: ObservableObject {
         guard agentSessions.isEmpty else { return [] }
 
         let workingDirectory = projectRoot ?? NSHomeDirectory()
-        let parent = Self.makePreviewAgentSession(
-            index: 1,
+        var previewSessions: [TerminalSession] = []
+
+        func appendPreviewAgent(
+            title: String,
+            subtitle: String,
+            agentName: String,
+            parentAgentID: UUID? = nil
+        ) -> TerminalSession {
+            let session = Self.makePreviewAgentSession(
+                index: previewSessions.count + 1,
+                title: title,
+                subtitle: subtitle,
+                agentName: agentName,
+                workingDirectory: workingDirectory,
+                projectRoot: projectRoot,
+                parentAgentID: parentAgentID
+            )
+            previewSessions.append(session)
+            return session
+        }
+
+        let parent = appendPreviewAgent(
             title: "Claude",
             subtitle: "Investigate Profile Cache Loading",
-            agentName: "Claude",
-            workingDirectory: workingDirectory,
-            projectRoot: projectRoot
+            agentName: "Claude"
         )
-        let child = Self.makePreviewAgentSession(
-            index: 2,
-            title: "Codex",
-            subtitle: "Patch Apollo cache policy",
-            agentName: "Codex",
-            workingDirectory: workingDirectory,
-            projectRoot: projectRoot,
-            parentAgentID: parent.id
-        )
-        let sibling = Self.makePreviewAgentSession(
-            index: 3,
-            title: "Gemini",
-            subtitle: "Check auth and profile flows",
-            agentName: "Gemini",
-            workingDirectory: workingDirectory,
-            projectRoot: projectRoot,
-            parentAgentID: parent.id
-        )
-        let grandchild = Self.makePreviewAgentSession(
-            index: 4,
-            title: "Amp",
-            subtitle: "Verify sidebar close behavior",
-            agentName: "Amp",
-            workingDirectory: workingDirectory,
-            projectRoot: projectRoot,
-            parentAgentID: child.id
-        )
-        let secondRoot = Self.makePreviewAgentSession(
-            index: 5,
-            title: "Codex Design",
-            subtitle: "Tune agent tree visuals",
-            agentName: "Codex",
-            workingDirectory: workingDirectory,
-            projectRoot: projectRoot
-        )
+        [
+            ("Codex", "tuning sidebar UI", "Codex"),
+            ("Gemini", "no agent process running", "Gemini"),
+            ("Amp", "previewed empty agent tree", "Amp"),
+            ("Codex Review", "check close confirmation", "Codex"),
+            ("Claude Notes", "inspect sidebar spacing", "Claude"),
+            ("Gemini Audit", "", "Gemini"),
+            ("Amp Layout", "", "Amp"),
+            ("Codex MCP", "validate parent_agent_id", "Codex"),
+            ("Claude Cache", "read cached profile data", "Claude"),
+            ("Gemini Trace", "measure row rhythm", "Gemini"),
+            ("Amp Snapshot", "compare guide alignment", "Amp"),
+            ("Codex Docs", "", "Codex")
+        ].forEach { title, subtitle, agentName in
+            _ = appendPreviewAgent(
+                title: title,
+                subtitle: subtitle,
+                agentName: agentName,
+                parentAgentID: parent.id
+            )
+        }
 
-        let previewSessions = [parent, child, sibling, grandchild, secondRoot]
+        let designParent = appendPreviewAgent(
+            title: "Codex Design",
+            subtitle: "agent tree preview visible",
+            agentName: "Codex"
+        )
+        [
+            ("Claude Close", "group close prompt", "Claude"),
+            ("Gemini Commands", "shortcut numbering", "Gemini"),
+            ("Amp Icons", "mixed provider logos", "Amp"),
+            ("Codex Empty", "", "Codex"),
+            ("Claude Labels", "longer sidebar details", "Claude")
+        ].forEach { title, subtitle, agentName in
+            _ = appendPreviewAgent(
+                title: title,
+                subtitle: subtitle,
+                agentName: agentName,
+                parentAgentID: designParent.id
+            )
+        }
+
+        _ = appendPreviewAgent(
+            title: "Claude Scratch",
+            subtitle: "",
+            agentName: "Claude"
+        )
         sessions.append(contentsOf: previewSessions)
         selectedSessionID = parent.id
         return previewSessions
@@ -985,13 +1012,6 @@ final class TerminalWorkspace: ObservableObject {
         agentSessions.filter { $0.parentAgentID == parentID }
     }
 
-    private func appendAgentDescendants(parentID: UUID, to descendants: inout [TerminalSession]) {
-        for child in childAgentSessions(parentID: parentID) {
-            descendants.append(child)
-            appendAgentDescendants(parentID: child.id, to: &descendants)
-        }
-    }
-
     private func appendAgentTreeItems(
         parent: TerminalSession,
         depth: Int,
@@ -1001,8 +1021,30 @@ final class TerminalWorkspace: ObservableObject {
         items.append(AgentSessionTreeItem(session: parent, depth: depth))
         guard !collapsedIDs.contains(parent.id) else { return }
         for child in childAgentSessions(parentID: parent.id) {
-            appendAgentTreeItems(parent: child, depth: depth + 1, collapsedIDs: collapsedIDs, to: &items)
+            items.append(AgentSessionTreeItem(session: child, depth: 1))
         }
+    }
+
+    private func normalizedParentAgentID(_ parentAgentID: UUID?) -> UUID? {
+        guard let parentAgentID,
+              let parent = agentSessions.first(where: { $0.id == parentAgentID })
+        else {
+            return parentAgentID
+        }
+
+        return rootAgentID(for: parent)
+    }
+
+    private func rootAgentID(for session: TerminalSession) -> UUID {
+        var current = session
+        var visitedIDs: Set<UUID> = [session.id]
+        while let parentID = current.parentAgentID,
+              !visitedIDs.contains(parentID),
+              let parent = agentSessions.first(where: { $0.id == parentID }) {
+            visitedIDs.insert(parentID)
+            current = parent
+        }
+        return current.id
     }
 
     private func promoteChildAgents(of parent: TerminalSession) {
@@ -1116,12 +1158,6 @@ final class TerminalWorkspace: ObservableObject {
             agentName: agentName,
             parentAgentID: parentAgentID
         )
-        session.ingestTestingData(Data("""
-        Agent tree preview
-
-        No agent process is running for this row.
-        Use CHERRY_PREVIEW_AGENT_TREE=1 to keep this fake tree visible while tuning the sidebar UI.
-        """.utf8))
         return session
     }
 

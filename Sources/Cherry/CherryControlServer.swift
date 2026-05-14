@@ -338,7 +338,7 @@ final class CherryControlServer: @unchecked Sendable {
             let service = try await waitForBoundPort(request, workspace: workspace)
             return .init(result: .waitForBoundPort(.init(service: service)))
         case .spawnProcess(let request):
-            let (session, sentBytes) = try spawnProcess(request, workspace: workspace)
+            let (session, sentBytes) = try await spawnProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .spawnProcess(.init(
                 process: processInfo(for: session, workspace: workspace),
@@ -427,13 +427,17 @@ final class CherryControlServer: @unchecked Sendable {
             if request.select ?? false {
                 chromeState(for: workspace)?.selectTerminal()
             }
-            let payload = try runAgentInputPayload(
+            let initialInput = try runAgentInitialInput(
                 text: request.text,
                 rawBase64: request.rawBase64,
                 submit: request.submit
             )
-            if let payload, !payload.isEmpty {
-                session.send(data: payload)
+            let sentBytes: Int
+            if let initialInput, !initialInput.isEmpty {
+                await waitForAgentInitialInputReadiness(session: session, agent: agent.definition)
+                sentBytes = await sendInitialAgentInput(initialInput, to: session, agent: agent.definition)
+            } else {
+                sentBytes = 0
             }
             let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
             let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
@@ -452,7 +456,7 @@ final class CherryControlServer: @unchecked Sendable {
                 parentAgentID: session.parentAgentID?.uuidString,
                 childAgentCount: workspace.childAgentCount(of: session),
                 projectRoot: projectRoot,
-                sentBytes: payload?.count ?? 0,
+                sentBytes: sentBytes,
                 output: output
             )))
         case .createNote(let request):
@@ -982,40 +986,47 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func spawnProcess(_ request: SpawnProcessRequest, workspace: TerminalWorkspace) throws -> (TerminalSession, Int) {
+    private func spawnProcess(_ request: SpawnProcessRequest, workspace: TerminalWorkspace) async throws -> (TerminalSession, Int) {
         let kind = try requiredProcessKind(from: request.kind)
         let session: TerminalSession
+        let agent: AgentToolDefinition?
         switch kind {
         case .terminal:
             guard request.name == nil else {
                 throw CherryControlError(code: "invalid_process_request", message: "Terminal processes do not use name; pass title instead.")
             }
             session = workspace.addSession(title: request.title, workingDirectory: request.workingDirectory, select: false)
+            agent = nil
         case .agent:
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
-            let agent = try findAgent(named: request.name ?? "")
-            guard agent.isLaunchable else {
-                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
+            let resolvedAgent = try findAgent(named: request.name ?? "")
+            guard resolvedAgent.isLaunchable else {
+                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
             session = workspace.addAgentSession(
-                agent: agent.definition,
+                agent: resolvedAgent.definition,
                 projectRoot: projectRoot,
                 title: request.title,
                 parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
                 select: false
             )
+            agent = resolvedAgent.definition
         case .command:
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
             let command = try findProjectCommand(named: request.name ?? "", projectRoot: projectRoot)
             session = workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
+            agent = nil
         }
 
         let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
         if let payload, !payload.isEmpty {
+            if let agent {
+                await waitForAgentInitialInputReadiness(session: session, agent: agent)
+            }
             session.send(data: payload)
         }
         return (session, payload?.count ?? 0)
@@ -1695,14 +1706,107 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
-    private func runAgentInputPayload(text: String?, rawBase64: String?, submit: Bool?) throws -> Data? {
-        guard var payload = try optionalInputPayload(text: text, rawBase64: rawBase64) else {
-            return nil
+    private struct AgentInitialInput {
+        let payload: Data
+        let submit: Bool
+
+        var isEmpty: Bool {
+            payload.isEmpty && !submit
         }
-        if submit != false, payload.last != 0x0d, payload.last != 0x0a {
+    }
+
+    @MainActor
+    private func sendInitialAgentInput(
+        _ input: AgentInitialInput,
+        to session: TerminalSession,
+        agent: AgentToolDefinition
+    ) async -> Int {
+        if shouldDeferInitialInput(for: agent), input.submit {
+            if !input.payload.isEmpty {
+                session.send(data: input.payload)
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            let enterSequence = TerminalInputEncoder.enterSequence(
+                isEnhancedKeyboardProtocolActive: session.isEnhancedKeyboardProtocolActive
+            )
+            session.send(data: enterSequence)
+            return input.payload.count + enterSequence.count
+        }
+
+        var payload = input.payload
+        if input.submit {
             payload.append(0x0d)
         }
-        return payload
+        guard !payload.isEmpty else { return 0 }
+        session.send(data: payload)
+        return payload.count
+    }
+
+    @MainActor
+    private func waitForAgentInitialInputReadiness(
+        session: TerminalSession,
+        agent: AgentToolDefinition
+    ) async {
+        guard shouldDeferInitialInput(for: agent) else { return }
+
+        let startedAt = Date()
+        let maximumWait: TimeInterval = 6
+        let quietInterval: TimeInterval = 0.75
+        let noOutputFallback: TimeInterval = 1
+
+        while true {
+            switch session.state {
+            case .exited, .failed:
+                return
+            case .launching, .live:
+                break
+            }
+
+            let now = Date()
+            let elapsed = now.timeIntervalSince(startedAt)
+            if let lastOutputAt = session.lastOutputAt {
+                if now.timeIntervalSince(lastOutputAt) >= quietInterval {
+                    return
+                }
+            } else if elapsed >= noOutputFallback {
+                return
+            }
+
+            if elapsed >= maximumWait {
+                return
+            }
+
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    private func shouldDeferInitialInput(for agent: AgentToolDefinition) -> Bool {
+        let knownInteractiveAgents: Set<String> = [
+            "amp",
+            "claude",
+            "codex",
+            "gemini",
+            "opencode",
+            "pi",
+        ]
+        let normalizedName = AgentToolDefinition.normalizedName(agent.name)
+        if knownInteractiveAgents.contains(normalizedName) {
+            return true
+        }
+
+        let commandName = URL(fileURLWithPath: agent.command.trimmingCharacters(in: .whitespacesAndNewlines))
+            .lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return knownInteractiveAgents.contains(commandName)
+    }
+
+    private func runAgentInitialInput(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
+        guard let payload = try optionalInputPayload(text: text, rawBase64: rawBase64) else {
+            return nil
+        }
+        let shouldSubmit = submit != false && payload.last != 0x0d && payload.last != 0x0a
+        return AgentInitialInput(payload: payload, submit: shouldSubmit)
     }
 
     @MainActor

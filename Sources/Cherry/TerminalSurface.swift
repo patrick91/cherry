@@ -58,6 +58,13 @@ enum TerminalInputEncoder {
         }
     }
 
+    static func enterSequence(isEnhancedKeyboardProtocolActive: Bool) -> Data {
+        if isEnhancedKeyboardProtocolActive {
+            return Data("\u{1B}[13u".utf8)
+        }
+        return Data("\r".utf8)
+    }
+
     enum CursorKey {
         case up
         case down

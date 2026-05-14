@@ -754,6 +754,51 @@ private struct MCPRunAgentPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerWaitsForKnownAgentStartupBeforeInitialPrompt() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let scriptURL = harness.projectRoot.appendingPathComponent("codex-ready-agent.sh")
+    let script = #"""
+    #!/bin/bash
+    printf 'boot\n'
+    sleep 0.2
+    while IFS= read -r -t 0.05 _; do :; done
+    printf 'ready\n'
+    stty raw -echo
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /[\r\n]/) { if (length($chunk) > 1) { $chunk =~ s/[\r\n].*//s; $buf .= $chunk; print "typed:$buf\r\n"; } else { print "submitted:$buf\r\n"; } last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+    try harness.settings.upsertAgent(AgentToolDefinition(
+        name: "Codex",
+        command: scriptURL.path
+    ))
+    harness.server.start()
+
+    let response = try await harness.send(.runAgent(.init(
+        agentName: "Codex",
+        text: "delayed prompt",
+        waitMilliseconds: 2_500,
+        lineLimit: 20
+    )))
+
+    guard case .runAgent(let result)? = response.result else {
+        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        return
+    }
+
+    let output = result.output?.lines.joined(separator: "\n") ?? ""
+    #expect(response.error == nil)
+    #expect(output.contains("ready"), Comment(rawValue: output))
+    #expect(output.contains("typed:delayed prompt"), Comment(rawValue: output))
+    #expect(output.contains("submitted:delayed prompt"), Comment(rawValue: output))
+}
+
+@MainActor
 @Test func controlServerNestsMCPSpawnedAgentsAndRequiresClosePolicy() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -4330,6 +4375,8 @@ private func serviceRecord(
     let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
 
     #expect(enter == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterSequence(isEnhancedKeyboardProtocolActive: false) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterSequence(isEnhancedKeyboardProtocolActive: true) == Data("\u{1B}[13u".utf8))
 }
 
 @Test func terminalArrowKeysFollowApplicationCursorMode() async throws {

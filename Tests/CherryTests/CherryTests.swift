@@ -2748,7 +2748,8 @@ private struct MCPWhoamiPayload: Decodable {
         title: "README.md",
         detail: "vim README.md",
         leadingIconResourceName: "vim",
-        leadingIconFallback: "Vi"
+        leadingIconFallback: "Vi",
+        leadingIconRendersAsTemplate: true
     ))
 
     #expect(SidebarTerminalProgramFormatter.label(
@@ -2759,7 +2760,8 @@ private struct MCPWhoamiPayload: Decodable {
         title: "ContentView.swift",
         detail: "nvim \"Sources/Cherry/ContentView.swift\"",
         leadingIconResourceName: "neovim",
-        leadingIconFallback: "Nv"
+        leadingIconFallback: "Nv",
+        leadingIconRendersAsTemplate: true
     ))
 }
 
@@ -2772,7 +2774,8 @@ private struct MCPWhoamiPayload: Decodable {
         title: "config",
         detail: "~/.aws · Nvim",
         leadingIconResourceName: "neovim",
-        leadingIconFallback: "Nv"
+        leadingIconFallback: "Nv",
+        leadingIconRendersAsTemplate: true
     ))
 }
 
@@ -2785,7 +2788,8 @@ private struct MCPWhoamiPayload: Decodable {
         title: "Vite",
         detail: "bunx vite --host 0.0.0.0",
         leadingIconResourceName: "vite",
-        leadingIconFallback: "Vt"
+        leadingIconFallback: "Vt",
+        leadingIconRendersAsTemplate: true
     ))
 
     #expect(SidebarTerminalProgramFormatter.label(
@@ -2796,7 +2800,8 @@ private struct MCPWhoamiPayload: Decodable {
         title: "create-next-app",
         detail: "npx --yes create-next-app@latest demo",
         leadingIconResourceName: "npm",
-        leadingIconFallback: "nx"
+        leadingIconFallback: "nx",
+        leadingIconRendersAsTemplate: true
     ))
 
     #expect(SidebarTerminalProgramFormatter.label(

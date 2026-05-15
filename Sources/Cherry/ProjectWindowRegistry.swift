@@ -435,6 +435,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
+    @Published var isIconDebugOverlayPresented = false
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
@@ -491,6 +492,10 @@ final class ProjectWindowChromeState: ObservableObject {
     func presentCommandPalette() {
         isCommandPalettePresented = true
         commandPaletteFocusRequest &+= 1
+    }
+
+    func toggleIconDebugOverlay() {
+        isIconDebugOverlayPresented.toggle()
     }
 
     func selectNote(id: UUID?) {

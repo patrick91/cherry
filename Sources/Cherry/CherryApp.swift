@@ -134,6 +134,14 @@ struct CherryApp: App {
                 .keyboardShortcut("s")
                 .disabled(focusedChromeState == nil)
 
+                if PrototypeFeatureFlags.isIconDebugEnabled {
+                    Button(focusedChromeState?.isIconDebugOverlayPresented == true ? "Hide Icon Debug Overlay" : "Show Icon Debug Overlay") {
+                        focusedChromeState?.toggleIconDebugOverlay()
+                    }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(focusedChromeState == nil)
+                }
+
                 Button("New Tab") {
                     focusedWorkspace?.addSession()
                 }

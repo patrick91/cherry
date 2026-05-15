@@ -127,6 +127,17 @@ struct ContentView: View {
                 .zIndex(2_000)
             }
 
+            if PrototypeFeatureFlags.isIconDebugEnabled,
+               chromeState.isIconDebugOverlayPresented {
+                SidebarIconDebugOverlay(
+                    projectRoot: projectRoot,
+                    presentation: isSidebarRevealed ? .floating : .docked,
+                    leadingOffset: iconDebugOverlayLeadingOffset,
+                    isPresented: $chromeState.isIconDebugOverlayPresented
+                )
+                .zIndex(2_100)
+            }
+
             if isSidebarHidden {
                 // Wider hot-zone (24pt) avoids the macOS fullscreen edge
                 // gestures that reserve the leftmost few pixels. Using
@@ -269,6 +280,18 @@ struct ContentView: View {
     private var pendingAgentGroupCloseSession: TerminalSession? {
         guard let id = chromeState.pendingAgentGroupCloseSessionID else { return nil }
         return workspace.sessions.first { $0.id == id }
+    }
+
+    private var iconDebugOverlayLeadingOffset: CGFloat {
+        let sidebarRightEdge: CGFloat
+        if isSidebarRevealed {
+            sidebarRightEdge = sidebarWidth + floatingSidebarLeadingInset
+        } else if isSidebarHidden {
+            sidebarRightEdge = floatingSidebarLeadingInset
+        } else {
+            sidebarRightEdge = sidebarWidth
+        }
+        return sidebarRightEdge + 10
     }
 
     private func canCloseAgentGroup(_ session: TerminalSession) -> Bool {
@@ -2962,6 +2985,19 @@ private enum AgentTreeLayout {
     }
 }
 
+enum PrototypeFeatureFlags {
+    static var isIconDebugEnabled: Bool {
+        truthyEnvironmentValue(for: "CHERRY_ICON_DEBUG")
+    }
+
+    private static func truthyEnvironmentValue(for key: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return value == "1" || value == "true" || value == "yes" || value == "on"
+    }
+}
+
 @MainActor
 private func copyCherryLink(_ link: String?) {
     guard let link, !link.isEmpty else { return }
@@ -3291,7 +3327,11 @@ private struct SidebarAgentSessionSection: View {
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                SidebarSectionHeader(title: "Agents", count: workspace.agentSessions.count, palette: palette)
+                SidebarSectionHeader(
+                    title: "Agents",
+                    count: workspace.agentSessions.count + (isIconDebugActive ? SidebarIconDebugFixtures.agentCount : 0),
+                    palette: palette
+                )
 
                 AgentLaunchMenu(
                     project: project,
@@ -3301,12 +3341,18 @@ private struct SidebarAgentSessionSection: View {
                 )
             }
 
-            if workspace.agentSessions.isEmpty {
+            if isIconDebugActive {
+                SidebarIconDebugAgentPreview(palette: palette)
+            }
+
+            if workspace.agentSessions.isEmpty && !isIconDebugActive {
                 SidebarEmptyRow(
                     title: "No agents",
                     palette: palette
                 )
-            } else {
+            }
+
+            if !workspace.agentSessions.isEmpty {
                 let items = workspace.visibleAgentTreeItems(collapsedIDs: chromeState.collapsedAgentGroupIDs)
                 let shortcutNumbers = Dictionary(uniqueKeysWithValues: items.enumerated().map { index, item in
                     (item.session.id, index + 1)
@@ -3354,6 +3400,10 @@ private struct SidebarAgentSessionSection: View {
         guard agent.isLaunchable, let root = project.validProjectRoot else { return }
         chromeState.selectTerminal()
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+    }
+
+    private var isIconDebugActive: Bool {
+        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
     }
 
     private func select(_ session: TerminalSession) {
@@ -3718,7 +3768,11 @@ private struct SidebarCommandSection: View {
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                SidebarSectionHeader(title: "Commands", count: commands.count, palette: palette)
+                SidebarSectionHeader(
+                    title: "Commands",
+                    count: commands.count + (isIconDebugActive ? SidebarIconDebugFixtures.commandCount : 0),
+                    palette: palette
+                )
 
                 Button(action: addCommand) {
                     Image(systemName: "plus")
@@ -3732,12 +3786,18 @@ private struct SidebarCommandSection: View {
                 .help("Add command")
             }
 
-            if commands.isEmpty {
+            if isIconDebugActive {
+                SidebarIconDebugCommandPreview(palette: palette)
+            }
+
+            if commands.isEmpty && !isIconDebugActive {
                 SidebarEmptyRow(
                     title: projectRoot == nil ? "Select a project" : "No commands",
                     palette: palette
                 )
-            } else {
+            }
+
+            if !commands.isEmpty {
                 ForEach(Array(commands.enumerated()), id: \.element.id) { index, command in
                     let session = workspace.commandSession(named: command.name)
                     SidebarCommandRow(
@@ -3887,6 +3947,10 @@ private struct SidebarCommandSection: View {
         if let projectRoot {
             settings.removeCommand(named: command.name, for: projectRoot)
         }
+    }
+
+    private var isIconDebugActive: Bool {
+        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
     }
 }
 
@@ -4164,12 +4228,7 @@ private struct SidebarCommandRow: View {
                     if let subtitle {
                         HStack(spacing: 4) {
                             if let resourceName = subtitle.iconResourceName {
-                                AgentLogoImage(
-                                    resourceName: resourceName,
-                                    rendersAsTemplate: true,
-                                    fallbackLabel: ""
-                                )
-                                .frame(width: 11, height: 11)
+                                SidebarDetailIcon(resourceName: resourceName)
                             }
 
                             Text(subtitle.text)
@@ -4299,6 +4358,7 @@ private struct SidebarEmptyRow: View {
             .frame(height: 34)
             .padding(.trailing, 12)
     }
+
 }
 
 private struct SidebarSessionSection: View {
@@ -4330,7 +4390,15 @@ private struct SidebarSessionSection: View {
         )
 
         VStack(alignment: .leading, spacing: 4) {
-            SidebarSectionHeader(title: title, count: sessions.count, palette: palette)
+            SidebarSectionHeader(
+                title: title,
+                count: sessions.count + (isIconDebugActive && kind == .terminal ? SidebarIconDebugFixtures.terminalCount : 0),
+                palette: palette
+            )
+
+            if isIconDebugActive, kind == .terminal {
+                SidebarIconDebugTerminalPreview(palette: palette)
+            }
 
             ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                 SidebarTabRow(
@@ -4415,6 +4483,10 @@ private struct SidebarSessionSection: View {
                 )
             }
         }
+    }
+
+    private var isIconDebugActive: Bool {
+        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
     }
 }
 
@@ -4956,6 +5028,8 @@ private struct SidebarTabRow: View {
     @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
     @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
     @AppStorage(AgentTreeLayout.disclosureOffsetKey) private var disclosureOffset = AgentTreeLayout.defaultDisclosureOffset
+    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+    @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
     @AppStorage(AgentTreeLayout.childRowHeightKey) private var childRowHeight = AgentTreeLayout.defaultChildRowHeight
     @AppStorage(AgentTreeLayout.childDetailRowHeightKey) private var childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
     @State private var isHovered = false
@@ -5032,9 +5106,13 @@ private struct SidebarTabRow: View {
             }
 
             if let icon = rowState.agentIconDescriptor {
-                AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+                if !usesInlineAgentIconsForRow {
+                    AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+                }
             } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
-                SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+                if !usesInlineProgramIconsForRow {
+                    SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+                }
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -5046,12 +5124,12 @@ private struct SidebarTabRow: View {
                 if let detail = label.detail {
                     HStack(spacing: 4) {
                         if let resourceName = label.detailIconResourceName {
-                            AgentLogoImage(
-                                resourceName: resourceName,
-                                rendersAsTemplate: true,
-                                fallbackLabel: ""
-                            )
-                            .frame(width: 11, height: 11)
+                            SidebarDetailIcon(resourceName: resourceName)
+                        } else if usesInlineAgentDetailIcons, let icon = rowState.agentIconDescriptor {
+                            AgentToolInlineIcon(descriptor: icon)
+                        } else if usesInlineProgramDetailIcons,
+                                  label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+                            SidebarProgramInlineIcon(label: label)
                         }
 
                         Text(detail)
@@ -5111,6 +5189,14 @@ private struct SidebarTabRow: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
+    }
+
+    private var usesInlineAgentIconsForRow: Bool {
+        usesInlineAgentDetailIcons && rowState.label.detail != nil
+    }
+
+    private var usesInlineProgramIconsForRow: Bool {
+        usesInlineProgramDetailIcons && rowState.label.detail != nil
     }
 
 }
@@ -5221,21 +5307,15 @@ private struct AgentToolIconDescriptor {
     let label: String
     let logoResourceName: String?
     let rendersAsTemplate: Bool
-    let foreground: Color
-    let background: Color
 
     private init(
         label: String,
         logoResourceName: String? = nil,
-        rendersAsTemplate: Bool = true,
-        foreground: Color,
-        background: Color
+        rendersAsTemplate: Bool = true
     ) {
         self.label = label
         self.logoResourceName = logoResourceName
         self.rendersAsTemplate = rendersAsTemplate
-        self.foreground = foreground
-        self.background = background
     }
 
     @MainActor
@@ -5249,18 +5329,47 @@ private struct AgentToolIconDescriptor {
         let displayName = agentName ?? title
         let name = displayName.lowercased()
         if name.contains("codex") || name.contains("openai") {
-            self.init(label: "Cx", logoResourceName: "openai", foreground: .white, background: .black.opacity(0.82))
+            self.init(label: "Cx", logoResourceName: "openai")
         } else if name.contains("claude") || name.contains("anthropic") {
-            self.init(label: "Cl", logoResourceName: "claude", foreground: Color(red: 0.24, green: 0.16, blue: 0.10), background: Color(red: 0.86, green: 0.70, blue: 0.52))
+            self.init(label: "Cl", logoResourceName: "claude")
         } else if name.contains("gemini") {
-            self.init(label: "", logoResourceName: "gemini", foreground: .white, background: Color(red: 0.36, green: 0.42, blue: 0.95))
+            self.init(label: "Ge", logoResourceName: "gemini")
         } else if name.contains("amp") {
-            self.init(label: "A", logoResourceName: "amp", rendersAsTemplate: false, foreground: Color(red: 0.95, green: 0.31, blue: 0.25), background: .white.opacity(0.94))
+            self.init(label: "A", logoResourceName: "amp")
         } else if name == "pi" || name.contains(" pi ") || name.contains("pi.ai") || name.contains("inflection") {
-            self.init(label: "Pi", foreground: .white, background: Color(red: 0.12, green: 0.54, blue: 0.53))
+            self.init(label: "Pi")
         } else {
             return nil
         }
+    }
+}
+
+private enum SidebarIconMetrics {
+    static let programGlyphScaleKey = "sidebar.icons.programGlyphScale"
+    static let detailGlyphScaleKey = "sidebar.icons.detailGlyphScale"
+    static let agentGlyphScaleKey = "sidebar.icons.agentGlyphScale"
+    static let usesInlineProgramDetailIconsKey = "sidebar.icons.usesInlineDetailIcons"
+    static let usesInlineAgentDetailIconsKey = "sidebar.icons.usesInlineAgentDetailIcons"
+
+    static let defaultProgramGlyphScale = 1.20
+    static let defaultDetailGlyphScale = 1.0
+    static let defaultAgentGlyphScale = 0.90
+    static let defaultUsesInlineProgramDetailIcons = true
+    static let defaultUsesInlineAgentDetailIcons = false
+
+    static let programFrameSize: CGFloat = 20
+    static let programGlyphSize: CGFloat = 18
+    static let detailGlyphSize: CGFloat = 11
+    static let agentFrameSize: CGFloat = 20
+    static let agentGlyphSize: CGFloat = 13
+
+    static func reset() {
+        let defaults = UserDefaults.standard
+        defaults.set(defaultProgramGlyphScale, forKey: programGlyphScaleKey)
+        defaults.set(defaultDetailGlyphScale, forKey: detailGlyphScaleKey)
+        defaults.set(defaultAgentGlyphScale, forKey: agentGlyphScaleKey)
+        defaults.set(defaultUsesInlineProgramDetailIcons, forKey: usesInlineProgramDetailIconsKey)
+        defaults.set(defaultUsesInlineAgentDetailIcons, forKey: usesInlineAgentDetailIconsKey)
     }
 }
 
@@ -5269,10 +5378,15 @@ private struct AgentToolIcon: View {
     let isSelected: Bool
     let palette: SidebarPalette
 
+    @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+
     var body: some View {
+        let iconColor = isSelected ? palette.selectedText : palette.rowText
+        let glyphSize = SidebarIconMetrics.agentGlyphSize * CGFloat(agentGlyphScale)
+
         ZStack {
             Circle()
-                .fill(isSelected ? palette.selectedText.opacity(0.22) : descriptor.background)
+                .fill(iconColor.opacity(isSelected ? 0.18 : 0.10))
 
             if let logoResourceName = descriptor.logoResourceName {
                 AgentLogoImage(
@@ -5280,7 +5394,7 @@ private struct AgentToolIcon: View {
                     rendersAsTemplate: descriptor.rendersAsTemplate,
                     fallbackLabel: descriptor.label
                 )
-                .frame(width: 13, height: 13)
+                .frame(width: glyphSize, height: glyphSize)
             } else {
                 Text(descriptor.label)
                     .font(.system(size: 9, weight: .bold))
@@ -5288,8 +5402,8 @@ private struct AgentToolIcon: View {
                     .minimumScaleFactor(0.7)
             }
         }
-        .foregroundStyle(isSelected ? palette.selectedText : descriptor.foreground)
-        .frame(width: 20, height: 20)
+        .foregroundStyle(iconColor)
+        .frame(width: SidebarIconMetrics.agentFrameSize, height: SidebarIconMetrics.agentFrameSize)
         .accessibilityHidden(true)
     }
 }
@@ -5299,27 +5413,113 @@ private struct SidebarProgramIcon: View {
     let isSelected: Bool
     let palette: SidebarPalette
 
+    @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+
     var body: some View {
+        let iconColor = isSelected ? palette.selectedText : palette.rowText
+        let glyphSize = SidebarIconMetrics.programGlyphSize * CGFloat(programGlyphScale)
+
         ZStack {
             if let resourceName = label.leadingIconResourceName {
                 AgentLogoImage(
                     resourceName: resourceName,
-                    rendersAsTemplate: label.leadingIconRendersAsTemplate,
+                    rendersAsTemplate: true,
                     fallbackLabel: label.leadingIconFallback ?? ""
                 )
-                .frame(width: 18, height: 18)
+                .frame(width: glyphSize, height: glyphSize)
             } else if let fallback = label.leadingIconFallback {
                 Circle()
-                    .fill(isSelected ? palette.selectedText.opacity(0.16) : palette.rowText.opacity(0.10))
+                    .fill(iconColor.opacity(isSelected ? 0.16 : 0.10))
 
                 Text(fallback)
                     .font(.system(size: 8, weight: .bold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
             }
         }
-        .frame(width: 20, height: 20)
+        .foregroundStyle(iconColor)
+        .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SidebarDetailIcon: View {
+    let resourceName: String
+
+    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+
+    var body: some View {
+        let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
+
+        AgentLogoImage(
+            resourceName: resourceName,
+            rendersAsTemplate: true,
+            fallbackLabel: ""
+        )
+        .frame(width: glyphSize, height: glyphSize)
+        .frame(width: SidebarIconMetrics.detailGlyphSize, height: SidebarIconMetrics.detailGlyphSize)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct AgentToolInlineIcon: View {
+    let descriptor: AgentToolIconDescriptor
+
+    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+
+    var body: some View {
+        let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
+
+        ZStack {
+            if let logoResourceName = descriptor.logoResourceName {
+                AgentLogoImage(
+                    resourceName: logoResourceName,
+                    rendersAsTemplate: descriptor.rendersAsTemplate,
+                    fallbackLabel: descriptor.label
+                )
+                .frame(width: glyphSize, height: glyphSize)
+            } else {
+                Circle()
+                    .fill(.primary.opacity(0.14))
+
+                Text(descriptor.label)
+                    .font(.system(size: 7, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+            }
+        }
+        .frame(width: SidebarIconMetrics.detailGlyphSize, height: SidebarIconMetrics.detailGlyphSize)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SidebarProgramInlineIcon: View {
+    let label: SidebarTerminalPathLabel
+
+    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+
+    var body: some View {
+        let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
+
+        ZStack {
+            if let resourceName = label.leadingIconResourceName {
+                AgentLogoImage(
+                    resourceName: resourceName,
+                    rendersAsTemplate: true,
+                    fallbackLabel: label.leadingIconFallback ?? ""
+                )
+                .frame(width: glyphSize, height: glyphSize)
+            } else if let fallback = label.leadingIconFallback {
+                Circle()
+                    .fill(.primary.opacity(0.14))
+
+                Text(fallback)
+                    .font(.system(size: 7, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+            }
+        }
+        .frame(width: SidebarIconMetrics.detailGlyphSize, height: SidebarIconMetrics.detailGlyphSize)
         .accessibilityHidden(true)
     }
 }
@@ -5345,6 +5545,11 @@ private struct AgentLogoImage: View {
 
     @MainActor
     private static func image(named name: String, rendersAsTemplate: Bool) -> NSImage? {
+        let cacheKey = "\(name)#\(rendersAsTemplate)"
+        if let cachedImage = imageCache[cacheKey] {
+            return cachedImage
+        }
+
         let url = Bundle.module.url(
             forResource: name,
             withExtension: "svg",
@@ -5362,9 +5567,860 @@ private struct AgentLogoImage: View {
             return nil
         }
 
+        if image.size.width <= 0 || image.size.height <= 0 {
+            image.size = NSSize(width: 24, height: 24)
+        }
         image.isTemplate = rendersAsTemplate
+        imageCache[cacheKey] = image
         return image
     }
+
+    @MainActor
+    private static var imageCache: [String: NSImage] = [:]
+}
+
+private struct SidebarIconDebugOverlay: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
+
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let leadingOffset: CGFloat
+    @Binding var isPresented: Bool
+
+    @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+    @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+    @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+
+    private let panelWidth: CGFloat = 430
+    private let topInset: CGFloat = 22
+    private let minimumInset: CGFloat = 8
+    private let trailingInset: CGFloat = 18
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+
+        GeometryReader { geometry in
+            panel(palette: palette)
+                .padding(.top, topInset)
+                .padding(.leading, clampedLeadingOffset(in: geometry.size))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .transition(.opacity)
+    }
+
+    private func reset() {
+        SidebarIconMetrics.reset()
+        programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+        detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+        agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+        usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+        usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+    }
+
+    private func clampedLeadingOffset(in size: CGSize) -> CGFloat {
+        max(minimumInset, min(leadingOffset, size.width - panelWidth - trailingInset))
+    }
+
+    private func panel(palette: SidebarPalette) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Text("Icon Debug")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(palette.rowText)
+
+                Spacer()
+
+                Button(action: reset) {
+                    Image(systemName: "arrow.counterclockwise")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .help("Reset icon tuning")
+
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .help("Close")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $usesInlineProgramDetailIcons) {
+                    Text("Small terminal icons in detail line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                Toggle(isOn: $usesInlineAgentDetailIcons) {
+                    Text("Small agent icons in detail line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                SidebarIconDebugSlider(
+                    title: "Program",
+                    value: $programGlyphScale,
+                    range: 0.70...1.30,
+                    step: 0.05,
+                    palette: palette
+                )
+
+                SidebarIconDebugSlider(
+                    title: "Detail",
+                    value: $detailGlyphScale,
+                    range: 0.70...1.45,
+                    step: 0.05,
+                    palette: palette
+                )
+
+                SidebarIconDebugSlider(
+                    title: "Agent",
+                    value: $agentGlyphScale,
+                    range: 0.70...1.35,
+                    step: 0.05,
+                    palette: palette
+                )
+            }
+
+            SidebarIconDebugLivePreview(palette: palette)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(SidebarIconDebugResource.Kind.allCases, id: \.self) { kind in
+                        SidebarIconDebugResourceSection(
+                            title: kind.title,
+                            resources: SidebarIconDebugResource.resources(for: kind),
+                            palette: palette
+                        )
+                    }
+                }
+                .padding(.trailing, 2)
+            }
+        }
+        .padding(14)
+        .frame(width: panelWidth)
+        .frame(maxHeight: 680)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(palette.rowText.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 22, y: 14)
+    }
+}
+
+private struct SidebarIconDebugSlider: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .frame(width: 52, alignment: .leading)
+
+            Slider(value: $value, in: range, step: step)
+
+            Text(value, format: .number.precision(.fractionLength(2)))
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundStyle(palette.rowText.opacity(0.62))
+                .frame(width: 34, alignment: .trailing)
+        }
+    }
+}
+
+private struct SidebarIconDebugLivePreview: View {
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 10) {
+            previewItem("Program") {
+                SidebarProgramIcon(
+                    label: SidebarTerminalPathLabel(
+                        title: "Vite",
+                        leadingIconResourceName: "vite",
+                        leadingIconFallback: "Vt",
+                        leadingIconRendersAsTemplate: true
+                    ),
+                    isSelected: false,
+                    palette: palette
+                )
+            }
+
+            previewItem("Detail") {
+                HStack(spacing: 4) {
+                    SidebarDetailIcon(resourceName: "github")
+                    Text("owner/repo")
+                        .font(.system(size: 11, weight: .regular))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(palette.rowText.opacity(0.56))
+            }
+
+            previewItem("Agent") {
+                if let descriptor = AgentToolIconDescriptor(
+                    kind: .agent,
+                    agentName: "Codex",
+                    title: "Codex"
+                ) {
+                    AgentToolIcon(descriptor: descriptor, isSelected: false, palette: palette)
+                }
+            }
+        }
+    }
+
+    private func previewItem<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(palette.headerText)
+                .textCase(.uppercase)
+
+            HStack {
+                content()
+                Spacer(minLength: 0)
+            }
+            .frame(height: 36)
+            .padding(.horizontal, 8)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(palette.rowText.opacity(0.07))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(palette.rowText.opacity(0.10), lineWidth: 1)
+                    }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private enum SidebarIconDebugPreviewIcon {
+    case agent(String)
+    case program(String, String)
+    case programFallback(String)
+    case none
+}
+
+private enum SidebarIconDebugFixtures {
+    static let agentCount = 5
+    static let terminalCount = 4
+    static let commandCount = 2
+
+    static let agentChildren = [
+        SidebarIconDebugPreviewAgent(title: "Codex", detail: "tuning sidebar UI", agentName: "Codex"),
+        SidebarIconDebugPreviewAgent(title: "Gemini", detail: "checking icon scale", agentName: "Gemini"),
+        SidebarIconDebugPreviewAgent(title: "Amp Icons", detail: "template render pass", agentName: "Amp")
+    ]
+}
+
+private struct SidebarIconDebugPreviewAgent: Identifiable {
+    let id = UUID()
+    let title: String
+    let detail: String?
+    let agentName: String
+}
+
+private struct SidebarIconDebugAgentPreview: View {
+    let palette: SidebarPalette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarIconDebugPreviewRow(
+                title: "Claude",
+                detail: "parent agent with nested work",
+                icon: .agent("Claude"),
+                isSelected: true,
+                palette: palette,
+                showsDisclosure: true
+            )
+
+            SidebarIconDebugAgentChildrenGroup(
+                children: SidebarIconDebugFixtures.agentChildren,
+                palette: palette,
+                isActive: true
+            ) { child in
+                SidebarIconDebugPreviewRow(
+                    title: child.title,
+                    detail: child.detail,
+                    icon: .agent(child.agentName),
+                    isSelected: false,
+                    palette: palette,
+                    nestingDepth: 1
+                )
+            }
+
+            SidebarIconDebugPreviewRow(
+                title: "Pi",
+                detail: "fallback initials agent",
+                icon: .agent("Pi"),
+                isSelected: false,
+                palette: palette
+            )
+        }
+    }
+}
+
+private struct SidebarIconDebugAgentChildrenGroup<RowContent: View>: View {
+    let children: [SidebarIconDebugPreviewAgent]
+    let palette: SidebarPalette
+    let isActive: Bool
+    let rowContent: (SidebarIconDebugPreviewAgent) -> RowContent
+
+    init(
+        children: [SidebarIconDebugPreviewAgent],
+        palette: SidebarPalette,
+        isActive: Bool,
+        @ViewBuilder rowContent: @escaping (SidebarIconDebugPreviewAgent) -> RowContent
+    ) {
+        self.children = children
+        self.palette = palette
+        self.isActive = isActive
+        self.rowContent = rowContent
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            SidebarIconDebugAgentChildrenGuide(
+                children: children,
+                palette: palette,
+                isActive: isActive
+            )
+
+            VStack(alignment: .leading, spacing: SidebarLayout.agentTreeRowSpacing) {
+                ForEach(children) { child in
+                    rowContent(child)
+                }
+            }
+        }
+    }
+}
+
+private struct SidebarIconDebugAgentChildrenGuide: View {
+    let children: [SidebarIconDebugPreviewAgent]
+    let palette: SidebarPalette
+    let isActive: Bool
+
+    @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
+    @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+    @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+    @AppStorage(AgentTreeLayout.guideConnectorLengthKey) private var guideConnectorLength = AgentTreeLayout.defaultGuideConnectorLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashLengthKey) private var guideConnectorDashLength = AgentTreeLayout.defaultGuideConnectorDashLength
+    @AppStorage(AgentTreeLayout.guideConnectorDashGapKey) private var guideConnectorDashGap = AgentTreeLayout.defaultGuideConnectorDashGap
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetXKey) private var guideConnectorOffsetX = AgentTreeLayout.defaultGuideConnectorOffsetX
+    @AppStorage(AgentTreeLayout.guideConnectorOffsetYKey) private var guideConnectorOffsetY = AgentTreeLayout.defaultGuideConnectorOffsetY
+    @AppStorage(AgentTreeLayout.guideTopOverlapKey) private var guideTopOverlap = AgentTreeLayout.defaultGuideTopOverlap
+    @AppStorage(AgentTreeLayout.guideBottomOverlapKey) private var guideBottomOverlap = AgentTreeLayout.defaultGuideBottomOverlap
+    @AppStorage(AgentTreeLayout.childDetailRowHeightKey) private var childDetailRowHeight = AgentTreeLayout.defaultChildDetailRowHeight
+
+    var body: some View {
+        let x = CGFloat(guideX)
+        let elbowWidth = CGFloat(guideElbowWidth)
+        let elbowX = x + CGFloat(guideElbowStartInset)
+        let connectorLength = CGFloat(guideConnectorLength)
+        let connectorDashLength = CGFloat(guideConnectorDashLength)
+        let connectorDashGap = CGFloat(guideConnectorDashGap)
+        let connectorX = x + CGFloat(guideConnectorOffsetX)
+        let connectorY = CGFloat(guideConnectorOffsetY)
+        let topOverlap = CGFloat(guideTopOverlap)
+        let bottomOverlap = CGFloat(guideBottomOverlap)
+        let color = palette.rowText.opacity(isActive ? 0.16 : 0.08)
+        let lastCenterY = centerY(forChildAt: max(children.count - 1, 0))
+
+        ZStack(alignment: .topLeading) {
+            Path { path in
+                path.move(to: CGPoint(x: connectorX, y: connectorY - connectorLength))
+                path.addLine(to: CGPoint(x: connectorX, y: connectorY + connectorLength))
+            }
+            .stroke(
+                color,
+                style: StrokeStyle(lineWidth: 1, lineCap: .round, dash: [connectorDashLength, connectorDashGap])
+            )
+
+            Rectangle()
+                .fill(color)
+                .frame(width: 1, height: lastCenterY + topOverlap + bottomOverlap)
+                .offset(x: x, y: -topOverlap)
+
+            ForEach(Array(children.enumerated()), id: \.element.id) { index, _ in
+                Rectangle()
+                    .fill(color)
+                    .frame(width: elbowWidth, height: 1)
+                    .offset(x: elbowX, y: centerY(forChildAt: index))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func centerY(forChildAt index: Int) -> CGFloat {
+        guard index > 0 else { return rowHeight / 2 }
+        return rowHeight * CGFloat(index)
+            + SidebarLayout.agentTreeRowSpacing * CGFloat(index)
+            + rowHeight / 2
+    }
+
+    private var rowHeight: CGFloat {
+        CGFloat(childDetailRowHeight)
+    }
+}
+
+private struct SidebarIconDebugTerminalPreview: View {
+    let palette: SidebarPalette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarIconDebugPreviewRow(
+                title: "shot",
+                detail: "farbun-dev/shot",
+                icon: .none,
+                detailIconResourceName: "github",
+                isSelected: true,
+                palette: palette
+            )
+
+            SidebarIconDebugPreviewRow(
+                title: "Vite",
+                detail: "bunx vite --host 0.0.0.0",
+                icon: .program("vite", "Vt"),
+                isSelected: false,
+                palette: palette
+            )
+
+            SidebarIconDebugPreviewRow(
+                title: "nvim ContentView.swift",
+                detail: "Nvim",
+                icon: .program("neovim", "Nv"),
+                isSelected: false,
+                palette: palette
+            )
+
+            SidebarIconDebugPreviewRow(
+                title: "FastAPI",
+                detail: "uv run fastapi dev",
+                icon: .programFallback("Fa"),
+                isSelected: false,
+                palette: palette
+            )
+        }
+    }
+}
+
+private struct SidebarIconDebugCommandPreview: View {
+    let palette: SidebarPalette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarIconDebugCommandPreviewRow(
+                title: "Dev Server",
+                detail: "farbun-dev/shot",
+                detailIconResourceName: "github",
+                isSelected: true,
+                palette: palette
+            )
+
+            SidebarIconDebugCommandPreviewRow(
+                title: "Lint",
+                detail: "swift test --no-parallel",
+                detailIconResourceName: nil,
+                isSelected: false,
+                palette: palette
+            )
+        }
+    }
+}
+
+private struct SidebarIconDebugCommandPreviewRow: View {
+    let title: String
+    let detail: String
+    let detailIconResourceName: String?
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+
+                HStack(spacing: 4) {
+                    if let detailIconResourceName {
+                        SidebarDetailIcon(resourceName: detailIconResourceName)
+                    }
+
+                    Text(detail)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Image(systemName: "play.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                .frame(width: 22, height: 22)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 46)
+        .padding(.leading, SidebarLayout.rowHorizontalInset)
+        .padding(.trailing, SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(palette.selectedFill)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                    }
+            }
+        }
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
+    }
+}
+
+private struct SidebarIconDebugPreviewRow: View {
+    let title: String
+    let detail: String?
+    let icon: SidebarIconDebugPreviewIcon
+    var detailIconResourceName: String? = nil
+    let isSelected: Bool
+    let palette: SidebarPalette
+    var nestingDepth = 0
+    var showsDisclosure = false
+
+    @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
+    @AppStorage(AgentTreeLayout.guideElbowWidthKey) private var guideElbowWidth = AgentTreeLayout.defaultGuideElbowWidth
+    @AppStorage(AgentTreeLayout.guideElbowStartInsetKey) private var guideElbowStartInset = AgentTreeLayout.defaultGuideElbowStartInset
+    @AppStorage(AgentTreeLayout.disclosureOffsetKey) private var disclosureOffset = AgentTreeLayout.defaultDisclosureOffset
+    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+    @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+
+    var body: some View {
+        let nested = nestingDepth > 0
+        let nestedGuideReservationWidth = CGFloat(guideX + guideElbowStartInset + guideElbowWidth + 2)
+        let nestedBackgroundLeadingInset = nested
+            ? SidebarLayout.rowHorizontalInset + nestedGuideReservationWidth + 2
+            : 0
+
+        HStack(spacing: nested ? 6 : 8) {
+            if nested {
+                Color.clear
+                    .frame(width: nestedGuideReservationWidth, height: rowHeight)
+            }
+
+            if showsDisclosure {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.54))
+                    .frame(width: 14, height: 22)
+                    .offset(x: CGFloat(disclosureOffset))
+                    .padding(.trailing, -6)
+            }
+
+            if shouldShowLeadingIcon {
+                iconView
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+
+                if let detail {
+                    HStack(spacing: 4) {
+                        if let detailIconResourceName {
+                            SidebarDetailIcon(resourceName: detailIconResourceName)
+                        } else if shouldShowInlineIcon {
+                            inlineIconView
+                        }
+
+                        Text(detail)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            Spacer(minLength: 8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: rowHeight)
+        .padding(.leading, SidebarLayout.rowHorizontalInset)
+        .padding(.trailing, SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(alignment: .leading) {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(palette.selectedFill)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                    }
+                    .padding(.leading, nestedBackgroundLeadingInset)
+            }
+        }
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
+    }
+
+    private var shouldShowLeadingIcon: Bool {
+        !shouldShowInlineIcon
+    }
+
+    private var shouldShowInlineIcon: Bool {
+        detail != nil && usesInlineDetailIconsForIcon && !isEmptyIcon
+    }
+
+    private var usesInlineDetailIconsForIcon: Bool {
+        switch icon {
+        case .agent:
+            usesInlineAgentDetailIcons
+        case .program, .programFallback:
+            usesInlineProgramDetailIcons
+        case .none:
+            false
+        }
+    }
+
+    private var isEmptyIcon: Bool {
+        if case .none = icon {
+            return true
+        }
+        return false
+    }
+
+    private var rowHeight: CGFloat {
+        if nestingDepth > 0 {
+            CGFloat(detail == nil ? AgentTreeLayout.defaultChildRowHeight : AgentTreeLayout.defaultChildDetailRowHeight)
+        } else {
+            detail == nil ? 42 : 50
+        }
+    }
+
+    @ViewBuilder
+    private var iconView: some View {
+        switch icon {
+        case .agent(let name):
+            if let descriptor = AgentToolIconDescriptor(
+                kind: .agent,
+                agentName: name,
+                title: name
+            ) {
+                AgentToolIcon(descriptor: descriptor, isSelected: isSelected, palette: palette)
+            } else {
+                Color.clear
+                    .frame(width: SidebarIconMetrics.agentFrameSize, height: SidebarIconMetrics.agentFrameSize)
+            }
+        case .program(let resourceName, let fallback):
+            SidebarProgramIcon(
+                label: SidebarTerminalPathLabel(
+                    title: title,
+                    leadingIconResourceName: resourceName,
+                    leadingIconFallback: fallback,
+                    leadingIconRendersAsTemplate: true
+                ),
+                isSelected: isSelected,
+                palette: palette
+            )
+        case .programFallback(let fallback):
+            SidebarProgramIcon(
+                label: SidebarTerminalPathLabel(
+                    title: title,
+                    leadingIconFallback: fallback
+                ),
+                isSelected: isSelected,
+                palette: palette
+            )
+        case .none:
+            Color.clear
+                .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
+        }
+    }
+
+    @ViewBuilder
+    private var inlineIconView: some View {
+        switch icon {
+        case .agent(let name):
+            if let descriptor = AgentToolIconDescriptor(
+                kind: .agent,
+                agentName: name,
+                title: name
+            ) {
+                AgentToolInlineIcon(descriptor: descriptor)
+            }
+        case .program(let resourceName, let fallback):
+            SidebarProgramInlineIcon(
+                label: SidebarTerminalPathLabel(
+                    title: title,
+                    leadingIconResourceName: resourceName,
+                    leadingIconFallback: fallback,
+                    leadingIconRendersAsTemplate: true
+                )
+            )
+        case .programFallback(let fallback):
+            SidebarProgramInlineIcon(
+                label: SidebarTerminalPathLabel(
+                    title: title,
+                    leadingIconFallback: fallback
+                )
+            )
+        case .none:
+            EmptyView()
+        }
+    }
+}
+
+private struct SidebarIconDebugResourceSection: View {
+    let title: String
+    let resources: [SidebarIconDebugResource]
+    let palette: SidebarPalette
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 72), spacing: 8)
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(palette.headerText)
+                .textCase(.uppercase)
+
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+                ForEach(resources) { resource in
+                    SidebarIconDebugTile(resource: resource, palette: palette)
+                }
+            }
+        }
+    }
+}
+
+private struct SidebarIconDebugTile: View {
+    let resource: SidebarIconDebugResource
+    let palette: SidebarPalette
+
+    @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+    @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+
+    var body: some View {
+        VStack(spacing: 5) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.black.opacity(0.72))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                    }
+
+                AgentLogoImage(
+                    resourceName: resource.name,
+                    rendersAsTemplate: true,
+                    fallbackLabel: resource.fallback
+                )
+                .frame(width: glyphSize, height: glyphSize)
+                .foregroundStyle(Color.white)
+            }
+            .frame(width: 46, height: 38)
+
+            Text(resource.name)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(palette.rowText.opacity(0.66))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .frame(minWidth: 72)
+    }
+
+    private var glyphSize: CGFloat {
+        switch resource.kind {
+        case .agents:
+            SidebarIconMetrics.agentGlyphSize * CGFloat(agentGlyphScale)
+        case .programs:
+            SidebarIconMetrics.programGlyphSize * CGFloat(programGlyphScale)
+        }
+    }
+}
+
+private struct SidebarIconDebugResource: Identifiable {
+    enum Kind: CaseIterable {
+        case agents
+        case programs
+
+        var title: String {
+            switch self {
+            case .agents: "Agent Logos"
+            case .programs: "Program Logos"
+            }
+        }
+    }
+
+    let kind: Kind
+    let name: String
+    let fallback: String
+
+    var id: String {
+        "\(kind)-\(name)"
+    }
+
+    static func resources(for kind: Kind) -> [SidebarIconDebugResource] {
+        all.filter { $0.kind == kind }
+    }
+
+    private static let all: [SidebarIconDebugResource] = [
+        .init(kind: .agents, name: "amp", fallback: "A"),
+        .init(kind: .agents, name: "claude", fallback: "Cl"),
+        .init(kind: .agents, name: "gemini", fallback: "Ge"),
+        .init(kind: .agents, name: "github", fallback: "Gh"),
+        .init(kind: .agents, name: "openai", fallback: "Cx"),
+        .init(kind: .programs, name: "bun", fallback: "Bn"),
+        .init(kind: .programs, name: "git", fallback: "Gt"),
+        .init(kind: .programs, name: "neovim", fallback: "Nv"),
+        .init(kind: .programs, name: "nodedotjs", fallback: "JS"),
+        .init(kind: .programs, name: "npm", fallback: "np"),
+        .init(kind: .programs, name: "pnpm", fallback: "pn"),
+        .init(kind: .programs, name: "python", fallback: "Py"),
+        .init(kind: .programs, name: "swift", fallback: "Sw"),
+        .init(kind: .programs, name: "uv", fallback: "uv"),
+        .init(kind: .programs, name: "vim", fallback: "Vi"),
+        .init(kind: .programs, name: "vite", fallback: "Vt"),
+        .init(kind: .programs, name: "yarn", fallback: "Ya")
+    ]
 }
 
 private struct SidebarPalette {

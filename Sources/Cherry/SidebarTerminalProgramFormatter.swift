@@ -95,7 +95,7 @@ enum SidebarTerminalProgramFormatter {
             detail: detail,
             leadingIconResourceName: descriptor.logoResourceName,
             leadingIconFallback: descriptor.fallbackLabel,
-            leadingIconRendersAsTemplate: descriptor.rendersAsTemplate
+            leadingIconRendersAsTemplate: descriptor.logoResourceName != nil && descriptor.rendersAsTemplate
         )
     }
 
@@ -319,7 +319,7 @@ private struct ProgramDescriptor {
         displayName: String,
         logoResourceName: String? = nil,
         fallbackLabel: String,
-        rendersAsTemplate: Bool = false,
+        rendersAsTemplate: Bool = true,
         prefersArgumentTitle: Bool = false,
         prefersSubcommandTitle: Bool = false
     ) {

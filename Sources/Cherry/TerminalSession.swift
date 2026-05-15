@@ -4,6 +4,10 @@ import Foundation
 
 private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
+private let prototypeProcessorDisabledForPerf =
+    ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
+private let fullPrototypeProcessorEnabled =
+    ProcessInfo.processInfo.environment["CHERRY_FULL_PROTOTYPE_PROCESSOR"] == "1"
 
 private final class TerminalTraceRecorder {
     let outputURL: URL
@@ -289,11 +293,13 @@ private struct SummaryTranscript {
 private final class TerminalRawOutputStore: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumBytes: Int
+    private let trimThresholdBytes: Int
     private var data = Data()
     private var observers: [UUID: @Sendable (Data) -> Void] = [:]
 
     init(maximumBytes: Int = 1_048_576) {
         self.maximumBytes = maximumBytes
+        self.trimThresholdBytes = maximumBytes + max(maximumBytes / 4, 64 * 1024)
     }
 
     func append(_ chunk: Data) {
@@ -301,7 +307,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 
         let currentObservers: [@Sendable (Data) -> Void] = lock.withLock {
             data.append(chunk)
-            if data.count > maximumBytes {
+            if data.count > trimThresholdBytes {
                 data.removeFirst(data.count - maximumBytes)
             }
             return Array(observers.values)
@@ -1311,7 +1317,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.restartOnExit = restartOnExit
         self.systemTitle = title
-        self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: buffer)
+        let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
+            ? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
+            : nil)
+        self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: processorBuffer)
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
             Task { @MainActor [weak self] in
@@ -1630,13 +1639,16 @@ final class TerminalSession: ObservableObject, Identifiable {
                     startupCommand: launchCommand
                 ),
                 onData: { data in
+                    TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
                     traceRecorder?.recordOutput(data)
                     self.rawOutputStore.append(data)
                     DispatchQueue.main.async { [weak self] in
                         self?.lastOutputAt = Date()
                         self?.ingestTerminalMetadata(data)
                     }
-                    processor.enqueueOutput(data, launchID: launchID, responseWriter: { _ in })
+                    if !prototypeProcessorDisabledForPerf {
+                        processor.enqueueOutput(data, launchID: launchID, responseWriter: { _ in })
+                    }
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {
@@ -1733,6 +1745,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func handleProcessorDidChange() {
+        TerminalPerformanceMonitor.recordProcessorChange()
         if inputDebugEnabled {
             let tailStart = max(0, processor.lineCount - 4)
             let tail = processor.snapshot(range: tailStart..<processor.lineCount)

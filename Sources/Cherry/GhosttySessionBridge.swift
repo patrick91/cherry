@@ -17,7 +17,10 @@ private func sidebarResizeLog(_ message: @autoclosure () -> String) {
 
 private final class GhosttyOutputSink: @unchecked Sendable {
     private let lock = NSLock()
+    private let queue = DispatchQueue(label: "Cherry.GhosttyOutputSink", qos: .userInitiated)
     private var session: InMemoryTerminalSession
+    private var pendingData = Data()
+    private var isDrainScheduled = false
 
     init(session: InMemoryTerminalSession) {
         self.session = session
@@ -26,14 +29,44 @@ private final class GhosttyOutputSink: @unchecked Sendable {
     func setSession(_ session: InMemoryTerminalSession) {
         lock.withLock {
             self.session = session
+            pendingData.removeAll(keepingCapacity: false)
         }
     }
 
     func receive(_ data: Data) {
-        let session = lock.withLock {
-            self.session
+        guard !data.isEmpty else { return }
+
+        let shouldScheduleDrain = lock.withLock {
+            pendingData.append(data)
+            guard !isDrainScheduled else { return false }
+            isDrainScheduled = true
+            return true
         }
-        session.receive(data)
+
+        if shouldScheduleDrain {
+            queue.async { [weak self] in
+                self?.drainPendingData()
+            }
+        }
+    }
+
+    private func drainPendingData() {
+        while true {
+            let next: (session: InMemoryTerminalSession, data: Data)? = lock.withLock {
+                guard !pendingData.isEmpty else {
+                    isDrainScheduled = false
+                    return nil
+                }
+
+                let data = pendingData
+                pendingData.removeAll(keepingCapacity: true)
+                return (session, data)
+            }
+
+            guard let next else { return }
+            TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: next.data.count)
+            next.session.receive(next.data)
+        }
     }
 }
 
@@ -92,6 +125,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private let controller: TerminalController
     private let outputSink: GhosttyOutputSink
     private var inMemorySession: InMemoryTerminalSession
+    private var appliedTerminalConfiguration: TerminalConfiguration
+    private var appliedTerminalTheme: TerminalTheme
+    private var appliedTerminalColorScheme: TerminalColorScheme?
     private var outputObserverID: UUID?
     private var pendingFeedActivation = false
     private var activeColorScheme: ColorScheme?
@@ -106,17 +142,24 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
         let inMemorySession = Self.makeInMemorySession(proxy: proxy)
+        let terminalConfiguration = TerminalSettings.shared.ghosttyConfiguration()
+        let terminalTheme = TerminalSettings.shared.ghosttyTheme()
 
         self.proxy = proxy
         self.inMemorySession = inMemorySession
         self.outputSink = GhosttyOutputSink(session: inMemorySession)
-        self.controller = Self.makeController()
+        self.controller = TerminalController(configuration: terminalConfiguration, theme: terminalTheme)
         self.terminalView = TerminalView(frame: .zero)
+        self.appliedTerminalConfiguration = terminalConfiguration
+        self.appliedTerminalTheme = terminalTheme
 
         super.init()
 
         Self.liveBridgeCount += 1
         terminalView.delegate = self
+        terminalView.onPostRender = {
+            TerminalPerformanceMonitor.recordRenderTick()
+        }
         terminalView.controller = controller
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
         observeSettingsChanges()
@@ -124,10 +167,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func attach(to container: GhosttyTerminalContainerView) {
         guard !isReleased else { return }
+        let isAlreadyInstalled = scrollContainer === container && terminalView.superview != nil
+        TerminalPerformanceMonitor.recordBridgeAttach(reused: isAlreadyInstalled)
         scrollContainer = container
-        container.install(terminalView: terminalView, bridge: self)
+        if !isAlreadyInstalled {
+            container.install(terminalView: terminalView, bridge: self)
+        }
         terminalView.setSurfaceVisible(true)
-        terminalView.fitToSize()
+        if !isAlreadyInstalled {
+            TerminalPerformanceMonitor.recordFitToSize()
+            terminalView.fitToSize()
+        }
         if terminalView.window != nil {
             activateOutputFeedWhenSurfaceIsReady()
         }
@@ -164,6 +214,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         if let terminalSession = proxy.session {
             terminalView.configuration = Self.makeOptions(for: terminalSession, inMemorySession: nextSession)
         }
+        TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
         activateOutputFeedWhenSurfaceIsReady()
     }
@@ -182,6 +233,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             terminalView.removeFromSuperview()
         }
         terminalView.delegate = nil
+        terminalView.onPostRender = nil
         terminalView.freeSurface()
         terminalView.controller = nil
     }
@@ -310,13 +362,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         )
     }
 
-    private static func makeController() -> TerminalController {
-        return TerminalController(
-            configuration: TerminalSettings.shared.ghosttyConfiguration(),
-            theme: TerminalSettings.shared.ghosttyTheme()
-        )
-    }
-
     private func observeSettingsChanges() {
         settingsObserver = NotificationCenter.default.addObserver(
             forName: .terminalSettingsDidChange,
@@ -330,12 +375,37 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     private func applyTerminalSettings() {
-        controller.setTerminalConfiguration(TerminalSettings.shared.ghosttyConfiguration())
-        controller.setTheme(TerminalSettings.shared.ghosttyTheme())
-        if let activeColorScheme {
-            controller.setColorScheme(terminalColorScheme(from: activeColorScheme))
+        let settings = TerminalSettings.shared
+        let nextConfiguration = settings.ghosttyConfiguration()
+        let nextTheme = settings.ghosttyTheme()
+        var needsFit = false
+
+        if nextConfiguration != appliedTerminalConfiguration,
+           controller.setTerminalConfiguration(nextConfiguration)
+        {
+            appliedTerminalConfiguration = nextConfiguration
+            needsFit = true
         }
-        terminalView.fitToSize()
+
+        if nextTheme != appliedTerminalTheme,
+           controller.setTheme(nextTheme)
+        {
+            appliedTerminalTheme = nextTheme
+        }
+
+        if let activeColorScheme {
+            let nextColorScheme = terminalColorScheme(from: activeColorScheme)
+            if nextColorScheme != appliedTerminalColorScheme {
+                controller.setColorScheme(nextColorScheme)
+                appliedTerminalColorScheme = nextColorScheme
+            }
+        }
+
+        if needsFit {
+            TerminalPerformanceMonitor.recordFitToSize()
+            terminalView.fitToSize()
+        }
+        TerminalPerformanceMonitor.recordSettingsApply(reconfigured: needsFit)
     }
 
     private func updateTerminalPointerStyle() {
@@ -405,6 +475,7 @@ final class GhosttyTerminalContainerView: NSView {
         colorScheme: ColorScheme,
         allowsAutoFocus: Bool = true
     ) {
+        TerminalPerformanceMonitor.recordContainerConfigure()
         self.allowsAutoFocus = allowsAutoFocus
         if !allowsAutoFocus {
             pendingTerminalFocus = false
@@ -625,6 +696,7 @@ final class GhosttyTerminalContainerView: NSView {
         documentView.frame.size.width = max(documentView.frame.size.width, targetWidth)
 
         terminalView.frame = NSRect(origin: .zero, size: targetSize)
+        TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
         didApplyEarlyFit = true
     }
@@ -1002,6 +1074,7 @@ final class GhosttyTerminalContainerView: NSView {
 
         sidebarResizeLog("synchronizeTerminalFrame -> \(targetFrame.size)")
         terminalView.frame = targetFrame
+        TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
     }
 

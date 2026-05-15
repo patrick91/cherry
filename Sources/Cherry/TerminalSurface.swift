@@ -452,10 +452,11 @@ enum TerminalPasteboardContent {
 }
 
 struct TerminalSurfaceView: NSViewRepresentable {
-    @ObservedObject var session: TerminalSession
+    let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
+        TerminalPerformanceMonitor.recordRepresentableUpdate()
         let containerView = GhosttyTerminalContainerView()
         containerView.configure(
             with: session,
@@ -470,6 +471,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: GhosttyTerminalContainerView, context: Context) {
+        TerminalPerformanceMonitor.recordRepresentableUpdate()
         nsView.configure(
             with: session,
             colorScheme: context.environment.colorScheme,

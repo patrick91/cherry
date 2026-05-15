@@ -2074,3 +2074,478 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         return cells
     }
 }
+
+struct LiveTerminalOutputBuffer: TerminalBuffering {
+    private enum ParserState {
+        case ground
+        case escape
+        case csi
+        case osc
+        case ignoredString
+        case charsetDesignation
+    }
+
+    private let maxScrollback: Int?
+    private let trimSlack: Int
+
+    private var completedLines: [String] = []
+    private var currentLine = ""
+    private var parserState = ParserState.ground
+    private var controlBuffer: [UInt8] = []
+    private var pendingText: [UInt8] = []
+    private var escapedStringPendingST = false
+    private var isUsingAlternateScreen = false
+    private var isApplicationCursorMode = false
+    private var currentMouseState = TerminalMouseState()
+    private var cursorRow = 0
+    private var cursorColumn = 0
+    private var cursorShape = TerminalCursorShape.block
+    private var isCursorVisible = true
+
+    init(maxScrollback: Int?) {
+        self.maxScrollback = maxScrollback
+        trimSlack = max(512, (maxScrollback ?? 4096) / 10)
+    }
+
+    var lineCount: Int {
+        max(1, completedLines.count + 1)
+    }
+
+    var storedLineCount: Int {
+        lineCount
+    }
+
+    var cursorState: TerminalCursorState {
+        TerminalCursorState(
+            row: cursorRow,
+            column: cursorColumn,
+            shape: cursorShape,
+            isVisible: isCursorVisible
+        )
+    }
+
+    var usesAlternateScreen: Bool {
+        isUsingAlternateScreen
+    }
+
+    var usesApplicationCursorKeys: Bool {
+        isApplicationCursorMode
+    }
+
+    var mouseState: TerminalMouseState {
+        currentMouseState
+    }
+
+    func snapshot(range: Range<Int>) -> [String] {
+        range.map { line(at: $0) ?? "" }
+    }
+
+    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
+        snapshot(range: range).map { line in
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(text: line, style: TerminalTextStyle())
+            ])
+        }
+    }
+
+    func lineLength(at row: Int) -> Int {
+        line(at: row)?.count ?? 0
+    }
+
+    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
+        TerminalGridPoint(row: row, column: column)
+    }
+
+    func selectedText(in selection: TerminalSelectionRange) -> String {
+        let lower = min(selection.anchor.row, selection.extent.row)
+        let upper = max(selection.anchor.row, selection.extent.row)
+        guard lower <= upper else { return "" }
+
+        return (lower...upper).compactMap { row -> String? in
+            guard let line = line(at: row) else { return nil }
+            let startColumn: Int
+            let endColumn: Int
+            if row == selection.anchor.row && row == selection.extent.row {
+                startColumn = min(selection.anchor.column, selection.extent.column)
+                endColumn = max(selection.anchor.column, selection.extent.column)
+            } else if row == selection.anchor.row {
+                startColumn = selection.anchor.row < selection.extent.row ? selection.anchor.column : 0
+                endColumn = selection.anchor.row < selection.extent.row ? line.count : selection.anchor.column
+            } else if row == selection.extent.row {
+                startColumn = selection.anchor.row < selection.extent.row ? 0 : selection.extent.column
+                endColumn = selection.anchor.row < selection.extent.row ? selection.extent.column : line.count
+            } else {
+                startColumn = 0
+                endColumn = line.count
+            }
+            return line.substringByCharacterColumns(startColumn..<endColumn)
+        }.joined(separator: "\n")
+    }
+
+    mutating func clear() {
+        completedLines.removeAll(keepingCapacity: true)
+        currentLine.removeAll(keepingCapacity: true)
+        parserState = .ground
+        controlBuffer.removeAll(keepingCapacity: true)
+        pendingText.removeAll(keepingCapacity: true)
+        escapedStringPendingST = false
+        isUsingAlternateScreen = false
+        isApplicationCursorMode = false
+        currentMouseState = TerminalMouseState()
+        cursorRow = 0
+        cursorColumn = 0
+        cursorShape = .block
+        isCursorVisible = true
+    }
+
+    mutating func resize(to viewportSize: TerminalViewportSize) {}
+
+    mutating func appendPlainLines(_ newLines: [String]) {
+        guard !newLines.isEmpty else { return }
+        flushPendingText()
+        completedLines.append(contentsOf: newLines)
+        currentLine.removeAll(keepingCapacity: true)
+        cursorRow = max(0, lineCount - 1)
+        cursorColumn = 0
+        trimIfNeeded(force: true)
+    }
+
+    @discardableResult
+    mutating func ingest(
+        _ data: Data,
+        viewportSize: TerminalViewportSize = TerminalViewportSize(columns: 120, rows: 32)
+    ) -> [Data] {
+        guard !data.isEmpty else { return [] }
+
+        for byte in data {
+            process(byte)
+        }
+
+        flushPendingText(preservingIncompleteUTF8: true)
+        trimIfNeeded()
+        return []
+    }
+
+    private func line(at row: Int) -> String? {
+        if completedLines.indices.contains(row) {
+            return completedLines[row]
+        }
+        if row == completedLines.count {
+            return currentLine
+        }
+        return nil
+    }
+
+    private mutating func process(_ byte: UInt8) {
+        switch parserState {
+        case .ground:
+            processGround(byte)
+        case .escape:
+            processEscape(byte)
+        case .csi:
+            processCSI(byte)
+        case .osc:
+            processOSC(byte)
+        case .ignoredString:
+            processIgnoredString(byte)
+        case .charsetDesignation:
+            parserState = .ground
+        }
+    }
+
+    private mutating func processGround(_ byte: UInt8) {
+        switch byte {
+        case 0x1B:
+            flushPendingText()
+            parserState = .escape
+        case 0x0A:
+            flushPendingText()
+            appendNewLine()
+        case 0x0D:
+            flushPendingText()
+            cursorColumn = 0
+        case 0x08, 0x7F:
+            flushPendingText()
+            removeCharacterBeforeCursor()
+        case 0x09:
+            flushPendingText()
+            let spaces = max(1, 8 - (cursorColumn % 8))
+            appendText(String(repeating: " ", count: spaces))
+        case 0x07, 0x00...0x1F:
+            flushPendingText()
+        default:
+            pendingText.append(byte)
+        }
+    }
+
+    private mutating func processEscape(_ byte: UInt8) {
+        switch byte {
+        case UInt8(ascii: "["):
+            controlBuffer.removeAll(keepingCapacity: true)
+            parserState = .csi
+        case UInt8(ascii: "]"):
+            controlBuffer.removeAll(keepingCapacity: true)
+            escapedStringPendingST = false
+            parserState = .osc
+        case UInt8(ascii: "P"), UInt8(ascii: "X"), UInt8(ascii: "^"), UInt8(ascii: "_"):
+            escapedStringPendingST = false
+            parserState = .ignoredString
+        case UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"), UInt8(ascii: "+"):
+            parserState = .charsetDesignation
+        case UInt8(ascii: "M"):
+            cursorRow = max(0, cursorRow - 1)
+            parserState = .ground
+        default:
+            parserState = .ground
+        }
+    }
+
+    private mutating func processCSI(_ byte: UInt8) {
+        controlBuffer.append(byte)
+        guard (0x40...0x7E).contains(byte) else { return }
+
+        let finalByte = byte
+        let payload = String(decoding: controlBuffer.dropLast(), as: UTF8.self)
+        handleCSI(finalByte: finalByte, payload: payload)
+
+        controlBuffer.removeAll(keepingCapacity: true)
+        parserState = .ground
+    }
+
+    private mutating func processOSC(_ byte: UInt8) {
+        if escapedStringPendingST {
+            escapedStringPendingST = false
+            if byte == UInt8(ascii: "\\") {
+                controlBuffer.removeAll(keepingCapacity: true)
+                parserState = .ground
+                return
+            }
+        }
+
+        if byte == 0x07 {
+            controlBuffer.removeAll(keepingCapacity: true)
+            parserState = .ground
+        } else if byte == 0x1B {
+            escapedStringPendingST = true
+        } else if controlBuffer.count < 8_192 {
+            controlBuffer.append(byte)
+        }
+    }
+
+    private mutating func processIgnoredString(_ byte: UInt8) {
+        if escapedStringPendingST {
+            escapedStringPendingST = false
+            if byte == UInt8(ascii: "\\") {
+                parserState = .ground
+            } else if byte == 0x1B {
+                escapedStringPendingST = true
+            }
+            return
+        }
+
+        if byte == 0x07 {
+            parserState = .ground
+        } else if byte == 0x1B {
+            escapedStringPendingST = true
+        }
+    }
+
+    private mutating func handleCSI(finalByte: UInt8, payload: String) {
+        let parameters = numericParameters(from: payload)
+
+        func parameter(at index: Int, default fallback: Int) -> Int {
+            guard parameters.indices.contains(index), let value = parameters[index] else {
+                return fallback
+            }
+            return value
+        }
+
+        switch Character(UnicodeScalar(finalByte)) {
+        case "h", "l":
+            guard payload.first == "?" else { return }
+            handlePrivateMode(isSet: finalByte == UInt8(ascii: "h"), parameters: parameters.compactMap { $0 })
+        case "q":
+            applyCursorShape(parameter(at: 0, default: 0))
+        case "A":
+            cursorRow = max(0, cursorRow - parameter(at: 0, default: 1))
+        case "B":
+            cursorRow += parameter(at: 0, default: 1)
+        case "C":
+            cursorColumn += parameter(at: 0, default: 1)
+        case "D":
+            cursorColumn = max(0, cursorColumn - parameter(at: 0, default: 1))
+        case "E":
+            cursorRow += parameter(at: 0, default: 1)
+            cursorColumn = 0
+        case "F":
+            cursorRow = max(0, cursorRow - parameter(at: 0, default: 1))
+            cursorColumn = 0
+        case "G":
+            cursorColumn = max(0, parameter(at: 0, default: 1) - 1)
+        case "H", "f":
+            cursorRow = max(0, parameter(at: 0, default: 1) - 1)
+            cursorColumn = max(0, parameter(at: 1, default: 1) - 1)
+        case "J":
+            if parameter(at: 0, default: 0) == 2 {
+                completedLines.removeAll(keepingCapacity: true)
+                currentLine.removeAll(keepingCapacity: true)
+                cursorRow = 0
+                cursorColumn = 0
+            }
+        case "K":
+            if parameter(at: 0, default: 0) == 2 || cursorColumn == 0 {
+                currentLine.removeAll(keepingCapacity: true)
+                cursorColumn = 0
+            }
+        default:
+            return
+        }
+    }
+
+    private func numericParameters(from payload: String) -> [Int?] {
+        payload
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map { segment -> Int? in
+                let digits = segment.filter(\.isNumber)
+                return digits.isEmpty ? nil : Int(digits)
+            }
+    }
+
+    private mutating func handlePrivateMode(isSet: Bool, parameters: [Int]) {
+        for parameter in parameters {
+            switch parameter {
+            case 1:
+                isApplicationCursorMode = isSet
+            case 25:
+                isCursorVisible = isSet
+            case 47, 1047, 1049:
+                isUsingAlternateScreen = isSet
+                if isSet {
+                    completedLines.removeAll(keepingCapacity: true)
+                    currentLine.removeAll(keepingCapacity: true)
+                    cursorRow = 0
+                    cursorColumn = 0
+                }
+            case 1000:
+                currentMouseState.trackingMode = isSet ? .normal : .disabled
+            case 1002:
+                currentMouseState.trackingMode = isSet ? .buttonEvent : .disabled
+            case 1003:
+                currentMouseState.trackingMode = isSet ? .anyEvent : .disabled
+            case 1004:
+                currentMouseState.sendsFocusEvents = isSet
+            case 1006:
+                currentMouseState.usesSGREncoding = isSet
+            case 1007:
+                currentMouseState.alternateScrollMode = isSet
+            default:
+                continue
+            }
+        }
+    }
+
+    private mutating func applyCursorShape(_ code: Int) {
+        cursorShape = switch code {
+        case 3, 4:
+            .underline
+        case 5, 6:
+            .bar
+        default:
+            .block
+        }
+    }
+
+    private mutating func flushPendingText(preservingIncompleteUTF8: Bool = false) {
+        guard !pendingText.isEmpty else { return }
+
+        if preservingIncompleteUTF8 {
+            var validEnd = pendingText.count
+            while validEnd > 0 {
+                let candidate = pendingText[..<validEnd]
+                if let text = String(bytes: candidate, encoding: .utf8) {
+                    appendText(text)
+                    pendingText.removeFirst(validEnd)
+                    return
+                }
+                validEnd -= 1
+            }
+            return
+        }
+
+        appendText(String(decoding: pendingText, as: UTF8.self))
+        pendingText.removeAll(keepingCapacity: true)
+    }
+
+    private mutating func appendText(_ text: String) {
+        guard !text.isEmpty else { return }
+
+        if cursorColumn <= 0 {
+            if currentLine.isEmpty {
+                currentLine = text
+            } else {
+                currentLine.replaceByCharacterColumns(0..<text.count, with: text)
+            }
+            cursorColumn = text.count
+            return
+        }
+
+        if cursorColumn >= currentLine.count {
+            if cursorColumn > currentLine.count {
+                currentLine += String(repeating: " ", count: cursorColumn - currentLine.count)
+            }
+            currentLine += text
+            cursorColumn = currentLine.count
+            return
+        }
+
+        currentLine.replaceByCharacterColumns(cursorColumn..<(cursorColumn + text.count), with: text)
+        cursorColumn += text.count
+    }
+
+    private mutating func appendNewLine() {
+        completedLines.append(currentLine)
+        currentLine.removeAll(keepingCapacity: true)
+        cursorRow = completedLines.count
+        cursorColumn = 0
+        trimIfNeeded()
+    }
+
+    private mutating func removeCharacterBeforeCursor() {
+        guard cursorColumn > 0, !currentLine.isEmpty else { return }
+        let removalColumn = cursorColumn - 1
+        currentLine.replaceByCharacterColumns(removalColumn..<cursorColumn, with: "")
+        cursorColumn = removalColumn
+    }
+
+    private mutating func trimIfNeeded(force: Bool = false) {
+        guard let maxScrollback, maxScrollback >= 0 else { return }
+
+        let maximumCompletedLines = max(0, maxScrollback - 1)
+        let threshold = force ? maximumCompletedLines : maximumCompletedLines + trimSlack
+        guard completedLines.count > threshold else { return }
+
+        let removeCount = completedLines.count - maximumCompletedLines
+        completedLines.removeFirst(removeCount)
+        cursorRow = max(0, cursorRow - removeCount)
+    }
+}
+
+private extension String {
+    func substringByCharacterColumns(_ range: Range<Int>) -> String {
+        let lower = max(0, min(range.lowerBound, count))
+        let upper = max(lower, min(range.upperBound, count))
+        guard lower < upper else { return "" }
+
+        let start = index(startIndex, offsetBy: lower)
+        let end = index(startIndex, offsetBy: upper)
+        return String(self[start..<end])
+    }
+
+    mutating func replaceByCharacterColumns(_ range: Range<Int>, with replacement: String) {
+        let lower = max(0, min(range.lowerBound, count))
+        let upper = max(lower, min(range.upperBound, count))
+        let start = index(startIndex, offsetBy: lower)
+        let end = index(startIndex, offsetBy: upper)
+        replaceSubrange(start..<end, with: replacement)
+    }
+}

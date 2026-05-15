@@ -4418,6 +4418,30 @@ private func serviceRecord(
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["two", "three", "four"])
 }
 
+@Test func liveTerminalOutputBufferTracksPlainTextAndInputModes() async throws {
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
+
+    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["alpha", "bravo", "charlie"])
+
+    buffer.ingest(Data("\u{1B}[?1h\u{1B}[?1049h\u{1B}[?1000h\u{1B}[?1006h\u{1B}[?1007l\u{1B}[?25l\u{1B}[5 q".utf8))
+    #expect(buffer.usesApplicationCursorKeys)
+    #expect(buffer.usesAlternateScreen)
+    #expect(buffer.mouseState == TerminalMouseState(
+        trackingMode: .normal,
+        usesSGREncoding: true,
+        alternateScrollMode: false
+    ))
+    #expect(buffer.cursorState.shape == .bar)
+    #expect(buffer.cursorState.isVisible == false)
+
+    buffer.ingest(Data("\u{1B}[?1l\u{1B}[?1049l\u{1B}[?1000l\u{1B}[?1006l\u{1B}[?1007h\u{1B}[?25h".utf8))
+    #expect(!buffer.usesApplicationCursorKeys)
+    #expect(!buffer.usesAlternateScreen)
+    #expect(buffer.mouseState == TerminalMouseState())
+    #expect(buffer.cursorState.isVisible)
+}
+
 @Test func pagedScrollbackStoresLinesAcrossPageBoundaries() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.appendPlainLines((0..<300).map { "line-\($0)" })

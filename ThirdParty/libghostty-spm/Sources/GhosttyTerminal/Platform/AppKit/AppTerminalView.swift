@@ -15,6 +15,7 @@
         var metalLayer: CAMetalLayer?
         var inputHandler: TerminalKeyEventHandler?
         var lastPerformKeyEvent: TimeInterval?
+        public var onPostRender: (() -> Void)?
 
         public weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }
@@ -99,7 +100,9 @@
                 self?.updateMetalLayerMetrics()
             }
             core.onPostRender = { [weak self] in
-                self?.enforceMetalLayerScale()
+                guard let self else { return }
+                enforceMetalLayerScale()
+                onPostRender?()
             }
         }
 

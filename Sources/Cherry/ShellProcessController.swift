@@ -383,8 +383,8 @@ final class ShellProcessController: @unchecked Sendable {
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
     private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
     private let masterFDLock = NSLock()
-    private let maximumReadBatchBytes = 4 * 1024
-    private let highVolumeReadThrottleInterval: DispatchTimeInterval = .milliseconds(4)
+    private let maximumReadBatchBytes = 64 * 1024
+    private let highVolumeReadThrottleInterval: DispatchTimeInterval = .milliseconds(1)
 
     private var masterFD: Int32 = -1
     private var childPID: pid_t = 0

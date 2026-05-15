@@ -5612,7 +5612,7 @@ extension NSColor {
 
 private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject var session: TerminalSession
+    let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
 
     var body: some View {

@@ -6,11 +6,44 @@ private func cherryMCPClient() -> CherryControlClient {
     CherryControlClient()
 }
 
-struct CherryMCPToolContext: Sendable {
-    let defaultParentAgentID: String?
+private func cherryMCPClient(timeout: TimeInterval?) -> CherryControlClient {
+    CherryControlClient(timeout: timeout ?? 10)
+}
 
-    static func bound(defaultParentAgentID: String?) -> CherryMCPToolContext {
-        CherryMCPToolContext(defaultParentAgentID: defaultParentAgentID)
+final class CherryMCPToolContext: @unchecked Sendable {
+    let sessionID: String?
+    private let lock = NSLock()
+    private var storedDefaultParentAgentID: String?
+    private var storedBoundProcessID: String?
+
+    var defaultParentAgentID: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedDefaultParentAgentID
+    }
+
+    var boundProcessID: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedBoundProcessID
+    }
+
+    private init(sessionID: String?, defaultParentAgentID: String?) {
+        self.sessionID = sessionID
+        self.storedDefaultParentAgentID = defaultParentAgentID
+    }
+
+    static func bound(sessionID: String? = nil, defaultParentAgentID: String?) -> CherryMCPToolContext {
+        CherryMCPToolContext(sessionID: sessionID, defaultParentAgentID: defaultParentAgentID)
+    }
+
+    @discardableResult
+    func bindProcessID(_ processID: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = storedBoundProcessID
+        storedBoundProcessID = processID
+        return previous
     }
 }
 
@@ -30,6 +63,11 @@ enum CherryMCPTools {
             "get_project_status",
             "Return active project root, process counts, note/todo counts, selected process, and health without changing the Cherry UI.",
             properties: [:]
+        ),
+        tool(
+            "whoami",
+            "Show how Cherry identified this MCP session, effective project scope, selected process, and bound process without changing the Cherry UI.",
+            properties: projectScopedProperties()
         ),
         tool(
             "resolve_link",
@@ -77,6 +115,11 @@ enum CherryMCPTools {
                 "max_matches": integer("Maximum matches. Max 500.")
             ]),
             required: ["query"]
+        ),
+        tool(
+            "wait_for_process_idle",
+            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input.",
+            properties: idleWaitProperties()
         ),
         tool(
             "get_process_ports",
@@ -148,6 +191,11 @@ enum CherryMCPTools {
             properties: processSelectorProperties(["title": string("New title. Empty clears the explicit title.")])
         ),
         tool(
+            "select_process",
+            "Explicitly select one Cherry process in the UI by process_id or process_name.",
+            properties: processSelectorProperties()
+        ),
+        tool(
             "send_process_input",
             "Send terminal text or raw bytes to an existing process by process_id or process_name.",
             properties: processSelectorProperties([
@@ -171,11 +219,6 @@ enum CherryMCPTools {
             "restart_all_commands",
             "Restart all trusted configured project commands without selecting them.",
             properties: bulkCommandProperties()
-        ),
-        tool(
-            "list_terminals",
-            "List visible Cherry terminals.",
-            properties: [:]
         ),
         tool(
             "list_agents",
@@ -310,12 +353,12 @@ enum CherryMCPTools {
         ),
         tool(
             "add_todo_comment",
-            "Append a comment to a Cherry todo without opening or selecting it. Requires Todos to be enabled for the project. Pass terminal_id for agent attribution when commenting from a Cherry agent session.",
+            "Append a comment to a Cherry todo without opening or selecting it. Requires Todos to be enabled for the project. Pass process_id for agent attribution when commenting from a Cherry agent session.",
             properties: projectScopedProperties([
                 "todo_id": string("Cherry todo UUID."),
                 "markdown": string("Comment Markdown."),
-                "author": string("Optional author label used when terminal_id is not provided."),
-                "terminal_id": string("Optional Cherry agent terminal UUID for attribution.")
+                "author": string("Optional author label used when process_id is not provided."),
+                "process_id": string("Optional Cherry process UUID for attribution.")
             ]),
             required: ["todo_id", "markdown"]
         ),
@@ -345,116 +388,9 @@ enum CherryMCPTools {
             required: ["todo_id", "comment_id"]
         ),
         tool(
-            "create_terminal",
-            "Create a new visible Cherry terminal tab without selecting it.",
-            properties: [
-                "title": string("Optional terminal title."),
-                "working_directory": string("Optional working directory."),
-                "command": string("Optional command to run after launch.")
-            ]
-        ),
-        tool(
-            "run_agent",
-            "Create a new configured Cherry agent session in the active project without selecting it. Always creates a new terminal; never use this to send input to an existing terminal.",
-            properties: [
-                "agent_name": string("Configured Cherry agent name."),
-                "title": string("Optional custom session title."),
-                "text": string("Optional initial prompt to send after launch."),
-                "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
-                "submit": boolean("Whether to press Enter after the initial prompt. Defaults to true when text or raw_base64 is provided."),
-                "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
-                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
-                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
-            ],
-            required: ["agent_name"]
-        ),
-        tool(
-            "rename_terminal",
-            "Rename a Cherry terminal. Pass an empty title to return to Cherry's automatic title.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "title": string("New title. Empty clears the explicit title.")
-            ],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "press_enter",
-            "Press Enter in a running Cherry terminal. Use this to submit prompts or forms in existing TUIs; it sends carriage return (0x0d), not line feed (0x0a).",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
-                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
-            ],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "select_terminal",
-            "Explicitly select a visible Cherry terminal tab. Use only when the user asks to switch the Cherry UI.",
-            properties: ["terminal_id": string("Cherry terminal UUID.")],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "send_input",
-            "Send terminal text or raw bytes to a running Cherry terminal. Use this for existing terminals; use press_enter for Enter in TUIs.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "text": string("Text to send exactly as provided."),
-                "raw_base64": string("Raw bytes to send, base64-encoded. For Enter in TUIs, prefer press_enter or send carriage return as DQ==, not line feed Cg==."),
-                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
-                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
-            ],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "get_terminal_output",
-            "Read rendered Cherry terminal output.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "start_line": integer("Optional zero-based start line."),
-                "line_limit": integer("Maximum rendered lines. Max 2000.")
-            ],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "get_terminal_raw_output",
-            "Read recent raw Cherry terminal output, including control sequences.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "max_bytes": integer("Maximum bytes. Max 1048576.")
-            ],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "search_output",
-            "Search rendered Cherry terminal output for matching lines.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "query": string("Text to search for."),
-                "case_sensitive": boolean("Whether matching is case-sensitive."),
-                "max_matches": integer("Maximum matches. Max 500.")
-            ],
-            required: ["terminal_id", "query"]
-        ),
-        tool(
-            "clear_output",
-            "Clear Cherry's saved output for a terminal without touching the PTY.",
-            properties: ["terminal_id": string("Cherry terminal UUID.")],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "restart_terminal",
-            "Restart a Cherry terminal shell.",
-            properties: ["terminal_id": string("Cherry terminal UUID.")],
-            required: ["terminal_id"]
-        ),
-        tool(
-            "close_terminal",
-            "Close a Cherry terminal tab. Parent agents with sub-agents require agent_close_policy.",
-            properties: [
-                "terminal_id": string("Cherry terminal UUID."),
-                "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
-            ],
-            required: ["terminal_id"]
+            "bind_session_process",
+            "Bind this MCP HTTP session to one Cherry process so later process tools can omit process_id. Does not change the Cherry UI.",
+            properties: processSelectorProperties()
         )
     ]
 
@@ -467,8 +403,14 @@ enum CherryMCPTools {
             if name == "get_status" {
                 return try statusResult()
             }
+            if name == "whoami" {
+                return try await whoamiResult(arguments: arguments, context: context)
+            }
+            if name == "bind_session_process" {
+                return try await bindSessionProcessResult(arguments: arguments, context: context)
+            }
             let request = scopedRequest(try controlRequest(name: name, arguments: arguments, context: context), arguments: arguments)
-            let response = try cherryMCPClient().send(request)
+            let response = try cherryMCPClient(timeout: clientTimeout(for: name, arguments: arguments)).send(request)
             if let error = response.error {
                 return try toolError(error)
             }
@@ -482,6 +424,67 @@ enum CherryMCPTools {
             let controlError = CherryControlError(code: "tool_error", message: error.localizedDescription)
             return (try? toolError(controlError)) ?? .init(content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)], isError: true)
         }
+    }
+
+    private static func whoamiResult(
+        arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) async throws -> CallTool.Result {
+        let projectsResponse = try? cherryMCPClient().send(.listProjects)
+        let activeProjectRoot: String?
+        if case .listProjects(let projects)? = projectsResponse?.result {
+            activeProjectRoot = projects.activeProjectRoot
+        } else {
+            activeProjectRoot = nil
+        }
+
+        let statusResponse = try cherryMCPClient().send(scopedRequest(.getProjectStatus, arguments: arguments))
+        if let error = statusResponse.error {
+            return try toolError(error)
+        }
+        guard case .getProjectStatus(let status)? = statusResponse.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for whoami."))
+        }
+
+        return try encodedResult(MCPWhoamiPayload(
+            mcpSessionID: context?.sessionID,
+            activeProjectRoot: activeProjectRoot,
+            effectiveProjectRoot: status.projectRoot,
+            boundProcessID: context?.boundProcessID,
+            defaultParentAgentID: context?.defaultParentAgentID,
+            selectedProcessID: status.selectedProcessID,
+            selectedProcessName: status.selectedProcessName
+        ))
+    }
+
+    private static func bindSessionProcessResult(
+        arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) async throws -> CallTool.Result {
+        guard let context else {
+            return try toolError(.init(code: "mcp_context_unavailable", message: "This MCP transport did not provide mutable session context."))
+        }
+
+        let selector = explicitProcessSelector(in: arguments)
+        guard selector.processID != nil || selector.processName != nil else {
+            return try toolError(.init(code: "missing_process_selector", message: "Provide process_id or process_name."))
+        }
+
+        let response = try cherryMCPClient().send(scopedRequest(.getProcessStatus(selector), arguments: arguments))
+        if let error = response.error {
+            return try toolError(error)
+        }
+        guard case .getProcessStatus(let status)? = response.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for bind_session_process."))
+        }
+
+        let previous = context.bindProcessID(status.process.id)
+        return try encodedResult(MCPBindSessionProcessPayload(
+            mcpSessionID: context.sessionID,
+            boundProcessID: status.process.id,
+            previousBoundProcessID: previous,
+            process: status.process
+        ))
     }
 
     @MainActor
@@ -630,31 +633,33 @@ enum CherryMCPTools {
         case "list_processes":
             return .listProcesses(.init(kind: stringArgument("kind", in: arguments)))
         case "get_process_status":
-            return .getProcessStatus(processSelector(in: arguments))
+            return .getProcessStatus(processSelector(in: arguments, context: context))
         case "get_process_output":
             return .getProcessOutput(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 startLine: intArgument("start_line", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
             ))
         case "get_process_raw_output":
             return .getProcessRawOutput(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 maxBytes: intArgument("max_bytes", in: arguments)
             ))
         case "search_process_output":
             return .searchProcessOutput(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 query: try requiredString("query", in: arguments),
                 caseSensitive: boolArgument("case_sensitive", in: arguments),
                 maxMatches: intArgument("max_matches", in: arguments)
             ))
+        case "wait_for_process_idle":
+            return .waitForProcessIdle(waitForProcessIdleRequest(in: arguments, context: context))
         case "get_process_ports":
             return .getProcessPorts(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 includeUnattributed: boolArgument("include_unattributed", in: arguments)
             ))
@@ -665,7 +670,7 @@ enum CherryMCPTools {
             ))
         case "wait_for_bound_port":
             return .waitForBoundPort(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 port: intArgument("port", in: arguments),
                 timeoutMilliseconds: intArgument("timeout_ms", in: arguments),
@@ -687,26 +692,28 @@ enum CherryMCPTools {
                 lineLimit: intArgument("line_limit", in: arguments)
             ))
         case "start_process":
-            return .startProcess(processLifecycle(in: arguments))
+            return .startProcess(processLifecycle(in: arguments, context: context))
         case "stop_process":
-            return .stopProcess(processLifecycle(in: arguments))
+            return .stopProcess(processLifecycle(in: arguments, context: context))
         case "restart_process":
-            return .restartProcess(processLifecycle(in: arguments))
+            return .restartProcess(processLifecycle(in: arguments, context: context))
         case "close_process":
             return .closeProcess(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 agentClosePolicy: try agentClosePolicyArgument("agent_close_policy", in: arguments)
             ))
         case "rename_process":
             return .renameProcess(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 title: stringArgument("title", in: arguments)
             ))
+        case "select_process":
+            return .selectProcess(processSelector(in: arguments, context: context))
         case "send_process_input":
             return .sendProcessInput(.init(
-                processID: stringArgument("process_id", in: arguments),
+                processID: processIDArgument(in: arguments, context: context),
                 processName: stringArgument("process_name", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
@@ -719,8 +726,6 @@ enum CherryMCPTools {
             return .stopAllCommands(processBulkCommand(in: arguments))
         case "restart_all_commands":
             return .restartAllCommands(processBulkCommand(in: arguments))
-        case "list_terminals":
-            return .listTerminals
         case "list_agents":
             return .listAgents
         case "list_notes":
@@ -797,7 +802,7 @@ enum CherryMCPTools {
                 todoID: try requiredString("todo_id", in: arguments),
                 markdown: try requiredString("markdown", in: arguments),
                 author: stringArgument("author", in: arguments),
-                terminalID: stringArgument("terminal_id", in: arguments),
+                terminalID: stringArgument("process_id", in: arguments),
                 open: false
             ))
         case "list_todo_comments":
@@ -812,74 +817,6 @@ enum CherryMCPTools {
             return .deleteTodoComment(.init(
                 todoID: try requiredString("todo_id", in: arguments),
                 commentID: try requiredString("comment_id", in: arguments)
-            ))
-        case "create_terminal":
-            return .createTerminal(.init(
-                title: stringArgument("title", in: arguments),
-                workingDirectory: stringArgument("working_directory", in: arguments),
-                command: stringArgument("command", in: arguments)
-            ))
-        case "run_agent":
-            return .runAgent(.init(
-                agentName: try requiredString("agent_name", in: arguments),
-                title: stringArgument("title", in: arguments),
-                text: stringArgument("text", in: arguments),
-                rawBase64: stringArgument("raw_base64", in: arguments),
-                waitMilliseconds: intArgument("wait_ms", in: arguments),
-                lineLimit: intArgument("line_limit", in: arguments),
-                submit: boolArgument("submit", in: arguments),
-                parentAgentID: parentAgentIDArgument(forKind: "agent", in: arguments, context: context),
-                select: false
-            ))
-        case "rename_terminal":
-            return .renameTerminal(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                title: stringArgument("title", in: arguments)
-            ))
-        case "press_enter":
-            return .sendInput(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                text: nil,
-                rawBase64: "DQ==",
-                waitMilliseconds: intArgument("wait_ms", in: arguments),
-                lineLimit: intArgument("line_limit", in: arguments)
-            ))
-        case "select_terminal":
-            return .selectTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))
-        case "send_input":
-            return .sendInput(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                text: stringArgument("text", in: arguments),
-                rawBase64: stringArgument("raw_base64", in: arguments),
-                waitMilliseconds: intArgument("wait_ms", in: arguments),
-                lineLimit: intArgument("line_limit", in: arguments)
-            ))
-        case "get_terminal_output":
-            return .getTerminalOutput(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                startLine: intArgument("start_line", in: arguments),
-                lineLimit: intArgument("line_limit", in: arguments)
-            ))
-        case "get_terminal_raw_output":
-            return .getTerminalRawOutput(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                maxBytes: intArgument("max_bytes", in: arguments)
-            ))
-        case "search_output":
-            return .searchOutput(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                query: try requiredString("query", in: arguments),
-                caseSensitive: boolArgument("case_sensitive", in: arguments),
-                maxMatches: intArgument("max_matches", in: arguments)
-            ))
-        case "clear_output":
-            return .clearOutput(.init(terminalID: try requiredString("terminal_id", in: arguments)))
-        case "restart_terminal":
-            return .restartTerminal(.init(terminalID: try requiredString("terminal_id", in: arguments)))
-        case "close_terminal":
-            return .closeTerminal(.init(
-                terminalID: try requiredString("terminal_id", in: arguments),
-                agentClosePolicy: try agentClosePolicyArgument("agent_close_policy", in: arguments)
             ))
         default:
             throw CherryControlError(code: "unknown_tool", message: "Unknown Cherry MCP tool: \(name)")
@@ -904,6 +841,8 @@ enum CherryMCPTools {
             return try encodedResult(payload)
         case .searchProcessOutput(let payload):
             return try encodedResult(payload)
+        case .waitForProcessIdle(let payload):
+            return try encodedResult(payload)
         case .getProcessPorts(let payload):
             return try encodedResult(payload)
         case .servicesList(let payload):
@@ -921,6 +860,8 @@ enum CherryMCPTools {
         case .closeProcess(let payload):
             return try encodedResult(payload)
         case .renameProcess(let payload):
+            return try encodedResult(payload)
+        case .selectProcess(let payload):
             return try encodedResult(payload)
         case .sendProcessInput(let payload):
             return try encodedResult(payload)
@@ -1121,16 +1062,51 @@ enum CherryMCPTools {
         return policy
     }
 
-    private static func processSelector(in arguments: [String: Value]) -> ProcessSelectorRequest {
+    private static func explicitProcessSelector(in arguments: [String: Value]) -> ProcessSelectorRequest {
         ProcessSelectorRequest(
-            processID: stringArgument("process_id", in: arguments),
+            processID: trimmedArgument("process_id", in: arguments),
             processName: stringArgument("process_name", in: arguments)
         )
     }
 
-    private static func processLifecycle(in arguments: [String: Value]) -> ProcessLifecycleRequest {
+    private static func processSelector(
+        in arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) -> ProcessSelectorRequest {
+        let processName = stringArgument("process_name", in: arguments)
+        return ProcessSelectorRequest(
+            processID: processIDArgument(in: arguments, context: context),
+            processName: processName
+        )
+    }
+
+    private static func processIDArgument(
+        in arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) -> String? {
+        if let explicit = trimmedArgument("process_id", in: arguments) {
+            return explicit
+        }
+
+        if let processName = trimmedArgument("process_name", in: arguments), !processName.isEmpty {
+            return nil
+        }
+
+        return context?.boundProcessID
+    }
+
+    private static func trimmedArgument(_ key: String, in arguments: [String: Value]) -> String? {
+        stringArgument(key, in: arguments)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+    }
+
+    private static func processLifecycle(
+        in arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) -> ProcessLifecycleRequest {
         ProcessLifecycleRequest(
-            processID: stringArgument("process_id", in: arguments),
+            processID: processIDArgument(in: arguments, context: context),
             processName: stringArgument("process_name", in: arguments),
             kind: stringArgument("kind", in: arguments),
             waitMilliseconds: intArgument("wait_ms", in: arguments),
@@ -1143,6 +1119,34 @@ enum CherryMCPTools {
             waitMilliseconds: intArgument("wait_ms", in: arguments),
             lineLimit: intArgument("line_limit", in: arguments)
         )
+    }
+
+    private static func waitForProcessIdleRequest(
+        in arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) -> WaitForProcessIdleRequest {
+        WaitForProcessIdleRequest(
+            processID: processIDArgument(in: arguments, context: context),
+            processName: stringArgument("process_name", in: arguments),
+            sinceOutputVersion: intArgument("since_output_version", in: arguments),
+            requireNewOutput: boolArgument("require_new_output", in: arguments),
+            quietMilliseconds: intArgument("quiet_ms", in: arguments),
+            timeoutMilliseconds: intArgument("timeout_ms", in: arguments),
+            lineLimit: intArgument("line_limit", in: arguments)
+        )
+    }
+
+    private static func clientTimeout(for toolName: String, arguments: [String: Value]) -> TimeInterval? {
+        switch toolName {
+        case "wait_for_process_idle":
+            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
+            return TimeInterval(timeoutMilliseconds) / 1_000 + 5
+        case "wait_for_bound_port":
+            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 10_000, 1), 60_000)
+            return TimeInterval(timeoutMilliseconds) / 1_000 + 5
+        default:
+            return nil
+        }
     }
 
     private static func tool(_ name: String, _ description: String, properties: [String: Value], required: [String] = []) -> Tool {
@@ -1179,13 +1183,23 @@ enum CherryMCPTools {
 
     private static func processSelectorProperties(_ extra: [String: Value] = [:]) -> [String: Value] {
         var properties: [String: Value] = [
-            "process_id": string("Stable Cherry process UUID. Preferred when known."),
+            "process_id": string("Stable Cherry process UUID. Preferred when known. Defaults to the bound MCP session process when process_name is also omitted."),
             "process_name": string("Process name/title when process_id is not known.")
         ]
         for (key, value) in extra {
             properties[key] = value
         }
         return properties
+    }
+
+    private static func idleWaitProperties() -> [String: Value] {
+        processSelectorProperties([
+            "since_output_version": integer("Optional output version baseline. Defaults to the process baseline recorded before the last input, then current output version."),
+            "require_new_output": boolean("Whether at least one new output version is required before idle can pass. Defaults to true."),
+            "quiet_ms": integer("Required quiet period in milliseconds. Defaults to 1000."),
+            "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 60000, max 300000."),
+            "line_limit": integer("Rendered output line limit in the response. Max 2000.")
+        ])
     }
 
     private static func projectScopedProperties(_ extra: [String: Value] = [:]) -> [String: Value] {
@@ -1216,6 +1230,23 @@ enum CherryMCPTools {
 
 private struct ErrorPayload: Codable {
     let error: CherryControlError
+}
+
+private struct MCPWhoamiPayload: Codable {
+    let mcpSessionID: String?
+    let activeProjectRoot: String?
+    let effectiveProjectRoot: String?
+    let boundProcessID: String?
+    let defaultParentAgentID: String?
+    let selectedProcessID: String?
+    let selectedProcessName: String?
+}
+
+private struct MCPBindSessionProcessPayload: Codable {
+    let mcpSessionID: String?
+    let boundProcessID: String
+    let previousBoundProcessID: String?
+    let process: ProcessSummary
 }
 
 private struct MCPStatusPayload: Codable {

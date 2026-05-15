@@ -142,14 +142,44 @@ enum SidebarTerminalPathFormatter {
 
     private static func normalizedAbsolutePath(_ path: String, homeDirectory: String) -> String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
         let expanded: String
         if trimmed == "~" {
             expanded = homeDirectory
         } else if trimmed.hasPrefix("~/") {
             expanded = homeDirectory + "/" + trimmed.dropFirst(2)
-        } else {
+        } else if trimmed.hasPrefix("~") {
             expanded = NSString(string: trimmed).expandingTildeInPath
+        } else {
+            expanded = trimmed
         }
-        return URL(fileURLWithPath: expanded).standardizedFileURL.path
+        return standardizedPath(expanded)
+    }
+
+    private static func standardizedPath(_ path: String) -> String {
+        let isAbsolute = path.hasPrefix("/")
+        var components: [Substring] = []
+
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                if !components.isEmpty, components.last != ".." {
+                    components.removeLast()
+                } else if !isAbsolute {
+                    components.append(component)
+                }
+            default:
+                components.append(component)
+            }
+        }
+
+        let joined = components.map(String.init).joined(separator: "/")
+        if isAbsolute {
+            return joined.isEmpty ? "/" : "/" + joined
+        }
+        return joined
     }
 }

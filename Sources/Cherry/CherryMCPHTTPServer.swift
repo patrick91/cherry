@@ -24,8 +24,9 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
 
         let app = CherryMCPHTTPApp(
             configuration: .init(host: Self.host, port: Self.port, endpoint: Self.endpoint),
-            serverFactory: { _, _ in
+            serverFactory: { sessionID, _ in
                 let toolContext = CherryMCPToolContext.bound(
+                    sessionID: sessionID,
                     defaultParentAgentID: await CherryMCPTools.defaultParentAgentIDForHTTPSession()
                 )
                 let server = Server(

@@ -110,16 +110,6 @@ private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: Call
     return try decoder.decode(T.self, from: Data(text.utf8))
 }
 
-private struct MCPRunAgentPayload: Decodable {
-    let terminalID: String
-    let parentAgentID: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case terminalID = "terminal_id"
-        case parentAgentID = "parent_agent_id"
-    }
-}
-
 private struct MCPSpawnProcessPayload: Decodable {
     struct Process: Decodable {
         let id: String
@@ -132,6 +122,48 @@ private struct MCPSpawnProcessPayload: Decodable {
     }
 
     let process: Process
+}
+
+private struct MCPProcessReference: Decodable {
+    let id: String
+    let outputVersion: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case outputVersion = "output_version"
+    }
+}
+
+private struct MCPProcessStatusPayload: Decodable {
+    let process: MCPProcessReference
+}
+
+private struct MCPBindSessionProcessPayload: Decodable {
+    let mcpSessionID: String?
+    let boundProcessID: String
+    let previousBoundProcessID: String?
+    let process: MCPProcessReference
+
+    private enum CodingKeys: String, CodingKey {
+        case mcpSessionID = "mcp_session_id"
+        case boundProcessID = "bound_process_id"
+        case previousBoundProcessID = "previous_bound_process_id"
+        case process
+    }
+}
+
+private struct MCPWhoamiPayload: Decodable {
+    let mcpSessionID: String?
+    let effectiveProjectRoot: String?
+    let boundProcessID: String?
+    let selectedProcessID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case mcpSessionID = "mcp_session_id"
+        case effectiveProjectRoot = "effective_project_root"
+        case boundProcessID = "bound_process_id"
+        case selectedProcessID = "selected_process_id"
+    }
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
@@ -272,6 +304,7 @@ private struct MCPSpawnProcessPayload: Decodable {
         .getProcessOutput(.init(processID: processID, startLine: 1, lineLimit: 20)),
         .getProcessRawOutput(.init(processName: "Web", maxBytes: 1024)),
         .searchProcessOutput(.init(processID: processID, query: "ready", caseSensitive: true, maxMatches: 5)),
+        .waitForProcessIdle(.init(processID: processID, sinceOutputVersion: 12, requireNewOutput: true, quietMilliseconds: 250, timeoutMilliseconds: 1_000, lineLimit: 20)),
         .getProcessPorts(.init(processID: processID, includeUnattributed: true)),
         .servicesList(.init(kind: "command", includeUnattributed: false)),
         .waitForBoundPort(.init(processID: processID, port: 5173, timeoutMilliseconds: 500, probeHTTP: true, path: "/health")),
@@ -281,6 +314,7 @@ private struct MCPSpawnProcessPayload: Decodable {
         .restartProcess(.init(processID: processID)),
         .closeProcess(.init(processID: processID, agentClosePolicy: .promoteSubAgents)),
         .renameProcess(.init(processID: processID, title: "Build")),
+        .selectProcess(.init(processID: processID)),
         .sendProcessInput(.init(processID: processID, text: "status\n", rawBase64: nil, waitMilliseconds: 100, lineLimit: 20)),
         .startAllCommands(.init(waitMilliseconds: 100, lineLimit: 20)),
         .stopAllCommands(.init()),
@@ -968,7 +1002,7 @@ private struct MCPSpawnProcessPayload: Decodable {
 }
 
 @MainActor
-@Test func mcpRunAgentDefaultsToSelectedAgentParent() async throws {
+@Test func mcpSpawnAgentDefaultsToSelectedAgentParent() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -976,11 +1010,14 @@ private struct MCPSpawnProcessPayload: Decodable {
 
     let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
     let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
     setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
     setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
     defer {
         setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
         setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
     }
 
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
@@ -998,46 +1035,49 @@ private struct MCPSpawnProcessPayload: Decodable {
     }
 
     let childResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("MCP child")
         ]
     )
-    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+    let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(child.process.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
 
     let emptyParentResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("MCP empty parent"),
             "parent_agent_id": .string("")
         ]
     )
-    let emptyParentChild = try decodeMCPToolResult(MCPRunAgentPayload.self, from: emptyParentResult)
+    let emptyParentChild = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: emptyParentResult)
 
-    #expect(emptyParentChild.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: emptyParentChild.terminalID)?.parentAgentID == parentID)
+    #expect(emptyParentChild.process.parentAgentID == parent.terminalID)
+    #expect(harness.workspace.session(id: emptyParentChild.process.id)?.parentAgentID == parentID)
 
     let topLevelResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("MCP root"),
             "top_level": .bool(true)
         ]
     )
-    let topLevel = try decodeMCPToolResult(MCPRunAgentPayload.self, from: topLevelResult)
+    let topLevel = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: topLevelResult)
 
-    #expect(topLevel.parentAgentID == nil)
-    #expect(harness.workspace.session(id: topLevel.terminalID)?.parentAgentID == nil)
+    #expect(topLevel.process.parentAgentID == nil)
+    #expect(harness.workspace.session(id: topLevel.process.id)?.parentAgentID == nil)
 }
 
 @MainActor
-@Test func mcpRunAgentKeepsHTTPSessionParentAfterSelectionChanges() async throws {
+@Test func mcpSpawnAgentKeepsHTTPSessionParentAfterSelectionChanges() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -1045,11 +1085,14 @@ private struct MCPSpawnProcessPayload: Decodable {
 
     let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
     let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
     setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
     setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
     defer {
         setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
         setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
     }
 
     let previousWorkspace = ProjectWindowRegistry.shared.activeWorkspace
@@ -1101,41 +1144,93 @@ private struct MCPSpawnProcessPayload: Decodable {
     #expect(harness.workspace.selectedSessionID == firstID)
 
     let childResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("Bound child")
         ],
         context: sessionContext
     )
-    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+    let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.parentAgentID == second.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == secondID)
+    #expect(child.process.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == secondID)
 
     let secondChildResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("Second bound child")
         ],
         context: sessionContext
     )
-    let secondChild = try decodeMCPToolResult(MCPRunAgentPayload.self, from: secondChildResult)
+    let secondChild = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: secondChildResult)
 
-    #expect(secondChild.parentAgentID == second.terminalID)
-    #expect(harness.workspace.session(id: secondChild.terminalID)?.parentAgentID == secondID)
+    #expect(secondChild.process.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: secondChild.process.id)?.parentAgentID == secondID)
 }
 
 @Test func mcpAgentCreationToolsDoNotAdvertiseTopLevelOverride() throws {
-    for toolName in ["run_agent", "spawn_process"] {
-        let tool = try #require(CherryMCPTools.all.first { $0.name == toolName })
-        let schema = try #require(tool.inputSchema.objectValue)
-        let properties = try #require(schema["properties"]?.objectValue)
+    let tool = try #require(CherryMCPTools.all.first { $0.name == "spawn_process" })
+    let schema = try #require(tool.inputSchema.objectValue)
+    let properties = try #require(schema["properties"]?.objectValue)
 
-        #expect(properties["parent_agent_id"] != nil)
-        #expect(properties["top_level"] == nil)
-    }
+    #expect(properties["parent_agent_id"] != nil)
+    #expect(properties["top_level"] == nil)
+}
+
+@Test func mcpWaitForProcessIdleAdvertisesOnlyProcessSelectors() throws {
+    let tool = try #require(CherryMCPTools.all.first { $0.name == "wait_for_process_idle" })
+    let schema = try #require(tool.inputSchema.objectValue)
+    let properties = try #require(schema["properties"]?.objectValue)
+
+    #expect(properties["process_id"] != nil)
+    #expect(properties["process_name"] != nil)
+    #expect(properties["terminal_id"] == nil)
+    #expect(properties["quiet_ms"] != nil)
+    #expect(properties["timeout_ms"] != nil)
+}
+
+@Test func mcpLegacyTerminalToolsAreNotAdvertised() throws {
+    let removedToolNames: Set<String> = [
+        "list_terminals",
+        "create_terminal",
+        "run_agent",
+        "rename_terminal",
+        "press_enter",
+        "select_terminal",
+        "send_input",
+        "get_terminal_output",
+        "get_terminal_raw_output",
+        "search_output",
+        "clear_output",
+        "restart_terminal",
+        "close_terminal",
+        "wait_for_idle"
+    ]
+    let advertisedNames = Set(CherryMCPTools.all.map(\.name))
+
+    #expect(advertisedNames.isDisjoint(with: removedToolNames))
+}
+
+@Test func mcpLegacyTerminalToolsReturnUnknownTool() async throws {
+    let result = await CherryMCPTools.call(
+        name: "send_input",
+        arguments: [
+            "terminal_id": .string(UUID().uuidString),
+            "text": .string("ignored")
+        ]
+    )
+
+    #expect(result.isError == true)
+    #expect(result.content.contains { content in
+        if case .text(let text, _, _) = content {
+            return text.contains("unknown_tool")
+        }
+        return false
+    })
 }
 
 @MainActor
@@ -1147,11 +1242,14 @@ private struct MCPSpawnProcessPayload: Decodable {
 
     let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
     let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
     setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
     setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
     defer {
         setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
         setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
     }
 
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
@@ -1176,17 +1274,18 @@ private struct MCPSpawnProcessPayload: Decodable {
 
     let sessionContext = CherryMCPToolContext.bound(defaultParentAgentID: nil)
     let childResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("Implicit child")
         ],
         context: sessionContext
     )
-    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+    let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.parentAgentID == second.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == secondID)
+    #expect(child.process.parentAgentID == second.terminalID)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == secondID)
 
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_process",
@@ -1204,6 +1303,83 @@ private struct MCPSpawnProcessPayload: Decodable {
 }
 
 @MainActor
+@Test func mcpSessionCanBindProcessAndUseBoundProcessFallback() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Echo", command: "/bin/cat"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Echo",
+        kind: "command"
+    )))
+    guard case .startProcess(let started)? = startResponse.result,
+          let processID = UUID(uuidString: started.process.id)
+    else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let context = CherryMCPToolContext.bound(sessionID: "test-session", defaultParentAgentID: nil)
+    let bindResult = await CherryMCPTools.call(
+        name: "bind_session_process",
+        arguments: ["process_id": .string(started.process.id)],
+        context: context
+    )
+    let bound = try decodeMCPToolResult(MCPBindSessionProcessPayload.self, from: bindResult)
+
+    #expect(bound.mcpSessionID == "test-session")
+    #expect(bound.boundProcessID == started.process.id)
+    #expect(bound.previousBoundProcessID == nil)
+    #expect(bound.process.id == started.process.id)
+    #expect(context.boundProcessID == started.process.id)
+
+    let statusResult = await CherryMCPTools.call(
+        name: "get_process_status",
+        arguments: [:],
+        context: context
+    )
+    let status = try decodeMCPToolResult(MCPProcessStatusPayload.self, from: statusResult)
+    #expect(status.process.id == started.process.id)
+
+    let whoamiResult = await CherryMCPTools.call(
+        name: "whoami",
+        arguments: [:],
+        context: context
+    )
+    let whoami = try decodeMCPToolResult(MCPWhoamiPayload.self, from: whoamiResult)
+    #expect(whoami.mcpSessionID == "test-session")
+    #expect(whoami.effectiveProjectRoot == harness.projectRoot.path)
+    #expect(whoami.boundProcessID == started.process.id)
+    #expect(whoami.selectedProcessID == harness.workspace.selectedSessionID?.uuidString)
+
+    let selectResult = await CherryMCPTools.call(
+        name: "select_process",
+        arguments: [:],
+        context: context
+    )
+    let selected = try decodeMCPToolResult(MCPProcessStatusPayload.self, from: selectResult)
+    #expect(selected.process.id == started.process.id)
+    #expect(harness.workspace.selectedSessionID == processID)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
+}
+
+@MainActor
 @Test func mcpAgentCreationPrefersCherryAgentEnvironmentParent() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -1212,10 +1388,13 @@ private struct MCPSpawnProcessPayload: Decodable {
 
     let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
     let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
     setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
     defer {
         setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
         setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
     }
 
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
@@ -1238,17 +1417,18 @@ private struct MCPSpawnProcessPayload: Decodable {
     setEnvironmentValue(first.terminalID, for: CherryControl.agentIDEnvironmentKey)
 
     let childResult = await CherryMCPTools.call(
-        name: "run_agent",
+        name: "spawn_process",
         arguments: [
-            "agent_name": .string("Echo"),
+            "kind": .string("agent"),
+            "name": .string("Echo"),
             "title": .string("Env child")
         ]
     )
-    let child = try decodeMCPToolResult(MCPRunAgentPayload.self, from: childResult)
+    let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
     #expect(second.parentAgentID == nil)
-    #expect(child.parentAgentID == first.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == firstID)
+    #expect(child.process.parentAgentID == first.terminalID)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == firstID)
 }
 
 @MainActor
@@ -1985,6 +2165,150 @@ private struct MCPSpawnProcessPayload: Decodable {
     #expect(stopped.process.kind == "command")
     #expect(stopped.process.state == "exit 0")
     #expect(harness.workspace.selectedSessionID == initialSelection)
+}
+
+@MainActor
+@Test func controlServerWaitsForProcessIdleAfterNewOutput() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Echo", command: "/bin/cat"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Echo",
+        kind: "command"
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let sentResponse = try await harness.send(.sendProcessInput(.init(
+        processID: started.process.id,
+        text: "idle-check\n",
+        rawBase64: nil
+    )))
+    guard case .sendProcessInput(let sent)? = sentResponse.result else {
+        Issue.record("Expected sendProcessInput result, got \(String(describing: sentResponse))")
+        return
+    }
+    #expect(sent.sentBytes == Data("idle-check\n".utf8).count)
+
+    let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+        processID: started.process.id,
+        requireNewOutput: true,
+        quietMilliseconds: 100,
+        timeoutMilliseconds: 2_000,
+        lineLimit: 20
+    )))
+    guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+        Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+        return
+    }
+
+    #expect(waited.reason == .idle)
+    #expect(waited.timedOut == false)
+    #expect(waited.observedNewOutput == true)
+    #expect(waited.output.lines.joined(separator: "\n").contains("idle-check"))
+    #expect(waited.outputVersion > waited.sinceOutputVersion)
+    #expect(waited.output.outputVersion == waited.outputVersion)
+    #expect(waited.process.outputVersion == waited.outputVersion)
+}
+
+@MainActor
+@Test func controlServerWaitForProcessIdleDoesNotReturnBeforeNewOutput() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Sleeper", command: "/bin/sleep", arguments: "3"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Sleeper",
+        kind: "command",
+        waitMilliseconds: 300
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let baselineResponse = try await harness.send(.waitForProcessIdle(.init(
+        processID: started.process.id,
+        requireNewOutput: false,
+        quietMilliseconds: 500,
+        timeoutMilliseconds: 2_000,
+        lineLimit: 20
+    )))
+    guard case .waitForProcessIdle(let baseline)? = baselineResponse.result else {
+        Issue.record("Expected waitForProcessIdle baseline result, got \(String(describing: baselineResponse))")
+        return
+    }
+    #expect(baseline.reason == .idle)
+
+    let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+        processID: started.process.id,
+        sinceOutputVersion: baseline.outputVersion,
+        requireNewOutput: true,
+        quietMilliseconds: 50,
+        timeoutMilliseconds: 200,
+        lineLimit: 20
+    )))
+    guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+        Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+        return
+    }
+
+    #expect(waited.reason == .timedOut)
+    #expect(waited.timedOut == true)
+    #expect(waited.observedNewOutput == false)
+    #expect(waited.outputVersion == waited.sinceOutputVersion)
+}
+
+@MainActor
+@Test func controlServerSelectsProcessByProcessID() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Echo", command: "/bin/cat"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+    let initialSelection = harness.workspace.selectedSessionID
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Echo",
+        kind: "command"
+    )))
+    guard case .startProcess(let started)? = startResponse.result,
+          let processID = UUID(uuidString: started.process.id)
+    else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+    #expect(harness.workspace.selectedSessionID == initialSelection)
+
+    let selectResponse = try await harness.send(.selectProcess(.init(processID: started.process.id)))
+    guard case .selectProcess(let selected)? = selectResponse.result else {
+        Issue.record("Expected selectProcess result, got \(String(describing: selectResponse))")
+        return
+    }
+
+    #expect(selected.process.id == started.process.id)
+    #expect(selected.process.selected == true)
+    #expect(harness.workspace.selectedSessionID == processID)
+    #expect(harness.chromeState.isShowingTerminalContent == true)
 }
 
 @MainActor

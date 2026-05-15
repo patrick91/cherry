@@ -109,6 +109,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case getProcessOutput(GetProcessOutputRequest)
     case getProcessRawOutput(GetProcessRawOutputRequest)
     case searchProcessOutput(SearchProcessOutputRequest)
+    case waitForProcessIdle(WaitForProcessIdleRequest)
     case getProcessPorts(GetProcessPortsRequest)
     case servicesList(ServicesListRequest)
     case waitForBoundPort(WaitForBoundPortRequest)
@@ -118,6 +119,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case restartProcess(ProcessLifecycleRequest)
     case closeProcess(CloseProcessRequest)
     case renameProcess(RenameProcessRequest)
+    case selectProcess(ProcessSelectorRequest)
     case sendProcessInput(SendProcessInputRequest)
     case startAllCommands(ProcessBulkCommandRequest)
     case stopAllCommands(ProcessBulkCommandRequest)
@@ -230,6 +232,34 @@ public struct SearchProcessOutputRequest: Codable, Equatable, Sendable {
         self.query = query
         self.caseSensitive = caseSensitive
         self.maxMatches = maxMatches
+    }
+}
+
+public struct WaitForProcessIdleRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let sinceOutputVersion: Int?
+    public let requireNewOutput: Bool?
+    public let quietMilliseconds: Int?
+    public let timeoutMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        sinceOutputVersion: Int? = nil,
+        requireNewOutput: Bool? = nil,
+        quietMilliseconds: Int? = nil,
+        timeoutMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.sinceOutputVersion = sinceOutputVersion
+        self.requireNewOutput = requireNewOutput
+        self.quietMilliseconds = quietMilliseconds
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.lineLimit = lineLimit
     }
 }
 
@@ -751,6 +781,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case getProcessOutput(TerminalOutputResult)
     case getProcessRawOutput(TerminalRawOutputResult)
     case searchProcessOutput(SearchOutputResult)
+    case waitForProcessIdle(WaitForProcessIdleResult)
     case getProcessPorts(ServicesResult)
     case servicesList(ServicesResult)
     case waitForBoundPort(WaitForBoundPortResult)
@@ -760,6 +791,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case restartProcess(ProcessLifecycleResult)
     case closeProcess(CloseProcessResult)
     case renameProcess(ProcessStatusResult)
+    case selectProcess(ProcessStatusResult)
     case sendProcessInput(SendProcessInputResult)
     case startAllCommands(ListProcessesResult)
     case stopAllCommands(ListProcessesResult)
@@ -967,6 +999,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let workingDirectory: String
     public let commandLine: String?
     public let lineCount: Int
+    public let outputVersion: Int
     public let summary: String?
     public let selected: Bool
     public let agentName: String?
@@ -990,6 +1023,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         workingDirectory: String,
         commandLine: String?,
         lineCount: Int,
+        outputVersion: Int = 0,
         summary: String?,
         selected: Bool,
         agentName: String?,
@@ -1012,6 +1046,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.workingDirectory = workingDirectory
         self.commandLine = commandLine
         self.lineCount = lineCount
+        self.outputVersion = outputVersion
         self.summary = summary
         self.selected = selected
         self.agentName = agentName
@@ -1115,6 +1150,42 @@ public struct ProcessStatusResult: Codable, Equatable, Sendable {
 
     public init(process: ProcessSummary) {
         self.process = process
+    }
+}
+
+public enum ProcessIdleWaitReason: String, Codable, Equatable, Sendable {
+    case idle
+    case exited
+    case timedOut = "timed_out"
+}
+
+public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
+    public let process: ProcessSummary
+    public let reason: ProcessIdleWaitReason
+    public let timedOut: Bool
+    public let observedNewOutput: Bool
+    public let sinceOutputVersion: Int
+    public let outputVersion: Int
+    public let lastOutputAt: Date?
+    public let output: TerminalOutputResult
+
+    public init(
+        process: ProcessSummary,
+        reason: ProcessIdleWaitReason,
+        observedNewOutput: Bool,
+        sinceOutputVersion: Int,
+        outputVersion: Int,
+        lastOutputAt: Date?,
+        output: TerminalOutputResult
+    ) {
+        self.process = process
+        self.reason = reason
+        self.timedOut = reason == .timedOut
+        self.observedNewOutput = observedNewOutput
+        self.sinceOutputVersion = sinceOutputVersion
+        self.outputVersion = outputVersion
+        self.lastOutputAt = lastOutputAt
+        self.output = output
     }
 }
 
@@ -1620,6 +1691,7 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
     public let startLine: Int
     public let endLineExclusive: Int
     public let totalLines: Int
+    public let outputVersion: Int
     public let lines: [String]
 
     public init(
@@ -1627,12 +1699,14 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
         startLine: Int,
         endLineExclusive: Int,
         totalLines: Int,
+        outputVersion: Int = 0,
         lines: [String]
     ) {
         self.terminalID = terminalID
         self.startLine = startLine
         self.endLineExclusive = endLineExclusive
         self.totalLines = totalLines
+        self.outputVersion = outputVersion
         self.lines = lines
     }
 }

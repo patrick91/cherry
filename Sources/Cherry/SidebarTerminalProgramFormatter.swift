@@ -1,5 +1,25 @@
 import Foundation
 
+private enum SidebarTerminalPathString {
+    static func lastPathComponent(_ value: String) -> String {
+        guard !value.isEmpty else { return "" }
+
+        var end = value.endIndex
+        while end > value.startIndex, value[value.index(before: end)] == "/" {
+            end = value.index(before: end)
+        }
+        guard end > value.startIndex else { return "/" }
+
+        let trimmed = value[..<end]
+        guard let separator = trimmed.lastIndex(of: "/") else {
+            return String(trimmed)
+        }
+
+        let start = value.index(after: separator)
+        return String(value[start..<end])
+    }
+}
+
 enum SidebarTerminalProgramFormatter {
     static func label(
         for title: String,
@@ -210,13 +230,13 @@ enum SidebarTerminalProgramFormatter {
             guard !token.hasPrefix("-"), !token.hasPrefix("+"), !isAssignment(token) else { continue }
 
             if token == "." {
-                return URL(fileURLWithPath: workingDirectory).lastPathComponent.nilIfEmpty
+                return SidebarTerminalPathString.lastPathComponent(workingDirectory).nilIfEmpty
             }
 
             let expanded = token.hasPrefix("~/")
                 ? homeDirectory + "/" + token.dropFirst(2)
                 : token
-            let lastComponent = URL(fileURLWithPath: String(expanded)).lastPathComponent
+            let lastComponent = SidebarTerminalPathString.lastPathComponent(String(expanded))
             return lastComponent.nilIfEmpty ?? token
         }
         return nil
@@ -236,7 +256,7 @@ enum SidebarTerminalProgramFormatter {
     }
 
     private static func cleanedPackageName(_ token: String) -> String {
-        var package = URL(fileURLWithPath: token).lastPathComponent
+        var package = SidebarTerminalPathString.lastPathComponent(token)
         if package.hasPrefix("@"), let slash = package.firstIndex(of: "/") {
             package = String(package[package.index(after: slash)...])
         }
@@ -324,21 +344,21 @@ private enum ProgramCatalog {
     }
 
     static func normalizedExecutableName(_ value: String) -> String {
-        var name = URL(fileURLWithPath: value).lastPathComponent.lowercased()
+        var name = SidebarTerminalPathString.lastPathComponent(value).lowercased()
         if name.hasSuffix(".exe") {
             name.removeLast(4)
         }
-        if name.range(of: #"^python[0-9.]*$"#, options: .regularExpression) != nil {
+        if isVersionedExecutable(name, prefix: "python") {
             return "python"
         }
-        if name.range(of: #"^node[0-9.]*$"#, options: .regularExpression) != nil {
+        if isVersionedExecutable(name, prefix: "node") {
             return "node"
         }
         return name
     }
 
     private static func cleanedPackageOrExecutable(_ value: String) -> String {
-        var package = URL(fileURLWithPath: value).lastPathComponent
+        var package = SidebarTerminalPathString.lastPathComponent(value)
         if package.hasPrefix("@"), let slash = package.firstIndex(of: "/") {
             package = String(package[package.index(after: slash)...])
         }
@@ -346,6 +366,13 @@ private enum ProgramCatalog {
             package = String(package[..<version])
         }
         return package
+    }
+
+    private static func isVersionedExecutable(_ name: String, prefix: String) -> Bool {
+        guard name.hasPrefix(prefix) else { return false }
+        return name.dropFirst(prefix.count).allSatisfy { character in
+            character.isNumber || character == "."
+        }
     }
 
     private static let aliases: [String: String] = [

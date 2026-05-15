@@ -3371,6 +3371,7 @@ private struct SidebarAgentSessionSection: View {
             isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
             projectRoot: projectRoot,
             presentation: presentation,
+            pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
             shortcutNumber: shortcutNumber,
             showShortcutHint: showShortcutHints,
             nestingDepth: nestingDepth,
@@ -4327,6 +4328,7 @@ private struct SidebarSessionSection: View {
                     isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
                     projectRoot: projectRoot,
                     presentation: presentation,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
                     onSelect: {
@@ -4926,11 +4928,12 @@ private struct SidebarTabRow: View {
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject private var agentSettings = AgentSettings.shared
 
-    @ObservedObject var session: TerminalSession
+    @StateObject private var rowState: SidebarTabRowState
 
     let isSelected: Bool
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutNumber: Int
     let showShortcutHint: Bool
     let nestingDepth: Int
@@ -4952,6 +4955,7 @@ private struct SidebarTabRow: View {
         isSelected: Bool,
         projectRoot: String?,
         presentation: SidebarPresentation,
+        pathDisplayMode: SidebarTerminalPathDisplayMode,
         shortcutNumber: Int,
         showShortcutHint: Bool,
         nestingDepth: Int = 0,
@@ -4960,10 +4964,14 @@ private struct SidebarTabRow: View {
         onToggleDisclosure: (() -> Void)? = nil,
         onSelect: @escaping () -> Void
     ) {
-        self.session = session
+        _rowState = StateObject(wrappedValue: SidebarTabRowState(
+            session: session,
+            pathDisplayMode: pathDisplayMode
+        ))
         self.isSelected = isSelected
         self.projectRoot = projectRoot
         self.presentation = presentation
+        self.pathDisplayMode = pathDisplayMode
         self.shortcutNumber = shortcutNumber
         self.showShortcutHint = showShortcutHint
         self.nestingDepth = nestingDepth
@@ -4982,7 +4990,7 @@ private struct SidebarTabRow: View {
             projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
-        let label = sidebarLabel()
+        let label = rowState.label
         let nested = nestingDepth > 0
         let nestedGuideReservationWidth = CGFloat(guideX + guideElbowStartInset + guideElbowWidth + 2)
         let nestedBackgroundLeadingInset = nested
@@ -5013,7 +5021,7 @@ private struct SidebarTabRow: View {
                 .padding(.trailing, -6)
             }
 
-            if let icon = AgentToolIconDescriptor(session: session) {
+            if let icon = rowState.agentIconDescriptor {
                 AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
             } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
                 SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
@@ -5047,9 +5055,9 @@ private struct SidebarTabRow: View {
             Spacer(minLength: 8)
 
             Circle()
-                .fill(Color(nsColor: session.tint))
+                .fill(Color(nsColor: rowState.tint))
                 .frame(width: 7, height: 7)
-                .opacity(session.hasUnreadNotification ? 1 : 0)
+                .opacity(rowState.hasUnreadNotification ? 1 : 0)
 
             if showShortcutHint, shortcutNumber <= 9 {
                 SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
@@ -5071,6 +5079,12 @@ private struct SidebarTabRow: View {
         .onHover { hovering in
             isHovered = hovering
         }
+        .onAppear {
+            rowState.updatePathDisplayMode(pathDisplayMode)
+        }
+        .onChange(of: pathDisplayMode) { _, mode in
+            rowState.updatePathDisplayMode(mode)
+        }
     }
 
     @ViewBuilder
@@ -5089,7 +5103,77 @@ private struct SidebarTabRow: View {
         }
     }
 
-    private func sidebarLabel() -> SidebarTerminalPathLabel {
+}
+
+@MainActor
+private final class SidebarTabRowState: ObservableObject {
+    let tint: NSColor
+    private(set) var agentIconDescriptor: AgentToolIconDescriptor?
+
+    @Published private(set) var label: SidebarTerminalPathLabel
+    @Published private(set) var hasUnreadNotification: Bool
+
+    private weak var session: TerminalSession?
+    private var pathDisplayMode: SidebarTerminalPathDisplayMode
+    private var cancellables: Set<AnyCancellable> = []
+
+    init(session: TerminalSession, pathDisplayMode: SidebarTerminalPathDisplayMode) {
+        self.session = session
+        self.pathDisplayMode = pathDisplayMode
+        self.tint = session.tint
+        self.agentIconDescriptor = AgentToolIconDescriptor(
+            kind: session.kind,
+            agentName: session.agentName,
+            title: session.title
+        )
+        self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        self.hasUnreadNotification = session.hasUnreadNotification
+
+        observe(session)
+    }
+
+    func updatePathDisplayMode(_ mode: SidebarTerminalPathDisplayMode) {
+        guard pathDisplayMode != mode else { return }
+        pathDisplayMode = mode
+        refreshLabel()
+    }
+
+    private func observe(_ session: TerminalSession) {
+        Publishers.CombineLatest4(session.$title, session.$titleSource, session.$subtitle, session.$summary)
+            .combineLatest(session.$workingDirectory)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshLabel()
+                }
+            }
+            .store(in: &cancellables)
+
+        session.$hasUnreadNotification
+            .removeDuplicates()
+            .sink { [weak self] hasUnreadNotification in
+                Task { @MainActor [weak self] in
+                    self?.hasUnreadNotification = hasUnreadNotification
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func refreshLabel() {
+        guard let session else { return }
+        agentIconDescriptor = AgentToolIconDescriptor(
+            kind: session.kind,
+            agentName: session.agentName,
+            title: session.title
+        )
+        let nextLabel = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        guard label != nextLabel else { return }
+        label = nextLabel
+    }
+
+    private static func label(
+        for session: TerminalSession,
+        pathDisplayMode: SidebarTerminalPathDisplayMode
+    ) -> SidebarTerminalPathLabel {
         guard session.kind == .terminal, !session.hasExplicitTitle else {
             return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
         }
@@ -5098,7 +5182,7 @@ private struct SidebarTabRow: View {
         if trimmedTitle == SidebarTerminalPathFormatter.displayPath(session.workingDirectory) {
             return SidebarTerminalPathFormatter.label(
                 for: session.workingDirectory,
-                mode: terminalSettings.sidebarTerminalPathDisplayMode
+                mode: pathDisplayMode
             )
         }
 
@@ -5115,7 +5199,7 @@ private struct SidebarTabRow: View {
         ) {
             return SidebarTerminalPathFormatter.label(
                 for: session.workingDirectory,
-                mode: terminalSettings.sidebarTerminalPathDisplayMode
+                mode: pathDisplayMode
             )
         }
 
@@ -5146,9 +5230,13 @@ private struct AgentToolIconDescriptor {
 
     @MainActor
     init?(session: TerminalSession) {
-        guard session.kind == .agent else { return nil }
+        self.init(kind: session.kind, agentName: session.agentName, title: session.title)
+    }
 
-        let displayName = session.agentName != nil ? session.agentName! : session.title
+    init?(kind: TerminalSession.SessionKind, agentName: String?, title: String) {
+        guard kind == .agent else { return nil }
+
+        let displayName = agentName ?? title
         let name = displayName.lowercased()
         if name.contains("codex") || name.contains("openai") {
             self.init(label: "Cx", logoResourceName: "openai", foreground: .white, background: .black.opacity(0.82))

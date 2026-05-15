@@ -68,10 +68,10 @@ claude mcp add --transport http --scope user cherry http://127.0.0.1:61234/mcp
 
 Run the Cherry app first. The app listens on `127.0.0.1:61234` and forwards MCP
 tool calls to Cherry's instance-scoped Unix control socket under `/tmp/cherry-$UID/`.
-The MCP server exposes tools for listing, creating, selecting, reading, searching,
-clearing, restarting, closing, and sending input to visible Cherry terminal
-tabs. It can also list configured agent tools and launch a new configured agent
-in the active project window.
+The MCP server exposes process-first tools for terminals, agents, configured
+project commands, output reads, idle waiting, service readiness, notes, and
+todos. See [docs/mcp.md](docs/mcp.md) for the tool guide and recommended
+agent workflows.
 
 ## Rendering Debug
 

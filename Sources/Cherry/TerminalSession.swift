@@ -1231,6 +1231,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var startedAt: Date?
     @Published private(set) var exitedAt: Date?
     @Published private(set) var lastOutputAt: Date?
+    @Published private(set) var outputVersion = 0
+    @Published private(set) var lastInputOutputVersion: Int?
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
     private(set) var isEnhancedKeyboardProtocolActive = false
@@ -1401,7 +1403,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func send(text: String) {
         guard acceptsInput else { return }
-        noteHumanInputIfNeeded()
+        if !text.isEmpty {
+            noteHumanInputIfNeeded()
+            noteInputOutputBaseline()
+        }
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
@@ -1413,6 +1418,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let outboundData = normalizedInputData(data)
         if !outboundData.isEmpty {
             noteHumanInputIfNeeded()
+            noteInputOutputBaseline()
         }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -1738,8 +1744,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         if kind == .agent {
             lastSummaryOutputChangeDate = Date()
         }
+        outputVersion &+= 1
         scheduleSummaryIfNeeded()
         bumpRevision()
+    }
+
+    private func noteInputOutputBaseline() {
+        lastInputOutputVersion = outputVersion
     }
 
     private func ingestTerminalMetadata(_ data: Data) {

@@ -182,7 +182,7 @@ final class TerminalSettings: ObservableObject {
         minimumContrast: Double
     ) -> TerminalConfiguration {
         TerminalConfiguration { builder in
-            builder.withFontFamily("SF Mono")
+            builder.withFontFamily("Menlo")
             builder.withFontSize(Float(fontSize))
             builder.withCursorStyle(.block)
             builder.withCursorStyleBlink(cursorBlink)

@@ -583,7 +583,13 @@ final class ShellProcessController: @unchecked Sendable {
         let agentID = configuration.agentID
         let term = configuration.term
         let startupCommand = configuration.startupCommand
-        let originalZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
+        let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
+        let inheritedCherryBootstrapZDOTDIR = ProcessInfo.processInfo.environment["CHERRY_BOOTSTRAP_ZDOTDIR"]
+        let originalZDOTDIR = if inheritedZDOTDIR == inheritedCherryBootstrapZDOTDIR {
+            String?.none
+        } else {
+            inheritedZDOTDIR
+        }
         let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
         let extraTerminfoDirs = Self.preferredTerminfo.additionalDirs
         let inheritedTerminfoDirs = ProcessInfo.processInfo.environment["TERMINFO_DIRS"]

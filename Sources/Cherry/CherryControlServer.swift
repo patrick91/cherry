@@ -316,6 +316,9 @@ final class CherryControlServer: @unchecked Sendable {
                 caseSensitive: request.caseSensitive,
                 maxMatches: request.maxMatches
             )))
+        case .waitForProcessIdle(let request):
+            let result = try await waitForProcessIdle(request, workspace: workspace)
+            return .init(result: .waitForProcessIdle(result))
         case .getProcessPorts(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             return .init(result: .getProcessPorts(try servicesResult(
@@ -367,6 +370,11 @@ final class CherryControlServer: @unchecked Sendable {
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             session.rename(to: request.title)
             return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: workspace))))
+        case .selectProcess(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            workspace.select(session)
+            chromeState(for: workspace)?.selectTerminal()
+            return .init(result: .selectProcess(.init(process: processInfo(for: session, workspace: workspace))))
         case .sendProcessInput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             let payload = try inputPayload(text: request.text, rawBase64: request.rawBase64)
@@ -943,6 +951,7 @@ final class CherryControlServer: @unchecked Sendable {
             workingDirectory: session.workingDirectory,
             commandLine: session.kind == .terminal ? nil : session.subtitle,
             lineCount: session.lineCount,
+            outputVersion: session.outputVersion,
             summary: session.summary,
             selected: workspace.selectedSessionID == session.id,
             agentName: session.agentName,
@@ -1156,6 +1165,69 @@ final class CherryControlServer: @unchecked Sendable {
             message: "Timed out waiting for a matching bound port.",
             serviceCandidates: lastCandidates.isEmpty ? nil : lastCandidates
         )
+    }
+
+    @MainActor
+    private func waitForProcessIdle(
+        _ request: WaitForProcessIdleRequest,
+        workspace: TerminalWorkspace
+    ) async throws -> WaitForProcessIdleResult {
+        let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+        let timeoutMilliseconds = min(max(request.timeoutMilliseconds ?? 60_000, 1), 300_000)
+        let quietMilliseconds = min(max(request.quietMilliseconds ?? 1_000, 0), timeoutMilliseconds)
+        let requireNewOutput = request.requireNewOutput ?? true
+        let sinceOutputVersion = request.sinceOutputVersion
+            ?? session.lastInputOutputVersion
+            ?? session.outputVersion
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutMilliseconds) / 1_000)
+        let startedAt = Date()
+        var observedNewOutput = session.outputVersion > sinceOutputVersion
+
+        func result(reason: ProcessIdleWaitReason) -> WaitForProcessIdleResult {
+            WaitForProcessIdleResult(
+                process: processInfo(for: session, workspace: workspace),
+                reason: reason,
+                observedNewOutput: observedNewOutput,
+                sinceOutputVersion: sinceOutputVersion,
+                outputVersion: session.outputVersion,
+                lastOutputAt: session.lastOutputAt,
+                output: terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
+            )
+        }
+
+        while true {
+            observedNewOutput = observedNewOutput || session.outputVersion > sinceOutputVersion
+
+            switch session.state {
+            case .exited, .failed:
+                return result(reason: .exited)
+            case .launching, .live:
+                break
+            }
+
+            let now = Date()
+            if !requireNewOutput || observedNewOutput {
+                if quietMilliseconds == 0 {
+                    return result(reason: .idle)
+                }
+
+                if let lastOutputAt = session.lastOutputAt {
+                    if now.timeIntervalSince(lastOutputAt) >= TimeInterval(quietMilliseconds) / 1_000 {
+                        return result(reason: .idle)
+                    }
+                } else if !requireNewOutput,
+                          now.timeIntervalSince(startedAt) >= TimeInterval(quietMilliseconds) / 1_000 {
+                    return result(reason: .idle)
+                }
+            }
+
+            if now >= deadline {
+                return result(reason: .timedOut)
+            }
+
+            let remainingMilliseconds = max(1, Int(deadline.timeIntervalSince(now) * 1_000))
+            try? await Task.sleep(for: .milliseconds(min(50, remainingMilliseconds)))
+        }
     }
 
     private func httpReadiness(for service: ServiceRecord, path requestedPath: String?) async -> ServiceReadiness {
@@ -1753,7 +1825,7 @@ final class CherryControlServer: @unchecked Sendable {
         let startedAt = Date()
         let maximumWait: TimeInterval = 6
         let quietInterval: TimeInterval = 0.75
-        let noOutputFallback: TimeInterval = 1
+        let noOutputFallback: TimeInterval = 2.5
 
         while true {
             switch session.state {
@@ -1822,6 +1894,7 @@ final class CherryControlServer: @unchecked Sendable {
             startLine: startLine,
             endLineExclusive: endLine,
             totalLines: totalLines,
+            outputVersion: session.outputVersion,
             lines: lines
         )
     }

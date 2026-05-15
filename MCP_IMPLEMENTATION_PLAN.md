@@ -12,13 +12,15 @@ Cherry now has a useful local MCP surface for project work:
 
 - The MCP helper can report app/socket reachability with `get_status`.
 - Socket reads and writes have timeouts, so calls return tool errors instead of hanging indefinitely.
-- Notes, todos, terminal tabs, agents, and project commands avoid UI selection side effects by default.
-- Explicit UI selection remains available through `select_terminal`, `select_note`, and `select_todo`.
+- Notes, todos, agent processes, terminal processes, and project commands avoid UI selection side effects by default.
+- Explicit UI selection remains available through `select_process`, `select_note`, and `select_todo`.
 - Terminals, agents, and project commands are exposed through a process-oriented layer on top of `TerminalWorkspace`.
 - Process summaries expose PID, timestamps, structured exit code, input readiness, output activity, and restart policy.
+- Process/output results expose `output_version` for wait baselines.
+- MCP sessions can bind to a Cherry process and wait for process idle without fixed sleeps.
 - Cherry can detect localhost TCP services for Cherry-managed process trees and wait for bound ports through MCP.
 - Project command execution is limited to trusted configured commands from Cherry settings or `cherry.toml`.
-- Backwards-compatible terminal tools still exist.
+- The public MCP surface is process-first; the old terminal-tab tool namespace has been removed.
 
 ## Implemented Tools
 
@@ -27,6 +29,9 @@ Cherry now has a useful local MCP surface for project work:
 - `get_status`
 - `list_projects`
 - `get_project_status`
+- `whoami`
+- `list_agents`
+- `bind_session_process`
 
 ### Process Read APIs
 
@@ -35,6 +40,7 @@ Cherry now has a useful local MCP surface for project work:
 - `get_process_output`
 - `get_process_raw_output`
 - `search_process_output`
+- `wait_for_process_idle`
 - `get_process_ports`
 - `services_list`
 - `wait_for_bound_port`
@@ -47,6 +53,7 @@ Cherry now has a useful local MCP surface for project work:
 - `restart_process`
 - `close_process`
 - `rename_process`
+- `select_process`
 - `send_process_input`
 - `start_all_commands`
 - `stop_all_commands`
@@ -77,23 +84,6 @@ Cherry now has a useful local MCP surface for project work:
 - `list_todo_comments`
 - `update_todo_comment`
 - `delete_todo_comment`
-
-### Backwards-Compatible Terminal/Agent Tools
-
-- `list_terminals`
-- `list_agents`
-- `create_terminal`
-- `run_agent`
-- `rename_terminal`
-- `press_enter`
-- `select_terminal`
-- `send_input`
-- `get_terminal_output`
-- `get_terminal_raw_output`
-- `search_output`
-- `clear_output`
-- `restart_terminal`
-- `close_terminal`
 
 ## Implemented Test Coverage
 
@@ -156,6 +146,8 @@ Still missing:
 
 ### 4. Timers And Idle Checks
 
+Process idle waiting is implemented through `wait_for_process_idle`.
+
 Timers remain unimplemented.
 
 Potential tools:
@@ -213,26 +205,21 @@ Recommended next step:
 
 ### 7. MCP Tool Contract Cleanup
 
-The helper now has both old terminal tools and new process tools.
-
-Needed decisions:
-
-- Keep both namespaces permanently, or steer agents toward process tools.
-- Decide whether `get_process_output` should eventually replace `get_terminal_output` in documentation.
-- Decide whether `run_agent` should be marked legacy after `spawn_process(kind: "agent")` is stable.
+The public helper now exposes process tools instead of the old terminal-tab MCP
+namespace.
 
 Recommended next step:
 
-- Keep backwards compatibility.
-- Update install/help text and examples to prefer process tools.
+- Watch dogfood usage for any missing process equivalent, especially output
+  clearing and configured-command discovery.
 
 ## Suggested Next Build Order
 
 1. Harden service detection based on dogfood usage: wildcard listener policy, HTTP probe detail, and optional short-lived caching.
 2. Decide process identity/history semantics: terminal UUIDs only, or durable per-project process records.
 3. Add `process_group_id` if descendant attribution misses real dev server launch patterns.
-4. Prototype in-memory timers using `last_output_at` for idle detection.
-5. Update README/install help to prefer process/service MCP tools over legacy terminal tools.
+4. Prototype in-memory timers using `last_output_at` and `output_version` for idle detection.
+5. Add any missing process/service tools surfaced by dogfood usage.
 6. Revisit todo/note locks only after real multi-agent usage shows contention.
 
 ## Non-Goals For Now

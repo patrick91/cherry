@@ -385,15 +385,21 @@ private enum ProgramCatalog {
         "pip": "python",
         "pip3": "python",
         "cargo": "rust",
+        "rustc": "rust",
         "ruff": "ruff",
         "ruff-lsp": "ruff",
-        "create-vite": "vite"
+        "uvicorn": "fastapi",
+        "py.test": "pytest",
+        "pytest3": "pytest",
+        "nextjs": "next",
+        "create-vite": "vite",
+        "create-next-app": "create-next-app"
     ]
 
     private static let descriptors: [String: ProgramDescriptor] = [
         "vim": ProgramDescriptor(displayName: "Vim", logoResourceName: "vim", fallbackLabel: "Vi", prefersArgumentTitle: true),
         "nvim": ProgramDescriptor(displayName: "Nvim", logoResourceName: "neovim", fallbackLabel: "Nv", prefersArgumentTitle: true),
-        "emacs": ProgramDescriptor(displayName: "Emacs", fallbackLabel: "Em", prefersArgumentTitle: true),
+        "emacs": ProgramDescriptor(displayName: "Emacs", logoResourceName: "gnuemacs", fallbackLabel: "Em", prefersArgumentTitle: true),
         "nano": ProgramDescriptor(displayName: "Nano", fallbackLabel: "Na", prefersArgumentTitle: true),
         "less": ProgramDescriptor(displayName: "less", fallbackLabel: "Ls", prefersArgumentTitle: true),
         "man": ProgramDescriptor(displayName: "man", fallbackLabel: "Ma", prefersArgumentTitle: true),
@@ -408,14 +414,17 @@ private enum ProgramCatalog {
         "uv": ProgramDescriptor(displayName: "uv", logoResourceName: "uv", fallbackLabel: "uv"),
         "uvx": ProgramDescriptor(displayName: "uvx", logoResourceName: "uv", fallbackLabel: "ux"),
         "python": ProgramDescriptor(displayName: "Python", logoResourceName: "python", fallbackLabel: "Py"),
-        "deno": ProgramDescriptor(displayName: "Deno", fallbackLabel: "De"),
-        "docker": ProgramDescriptor(displayName: "Docker", fallbackLabel: "Do", prefersSubcommandTitle: true),
-        "go": ProgramDescriptor(displayName: "Go", fallbackLabel: "Go", prefersSubcommandTitle: true),
+        "deno": ProgramDescriptor(displayName: "Deno", logoResourceName: "deno", fallbackLabel: "De"),
+        "docker": ProgramDescriptor(displayName: "Docker", logoResourceName: "docker", fallbackLabel: "Do", prefersSubcommandTitle: true),
+        "go": ProgramDescriptor(displayName: "Go", logoResourceName: "go", fallbackLabel: "Go", prefersSubcommandTitle: true),
         "swift": ProgramDescriptor(displayName: "Swift", logoResourceName: "swift", fallbackLabel: "Sw", prefersSubcommandTitle: true),
-        "rust": ProgramDescriptor(displayName: "Rust", fallbackLabel: "Rs", prefersSubcommandTitle: true),
+        "rust": ProgramDescriptor(displayName: "Rust", logoResourceName: "rust", fallbackLabel: "Rs", prefersSubcommandTitle: true),
         "vite": ProgramDescriptor(displayName: "Vite", logoResourceName: "vite", fallbackLabel: "Vt"),
-        "fastapi": ProgramDescriptor(displayName: "FastAPI", fallbackLabel: "Fa"),
-        "ruff": ProgramDescriptor(displayName: "Ruff", fallbackLabel: "Rf")
+        "fastapi": ProgramDescriptor(displayName: "FastAPI", logoResourceName: "fastapi", fallbackLabel: "Fa"),
+        "ruff": ProgramDescriptor(displayName: "Ruff", logoResourceName: "ruff", fallbackLabel: "Rf"),
+        "pytest": ProgramDescriptor(displayName: "Pytest", logoResourceName: "pytest", fallbackLabel: "Py"),
+        "next": ProgramDescriptor(displayName: "Next.js", logoResourceName: "nextdotjs", fallbackLabel: "Nx"),
+        "create-next-app": ProgramDescriptor(displayName: "create-next-app", logoResourceName: "nextdotjs", fallbackLabel: "nx")
     ]
 }
 

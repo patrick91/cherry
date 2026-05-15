@@ -2799,7 +2799,7 @@ private struct MCPWhoamiPayload: Decodable {
     ) == SidebarTerminalPathLabel(
         title: "create-next-app",
         detail: "npx --yes create-next-app@latest demo",
-        leadingIconResourceName: "npm",
+        leadingIconResourceName: "nextdotjs",
         leadingIconFallback: "nx",
         leadingIconRendersAsTemplate: true
     ))
@@ -2811,7 +2811,9 @@ private struct MCPWhoamiPayload: Decodable {
     ) == SidebarTerminalPathLabel(
         title: "Ruff",
         detail: "uvx ruff check .",
-        leadingIconFallback: "Rf"
+        leadingIconResourceName: "ruff",
+        leadingIconFallback: "Rf",
+        leadingIconRendersAsTemplate: true
     ))
 
     #expect(SidebarTerminalProgramFormatter.label(
@@ -2821,7 +2823,59 @@ private struct MCPWhoamiPayload: Decodable {
     ) == SidebarTerminalPathLabel(
         title: "FastAPI",
         detail: "uv run fastapi dev",
-        leadingIconFallback: "Fa"
+        leadingIconResourceName: "fastapi",
+        leadingIconFallback: "Fa",
+        leadingIconRendersAsTemplate: true
+    ))
+}
+
+@Test func sidebarTerminalProgramFormatterUsesCommonSoftwareLogos() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "docker compose up",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "Docker compose",
+        detail: "docker compose up",
+        leadingIconResourceName: "docker",
+        leadingIconFallback: "Do",
+        leadingIconRendersAsTemplate: true
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "go test ./...",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "Go test",
+        detail: "go test ./...",
+        leadingIconResourceName: "go",
+        leadingIconFallback: "Go",
+        leadingIconRendersAsTemplate: true
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "pytest tests",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "Pytest",
+        detail: "pytest tests",
+        leadingIconResourceName: "pytest",
+        leadingIconFallback: "Py",
+        leadingIconRendersAsTemplate: true
+    ))
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "uvicorn main:app",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "FastAPI",
+        detail: "uvicorn main:app",
+        leadingIconResourceName: "fastapi",
+        leadingIconFallback: "Fa",
+        leadingIconRendersAsTemplate: true
     ))
 }
 

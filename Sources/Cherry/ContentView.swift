@@ -739,7 +739,12 @@ private struct NoteDetailView: View {
     private func scheduleSave() {
         pendingSave?.cancel()
         pendingSave = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
+            do {
+                try await Task.sleep(for: .milliseconds(400))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
             saveNow()
         }
     }
@@ -1917,7 +1922,12 @@ private struct TodoInspectorPane: View {
     private func scheduleSave() {
         pendingSave?.cancel()
         pendingSave = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
+            do {
+                try await Task.sleep(for: .milliseconds(400))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
             saveNow()
         }
     }

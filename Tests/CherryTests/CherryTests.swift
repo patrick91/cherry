@@ -152,6 +152,62 @@ private struct MCPBindSessionProcessPayload: Decodable {
     }
 }
 
+private struct MCPSpawnAgentPayload: Decodable {
+    let process: MCPAgentProcessReference
+    let sentBytes: Int
+    let boundProcessID: String?
+    let previousBoundProcessID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case process
+        case sentBytes = "sent_bytes"
+        case boundProcessID = "bound_process_id"
+        case previousBoundProcessID = "previous_bound_process_id"
+    }
+}
+
+private struct MCPSendAgentMessagePayload: Decodable {
+    let process: MCPAgentProcessReference
+    let sentBytes: Int
+    let output: MCPAgentOutput?
+    let wait: MCPAgentWait?
+
+    private enum CodingKeys: String, CodingKey {
+        case process
+        case sentBytes = "sent_bytes"
+        case output
+        case wait
+    }
+}
+
+private struct MCPAgentProcessReference: Decodable {
+    let id: String
+    let kind: String
+    let parentAgentID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case parentAgentID = "parent_agent_id"
+    }
+}
+
+private struct MCPAgentOutput: Decodable {
+    let lines: [String]
+}
+
+private struct MCPAgentWait: Decodable {
+    let reason: String
+    let observedNewOutput: Bool
+    let output: MCPAgentOutput
+
+    private enum CodingKeys: String, CodingKey {
+        case reason
+        case observedNewOutput = "observed_new_output"
+        case output
+    }
+}
+
 private struct MCPWhoamiPayload: Decodable {
     let mcpSessionID: String?
     let effectiveProjectRoot: String?
@@ -1193,6 +1249,32 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(properties["timeout_ms"] != nil)
 }
 
+@Test func mcpAgentSpecificToolsAdvertiseMessageSchemas() throws {
+    let spawnTool = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
+    let spawnSchema = try #require(spawnTool.inputSchema.objectValue)
+    let spawnProperties = try #require(spawnSchema["properties"]?.objectValue)
+    let spawnRequired = try #require(spawnSchema["required"]?.arrayValue)
+
+    #expect(spawnProperties["name"] != nil)
+    #expect(spawnProperties["message"] != nil)
+    #expect(spawnProperties["bind_session"] != nil)
+    #expect(spawnProperties["raw_base64"] == nil)
+    #expect(spawnProperties["kind"] == nil)
+    #expect(spawnRequired.contains(.string("name")))
+
+    let sendTool = try #require(CherryMCPTools.all.first { $0.name == "send_agent_message" })
+    let sendSchema = try #require(sendTool.inputSchema.objectValue)
+    let sendProperties = try #require(sendSchema["properties"]?.objectValue)
+    let sendRequired = try #require(sendSchema["required"]?.arrayValue)
+
+    #expect(sendProperties["process_id"] != nil)
+    #expect(sendProperties["message"] != nil)
+    #expect(sendProperties["wait_for_idle"] != nil)
+    #expect(sendProperties["raw_base64"] == nil)
+    #expect(sendProperties["text"] == nil)
+    #expect(sendRequired.contains(.string("message")))
+}
+
 @Test func mcpLegacyTerminalToolsAreNotAdvertised() throws {
     let removedToolNames: Set<String> = [
         "list_terminals",
@@ -1377,6 +1459,109 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(selected.process.id == started.process.id)
     #expect(harness.workspace.selectedSessionID == processID)
     #expect(harness.chromeState.isShowingTerminalContent == true)
+}
+
+@MainActor
+@Test func mcpSpawnAgentBindsSessionAndSendAgentMessageUsesBoundAgent() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+    harness.server.start()
+
+    let context = CherryMCPToolContext.bound(sessionID: "agent-session", defaultParentAgentID: nil)
+    let spawnResult = await CherryMCPTools.call(
+        name: "spawn_agent",
+        arguments: [
+            "name": .string("Echo"),
+            "title": .string("Dedicated agent")
+        ],
+        context: context
+    )
+    let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+
+    #expect(spawned.process.kind == "agent")
+    #expect(spawned.boundProcessID == spawned.process.id)
+    #expect(spawned.previousBoundProcessID == nil)
+    #expect(context.boundProcessID == spawned.process.id)
+
+    let sendResult = await CherryMCPTools.call(
+        name: "send_agent_message",
+        arguments: [
+            "message": .string("hello from agent message"),
+            "quiet_ms": .int(100),
+            "timeout_ms": .int(2_000),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let sent = try decodeMCPToolResult(MCPSendAgentMessagePayload.self, from: sendResult)
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+
+    #expect(sent.process.id == spawned.process.id)
+    #expect(sent.sentBytes == Data("hello from agent message\r".utf8).count)
+    #expect(sent.wait?.reason == "idle")
+    #expect(sent.wait?.observedNewOutput == true)
+    #expect(output.contains("hello from agent message"), Comment(rawValue: output))
+}
+
+@MainActor
+@Test func mcpSendAgentMessageRejectsNonAgentProcesses() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Echo", command: "/bin/cat"),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Echo",
+        kind: "command"
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let result = await CherryMCPTools.call(
+        name: "send_agent_message",
+        arguments: [
+            "process_id": .string(started.process.id),
+            "message": .string("should not send")
+        ]
+    )
+
+    #expect(result.isError == true)
+    #expect(result.content.contains { content in
+        if case .text(let text, _, _) = content {
+            return text.contains("not_agent_process")
+        }
+        return false
+    })
 }
 
 @MainActor
@@ -2258,13 +2443,13 @@ private struct MCPWhoamiPayload: Decodable {
     let session = try #require(harness.workspace.sessions.first { $0.id.uuidString == started.process.id })
     let deadline = Date(timeIntervalSinceNow: 2)
     while Date() < deadline {
-        let output = session.snapshot(range: 0..<session.lineCount).joined(separator: "\n")
+        let output = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
         if output.contains("listening") {
             break
         }
         try await Task.sleep(for: .milliseconds(25))
     }
-    #expect(session.snapshot(range: 0..<session.lineCount).joined(separator: "\n").contains("listening"))
+    #expect(String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self).contains("listening"))
 
     session.ingestTestingData(Data("\u{1B}[>7u".utf8))
     #expect(session.isEnhancedKeyboardProtocolActive)
@@ -2290,6 +2475,80 @@ private struct MCPWhoamiPayload: Decodable {
     )
     #expect(sent.sentBytes == expectedPayload.count)
     #expect(output.contains("submitted-cr:enhanced-submit"), Comment(rawValue: output))
+    #expect(!output.contains("submitted-csi"), Comment(rawValue: output))
+    #expect(!output.contains("lf-only"), Comment(rawValue: output))
+}
+
+@MainActor
+@Test func controlServerSendProcessInputKeepsPlainEnterInReportAllKeysMode() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let scriptURL = harness.projectRoot.appendingPathComponent("report-all-enter.sh")
+    let script = #"""
+    #!/bin/bash
+    printf 'ready\r\n'
+    stty raw -echo
+    printf 'listening\r\n'
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /\e\[13u/) { $chunk =~ s/\e\[13u.*//s; $buf .= $chunk; print "submitted-csi:$buf\r\n"; last; } if ($chunk =~ /\r/) { $chunk =~ s/\r.*//s; $buf .= $chunk; print "submitted-cr:$buf\r\n"; last; } if ($chunk =~ /\n/) { $chunk =~ s/\n.*//s; $buf .= $chunk; print "lf-only:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "ReportAll", command: scriptURL.path),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "ReportAll",
+        kind: "command",
+        waitMilliseconds: 500,
+        lineLimit: 20
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let session = try #require(harness.workspace.sessions.first { $0.id.uuidString == started.process.id })
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while Date() < deadline {
+        let output = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
+        if output.contains("listening") {
+            break
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    #expect(String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self).contains("listening"))
+
+    session.ingestTestingData(Data("\u{1B}[>8u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive)
+    #expect(session.keyboardProtocolFlags == 8)
+
+    let prompt = "report-all-submit\n"
+    let sendResponse = try await harness.send(.sendProcessInput(.init(
+        processID: started.process.id,
+        text: prompt,
+        rawBase64: nil,
+        waitMilliseconds: 500,
+        lineLimit: 20
+    )))
+    guard case .sendProcessInput(let sent)? = sendResponse.result else {
+        Issue.record("Expected sendProcessInput result, got \(String(describing: sendResponse))")
+        return
+    }
+
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+    let expectedPayload = TerminalInputEncoder.terminalTextData(
+        prompt,
+        keyboardProtocolFlags: 8
+    )
+    #expect(sent.sentBytes == expectedPayload.count)
+    #expect(output.contains("submitted-cr:report-all-submit"), Comment(rawValue: output))
     #expect(!output.contains("submitted-csi"), Comment(rawValue: output))
     #expect(!output.contains("lf-only"), Comment(rawValue: output))
 }
@@ -5076,8 +5335,8 @@ private func serviceRecord(
     #expect(enter == Data("\r".utf8))
     #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 0) == Data("\r".utf8))
     #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 7) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 8) == Data("\u{1B}[13u".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 9) == Data("\u{1B}[13u".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 8) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 9) == Data("\r".utf8))
 }
 
 @Test func terminalTextDataEncodesLineEndingsAsEnter() async throws {
@@ -5094,7 +5353,7 @@ private func serviceRecord(
     #expect(TerminalInputEncoder.terminalTextData(
         "all-keys\n",
         keyboardProtocolFlags: 8
-    ) == Data("all-keys\u{1B}[13u".utf8))
+    ) == Data("all-keys\r".utf8))
 }
 
 @Test func terminalArrowKeysFollowApplicationCursorMode() async throws {

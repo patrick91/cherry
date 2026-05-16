@@ -164,6 +164,20 @@ enum CherryMCPTools {
             required: ["kind"]
         ),
         tool(
+            "spawn_agent",
+            "Create a configured Cherry agent process without selecting it. This is the agent-specific wrapper around spawn_process.",
+            properties: [
+                "name": string("Configured agent name."),
+                "title": string("Optional custom title."),
+                "message": string("Optional first message to submit after launch. A final Enter is added automatically when omitted."),
+                "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
+                "bind_session": boolean("Whether to bind this MCP HTTP session to the spawned agent so later agent tools can omit process_id. Defaults to true."),
+                "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
+                "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
+            ],
+            required: ["name"]
+        ),
+        tool(
             "start_process",
             "Start an existing stopped process, or start a configured command/agent by process_name and kind, without selecting it.",
             properties: processSelectorProperties(lifecycleProperties())
@@ -204,6 +218,18 @@ enum CherryMCPTools {
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ])
+        ),
+        tool(
+            "send_agent_message",
+            "Send a human-style message to a Cherry agent process and optionally wait for the agent to go idle.",
+            properties: processSelectorProperties([
+                "message": string("Message to submit to the agent. A final Enter is added automatically when omitted."),
+                "wait_for_idle": boolean("Whether to wait for new output and a quiet period after sending. Defaults to true."),
+                "quiet_ms": integer("Required quiet period in milliseconds when wait_for_idle is true. Defaults to 1000."),
+                "timeout_ms": integer("Maximum wait in milliseconds when wait_for_idle is true. Defaults to 60000, max 300000."),
+                "line_limit": integer("Rendered output line limit in the response. Max 2000.")
+            ]),
+            required: ["message"]
         ),
         tool(
             "start_all_commands",
@@ -409,6 +435,12 @@ enum CherryMCPTools {
             if name == "bind_session_process" {
                 return try await bindSessionProcessResult(arguments: arguments, context: context)
             }
+            if name == "spawn_agent" {
+                return try await spawnAgentResult(arguments: arguments, context: context)
+            }
+            if name == "send_agent_message" {
+                return try await sendAgentMessageResult(arguments: arguments, context: context)
+            }
             let request = scopedRequest(try controlRequest(name: name, arguments: arguments, context: context), arguments: arguments)
             let response = try cherryMCPClient(timeout: clientTimeout(for: name, arguments: arguments)).send(request)
             if let error = response.error {
@@ -484,6 +516,110 @@ enum CherryMCPTools {
             boundProcessID: status.process.id,
             previousBoundProcessID: previous,
             process: status.process
+        ))
+    }
+
+    private static func spawnAgentResult(
+        arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) async throws -> CallTool.Result {
+        let message = stringArgument("message", in: arguments)
+        let request = CherryControlRequest.spawnProcess(.init(
+            kind: "agent",
+            name: try requiredString("name", in: arguments),
+            title: stringArgument("title", in: arguments),
+            workingDirectory: nil,
+            text: message.map(agentMessageText),
+            rawBase64: nil,
+            parentAgentID: parentAgentIDArgument(forKind: "agent", in: arguments, context: context),
+            waitMilliseconds: intArgument("wait_ms", in: arguments),
+            lineLimit: intArgument("line_limit", in: arguments)
+        ))
+
+        let response = try cherryMCPClient(timeout: clientTimeout(for: "spawn_agent", arguments: arguments))
+            .send(scopedRequest(request, arguments: arguments))
+        if let error = response.error {
+            return try toolError(error)
+        }
+        guard case .spawnProcess(let spawned)? = response.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for spawn_agent."))
+        }
+
+        let shouldBind = boolArgument("bind_session", in: arguments) ?? true
+        let previousBoundProcessID = shouldBind ? context?.bindProcessID(spawned.process.id) : nil
+        return try encodedResult(MCPSpawnAgentPayload(
+            process: spawned.process,
+            sentBytes: spawned.sentBytes,
+            output: spawned.output,
+            boundProcessID: shouldBind ? context?.boundProcessID : nil,
+            previousBoundProcessID: previousBoundProcessID
+        ))
+    }
+
+    private static func sendAgentMessageResult(
+        arguments: [String: Value],
+        context: CherryMCPToolContext?
+    ) async throws -> CallTool.Result {
+        let message = try requiredString("message", in: arguments)
+        let selector = processSelector(in: arguments, context: context)
+        let client = cherryMCPClient(timeout: clientTimeout(for: "send_agent_message", arguments: arguments))
+
+        let statusResponse = try client.send(scopedRequest(.getProcessStatus(selector), arguments: arguments))
+        if let error = statusResponse.error {
+            return try toolError(error)
+        }
+        guard case .getProcessStatus(let status)? = statusResponse.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message status lookup."))
+        }
+        guard status.process.kind == "agent" else {
+            return try toolError(.init(
+                code: "not_agent_process",
+                message: "send_agent_message requires an agent process; \(status.process.name) is kind \(status.process.kind)."
+            ))
+        }
+
+        let sendRequest = CherryControlRequest.sendProcessInput(.init(
+            processID: status.process.id,
+            text: agentMessageText(message)
+        ))
+        let sendResponse = try client.send(scopedRequest(sendRequest, arguments: arguments))
+        if let error = sendResponse.error {
+            return try toolError(error)
+        }
+        guard case .sendProcessInput(let sent)? = sendResponse.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message input."))
+        }
+
+        let shouldWait = boolArgument("wait_for_idle", in: arguments) ?? true
+        guard shouldWait else {
+            return try encodedResult(MCPSendAgentMessagePayload(
+                process: status.process,
+                sentBytes: sent.sentBytes,
+                output: sent.output,
+                wait: nil
+            ))
+        }
+
+        let waitRequest = CherryControlRequest.waitForProcessIdle(.init(
+            processID: status.process.id,
+            requireNewOutput: true,
+            quietMilliseconds: intArgument("quiet_ms", in: arguments),
+            timeoutMilliseconds: intArgument("timeout_ms", in: arguments),
+            lineLimit: intArgument("line_limit", in: arguments)
+        ))
+        let waitResponse = try client.send(scopedRequest(waitRequest, arguments: arguments))
+        if let error = waitResponse.error {
+            return try toolError(error)
+        }
+        guard case .waitForProcessIdle(let wait)? = waitResponse.result else {
+            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message idle wait."))
+        }
+
+        return try encodedResult(MCPSendAgentMessagePayload(
+            process: wait.process,
+            sentBytes: sent.sentBytes,
+            output: wait.output,
+            wait: wait
         ))
     }
 
@@ -1101,6 +1237,13 @@ enum CherryMCPTools {
             .nilIfEmpty
     }
 
+    private static func agentMessageText(_ message: String) -> String {
+        if message.hasSuffix("\n") || message.hasSuffix("\r") {
+            return message
+        }
+        return message + "\n"
+    }
+
     private static func processLifecycle(
         in arguments: [String: Value],
         context: CherryMCPToolContext?
@@ -1138,7 +1281,10 @@ enum CherryMCPTools {
 
     private static func clientTimeout(for toolName: String, arguments: [String: Value]) -> TimeInterval? {
         switch toolName {
-        case "wait_for_process_idle":
+        case "spawn_agent":
+            let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
+            return TimeInterval(waitMilliseconds) / 1_000 + 12
+        case "wait_for_process_idle", "send_agent_message":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5
         case "wait_for_bound_port":
@@ -1247,6 +1393,21 @@ private struct MCPBindSessionProcessPayload: Codable {
     let boundProcessID: String
     let previousBoundProcessID: String?
     let process: ProcessSummary
+}
+
+private struct MCPSpawnAgentPayload: Codable {
+    let process: ProcessSummary
+    let sentBytes: Int
+    let output: TerminalOutputResult?
+    let boundProcessID: String?
+    let previousBoundProcessID: String?
+}
+
+private struct MCPSendAgentMessagePayload: Codable {
+    let process: ProcessSummary
+    let sentBytes: Int
+    let output: TerminalOutputResult?
+    let wait: WaitForProcessIdleResult?
 }
 
 private struct MCPStatusPayload: Codable {

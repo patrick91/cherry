@@ -35,6 +35,7 @@ Use process tools for new automation:
 - `list_processes`, `get_process_status`
 - `spawn_process`, `start_process`, `stop_process`, `restart_process`,
   `close_process`, `rename_process`, `send_process_input`
+- `spawn_agent`, `send_agent_message` for agent-native launch and messaging
 - `get_process_output`, `get_process_raw_output`, `search_process_output`
 - `wait_for_process_idle`
 - `get_process_ports`, `services_list`, `wait_for_bound_port`
@@ -63,7 +64,16 @@ after a prompt is submitted. The result includes `reason` (`idle`, `exited`, or
 process status, and the rendered output tail. Timeouts return a normal result
 with partial output rather than a tool error.
 
-A typical multi-agent flow:
+A typical agent-native flow:
+
+1. `spawn_agent` with the configured agent name. This binds the MCP HTTP
+   session to the new agent by default.
+2. `send_agent_message` with `message`; no trailing newline is required. By
+   default it sends the message and waits for new output plus a quiet period.
+3. `get_process_output` if more context is needed.
+
+The lower-level process flow is still available when you need raw terminal
+control:
 
 1. `spawn_process` to launch the agent.
 2. `send_process_input` with the prompt.
@@ -71,10 +81,8 @@ A typical multi-agent flow:
 4. `get_process_output` if more context is needed.
 
 For `send_process_input` and `spawn_process`, `text` is typed as terminal
-input. CR/LF line endings are encoded as Enter, using carriage return in
-compatibility and disambiguate modes and `CSI 13 u` only when the session has
-enabled report-all-keys mode. Use `raw_base64` when you need exact PTY bytes
-instead.
+input. CR/LF line endings are encoded as carriage-return Enter, matching the
+plain Enter key path. Use `raw_base64` when you need exact PTY bytes instead.
 
 ## Dev Server Readiness
 

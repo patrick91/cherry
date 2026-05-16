@@ -968,6 +968,7 @@ private struct TodoListPane: View {
                     .padding(.horizontal, 18)
                     .padding(.bottom, 10)
                 }
+                .frame(height: 28, alignment: .top)
             }
 
             ZStack(alignment: .bottomTrailing) {

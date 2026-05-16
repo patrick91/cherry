@@ -5,7 +5,6 @@ import SwiftUI
 private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
 enum TerminalInputEncoder {
-    private static let reportAllKeysAsEscapeCodesFlag = 0b1000
     private static let maximumScrollStepsPerEvent = 36
     private static let terminalScrollRowsPerLine: CGFloat = 3
     private static let returnKeyCode: UInt16 = 36
@@ -60,9 +59,6 @@ enum TerminalInputEncoder {
     }
 
     static func enterSequence(keyboardProtocolFlags: Int) -> Data {
-        if keyboardProtocolFlags & reportAllKeysAsEscapeCodesFlag != 0 {
-            return Data("\u{1B}[13u".utf8)
-        }
         return Data("\r".utf8)
     }
 

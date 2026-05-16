@@ -14,13 +14,38 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     private var lastResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
+    private let writeBuffer: (ghostty_surface_t, Data) -> Void
+    private let processExit: (ghostty_surface_t, UInt32, UInt64) -> Void
 
     public init(
         write: @escaping @Sendable (Data) -> Void,
         resize: @escaping @Sendable (InMemoryTerminalViewport) -> Void
     ) {
+        self.writeHandler = write
+        self.resizeHandler = resize
+        self.writeBuffer = { surface, data in
+            data.withUnsafeBytes { buffer in
+                guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+                ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
+            }
+        }
+        self.processExit = { surface, exitCode, runtimeMilliseconds in
+            ghostty_surface_process_exit(surface, exitCode, runtimeMilliseconds)
+        }
+    }
+
+    init(
+        write: @escaping @Sendable (Data) -> Void,
+        resize: @escaping @Sendable (InMemoryTerminalViewport) -> Void,
+        writeBuffer: @escaping (ghostty_surface_t, Data) -> Void,
+        processExit: @escaping (ghostty_surface_t, UInt32, UInt64) -> Void
+    ) {
         writeHandler = write
         resizeHandler = resize
+        self.writeBuffer = writeBuffer
+        self.processExit = processExit
     }
 
     // MARK: - Surface Lifecycle
@@ -74,8 +99,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Feed data into the terminal from the host backend.
     public func receive(_ data: Data) {
         lock.lock()
-        defer { lock.unlock() }
-        guard let surface else {
+        let currentSurface = surface
+        lock.unlock()
+
+        guard let currentSurface else {
             TerminalDebugLog.log(
                 .output,
                 "terminal <- host dropped \(TerminalDebugLog.describe(data))"
@@ -88,12 +115,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             "terminal <- host \(TerminalDebugLog.describe(data))"
         )
 
-        data.withUnsafeBytes { buffer in
-            guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return
-            }
-            ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
-        }
+        writeBuffer(currentSurface, data)
     }
 
     /// Feed a UTF-8 string into the terminal from the host backend.
@@ -119,8 +141,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Signal that the host-managed process has exited.
     public func finish(exitCode: UInt32, runtimeMilliseconds: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
-        guard let surface else {
+        let currentSurface = surface
+        lock.unlock()
+
+        guard let currentSurface else {
             TerminalDebugLog.log(
                 .lifecycle,
                 "process exit ignored: missing surface exitCode=\(exitCode) runtimeMs=\(runtimeMilliseconds)"
@@ -132,7 +156,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             .lifecycle,
             "process exit exitCode=\(exitCode) runtimeMs=\(runtimeMilliseconds)"
         )
-        ghostty_surface_process_exit(surface, exitCode, runtimeMilliseconds)
+        processExit(currentSurface, exitCode, runtimeMilliseconds)
     }
 
     // MARK: - C Callbacks

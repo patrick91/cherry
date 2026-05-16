@@ -1825,7 +1825,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func handleTerminalNotification(_ notification: TerminalNotificationRequest) {
-        guard !ProjectWindowRegistry.shared.isSessionActive(self) else { return }
+        guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
         guard !(kind == .agent && parentAgentID != nil) else { return }
         lastNotification = notification
         hasUnreadNotification = true
@@ -1874,7 +1874,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func scheduleSummaryIfNeeded() {
         guard kind == .agent else { return }
-        guard !ProjectWindowRegistry.shared.isSessionActive(self) else { return }
+        guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
 
         let settings = AgentSettings.shared
         let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)

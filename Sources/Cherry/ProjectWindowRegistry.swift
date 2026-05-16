@@ -256,19 +256,39 @@ final class ProjectWindowRegistry {
         return nil
     }
 
-    func isSessionActive(_ session: TerminalSession) -> Bool {
-        guard NSApplication.shared.isActive,
-              let activeWorkspace,
-              activeWorkspace.sessions.contains(where: { $0.id == session.id })
-        else {
-            return false
+    func isSessionVisible(_ session: TerminalSession) -> Bool {
+        pruneStaleWindows()
+
+        for (projectRoot, weakWorkspace) in workspaces {
+            guard let workspace = weakWorkspace.workspace,
+                  workspace.sessions.contains(where: { $0.id == session.id }),
+                  workspace.selectedSessionID == session.id,
+                  chromeStates[projectRoot]?.chromeState?.isShowingTerminalContent ?? true,
+                  let window = windows[projectRoot]?.window
+            else {
+                continue
+            }
+
+            return Self.isTerminalWindowVisible(
+                windowIsKey: window.isKeyWindow,
+                isVisible: window.isVisible,
+                isMiniaturized: window.isMiniaturized,
+                occlusionState: window.occlusionState
+            )
         }
 
-        guard activeWorkspace.selectedSessionID == session.id else {
-            return false
-        }
+        return false
+    }
 
-        return activeChromeState?.isShowingTerminalContent ?? true
+    static func isTerminalWindowVisible(
+        windowIsKey _: Bool,
+        isVisible: Bool,
+        isMiniaturized: Bool,
+        occlusionState: NSWindow.OcclusionState
+    ) -> Bool {
+        isVisible
+            && !isMiniaturized
+            && occlusionState.contains(.visible)
     }
 
     func handleApplicationDidBecomeActive() {

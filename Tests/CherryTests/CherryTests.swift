@@ -2643,6 +2643,38 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func projectWindowVisibilityDoesNotRequireKeyWindow() {
+    #expect(ProjectWindowRegistry.isTerminalWindowVisible(
+        windowIsKey: false,
+        isVisible: true,
+        isMiniaturized: false,
+        occlusionState: [.visible]
+    ))
+}
+
+@MainActor
+@Test func projectWindowVisibilityRejectsHiddenWindows() {
+    #expect(!ProjectWindowRegistry.isTerminalWindowVisible(
+        windowIsKey: true,
+        isVisible: false,
+        isMiniaturized: false,
+        occlusionState: [.visible]
+    ))
+    #expect(!ProjectWindowRegistry.isTerminalWindowVisible(
+        windowIsKey: true,
+        isVisible: true,
+        isMiniaturized: true,
+        occlusionState: [.visible]
+    ))
+    #expect(!ProjectWindowRegistry.isTerminalWindowVisible(
+        windowIsKey: true,
+        isVisible: true,
+        isMiniaturized: false,
+        occlusionState: []
+    ))
+}
+
+@MainActor
 @Test func workspaceCloseReleasesGhosttyBridge() async throws {
     let workspace = TerminalWorkspace()
     defer {

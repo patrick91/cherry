@@ -38,7 +38,7 @@ final class TerminalNotificationCenter {
 
     func post(_ notification: TerminalNotificationRequest, for session: TerminalSession) {
         guard isDeliveryEnabled else { return }
-        guard !ProjectWindowRegistry.shared.isSessionActive(session) else { return }
+        guard !ProjectWindowRegistry.shared.isSessionVisible(session) else { return }
         guard canUseNativeNotifications else {
             reportUnavailableDeliveryIfNeeded()
             return

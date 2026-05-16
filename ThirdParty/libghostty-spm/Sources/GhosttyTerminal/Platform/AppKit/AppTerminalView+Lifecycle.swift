@@ -154,14 +154,27 @@
                 return
             }
 
-            let isRenderable = window.isKeyWindow
-                && window.isVisible
-                && !window.isMiniaturized
-                && window.occlusionState.contains(.visible)
+            let isRenderable = Self.isSurfaceRenderable(
+                windowIsKey: window.isKeyWindow,
+                isVisible: window.isVisible,
+                isMiniaturized: window.isMiniaturized,
+                occlusionState: window.occlusionState
+            )
             core.setDisplayVisible(isRenderable)
             if isRenderable {
                 core.requestImmediateTick()
             }
+        }
+
+        internal static func isSurfaceRenderable(
+            windowIsKey _: Bool,
+            isVisible: Bool,
+            isMiniaturized: Bool,
+            occlusionState: NSWindow.OcclusionState
+        ) -> Bool {
+            isVisible
+                && !isMiniaturized
+                && occlusionState.contains(.visible)
         }
 
         override func setFrameSize(_ newSize: NSSize) {

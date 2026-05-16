@@ -2,6 +2,9 @@ import Foundation
 import GhosttyKit
 @testable import GhosttyTerminal
 import Testing
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+#endif
 
 @MainActor
 struct TerminalLifecycleTests {
@@ -117,4 +120,38 @@ struct TerminalLifecycleTests {
 
         #expect(controller.retainedBridgeCount == 0)
     }
+
+    #if canImport(AppKit) && !canImport(UIKit)
+        @Test
+        func visibleNonKeyWindowCanRenderSurface() {
+            #expect(AppTerminalView.isSurfaceRenderable(
+                windowIsKey: false,
+                isVisible: true,
+                isMiniaturized: false,
+                occlusionState: [.visible]
+            ))
+        }
+
+        @Test
+        func hiddenWindowsDoNotRenderSurface() {
+            #expect(!AppTerminalView.isSurfaceRenderable(
+                windowIsKey: true,
+                isVisible: false,
+                isMiniaturized: false,
+                occlusionState: [.visible]
+            ))
+            #expect(!AppTerminalView.isSurfaceRenderable(
+                windowIsKey: true,
+                isVisible: true,
+                isMiniaturized: true,
+                occlusionState: [.visible]
+            ))
+            #expect(!AppTerminalView.isSurfaceRenderable(
+                windowIsKey: true,
+                isVisible: true,
+                isMiniaturized: false,
+                occlusionState: []
+            ))
+        }
+    #endif
 }

@@ -2221,6 +2221,80 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerSendProcessInputKeepsPlainEnterInDisambiguateMode() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let scriptURL = harness.projectRoot.appendingPathComponent("disambiguate-enter.sh")
+    let script = #"""
+    #!/bin/bash
+    printf 'ready\r\n'
+    stty raw -echo
+    printf 'listening\r\n'
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /\e\[13u/) { $chunk =~ s/\e\[13u.*//s; $buf .= $chunk; print "submitted-csi:$buf\r\n"; last; } if ($chunk =~ /\r/) { $chunk =~ s/\r.*//s; $buf .= $chunk; print "submitted-cr:$buf\r\n"; last; } if ($chunk =~ /\n/) { $chunk =~ s/\n.*//s; $buf .= $chunk; print "lf-only:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+    try harness.settings.upsertCommand(
+        ProjectCommandDefinition(name: "Disambiguate", command: scriptURL.path),
+        for: harness.projectRoot.path
+    )
+    harness.server.start()
+
+    let startResponse = try await harness.send(.startProcess(.init(
+        processName: "Disambiguate",
+        kind: "command",
+        waitMilliseconds: 500,
+        lineLimit: 20
+    )))
+    guard case .startProcess(let started)? = startResponse.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: startResponse))")
+        return
+    }
+
+    let session = try #require(harness.workspace.sessions.first { $0.id.uuidString == started.process.id })
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while Date() < deadline {
+        let output = session.snapshot(range: 0..<session.lineCount).joined(separator: "\n")
+        if output.contains("listening") {
+            break
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    #expect(session.snapshot(range: 0..<session.lineCount).joined(separator: "\n").contains("listening"))
+
+    session.ingestTestingData(Data("\u{1B}[>7u".utf8))
+    #expect(session.isEnhancedKeyboardProtocolActive)
+    #expect(session.keyboardProtocolFlags == 7)
+
+    let prompt = "enhanced-submit\n"
+    let sendResponse = try await harness.send(.sendProcessInput(.init(
+        processID: started.process.id,
+        text: prompt,
+        rawBase64: nil,
+        waitMilliseconds: 500,
+        lineLimit: 20
+    )))
+    guard case .sendProcessInput(let sent)? = sendResponse.result else {
+        Issue.record("Expected sendProcessInput result, got \(String(describing: sendResponse))")
+        return
+    }
+
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+    let expectedPayload = TerminalInputEncoder.terminalTextData(
+        prompt,
+        keyboardProtocolFlags: 7
+    )
+    #expect(sent.sentBytes == expectedPayload.count)
+    #expect(output.contains("submitted-cr:enhanced-submit"), Comment(rawValue: output))
+    #expect(!output.contains("submitted-csi"), Comment(rawValue: output))
+    #expect(!output.contains("lf-only"), Comment(rawValue: output))
+}
+
+@MainActor
 @Test func controlServerWaitForProcessIdleDoesNotReturnBeforeNewOutput() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -4968,8 +5042,27 @@ private func serviceRecord(
     let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
 
     #expect(enter == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(isEnhancedKeyboardProtocolActive: false) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(isEnhancedKeyboardProtocolActive: true) == Data("\u{1B}[13u".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 0) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 7) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 8) == Data("\u{1B}[13u".utf8))
+    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 9) == Data("\u{1B}[13u".utf8))
+}
+
+@Test func terminalTextDataEncodesLineEndingsAsEnter() async throws {
+    #expect(TerminalInputEncoder.terminalTextData(
+        "one\ntwo\r\nthree\rfour",
+        keyboardProtocolFlags: 0
+    ) == Data("one\rtwo\rthree\rfour".utf8))
+
+    #expect(TerminalInputEncoder.terminalTextData(
+        "disambiguate\n",
+        keyboardProtocolFlags: 7
+    ) == Data("disambiguate\r".utf8))
+
+    #expect(TerminalInputEncoder.terminalTextData(
+        "all-keys\n",
+        keyboardProtocolFlags: 8
+    ) == Data("all-keys\u{1B}[13u".utf8))
 }
 
 @Test func terminalArrowKeysFollowApplicationCursorMode() async throws {

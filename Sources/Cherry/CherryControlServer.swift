@@ -377,10 +377,10 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .selectProcess(.init(process: processInfo(for: session, workspace: workspace))))
         case .sendProcessInput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            let payload = try inputPayload(text: request.text, rawBase64: request.rawBase64)
-            session.send(data: payload)
+            let input = try terminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+            sendTerminalInput(input, to: session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: payload.count, output: output)))
+            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
         case .startAllCommands(let request):
             _ = try startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
@@ -655,15 +655,15 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            let payload = try inputPayload(from: request)
-            session.send(data: payload)
+            let input = try terminalInputPayload(from: request, for: session)
+            sendTerminalInput(input, to: session)
             let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
             let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
             if waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(waitMilliseconds))
             }
             let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
-            return .init(result: .sendInput(.init(terminalID: session.id.uuidString, sentBytes: payload.count, output: output)))
+            return .init(result: .sendInput(.init(terminalID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
         case .getTerminalOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             return .init(result: .getTerminalOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
@@ -1031,14 +1031,15 @@ final class CherryControlServer: @unchecked Sendable {
             agent = nil
         }
 
-        let payload = try optionalInputPayload(text: request.text, rawBase64: request.rawBase64)
-        if let payload, !payload.isEmpty {
-            if let agent {
-                await waitForAgentInitialInputReadiness(session: session, agent: agent)
-            }
-            session.send(data: payload)
+        if (request.text != nil || request.rawBase64 != nil), let agent {
+            await waitForAgentInitialInputReadiness(session: session, agent: agent)
         }
-        return (session, payload?.count ?? 0)
+
+        let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+        if let input, !input.payload.isEmpty {
+            sendTerminalInput(input, to: session)
+        }
+        return (session, input?.payload.count ?? 0)
     }
 
     @MainActor
@@ -1733,21 +1734,66 @@ final class CherryControlServer: @unchecked Sendable {
         )
     }
 
-    private func inputPayload(from request: SendInputRequest) throws -> Data {
-        try inputPayload(text: request.text, rawBase64: request.rawBase64)
+    private struct TerminalControlInput {
+        let payload: Data
+        let isRaw: Bool
     }
 
-    private func inputPayload(text: String?, rawBase64: String?) throws -> Data {
+    @MainActor
+    private func terminalInputPayload(from request: SendInputRequest, for session: TerminalSession) throws -> TerminalControlInput {
+        try terminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+    }
+
+    @MainActor
+    private func terminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput {
         switch (text, rawBase64) {
         case let (text?, nil):
-            return Data(text.utf8)
+            return .init(
+                payload: TerminalInputEncoder.terminalTextData(
+                    text,
+                    keyboardProtocolFlags: session.keyboardProtocolFlags
+                ),
+                isRaw: false
+            )
         case let (nil, rawBase64?):
             guard let data = Data(base64Encoded: rawBase64) else {
                 throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
             }
-            return data
+            return .init(payload: data, isRaw: true)
         default:
             throw CherryControlError(code: "invalid_input", message: "Provide exactly one of text or raw_base64.")
+        }
+    }
+
+    @MainActor
+    private func optionalTerminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput? {
+        switch (text, rawBase64) {
+        case let (text?, nil):
+            return .init(
+                payload: TerminalInputEncoder.terminalTextData(
+                    text,
+                    keyboardProtocolFlags: session.keyboardProtocolFlags
+                ),
+                isRaw: false
+            )
+        case let (nil, rawBase64?):
+            guard let data = Data(base64Encoded: rawBase64) else {
+                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
+            }
+            return .init(payload: data, isRaw: true)
+        case (nil, nil):
+            return nil
+        case (_?, _?):
+            throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
+        }
+    }
+
+    @MainActor
+    private func sendTerminalInput(_ input: TerminalControlInput, to session: TerminalSession) {
+        if input.isRaw {
+            session.sendRaw(data: input.payload)
+        } else {
+            session.send(data: input.payload)
         }
     }
 
@@ -1800,7 +1846,7 @@ final class CherryControlServer: @unchecked Sendable {
                 try? await Task.sleep(for: .milliseconds(150))
             }
             let enterSequence = TerminalInputEncoder.enterSequence(
-                isEnhancedKeyboardProtocolActive: session.isEnhancedKeyboardProtocolActive
+                keyboardProtocolFlags: session.keyboardProtocolFlags
             )
             session.send(data: enterSequence)
             return input.payload.count + enterSequence.count

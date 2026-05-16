@@ -893,6 +893,7 @@ private struct TodoListPane: View {
     let themeForeground: Color
 
     @AppStorage("todos.listStyle") private var listStyleRaw: String = TodoListRowStyle.thingsLike.rawValue
+    @State private var collapsedStatuses: Set<TodoStatus> = [.done]
 
     private var listStyle: Binding<TodoListRowStyle> {
         Binding(
@@ -902,6 +903,11 @@ private struct TodoListPane: View {
     }
 
     var body: some View {
+        let filterTags = availableFilterTags
+        let groupedTodos = groupedFilteredTodos
+        let filteredTodoCount = groupedTodos.values.reduce(0) { $0 + $1.count }
+        let openCount = openTodoCount
+
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Text("Todos")
@@ -913,7 +919,7 @@ private struct TodoListPane: View {
                     .fill(themeForeground.opacity(0.18))
                     .frame(height: 1)
 
-                Text("\(openTodoCount)")
+                Text("\(openCount)")
                     .font(.system(size: 12, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(themeForeground.opacity(0.58))
@@ -938,12 +944,12 @@ private struct TodoListPane: View {
             }
             .padding(.horizontal, 18)
             .padding(.top, 4)
-            .padding(.bottom, availableFilterTags.isEmpty ? 10 : 6)
+            .padding(.bottom, filterTags.isEmpty ? 10 : 6)
 
-            if !availableFilterTags.isEmpty {
+            if !filterTags.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(availableFilterTags) { tag in
+                    LazyHStack(spacing: 5) {
+                        ForEach(filterTags) { tag in
                             let isSelected = chromeState.selectedTodoTagFilterIDs.contains(tag.id)
                             Button {
                                 toggleTagFilter(tag)
@@ -968,7 +974,7 @@ private struct TodoListPane: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         ForEach(TodoStatus.allCases) { status in
-                            let todos = todos(in: status)
+                            let todos = groupedTodos[status, default: []]
                             if !todos.isEmpty {
                                 TodoStatusGroup(
                                     status: status,
@@ -976,6 +982,8 @@ private struct TodoListPane: View {
                                     selectedTodoID: chromeState.selectedTodoID,
                                     themeForeground: themeForeground,
                                     style: listStyle.wrappedValue,
+                                    isCollapsed: collapsedStatuses.contains(status),
+                                    toggleCollapsed: { toggleCollapsed(status) },
                                     select: { chromeState.selectTodo(id: $0.id) },
                                     moveUp: moveUp,
                                     moveDown: moveDown,
@@ -995,7 +1003,7 @@ private struct TodoListPane: View {
                             .foregroundStyle(themeForeground.opacity(0.7))
                             .frame(maxWidth: .infinity)
                             .padding(.top, 60)
-                        } else if filteredTodos.isEmpty {
+                        } else if filteredTodoCount == 0 {
                             ContentUnavailableView {
                                 Label("No Matching Todos", systemImage: "tag")
                             } description: {
@@ -1017,10 +1025,20 @@ private struct TodoListPane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(themeForeground.opacity(0.035))
+        .onAppear {
+            expandStatusForSelectedTodo(chromeState.selectedTodoID)
+        }
+        .onChange(of: chromeState.selectedTodoID) { _, selectedID in
+            expandStatusForSelectedTodo(selectedID)
+        }
     }
 
     private func todos(in status: TodoStatus) -> [ProjectTodo] {
         filteredTodos.filter { $0.status == status }
+    }
+
+    private var groupedFilteredTodos: [TodoStatus: [ProjectTodo]] {
+        Dictionary(grouping: filteredTodos, by: \.status)
     }
 
     private var filteredTodos: [ProjectTodo] {
@@ -1086,6 +1104,21 @@ private struct TodoListPane: View {
 
     private func clearTagFilters() {
         chromeState.selectedTodoTagFilterIDs.removeAll()
+    }
+
+    private func toggleCollapsed(_ status: TodoStatus) {
+        if collapsedStatuses.contains(status) {
+            collapsedStatuses.remove(status)
+        } else {
+            collapsedStatuses.insert(status)
+        }
+    }
+
+    private func expandStatusForSelectedTodo(_ selectedID: UUID?) {
+        guard let selectedID,
+              let todo = todoStore.todos.first(where: { $0.id == selectedID })
+        else { return }
+        collapsedStatuses.remove(todo.status)
     }
 }
 
@@ -1155,6 +1188,8 @@ private struct TodoStatusGroup: View {
     let selectedTodoID: UUID?
     let themeForeground: Color
     let style: TodoListRowStyle
+    let isCollapsed: Bool
+    let toggleCollapsed: () -> Void
     let select: (ProjectTodo) -> Void
     let moveUp: (ProjectTodo) -> Void
     let moveDown: (ProjectTodo) -> Void
@@ -1167,93 +1202,103 @@ private struct TodoStatusGroup: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 7) {
-                Image(systemName: status.symbolName)
-                    .font(.system(size: 10.5, weight: .semibold))
-                Text(status.displayName.uppercased())
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .tracking(0.6)
-                Spacer(minLength: 4)
-                Text("\(todos.count)")
-                    .font(.system(size: 11, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(themeForeground.opacity(0.45))
+            Button(action: toggleCollapsed) {
+                HStack(spacing: 7) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 10)
+                    Image(systemName: status.symbolName)
+                        .font(.system(size: 10.5, weight: .semibold))
+                    Text(status.displayName.uppercased())
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .tracking(0.6)
+                    Spacer(minLength: 4)
+                    Text("\(todos.count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(themeForeground.opacity(0.45))
+                }
             }
+            .buttonStyle(.plain)
             .foregroundStyle(themeForeground.opacity(0.6))
             .padding(.horizontal, 10)
             .padding(.bottom, 2)
 
-            ForEach(todos) { todo in
-                TodoListRow(
-                    todo: todo,
-                    isSelected: selectedTodoID == todo.id,
-                    themeForeground: themeForeground,
-                    style: style,
-                    action: { select(todo) }
-                )
-                .offset(y: draggedTodoID == todo.id ? draggedRowOffsetY : 0)
-                .zIndex(draggedTodoID == todo.id ? 1 : 0)
-                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
-                    [todo.id: anchor]
-                }
-                .contextMenu {
-                    Button("Copy Link") {
-                        copyCherryLink(cherryLink(for: todo))
+            if !isCollapsed {
+                ForEach(todos) { todo in
+                    TodoListRow(
+                        todo: todo,
+                        isSelected: selectedTodoID == todo.id,
+                        themeForeground: themeForeground,
+                        style: style,
+                        action: { select(todo) }
+                    )
+                    .offset(y: draggedTodoID == todo.id ? draggedRowOffsetY : 0)
+                    .zIndex(draggedTodoID == todo.id ? 1 : 0)
+                    .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
+                        [todo.id: anchor]
                     }
-
-                    Divider()
-
-                    Button("Move Up") { moveUp(todo) }
-                    Button("Move Down") { moveDown(todo) }
-
-                    Menu("Move to Status") {
-                        ForEach(TodoStatus.allCases) { targetStatus in
-                            Button(targetStatus.displayName) {
-                                moveToStatus(todo, targetStatus)
-                            }
-                            .disabled(targetStatus == todo.status)
+                    .contextMenu {
+                        Button("Copy Link") {
+                            copyCherryLink(cherryLink(for: todo))
                         }
-                    }
 
-                    Divider()
+                        Divider()
 
-                    Button("Delete", role: .destructive) {
-                        delete(todo)
+                        Button("Move Up") { moveUp(todo) }
+                        Button("Move Down") { moveDown(todo) }
+
+                        Menu("Move to Status") {
+                            ForEach(TodoStatus.allCases) { targetStatus in
+                                Button(targetStatus.displayName) {
+                                    moveToStatus(todo, targetStatus)
+                                }
+                                .disabled(targetStatus == todo.status)
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Delete", role: .destructive) {
+                            delete(todo)
+                        }
                     }
                 }
             }
         }
         .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
-            GeometryReader { geometry in
-                SidebarInteractionOverlay(
-                    rows: todos.compactMap { todo in
-                        rowBounds[todo.id].map { anchor in
-                            SidebarRowFrame(id: todo.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
+            if !isCollapsed {
+                GeometryReader { geometry in
+                    SidebarInteractionOverlay(
+                        rows: todos.compactMap { todo in
+                            rowBounds[todo.id].map { anchor in
+                                SidebarRowFrame(id: todo.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
+                            }
+                        },
+                        onSelect: { todoID in
+                            guard let todo = todos.first(where: { $0.id == todoID }) else { return }
+                            select(todo)
+                        },
+                        onDragChanged: { todoID, offsetY in
+                            draggedTodoID = todoID
+                            draggedRowOffsetY = offsetY
+                        },
+                        onMove: { todoID, targetIndex in
+                            guard let todo = todos.first(where: { $0.id == todoID }) else { return }
+                            var transaction = Transaction()
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                reorder(todo, targetIndex)
+                            }
+                        },
+                        onDragEnded: {
+                            withAnimation(.snappy(duration: 0.16)) {
+                                draggedTodoID = nil
+                                draggedRowOffsetY = 0
+                            }
                         }
-                    },
-                    onSelect: { todoID in
-                        guard let todo = todos.first(where: { $0.id == todoID }) else { return }
-                        select(todo)
-                    },
-                    onDragChanged: { todoID, offsetY in
-                        draggedTodoID = todoID
-                        draggedRowOffsetY = offsetY
-                    },
-                    onMove: { todoID, targetIndex in
-                        guard let todo = todos.first(where: { $0.id == todoID }) else { return }
-                        var transaction = Transaction()
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            reorder(todo, targetIndex)
-                        }
-                    },
-                    onDragEnded: {
-                        withAnimation(.snappy(duration: 0.16)) {
-                            draggedTodoID = nil
-                            draggedRowOffsetY = 0
-                        }
-                    }
-                )
+                    )
+                }
             }
         }
     }

@@ -1424,7 +1424,16 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func send(data: Data) {
         guard acceptsInput else { return }
-        let outboundData = normalizedInputData(data)
+        sendInputData(data, normalize: true)
+    }
+
+    func sendRaw(data: Data) {
+        guard acceptsInput else { return }
+        sendInputData(data, normalize: false)
+    }
+
+    private func sendInputData(_ data: Data, normalize: Bool) {
+        let outboundData = normalize ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
             noteHumanInputIfNeeded()
             noteInputOutputBaseline()

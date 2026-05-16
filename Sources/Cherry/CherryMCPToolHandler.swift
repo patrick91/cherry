@@ -155,8 +155,8 @@ enum CherryMCPTools {
                 "name": string("Configured agent or command name. Not used for terminal."),
                 "title": string("Optional custom title."),
                 "working_directory": string("Optional terminal working directory."),
-                "text": string("Optional text to send exactly as provided after launch."),
-                "raw_base64": string("Optional raw bytes to send after launch, base64-encoded."),
+                "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
+                "raw_base64": string("Optional exact raw bytes to send after launch, base64-encoded."),
                 "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
@@ -199,8 +199,8 @@ enum CherryMCPTools {
             "send_process_input",
             "Send terminal text or raw bytes to an existing process by process_id or process_name.",
             properties: processSelectorProperties([
-                "text": string("Text to send exactly as provided."),
-                "raw_base64": string("Raw bytes to send, base64-encoded."),
+                "text": string("Text to type. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
+                "raw_base64": string("Exact raw bytes to send, base64-encoded."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ])

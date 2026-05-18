@@ -4187,6 +4187,112 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(text == "{\"state\":\"WORKING\",\"summary\":\"reviewing check runs\"}")
 }
 
+@Test func commandPaletteMatcherSupportsCaseInsensitiveSubsequenceTokens() {
+    #expect(CommandPaletteMatcher.matches(
+        query: "tgl drk",
+        fields: ["Toggle Light/Dark Mode", "Switch app appearance"]
+    ))
+    #expect(CommandPaletteMatcher.matches(
+        query: "fast api",
+        fields: ["FastAPI Cloud", "/Users/patrick/github/fastapi-cloud"]
+    ))
+    #expect(!CommandPaletteMatcher.matches(
+        query: "tgl zzz",
+        fields: ["Toggle Light/Dark Mode", "Switch app appearance"]
+    ))
+}
+
+@MainActor
+@Test func commandPaletteRootItemsExcludeProjectsUntilSearchQueryExists() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        .appendingPathComponent("PaletteRootProject", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let project = CherryProject(root: directory.path)
+    let agent = ResolvedAgentTool(
+        definition: AgentToolDefinition(name: "Codex", command: "codex"),
+        source: .global
+    )
+
+    let items = CommandPaletteRootItem.filteredItems(
+        query: "",
+        agents: [agent],
+        projects: [project]
+    )
+    let ids = items.map(\.id)
+
+    #expect(ids.contains("command:projects"))
+    #expect(ids.contains("agent:codex"))
+    #expect(!ids.contains("project:\(project.root)"))
+}
+
+@MainActor
+@Test func commandPaletteRootItemsIncludeMatchingProjectsDuringRootSearch() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let matchingDirectory = root.appendingPathComponent("PaletteRootSearchTarget", isDirectory: true)
+    let otherDirectory = root.appendingPathComponent("OtherProject", isDirectory: true)
+    try FileManager.default.createDirectory(at: matchingDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: otherDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let matchingProject = CherryProject(root: matchingDirectory.path)
+    let otherProject = CherryProject(root: otherDirectory.path)
+
+    let items = CommandPaletteRootItem.filteredItems(
+        query: "rootsearchtarget",
+        agents: [],
+        projects: [matchingProject, otherProject]
+    )
+
+    #expect(items.map(\.id) == ["project:\(matchingProject.root)"])
+    #expect(items.first?.icon == "folder.fill")
+    #expect(items.first?.title == "PaletteRootSearchTarget")
+    #expect(items.first?.subtitle == matchingProject.root)
+    #expect(items.first?.isCurrent(selectedProjectRoot: matchingProject.root) == true)
+}
+
+@MainActor
+@Test func commandPaletteRootItemsFuzzyMatchProjectsDuringRootSearch() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let matchingDirectory = root.appendingPathComponent("PaletteRootSearchTarget", isDirectory: true)
+    let otherDirectory = root.appendingPathComponent("OtherProject", isDirectory: true)
+    try FileManager.default.createDirectory(at: matchingDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: otherDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let matchingProject = CherryProject(root: matchingDirectory.path)
+    let otherProject = CherryProject(root: otherDirectory.path)
+
+    let items = CommandPaletteRootItem.filteredItems(
+        query: "prst",
+        agents: [],
+        projects: [matchingProject, otherProject]
+    )
+
+    #expect(items.map(\.id) == ["project:\(matchingProject.root)"])
+}
+
+@Test func appShortcutMonitorRoutesCommandSToSidebarToggle() {
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "s",
+        modifiers: [.command]
+    ) == .toggleSidebar)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "s",
+        modifiers: [.command, .shift]
+    ) == nil)
+}
+
 @MainActor
 @Test func agentSettingsPersistProjectCommandsPerProject() async throws {
     let defaultsName = "CherryTests.ProjectCommands.\(UUID().uuidString)"

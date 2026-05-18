@@ -2211,7 +2211,7 @@ private enum CommandPaletteMode {
     case agentPresets
 }
 
-private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
+enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case projects
     case addProject
     case agents
@@ -2251,16 +2251,50 @@ private enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     }
 
     func matches(_ query: String) -> Bool {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return true }
-        return title.localizedCaseInsensitiveContains(normalizedQuery) ||
-            subtitle.localizedCaseInsensitiveContains(normalizedQuery)
+        CommandPaletteMatcher.matches(query: query, fields: [title, subtitle])
     }
 }
 
-private enum CommandPaletteRootItem: Identifiable {
+enum CommandPaletteMatcher {
+    static func matches(query: String, fields: [String]) -> Bool {
+        let tokens = query
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard !tokens.isEmpty else { return true }
+
+        return tokens.allSatisfy { token in
+            fields.contains { field in
+                fieldMatches(token, in: field)
+            }
+        }
+    }
+
+    private static func fieldMatches(_ token: String, in field: String) -> Bool {
+        let normalizedToken = normalized(token)
+        guard !normalizedToken.isEmpty else { return true }
+
+        let normalizedField = normalized(field)
+        var fieldIndex = normalizedField.startIndex
+        for character in normalizedToken {
+            guard let matchIndex = normalizedField[fieldIndex...].firstIndex(of: character) else {
+                return false
+            }
+            fieldIndex = normalizedField.index(after: matchIndex)
+        }
+        return true
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+    }
+}
+
+enum CommandPaletteRootItem: Identifiable, Equatable {
     case command(CommandPaletteCommand)
     case agent(ResolvedAgentTool)
+    case project(CherryProject)
 
     var id: String {
         switch self {
@@ -2268,6 +2302,8 @@ private enum CommandPaletteRootItem: Identifiable {
             "command:\(command.id)"
         case .agent(let agent):
             "agent:\(agent.id)"
+        case .project(let project):
+            "project:\(project.root)"
         }
     }
 
@@ -2277,6 +2313,8 @@ private enum CommandPaletteRootItem: Identifiable {
             command.icon
         case .agent:
             "terminal"
+        case .project:
+            "folder.fill"
         }
     }
 
@@ -2286,6 +2324,8 @@ private enum CommandPaletteRootItem: Identifiable {
             command.title
         case .agent(let agent):
             agent.name
+        case .project(let project):
+            project.name
         }
     }
 
@@ -2295,6 +2335,49 @@ private enum CommandPaletteRootItem: Identifiable {
             command.subtitle
         case .agent(let agent):
             agent.commandLine
+        case .project(let project):
+            project.root
+        }
+    }
+
+    static func filteredItems(
+        query: String,
+        agents: [ResolvedAgentTool],
+        projects: [CherryProject]
+    ) -> [CommandPaletteRootItem] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commands = CommandPaletteCommand.allCases
+            .filter { $0.matches(query) }
+            .map(CommandPaletteRootItem.command)
+        let matchedAgents = agents
+            .filter { agent in
+                guard !normalizedQuery.isEmpty else { return true }
+                return CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                    agent.name,
+                    agent.commandLine
+                ])
+            }
+            .map(CommandPaletteRootItem.agent)
+        let matchedProjects = normalizedQuery.isEmpty
+            ? []
+            : projects
+                .filter { project in
+                    CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                        project.name,
+                        project.root
+                    ])
+                }
+                .map(CommandPaletteRootItem.project)
+
+        return commands + matchedAgents + matchedProjects
+    }
+
+    func isCurrent(selectedProjectRoot: String?) -> Bool {
+        switch self {
+        case .command, .agent:
+            false
+        case .project(let project):
+            project.root == selectedProjectRoot
         }
     }
 }
@@ -2439,21 +2522,22 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
-    private var filteredCommands: [CommandPaletteCommand] {
-        CommandPaletteCommand.allCases.filter { $0.matches(query) }
-    }
-
     private var filteredRootItems: [CommandPaletteRootItem] {
-        filteredCommands.map(CommandPaletteRootItem.command) +
-            filteredAgents.map(CommandPaletteRootItem.agent)
+        CommandPaletteRootItem.filteredItems(
+            query: query,
+            agents: settings.resolvedProject(for: selectedProjectRoot).launchableAgents,
+            projects: settings.projects
+        )
     }
 
     private var filteredProjects: [CherryProject] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return settings.projects }
         return settings.projects.filter { project in
-            project.name.localizedCaseInsensitiveContains(normalizedQuery) ||
-                project.root.localizedCaseInsensitiveContains(normalizedQuery)
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                project.name,
+                project.root
+            ])
         }
     }
 
@@ -2462,8 +2546,10 @@ private struct CommandPaletteOverlay: View {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return agents }
         return agents.filter { agent in
-            agent.name.localizedCaseInsensitiveContains(normalizedQuery) ||
-                agent.commandLine.localizedCaseInsensitiveContains(normalizedQuery)
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                agent.name,
+                agent.commandLine
+            ])
         }
     }
 
@@ -2471,8 +2557,10 @@ private struct CommandPaletteOverlay: View {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return AgentConfiguration.presets }
         return AgentConfiguration.presets.filter { preset in
-            preset.name.localizedCaseInsensitiveContains(normalizedQuery) ||
-                preset.commandLine.localizedCaseInsensitiveContains(normalizedQuery)
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                preset.name,
+                preset.commandLine
+            ])
         }
     }
 
@@ -2487,7 +2575,7 @@ private struct CommandPaletteOverlay: View {
                     title: item.title,
                     subtitle: item.subtitle,
                     isSelected: index == selectedIndex,
-                    isCurrent: false
+                    isCurrent: item.isCurrent(selectedProjectRoot: selectedProjectRoot)
                 ) {
                     selectedIndex = index
                     commitSelection()
@@ -2680,6 +2768,9 @@ private struct CommandPaletteOverlay: View {
                 }
             case .agent(let agent):
                 launch(agent)
+            case .project(let project):
+                dismiss()
+                openProject(project)
             }
         case .projects:
             if filteredProjects.isEmpty {

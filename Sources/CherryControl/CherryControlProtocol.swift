@@ -102,6 +102,7 @@ public enum CherryControl {
 public enum CherryControlRequest: Codable, Equatable, Sendable {
     indirect case scoped(ScopedControlRequest)
     case listProjects
+    case openProject(OpenProjectRequest)
     case getProjectStatus
     case resolveLink(ResolveDeepLinkRequest)
     case listProcesses(ListProcessesRequest)
@@ -774,6 +775,7 @@ public struct CherryControlResponse: Codable, Equatable, Sendable {
 
 public enum CherryControlResult: Codable, Equatable, Sendable {
     case listProjects(ListProjectsResult)
+    case openProject(OpenProjectResult)
     case getProjectStatus(ProjectStatusResult)
     case resolveLink(ResolveDeepLinkResult)
     case listProcesses(ListProcessesResult)
@@ -896,6 +898,14 @@ public struct ListTerminalsResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct OpenProjectRequest: Codable, Equatable, Sendable {
+    public let projectRoot: String
+
+    public init(projectRoot: String) {
+        self.projectRoot = projectRoot
+    }
+}
+
 public struct ProjectInfo: Codable, Equatable, Sendable {
     public let root: String
     public let name: String
@@ -935,6 +945,16 @@ public struct ListProjectsResult: Codable, Equatable, Sendable {
     public init(activeProjectRoot: String?, projects: [ProjectInfo]) {
         self.activeProjectRoot = activeProjectRoot
         self.projects = projects
+    }
+}
+
+public struct OpenProjectResult: Codable, Equatable, Sendable {
+    public let projectRoot: String
+    public let alreadyOpen: Bool
+
+    public init(projectRoot: String, alreadyOpen: Bool) {
+        self.projectRoot = projectRoot
+        self.alreadyOpen = alreadyOpen
     }
 }
 

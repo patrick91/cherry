@@ -189,6 +189,7 @@ final class TerminalSettings: ObservableObject {
             builder.withMinimumContrast(minimumContrast)
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
+            builder.withCustom("scrollback-limit", "\(Defaults.ghosttyScrollbackLimitBytes)")
         }
     }
 
@@ -250,6 +251,7 @@ final class TerminalSettings: ObservableObject {
         static let fontSize = 14.0
         static let cursorBlink = true
         static let minimumContrast = 1.15
+        static let ghosttyScrollbackLimitBytes = 4_000_000
         static let sidebarBackgroundDepth = 0.08
         static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
         static let projectColorDisplayMode = ProjectColorDisplayMode.accent

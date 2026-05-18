@@ -16,6 +16,7 @@ final class CherryControlServer: @unchecked Sendable {
     private let todoStoreForProjectRootProvider: @MainActor (String) -> ProjectTodoStore?
     private let chromeStateForProjectRootProvider: @MainActor (String) -> ProjectWindowChromeState?
     private let openProjectRootsProvider: @MainActor () -> [String]
+    private let openProjectProvider: @MainActor (String) -> Void
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
     private let socketURL: URL
@@ -56,6 +57,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.openProjectRootsProvider = {
             workspace.projectRoot.map { [$0] } ?? []
         }
+        self.openProjectProvider = { _ in }
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -88,6 +90,7 @@ final class CherryControlServer: @unchecked Sendable {
         openProjectRootsProvider: @escaping @MainActor () -> [String] = {
             ProjectWindowRegistry.shared.projectRoots
         },
+        openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector()
@@ -105,6 +108,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.todoStoreForProjectRootProvider = todoStoreForProjectRootProvider
         self.chromeStateForProjectRootProvider = chromeStateForProjectRootProvider
         self.openProjectRootsProvider = openProjectRootsProvider
+        self.openProjectProvider = openProjectProvider
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
         self.socketURL = socketURL
@@ -293,6 +297,8 @@ final class CherryControlServer: @unchecked Sendable {
             return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
         case .listProjects:
             return .init(result: .listProjects(listProjects(workspace: workspace)))
+        case .openProject(let request):
+            return .init(result: .openProject(try openProject(request, fallbackWorkspace: workspace)))
         case .getProjectStatus:
             return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
         case .resolveLink(let request):
@@ -881,19 +887,44 @@ final class CherryControlServer: @unchecked Sendable {
         if let activeRoot, !roots.contains(activeRoot) {
             roots.insert(activeRoot, at: 0)
         }
+        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
 
         return ListProjectsResult(
             activeProjectRoot: activeRoot,
             projects: roots.map { root in
-                ProjectInfo(
+                let standardizedRoot = standardizedProjectRoot(root)
+                return ProjectInfo(
                     root: root,
                     name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
                     active: root == activeRoot,
-                    open: root == activeRoot,
+                    open: openRoots.contains(standardizedRoot),
                     features: projectFeatureAvailability(for: root)
                 )
             }
         )
+    }
+
+    @MainActor
+    private func openProject(
+        _ request: OpenProjectRequest,
+        fallbackWorkspace workspace: TerminalWorkspace
+    ) throws -> OpenProjectResult {
+        let requestedRoot = standardizedProjectRoot(request.projectRoot)
+        let candidateRoots = agentSettings.projects.map(\.root)
+            + openProjectRootsProvider()
+            + [workspace.projectRoot].compactMap { $0 }
+        guard let projectRoot = candidateRoots.first(where: { standardizedProjectRoot($0) == requestedRoot }) else {
+            throw CherryControlError(
+                code: "project_not_found",
+                message: "Cherry project is not configured: \(request.projectRoot)."
+            )
+        }
+
+        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
+        let alreadyOpen = openRoots.contains(standardizedProjectRoot(projectRoot))
+        openProjectProvider(projectRoot)
+
+        return OpenProjectResult(projectRoot: projectRoot, alreadyOpen: alreadyOpen)
     }
 
     @MainActor

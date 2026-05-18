@@ -294,7 +294,8 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumBytes: Int
     private let trimThresholdBytes: Int
-    private var data = Data()
+    private var chunks: [Data] = []
+    private var byteCount = 0
     private var observers: [UUID: @Sendable (Data) -> Void] = [:]
 
     init(maximumBytes: Int = 1_048_576) {
@@ -306,10 +307,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         guard !chunk.isEmpty else { return }
 
         let currentObservers: [@Sendable (Data) -> Void] = lock.withLock {
-            data.append(chunk)
-            if data.count > trimThresholdBytes {
-                data.removeFirst(data.count - maximumBytes)
-            }
+            appendLocked(chunk)
             return Array(observers.values)
         }
 
@@ -321,8 +319,8 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     func observe(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
         let id = UUID()
         lock.withLock {
-            if replayExistingOutput, !data.isEmpty {
-                observer(data)
+            if replayExistingOutput, byteCount > 0 {
+                observer(snapshotLocked(maxBytes: maximumBytes).data)
             }
             observers[id] = observer
         }
@@ -344,18 +342,88 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
     func snapshot(maxBytes requestedMaxBytes: Int) -> (data: Data, truncated: Bool) {
         lock.withLock {
             let maxBytes = max(0, min(requestedMaxBytes, maximumBytes))
-            guard data.count > maxBytes else {
-                return (data, false)
-            }
-
-            return (data.suffix(maxBytes), true)
+            return snapshotLocked(maxBytes: maxBytes)
         }
     }
 
     func clear() {
         lock.withLock {
-            data.removeAll(keepingCapacity: true)
+            chunks.removeAll(keepingCapacity: false)
+            byteCount = 0
         }
+    }
+
+    private func appendLocked(_ chunk: Data) {
+        var retainedChunk = Data()
+        if chunk.count > maximumBytes {
+            retainedChunk.reserveCapacity(maximumBytes)
+            retainedChunk.append(chunk.suffix(maximumBytes))
+        } else {
+            retainedChunk.reserveCapacity(chunk.count)
+            retainedChunk.append(chunk)
+        }
+        chunks.append(retainedChunk)
+        byteCount += retainedChunk.count
+
+        guard byteCount > trimThresholdBytes else { return }
+        trimLocked(to: maximumBytes)
+    }
+
+    private func trimLocked(to targetBytes: Int) {
+        var excessBytes = max(0, byteCount - targetBytes)
+
+        var removeCount = 0
+        while excessBytes > 0, removeCount < chunks.count {
+            let first = chunks[removeCount]
+            if first.count <= excessBytes {
+                byteCount -= first.count
+                excessBytes -= first.count
+                removeCount += 1
+            } else {
+                break
+            }
+        }
+
+        if removeCount > 0 {
+            chunks.removeFirst(removeCount)
+        }
+
+        if excessBytes > 0, let first = chunks.first {
+            chunks[0] = Data(first.dropFirst(excessBytes))
+            byteCount -= excessBytes
+        }
+
+        if chunks.isEmpty {
+            byteCount = 0
+        }
+    }
+
+    private func snapshotLocked(maxBytes: Int) -> (data: Data, truncated: Bool) {
+        guard maxBytes > 0, byteCount > 0 else {
+            return (Data(), byteCount > 0)
+        }
+
+        let outputByteCount = min(maxBytes, byteCount)
+        var remainingBytes = outputByteCount
+        var slices: [Data.SubSequence] = []
+
+        for chunk in chunks.reversed() {
+            guard remainingBytes > 0 else { break }
+            if chunk.count <= remainingBytes {
+                slices.append(chunk[chunk.startIndex..<chunk.endIndex])
+                remainingBytes -= chunk.count
+            } else {
+                slices.append(chunk.suffix(remainingBytes))
+                remainingBytes = 0
+            }
+        }
+
+        var output = Data()
+        output.reserveCapacity(outputByteCount)
+        for slice in slices.reversed() {
+            output.append(slice)
+        }
+        return (output, byteCount > maxBytes)
     }
 }
 
@@ -396,6 +464,10 @@ private final class TerminalMetadataParser {
     private var controlBuffer = [UInt8]()
 
     func parse(_ data: Data) -> [TerminalMetadataEvent] {
+        if isGround, !Self.containsEscape(in: data) {
+            return []
+        }
+
         var events: [TerminalMetadataEvent] = []
 
         for byte in data {
@@ -444,6 +516,22 @@ private final class TerminalMetadataParser {
         }
 
         return events
+    }
+
+    private static func containsEscape(in data: Data) -> Bool {
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress, rawBuffer.count > 0 else {
+                return false
+            }
+            return memchr(baseAddress, 0x1B, rawBuffer.count) != nil
+        }
+    }
+
+    private var isGround: Bool {
+        if case .ground = state {
+            return true
+        }
+        return false
     }
 
     private func appendOSCByte(_ byte: UInt8) {
@@ -563,6 +651,10 @@ private final class TerminalMetadataParser {
     }
 
     private static func localHostnames() -> Set<String> {
+        cachedLocalHostnames
+    }
+
+    private static let cachedLocalHostnames: Set<String> = {
         var names = Set<String>()
 
         var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
@@ -585,7 +677,7 @@ private final class TerminalMetadataParser {
         }
 
         return names
-    }
+    }()
 
     private static func keyboardProtocolEvent(from rawPayload: String, finalByte: UInt8) -> TerminalMetadataEvent? {
         guard finalByte == UInt8(ascii: "u"), let prefix = rawPayload.first else { return nil }
@@ -1539,6 +1631,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let ghosttyBridgeStorage else { return }
         ghosttyBridgeStorage.releaseResources()
         self.ghosttyBridgeStorage = nil
+    }
+
+    func detachGhosttyBridge(from container: GhosttyTerminalContainerView) {
+        ghosttyBridgeStorage?.detach(from: container)
     }
 
     func stopManagedCommand() {

@@ -963,6 +963,8 @@ enum CherryMCPTools {
         switch result {
         case .listProjects(let payload):
             return try encodedResult(payload)
+        case .openProject(let payload):
+            return try encodedResult(payload)
         case .getProjectStatus(let payload):
             return try encodedResult(payload)
         case .resolveLink(let payload):

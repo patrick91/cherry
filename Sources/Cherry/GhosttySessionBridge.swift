@@ -16,11 +16,16 @@ private func sidebarResizeLog(_ message: @autoclosure () -> String) {
 }
 
 private final class GhosttyOutputSink: @unchecked Sendable {
+    private static let maximumRetainedPendingBytes = 1_048_576
+    private static let burstCoalescingDelay: DispatchTimeInterval = .milliseconds(4)
+    private static let burstDetectionWindowNanoseconds: UInt64 = 12_000_000
+
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "Cherry.GhosttyOutputSink", qos: .userInitiated)
     private var session: InMemoryTerminalSession
     private var pendingData = Data()
     private var isDrainScheduled = false
+    private var lastDrainUptimeNanoseconds: UInt64?
 
     init(session: InMemoryTerminalSession) {
         self.session = session
@@ -30,21 +35,36 @@ private final class GhosttyOutputSink: @unchecked Sendable {
         lock.withLock {
             self.session = session
             pendingData.removeAll(keepingCapacity: false)
+            lastDrainUptimeNanoseconds = nil
         }
     }
 
     func receive(_ data: Data) {
         guard !data.isEmpty else { return }
 
-        let shouldScheduleDrain = lock.withLock {
+        let drainDelay: DispatchTimeInterval? = lock.withLock {
             pendingData.append(data)
-            guard !isDrainScheduled else { return false }
+            guard !isDrainScheduled else { return nil }
             isDrainScheduled = true
-            return true
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard let lastDrainUptimeNanoseconds else { return .never }
+            let elapsed = now >= lastDrainUptimeNanoseconds
+                ? now - lastDrainUptimeNanoseconds
+                : .max
+            return elapsed <= Self.burstDetectionWindowNanoseconds
+                ? Self.burstCoalescingDelay
+                : .never
         }
 
-        if shouldScheduleDrain {
+        switch drainDelay {
+        case .none:
+            return
+        case .some(.never):
             queue.async { [weak self] in
+                self?.drainPendingData()
+            }
+        case let .some(delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.drainPendingData()
             }
         }
@@ -55,11 +75,16 @@ private final class GhosttyOutputSink: @unchecked Sendable {
             let next: (session: InMemoryTerminalSession, data: Data)? = lock.withLock {
                 guard !pendingData.isEmpty else {
                     isDrainScheduled = false
+                    lastDrainUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
                     return nil
                 }
 
                 let data = pendingData
-                pendingData.removeAll(keepingCapacity: true)
+                if pendingData.count > Self.maximumRetainedPendingBytes {
+                    pendingData = Data()
+                } else {
+                    pendingData.removeAll(keepingCapacity: true)
+                }
                 return (session, data)
             }
 
@@ -224,6 +249,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         isReleased = true
         pendingFeedActivation = false
         uninstallOutputObserver()
+        uninstallSettingsObserver()
         if let scrollContainer {
             terminalView.setSurfaceVisible(false)
             scrollContainer.uninstall(terminalView: terminalView)
@@ -298,9 +324,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     deinit {
         MainActor.assumeIsolated {
             releaseResources()
-            if let settingsObserver {
-                NotificationCenter.default.removeObserver(settingsObserver)
-            }
+            uninstallSettingsObserver()
             Self.liveBridgeCount -= 1
         }
     }
@@ -368,10 +392,16 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             object: TerminalSettings.shared,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.applyTerminalSettings()
             }
         }
+    }
+
+    private func uninstallSettingsObserver() {
+        guard let settingsObserver else { return }
+        NotificationCenter.default.removeObserver(settingsObserver)
+        self.settingsObserver = nil
     }
 
     private func applyTerminalSettings() {
@@ -482,7 +512,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            activeSession?.ghosttyBridge.detach(from: self)
+            activeSession?.releaseGhosttyBridge()
             activeSession = session
             session.ghosttyBridge.attach(to: self)
             requestTerminalFocus()
@@ -574,13 +604,16 @@ final class GhosttyTerminalContainerView: NSView {
         }
     }
 
-    func detachActiveSession(clearsSession: Bool = true) {
+    func detachActiveSession(clearsSession: Bool = true, releasesBridge: Bool = true) {
         guard let session = activeSession else {
             activeBridge = nil
             return
         }
 
-        session.ghosttyBridge.detach(from: self)
+        session.detachGhosttyBridge(from: self)
+        if releasesBridge {
+            session.releaseGhosttyBridge()
+        }
         if clearsSession {
             activeSession = nil
         }
@@ -883,7 +916,7 @@ final class GhosttyTerminalContainerView: NSView {
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.handleScrollBoundsChange()
             }
         })
@@ -893,7 +926,7 @@ final class GhosttyTerminalContainerView: NSView {
             object: scrollView,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.isLiveScrolling = true
             }
         })
@@ -903,7 +936,7 @@ final class GhosttyTerminalContainerView: NSView {
             object: scrollView,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.isLiveScrolling = false
             }
         })
@@ -913,7 +946,7 @@ final class GhosttyTerminalContainerView: NSView {
             object: scrollView,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.handleLiveScroll()
             }
         })

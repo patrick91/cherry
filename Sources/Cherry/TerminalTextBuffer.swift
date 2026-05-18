@@ -646,8 +646,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     }
 
     mutating func clear() {
-        mainGrid.removeAll(keepingCapacity: true)
-        alternateGrid.removeAll(keepingCapacity: true)
+        mainGrid.removeAll(keepingCapacity: false)
+        alternateGrid.removeAll(keepingCapacity: false)
         isUsingAlternateScreen = false
         savedCursorState = nil
         cursorRow = 0
@@ -659,8 +659,8 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         scrollRegionBottom = nil
         currentMouseState = TerminalMouseState()
         parserState = .ground
-        controlBuffer.removeAll(keepingCapacity: true)
-        pendingText.removeAll(keepingCapacity: true)
+        controlBuffer.removeAll(keepingCapacity: false)
+        pendingText.removeAll(keepingCapacity: false)
         escapedStringPendingST = false
         currentStyle = TerminalTextStyle()
         g0Charset = .ascii
@@ -2090,11 +2090,14 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
 
     private var completedLines: [String] = []
     private var currentLine = ""
+    private var alternateCompletedLines: [String] = []
+    private var alternateCurrentLine = ""
     private var parserState = ParserState.ground
     private var controlBuffer: [UInt8] = []
     private var pendingText: [UInt8] = []
     private var escapedStringPendingST = false
     private var isUsingAlternateScreen = false
+    private var currentViewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var isApplicationCursorMode = false
     private var currentMouseState = TerminalMouseState()
     private var cursorRow = 0
@@ -2108,7 +2111,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     }
 
     var lineCount: Int {
-        max(1, completedLines.count + 1)
+        max(1, activeCompletedLineCount + 1)
     }
 
     var storedLineCount: Int {
@@ -2183,11 +2186,13 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     }
 
     mutating func clear() {
-        completedLines.removeAll(keepingCapacity: true)
-        currentLine.removeAll(keepingCapacity: true)
+        completedLines.removeAll(keepingCapacity: false)
+        currentLine.removeAll(keepingCapacity: false)
+        alternateCompletedLines.removeAll(keepingCapacity: false)
+        alternateCurrentLine.removeAll(keepingCapacity: false)
         parserState = .ground
-        controlBuffer.removeAll(keepingCapacity: true)
-        pendingText.removeAll(keepingCapacity: true)
+        controlBuffer.removeAll(keepingCapacity: false)
+        pendingText.removeAll(keepingCapacity: false)
         escapedStringPendingST = false
         isUsingAlternateScreen = false
         isApplicationCursorMode = false
@@ -2198,13 +2203,16 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         isCursorVisible = true
     }
 
-    mutating func resize(to viewportSize: TerminalViewportSize) {}
+    mutating func resize(to viewportSize: TerminalViewportSize) {
+        currentViewportSize = viewportSize
+        trimIfNeeded(force: true)
+    }
 
     mutating func appendPlainLines(_ newLines: [String]) {
         guard !newLines.isEmpty else { return }
         flushPendingText()
-        completedLines.append(contentsOf: newLines)
-        currentLine.removeAll(keepingCapacity: true)
+        appendCompletedLines(newLines)
+        clearCurrentLine(keepingCapacity: true)
         cursorRow = max(0, lineCount - 1)
         cursorColumn = 0
         trimIfNeeded(force: true)
@@ -2217,6 +2225,16 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     ) -> [Data] {
         guard !data.isEmpty else { return [] }
 
+        currentViewportSize = viewportSize
+        if let plainLines = plainCompletedLines(from: data) {
+            appendCompletedLines(plainLines)
+            clearCurrentLine(keepingCapacity: true)
+            cursorRow = activeCompletedLineCount
+            cursorColumn = 0
+            trimIfNeeded()
+            return []
+        }
+
         for byte in data {
             process(byte)
         }
@@ -2227,13 +2245,128 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     }
 
     private func line(at row: Int) -> String? {
-        if completedLines.indices.contains(row) {
-            return completedLines[row]
-        }
-        if row == completedLines.count {
-            return currentLine
+        if isUsingAlternateScreen {
+            if alternateCompletedLines.indices.contains(row) {
+                return alternateCompletedLines[row]
+            }
+            if row == alternateCompletedLines.count {
+                return alternateCurrentLine
+            }
+        } else {
+            if completedLines.indices.contains(row) {
+                return completedLines[row]
+            }
+            if row == completedLines.count {
+                return currentLine
+            }
         }
         return nil
+    }
+
+    private func plainCompletedLines(from data: Data) -> [String]? {
+        guard case .ground = parserState,
+              pendingText.isEmpty,
+              activeCurrentLineText.isEmpty,
+              cursorColumn == 0,
+              data.last == 0x0A
+        else { return nil }
+
+        return data.withUnsafeBytes { rawBuffer -> [String]? in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            guard let baseAddress = bytes.baseAddress else { return [] }
+
+            var lines: [String] = []
+            lines.reserveCapacity(max(1, data.count / 80))
+
+            var lineStart = 0
+            var index = 0
+            while index < bytes.count {
+                switch bytes[index] {
+                case 0x0A:
+                    lines.append(String(
+                        decoding: UnsafeBufferPointer(
+                            start: baseAddress.advanced(by: lineStart),
+                            count: index - lineStart
+                        ),
+                        as: UTF8.self
+                    ))
+                    index += 1
+                    lineStart = index
+                case 0x0D:
+                    guard index + 1 < bytes.count, bytes[index + 1] == 0x0A else {
+                        return nil
+                    }
+                    lines.append(String(
+                        decoding: UnsafeBufferPointer(
+                            start: baseAddress.advanced(by: lineStart),
+                            count: index - lineStart
+                        ),
+                        as: UTF8.self
+                    ))
+                    index += 2
+                    lineStart = index
+                case 0x00..<0x20, 0x7F:
+                    return nil
+                default:
+                    index += 1
+                }
+            }
+
+            guard lineStart == bytes.count else { return nil }
+            return lines
+        }
+    }
+
+    private var activeCompletedLineCount: Int {
+        isUsingAlternateScreen ? alternateCompletedLines.count : completedLines.count
+    }
+
+    private var activeCurrentLineCount: Int {
+        isUsingAlternateScreen ? alternateCurrentLine.count : currentLine.count
+    }
+
+    private var activeCurrentLineText: String {
+        isUsingAlternateScreen ? alternateCurrentLine : currentLine
+    }
+
+    private mutating func setActiveCurrentLine(_ line: String) {
+        if isUsingAlternateScreen {
+            alternateCurrentLine = line
+        } else {
+            currentLine = line
+        }
+    }
+
+    private mutating func appendCompletedLine(_ line: String) {
+        if isUsingAlternateScreen {
+            alternateCompletedLines.append(line)
+        } else {
+            completedLines.append(line)
+        }
+    }
+
+    private mutating func appendCompletedLines(_ lines: [String]) {
+        if isUsingAlternateScreen {
+            alternateCompletedLines.append(contentsOf: lines)
+        } else {
+            completedLines.append(contentsOf: lines)
+        }
+    }
+
+    private mutating func clearActiveCompletedLines(keepingCapacity: Bool) {
+        if isUsingAlternateScreen {
+            alternateCompletedLines.removeAll(keepingCapacity: keepingCapacity)
+        } else {
+            completedLines.removeAll(keepingCapacity: keepingCapacity)
+        }
+    }
+
+    private mutating func clearCurrentLine(keepingCapacity: Bool) {
+        if isUsingAlternateScreen {
+            alternateCurrentLine.removeAll(keepingCapacity: keepingCapacity)
+        } else {
+            currentLine.removeAll(keepingCapacity: keepingCapacity)
+        }
     }
 
     private mutating func process(_ byte: UInt8) {
@@ -2386,15 +2519,27 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             cursorRow = max(0, parameter(at: 0, default: 1) - 1)
             cursorColumn = max(0, parameter(at: 1, default: 1) - 1)
         case "J":
-            if parameter(at: 0, default: 0) == 2 {
-                completedLines.removeAll(keepingCapacity: true)
-                currentLine.removeAll(keepingCapacity: true)
+            switch parameter(at: 0, default: 0) {
+            case 2 where isUsingAlternateScreen:
+                clearActiveCompletedLines(keepingCapacity: false)
+                clearCurrentLine(keepingCapacity: false)
                 cursorRow = 0
                 cursorColumn = 0
+            case 2:
+                clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
+                cursorRow = max(0, activeCompletedLineCount)
+                cursorColumn = 0
+            case 3:
+                clearActiveCompletedLines(keepingCapacity: false)
+                clearCurrentLine(keepingCapacity: false)
+                cursorRow = 0
+                cursorColumn = 0
+            default:
+                break
             }
         case "K":
             if parameter(at: 0, default: 0) == 2 || cursorColumn == 0 {
-                currentLine.removeAll(keepingCapacity: true)
+                clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
                 cursorColumn = 0
             }
         default:
@@ -2419,12 +2564,10 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             case 25:
                 isCursorVisible = isSet
             case 47, 1047, 1049:
-                isUsingAlternateScreen = isSet
                 if isSet {
-                    completedLines.removeAll(keepingCapacity: true)
-                    currentLine.removeAll(keepingCapacity: true)
-                    cursorRow = 0
-                    cursorColumn = 0
+                    enterAlternateScreen()
+                } else {
+                    leaveAlternateScreen()
                 }
             case 1000:
                 currentMouseState.trackingMode = isSet ? .normal : .disabled
@@ -2479,45 +2622,61 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private mutating func appendText(_ text: String) {
         guard !text.isEmpty else { return }
 
+        var line = activeCurrentLineText
         if cursorColumn <= 0 {
-            if currentLine.isEmpty {
-                currentLine = text
+            if line.isEmpty {
+                line = text
             } else {
-                currentLine.replaceByCharacterColumns(0..<text.count, with: text)
+                line.replaceByCharacterColumns(0..<text.count, with: text)
             }
+            setActiveCurrentLine(line)
             cursorColumn = text.count
             return
         }
 
-        if cursorColumn >= currentLine.count {
-            if cursorColumn > currentLine.count {
-                currentLine += String(repeating: " ", count: cursorColumn - currentLine.count)
+        if cursorColumn >= line.count {
+            if cursorColumn > line.count {
+                line += String(repeating: " ", count: cursorColumn - line.count)
             }
-            currentLine += text
-            cursorColumn = currentLine.count
+            line += text
+            setActiveCurrentLine(line)
+            cursorColumn = line.count
             return
         }
 
-        currentLine.replaceByCharacterColumns(cursorColumn..<(cursorColumn + text.count), with: text)
+        line.replaceByCharacterColumns(cursorColumn..<(cursorColumn + text.count), with: text)
+        setActiveCurrentLine(line)
         cursorColumn += text.count
     }
 
     private mutating func appendNewLine() {
-        completedLines.append(currentLine)
-        currentLine.removeAll(keepingCapacity: true)
-        cursorRow = completedLines.count
+        appendCompletedLine(activeCurrentLineText)
+        clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
+        cursorRow = activeCompletedLineCount
         cursorColumn = 0
         trimIfNeeded()
     }
 
     private mutating func removeCharacterBeforeCursor() {
-        guard cursorColumn > 0, !currentLine.isEmpty else { return }
+        var line = activeCurrentLineText
+        guard cursorColumn > 0, !line.isEmpty else { return }
         let removalColumn = cursorColumn - 1
-        currentLine.replaceByCharacterColumns(removalColumn..<cursorColumn, with: "")
+        line.replaceByCharacterColumns(removalColumn..<cursorColumn, with: "")
+        setActiveCurrentLine(line)
         cursorColumn = removalColumn
     }
 
     private mutating func trimIfNeeded(force: Bool = false) {
+        if isUsingAlternateScreen {
+            let maximumCompletedLines = max(0, currentViewportSize.rows - 1)
+            guard alternateCompletedLines.count > maximumCompletedLines else { return }
+
+            let removeCount = alternateCompletedLines.count - maximumCompletedLines
+            alternateCompletedLines.removeFirst(removeCount)
+            cursorRow = max(0, cursorRow - removeCount)
+            return
+        }
+
         guard let maxScrollback, maxScrollback >= 0 else { return }
 
         let maximumCompletedLines = max(0, maxScrollback - 1)
@@ -2527,6 +2686,23 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         let removeCount = completedLines.count - maximumCompletedLines
         completedLines.removeFirst(removeCount)
         cursorRow = max(0, cursorRow - removeCount)
+    }
+
+    private mutating func enterAlternateScreen() {
+        isUsingAlternateScreen = true
+        alternateCompletedLines.removeAll(keepingCapacity: false)
+        alternateCurrentLine.removeAll(keepingCapacity: false)
+        cursorRow = 0
+        cursorColumn = 0
+    }
+
+    private mutating func leaveAlternateScreen() {
+        guard isUsingAlternateScreen else { return }
+        alternateCompletedLines.removeAll(keepingCapacity: false)
+        alternateCurrentLine.removeAll(keepingCapacity: false)
+        isUsingAlternateScreen = false
+        cursorRow = max(0, lineCount - 1)
+        cursorColumn = activeCurrentLineCount
     }
 }
 

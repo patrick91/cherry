@@ -66,18 +66,29 @@ enum TerminalInputEncoder {
         _ text: String,
         keyboardProtocolFlags: Int
     ) -> Data {
-        let normalizedText = text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        let utf8 = text.utf8
+        if !utf8.contains(0x0A), !utf8.contains(0x0D) {
+            return Data(utf8)
+        }
+
         let enter = enterSequence(keyboardProtocolFlags: keyboardProtocolFlags)
         var data = Data()
-        data.reserveCapacity(normalizedText.utf8.count)
+        data.reserveCapacity(utf8.count)
+        var previousWasCarriageReturn = false
 
-        for byte in normalizedText.utf8 {
-            if byte == 0x0A {
+        for byte in utf8 {
+            switch byte {
+            case 0x0D:
                 data.append(enter)
-            } else {
+                previousWasCarriageReturn = true
+            case 0x0A:
+                if !previousWasCarriageReturn {
+                    data.append(enter)
+                }
+                previousWasCarriageReturn = false
+            default:
                 data.append(byte)
+                previousWasCarriageReturn = false
             }
         }
 

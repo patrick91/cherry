@@ -91,6 +91,7 @@ struct CherryApp: App {
     @StateObject private var agentSettings = AgentSettings.shared
     @State private var controlServer: CherryControlServer?
     @State private var mcpHTTPServer: CherryMCPHTTPServer?
+    @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
@@ -108,6 +109,10 @@ struct CherryApp: App {
                         ProjectWindowRegistry.shared.activeTodoStore
                     }, chromeStateProvider: {
                         ProjectWindowRegistry.shared.activeChromeState
+                    }, openProjectProvider: { projectRoot in
+                        agentSettings.markProjectOpened(projectRoot)
+                        guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
+                        openWindow(value: projectRoot)
                     })
                     server.start()
                     let mcpServer = CherryMCPHTTPServer()

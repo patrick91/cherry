@@ -646,6 +646,62 @@ private struct MCPWhoamiPayload: Decodable {
     }
 }
 
+@Test func mcpHTTPAppCloseSessionStopsActiveStreamAndDropsSession() async throws {
+    let app = CherryMCPHTTPApp(
+        configuration: .init(host: "127.0.0.1", port: try availableLocalTCPPort(), endpoint: "/mcp"),
+        serverFactory: { _, _ in
+            Server(name: "test-cherry", version: "1.0.0")
+        }
+    )
+
+    let initializeBody = Data("""
+        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}
+        """.utf8)
+    let initializeResponse = await app.handleHTTPRequest(HTTPRequest(
+        method: "POST",
+        headers: [
+            HTTPHeaderName.accept: "application/json, text/event-stream",
+            HTTPHeaderName.contentType: "application/json",
+        ],
+        body: initializeBody,
+        path: "/mcp"
+    ))
+
+    let sessionID: String
+    switch initializeResponse {
+    case .stream(let stream, let headers):
+        sessionID = try #require(headers[HTTPHeaderName.sessionID])
+        for try await _ in stream {}
+    default:
+        Issue.record("Initialize should return an SSE stream, got \(initializeResponse)")
+        return
+    }
+
+    #expect(await app.activeSessionCount == 1)
+
+    let getResponse = await app.handleHTTPRequest(HTTPRequest(
+        method: "GET",
+        headers: [
+            HTTPHeaderName.accept: "text/event-stream",
+            HTTPHeaderName.protocolVersion: "2025-03-26",
+            HTTPHeaderName.sessionID: sessionID,
+        ],
+        body: nil,
+        path: "/mcp"
+    ))
+
+    switch getResponse {
+    case .stream(let stream, _):
+        var iterator = stream.makeAsyncIterator()
+        _ = try await iterator.next()
+        await app.closeSession(sessionID)
+        #expect(await app.activeSessionCount == 0)
+        #expect(try await iterator.next() == nil)
+    default:
+        Issue.record("GET should return an SSE stream, got \(getResponse)")
+    }
+}
+
 @MainActor
 @Test func projectNoteStorePersistsProjectNotes() async throws {
     let projectRoot = FileManager.default.temporaryDirectory
@@ -1859,6 +1915,82 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerOpensConfiguredProject() async throws {
+    let defaultsName = "CherryTests.OpenProject.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let settings = AgentSettings(defaults: defaults)
+
+    let projectRootA = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let projectRootB = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let socketDirectory = URL(
+        fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
+        isDirectory: true
+    )
+    let socketURL = socketDirectory.appendingPathComponent("control.sock")
+
+    try FileManager.default.createDirectory(at: projectRootA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
+    _ = settings.addProject(path: projectRootA.path)
+    _ = settings.addProject(path: projectRootB.path)
+
+    let workspace = TerminalWorkspace(projectRoot: projectRootA.path)
+    var openProjectRoots = [projectRootA.path]
+    var openedProjectRoots: [String] = []
+    let server = CherryControlServer(
+        workspaceProvider: { workspace },
+        openProjectRootsProvider: { openProjectRoots },
+        openProjectProvider: { projectRoot in
+            openedProjectRoots.append(projectRoot)
+            if !openProjectRoots.contains(projectRoot) {
+                openProjectRoots.append(projectRoot)
+            }
+        },
+        socketURL: socketURL,
+        agentSettings: settings
+    )
+    defer {
+        server.stop()
+        workspace.sessions.forEach { $0.stop() }
+        defaults.removePersistentDomain(forName: defaultsName)
+        try? FileManager.default.removeItem(at: projectRootA)
+        try? FileManager.default.removeItem(at: projectRootB)
+        try? FileManager.default.removeItem(at: socketDirectory)
+    }
+    server.start()
+
+    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try CherryControlClient(socketURL: socketURL).send(request)
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    let response = try await send(.openProject(.init(projectRoot: projectRootB.path)))
+    guard case .openProject(let result)? = response.result else {
+        Issue.record("Expected openProject result, got \(String(describing: response))")
+        return
+    }
+    #expect(result.projectRoot == projectRootB.path)
+    #expect(result.alreadyOpen == false)
+    #expect(openedProjectRoots == [projectRootB.path])
+
+    let listResponse = try await send(.listProjects)
+    guard case .listProjects(let projects)? = listResponse.result else {
+        Issue.record("Expected listProjects result, got \(String(describing: listResponse))")
+        return
+    }
+    #expect(projects.projects.first { $0.root == projectRootB.path }?.open == true)
+}
+
+@MainActor
 @Test func controlServerScopesNotesToRequestedProject() async throws {
     let defaultsName = "CherryTests.ScopedControlServer.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
@@ -2785,6 +2917,15 @@ private struct MCPWhoamiPayload: Decodable {
 
     session.ingestTestingData(Data("\u{1B}]7;/tmp/cherry/raw\u{7}".utf8))
     #expect(session.workingDirectory == "/tmp/cherry/kitty")
+
+    let titleBeforePlainOutput = session.title
+    session.ingestTestingData(Data("plain output with no metadata\n".utf8))
+    #expect(session.title == titleBeforePlainOutput)
+    #expect(session.workingDirectory == "/tmp/cherry/kitty")
+
+    session.ingestTestingData(Data("\u{1B}".utf8))
+    session.ingestTestingData(Data("]2;Split Title\u{7}".utf8))
+    #expect(session.title == "Split Title")
 }
 
 @MainActor
@@ -2952,6 +3093,66 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount)
     #expect(session.rawOutputObserverCount == 0)
+}
+
+@MainActor
+@Test func ghosttyContainerReleasesPreviousBridgeWhenSwitchingSessions() async throws {
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Second",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+
+    defer {
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    #expect(first.rawOutputObserverCount == 0)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+}
+
+@MainActor
+@Test func ghosttyContainerDetachReleasesActiveBridge() async throws {
+    let session = TerminalSession(
+        title: "Detach",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    container.detachActiveSession()
+
+    #expect(session.rawOutputObserverCount == 0)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount)
 }
 
 @MainActor
@@ -3286,6 +3487,17 @@ private struct MCPWhoamiPayload: Decodable {
 
     settings.resetTerminalAppearance()
     #expect(settings.projectColorDisplayMode == .accent)
+}
+
+@MainActor
+@Test func terminalSettingsLimitGhosttyScrollbackMemory() async throws {
+    let configuration = TerminalSettings.ghosttyConfiguration(
+        fontSize: 14,
+        cursorBlink: true,
+        minimumContrast: 1.15
+    )
+
+    #expect(configuration.rendered.contains("scrollback-limit = 4000000"))
 }
 
 @Test func sidebarThemeSampleContrastsTerminalBackgroundByAppearance() async throws {
@@ -4848,6 +5060,10 @@ private func serviceRecord(
     buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
     #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["alpha", "bravo", "charlie"])
 
+    buffer.ingest(Data("\r".utf8))
+    buffer.ingest(Data("\ndelta\r\necho".utf8))
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["alpha", "bravo", "charlie", "delta", "echo"])
+
     buffer.ingest(Data("\u{1B}[?1h\u{1B}[?1049h\u{1B}[?1000h\u{1B}[?1006h\u{1B}[?1007l\u{1B}[?25l\u{1B}[5 q".utf8))
     #expect(buffer.usesApplicationCursorKeys)
     #expect(buffer.usesAlternateScreen)
@@ -4864,6 +5080,39 @@ private func serviceRecord(
     #expect(!buffer.usesAlternateScreen)
     #expect(buffer.mouseState == TerminalMouseState())
     #expect(buffer.cursorState.isVisible)
+}
+
+@Test func liveTerminalOutputBufferPreservesPrimaryScrollbackAcrossAlternateScreen() async throws {
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
+
+    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
+    buffer.ingest(Data("\u{1B}[?1049hfullscreen\r\nstatus\r\n\u{1B}[?1049l".utf8))
+
+    #expect(!buffer.usesAlternateScreen)
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["alpha", "bravo", "charlie"])
+}
+
+@Test func liveTerminalOutputBufferPreservesScrollbackAcrossPrimaryScreenClear() async throws {
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
+
+    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
+    buffer.ingest(Data("\u{1B}[2J\u{1B}[Hafter-clear".utf8))
+
+    #expect(buffer.snapshot(range: 0..<buffer.lineCount).prefix(2) == ["alpha", "bravo"])
+}
+
+@Test func liveTerminalOutputBufferBoundsAlternateScreenOutputToViewport() async throws {
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 1_000)
+    let viewport = TerminalViewportSize(columns: 80, rows: 6)
+    let screenLines = (0..<200)
+        .map { "row-\($0)" }
+        .joined(separator: "\r\n")
+
+    buffer.ingest(Data("\u{1B}[?1049h".utf8), viewportSize: viewport)
+    buffer.ingest(Data(screenLines.utf8), viewportSize: viewport)
+
+    #expect(buffer.usesAlternateScreen)
+    #expect(buffer.lineCount <= viewport.rows)
 }
 
 @Test func pagedScrollbackStoresLinesAcrossPageBoundaries() async throws {

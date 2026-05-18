@@ -19,6 +19,10 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
     private var app: CherryMCPHTTPApp?
     private var task: Task<Void, Never>?
 
+    deinit {
+        stop()
+    }
+
     func start() {
         guard task == nil else { return }
 
@@ -235,6 +239,10 @@ actor CherryMCPHTTPApp {
 
     var endpoint: String { configuration.endpoint }
 
+    var activeSessionCount: Int {
+        sessions.count
+    }
+
     /// Routes an incoming HTTP request to the appropriate session transport.
     ///
     /// - Requests with a valid `Mcp-Session-Id` are forwarded to the matching transport.
@@ -252,7 +260,7 @@ actor CherryMCPHTTPApp {
 
             // Clean up on successful DELETE
             if request.method.uppercased() == "DELETE" && response.statusCode == 200 {
-                sessions.removeValue(forKey: sessionID)
+                await closeSession(sessionID)
             }
 
             return response
@@ -294,26 +302,9 @@ actor CherryMCPHTTPApp {
             logger: logger
         )
 
+        let server: Server
         do {
-            let server = try await serverFactory(sessionID, transport)
-            try await server.start(transport: transport)
-
-            sessions[sessionID] = SessionContext(
-                server: server,
-                transport: transport,
-                createdAt: Date(),
-                lastAccessedAt: Date()
-            )
-
-            let response = await transport.handleRequest(request)
-
-            // If transport returned an error, clean up
-            if case .error = response {
-                sessions.removeValue(forKey: sessionID)
-                await transport.disconnect()
-            }
-
-            return response
+            server = try await serverFactory(sessionID, transport)
         } catch {
             await transport.disconnect()
             return .error(
@@ -321,16 +312,44 @@ actor CherryMCPHTTPApp {
                 .internalError("Failed to create session: \(error.localizedDescription)")
             )
         }
+
+        do {
+            try await server.start(transport: transport)
+        } catch {
+            await server.stop()
+            await transport.disconnect()
+            return .error(
+                statusCode: 500,
+                .internalError("Failed to create session: \(error.localizedDescription)")
+            )
+        }
+
+        sessions[sessionID] = SessionContext(
+            server: server,
+            transport: transport,
+            createdAt: Date(),
+            lastAccessedAt: Date()
+        )
+
+        let response = await transport.handleRequest(request)
+
+        // If transport returned an error, clean up
+        if case .error = response {
+            sessions.removeValue(forKey: sessionID)
+            await server.stop()
+        }
+
+        return response
     }
 
-    private func closeSession(_ sessionID: String) async {
+    func closeSession(_ sessionID: String) async {
         guard let session = sessions.removeValue(forKey: sessionID) else { return }
-        await session.transport.disconnect()
+        await session.server.stop()
         logger.info("Closed session", metadata: ["sessionID": "\(sessionID)"])
     }
 
     private func closeAllSessions() async {
-        for sessionID in sessions.keys {
+        for sessionID in Array(sessions.keys) {
             await closeSession(sessionID)
         }
     }
@@ -380,6 +399,8 @@ private final class CherryMCPHTTPHandler: ChannelInboundHandler, @unchecked Send
     typealias OutboundOut = HTTPServerResponsePart
 
     private let app: CherryMCPHTTPApp
+    private let activeStreamLock = NSLock()
+    private var activeStreamSessionIDs = Set<String>()
 
     private struct RequestState {
         var head: HTTPRequestHead
@@ -408,10 +429,22 @@ private final class CherryMCPHTTPHandler: ChannelInboundHandler, @unchecked Send
             requestState = nil
 
             nonisolated(unsafe) let ctx = context
-            Task { @MainActor in
+            Task {
                 await self.handleRequest(state: state, context: ctx)
             }
         }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        let sessionIDs = takeActiveStreamSessionIDs()
+        if !sessionIDs.isEmpty {
+            Task {
+                for sessionID in sessionIDs {
+                    await app.closeSession(sessionID)
+                }
+            }
+        }
+        context.fireChannelInactive()
     }
 
     // MARK: - Request Processing
@@ -481,6 +514,16 @@ private final class CherryMCPHTTPHandler: ChannelInboundHandler, @unchecked Send
 
         switch response {
         case .stream(let stream, _):
+            let streamSessionID = response.headers[HTTPHeaderName.sessionID]
+            if let streamSessionID {
+                trackActiveStream(sessionID: streamSessionID)
+            }
+            defer {
+                if let streamSessionID {
+                    untrackActiveStream(sessionID: streamSessionID)
+                }
+            }
+
             eventLoop.execute {
                 var head = HTTPResponseHead(
                     version: version,
@@ -534,6 +577,26 @@ private final class CherryMCPHTTPHandler: ChannelInboundHandler, @unchecked Send
             }
         }
     }
+
+    private func trackActiveStream(sessionID: String) {
+        activeStreamLock.withLock {
+            activeStreamSessionIDs.insert(sessionID)
+        }
+    }
+
+    private func untrackActiveStream(sessionID: String) {
+        activeStreamLock.withLock {
+            activeStreamSessionIDs.remove(sessionID)
+        }
+    }
+
+    private func takeActiveStreamSessionIDs() -> [String] {
+        activeStreamLock.withLock {
+            let sessionIDs = Array(activeStreamSessionIDs)
+            activeStreamSessionIDs.removeAll()
+            return sessionIDs
+        }
+    }
 }
 
 private enum CherryJSONRPCMessageKind {
@@ -576,5 +639,14 @@ private enum CherryJSONRPCMessageKind {
             return String(intID)
         }
         return nil
+    }
+}
+
+private extension NSLock {
+    @discardableResult
+    func withLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
     }
 }

@@ -392,6 +392,7 @@ final class ShellProcessController: @unchecked Sendable {
     private var writeSource: DispatchSourceWrite?
     private var processSource: DispatchSourceProcess?
     private var pendingWrite = Data()
+    private var pendingWriteStartOffset = 0
     private var isReadSourcePaused = false
     private var isReadSourceThrottled = false
     private var isReadSourceSuspended = false
@@ -453,7 +454,7 @@ final class ShellProcessController: @unchecked Sendable {
                 return
             }
 
-            self.pendingWrite.append(data)
+            self.appendPendingWrite(data)
             self.flushPendingWrites()
         }
     }
@@ -801,7 +802,7 @@ final class ShellProcessController: @unchecked Sendable {
 
         isTerminating = true
         retainedUntilExit = self
-        pendingWrite.removeAll(keepingCapacity: true)
+        clearPendingWrite()
         cancelWriteSource()
 
         if childPID > 0, !exitReported {
@@ -880,24 +881,28 @@ final class ShellProcessController: @unchecked Sendable {
 
     private func flushPendingWrites() {
         guard masterFD >= 0 else {
-            pendingWrite.removeAll(keepingCapacity: true)
+            clearPendingWrite()
             cancelWriteSource()
             return
         }
 
-        while !pendingWrite.isEmpty {
+        while pendingWriteStartOffset < pendingWrite.count {
             let written = pendingWrite.withUnsafeBytes { rawBuffer -> Int in
                 guard let baseAddress = rawBuffer.baseAddress else { return 0 }
-                return Darwin.write(masterFD, baseAddress, rawBuffer.count)
+                return Darwin.write(
+                    masterFD,
+                    baseAddress.advanced(by: pendingWriteStartOffset),
+                    rawBuffer.count - pendingWriteStartOffset
+                )
             }
 
             if written > 0 {
                 if shellTransportDebugEnabled {
-                    let chunk = pendingWrite.prefix(written)
+                    let chunk = pendingWrite[pendingWriteStartOffset..<(pendingWriteStartOffset + written)]
                     let rendered = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
                     fputs("[pty write] fd=\(masterFD) bytes=\(written) data=\(rendered)\n", stderr)
                 }
-                pendingWrite.removeSubrange(0..<written)
+                discardPendingWriteBytes(written)
                 continue
             }
 
@@ -919,12 +924,45 @@ final class ShellProcessController: @unchecked Sendable {
             if shellTransportDebugEnabled {
                 fputs("[pty write error] fd=\(masterFD) errno=\(writeError)\n", stderr)
             }
-            pendingWrite.removeAll(keepingCapacity: true)
+            clearPendingWrite()
             cancelWriteSource()
             return
         }
 
         cancelWriteSource()
+    }
+
+    private func appendPendingWrite(_ data: Data) {
+        compactPendingWriteIfNeeded(force: false)
+        pendingWrite.append(data)
+    }
+
+    private func discardPendingWriteBytes(_ byteCount: Int) {
+        pendingWriteStartOffset += byteCount
+        compactPendingWriteIfNeeded(force: pendingWriteStartOffset == pendingWrite.count)
+    }
+
+    private func compactPendingWriteIfNeeded(force: Bool) {
+        guard pendingWriteStartOffset > 0 else { return }
+
+        if force {
+            clearPendingWrite()
+            return
+        }
+
+        guard pendingWriteStartOffset >= 64 * 1024,
+              pendingWriteStartOffset >= pendingWrite.count / 2
+        else {
+            return
+        }
+
+        pendingWrite.removeSubrange(0..<pendingWriteStartOffset)
+        pendingWriteStartOffset = 0
+    }
+
+    private func clearPendingWrite() {
+        pendingWrite.removeAll(keepingCapacity: true)
+        pendingWriteStartOffset = 0
     }
 
     private func ensureWriteSource() {
@@ -1002,7 +1040,7 @@ final class ShellProcessController: @unchecked Sendable {
         if shellTransportDebugEnabled {
             fputs("[pty cleanup] pid=\(childPID) fd=\(masterFD)\n", stderr)
         }
-        pendingWrite.removeAll(keepingCapacity: true)
+        clearPendingWrite()
         cancelWriteSource()
         cancelReadSource()
         processSource?.cancel()

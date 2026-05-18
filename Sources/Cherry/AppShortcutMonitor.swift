@@ -23,6 +23,48 @@ struct AppShortcutMonitor: NSViewRepresentable {
         agentSettings.projectFeatures(for: projectRoot)
     }
 
+    enum ShortcutAction: Equatable {
+        case selectVisibleSidebarItem(Int)
+        case presentCommandPalette
+        case toggleSidebar
+        case addSession
+        case closeSelectedSessionOrWindow
+        case terminate
+        case openSettings
+    }
+
+    nonisolated static func shortcutAction(
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> ShortcutAction? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers == .command else { return nil }
+
+        switch charactersIgnoringModifiers?.lowercased() {
+        case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+            guard let character = charactersIgnoringModifiers,
+                  let number = Int(character)
+            else {
+                return nil
+            }
+            return .selectVisibleSidebarItem(number)
+        case "p":
+            return .presentCommandPalette
+        case "s":
+            return .toggleSidebar
+        case "t":
+            return .addSession
+        case "w":
+            return .closeSelectedSessionOrWindow
+        case "q":
+            return .terminate
+        case ",":
+            return .openSettings
+        default:
+            return nil
+        }
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             workspace: workspace,
@@ -150,30 +192,33 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 }
             }
 
-            guard modifiers == .command else { return false }
-
-            switch event.charactersIgnoringModifiers?.lowercased() {
-            case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-                guard let number = event.charactersIgnoringModifiers.flatMap(Int.init) else { return false }
-                selectVisibleSidebarItem(number: number)
-                return true
-            case "p":
-                chromeState?.presentCommandPalette()
-                return true
-            case "t":
-                workspace?.addSession()
-                return true
-            case "w":
-                closeSelectedSessionOrWindow()
-                return true
-            case "q":
-                NSApp.terminate(nil)
-                return true
-            case ",":
-                openSettings()
-                return true
-            default:
+            guard let action = AppShortcutMonitor.shortcutAction(
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                modifiers: modifiers
+            ) else {
                 return false
+            }
+
+            perform(action)
+            return true
+        }
+
+        private func perform(_ action: ShortcutAction) {
+            switch action {
+            case .selectVisibleSidebarItem(let number):
+                selectVisibleSidebarItem(number: number)
+            case .presentCommandPalette:
+                chromeState?.presentCommandPalette()
+            case .toggleSidebar:
+                chromeState?.toggleSidebar()
+            case .addSession:
+                workspace?.addSession()
+            case .closeSelectedSessionOrWindow:
+                closeSelectedSessionOrWindow()
+            case .terminate:
+                NSApp.terminate(nil)
+            case .openSettings:
+                openSettings()
             }
         }
 

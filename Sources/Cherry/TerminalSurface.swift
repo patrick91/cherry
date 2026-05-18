@@ -514,7 +514,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: GhosttyTerminalContainerView, coordinator: ()) {
-        nsView.detachActiveSession()
+        nsView.detachActiveSession(releasesBridge: false)
     }
 }
 

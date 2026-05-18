@@ -513,7 +513,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            activeSession?.releaseGhosttyBridge()
+            activeSession?.detachGhosttyBridge(from: self)
             activeSession = session
             session.ghosttyBridge.attach(to: self)
             requestTerminalFocus()

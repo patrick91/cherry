@@ -3113,7 +3113,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyContainerReleasesPreviousBridgeWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerRetainsPreviousBridgeWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -3138,12 +3138,17 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    let firstBridge = first.ghosttyBridge
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
-    #expect(first.rawOutputObserverCount == 0)
-    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+
+    #expect(first.ghosttyBridge === firstBridge)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
 }
 
 @MainActor
@@ -3170,6 +3175,32 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(session.rawOutputObserverCount == 0)
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount)
+}
+
+@MainActor
+@Test func terminalSurfaceDismantleRetainsActiveBridgeForTemporaryDetach() async throws {
+    let session = TerminalSession(
+        title: "Dismantle",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+
+    defer {
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    let bridge = session.ghosttyBridge
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    TerminalSurfaceView.dismantleNSView(container, coordinator: ())
+
+    #expect(session.ghosttyBridge === bridge)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 }
 
 @MainActor

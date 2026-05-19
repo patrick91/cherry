@@ -82,6 +82,23 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     return String(decoding: output + errorOutput, as: UTF8.self)
 }
 
+private final class DataWriteRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [Data] = []
+
+    func append(_ value: Data) {
+        lock.lock()
+        storedValues.append(value)
+        lock.unlock()
+    }
+
+    var values: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValues
+    }
+}
+
 private func environmentValue(_ key: String) -> String? {
     getenv(key).map { String(cString: $0) }
 }
@@ -3622,6 +3639,22 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(TerminalInputNormalizer.normalize(tab, keyboardProtocolFlags: 1) == tab)
     #expect(TerminalInputNormalizer.normalize(tab, keyboardProtocolFlags: 8) == encodedTab)
     #expect(TerminalInputNormalizer.normalize(enter, keyboardProtocolFlags: 8) == enter)
+}
+
+@Test func terminalInputWriterUsesCachedKeyboardProtocolFlags() async throws {
+    let recorder = DataWriteRecorder()
+    let writer = TerminalInputWriter(writeHandler: { data in
+        recorder.append(data)
+    })
+
+    writer.setKeyboardProtocolFlags(8)
+    writer.write(Data([0x09]))
+    writer.write(Data("x".utf8))
+
+    #expect(recorder.values == [
+        Data("\u{1B}[9u".utf8),
+        Data("x".utf8),
+    ])
 }
 
 @Test func shiftEnterUsesEnhancedKeyboardProtocolWhenActive() async throws {

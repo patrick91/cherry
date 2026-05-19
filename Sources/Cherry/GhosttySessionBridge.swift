@@ -97,12 +97,14 @@ private final class GhosttyOutputSink: @unchecked Sendable {
 
 private final class GhosttySessionProxy: @unchecked Sendable {
     private let lock = NSLock()
+    private let inputWriter: TerminalInputWriter
     private var isHostInputSuppressed = false
 
     weak var session: TerminalSession?
 
     init(session: TerminalSession) {
         self.session = session
+        self.inputWriter = session.hostInputWriter
     }
 
     func send(_ data: Data) {
@@ -111,9 +113,7 @@ private final class GhosttySessionProxy: @unchecked Sendable {
         }
         guard !shouldSuppress else { return }
 
-        Task { @MainActor [weak self] in
-            self?.session?.send(data: data)
-        }
+        inputWriter.write(data)
     }
 
     func resize(columns: Int, rows: Int) {
@@ -299,7 +299,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func scrollToBottomForHostInput() {
         scrollContainer?.beginHostInputScrollSuppression()
         terminalView.performBindingAction("scroll_to_bottom")
-        scrollContainer?.synchronizeScrollState()
+        scrollContainer?.scheduleHostInputScrollSynchronization()
     }
 
     func terminalWillSendHostInput() {
@@ -470,6 +470,7 @@ final class GhosttyTerminalContainerView: NSView {
     private var pendingPostAnimationDelta: CGFloat = 0
     private var didApplyEarlyFit = false
     private var shouldSuppressMomentumScrollAfterHostInput = false
+    private var isHostInputScrollSyncScheduled = false
 
     override var acceptsFirstResponder: Bool {
         true
@@ -653,6 +654,17 @@ final class GhosttyTerminalContainerView: NSView {
 
     func beginHostInputScrollSuppression() {
         shouldSuppressMomentumScrollAfterHostInput = true
+    }
+
+    func scheduleHostInputScrollSynchronization() {
+        guard !isHostInputScrollSyncScheduled else { return }
+        isHostInputScrollSyncScheduled = true
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isHostInputScrollSyncScheduled = false
+            self.synchronizeScrollState()
+        }
     }
 
     func shouldSuppressScrollInputForHostInput(isMomentum: Bool) -> Bool {

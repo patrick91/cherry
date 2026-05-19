@@ -264,9 +264,19 @@ extension String {
     }
 }
 
-private final class ShellProcessBox: @unchecked Sendable {
+final class TerminalInputWriter: @unchecked Sendable {
+    typealias WriteHandler = @Sendable (Data) -> Void
+
     private let lock = NSLock()
     private weak var process: ShellProcessController?
+    private let fallbackWriteHandler: WriteHandler?
+    private var keyboardProtocolFlags = 0
+    private var inputHandler: (@MainActor @Sendable () -> Void)?
+    private var isInputHandlerScheduled = false
+
+    init(writeHandler: WriteHandler? = nil) {
+        self.fallbackWriteHandler = writeHandler
+    }
 
     func set(_ process: ShellProcessController?) {
         lock.withLock {
@@ -274,11 +284,65 @@ private final class ShellProcessBox: @unchecked Sendable {
         }
     }
 
-    func write(_ data: Data) {
-        let process = lock.withLock {
-            self.process
+    func setKeyboardProtocolFlags(_ flags: Int) {
+        lock.withLock {
+            keyboardProtocolFlags = flags
         }
-        process?.write(data)
+    }
+
+    func setInputHandler(_ handler: (@MainActor @Sendable () -> Void)?) {
+        lock.withLock {
+            inputHandler = handler
+        }
+    }
+
+    func write(_ data: Data, normalize: Bool = true) {
+        let snapshot = lock.withLock {
+            let writer: WriteHandler? = if let process {
+                { process.write($0) }
+            } else {
+                fallbackWriteHandler
+            }
+            return (
+                writer: writer,
+                keyboardProtocolFlags: keyboardProtocolFlags,
+                inputHandler: inputHandler
+            )
+        }
+
+        guard let writer = snapshot.writer else { return }
+        let outboundData = normalize
+            ? TerminalInputNormalizer.normalize(
+                data,
+                keyboardProtocolFlags: snapshot.keyboardProtocolFlags
+            )
+            : data
+        guard !outboundData.isEmpty else { return }
+
+        writer(outboundData)
+        scheduleInputHandler(snapshot.inputHandler)
+    }
+
+    private func scheduleInputHandler(_ handler: (@MainActor @Sendable () -> Void)?) {
+        guard let handler else { return }
+
+        let shouldSchedule = lock.withLock {
+            guard !isInputHandlerScheduled else { return false }
+            isInputHandlerScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+
+        Task { @MainActor [weak self] in
+            handler()
+            self?.markInputHandlerFinished()
+        }
+    }
+
+    private func markInputHandlerFinished() {
+        lock.withLock {
+            isInputHandlerScheduled = false
+        }
     }
 }
 
@@ -1354,6 +1418,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private let processor: TerminalProcessor
     private let rawOutputStore = TerminalRawOutputStore()
     private let metadataParser = TerminalMetadataParser()
+    let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
@@ -1418,6 +1483,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             Task { @MainActor [weak self] in
                 self?.handleProcessorDidChange()
             }
+        }
+        self.hostInputWriter.setInputHandler { [weak self] in
+            self?.noteInputBurst()
         }
 
         if launchShell {
@@ -1505,8 +1573,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func send(text: String) {
         guard acceptsInput else { return }
         if !text.isEmpty {
-            noteHumanInputIfNeeded()
-            noteInputOutputBaseline()
+            noteInputBurst()
         }
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
@@ -1527,8 +1594,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func sendInputData(_ data: Data, normalize: Bool) {
         let outboundData = normalize ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
-            noteHumanInputIfNeeded()
-            noteInputOutputBaseline()
+            noteInputBurst()
         }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -1623,6 +1689,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
+        hostInputWriter.set(nil)
         shellProcess?.terminate()
         shellProcess = nil
     }
@@ -1732,7 +1799,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         do {
             let processor = processor
             let traceRecorder = traceRecorder
-            let processBox = ShellProcessBox()
             let process = try ShellProcessController(
                 configuration: .init(
                     shellPath: ShellProcessController.defaultShellPath,
@@ -1761,14 +1827,15 @@ final class TerminalSession: ObservableObject, Identifiable {
                     }
                 }
             )
-            processBox.set(process)
             shellProcess = process
+            hostInputWriter.set(process)
             childProcessID = process.processIdentifier.map { Int32($0) }
 
             state = .live
             bumpRevision()
         } catch {
             activeLaunchID = nil
+            hostInputWriter.set(nil)
             processor.endLaunch(launchID)
             state = .failed(error.localizedDescription)
             processor.appendPlainLines([
@@ -1787,6 +1854,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard activeLaunchID == launchID else { return }
 
         activeLaunchID = nil
+        hostInputWriter.set(nil)
         shellProcess = nil
         childProcessID = nil
         exitCode = status
@@ -1867,6 +1935,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
+    private func noteInputBurst() {
+        noteHumanInputIfNeeded()
+        noteInputOutputBaseline()
+    }
+
     private func noteInputOutputBaseline() {
         lastInputOutputVersion = outputVersion
     }
@@ -1896,22 +1969,19 @@ final class TerminalSession: ObservableObject, Identifiable {
 
             case .keyboardProtocolPush(let flags):
                 keyboardProtocolFlagStack.append(keyboardProtocolFlags)
-                keyboardProtocolFlags = flags
-                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
+                applyKeyboardProtocolFlags(flags)
 
             case .keyboardProtocolPop(let count):
                 if count > keyboardProtocolFlagStack.count {
                     keyboardProtocolFlagStack.removeAll(keepingCapacity: true)
-                    keyboardProtocolFlags = 0
+                    applyKeyboardProtocolFlags(0)
                 } else {
                     keyboardProtocolFlagStack.removeLast(count - 1)
-                    keyboardProtocolFlags = keyboardProtocolFlagStack.removeLast()
+                    applyKeyboardProtocolFlags(keyboardProtocolFlagStack.removeLast())
                 }
-                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
 
             case .keyboardProtocolSet(let flags, let mode):
-                keyboardProtocolFlags = keyboardProtocolFlagsByApplying(flags: flags, mode: mode)
-                isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
+                applyKeyboardProtocolFlags(keyboardProtocolFlagsByApplying(flags: flags, mode: mode))
             }
         }
 
@@ -1932,10 +2002,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         TerminalInputNormalizer.normalize(data, keyboardProtocolFlags: keyboardProtocolFlags)
     }
 
+    private func applyKeyboardProtocolFlags(_ flags: Int) {
+        keyboardProtocolFlags = flags
+        isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
+        hostInputWriter.setKeyboardProtocolFlags(keyboardProtocolFlags)
+    }
+
     private func resetKeyboardProtocolState() {
         keyboardProtocolFlagStack.removeAll(keepingCapacity: true)
-        keyboardProtocolFlags = 0
-        isEnhancedKeyboardProtocolActive = false
+        applyKeyboardProtocolFlags(0)
     }
 
     private func clearExplicitTitle() {

@@ -321,6 +321,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let workingDirectory: String?
     public let text: String?
     public let rawBase64: String?
+    public let submit: Bool?
     public let parentAgentID: String?
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
@@ -332,6 +333,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         workingDirectory: String? = nil,
         text: String? = nil,
         rawBase64: String? = nil,
+        submit: Bool? = nil,
         parentAgentID: String? = nil,
         waitMilliseconds: Int? = nil,
         lineLimit: Int? = nil
@@ -342,6 +344,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.workingDirectory = workingDirectory
         self.text = text
         self.rawBase64 = rawBase64
+        self.submit = submit
         self.parentAgentID = parentAgentID
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
@@ -409,6 +412,7 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
     public let processName: String?
     public let text: String?
     public let rawBase64: String?
+    public let submit: Bool?
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
 
@@ -417,6 +421,7 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
         processName: String? = nil,
         text: String? = nil,
         rawBase64: String? = nil,
+        submit: Bool? = nil,
         waitMilliseconds: Int? = nil,
         lineLimit: Int? = nil
     ) {
@@ -424,6 +429,7 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
         self.processName = processName
         self.text = text
         self.rawBase64 = rawBase64
+        self.submit = submit
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
     }

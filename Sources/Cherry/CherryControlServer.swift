@@ -2,6 +2,13 @@ import CherryControl
 import Darwin
 import Foundation
 
+private let mcpControlDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_MCP"] == "1"
+
+private func mcpControlDebugLog(_ message: @autoclosure () -> String) {
+    guard mcpControlDebugEnabled else { return }
+    fputs("[mcp-control] \(message())\n", stderr)
+}
+
 final class CherryControlServer: @unchecked Sendable {
     private weak var workspace: TerminalWorkspace?
     private weak var noteStore: ProjectNoteStore?
@@ -383,10 +390,14 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .selectProcess(.init(process: processInfo(for: session, workspace: workspace))))
         case .sendProcessInput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            let input = try terminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
-            sendTerminalInput(input, to: session)
+            let sentBytes = try await sendControlInput(
+                text: request.text,
+                rawBase64: request.rawBase64,
+                submit: request.submit,
+                to: session
+            )
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
+            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
         case .startAllCommands(let request):
             _ = try startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
@@ -1004,7 +1015,9 @@ final class CherryControlServer: @unchecked Sendable {
         processName: String?
     ) throws -> TerminalSession {
         if let processID = processID?.trimmingCharacters(in: .whitespacesAndNewlines), !processID.isEmpty {
-            return try findSession(workspace: workspace, terminalID: processID)
+            let session = try findSession(workspace: workspace, terminalID: processID)
+            mcpControlDebugLog("resolved process selector=id:\(processID) session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(self.processName(for: session))")
+            return session
         }
 
         guard let requestedName = processName?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedName.isEmpty else {
@@ -1022,6 +1035,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard matches.count == 1 else {
             throw CherryControlError(code: "ambiguous_process_name", message: "Multiple Cherry processes match name \(requestedName); use process_id.")
         }
+        mcpControlDebugLog("resolved process selector=name:\(requestedName) session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(self.processName(for: session))")
         return session
     }
 
@@ -1062,15 +1076,28 @@ final class CherryControlServer: @unchecked Sendable {
             agent = nil
         }
 
-        if (request.text != nil || request.rawBase64 != nil), let agent {
+        mcpControlDebugLog("spawned process session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) parent=\(session.parentAgentID?.uuidString ?? "nil") submit=\(String(describing: request.submit))")
+
+        if (request.text != nil || request.rawBase64 != nil || request.submit == true), let agent {
             await waitForAgentInitialInputReadiness(session: session, agent: agent)
         }
 
-        let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
-        if let input, !input.payload.isEmpty {
-            sendTerminalInput(input, to: session)
+        let sentBytes: Int
+        if session.kind == .agent, let agent {
+            let input = try agentInputPayload(text: request.text, rawBase64: request.rawBase64, submit: request.submit)
+            if let input, !input.isEmpty {
+                sentBytes = await sendInitialAgentInput(input, to: session, agent: agent)
+            } else {
+                sentBytes = 0
+            }
+        } else {
+            let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+            if let input, !input.payload.isEmpty {
+                sendTerminalInput(input, to: session)
+            }
+            sentBytes = input?.payload.count ?? 0
         }
-        return (session, input?.payload.count ?? 0)
+        return (session, sentBytes)
     }
 
     @MainActor
@@ -1350,7 +1377,9 @@ final class CherryControlServer: @unchecked Sendable {
         }
         if normalizedValue == CherryControl.selectedAgentParentID
             || normalizedValue == "current" {
-            return selectedAgentParentID(workspace: workspace)
+            let parentID = selectedAgentParentID(workspace: workspace)
+            mcpControlDebugLog("resolved parent_agent_id=\(rawValue) parent=\(parentID?.uuidString ?? "nil")")
+            return parentID
         }
         guard let parentID = UUID(uuidString: rawValue) else {
             throw CherryControlError(code: "invalid_parent_agent_id", message: "parent_agent_id must be a Cherry agent UUID.")
@@ -1361,6 +1390,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard parent.kind == .agent else {
             throw CherryControlError(code: "parent_agent_not_agent", message: "parent_agent_id must refer to an agent session.")
         }
+        mcpControlDebugLog("resolved parent_agent_id=\(rawValue) parent=\(parentID.uuidString)")
         return parentID
     }
 
@@ -1829,6 +1859,30 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func sendControlInput(
+        text: String?,
+        rawBase64: String?,
+        submit: Bool?,
+        to session: TerminalSession
+    ) async throws -> Int {
+        mcpControlDebugLog("send input session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) textBytes=\(text?.utf8.count ?? 0) raw=\(rawBase64 != nil) submit=\(String(describing: submit))")
+        if session.kind == .agent, submit != nil {
+            let input = try agentInputPayload(text: text, rawBase64: rawBase64, submit: submit)
+            guard let input, !input.isEmpty else { return 0 }
+            return await sendAgentInput(
+                input,
+                to: session,
+                shouldDeferSubmit: shouldDeferSubmittedInput(for: session),
+                source: "message"
+            )
+        }
+
+        let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
+        sendTerminalInput(input, to: session)
+        return input.payload.count
+    }
+
+    @MainActor
     private func lifecycleOutput(
         for session: TerminalSession,
         waitMilliseconds requestedWaitMilliseconds: Int?,
@@ -1871,23 +1925,43 @@ final class CherryControlServer: @unchecked Sendable {
         to session: TerminalSession,
         agent: AgentToolDefinition
     ) async -> Int {
-        if shouldDeferInitialInput(for: agent), input.submit {
+        await sendAgentInput(
+            input,
+            to: session,
+            shouldDeferSubmit: shouldDeferInitialInput(for: agent),
+            source: "initial"
+        )
+    }
+
+    @MainActor
+    private func sendAgentInput(
+        _ input: AgentInitialInput,
+        to session: TerminalSession,
+        shouldDeferSubmit: Bool,
+        source: String
+    ) async -> Int {
+        if shouldDeferSubmit, input.submit {
             if !input.payload.isEmpty {
+                mcpControlDebugLog("agent \(source) input type session=\(session.id.uuidString) bytes=\(input.payload.count)")
                 session.send(data: input.payload)
                 try? await Task.sleep(for: .milliseconds(150))
             }
             let enterSequence = TerminalInputEncoder.enterSequence(
                 keyboardProtocolFlags: session.keyboardProtocolFlags
             )
+            mcpControlDebugLog("agent \(source) input submit session=\(session.id.uuidString) bytes=\(enterSequence.count)")
             session.send(data: enterSequence)
             return input.payload.count + enterSequence.count
         }
 
         var payload = input.payload
         if input.submit {
-            payload.append(0x0d)
+            payload.append(TerminalInputEncoder.enterSequence(
+                keyboardProtocolFlags: session.keyboardProtocolFlags
+            ))
         }
         guard !payload.isEmpty else { return 0 }
+        mcpControlDebugLog("agent \(source) input combined session=\(session.id.uuidString) bytes=\(payload.count) submit=\(input.submit)")
         session.send(data: payload)
         return payload.count
     }
@@ -1931,6 +2005,15 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     private func shouldDeferInitialInput(for agent: AgentToolDefinition) -> Bool {
+        shouldDeferAgentInput(agentName: agent.name, command: agent.command)
+    }
+
+    @MainActor
+    private func shouldDeferSubmittedInput(for session: TerminalSession) -> Bool {
+        shouldDeferAgentInput(agentName: session.agentName, command: session.subtitle)
+    }
+
+    private func shouldDeferAgentInput(agentName: String?, command: String) -> Bool {
         let knownInteractiveAgents: Set<String> = [
             "amp",
             "claude",
@@ -1939,24 +2022,42 @@ final class CherryControlServer: @unchecked Sendable {
             "opencode",
             "pi",
         ]
-        let normalizedName = AgentToolDefinition.normalizedName(agent.name)
-        if knownInteractiveAgents.contains(normalizedName) {
+        if let agentName, knownInteractiveAgents.contains(AgentToolDefinition.normalizedName(agentName)) {
             return true
         }
 
-        let commandName = URL(fileURLWithPath: agent.command.trimmingCharacters(in: .whitespacesAndNewlines))
+        let commandName = URL(fileURLWithPath: firstCommandToken(command))
             .lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return knownInteractiveAgents.contains(commandName)
     }
 
-    private func runAgentInitialInput(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
+    private func firstCommandToken(_ command: String) -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "" }
+
+        if first == "\"" || first == "'" {
+            let remainder = trimmed.dropFirst()
+            if let endIndex = remainder.firstIndex(of: first) {
+                return String(remainder[..<endIndex])
+            }
+            return String(remainder)
+        }
+
+        return trimmed.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+    }
+
+    private func agentInputPayload(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
         guard let payload = try optionalInputPayload(text: text, rawBase64: rawBase64) else {
             return nil
         }
         let shouldSubmit = submit != false && payload.last != 0x0d && payload.last != 0x0a
         return AgentInitialInput(payload: payload, submit: shouldSubmit)
+    }
+
+    private func runAgentInitialInput(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
+        try agentInputPayload(text: text, rawBase64: rawBase64, submit: submit)
     }
 
     @MainActor

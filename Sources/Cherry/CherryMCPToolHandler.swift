@@ -171,7 +171,7 @@ enum CherryMCPTools {
                 "title": string("Optional custom title."),
                 "message": string("Optional first message to submit after launch. A final Enter is added automatically when omitted."),
                 "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
-                "bind_session": boolean("Whether to bind this MCP HTTP session to the spawned agent so later agent tools can omit process_id. Defaults to true."),
+                "bind_session": boolean("Whether to bind this MCP HTTP session to the spawned agent so later agent tools can omit process_id. Defaults to false; enable only for a single-agent conversation."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -529,8 +529,9 @@ enum CherryMCPTools {
             name: try requiredString("name", in: arguments),
             title: stringArgument("title", in: arguments),
             workingDirectory: nil,
-            text: message.map(agentMessageText),
+            text: message,
             rawBase64: nil,
+            submit: message == nil ? nil : true,
             parentAgentID: parentAgentIDArgument(forKind: "agent", in: arguments, context: context),
             waitMilliseconds: intArgument("wait_ms", in: arguments),
             lineLimit: intArgument("line_limit", in: arguments)
@@ -545,7 +546,7 @@ enum CherryMCPTools {
             return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for spawn_agent."))
         }
 
-        let shouldBind = boolArgument("bind_session", in: arguments) ?? true
+        let shouldBind = boolArgument("bind_session", in: arguments) ?? false
         let previousBoundProcessID = shouldBind ? context?.bindProcessID(spawned.process.id) : nil
         return try encodedResult(MCPSpawnAgentPayload(
             process: spawned.process,
@@ -580,7 +581,8 @@ enum CherryMCPTools {
 
         let sendRequest = CherryControlRequest.sendProcessInput(.init(
             processID: status.process.id,
-            text: agentMessageText(message)
+            text: message,
+            submit: true
         ))
         let sendResponse = try client.send(scopedRequest(sendRequest, arguments: arguments))
         if let error = sendResponse.error {
@@ -1237,13 +1239,6 @@ enum CherryMCPTools {
         stringArgument(key, in: arguments)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
-    }
-
-    private static func agentMessageText(_ message: String) -> String {
-        if message.hasSuffix("\n") || message.hasSuffix("\r") {
-            return message
-        }
-        return message + "\n"
     }
 
     private static func processLifecycle(

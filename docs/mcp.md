@@ -66,10 +66,13 @@ with partial output rather than a tool error.
 
 A typical agent-native flow:
 
-1. `spawn_agent` with the configured agent name. This binds the MCP HTTP
-   session to the new agent by default.
-2. `send_agent_message` with `message`; no trailing newline is required. By
-   default it sends the message and waits for new output plus a quiet period.
+1. `spawn_agent` with the configured agent name. Keep the returned
+   `process.id`; agent sessions are not rebound by default so multi-agent
+   orchestration does not accidentally message the most recently spawned agent.
+   For a single-agent conversation, pass `bind_session: true`.
+2. `send_agent_message` with `process_id` and `message`; no trailing newline is
+   required. By default it sends the message and waits for new output plus a
+   quiet period.
 3. `get_process_output` if more context is needed.
 
 The lower-level process flow is still available when you need raw terminal

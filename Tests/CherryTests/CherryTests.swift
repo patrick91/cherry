@@ -5715,6 +5715,32 @@ private func serviceRecord(
     #expect(buffer.lineCount <= viewport.rows)
 }
 
+@Test func liveTerminalOutputBufferKeepsAtuinCursorProbeStableAfterPrimaryScreenOverlay() async throws {
+    let viewport = TerminalViewportSize(columns: 120, rows: 44)
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 200)
+    buffer.ingest(Data("~/repo main\r\n> ".utf8), viewportSize: viewport)
+
+    let openAtuin = Data((
+        "\u{1B}[K\r\r\n" +
+        "\u{1B}[?1000h\u{1B}[?1002h\u{1B}[?1003h\u{1B}[?1015h\u{1B}[?1006h\u{1B}[?2004h" +
+        "\u{1B}[>13u" +
+        "\u{1B}[6n"
+    ).utf8)
+    let firstProbe = buffer.ingest(openAtuin, viewportSize: viewport)
+    #expect(firstProbe == [Data("\u{1B}[3;1R".utf8)])
+
+    buffer.ingest(Data((
+        String(repeating: "\n", count: 40) +
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.15.2" +
+        "\u{1B}[3;1H\u{1B}[J" +
+        "\u{1B}[<1u\u{1B}[?1006l\u{1B}[?1015l\u{1B}[?1003l\u{1B}[?1002l\u{1B}[?1000l\u{1B}[?2004l" +
+        "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K\u{1B}[?2004h"
+    ).utf8), viewportSize: viewport)
+
+    let secondProbe = buffer.ingest(openAtuin, viewportSize: viewport)
+    #expect(secondProbe == firstProbe)
+}
+
 @Test func pagedScrollbackStoresLinesAcrossPageBoundaries() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
     buffer.appendPlainLines((0..<300).map { "line-\($0)" })

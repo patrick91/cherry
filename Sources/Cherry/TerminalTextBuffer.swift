@@ -2108,6 +2108,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private var cursorColumn = 0
     private var cursorShape = TerminalCursorShape.block
     private var isCursorVisible = true
+    private var primaryScreenTopRow: Int?
 
     init(maxScrollback: Int?) {
         self.maxScrollback = maxScrollback
@@ -2206,6 +2207,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         cursorColumn = 0
         cursorShape = .block
         isCursorVisible = true
+        primaryScreenTopRow = nil
     }
 
     mutating func resize(to viewportSize: TerminalViewportSize) {
@@ -2335,10 +2337,66 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         isUsingAlternateScreen ? alternateCurrentLine : currentLine
     }
 
-    private mutating func setActiveCurrentLine(_ line: String) {
+    private var viewportRowCount: Int {
+        max(1, currentViewportSize.rows)
+    }
+
+    private var screenTopRow: Int {
+        guard !isUsingAlternateScreen else { return 0 }
+
+        let naturalTopRow = max(0, lineCount - viewportRowCount)
+        guard let primaryScreenTopRow else { return naturalTopRow }
+
+        return max(naturalTopRow, max(0, primaryScreenTopRow))
+    }
+
+    private var screenBottomRow: Int {
+        screenTopRow + viewportRowCount - 1
+    }
+
+    private func activeLineText(at row: Int) -> String {
+        line(at: row) ?? ""
+    }
+
+    private mutating func setActiveLineText(_ line: String, at row: Int) {
+        let targetRow = max(0, row)
+        ensureActiveLineExists(at: targetRow)
+
         if isUsingAlternateScreen {
+            if targetRow < alternateCompletedLines.count {
+                alternateCompletedLines[targetRow] = line
+            } else {
+                alternateCurrentLine = line
+            }
+        } else if targetRow < completedLines.count {
+            completedLines[targetRow] = line
+        } else {
+            currentLine = line
+        }
+    }
+
+    private mutating func ensureActiveLineExists(at row: Int) {
+        let targetRow = max(0, row)
+        while activeCompletedLineCount < targetRow {
+            appendCompletedLine(activeCurrentLineText)
+            clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
+        }
+    }
+
+    private mutating func makeActiveLineCurrent(at row: Int) {
+        let targetRow = max(0, row)
+        ensureActiveLineExists(at: targetRow)
+        let line = activeLineText(at: targetRow)
+
+        if isUsingAlternateScreen {
+            if targetRow < alternateCompletedLines.count {
+                alternateCompletedLines.removeSubrange(targetRow..<alternateCompletedLines.count)
+            }
             alternateCurrentLine = line
         } else {
+            if targetRow < completedLines.count {
+                completedLines.removeSubrange(targetRow..<completedLines.count)
+            }
             currentLine = line
         }
     }
@@ -2432,7 +2490,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         case UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"), UInt8(ascii: "+"):
             parserState = .charsetDesignation
         case UInt8(ascii: "M"):
-            cursorRow = max(0, cursorRow - 1)
+            moveCursorRow(by: -1)
             parserState = .ground
         default:
             parserState = .ground
@@ -2554,48 +2612,27 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         case "q":
             applyCursorShape(parameter(at: 0, default: 0))
         case "A":
-            cursorRow = max(0, cursorRow - parameter(at: 0, default: 1))
+            moveCursorRow(by: -parameter(at: 0, default: 1))
         case "B":
-            cursorRow += parameter(at: 0, default: 1)
+            moveCursorRow(by: parameter(at: 0, default: 1))
         case "C":
             cursorColumn += parameter(at: 0, default: 1)
         case "D":
             cursorColumn = max(0, cursorColumn - parameter(at: 0, default: 1))
         case "E":
-            cursorRow += parameter(at: 0, default: 1)
+            moveCursorRow(by: parameter(at: 0, default: 1))
             cursorColumn = 0
         case "F":
-            cursorRow = max(0, cursorRow - parameter(at: 0, default: 1))
+            moveCursorRow(by: -parameter(at: 0, default: 1))
             cursorColumn = 0
         case "G":
             cursorColumn = max(0, parameter(at: 0, default: 1) - 1)
         case "H", "f":
-            cursorRow = max(0, parameter(at: 0, default: 1) - 1)
-            cursorColumn = max(0, parameter(at: 1, default: 1) - 1)
+            moveCursor(toScreenRow: parameter(at: 0, default: 1) - 1, column: parameter(at: 1, default: 1) - 1)
         case "J":
-            switch parameter(at: 0, default: 0) {
-            case 2 where isUsingAlternateScreen:
-                clearActiveCompletedLines(keepingCapacity: false)
-                clearCurrentLine(keepingCapacity: false)
-                cursorRow = 0
-                cursorColumn = 0
-            case 2:
-                clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
-                cursorRow = max(0, activeCompletedLineCount)
-                cursorColumn = 0
-            case 3:
-                clearActiveCompletedLines(keepingCapacity: false)
-                clearCurrentLine(keepingCapacity: false)
-                cursorRow = 0
-                cursorColumn = 0
-            default:
-                break
-            }
+            eraseInDisplay(mode: parameter(at: 0, default: 0))
         case "K":
-            if parameter(at: 0, default: 0) == 2 || cursorColumn == 0 {
-                clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
-                cursorColumn = 0
-            }
+            eraseInLine(mode: parameter(at: 0, default: 0))
         default:
             return
         }
@@ -2751,14 +2788,15 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private mutating func appendText(_ text: String) {
         guard !text.isEmpty else { return }
 
-        var line = activeCurrentLineText
+        ensureActiveLineExists(at: cursorRow)
+        var line = activeLineText(at: cursorRow)
         if cursorColumn <= 0 {
             if line.isEmpty {
                 line = text
             } else {
                 line.replaceByCharacterColumns(0..<text.count, with: text)
             }
-            setActiveCurrentLine(line)
+            setActiveLineText(line, at: cursorRow)
             cursorColumn = text.count
             return
         }
@@ -2768,31 +2806,103 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
                 line += String(repeating: " ", count: cursorColumn - line.count)
             }
             line += text
-            setActiveCurrentLine(line)
+            setActiveLineText(line, at: cursorRow)
             cursorColumn = line.count
             return
         }
 
         line.replaceByCharacterColumns(cursorColumn..<(cursorColumn + text.count), with: text)
-        setActiveCurrentLine(line)
+        setActiveLineText(line, at: cursorRow)
         cursorColumn += text.count
     }
 
     private mutating func appendNewLine() {
-        appendCompletedLine(activeCurrentLineText)
-        clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
-        cursorRow = activeCompletedLineCount
+        ensureActiveLineExists(at: cursorRow)
+        if cursorRow >= activeCompletedLineCount {
+            appendCompletedLine(activeCurrentLineText)
+            clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
+            cursorRow = activeCompletedLineCount
+        } else {
+            cursorRow = min(cursorRow + 1, screenBottomRow)
+            ensureActiveLineExists(at: cursorRow)
+        }
         cursorColumn = 0
         trimIfNeeded()
     }
 
     private mutating func removeCharacterBeforeCursor() {
-        var line = activeCurrentLineText
+        ensureActiveLineExists(at: cursorRow)
+        var line = activeLineText(at: cursorRow)
         guard cursorColumn > 0, !line.isEmpty else { return }
         let removalColumn = cursorColumn - 1
         line.replaceByCharacterColumns(removalColumn..<cursorColumn, with: "")
-        setActiveCurrentLine(line)
+        setActiveLineText(line, at: cursorRow)
         cursorColumn = removalColumn
+    }
+
+    private mutating func moveCursorRow(by delta: Int) {
+        let top = screenTopRow
+        let bottom = screenBottomRow
+        cursorRow = min(max(cursorRow + delta, top), bottom)
+        ensureActiveLineExists(at: cursorRow)
+    }
+
+    private mutating func moveCursor(toScreenRow row: Int, column: Int) {
+        let top = screenTopRow
+        let bottom = screenBottomRow
+        cursorRow = min(max(top + max(0, row), top), bottom)
+        ensureActiveLineExists(at: cursorRow)
+        cursorColumn = max(0, column)
+    }
+
+    private mutating func eraseInDisplay(mode: Int) {
+        switch mode {
+        case 0:
+            eraseInLine(mode: 0)
+            makeActiveLineCurrent(at: cursorRow)
+        case 2 where isUsingAlternateScreen:
+            clearActiveCompletedLines(keepingCapacity: false)
+            clearCurrentLine(keepingCapacity: false)
+            cursorRow = 0
+            cursorColumn = 0
+        case 2:
+            appendCompletedLine(activeCurrentLineText)
+            clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
+            cursorRow = activeCompletedLineCount
+            cursorColumn = 0
+            primaryScreenTopRow = cursorRow
+        case 3:
+            clearActiveCompletedLines(keepingCapacity: false)
+            clearCurrentLine(keepingCapacity: false)
+            cursorRow = 0
+            cursorColumn = 0
+            primaryScreenTopRow = nil
+        default:
+            break
+        }
+    }
+
+    private mutating func eraseInLine(mode: Int) {
+        ensureActiveLineExists(at: cursorRow)
+        var line = activeLineText(at: cursorRow)
+
+        switch mode {
+        case 1:
+            let erasedColumnCount = min(max(0, cursorColumn + 1), line.count)
+            guard erasedColumnCount > 0 else { return }
+            line.replaceByCharacterColumns(0..<erasedColumnCount, with: String(repeating: " ", count: erasedColumnCount))
+        case 2:
+            line.removeAll(keepingCapacity: line.count <= 4_096)
+        default:
+            guard cursorColumn < line.count else { return }
+            if cursorColumn <= 0 {
+                line.removeAll(keepingCapacity: line.count <= 4_096)
+            } else {
+                line = line.substringByCharacterColumns(0..<cursorColumn)
+            }
+        }
+
+        setActiveLineText(line, at: cursorRow)
     }
 
     private mutating func trimIfNeeded(force: Bool = false) {
@@ -2815,6 +2925,9 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         let removeCount = completedLines.count - maximumCompletedLines
         completedLines.removeFirst(removeCount)
         cursorRow = max(0, cursorRow - removeCount)
+        if let screenTopRow = primaryScreenTopRow {
+            primaryScreenTopRow = max(0, screenTopRow - removeCount)
+        }
     }
 
     private mutating func enterAlternateScreen() {
@@ -2837,7 +2950,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private func cursorPositionReport() -> Data {
         let rows = max(1, currentViewportSize.rows)
         let columns = max(1, currentViewportSize.columns)
-        let row = min(rows, max(1, cursorRow + 1))
+        let row = min(rows, max(1, cursorRow - screenTopRow + 1))
         let column = min(columns, max(1, cursorColumn + 1))
 
         return Data("\u{1B}[\(row);\(column)R".utf8)

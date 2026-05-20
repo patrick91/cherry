@@ -1702,8 +1702,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.ghosttyBridgeStorage = nil
     }
 
-    func detachGhosttyBridge(from container: GhosttyTerminalContainerView) {
-        ghosttyBridgeStorage?.detach(from: container)
+    func detachGhosttyBridge(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
+        ghosttyBridgeStorage?.detach(from: container, preservingSurface: preservingSurface)
     }
 
     func stopManagedCommand() {

@@ -15,35 +15,73 @@ private func sidebarResizeLog(_ message: @autoclosure () -> String) {
     print("[sidebar.resize] \(message())")
 }
 
-private final class GhosttyOutputSink: @unchecked Sendable {
+final class GhosttyOutputSink: @unchecked Sendable {
     private static let maximumRetainedPendingBytes = 1_048_576
     private static let burstCoalescingDelay: DispatchTimeInterval = .milliseconds(4)
     private static let burstDetectionWindowNanoseconds: UInt64 = 12_000_000
 
+    private struct PendingChunk {
+        var data: Data
+        let suppressHostInput: Bool
+    }
+
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "Cherry.GhosttyOutputSink", qos: .userInitiated)
-    private var session: InMemoryTerminalSession
-    private var pendingData = Data()
+    private let receiveData: (InMemoryTerminalSession?, Data) -> Void
+    private let hostInputSuppressor: (@escaping () -> Void) -> Void
+    private var session: InMemoryTerminalSession?
+    private var pendingChunks: [PendingChunk] = []
+    private var pendingByteCount = 0
     private var isDrainScheduled = false
     private var lastDrainUptimeNanoseconds: UInt64?
 
-    init(session: InMemoryTerminalSession) {
+    init(
+        session: InMemoryTerminalSession,
+        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() }
+    ) {
         self.session = session
+        self.hostInputSuppressor = hostInputSuppressor
+        self.receiveData = { session, data in
+            session?.receive(data)
+        }
+    }
+
+    init(
+        receiveForTesting: @escaping (Data) -> Void,
+        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() }
+    ) {
+        self.session = nil
+        self.hostInputSuppressor = hostInputSuppressor
+        self.receiveData = { _, data in
+            receiveForTesting(data)
+        }
     }
 
     func setSession(_ session: InMemoryTerminalSession) {
         lock.withLock {
             self.session = session
-            pendingData.removeAll(keepingCapacity: false)
+            pendingChunks.removeAll(keepingCapacity: false)
+            pendingByteCount = 0
             lastDrainUptimeNanoseconds = nil
         }
     }
 
-    func receive(_ data: Data) {
+    func receive(_ data: Data, suppressHostInput: Bool = false) {
         guard !data.isEmpty else { return }
 
         let drainDelay: DispatchTimeInterval? = lock.withLock {
-            pendingData.append(data)
+            if pendingByteCount + data.count > Self.maximumRetainedPendingBytes {
+                pendingChunks.removeAll(keepingCapacity: true)
+                pendingByteCount = 0
+            }
+            if let lastIndex = pendingChunks.indices.last,
+               pendingChunks[lastIndex].suppressHostInput == suppressHostInput
+            {
+                pendingChunks[lastIndex].data.append(data)
+            } else {
+                pendingChunks.append(PendingChunk(data: data, suppressHostInput: suppressHostInput))
+            }
+            pendingByteCount += data.count
             guard !isDrainScheduled else { return nil }
             isDrainScheduled = true
             let now = DispatchTime.now().uptimeNanoseconds
@@ -70,27 +108,37 @@ private final class GhosttyOutputSink: @unchecked Sendable {
         }
     }
 
+    func flushForTesting() {
+        queue.sync {}
+    }
+
     private func drainPendingData() {
         while true {
-            let next: (session: InMemoryTerminalSession, data: Data)? = lock.withLock {
-                guard !pendingData.isEmpty else {
+            let next: (session: InMemoryTerminalSession?, chunks: [PendingChunk])? = lock.withLock {
+                guard !pendingChunks.isEmpty else {
                     isDrainScheduled = false
                     lastDrainUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
                     return nil
                 }
 
-                let data = pendingData
-                if pendingData.count > Self.maximumRetainedPendingBytes {
-                    pendingData = Data()
-                } else {
-                    pendingData.removeAll(keepingCapacity: true)
-                }
-                return (session, data)
+                let chunks = pendingChunks
+                pendingChunks.removeAll(keepingCapacity: true)
+                pendingByteCount = 0
+                return (session, chunks)
             }
 
             guard let next else { return }
-            TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: next.data.count)
-            next.session.receive(next.data)
+            for chunk in next.chunks {
+                TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: chunk.data.count)
+                let receive = { [receiveData, session = next.session, data = chunk.data] in
+                    receiveData(session, data)
+                }
+                if chunk.suppressHostInput {
+                    hostInputSuppressor(receive)
+                } else {
+                    receive()
+                }
+            }
         }
     }
 }
@@ -112,8 +160,10 @@ private final class GhosttySessionProxy: @unchecked Sendable {
             isHostInputSuppressed
         }
         guard !shouldSuppress else { return }
+        let sanitizedData = GhosttySessionBridge.sanitizeHostInputFromGhostty(data)
+        guard !sanitizedData.isEmpty else { return }
 
-        inputWriter.write(data)
+        inputWriter.write(sanitizedData)
     }
 
     func resize(columns: Int, rows: Int) {
@@ -143,6 +193,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 {
     private(set) static var liveBridgeCount = 0
     private(set) static var installedOutputObserverCount = 0
+    static var detachedSurfaceReleaseDelay: Duration = .milliseconds(750)
 
     let terminalView: TerminalView
 
@@ -163,6 +214,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var pointerStyle: TerminalPointerStyle = .text
     private var hoveredLink: String?
     private var isReleased = false
+    private var detachedSurfaceReleaseTask: Task<Void, Never>?
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -172,7 +224,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         self.proxy = proxy
         self.inMemorySession = inMemorySession
-        self.outputSink = GhosttyOutputSink(session: inMemorySession)
+        self.outputSink = GhosttyOutputSink(session: inMemorySession) { operation in
+            proxy.withHostInputSuppressed {
+                operation()
+            }
+        }
         self.controller = TerminalController(configuration: terminalConfiguration, theme: terminalTheme)
         self.terminalView = TerminalView(frame: .zero)
         self.appliedTerminalConfiguration = terminalConfiguration
@@ -192,6 +248,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func attach(to container: GhosttyTerminalContainerView) {
         guard !isReleased else { return }
+        cancelDetachedSurfaceRelease()
         let isAlreadyInstalled = scrollContainer === container && terminalView.superview != nil
         TerminalPerformanceMonitor.recordBridgeAttach(reused: isAlreadyInstalled)
         scrollContainer = container
@@ -208,9 +265,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
     }
 
-    func detach(from container: GhosttyTerminalContainerView) {
+    func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased || scrollContainer === container else { return }
         terminalView.setSurfaceVisible(false)
+        if !preservingSurface {
+            scheduleDetachedSurfaceRelease()
+        }
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         if scrollContainer === container {
@@ -231,6 +291,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func reset() {
         guard !isReleased else { return }
         uninstallOutputObserver()
+        gridMetrics = nil
+        scrollbarMetrics = nil
 
         let nextSession = Self.makeInMemorySession(proxy: proxy)
         inMemorySession = nextSession
@@ -241,12 +303,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
+        scrollContainer?.synchronizeScrollState()
         activateOutputFeedWhenSurfaceIsReady()
     }
 
     func releaseResources() {
         guard !isReleased else { return }
         isReleased = true
+        cancelDetachedSurfaceRelease()
         pendingFeedActivation = false
         uninstallOutputObserver()
         uninstallSettingsObserver()
@@ -345,10 +409,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         guard !isReleased, outputObserverID == nil, let session = proxy.session else { return }
 
         let existingOutput = session.rawOutput(maxBytes: 1_048_576).data
-        if !existingOutput.isEmpty {
-            proxy.withHostInputSuppressed {
-                outputSink.receive(existingOutput)
-            }
+        let replayOutput = Self.sanitizeReplayOutputForHostManagedTerminal(existingOutput)
+        if !replayOutput.isEmpty {
+            outputSink.receive(replayOutput, suppressHostInput: true)
         }
 
         outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
@@ -357,11 +420,251 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         Self.installedOutputObserverCount += 1
     }
 
+    func installOutputObserverForTesting() {
+        installOutputObserver()
+    }
+
     private func uninstallOutputObserver() {
         guard let outputObserverID else { return }
         proxy.session?.removeRawOutputObserver(id: outputObserverID)
         self.outputObserverID = nil
         Self.installedOutputObserverCount -= 1
+    }
+
+    private func scheduleDetachedSurfaceRelease() {
+        cancelDetachedSurfaceRelease()
+        let delay = Self.detachedSurfaceReleaseDelay
+        detachedSurfaceReleaseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let self, !self.isReleased, self.scrollContainer == nil else { return }
+            self.detachedSurfaceReleaseTask = nil
+            self.releaseDetachedSurface()
+        }
+    }
+
+    private func cancelDetachedSurfaceRelease() {
+        detachedSurfaceReleaseTask?.cancel()
+        detachedSurfaceReleaseTask = nil
+    }
+
+    private func releaseDetachedSurface() {
+        pendingFeedActivation = false
+        uninstallOutputObserver()
+        terminalView.freeSurface()
+        gridMetrics = nil
+        scrollbarMetrics = nil
+    }
+
+    nonisolated static func sanitizeReplayOutputForHostManagedTerminal(_ data: Data) -> Data {
+        guard !data.isEmpty else { return data }
+
+        let bytes = Array(data)
+        var sanitized: [UInt8] = []
+        sanitized.reserveCapacity(bytes.count)
+
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x1B, index + 1 < bytes.count {
+                switch bytes[index + 1] {
+                case UInt8(ascii: "]"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isResponseGeneratingOSCQuery(payload) {
+                            index = bounds.endIndex
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
+                        index = bounds.endIndex
+                        continue
+                    }
+                case UInt8(ascii: "["):
+                    if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<finalIndex]
+                        let finalByte = bytes[finalIndex]
+                        if isResponseGeneratingCSIQuery(payload, finalByte: finalByte) {
+                            index = finalIndex + 1
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<(finalIndex + 1)])
+                        index = finalIndex + 1
+                        continue
+                    }
+                default:
+                    break
+                }
+            }
+
+            sanitized.append(bytes[index])
+            index += 1
+        }
+
+        return sanitized.count == bytes.count ? data : Data(sanitized)
+    }
+
+    nonisolated static func sanitizeHostInputFromGhostty(_ data: Data) -> Data {
+        guard !data.isEmpty else { return data }
+
+        let bytes = Array(data)
+        var sanitized: [UInt8] = []
+        sanitized.reserveCapacity(bytes.count)
+
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x1B, index + 1 < bytes.count {
+                switch bytes[index + 1] {
+                case UInt8(ascii: "]"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isTerminalGeneratedOSCResponse(payload) {
+                            index = bounds.endIndex
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
+                        index = bounds.endIndex
+                        continue
+                    }
+                case UInt8(ascii: "["):
+                    if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<finalIndex]
+                        let finalByte = bytes[finalIndex]
+                        if isTerminalGeneratedCSIResponse(payload, finalByte: finalByte) {
+                            index = finalIndex + 1
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<(finalIndex + 1)])
+                        index = finalIndex + 1
+                        continue
+                    }
+                default:
+                    break
+                }
+            }
+
+            sanitized.append(bytes[index])
+            index += 1
+        }
+
+        return sanitized.count == bytes.count ? data : Data(sanitized)
+    }
+
+    nonisolated private static func oscSequenceBounds(
+        in bytes: [UInt8],
+        payloadStart: Int
+    ) -> (payloadEnd: Int, endIndex: Int)? {
+        var index = payloadStart
+        while index < bytes.count {
+            if bytes[index] == 0x07 {
+                return (payloadEnd: index, endIndex: index + 1)
+            }
+
+            if bytes[index] == 0x1B {
+                guard index + 1 < bytes.count else { return nil }
+                if bytes[index + 1] == UInt8(ascii: "\\") {
+                    return (payloadEnd: index, endIndex: index + 2)
+                }
+                index += 2
+                continue
+            }
+
+            index += 1
+        }
+
+        return nil
+    }
+
+    nonisolated private static func csiFinalIndex(in bytes: [UInt8], payloadStart: Int) -> Int? {
+        var index = payloadStart
+        while index < bytes.count {
+            let byte = bytes[index]
+            if (0x40...0x7E).contains(byte) {
+                return index
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    nonisolated private static func isResponseGeneratingOSCQuery(_ payload: ArraySlice<UInt8>) -> Bool {
+        let fields = String(decoding: payload, as: UTF8.self)
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard let command = fields.first else { return false }
+
+        switch command {
+        case "4":
+            return fields.dropFirst().contains("?")
+        case "10", "11", "12", "13", "17", "19":
+            return fields.indices.contains(1) && fields[1] == "?"
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isTerminalGeneratedOSCResponse(_ payload: ArraySlice<UInt8>) -> Bool {
+        let fields = String(decoding: payload, as: UTF8.self)
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard let command = fields.first else { return false }
+
+        switch command {
+        case "4":
+            guard fields.count >= 3 else { return false }
+            return fields.dropFirst().contains { $0.hasPrefix("rgb:") }
+        case "10", "11", "12", "13", "17", "19":
+            return fields.indices.contains(1) && fields[1].hasPrefix("rgb:")
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isResponseGeneratingCSIQuery(
+        _ payloadBytes: ArraySlice<UInt8>,
+        finalByte: UInt8
+    ) -> Bool {
+        let payload = String(decoding: payloadBytes, as: UTF8.self)
+
+        switch finalByte {
+        case UInt8(ascii: "c"):
+            return true
+        case UInt8(ascii: "n"):
+            return payload == "5" || payload == "6"
+        case UInt8(ascii: "p"):
+            return payload.hasPrefix("?") && payload.hasSuffix("$")
+        case UInt8(ascii: "u"):
+            return payload.first == "?"
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isTerminalGeneratedCSIResponse(
+        _ payloadBytes: ArraySlice<UInt8>,
+        finalByte: UInt8
+    ) -> Bool {
+        let payload = String(decoding: payloadBytes, as: UTF8.self)
+
+        switch finalByte {
+        case UInt8(ascii: "c"):
+            return payload.hasPrefix("?") || payload.hasPrefix(">")
+        case UInt8(ascii: "n"):
+            return payload == "0"
+        case UInt8(ascii: "R"):
+            let fields = payload.split(separator: ";", omittingEmptySubsequences: false)
+            guard fields.count == 2 else { return false }
+            return fields.allSatisfy { Int($0) != nil }
+        case UInt8(ascii: "y"):
+            guard payload.hasPrefix("?"), payload.contains(";"), payload.hasSuffix("$") else {
+                return false
+            }
+            let body = payload.dropFirst().dropLast()
+            let fields = body.split(separator: ";", omittingEmptySubsequences: false)
+            guard fields.count == 2 else { return false }
+            return fields.allSatisfy { Int($0) != nil }
+        case UInt8(ascii: "u"):
+            return payload == "?0"
+        default:
+            return false
+        }
     }
 
     private static func makeInMemorySession(proxy: GhosttySessionProxy) -> InMemoryTerminalSession {
@@ -605,13 +908,17 @@ final class GhosttyTerminalContainerView: NSView {
         }
     }
 
-    func detachActiveSession(clearsSession: Bool = true, releasesBridge: Bool = true) {
+    func detachActiveSession(
+        clearsSession: Bool = true,
+        releasesBridge: Bool = true,
+        preservingSurface: Bool = false
+    ) {
         guard let session = activeSession else {
             activeBridge = nil
             return
         }
 
-        session.detachGhosttyBridge(from: self)
+        session.detachGhosttyBridge(from: self, preservingSurface: preservingSurface)
         if releasesBridge {
             session.releaseGhosttyBridge()
         }

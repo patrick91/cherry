@@ -2,6 +2,7 @@ import AppKit
 import CherryControl
 import Darwin
 import Foundation
+import GhosttyTerminal
 import MCP
 import SwiftUI
 import Testing
@@ -96,6 +97,44 @@ private final class DataWriteRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storedValues
+    }
+}
+
+private final class BoolRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [Bool] = []
+
+    func append(_ value: Bool) {
+        lock.lock()
+        storedValues.append(value)
+        lock.unlock()
+    }
+
+    var values: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValues
+    }
+}
+
+private final class LockedBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Bool
+
+    init(_ value: Bool) {
+        storedValue = value
+    }
+
+    func set(_ value: Bool) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
+    }
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
     }
 }
 
@@ -3134,6 +3173,66 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!rawOutput.contains("NO_RESPONSE"))
 }
 
+@Test func ghosttyOutputSinkSuppressesHostInputDuringDeferredReplayDrain() async throws {
+    let suppressionState = LockedBool(false)
+    let observedSuppression = BoolRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { _ in
+            observedSuppression.append(suppressionState.value)
+        },
+        hostInputSuppressor: { operation in
+            suppressionState.set(true)
+            operation()
+            suppressionState.set(false)
+        }
+    )
+
+    sink.receive(Data("replayed terminal output".utf8), suppressHostInput: true)
+    sink.flushForTesting()
+
+    #expect(observedSuppression.values == [true])
+}
+
+@Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
+    let replay = Data((
+        "before" +
+        "\u{1B}]11;?\u{07}" +
+        "\u{1B}]10;?\u{1B}\\" +
+        "\u{1B}[6n" +
+        "\u{1B}[c" +
+        "\u{1B}[>c" +
+        "\u{1B}[?2027$p" +
+        "\u{1B}[?u" +
+        "\u{1B}]2;kept title\u{07}" +
+        "\u{1B}[31m" +
+        "after"
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+
+    #expect(String(decoding: sanitized, as: UTF8.self) == "before\u{1B}]2;kept title\u{07}\u{1B}[31mafter")
+}
+
+@Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
+    let input = Data((
+        "keep" +
+        "\u{1B}]10;rgb:eded/ecec/eeee\u{1B}\\" +
+        "\u{1B}]11;rgb:1515/1414/1b1b\u{07}" +
+        "\u{1B}[0n" +
+        "\u{1B}[12;34R" +
+        "\u{1B}[?1;2c" +
+        "\u{1B}[>0;0;0c" +
+        "\u{1B}[?2027;1$y" +
+        "\u{1B}[?0u" +
+        "\u{1B}[A" +
+        "tail"
+    ).utf8)
+
+    let filtered = GhosttySessionBridge.sanitizeHostInputFromGhostty(input)
+
+    #expect(String(decoding: filtered, as: UTF8.self) == "keep\u{1B}[Atail")
+}
+
 @MainActor
 @Test func terminalSessionMetadataFollowsOSCSequences() async throws {
     let session = TerminalSession(
@@ -3372,6 +3471,80 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(first.ghosttyBridge === firstBridge)
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
+}
+
+@MainActor
+@Test func ghosttyContainerKeepsDetachedSurfaceBrieflyWhenSwitchingSessions() async throws {
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Second",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let previousDelay = GhosttySessionBridge.detachedSurfaceReleaseDelay
+    GhosttySessionBridge.detachedSurfaceReleaseDelay = .milliseconds(50)
+
+    defer {
+        GhosttySessionBridge.detachedSurfaceReleaseDelay = previousDelay
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    first.ghosttyBridge.installOutputObserverForTesting()
+    #expect(first.rawOutputObserverCount == 1)
+
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    #expect(first.rawOutputObserverCount == 1)
+
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(first.rawOutputObserverCount == 0)
+}
+
+@MainActor
+@Test func ghosttyBridgeResetClearsCachedScrollGeometry() async throws {
+    let session = TerminalSession(
+        title: "Reset",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    defer {
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    let bridge = session.ghosttyBridge
+    bridge.terminalDidResize(TerminalGridMetrics(
+        columns: 80,
+        rows: 24,
+        widthPixels: 800,
+        heightPixels: 480,
+        cellWidthPixels: 10,
+        cellHeightPixels: 20
+    ))
+    bridge.terminalDidUpdateScrollbar(TerminalScrollbarMetrics(
+        total: 1_000,
+        offset: 976,
+        length: 24
+    ))
+
+    bridge.reset()
+
+    #expect(bridge.gridMetrics == nil)
+    #expect(bridge.scrollbarMetrics == nil)
 }
 
 @MainActor

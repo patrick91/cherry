@@ -2087,6 +2087,9 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
 
     private let maxScrollback: Int?
     private let trimSlack: Int
+    private static let defaultForegroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (219, 227, 235)
+    private static let defaultBackgroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (18, 17, 23)
+    private static let maximumOSCBytes = 8_192
 
     private var completedLines: [String] = []
     private var currentLine = ""
@@ -2099,6 +2102,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private var isUsingAlternateScreen = false
     private var currentViewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var isApplicationCursorMode = false
+    private var isBracketedPasteMode = false
     private var currentMouseState = TerminalMouseState()
     private var cursorRow = 0
     private var cursorColumn = 0
@@ -2196,6 +2200,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         escapedStringPendingST = false
         isUsingAlternateScreen = false
         isApplicationCursorMode = false
+        isBracketedPasteMode = false
         currentMouseState = TerminalMouseState()
         cursorRow = 0
         cursorColumn = 0
@@ -2226,6 +2231,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         guard !data.isEmpty else { return [] }
 
         currentViewportSize = viewportSize
+        var responses: [Data] = []
         if let plainLines = plainCompletedLines(from: data) {
             appendCompletedLines(plainLines)
             clearCurrentLine(keepingCapacity: true)
@@ -2236,12 +2242,12 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
 
         for byte in data {
-            process(byte)
+            process(byte, responses: &responses)
         }
 
         flushPendingText(preservingIncompleteUTF8: true)
         trimIfNeeded()
-        return []
+        return responses
     }
 
     private func line(at row: Int) -> String? {
@@ -2369,16 +2375,16 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
     }
 
-    private mutating func process(_ byte: UInt8) {
+    private mutating func process(_ byte: UInt8, responses: inout [Data]) {
         switch parserState {
         case .ground:
             processGround(byte)
         case .escape:
             processEscape(byte)
         case .csi:
-            processCSI(byte)
+            processCSI(byte, responses: &responses)
         case .osc:
-            processOSC(byte)
+            processOSC(byte, responses: &responses)
         case .ignoredString:
             processIgnoredString(byte)
         case .charsetDesignation:
@@ -2433,36 +2439,76 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
     }
 
-    private mutating func processCSI(_ byte: UInt8) {
+    private mutating func processCSI(_ byte: UInt8, responses: inout [Data]) {
         controlBuffer.append(byte)
         guard (0x40...0x7E).contains(byte) else { return }
 
         let finalByte = byte
         let payload = String(decoding: controlBuffer.dropLast(), as: UTF8.self)
-        handleCSI(finalByte: finalByte, payload: payload)
+        handleCSI(finalByte: finalByte, payload: payload, responses: &responses)
 
         controlBuffer.removeAll(keepingCapacity: true)
         parserState = .ground
     }
 
-    private mutating func processOSC(_ byte: UInt8) {
+    private mutating func processOSC(_ byte: UInt8, responses: inout [Data]) {
         if escapedStringPendingST {
             escapedStringPendingST = false
             if byte == UInt8(ascii: "\\") {
-                controlBuffer.removeAll(keepingCapacity: true)
-                parserState = .ground
+                finishOSC(responses: &responses)
                 return
             }
+
+            appendOSCByte(0x1B)
         }
 
         if byte == 0x07 {
-            controlBuffer.removeAll(keepingCapacity: true)
-            parserState = .ground
+            finishOSC(responses: &responses)
         } else if byte == 0x1B {
             escapedStringPendingST = true
-        } else if controlBuffer.count < 8_192 {
-            controlBuffer.append(byte)
+        } else {
+            appendOSCByte(byte)
         }
+    }
+
+    private mutating func appendOSCByte(_ byte: UInt8) {
+        guard controlBuffer.count < Self.maximumOSCBytes else { return }
+        controlBuffer.append(byte)
+    }
+
+    private mutating func finishOSC(responses: inout [Data]) {
+        let rawPayload = String(decoding: controlBuffer, as: UTF8.self)
+        handleOSC(rawPayload: rawPayload, responses: &responses)
+
+        controlBuffer.removeAll(keepingCapacity: true)
+        escapedStringPendingST = false
+        parserState = .ground
+    }
+
+    private func handleOSC(rawPayload: String, responses: inout [Data]) {
+        let fields = rawPayload.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+        guard fields.count >= 2, fields[1] == "?" else { return }
+
+        switch fields[0] {
+        case "10":
+            responses.append(Self.oscColorResponse(code: "10", color: Self.defaultForegroundColor))
+        case "11":
+            responses.append(Self.oscColorResponse(code: "11", color: Self.defaultBackgroundColor))
+        default:
+            break
+        }
+    }
+
+    private static func oscColorResponse(
+        code: String,
+        color: (red: UInt8, green: UInt8, blue: UInt8)
+    ) -> Data {
+        let payload = "\u{1B}]\(code);rgb:\(hex16(color.red))/\(hex16(color.green))/\(hex16(color.blue))\u{07}"
+        return Data(payload.utf8)
+    }
+
+    private static func hex16(_ value: UInt8) -> String {
+        String(format: "%04x", UInt16(value) * 257)
     }
 
     private mutating func processIgnoredString(_ byte: UInt8) {
@@ -2483,7 +2529,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
     }
 
-    private mutating func handleCSI(finalByte: UInt8, payload: String) {
+    private mutating func handleCSI(finalByte: UInt8, payload: String, responses: inout [Data]) {
         let parameters = numericParameters(from: payload)
 
         func parameter(at index: Int, default fallback: Int) -> Int {
@@ -2494,9 +2540,17 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
 
         switch Character(UnicodeScalar(finalByte)) {
+        case "c":
+            handleDeviceAttributes(rawPayload: payload, responses: &responses)
+        case "n":
+            handleDeviceStatusReport(parameter(at: 0, default: 0), responses: &responses)
+        case "p":
+            handleModeStatusReport(rawPayload: payload, responses: &responses)
         case "h", "l":
             guard payload.first == "?" else { return }
             handlePrivateMode(isSet: finalByte == UInt8(ascii: "h"), parameters: parameters.compactMap { $0 })
+        case "u":
+            handleCursorRestoreOrKeyboardProtocol(rawPayload: payload, responses: &responses)
         case "q":
             applyCursorShape(parameter(at: 0, default: 0))
         case "A":
@@ -2547,6 +2601,79 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         }
     }
 
+    private func handleDeviceAttributes(rawPayload: String, responses: inout [Data]) {
+        if rawPayload.first == ">" {
+            responses.append(Data("\u{1B}[>0;0;0c".utf8))
+            return
+        }
+
+        if rawPayload.isEmpty || rawPayload == "0" {
+            responses.append(Data("\u{1B}[?1;2c".utf8))
+        }
+    }
+
+    private mutating func handleCursorRestoreOrKeyboardProtocol(rawPayload: String, responses: inout [Data]) {
+        switch rawPayload.first {
+        case "?":
+            responses.append(Data("\u{1B}[?0u".utf8))
+        case ">", "<", "=":
+            return
+        default:
+            return
+        }
+    }
+
+    private func handleDeviceStatusReport(_ code: Int, responses: inout [Data]) {
+        switch code {
+        case 5:
+            responses.append(Data("\u{1B}[0n".utf8))
+        case 6:
+            responses.append(cursorPositionReport())
+        default:
+            return
+        }
+    }
+
+    private func handleModeStatusReport(rawPayload: String, responses: inout [Data]) {
+        guard rawPayload.hasPrefix("?"), rawPayload.hasSuffix("$") else { return }
+
+        let modeText = rawPayload.dropFirst().dropLast()
+        guard let mode = Int(modeText) else { return }
+
+        responses.append(Data("\u{1B}[?\(mode);\(privateModeStatus(mode))$y".utf8))
+    }
+
+    private func privateModeStatus(_ mode: Int) -> Int {
+        switch mode {
+        case 1:
+            isApplicationCursorMode ? 1 : 2
+        case 25:
+            isCursorVisible ? 1 : 2
+        case 47, 1047, 1049:
+            isUsingAlternateScreen ? 1 : 2
+        case 69:
+            2
+        case 1000:
+            currentMouseState.trackingMode == .normal ? 1 : 2
+        case 1002:
+            currentMouseState.trackingMode == .buttonEvent ? 1 : 2
+        case 1003:
+            currentMouseState.trackingMode == .anyEvent ? 1 : 2
+        case 1004:
+            currentMouseState.sendsFocusEvents ? 1 : 2
+        case 1006:
+            currentMouseState.usesSGREncoding ? 1 : 2
+        case 1007:
+            currentMouseState.alternateScrollMode ? 1 : 2
+        case 2004:
+            isBracketedPasteMode ? 1 : 2
+        case 2026, 2027, 2031, 2048:
+            4
+        default:
+            0
+        }
+    }
+
     private func numericParameters(from payload: String) -> [Int?] {
         payload
             .split(separator: ";", omittingEmptySubsequences: false)
@@ -2581,6 +2708,8 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
                 currentMouseState.usesSGREncoding = isSet
             case 1007:
                 currentMouseState.alternateScrollMode = isSet
+            case 2004:
+                isBracketedPasteMode = isSet
             default:
                 continue
             }
@@ -2703,6 +2832,15 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         isUsingAlternateScreen = false
         cursorRow = max(0, lineCount - 1)
         cursorColumn = activeCurrentLineCount
+    }
+
+    private func cursorPositionReport() -> Data {
+        let rows = max(1, currentViewportSize.rows)
+        let columns = max(1, currentViewportSize.columns)
+        let row = min(rows, max(1, cursorRow + 1))
+        let column = min(columns, max(1, cursorColumn + 1))
+
+        return Data("\u{1B}[\(row);\(column)R".utf8)
     }
 }
 

@@ -296,7 +296,7 @@ final class TerminalInputWriter: @unchecked Sendable {
         }
     }
 
-    func write(_ data: Data, normalize: Bool = true) {
+    func write(_ data: Data, normalize: Bool = true, notifyInput: Bool = true) {
         let snapshot = lock.withLock {
             let writer: WriteHandler? = if let process {
                 { process.write($0) }
@@ -320,7 +320,9 @@ final class TerminalInputWriter: @unchecked Sendable {
         guard !outboundData.isEmpty else { return }
 
         writer(outboundData)
-        scheduleInputHandler(snapshot.inputHandler)
+        if notifyInput {
+            scheduleInputHandler(snapshot.inputHandler)
+        }
     }
 
     private func scheduleInputHandler(_ handler: (@MainActor @Sendable () -> Void)?) {
@@ -1818,7 +1820,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                         self?.ingestTerminalMetadata(data)
                     }
                     if !prototypeProcessorDisabledForPerf {
-                        processor.enqueueOutput(data, launchID: launchID, responseWriter: { _ in })
+                        processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
+                            self.hostInputWriter.write(response, normalize: false, notifyInput: false)
+                        })
                     }
                 },
                 onExit: { [weak self] status in

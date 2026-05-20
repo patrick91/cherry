@@ -3084,6 +3084,57 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func terminalSessionWritesTerminalQueryResponsesBackToPTY() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let scriptURL = directory.appendingPathComponent("query-response-probe.py")
+    let script = #"""
+    import os
+    import select
+    import sys
+    import termios
+    import tty
+
+    stdin = sys.stdin.fileno()
+    original = termios.tcgetattr(stdin)
+    try:
+        tty.setraw(stdin)
+        os.write(sys.stdout.fileno(), b"\x1b[5n")
+        ready, _, _ = select.select([stdin], [], [], 1.0)
+        if ready:
+            data = os.read(stdin, 16)
+            os.write(sys.stdout.fileno(), b"\r\nRESPONSE=" + data.hex().encode("ascii") + b"\r\n")
+        else:
+            os.write(sys.stdout.fileno(), b"\r\nNO_RESPONSE\r\n")
+    finally:
+        termios.tcsetattr(stdin, termios.TCSANOW, original)
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+    let session = TerminalSession(
+        title: "Probe",
+        subtitle: "PTY query probe",
+        tint: .systemGreen,
+        workingDirectory: directory.path,
+        launchCommand: "/usr/bin/python3 \(TerminalPasteboardContent.shellEscaped(scriptURL.path))"
+    )
+    defer {
+        session.stop()
+    }
+
+    try await waitForExit(session)
+
+    let rawOutput = String(decoding: session.rawOutput(maxBytes: 16 * 1024).data, as: UTF8.self)
+    #expect(rawOutput.contains("RESPONSE=1b5b306e"))
+    #expect(!rawOutput.contains("NO_RESPONSE"))
+}
+
+@MainActor
 @Test func terminalSessionMetadataFollowsOSCSequences() async throws {
     let session = TerminalSession(
         title: "Shell 1",
@@ -5422,6 +5473,40 @@ private func serviceRecord(
     #expect(!buffer.usesAlternateScreen)
     #expect(buffer.mouseState == TerminalMouseState())
     #expect(buffer.cursorState.isVisible)
+}
+
+@Test func liveTerminalOutputBufferRespondsToNvimStartupQueries() async throws {
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
+    let viewportSize = TerminalViewportSize(columns: 10, rows: 5)
+
+    buffer.ingest(Data("abc\r\nxy".utf8), viewportSize: viewportSize)
+    let responses = buffer.ingest(Data((
+        "\u{1B}[5n" +
+        "\u{1B}[6n" +
+        "\u{1B}[?u" +
+        "\u{1B}[c" +
+        "\u{1B}[>c" +
+        "\u{1B}]11;?\u{07}" +
+        "\u{1B}[?69$p" +
+        "\u{1B}[?2026$p" +
+        "\u{1B}[?2027$p" +
+        "\u{1B}[?2031$p" +
+        "\u{1B}[?2048$p"
+    ).utf8), viewportSize: viewportSize)
+
+    #expect(responses == [
+        Data("\u{1B}[0n".utf8),
+        Data("\u{1B}[2;3R".utf8),
+        Data("\u{1B}[?0u".utf8),
+        Data("\u{1B}[?1;2c".utf8),
+        Data("\u{1B}[>0;0;0c".utf8),
+        Data("\u{1B}]11;rgb:1212/1111/1717\u{07}".utf8),
+        Data("\u{1B}[?69;2$y".utf8),
+        Data("\u{1B}[?2026;4$y".utf8),
+        Data("\u{1B}[?2027;4$y".utf8),
+        Data("\u{1B}[?2031;4$y".utf8),
+        Data("\u{1B}[?2048;4$y".utf8),
+    ])
 }
 
 @Test func liveTerminalOutputBufferPreservesPrimaryScrollbackAcrossAlternateScreen() async throws {

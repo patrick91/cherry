@@ -1441,6 +1441,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastSummaryInput: String?
     private var lastSummaryDate: Date?
     private var lastHumanInputLine: Int?
+    private var didObserveAgentCompletionStatus = false
 
     private static let defaultMaxScrollback = 50_000
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
@@ -1696,6 +1697,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         if kind == .agent,
            let nextAgentActivityState,
+           shouldApplySummaryActivityState(nextAgentActivityState),
            agentActivityState != nextAgentActivityState {
             agentActivityState = nextAgentActivityState
             didChange = true
@@ -1974,6 +1976,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func noteInputBurst() {
         noteHumanInputIfNeeded()
         noteInputOutputBaseline()
+        didObserveAgentCompletionStatus = false
         setAgentActivityState(.thinking)
     }
 
@@ -2001,8 +2004,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
 
             case .notification(let notification):
-                updateAgentActivityState(for: notification)
-                handleTerminalNotification(notification)
+                if !updateAgentActivityState(for: notification) {
+                    handleTerminalNotification(notification)
+                }
                 didChange = true
 
             case .keyboardProtocolPush(let flags):
@@ -2036,19 +2040,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         TerminalNotificationCenter.shared.post(notification, for: self)
     }
 
-    private func updateAgentActivityState(for notification: TerminalNotificationRequest) {
-        guard kind == .agent else { return }
+    private func updateAgentActivityState(for notification: TerminalNotificationRequest) -> Bool {
+        guard kind == .agent else { return false }
 
         let body = notification.body.lowercased()
         if body.contains("permission") ||
             body.contains("approval") ||
             body.contains("confirm") {
+            didObserveAgentCompletionStatus = false
             setAgentActivityState(.permission)
+            return false
         } else if body.contains("turn complete") ||
                     body.contains("complete") ||
                     body.contains("done") {
+            didObserveAgentCompletionStatus = true
             setAgentActivityState(.idle)
+            clearUnreadNotification()
+            return true
         }
+        return false
+    }
+
+    private func shouldApplySummaryActivityState(_ nextState: AgentActivityState) -> Bool {
+        !(didObserveAgentCompletionStatus && nextState.showsWorkingIndicator)
     }
 
     private func setAgentActivityState(_ nextState: AgentActivityState) {

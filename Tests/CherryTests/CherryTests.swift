@@ -169,6 +169,22 @@ private func installCodexLikeDeferredSubmitAgentScript(
     return scriptURL
 }
 
+private func installStartupConfirmationAgentScript(
+    in directory: URL,
+    name: String = "startup-confirmation-agent.sh"
+) throws -> URL {
+    let scriptURL = directory.appendingPathComponent(name)
+    let script = #"""
+    #!/bin/bash
+    printf 'Do you trust the files in this folder?\n'
+    stty raw -echo
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $first = ""; my $n = sysread(STDIN, $first, 1); if (defined($n) && $n > 0 && $first =~ /[\r\n]/) { print "accepted-startup\r\n"; } else { $first =~ s/[\r\n]//g; print "startup-consumed:$first\r\n"; } print "ready\r\n"; my $buf = ""; while (1) { my $chunk = ""; my $m = sysread(STDIN, $chunk, 4096); last unless defined($m) && $m > 0; if ($chunk =~ /[\r\n]/) { $chunk =~ s/[\r\n].*//s; $buf .= $chunk; print "submitted:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+    return scriptURL
+}
+
 private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallTool.Result) throws -> T {
     guard let text = result.content.compactMap({ content -> String? in
         if case .text(let text, _, _) = content {
@@ -254,6 +270,18 @@ private struct MCPSendAgentMessagePayload: Decodable {
         case sentBytes = "sent_bytes"
         case output
         case wait
+    }
+}
+
+private struct MCPSendProcessInputPayload: Decodable {
+    let processID: String
+    let sentBytes: Int
+    let output: MCPAgentOutput?
+
+    private enum CodingKeys: String, CodingKey {
+        case processID = "process_id"
+        case sentBytes = "sent_bytes"
+        case output
     }
 }
 
@@ -1367,7 +1395,16 @@ private struct MCPWhoamiPayload: Decodable {
     let properties = try #require(schema["properties"]?.objectValue)
 
     #expect(properties["parent_agent_id"] != nil)
+    #expect(properties["submit"] != nil)
     #expect(properties["top_level"] == nil)
+}
+
+@Test func mcpSendProcessInputAdvertisesSubmitOverride() throws {
+    let tool = try #require(CherryMCPTools.all.first { $0.name == "send_process_input" })
+    let schema = try #require(tool.inputSchema.objectValue)
+    let properties = try #require(schema["properties"]?.objectValue)
+
+    #expect(properties["submit"] != nil)
 }
 
 @Test func mcpWaitForProcessIdleAdvertisesOnlyProcessSelectors() throws {
@@ -1772,12 +1809,14 @@ private struct MCPWhoamiPayload: Decodable {
             "name": .string("Codex"),
             "title": .string("Codex target"),
             "bind_session": .bool(true),
-            "wait_ms": .int(700),
+            "wait_ms": .int(2_500),
             "line_limit": .int(20)
         ],
         context: context
     )
     let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+    let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
+    #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
 
     let sendResult = await CherryMCPTools.call(
         name: "send_agent_message",
@@ -1798,6 +1837,181 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output.contains("submitted:bound prompt"), Comment(rawValue: output))
     #expect(!output.contains("combined-submit"), Comment(rawValue: output))
     #expect(!output.contains("early-submit"), Comment(rawValue: output))
+}
+
+@MainActor
+@Test func mcpSendAgentMessageAcknowledgesStartupConfirmationBeforeFirstMessage() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    let scriptURL = try installStartupConfirmationAgentScript(
+        in: harness.projectRoot,
+        name: "claude-startup-confirmation-agent.sh"
+    )
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: scriptURL.path))
+    harness.server.start()
+
+    let context = CherryMCPToolContext.bound(sessionID: "claude-agent-session", defaultParentAgentID: nil)
+    let spawnResult = await CherryMCPTools.call(
+        name: "spawn_agent",
+        arguments: [
+            "name": .string("Claude"),
+            "title": .string("Claude target"),
+            "bind_session": .bool(true),
+            "wait_ms": .int(1_000),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+    #expect(spawned.process.kind == "agent")
+
+    let sendResult = await CherryMCPTools.call(
+        name: "send_agent_message",
+        arguments: [
+            "message": .string("after startup"),
+            "quiet_ms": .int(100),
+            "timeout_ms": .int(3_000),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let sent = try decodeMCPToolResult(MCPSendAgentMessagePayload.self, from: sendResult)
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+
+    #expect(sent.process.id == spawned.process.id)
+    #expect(output.contains("accepted-startup"), Comment(rawValue: output))
+    #expect(output.contains("submitted:after startup"), Comment(rawValue: output))
+    #expect(!output.contains("startup-consumed"), Comment(rawValue: output))
+}
+
+@MainActor
+@Test func mcpSendProcessInputSubmitsPlainTextToKnownInteractiveAgentByDefault() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    let scriptURL = try installCodexLikeDeferredSubmitAgentScript(
+        in: harness.projectRoot,
+        name: "pi-send-process-input-agent.sh"
+    )
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
+    harness.server.start()
+
+    let context = CherryMCPToolContext.bound(sessionID: "pi-agent-session", defaultParentAgentID: nil)
+    let spawnResult = await CherryMCPTools.call(
+        name: "spawn_agent",
+        arguments: [
+            "name": .string("Pi"),
+            "title": .string("Pi target"),
+            "bind_session": .bool(true),
+            "wait_ms": .int(2_500),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+    let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
+    #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
+
+    let sendResult = await CherryMCPTools.call(
+        name: "send_process_input",
+        arguments: [
+            "text": .string("pi prompt"),
+            "wait_ms": .int(1_000),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let sent = try decodeMCPToolResult(MCPSendProcessInputPayload.self, from: sendResult)
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+
+    #expect(sent.processID == spawned.process.id)
+    #expect(sent.sentBytes == Data("pi prompt\r".utf8).count)
+    #expect(output.contains("typed:pi prompt"), Comment(rawValue: output))
+    #expect(output.contains("submitted:pi prompt"), Comment(rawValue: output))
+    #expect(!output.contains("combined-submit"), Comment(rawValue: output))
+    #expect(!output.contains("early-submit"), Comment(rawValue: output))
+}
+
+@MainActor
+@Test func mcpSendProcessInputNormalizesTextNewlineForAgents() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    let scriptURL = harness.projectRoot.appendingPathComponent("pi-newline-agent.sh")
+    let script = #"""
+    #!/bin/bash
+    printf 'ready\n'
+    stty raw -echo
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /\r/) { $chunk =~ s/\r.*//s; $buf .= $chunk; print "submitted-cr:$buf\r\n"; last; } if ($chunk =~ /\n/) { $chunk =~ s/\n.*//s; $buf .= $chunk; print "lf-only:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    """#
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
+    harness.server.start()
+
+    let context = CherryMCPToolContext.bound(sessionID: "pi-newline-session", defaultParentAgentID: nil)
+    let spawnResult = await CherryMCPTools.call(
+        name: "spawn_agent",
+        arguments: [
+            "name": .string("Pi"),
+            "bind_session": .bool(true),
+            "wait_ms": .int(700),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    _ = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+
+    let sendResult = await CherryMCPTools.call(
+        name: "send_process_input",
+        arguments: [
+            "text": .string("newline prompt\n"),
+            "wait_ms": .int(700),
+            "line_limit": .int(20)
+        ],
+        context: context
+    )
+    let sent = try decodeMCPToolResult(MCPSendProcessInputPayload.self, from: sendResult)
+    let output = sent.output?.lines.joined(separator: "\n") ?? ""
+
+    #expect(sent.sentBytes == Data("newline prompt\r".utf8).count)
+    #expect(output.contains("submitted-cr:newline prompt"), Comment(rawValue: output))
+    #expect(!output.contains("lf-only"), Comment(rawValue: output))
 }
 
 @MainActor
@@ -3203,6 +3417,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[>c" +
         "\u{1B}[?2027$p" +
         "\u{1B}[?u" +
+        "\u{1B}P+q4D73\u{1B}\\" +
         "\u{1B}]2;kept title\u{07}" +
         "\u{1B}[31m" +
         "after"
@@ -3224,6 +3439,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[>0;0;0c" +
         "\u{1B}[?2027;1$y" +
         "\u{1B}[?0u" +
+        "\u{1B}P1+r4D73=5C455D35323B25703125733B25703225735C303037\u{1B}\\" +
         "\u{1B}[A" +
         "tail"
     ).utf8)

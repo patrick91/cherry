@@ -455,7 +455,8 @@ final class CherryControlServer: @unchecked Sendable {
             let initialInput = try runAgentInitialInput(
                 text: request.text,
                 rawBase64: request.rawBase64,
-                submit: request.submit
+                submit: request.submit,
+                keyboardProtocolFlags: session.keyboardProtocolFlags
             )
             let sentBytes: Int
             if let initialInput, !initialInput.isEmpty {
@@ -1084,7 +1085,12 @@ final class CherryControlServer: @unchecked Sendable {
 
         let sentBytes: Int
         if session.kind == .agent, let agent {
-            let input = try agentInputPayload(text: request.text, rawBase64: request.rawBase64, submit: request.submit)
+            let input = try agentInputPayload(
+                text: request.text,
+                rawBase64: request.rawBase64,
+                submit: request.submit,
+                keyboardProtocolFlags: session.keyboardProtocolFlags
+            )
             if let input, !input.isEmpty {
                 sentBytes = await sendInitialAgentInput(input, to: session, agent: agent)
             } else {
@@ -1866,8 +1872,14 @@ final class CherryControlServer: @unchecked Sendable {
         to session: TerminalSession
     ) async throws -> Int {
         mcpControlDebugLog("send input session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) textBytes=\(text?.utf8.count ?? 0) raw=\(rawBase64 != nil) submit=\(String(describing: submit))")
-        if session.kind == .agent, submit != nil {
-            let input = try agentInputPayload(text: text, rawBase64: rawBase64, submit: submit)
+        if session.kind == .agent {
+            await waitForAgentSubmittedInputReadinessIfNeeded(to: session)
+            let input = try agentInputPayload(
+                text: text,
+                rawBase64: rawBase64,
+                submit: submit,
+                keyboardProtocolFlags: session.keyboardProtocolFlags
+            )
             guard let input, !input.isEmpty else { return 0 }
             return await sendAgentInput(
                 input,
@@ -1892,22 +1904,6 @@ final class CherryControlServer: @unchecked Sendable {
         guard waitMilliseconds > 0 else { return nil }
         try? await Task.sleep(for: .milliseconds(waitMilliseconds))
         return terminalOutput(for: session, startLine: nil, lineLimit: lineLimit)
-    }
-
-    private func optionalInputPayload(text: String?, rawBase64: String?) throws -> Data? {
-        switch (text, rawBase64) {
-        case let (text?, nil):
-            return Data(text.utf8)
-        case let (nil, rawBase64?):
-            guard let data = Data(base64Encoded: rawBase64) else {
-                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
-            }
-            return data
-        case (nil, nil):
-            return nil
-        case (_?, _?):
-            throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
-        }
     }
 
     private struct AgentInitialInput {
@@ -1972,11 +1968,26 @@ final class CherryControlServer: @unchecked Sendable {
         agent: AgentToolDefinition
     ) async {
         guard shouldDeferInitialInput(for: agent) else { return }
+        await waitForDeferredAgentInputReadiness(session: session)
+    }
 
+    @MainActor
+    private func waitForAgentSubmittedInputReadinessIfNeeded(to session: TerminalSession) async {
+        guard session.lastInputOutputVersion == nil else { return }
+        guard shouldDeferSubmittedInput(for: session) else { return }
+        await waitForDeferredAgentInputReadiness(session: session)
+    }
+
+    @MainActor
+    private func waitForDeferredAgentInputReadiness(session: TerminalSession) async {
         let startedAt = Date()
         let maximumWait: TimeInterval = 6
         let quietInterval: TimeInterval = 0.75
         let noOutputFallback: TimeInterval = 2.5
+        let maximumStartupAcknowledgements = 2
+        var acknowledgedStartupPromptCount = 0
+        var awaitingOutputAfterAcknowledgementVersion: Int?
+        var startupPromptSearchStartLine = 0
 
         while true {
             switch session.state {
@@ -1986,10 +1997,29 @@ final class CherryControlServer: @unchecked Sendable {
                 break
             }
 
+            if let outputVersion = awaitingOutputAfterAcknowledgementVersion,
+               session.outputVersion > outputVersion {
+                awaitingOutputAfterAcknowledgementVersion = nil
+            }
+
             let now = Date()
             let elapsed = now.timeIntervalSince(startedAt)
             if let lastOutputAt = session.lastOutputAt {
-                if now.timeIntervalSince(lastOutputAt) >= quietInterval {
+                if now.timeIntervalSince(lastOutputAt) >= quietInterval,
+                   awaitingOutputAfterAcknowledgementVersion == nil {
+                    if acknowledgedStartupPromptCount < maximumStartupAcknowledgements,
+                       shouldAcknowledgeAgentStartupPrompt(in: session, startLine: startupPromptSearchStartLine) {
+                        acknowledgedStartupPromptCount += 1
+                        awaitingOutputAfterAcknowledgementVersion = session.outputVersion
+                        startupPromptSearchStartLine = session.lineCount
+                        let enterSequence = TerminalInputEncoder.enterSequence(
+                            keyboardProtocolFlags: session.keyboardProtocolFlags
+                        )
+                        mcpControlDebugLog("agent startup prompt acknowledged session=\(session.id.uuidString) bytes=\(enterSequence.count)")
+                        session.send(data: enterSequence)
+                        try? await Task.sleep(for: .milliseconds(150))
+                        continue
+                    }
                     return
                 }
             } else if elapsed >= noOutputFallback {
@@ -2002,6 +2032,47 @@ final class CherryControlServer: @unchecked Sendable {
 
             try? await Task.sleep(for: .milliseconds(50))
         }
+    }
+
+    @MainActor
+    private func shouldAcknowledgeAgentStartupPrompt(in session: TerminalSession, startLine requestedStartLine: Int) -> Bool {
+        let lineCount = session.lineCount
+        guard lineCount > 0 else { return false }
+        let startLine = max(min(max(requestedStartLine, 0), lineCount), lineCount - 20)
+        guard startLine < lineCount else { return false }
+        let output = session.snapshot(range: startLine..<lineCount).joined(separator: "\n")
+        return isAgentStartupConfirmationPrompt(output)
+    }
+
+    private func isAgentStartupConfirmationPrompt(_ output: String) -> Bool {
+        let compactOutput = output
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+
+        let directPhrases = [
+            "do you trust",
+            "do you want to trust",
+            "do you want to continue",
+            "do you want to proceed",
+            "do you want to run",
+            "press enter to continue",
+            "press return to continue",
+            "trust the files in this folder",
+            "trust this folder",
+            "trust this directory",
+        ]
+        if directPhrases.contains(where: { compactOutput.contains($0) }) {
+            return true
+        }
+
+        return compactOutput.contains("yes, proceed")
+            && compactOutput.contains("no")
+            && (
+                compactOutput.contains("trust")
+                    || compactOutput.contains("folder")
+                    || compactOutput.contains("directory")
+            )
     }
 
     private func shouldDeferInitialInput(for agent: AgentToolDefinition) -> Bool {
@@ -2048,16 +2119,50 @@ final class CherryControlServer: @unchecked Sendable {
         return trimmed.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
     }
 
-    private func agentInputPayload(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
-        guard let payload = try optionalInputPayload(text: text, rawBase64: rawBase64) else {
+    private func agentInputPayload(
+        text: String?,
+        rawBase64: String?,
+        submit: Bool?,
+        keyboardProtocolFlags: Int
+    ) throws -> AgentInitialInput? {
+        let payload: Data
+        let isTextInput: Bool
+        switch (text, rawBase64) {
+        case let (text?, nil):
+            payload = TerminalInputEncoder.terminalTextData(
+                text,
+                keyboardProtocolFlags: keyboardProtocolFlags
+            )
+            isTextInput = true
+        case let (nil, rawBase64?):
+            guard let data = Data(base64Encoded: rawBase64) else {
+                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
+            }
+            payload = data
+            isTextInput = false
+        case (nil, nil):
             return nil
+        case (_?, _?):
+            throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
         }
-        let shouldSubmit = submit != false && payload.last != 0x0d && payload.last != 0x0a
+
+        let wantsSubmit = submit ?? isTextInput
+        let shouldSubmit = wantsSubmit && payload.last != 0x0d && payload.last != 0x0a
         return AgentInitialInput(payload: payload, submit: shouldSubmit)
     }
 
-    private func runAgentInitialInput(text: String?, rawBase64: String?, submit: Bool?) throws -> AgentInitialInput? {
-        try agentInputPayload(text: text, rawBase64: rawBase64, submit: submit)
+    private func runAgentInitialInput(
+        text: String?,
+        rawBase64: String?,
+        submit: Bool?,
+        keyboardProtocolFlags: Int
+    ) throws -> AgentInitialInput? {
+        try agentInputPayload(
+            text: text,
+            rawBase64: rawBase64,
+            submit: submit,
+            keyboardProtocolFlags: keyboardProtocolFlags
+        )
     }
 
     @MainActor

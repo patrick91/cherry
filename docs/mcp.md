@@ -75,17 +75,20 @@ A typical agent-native flow:
    quiet period.
 3. `get_process_output` if more context is needed.
 
-The lower-level process flow is still available when you need raw terminal
+The lower-level process flow is still available when you need terminal-shaped
 control:
 
 1. `spawn_process` to launch the agent.
-2. `send_process_input` with the prompt.
+2. `send_process_input` with the prompt. For agent processes, plain `text`
+   input is submitted with Enter by default; pass `submit: false` to only type
+   it.
 3. `wait_for_process_idle` on that `process_id`.
 4. `get_process_output` if more context is needed.
 
 For `send_process_input` and `spawn_process`, `text` is typed as terminal
 input. CR/LF line endings are encoded as carriage-return Enter, matching the
-plain Enter key path. Use `raw_base64` when you need exact PTY bytes instead.
+plain Enter key path. Use `raw_base64` when you need exact PTY bytes instead;
+raw bytes are not auto-submitted unless `submit: true` is provided.
 
 ## Dev Server Readiness
 

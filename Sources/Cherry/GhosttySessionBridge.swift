@@ -489,6 +489,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
                         index = finalIndex + 1
                         continue
                     }
+                case UInt8(ascii: "P"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isResponseGeneratingDCSQuery(payload) {
+                            index = bounds.endIndex
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
+                        index = bounds.endIndex
+                        continue
+                    }
                 default:
                     break
                 }
@@ -533,6 +544,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
                         }
                         sanitized.append(contentsOf: bytes[index..<(finalIndex + 1)])
                         index = finalIndex + 1
+                        continue
+                    }
+                case UInt8(ascii: "P"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isTerminalGeneratedDCSResponse(payload) {
+                            index = bounds.endIndex
+                            continue
+                        }
+                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
+                        index = bounds.endIndex
                         continue
                     }
                 default:
@@ -615,6 +637,85 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         default:
             return false
         }
+    }
+
+    nonisolated private static func isResponseGeneratingDCSQuery(_ payload: ArraySlice<UInt8>) -> Bool {
+        guard payload.starts(with: [UInt8(ascii: "+"), UInt8(ascii: "q")]) else {
+            return false
+        }
+
+        return isXTGETTCAPPayload(payload.dropFirst(2), allowsValue: false)
+    }
+
+    nonisolated private static func isTerminalGeneratedDCSResponse(_ payload: ArraySlice<UInt8>) -> Bool {
+        guard payload.count >= 3 else { return false }
+
+        let prefix = Array(payload.prefix(3))
+        guard prefix == [UInt8(ascii: "0"), UInt8(ascii: "+"), UInt8(ascii: "r")]
+            || prefix == [UInt8(ascii: "1"), UInt8(ascii: "+"), UInt8(ascii: "r")]
+        else {
+            return false
+        }
+
+        return isXTGETTCAPPayload(payload.dropFirst(3), allowsValue: true)
+    }
+
+    nonisolated private static func isXTGETTCAPPayload(
+        _ bytes: ArraySlice<UInt8>,
+        allowsValue: Bool
+    ) -> Bool {
+        guard !bytes.isEmpty else { return false }
+
+        var fieldStart = bytes.startIndex
+        var index = fieldStart
+        while true {
+            if index == bytes.endIndex || bytes[index] == UInt8(ascii: ";") {
+                guard isXTGETTCAPField(bytes[fieldStart..<index], allowsValue: allowsValue) else {
+                    return false
+                }
+
+                guard index != bytes.endIndex else { return true }
+                index = bytes.index(after: index)
+                fieldStart = index
+                continue
+            }
+
+            index = bytes.index(after: index)
+        }
+    }
+
+    nonisolated private static func isXTGETTCAPField(
+        _ bytes: ArraySlice<UInt8>,
+        allowsValue: Bool
+    ) -> Bool {
+        guard !bytes.isEmpty else { return false }
+
+        var sawEquals = false
+        var hasNameBytes = false
+        var hasValueBytes = false
+        for byte in bytes {
+            if byte == UInt8(ascii: "=") {
+                guard allowsValue, !sawEquals else { return false }
+                sawEquals = true
+                continue
+            }
+
+            guard isASCIIHexDigit(byte) else { return false }
+            if sawEquals {
+                hasValueBytes = true
+            } else {
+                hasNameBytes = true
+            }
+        }
+
+        guard hasNameBytes else { return false }
+        return !sawEquals || hasValueBytes
+    }
+
+    nonisolated private static func isASCIIHexDigit(_ byte: UInt8) -> Bool {
+        (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+            || (UInt8(ascii: "A")...UInt8(ascii: "F")).contains(byte)
+            || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
     }
 
     nonisolated private static func isResponseGeneratingCSIQuery(

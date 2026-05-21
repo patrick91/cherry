@@ -157,6 +157,7 @@ enum CherryMCPTools {
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Optional exact raw bytes to send after launch, base64-encoded."),
+                "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
                 "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
@@ -215,6 +216,7 @@ enum CherryMCPTools {
             properties: processSelectorProperties([
                 "text": string("Text to type. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Exact raw bytes to send, base64-encoded."),
+                "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ])
@@ -825,6 +827,7 @@ enum CherryMCPTools {
                 workingDirectory: stringArgument("working_directory", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
+                submit: boolArgument("submit", in: arguments),
                 parentAgentID: parentAgentIDArgument(forKind: kind, in: arguments, context: context),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
@@ -855,6 +858,7 @@ enum CherryMCPTools {
                 processName: stringArgument("process_name", in: arguments),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
+                submit: boolArgument("submit", in: arguments),
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
             ))

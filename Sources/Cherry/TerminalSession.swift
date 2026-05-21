@@ -1964,7 +1964,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if kind == .agent {
             lastSummaryOutputChangeDate = Date()
-            if agentActivityState == .thinking {
+            if renderedOutputShowsAgentInputPrompt() {
+                didObserveAgentCompletionStatus = true
+                agentActivityState = .idle
+            } else if agentActivityState == .thinking {
                 agentActivityState = .working
             }
         }
@@ -2063,6 +2066,21 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func shouldApplySummaryActivityState(_ nextState: AgentActivityState) -> Bool {
         !(didObserveAgentCompletionStatus && nextState.showsWorkingIndicator)
+    }
+
+    private func renderedOutputShowsAgentInputPrompt() -> Bool {
+        let lineCount = processor.lineCount
+        guard lineCount > 0 else { return false }
+
+        let start = max(0, lineCount - 8)
+        return processor.snapshot(range: start..<lineCount).contains { line in
+            Self.isAgentInputPromptLine(line)
+        }
+    }
+
+    private static func isAgentInputPromptLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == "\u{203A}" || trimmed.hasPrefix("\u{203A} ")
     }
 
     private func setAgentActivityState(_ nextState: AgentActivityState) {

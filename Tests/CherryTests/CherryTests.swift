@@ -3945,6 +3945,35 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func renderedCodexInputPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.applyAutomaticSummary(
+        "Reading Cross Auth docs",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Before I write code: should this be a demo auth setup?
+    Worked for 1m 35s
+    \u{203A} Summarize recent commits
+    gpt-5.5 xhigh fast · ~/github/patrick91/demo
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func terminalSidebarOmitsGenericShellSubtitle() async throws {
     let session = TerminalSession(
         title: "Shell 1",

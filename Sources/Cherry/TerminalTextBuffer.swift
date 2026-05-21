@@ -448,6 +448,7 @@ protocol TerminalBuffering {
     var cursorState: TerminalCursorState { get }
     var usesAlternateScreen: Bool { get }
     var usesApplicationCursorKeys: Bool { get }
+    var usesBracketedPasteMode: Bool { get }
     var mouseState: TerminalMouseState { get }
 
     func snapshot(range: Range<Int>) -> [String]
@@ -619,6 +620,10 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
 
     var usesApplicationCursorKeys: Bool {
         isApplicationCursorMode
+    }
+
+    var usesBracketedPasteMode: Bool {
+        isBracketedPasteMode
     }
 
     var mouseState: TerminalMouseState {
@@ -2138,6 +2143,10 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
 
     var usesApplicationCursorKeys: Bool {
         isApplicationCursorMode
+    }
+
+    var usesBracketedPasteMode: Bool {
+        isBracketedPasteMode
     }
 
     var mouseState: TerminalMouseState {

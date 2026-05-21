@@ -3875,6 +3875,37 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func agentSessionTracksActivityStateFromSummaryAndCompletionNotification() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    #expect(session.agentActivityState == .unknown)
+
+    session.applyAutomaticSummary(
+        "Reviewing deployment workflow",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+
+    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func terminalSidebarOmitsGenericShellSubtitle() async throws {
     let session = TerminalSession(
         title: "Shell 1",
@@ -4273,6 +4304,24 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(session.keyboardProtocolFlags == 1)
 }
 
+@MainActor
+@Test func terminalSessionTracksBracketedPasteMode() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+
+    #expect(session.usesBracketedPasteMode == false)
+
+    session.ingestTestingData(Data("\u{1B}[?2004h".utf8))
+    #expect(session.usesBracketedPasteMode == true)
+
+    session.ingestTestingData(Data("\u{1B}[?2004l".utf8))
+    #expect(session.usesBracketedPasteMode == false)
+}
+
 @Test func tabInputIsOnlyRewrittenWhenKeyboardProtocolReportsAllKeys() async throws {
     let tab = Data([0x09])
     let enter = Data("\r".utf8)
@@ -4608,6 +4657,16 @@ private struct MCPWhoamiPayload: Decodable {
     """)
 
     #expect(summary == "reviewing deployment workflow")
+}
+
+@Test func agentSummaryRunnerParsesStructuredSummaryState() {
+    let response = summaryContentFromCommandOutput("""
+    {"state":"WORKING","summary":"reviewing deployment workflow"}
+    """)
+
+    #expect(response.summary == "reviewing deployment workflow")
+    #expect(response.state == .working)
+    #expect(response.state?.showsWorkingIndicator == true)
 }
 
 @Test func agentSummaryRunnerParsesStructuredSummaryAfterCliBoilerplate() {
@@ -6602,6 +6661,28 @@ private func serviceRecord(
     let data = TerminalInputEncoder.pastedTextData("one\r\ntwo\rthree")
 
     #expect(String(decoding: data, as: UTF8.self) == "one\ntwo\nthree")
+}
+
+@Test func pastedTextWrapsBracketedPasteMode() async throws {
+    let data = TerminalInputEncoder.pastedTextData(
+        "one\r\ntwo",
+        bracketedPasteMode: true
+    )
+
+    #expect(String(decoding: data, as: UTF8.self) == "\u{1B}[200~one\ntwo\u{1B}[201~")
+}
+
+@Test func pasteboardTextUsesBracketedPasteMode() async throws {
+    let pasteboard = NSPasteboard(name: .init("CherryTests.TextPaste.\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    pasteboard.setString("alpha\nbeta", forType: .string)
+
+    let data = try #require(TerminalPasteboardContent.pasteData(
+        from: pasteboard,
+        bracketedPasteMode: true
+    ))
+
+    #expect(String(decoding: data, as: UTF8.self) == "\u{1B}[200~alpha\nbeta\u{1B}[201~")
 }
 
 @Test func pasteboardURLContentsPasteEscapedPaths() async throws {

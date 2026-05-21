@@ -107,6 +107,10 @@ final class TerminalProcessor: @unchecked Sendable {
         locked { buffer.usesApplicationCursorKeys }
     }
 
+    var usesBracketedPasteMode: Bool {
+        locked { buffer.usesBracketedPasteMode }
+    }
+
     var mouseState: TerminalMouseState {
         locked { buffer.mouseState }
     }
@@ -1392,6 +1396,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var state: SessionState = .launching
     @Published private(set) var hasUnreadNotification = false
     @Published private(set) var lastNotification: TerminalNotificationRequest?
+    @Published private(set) var agentActivityState: AgentActivityState = .unknown
     @Published private(set) var startedAt: Date?
     @Published private(set) var exitedAt: Date?
     @Published private(set) var lastOutputAt: Date?
@@ -1511,6 +1516,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var usesApplicationCursorKeys: Bool {
         processor.usesApplicationCursorKeys
+    }
+
+    var usesBracketedPasteMode: Bool {
+        processor.usesBracketedPasteMode
     }
 
     var mouseState: TerminalMouseState {
@@ -1664,18 +1673,35 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
-    func applyAutomaticSummary(_ nextSummary: String, useAsTitle: Bool) {
+    func applyAutomaticSummary(
+        _ nextSummary: String,
+        useAsTitle: Bool,
+        agentActivityState nextAgentActivityState: AgentActivityState? = nil
+    ) {
         let sanitized = sanitizedSummary(nextSummary).nilIfEmpty
         let shouldApplyTitle = kind != .agent && useAsTitle && titleSource != .explicit && sanitized != nil
-        guard summary != sanitized || (shouldApplyTitle && title != sanitized) else { return }
-        summary = sanitized
+        var didChange = false
+
+        if summary != sanitized {
+            summary = sanitized
+            didChange = true
+        }
 
         if shouldApplyTitle, let sanitized {
             automaticTitle = sanitized
             title = sanitized
             titleSource = .automatic
+            didChange = true
         }
 
+        if kind == .agent,
+           let nextAgentActivityState,
+           agentActivityState != nextAgentActivityState {
+            agentActivityState = nextAgentActivityState
+            didChange = true
+        }
+
+        guard didChange else { return }
         bumpRevision()
     }
 
@@ -1863,6 +1889,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         childProcessID = nil
         exitCode = status
         exitedAt = Date()
+        if kind == .agent {
+            agentActivityState = status == 0 ? .idle : .error
+        }
         resetKeyboardProtocolState()
         outputHoldUntil = nil
         processor.endLaunch(launchID)
@@ -1933,6 +1962,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if kind == .agent {
             lastSummaryOutputChangeDate = Date()
+            if agentActivityState == .thinking {
+                agentActivityState = .working
+            }
         }
         outputVersion &+= 1
         scheduleSummaryIfNeeded()
@@ -1942,6 +1974,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func noteInputBurst() {
         noteHumanInputIfNeeded()
         noteInputOutputBaseline()
+        setAgentActivityState(.thinking)
     }
 
     private func noteInputOutputBaseline() {
@@ -1968,6 +2001,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
 
             case .notification(let notification):
+                updateAgentActivityState(for: notification)
                 handleTerminalNotification(notification)
                 didChange = true
 
@@ -2000,6 +2034,27 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastNotification = notification
         hasUnreadNotification = true
         TerminalNotificationCenter.shared.post(notification, for: self)
+    }
+
+    private func updateAgentActivityState(for notification: TerminalNotificationRequest) {
+        guard kind == .agent else { return }
+
+        let body = notification.body.lowercased()
+        if body.contains("permission") ||
+            body.contains("approval") ||
+            body.contains("confirm") {
+            setAgentActivityState(.permission)
+        } else if body.contains("turn complete") ||
+                    body.contains("complete") ||
+                    body.contains("done") {
+            setAgentActivityState(.idle)
+        }
+    }
+
+    private func setAgentActivityState(_ nextState: AgentActivityState) {
+        guard kind == .agent, agentActivityState != nextState else { return }
+        agentActivityState = nextState
+        bumpRevision()
     }
 
     private func normalizedInputData(_ data: Data) -> Data {

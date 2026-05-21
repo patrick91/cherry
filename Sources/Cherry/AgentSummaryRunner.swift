@@ -3,6 +3,7 @@ import Foundation
 struct AgentSummaryRunner {
     struct Result: Equatable {
         let summary: String
+        let state: AgentActivityState?
         let prompt: String
     }
 
@@ -141,18 +142,62 @@ private func runCommand(
 
     let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
     _ = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-    let summary = summaryFromCommandOutput(String(decoding: outputData, as: UTF8.self))
-    guard !summary.isEmpty else {
+    let response = summaryContentFromCommandOutput(String(decoding: outputData, as: UTF8.self))
+    guard !response.summary.isEmpty else {
         throw AgentSummaryRunner.SummaryError.emptyOutput
     }
-    return .init(summary: summary, prompt: input)
+    return .init(summary: response.summary, state: response.state, prompt: input)
+}
+
+struct AgentSummaryContent: Equatable {
+    let summary: String
+    let state: AgentActivityState?
+}
+
+enum AgentActivityState: String, Equatable, Codable {
+    case unknown
+    case idle
+    case permission
+    case thinking
+    case working
+    case error
+
+    init?(summaryValue: String?) {
+        guard let value = summaryValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased(),
+              !value.isEmpty
+        else {
+            return nil
+        }
+
+        switch value {
+        case "IDLE", "WAITING", "READY":
+            self = .idle
+        case "PERMISSION", "CONFIRMATION", "APPROVAL":
+            self = .permission
+        case "THINKING", "RESPONDING":
+            self = .thinking
+        case "WORKING", "RUNNING", "EXECUTING":
+            self = .working
+        case "ERROR", "FAILED":
+            self = .error
+        default:
+            self = .unknown
+        }
+    }
+
+    var showsWorkingIndicator: Bool {
+        self == .thinking || self == .working
+    }
 }
 
 private struct StructuredSummaryResponse: Decodable {
+    let state: String?
     let summary: String
 }
 
-func summaryFromCommandOutput(_ value: String) -> String {
+func summaryContentFromCommandOutput(_ value: String) -> AgentSummaryContent {
     let lines = value
         .replacingOccurrences(of: "\r\n", with: "\n")
         .replacingOccurrences(of: "\r", with: "\n")
@@ -161,15 +206,19 @@ func summaryFromCommandOutput(_ value: String) -> String {
         .filter { !$0.isEmpty && !$0.hasPrefix("```") }
 
     for line in lines.reversed() {
-        if let summary = structuredSummary(from: line) {
-            return summary
+        if let response = structuredSummary(from: line) {
+            return response
         }
     }
 
-    return sanitizedSummary(lines.first ?? "")
+    return AgentSummaryContent(summary: sanitizedSummary(lines.first ?? ""), state: nil)
 }
 
-private func structuredSummary(from value: String) -> String? {
+func summaryFromCommandOutput(_ value: String) -> String {
+    summaryContentFromCommandOutput(value).summary
+}
+
+private func structuredSummary(from value: String) -> AgentSummaryContent? {
     guard let jsonRange = value.range(of: #"\{.*\}"#, options: .regularExpression) else { return nil }
     let json = String(value[jsonRange])
     guard let data = json.data(using: .utf8),
@@ -177,7 +226,10 @@ private func structuredSummary(from value: String) -> String? {
     else {
         return nil
     }
-    return sanitizedSummary(response.summary)
+    return AgentSummaryContent(
+        summary: sanitizedSummary(response.summary),
+        state: AgentActivityState(summaryValue: response.state)
+    )
 }
 
 struct SummaryRunnerShellInvocation: Equatable {

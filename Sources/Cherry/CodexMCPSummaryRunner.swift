@@ -102,11 +102,11 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         }
 
         let rawOutput = codexMCPText(from: result)
-        let summary = summaryFromCommandOutput(rawOutput)
-        guard !summary.isEmpty else {
+        let summaryContent = summaryContentFromCommandOutput(rawOutput)
+        guard !summaryContent.summary.isEmpty else {
             throw AgentSummaryRunner.SummaryError.emptyOutput
         }
-        return .init(summary: summary, prompt: prompt)
+        return .init(summary: summaryContent.summary, state: summaryContent.state, prompt: prompt)
     }
 
     private func ensureServer() throws {

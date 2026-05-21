@@ -1392,7 +1392,10 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if isPasteShortcut(event),
-           let pasteData = TerminalPasteboardContent.nonTextPasteData(from: .general) {
+           let pasteData = TerminalPasteboardContent.pasteData(
+               from: .general,
+               bracketedPasteMode: activeSession.usesBracketedPasteMode
+           ) {
             activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: pasteData)
             return true

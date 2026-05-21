@@ -256,11 +256,17 @@ enum TerminalInputEncoder {
         return Data("\u{1B}[Z".utf8)
     }
 
-    static func pastedTextData(_ text: String) -> Data {
+    static func pastedTextData(_ text: String, bracketedPasteMode: Bool = false) -> Data {
         let normalizedText = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        return Data(normalizedText.utf8)
+        let textData = Data(normalizedText.utf8)
+        guard bracketedPasteMode else { return textData }
+
+        var data = Data("\u{1B}[200~".utf8)
+        data.append(textData)
+        data.append(contentsOf: "\u{1B}[201~".utf8)
+        return data
     }
 
     static func insertedTextData(_ text: String) -> Data? {
@@ -402,13 +408,34 @@ enum TerminalPasteboardContent {
             .appendingPathComponent("CherryPastedImages", isDirectory: true)
     }
 
+    static func pasteData(
+        from pasteboard: NSPasteboard,
+        bracketedPasteMode: Bool = false
+    ) -> Data? {
+        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            return TerminalInputEncoder.pastedTextData(
+                text,
+                bracketedPasteMode: bracketedPasteMode
+            )
+        }
+
+        return nonTextPasteData(
+            from: pasteboard,
+            bracketedPasteMode: bracketedPasteMode
+        )
+    }
+
     static func nonTextPasteData(
         from pasteboard: NSPasteboard,
         imageDirectory: URL = defaultImageDirectory,
-        imageID: UUID = UUID()
+        imageID: UUID = UUID(),
+        bracketedPasteMode: Bool = false
     ) -> Data? {
         if let urlText = urlPasteText(from: pasteboard) {
-            return TerminalInputEncoder.pastedTextData(urlText)
+            return TerminalInputEncoder.pastedTextData(
+                urlText,
+                bracketedPasteMode: bracketedPasteMode
+            )
         }
 
         guard let imageURL = pastedImageFileURL(
@@ -419,7 +446,10 @@ enum TerminalPasteboardContent {
             return nil
         }
 
-        return TerminalInputEncoder.pastedTextData(shellEscaped(imageURL.path))
+        return TerminalInputEncoder.pastedTextData(
+            shellEscaped(imageURL.path),
+            bracketedPasteMode: bracketedPasteMode
+        )
     }
 
     static func urlPasteText(from pasteboard: NSPasteboard) -> String? {
@@ -1209,13 +1239,10 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             return false
         }
 
-        let pasteData: Data?
-        if let text = pasteboard.string(forType: .string), !text.isEmpty {
-            pasteData = TerminalInputEncoder.pastedTextData(text)
-        } else {
-            pasteData = TerminalPasteboardContent.nonTextPasteData(from: pasteboard)
-        }
-
+        let pasteData = TerminalPasteboardContent.pasteData(
+            from: pasteboard,
+            bracketedPasteMode: session?.usesBracketedPasteMode ?? false
+        )
         guard let pasteData else { return false }
 
         clearSelection()

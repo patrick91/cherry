@@ -12,13 +12,12 @@ agent harness. In a SwiftPM checkout, build the helper and install it like this:
 
 ```bash
 swift build --product CherryMCP
-codex mcp add cherry -- .build/debug/CherryMCP
-claude mcp add --transport stdio --scope user cherry -- .build/debug/CherryMCP
+codex mcp add cherry -- "$(swift build --show-bin-path)/CherryMCP"
+claude mcp add --transport stdio --scope user cherry -- "$(swift build --show-bin-path)/CherryMCP"
 ```
 
-Cherry still hosts a local-only HTTP MCP endpoint at `127.0.0.1:61234/mcp` for
-internal use and diagnostics. Direct HTTP clients are unbound: they do not infer
-identity from the currently selected Cherry UI process.
+The helper talks to Cherry through the instance-scoped Unix control socket; the
+old direct HTTP MCP endpoint has been removed.
 
 ## Scope And Identity
 

@@ -1047,8 +1047,8 @@ private struct MCPSettingsPane: View {
     var body: some View {
         SettingsPaneScroll(page: .mcp) {
             SettingsCard("Status") {
-                SettingsRow("MCP server", subtitle: "Available whenever Cherry is running.") {
-                    Text("Always available")
+                SettingsRow("MCP helper", subtitle: "Installed next to the Cherry app.") {
+                    Text("Stdio")
                         .foregroundStyle(.secondary)
                 }
 

@@ -58,20 +58,19 @@ Inside the prototype:
 
 ## MCP Control
 
-Cherry serves a local HTTP MCP endpoint from the running app. After installing
-and opening the local app, register that endpoint with your harness:
+Cherry installs a stdio MCP helper next to the app executable. After installing
+and opening the local app, register the helper with your agent harness:
 
 ```bash
-codex mcp add cherry --url http://127.0.0.1:61234/mcp
-claude mcp add --transport http --scope user cherry http://127.0.0.1:61234/mcp
+codex mcp add cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
+claude mcp add --transport stdio --scope user cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
 ```
 
-Run the Cherry app first. The app listens on `127.0.0.1:61234` and forwards MCP
-tool calls to Cherry's instance-scoped Unix control socket under `/tmp/cherry-$UID/`.
-The MCP server exposes process-first tools for terminals, agents, configured
-project commands, output reads, idle waiting, service readiness, notes, and
-todos. See [docs/mcp.md](docs/mcp.md) for the tool guide and recommended
-agent workflows.
+Run the Cherry app first. The helper forwards MCP tool calls to Cherry's
+instance-scoped Unix control socket under `/tmp/cherry-$UID/`. The MCP server
+exposes process-first tools for terminals, agents, configured project commands,
+output reads, idle waiting, service readiness, notes, and todos. See
+[docs/mcp.md](docs/mcp.md) for the tool guide and recommended agent workflows.
 
 ## Rendering Debug
 

@@ -24,10 +24,6 @@ struct MCPInstallCommand: Identifiable, Equatable {
 }
 
 enum MCPInstallCommandBuilder {
-    static var serverURL: String {
-        CherryMCPHTTPServer.url
-    }
-
     static var helperCommand: String {
         guard let executableURL = Bundle.main.executableURL else {
             return "CherryMCP"

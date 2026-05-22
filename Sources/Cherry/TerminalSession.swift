@@ -270,13 +270,15 @@ extension String {
 
 final class TerminalInputWriter: @unchecked Sendable {
     typealias WriteHandler = @Sendable (Data) -> Void
+    typealias InputHandler = @MainActor @Sendable (Data) -> Void
 
     private let lock = NSLock()
     private weak var process: ShellProcessController?
     private let fallbackWriteHandler: WriteHandler?
     private var keyboardProtocolFlags = 0
-    private var inputHandler: (@MainActor @Sendable () -> Void)?
+    private var inputHandler: InputHandler?
     private var isInputHandlerScheduled = false
+    private var pendingInputHandlerData = Data()
 
     init(writeHandler: WriteHandler? = nil) {
         self.fallbackWriteHandler = writeHandler
@@ -294,7 +296,7 @@ final class TerminalInputWriter: @unchecked Sendable {
         }
     }
 
-    func setInputHandler(_ handler: (@MainActor @Sendable () -> Void)?) {
+    func setInputHandler(_ handler: InputHandler?) {
         lock.withLock {
             inputHandler = handler
         }
@@ -325,14 +327,15 @@ final class TerminalInputWriter: @unchecked Sendable {
 
         writer(outboundData)
         if notifyInput {
-            scheduleInputHandler(snapshot.inputHandler)
+            scheduleInputHandler(snapshot.inputHandler, data: outboundData)
         }
     }
 
-    private func scheduleInputHandler(_ handler: (@MainActor @Sendable () -> Void)?) {
+    private func scheduleInputHandler(_ handler: InputHandler?, data: Data) {
         guard let handler else { return }
 
         let shouldSchedule = lock.withLock {
+            pendingInputHandlerData.append(data)
             guard !isInputHandlerScheduled else { return false }
             isInputHandlerScheduled = true
             return true
@@ -340,14 +343,21 @@ final class TerminalInputWriter: @unchecked Sendable {
         guard shouldSchedule else { return }
 
         Task { @MainActor [weak self] in
-            handler()
-            self?.markInputHandlerFinished()
+            while let data = self?.takePendingInputHandlerDataOrFinish() {
+                handler(data)
+            }
         }
     }
 
-    private func markInputHandlerFinished() {
+    private func takePendingInputHandlerDataOrFinish() -> Data? {
         lock.withLock {
-            isInputHandlerScheduled = false
+            guard !pendingInputHandlerData.isEmpty else {
+                isInputHandlerScheduled = false
+                return nil
+            }
+            let data = pendingInputHandlerData
+            pendingInputHandlerData.removeAll(keepingCapacity: true)
+            return data
         }
     }
 }
@@ -1436,6 +1446,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var ghosttyBridgeStorage: GhosttySessionBridge?
     private var summaryDebounceTask: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
+    private var agentIdleRecheckTask: Task<Void, Never>?
     private var summaryGeneration = 0
     private var lastSummaryOutputChangeDate: Date?
     private var lastSummaryInput: String?
@@ -1449,6 +1460,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let summaryMaximumIdleWait: TimeInterval = 20
     private static let summaryTailLineLimit = 80
     private static let summaryMaximumCharacters = 6_000
+    private static let agentGenericIdleQuietMilliseconds = 250
 
     init(
         title: String,
@@ -1492,8 +1504,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                 self?.handleProcessorDidChange()
             }
         }
-        self.hostInputWriter.setInputHandler { [weak self] in
-            self?.noteInputBurst()
+        self.hostInputWriter.setInputHandler { [weak self] data in
+            self?.noteInputBurst(data)
         }
 
         if launchShell {
@@ -1584,8 +1596,9 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func send(text: String) {
         guard acceptsInput else { return }
-        if !text.isEmpty {
-            noteInputBurst()
+        let data = Data(text.utf8)
+        if !data.isEmpty {
+            noteInputBurst(data)
         }
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
@@ -1606,7 +1619,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func sendInputData(_ data: Data, normalize: Bool) {
         let outboundData = normalize ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
-            noteInputBurst()
+            noteInputBurst(outboundData)
         }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -1780,6 +1793,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func ingestTestingData(_ data: Data) {
         rawOutputStore.append(data)
+        lastOutputAt = Date()
         ingestTerminalMetadata(data)
         processor.ingestTestingData(data)
         bumpRevision()
@@ -1813,6 +1827,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func startShell() {
         let launchID = UUID()
+        cancelAgentIdleRecheck()
         activeLaunchID = launchID
         resetKeyboardProtocolState()
         outputHoldUntil = nil
@@ -1885,6 +1900,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func finishProcessExit(status: Int32, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
 
+        cancelAgentIdleRecheck()
         activeLaunchID = nil
         hostInputWriter.set(nil)
         shellProcess = nil
@@ -1962,25 +1978,34 @@ final class TerminalSession: ObservableObject, Identifiable {
         if case .launching = state {
             state = .live
         }
+        outputVersion &+= 1
         if kind == .agent {
             lastSummaryOutputChangeDate = Date()
             if renderedOutputShowsAgentInputPrompt() {
-                didObserveAgentCompletionStatus = true
-                agentActivityState = .idle
+                markAgentIdleFromRenderedOutput()
             } else if agentActivityState == .thinking {
-                agentActivityState = .working
+                setAgentActivityState(.working)
+                scheduleAgentIdleRecheckIfNeeded(outputVersionAtChange: outputVersion)
+            } else {
+                scheduleAgentIdleRecheckIfNeeded(outputVersionAtChange: outputVersion)
             }
         }
-        outputVersion &+= 1
         scheduleSummaryIfNeeded()
         bumpRevision()
     }
 
-    private func noteInputBurst() {
+    private func noteInputBurst(_ input: Data) {
+        cancelAgentIdleRecheck()
         noteHumanInputIfNeeded()
         noteInputOutputBaseline()
-        didObserveAgentCompletionStatus = false
-        setAgentActivityState(.thinking)
+        guard kind == .agent else { return }
+
+        if Self.agentInputSubmitsTurn(input) {
+            didObserveAgentCompletionStatus = false
+            setAgentActivityState(.thinking)
+        } else if renderedOutputShowsAgentInputPrompt() {
+            markAgentIdleFromRenderedOutput()
+        }
     }
 
     private func noteInputOutputBaseline() {
@@ -2065,22 +2090,172 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func shouldApplySummaryActivityState(_ nextState: AgentActivityState) -> Bool {
-        !(didObserveAgentCompletionStatus && nextState.showsWorkingIndicator)
+        guard nextState.showsWorkingIndicator else { return true }
+        guard !didObserveAgentCompletionStatus else { return false }
+        guard renderedOutputShowsAgentInputPrompt() else { return true }
+
+        markAgentIdleFromRenderedOutput()
+        return false
     }
 
     private func renderedOutputShowsAgentInputPrompt() -> Bool {
         let lineCount = processor.lineCount
         guard lineCount > 0 else { return false }
 
-        let start = max(0, lineCount - 8)
-        return processor.snapshot(range: start..<lineCount).contains { line in
-            Self.isAgentInputPromptLine(line)
+        let promptStart = max(0, lineCount - Self.agentInputPromptTailLineLimit)
+        let promptLines = processor.snapshot(range: promptStart..<lineCount)
+        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        if promptLines.contains(where: { line in
+            Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
+        }) {
+            return true
+        }
+
+        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+        let markerLines = processor.snapshot(range: markerStart..<lineCount)
+        return Self.outputContainsAgentInputMarker(markerLines, normalizedAgentName: normalizedAgentName)
+    }
+
+    private func scheduleAgentIdleRecheckIfNeeded(outputVersionAtChange: Int) {
+        guard kind == .agent, agentActivityState.showsWorkingIndicator else {
+            cancelAgentIdleRecheck()
+            return
+        }
+
+        cancelAgentIdleRecheck()
+        agentIdleRecheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Self.agentGenericIdleQuietMilliseconds))
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard self.outputVersion == outputVersionAtChange else { return }
+                guard self.agentActivityState.showsWorkingIndicator else { return }
+                guard self.agentOutputHasQuietedForGenericIdle(now: Date()) else { return }
+                guard self.renderedOutputLooksReadyForGenericAgentInput() else { return }
+
+                self.markAgentIdleFromRenderedOutput()
+            }
         }
     }
 
-    private static func isAgentInputPromptLine(_ line: String) -> Bool {
+    private func cancelAgentIdleRecheck() {
+        agentIdleRecheckTask?.cancel()
+        agentIdleRecheckTask = nil
+    }
+
+    private func markAgentIdleFromRenderedOutput() {
+        cancelAgentIdleRecheck()
+        didObserveAgentCompletionStatus = true
+        setAgentActivityState(.idle)
+    }
+
+    private func agentOutputHasQuietedForGenericIdle(now: Date) -> Bool {
+        ProcessIdleDetector.isQuiet(
+            now: now,
+            lastOutputAt: lastOutputAt,
+            startedAt: lastSummaryOutputChangeDate ?? now,
+            quietMilliseconds: Self.agentGenericIdleQuietMilliseconds,
+            requireNewOutput: false,
+            observedNewOutput: true
+        )
+    }
+
+    private func renderedOutputLooksReadyForGenericAgentInput() -> Bool {
+        let cursor = processor.cursorState
+        guard cursor.isVisible else { return false }
+
+        let lineCount = processor.lineCount
+        guard lineCount > 0 else { return false }
+        guard cursor.row >= max(0, lineCount - Self.agentInputMarkerTailLineLimit),
+              cursor.row < lineCount else {
+            return false
+        }
+
+        let line = processor.snapshot(range: cursor.row..<(cursor.row + 1)).first ?? ""
+        return Self.isGenericAgentInputCursorLine(line)
+    }
+
+    private static let agentInputPromptTailLineLimit = 8
+    private static let agentInputMarkerTailLineLimit = 32
+
+    private static func isAgentInputPromptLine(_ line: String, normalizedAgentName: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed == "\u{203A}" || trimmed.hasPrefix("\u{203A} ")
+        guard !trimmed.isEmpty else { return false }
+
+        if isPromptLine(trimmed, prompt: "\u{203A}") ||
+            isPromptLine(trimmed, prompt: "\u{276F}") {
+            return true
+        }
+
+        if normalizedAgentName == "gemini" {
+            return isPromptLine(trimmed, prompt: ">")
+        }
+
+        return false
+    }
+
+    private static func isPromptLine(_ trimmed: String, prompt: String) -> Bool {
+        trimmed == prompt || trimmed.hasPrefix("\(prompt) ")
+    }
+
+    private static func isGenericAgentInputCursorLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return true
+        }
+
+        return trimmed.unicodeScalars.first.map { scalar in
+            CharacterSet(charactersIn: "\u{2502}\u{2503}\u{2551}").contains(scalar)
+        } ?? false
+    }
+
+    private static func outputContainsAgentInputMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
+        let output = lines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .joined(separator: "\n")
+
+        switch normalizedAgentName {
+        case "gemini":
+            return output.contains("do you trust this folder?")
+                || output.contains("how would you like to authenticate for this project?")
+        case "opencode":
+            return output.contains("ask anything...")
+        case "pi":
+            return output.contains("press ctrl+o to show full startup help")
+                || output.contains("pi can explain its own features")
+        default:
+            return false
+        }
+    }
+
+    private static let bracketedPasteStartBytes = Array("\u{1B}[200~".utf8)
+    private static let bracketedPasteEndBytes = Array("\u{1B}[201~".utf8)
+
+    private static func agentInputSubmitsTurn(_ data: Data) -> Bool {
+        let bytes = Array(data)
+        var isBracketedPaste = false
+        var index = 0
+
+        while index < bytes.count {
+            if bytes[index...].starts(with: bracketedPasteStartBytes) {
+                isBracketedPaste = true
+                index += bracketedPasteStartBytes.count
+                continue
+            }
+
+            if isBracketedPaste, bytes[index...].starts(with: bracketedPasteEndBytes) {
+                isBracketedPaste = false
+                index += bracketedPasteEndBytes.count
+                continue
+            }
+
+            if !isBracketedPaste, bytes[index] == 0x0A || bytes[index] == 0x0D {
+                return true
+            }
+
+            index += 1
+        }
+
+        return false
     }
 
     private func setAgentActivityState(_ nextState: AgentActivityState) {
@@ -2210,7 +2385,11 @@ final class TerminalSession: ObservableObject, Identifiable {
                         summary: result.summary,
                         error: nil
                     )
-                    self.applyAutomaticSummary(result.summary, useAsTitle: useAsTitle)
+                    self.applyAutomaticSummary(
+                        result.summary,
+                        useAsTitle: useAsTitle,
+                        agentActivityState: result.state
+                    )
                 }
             } catch {
                 await MainActor.run {

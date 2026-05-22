@@ -404,6 +404,7 @@ private enum ProgramCatalog {
         "less": ProgramDescriptor(displayName: "less", fallbackLabel: "Ls", prefersArgumentTitle: true),
         "man": ProgramDescriptor(displayName: "man", fallbackLabel: "Ma", prefersArgumentTitle: true),
         "git": ProgramDescriptor(displayName: "Git", logoResourceName: "git", fallbackLabel: "Gt", prefersSubcommandTitle: true),
+        "gh": ProgramDescriptor(displayName: "GitHub", logoResourceName: "github", fallbackLabel: "GH", prefersSubcommandTitle: true),
         "node": ProgramDescriptor(displayName: "Node.js", logoResourceName: "nodedotjs", fallbackLabel: "JS"),
         "npm": ProgramDescriptor(displayName: "npm", logoResourceName: "npm", fallbackLabel: "np"),
         "npx": ProgramDescriptor(displayName: "npx", logoResourceName: "npm", fallbackLabel: "nx"),

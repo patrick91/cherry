@@ -1246,7 +1246,10 @@ final class CherryControlServer: @unchecked Sendable {
             ?? session.outputVersion
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMilliseconds) / 1_000)
         let startedAt = Date()
-        var observedNewOutput = session.outputVersion > sinceOutputVersion
+        var observedNewOutput = ProcessIdleDetector.observedNewOutput(
+            currentOutputVersion: session.outputVersion,
+            sinceOutputVersion: sinceOutputVersion
+        )
 
         func result(reason: ProcessIdleWaitReason) -> WaitForProcessIdleResult {
             WaitForProcessIdleResult(
@@ -1261,7 +1264,10 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         while true {
-            observedNewOutput = observedNewOutput || session.outputVersion > sinceOutputVersion
+            observedNewOutput = observedNewOutput || ProcessIdleDetector.observedNewOutput(
+                currentOutputVersion: session.outputVersion,
+                sinceOutputVersion: sinceOutputVersion
+            )
 
             switch session.state {
             case .exited, .failed:
@@ -1271,19 +1277,15 @@ final class CherryControlServer: @unchecked Sendable {
             }
 
             let now = Date()
-            if !requireNewOutput || observedNewOutput {
-                if quietMilliseconds == 0 {
-                    return result(reason: .idle)
-                }
-
-                if let lastOutputAt = session.lastOutputAt {
-                    if now.timeIntervalSince(lastOutputAt) >= TimeInterval(quietMilliseconds) / 1_000 {
-                        return result(reason: .idle)
-                    }
-                } else if !requireNewOutput,
-                          now.timeIntervalSince(startedAt) >= TimeInterval(quietMilliseconds) / 1_000 {
-                    return result(reason: .idle)
-                }
+            if ProcessIdleDetector.isQuiet(
+                now: now,
+                lastOutputAt: session.lastOutputAt,
+                startedAt: startedAt,
+                quietMilliseconds: quietMilliseconds,
+                requireNewOutput: requireNewOutput,
+                observedNewOutput: observedNewOutput
+            ) {
+                return result(reason: .idle)
             }
 
             if now >= deadline {

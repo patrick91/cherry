@@ -3974,6 +3974,278 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func composingAtRenderedCodexPromptDoesNotShowAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.applyAutomaticSummary(
+        "Finished CI review",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+    session.ingestTestingData(Data("Worked for 1m 35s\n\u{203A} ".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+
+    session.send(data: Data("Run /review on my current changes".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.applyAutomaticSummary(
+        "Launching Claude Code",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Claude Code v2.1.146
+    Opus 4.7 (1M context) with xhigh effort
+    \u{276F} [Image #1] can you match these two fonts
+    \u{25B6}\u{25B6} bypass permissions on (shift+tab to cycle)
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedGeminiInputPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Gemini",
+        subtitle: "gemini",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Gemini"
+    )
+
+    session.applyAutomaticSummary(
+        "Launching Gemini",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Tips for getting started:
+    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+     > Ask anything
+    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedGeminiTrustPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Gemini",
+        subtitle: "gemini",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Gemini"
+    )
+
+    session.applyAutomaticSummary(
+        "Launching Gemini",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    \u{256D}\u{2500}\u{2500}\u{2500}\u{256E}
+    \u{2502} Do you trust this folder? \u{2502}
+    \u{2502} \u{25CF} 1. Trust folder \u{2502}
+    \u{2502}   2. Don't trust \u{2502}
+    \u{2570}\u{2500}\u{2500}\u{2500}\u{256F}
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedOpenCodeInputPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "OpenCode",
+        subtitle: "opencode",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "OpenCode"
+    )
+
+    session.applyAutomaticSummary(
+        "Launching OpenCode",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    OpenCode
+    \u{2503}
+    \u{2503} Ask anything... "What is the tech stack of this project?"
+    \u{2503}
+    ctrl+t variants  tab agents  ctrl+p commands
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedPiStartupPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Pi",
+        subtitle: "pi",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Pi"
+    )
+
+    session.applyAutomaticSummary(
+        "Launching Pi",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    pi v0.74.0
+    Press ctrl+o to show full startup help and loaded resources.
+    Pi can explain its own features and look up its docs.
+    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+
+    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+    ~/github/patrick91/cherry (main)
+    $0.000 (sub) 0.0%/272k (auto) (openai-codex) gpt-5.5 - high
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func genericChevronOutputDoesNotClearAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Custom",
+        subtitle: "custom-agent",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Custom"
+    )
+
+    session.applyAutomaticSummary(
+        "Reading output",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    > quoted output, not an input prompt
+    still working
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(480))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func genericVisibleCursorAfterQuietClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Custom",
+        subtitle: "custom-agent",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Custom"
+    )
+
+    session.applyAutomaticSummary(
+        "Working on custom task",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Finished streaming the last tool result
+    \u{250C}\u{2500}\u{2500}\u{2500}\u{2510}
+    \u{2502} Draft prompt waiting here
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+
+    try await Task.sleep(for: .milliseconds(400))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func hiddenCursorAfterQuietDoesNotClearAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Custom",
+        subtitle: "custom-agent",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Custom"
+    )
+
+    session.applyAutomaticSummary(
+        "Working on custom task",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("\u{1B}[?25lStill thinking without new output".utf8))
+    try await Task.sleep(for: .milliseconds(480))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func terminalSidebarOmitsGenericShellSubtitle() async throws {
     let session = TerminalSession(
         title: "Shell 1",

@@ -564,7 +564,79 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             index += 1
         }
 
-        return sanitized.count == bytes.count ? data : Data(sanitized)
+        let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
+        return collapseOverwrittenProgressFramesForReplay(querySanitized)
+    }
+
+    nonisolated private static func collapseOverwrittenProgressFramesForReplay(_ data: Data) -> Data {
+        guard !data.isEmpty else { return data }
+
+        let bytes = Array(data)
+        var collapsed: [UInt8] = []
+        collapsed.reserveCapacity(bytes.count)
+
+        var index = 0
+        var didCollapse = false
+        while index < bytes.count {
+            guard isEraseLineCarriageReturnMarker(in: bytes, at: index) else {
+                collapsed.append(bytes[index])
+                index += 1
+                continue
+            }
+
+            let runStart = index
+            var latestFrameStart = index
+            var frameCount = 1
+            var scan = index + eraseLineCarriageReturnMarkerLength
+            var lineEndExclusive = bytes.count
+            var canCollapse = true
+
+            while scan < bytes.count {
+                if bytes[scan] == UInt8(ascii: "\n") {
+                    lineEndExclusive = scan + 1
+                    break
+                }
+
+                if isEraseLineCarriageReturnMarker(in: bytes, at: scan) {
+                    let payloadStart = latestFrameStart + eraseLineCarriageReturnMarkerLength
+                    if bytes[payloadStart..<scan].contains(0x1B) {
+                        canCollapse = false
+                        break
+                    }
+                    latestFrameStart = scan
+                    frameCount += 1
+                    scan += eraseLineCarriageReturnMarkerLength
+                    continue
+                }
+
+                scan += 1
+            }
+
+            if canCollapse, frameCount > 1 {
+                collapsed.append(contentsOf: bytes[latestFrameStart..<lineEndExclusive])
+                didCollapse = true
+                index = lineEndExclusive
+            } else {
+                collapsed.append(contentsOf: bytes[runStart..<lineEndExclusive])
+                index = lineEndExclusive
+            }
+        }
+
+        return didCollapse ? Data(collapsed) : data
+    }
+
+    nonisolated private static var eraseLineCarriageReturnMarkerLength: Int { 5 }
+
+    nonisolated private static func isEraseLineCarriageReturnMarker(
+        in bytes: [UInt8],
+        at index: Int
+    ) -> Bool {
+        index + eraseLineCarriageReturnMarkerLength <= bytes.count
+            && bytes[index] == 0x1B
+            && bytes[index + 1] == UInt8(ascii: "[")
+            && bytes[index + 2] == UInt8(ascii: "2")
+            && bytes[index + 3] == UInt8(ascii: "K")
+            && bytes[index + 4] == UInt8(ascii: "\r")
     }
 
     nonisolated static func sanitizeHostInputFromGhostty(_ data: Data) -> Data {

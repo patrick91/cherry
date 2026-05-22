@@ -3516,6 +3516,26 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(String(decoding: sanitized, as: UTF8.self) == "before\u{1B}]2;kept title\u{07}\u{1B}[31mafter")
 }
 
+@Test func ghosttyReplayOutputCollapsesOverwrittenProgressFrames() async throws {
+    let replay = Data((
+        "Building for debugging...\r\n" +
+        "\u{1B}[2K\r[0/3] Write swift-version--58304C5D6DBC2206.txt" +
+        "\u{1B}[2K\r[1/3] Write swift-version--58304C5D6DBC2206.txt" +
+        "\u{1B}[2K\r[1/4] Write swift-version--58304C5D6DBC2206.txt" +
+        "\u{1B}[2K\r[2/4] Emitting module Cherry" +
+        "\r\nBuild complete\r\n"
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let output = String(decoding: sanitized, as: UTF8.self)
+
+    #expect(output == (
+        "Building for debugging...\r\n" +
+        "\u{1B}[2K\r[2/4] Emitting module Cherry\r\n" +
+        "Build complete\r\n"
+    ))
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +

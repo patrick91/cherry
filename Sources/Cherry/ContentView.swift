@@ -5164,6 +5164,19 @@ private struct SidebarAgentWorkingIndicator: View {
     }
 }
 
+private struct SidebarAgentPermissionIndicator: View {
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        Image(systemName: "hand.raised.fill")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Color.orange)
+            .frame(width: 14, height: 18)
+            .accessibilityLabel("Agent awaiting permission")
+    }
+}
+
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
@@ -5301,8 +5314,10 @@ private struct SidebarTabRow: View {
 
             Spacer(minLength: 8)
 
-            if rowState.showsAgentWorkingIndicator {
+            if rowState.agentActivityState.showsWorkingIndicator {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
+            } else if rowState.agentActivityState == .permission {
+                SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
             }
 
             Circle()
@@ -5371,7 +5386,7 @@ private final class SidebarTabRowState: ObservableObject {
 
     @Published private(set) var label: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
-    @Published private(set) var showsAgentWorkingIndicator: Bool
+    @Published private(set) var agentActivityState: AgentActivityState
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -5388,7 +5403,7 @@ private final class SidebarTabRowState: ObservableObject {
         )
         self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
-        self.showsAgentWorkingIndicator = session.agentActivityState.showsWorkingIndicator
+        self.agentActivityState = session.agentActivityState
 
         observe(session)
     }
@@ -5419,11 +5434,10 @@ private final class SidebarTabRowState: ObservableObject {
             .store(in: &cancellables)
 
         session.$agentActivityState
-            .map(\.showsWorkingIndicator)
             .removeDuplicates()
-            .sink { [weak self] showsAgentWorkingIndicator in
+            .sink { [weak self] state in
                 Task { @MainActor [weak self] in
-                    self?.showsAgentWorkingIndicator = showsAgentWorkingIndicator
+                    self?.agentActivityState = state
                 }
             }
             .store(in: &cancellables)

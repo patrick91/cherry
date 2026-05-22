@@ -159,7 +159,6 @@ enum AgentActivityState: String, Equatable, Codable {
     case unknown
     case idle
     case permission
-    case thinking
     case working
     case error
 
@@ -177,9 +176,7 @@ enum AgentActivityState: String, Equatable, Codable {
             self = .idle
         case "PERMISSION", "CONFIRMATION", "APPROVAL":
             self = .permission
-        case "THINKING", "RESPONDING":
-            self = .thinking
-        case "WORKING", "RUNNING", "EXECUTING":
+        case "THINKING", "RESPONDING", "WORKING", "RUNNING", "EXECUTING":
             self = .working
         case "ERROR", "FAILED":
             self = .error
@@ -189,7 +186,7 @@ enum AgentActivityState: String, Equatable, Codable {
     }
 
     var showsWorkingIndicator: Bool {
-        self == .thinking || self == .working
+        self == .working
     }
 }
 

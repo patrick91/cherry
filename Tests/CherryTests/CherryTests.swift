@@ -1389,6 +1389,122 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(harness.workspace.session(id: secondChild.process.id)?.parentAgentID == secondID)
 }
 
+@MainActor
+@Test func mcpSpawnAgentIgnoresHTTPSessionParentFromDifferentScopedProject() async throws {
+    let defaultsName = "CherryTests.ScopedMCPParent.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let settings = AgentSettings(defaults: defaults)
+
+    let projectRootA = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let projectRootB = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let socketDirectory = URL(
+        fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
+        isDirectory: true
+    )
+    let socketURL = socketDirectory.appendingPathComponent("control.sock")
+
+    try FileManager.default.createDirectory(at: projectRootA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
+    _ = settings.addProject(path: projectRootA.path)
+    _ = settings.addProject(path: projectRootB.path)
+    try settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
+
+    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path)
+    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path)
+    let chromeStateA = ProjectWindowChromeState()
+    let chromeStateB = ProjectWindowChromeState()
+    let workspaces = [projectRootA.path: workspaceA, projectRootB.path: workspaceB]
+    let chromeStates = [projectRootA.path: chromeStateA, projectRootB.path: chromeStateB]
+    let openProjectRoots = [projectRootA.path, projectRootB.path]
+
+    let server = CherryControlServer(
+        workspaceProvider: { workspaceA },
+        chromeStateProvider: { chromeStateA },
+        workspaceForProjectRootProvider: { workspaces[$0] },
+        chromeStateForProjectRootProvider: { chromeStates[$0] },
+        openProjectRootsProvider: { openProjectRoots },
+        socketURL: socketURL,
+        agentSettings: settings
+    )
+    defer {
+        server.stop()
+        workspaceA.sessions.forEach { $0.stop() }
+        workspaceB.sessions.forEach { $0.stop() }
+        defaults.removePersistentDomain(forName: defaultsName)
+        try? FileManager.default.removeItem(at: projectRootA)
+        try? FileManager.default.removeItem(at: projectRootB)
+        try? FileManager.default.removeItem(at: socketDirectory)
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousAgentID = environmentValue(CherryControl.agentIDEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(nil, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(projectRootB.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousAgentID, for: CherryControl.agentIDEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+    server.start()
+
+    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try CherryControlClient(socketURL: socketURL).send(request)
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    let parentAResponse = try await send(.runAgent(.init(
+        agentName: "Echo",
+        title: "Project A parent",
+        select: true
+    )))
+    guard case .runAgent(let parentA)? = parentAResponse.result else {
+        Issue.record("Expected project A parent, got \(String(describing: parentAResponse))")
+        return
+    }
+
+    let parentBResponse = try await send(.scoped(.init(
+        projectRoot: projectRootB.path,
+        request: .runAgent(.init(
+            agentName: "Echo",
+            title: "Project B parent",
+            select: true
+        ))
+    )))
+    guard case .runAgent(let parentB)? = parentBResponse.result,
+          let parentBID = UUID(uuidString: parentB.terminalID)
+    else {
+        Issue.record("Expected project B parent, got \(String(describing: parentBResponse))")
+        return
+    }
+
+    let sessionContext = CherryMCPToolContext.bound(defaultParentAgentID: parentA.terminalID)
+    let childResult = await CherryMCPTools.call(
+        name: "spawn_process",
+        arguments: [
+            "kind": .string("agent"),
+            "name": .string("Echo"),
+            "title": .string("Project B child")
+        ],
+        context: sessionContext
+    )
+    let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
+
+    #expect(child.process.parentAgentID == parentB.terminalID)
+    #expect(workspaceB.session(id: child.process.id)?.parentAgentID == parentBID)
+}
+
 @Test func mcpAgentCreationToolsDoNotAdvertiseTopLevelOverride() throws {
     let tool = try #require(CherryMCPTools.all.first { $0.name == "spawn_process" })
     let schema = try #require(tool.inputSchema.objectValue)
@@ -3596,19 +3712,19 @@ private struct MCPWhoamiPayload: Decodable {
         parentAgentID: parent.id
     )
 
-    child.ingestTestingData(Data("\u{1B}]9;Nested complete\u{7}".utf8))
+    child.ingestTestingData(Data("\u{1B}]9;Nested turn complete\u{7}".utf8))
     #expect(child.hasUnreadNotification == false)
     #expect(child.lastNotification == nil)
 
-    parent.ingestTestingData(Data("\u{1B}]9;Parent complete\u{7}".utf8))
+    parent.ingestTestingData(Data("\u{1B}]9;Parent turn complete\u{7}".utf8))
     #expect(parent.hasUnreadNotification == false)
     #expect(parent.lastNotification == nil)
 
-    parent.ingestTestingData(Data("\u{1B}]777;notify;Codex;Approval requested\u{7}".utf8))
+    parent.ingestTestingData(Data("\u{1B}]777;notify;Codex;Approval required\u{7}".utf8))
     #expect(parent.hasUnreadNotification == true)
     #expect(parent.lastNotification == TerminalNotificationRequest(
         title: "Codex",
-        body: "Approval requested",
+        body: "Approval required",
         source: .osc777
     ))
 }
@@ -3769,6 +3885,96 @@ private struct MCPWhoamiPayload: Decodable {
     try await Task.sleep(for: .milliseconds(80))
 
     #expect(first.rawOutputObserverCount == 0)
+}
+
+@MainActor
+@Test func ghosttyBridgeAttachLaysOutTerminalSurfaceBeforeOutputReplay() async throws {
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Second",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let previousDelay = GhosttySessionBridge.detachedSurfaceReleaseDelay
+    GhosttySessionBridge.detachedSurfaceReleaseDelay = .milliseconds(50)
+
+    defer {
+        GhosttySessionBridge.detachedSurfaceReleaseDelay = previousDelay
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    // Wait long enough for the scheduled detached-surface release on `first`
+    // to fire so the next attach has to rebuild the surface from scratch.
+    try await Task.sleep(for: .milliseconds(80))
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+
+    // attach must drive a synchronous layout pass so the freshly-inserted
+    // terminalView has real bounds before the deferred installOutputObserver
+    // runs. Without it, fitToSize sees zero bounds and the rebuilt surface
+    // stays at ghostty's default grid; absolute cursor moves in the replayed
+    // scrollback (e.g. zsh's RPROMPT positioning) then land at the wrong
+    // column and the post-resize redraw stacks a second RPROMPT on top.
+    let bounds = first.ghosttyBridge.terminalView.bounds
+    #expect(bounds.width > 0)
+    #expect(bounds.height > 0)
+}
+
+@MainActor
+@Test func ghosttyBridgeDefersOutputReplayUntilAttachedSurfaceHasUsableBounds() async throws {
+    let session = TerminalSession(
+        title: "Build",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    session.ingestTestingData(Data("[1/4] Write swift-version--58304C5D6DBC2206.txt\r".utf8))
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let rootView = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 640, height: 400))
+    let container = GhosttyTerminalContainerView(frame: .zero)
+    rootView.addSubview(container)
+    window.contentView = rootView
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(session.rawOutputObserverCount == 0)
+
+    container.frame = rootView.bounds
+    container.needsLayout = true
+    container.layoutSubtreeIfNeeded()
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(session.rawOutputObserverCount == 1)
+    session.ghosttyBridge.flushOutputForTesting()
 }
 
 @MainActor
@@ -3950,6 +4156,65 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func permissionNotificationFlipsAgentToPermissionState() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.applyAutomaticSummary(
+        "Editing routing tests",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(Data("\u{1B}]9;Permission required\u{7}".utf8))
+    #expect(session.agentActivityState == .permission)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+    #expect(session.hasUnreadNotification == true)
+}
+
+@MainActor
+@Test func unrelatedCompletionNotificationDoesNotClearAgentWorkingIndicator() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = true
+    }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.applyAutomaticSummary(
+        "Investigating build failure",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(Data("\u{1B}]9;Compilation completed for module Foo\u{7}".utf8))
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(Data("\u{1B}]9;Confirmation email sent to user\u{7}".utf8))
+    #expect(session.agentActivityState == .working)
+}
+
+@MainActor
 @Test func lateWorkingSummaryDoesNotRestartAgentIndicatorAfterCompletion() async throws {
     TerminalNotificationCenter.shared.isDeliveryEnabled = false
     defer {
@@ -3983,6 +4248,63 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func agentOutputDoesNotClearWorkingStateJustBecauseOutputIsQuiet() async throws {
+    let session = TerminalSession(
+        title: "Custom",
+        subtitle: "custom-agent",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Custom"
+    )
+
+    #expect(session.agentActivityState == .unknown)
+
+    session.ingestTestingData(Data("streaming chunk one\n".utf8))
+    try await Task.sleep(for: .milliseconds(60))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+
+    try await Task.sleep(for: .milliseconds(1_700))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func submittedAgentInputMarksAgentWorkingBeforeOutput() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("finished previous turn\n".utf8))
+    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
+    #expect(session.agentActivityState == .idle)
+
+    session.send(text: "Run /review on my current changes\n")
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func renderedCodexInputPromptClearsAgentWorkingIndicator() async throws {
     let session = TerminalSession(
         title: "Codex",
@@ -4012,275 +4334,29 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func composingAtRenderedCodexPromptDoesNotShowAgentWorkingIndicator() async throws {
+@Test func outputAfterCompletionNotificationStaysIdleUntilUserInput() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
     let session = TerminalSession(
         title: "Codex",
         subtitle: "codex --yolo",
         tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.applyAutomaticSummary(
-        "Finished CI review",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-    session.ingestTestingData(Data("Worked for 1m 35s\n\u{203A} ".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-
-    session.send(data: Data("Run /review on my current changes".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemGreen,
         launchShell: false,
         kind: .agent,
-        agentName: "Claude"
+        agentName: "Codex"
     )
 
-    session.applyAutomaticSummary(
-        "Launching Claude Code",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    Claude Code v2.1.146
-    Opus 4.7 (1M context) with xhigh effort
-    \u{276F} [Image #1] can you match these two fonts
-    \u{25B6}\u{25B6} bypass permissions on (shift+tab to cycle)
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedGeminiInputPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Gemini",
-        subtitle: "gemini",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Gemini"
-    )
-
-    session.applyAutomaticSummary(
-        "Launching Gemini",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    Tips for getting started:
-    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-     > Ask anything
-    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedGeminiTrustPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Gemini",
-        subtitle: "gemini",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Gemini"
-    )
-
-    session.applyAutomaticSummary(
-        "Launching Gemini",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    \u{256D}\u{2500}\u{2500}\u{2500}\u{256E}
-    \u{2502} Do you trust this folder? \u{2502}
-    \u{2502} \u{25CF} 1. Trust folder \u{2502}
-    \u{2502}   2. Don't trust \u{2502}
-    \u{2570}\u{2500}\u{2500}\u{2500}\u{256F}
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedOpenCodeInputPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "OpenCode",
-        subtitle: "opencode",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "OpenCode"
-    )
-
-    session.applyAutomaticSummary(
-        "Launching OpenCode",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    OpenCode
-    \u{2503}
-    \u{2503} Ask anything... "What is the tech stack of this project?"
-    \u{2503}
-    ctrl+t variants  tab agents  ctrl+p commands
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedPiStartupPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Pi",
-        subtitle: "pi",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Pi"
-    )
-
-    session.applyAutomaticSummary(
-        "Launching Pi",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    pi v0.74.0
-    Press ctrl+o to show full startup help and loaded resources.
-    Pi can explain its own features and look up its docs.
-    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-
-    \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-    ~/github/patrick91/cherry (main)
-    $0.000 (sub) 0.0%/272k (auto) (openai-codex) gpt-5.5 - high
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func genericChevronOutputDoesNotClearAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Custom",
-        subtitle: "custom-agent",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Custom"
-    )
-
-    session.applyAutomaticSummary(
-        "Reading output",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    > quoted output, not an input prompt
-    still working
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(480))
-
+    session.ingestTestingData(Data("streaming output\n".utf8))
+    try await Task.sleep(for: .milliseconds(60))
     #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
 
-@MainActor
-@Test func genericVisibleCursorAfterQuietClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Custom",
-        subtitle: "custom-agent",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Custom"
-    )
-
-    session.applyAutomaticSummary(
-        "Working on custom task",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("""
-    Finished streaming the last tool result
-    \u{250C}\u{2500}\u{2500}\u{2500}\u{2510}
-    \u{2502} Draft prompt waiting here
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-
-    try await Task.sleep(for: .milliseconds(400))
-
+    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
     #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
 
-@MainActor
-@Test func hiddenCursorAfterQuietDoesNotClearAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Custom",
-        subtitle: "custom-agent",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Custom"
-    )
-
-    session.applyAutomaticSummary(
-        "Working on custom task",
-        useAsTitle: true,
-        agentActivityState: .working
-    )
-
-    session.ingestTestingData(Data("\u{1B}[?25lStill thinking without new output".utf8))
-    try await Task.sleep(for: .milliseconds(480))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
+    session.ingestTestingData(Data("post-completion housekeeping line\n".utf8))
+    try await Task.sleep(for: .milliseconds(60))
+    #expect(session.agentActivityState == .idle)
 }
 
 @MainActor

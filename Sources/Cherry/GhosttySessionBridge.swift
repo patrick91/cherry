@@ -265,6 +265,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.setSurfaceVisible(true)
         if !isAlreadyInstalled {
+            // Drive a synchronous layout pass so the rebuilt surface receives
+            // its real pixel size *before* installOutputObserver replays the
+            // raw scrollback. Without this, fitToSize sees zero bounds on the
+            // freshly-inserted terminalView and skips setSize, leaving the
+            // surface at ghostty's default grid. Absolute cursor moves in the
+            // replayed bytes (e.g. zsh's RPROMPT positioning) then land at the
+            // wrong column and stay there after layout widens the grid.
+            container.needsLayout = true
+            container.layoutSubtreeIfNeeded()
             TerminalPerformanceMonitor.recordFitToSize()
             terminalView.fitToSize()
         }
@@ -414,7 +423,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
     }
 
-    private func activateOutputFeedWhenSurfaceIsReady() {
+    func activateOutputFeedWhenSurfaceIsReady() {
         guard !isReleased, outputObserverID == nil, !pendingFeedActivation else { return }
         pendingFeedActivation = true
 
@@ -422,8 +431,29 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             guard let self else { return }
             self.pendingFeedActivation = false
             guard !self.isReleased else { return }
+            guard self.prepareSurfaceForOutputReplay() else { return }
             self.installOutputObserver()
         }
+    }
+
+    private func prepareSurfaceForOutputReplay() -> Bool {
+        guard terminalView.window != nil,
+              terminalView.bounds.width > 0,
+              terminalView.bounds.height > 0
+        else {
+            return false
+        }
+
+        TerminalPerformanceMonitor.recordFitToSize()
+        terminalView.fitToSize()
+        guard let gridMetrics,
+              gridMetrics.columns > 0,
+              gridMetrics.rows > 0
+        else {
+            return false
+        }
+
+        return true
     }
 
     private func installOutputObserver() {
@@ -443,6 +473,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func installOutputObserverForTesting() {
         installOutputObserver()
+    }
+
+    func flushOutputForTesting() {
+        outputSink.flushForTesting()
     }
 
     private func uninstallOutputObserver() {
@@ -980,13 +1014,14 @@ final class GhosttyTerminalContainerView: NSView {
         scrollView.frame = bounds
 
         // We deliberately *do not* call `bridge.attach(to: self)` here.
-        // `attach` calls `terminalView.fitToSize()` unconditionally, which
-        // would re-issue a Metal surface reconfigure on every layout pass —
-        // including the final post-animation one — undoing the work the
-        // freeze + early-fit are doing. Attachment is already handled in
+        // `attach` can call `terminalView.fitToSize()`, which would re-issue
+        // a Metal surface reconfigure on every layout pass — including the
+        // final post-animation one — undoing the work the freeze + early-fit
+        // are doing. Attachment is already handled in
         // `configure(with:colorScheme:)` (session changes) and
         // `viewDidMoveToWindow` (window changes), which is sufficient.
         synchronizeScrollState()
+        activeBridge?.activateOutputFeedWhenSurfaceIsReady()
 
         updateSnapshotLayerFrame()
     }
@@ -1066,9 +1101,8 @@ final class GhosttyTerminalContainerView: NSView {
 
         scrollView.reflectScrolledClipView(scrollView.contentView)
 
-        // `synchronizeTerminalFrame` is the only path that calls
-        // `fitToSize`. While the sidebar is animating we want exactly zero
-        // re-fits — otherwise the terminal reflows on every scroll-bounds
+        // While the sidebar is animating we want exactly zero resize-driven
+        // re-fits; otherwise the terminal reflows on every scroll-bounds
         // change and the prompt visibly walks up/down under the snapshot.
         if !isSyncFrozen {
             synchronizeTerminalFrame(terminalView)

@@ -4897,6 +4897,18 @@ final class TrafficLightController {
     }
 }
 
+enum TrafficLightWindowLayout {
+    static let refreshNotificationNames: [NSNotification.Name] = [
+        NSWindow.didResizeNotification,
+        NSWindow.didEnterFullScreenNotification,
+        NSWindow.didExitFullScreenNotification,
+        NSWindow.didBecomeKeyNotification,
+        NSWindow.didResignKeyNotification,
+        NSWindow.didMiniaturizeNotification,
+        NSWindow.didDeminiaturizeNotification
+    ]
+}
+
 private struct TrafficLightOverlay: NSViewRepresentable {
     let controller: TrafficLightController
 
@@ -4969,16 +4981,7 @@ private final class TrafficLightOverlayView: NSView {
         // Re-apply our translation after AppKit-driven window state changes
         // — these are the moments when the standard buttons can get moved
         // back to default by AppKit's titlebar layout.
-        let names: [NSNotification.Name] = [
-            NSWindow.didResizeNotification,
-            NSWindow.didEnterFullScreenNotification,
-            NSWindow.didExitFullScreenNotification,
-            NSWindow.didBecomeKeyNotification,
-            NSWindow.didMiniaturizeNotification,
-            NSWindow.didDeminiaturizeNotification
-        ]
-
-        for name in names {
+        for name in TrafficLightWindowLayout.refreshNotificationNames {
             NotificationCenter.default.publisher(for: name, object: window)
                 .receive(on: RunLoop.main)
                 .sink { [weak self] _ in

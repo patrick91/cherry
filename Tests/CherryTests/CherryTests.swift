@@ -3634,6 +3634,11 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func trafficLightOverlayRefreshesWhenWindowResignsKey() {
+    #expect(TrafficLightWindowLayout.refreshNotificationNames.contains(NSWindow.didResignKeyNotification))
+}
+
+@MainActor
 @Test func workspaceCloseReleasesGhosttyBridge() async throws {
     let workspace = TerminalWorkspace()
     defer {

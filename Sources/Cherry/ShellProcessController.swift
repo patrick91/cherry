@@ -165,6 +165,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellPath: String
         let workingDirectory: String
         let projectRoot: String?
+        let processID: String?
         let agentID: String?
         let term: String
         let initialSize: TerminalViewportSize
@@ -174,6 +175,7 @@ final class ShellProcessController: @unchecked Sendable {
             shellPath: String,
             workingDirectory: String,
             projectRoot: String? = nil,
+            processID: String? = nil,
             agentID: String? = nil,
             term: String,
             initialSize: TerminalViewportSize,
@@ -182,6 +184,7 @@ final class ShellProcessController: @unchecked Sendable {
             self.shellPath = shellPath
             self.workingDirectory = workingDirectory
             self.projectRoot = projectRoot
+            self.processID = processID
             self.agentID = agentID
             self.term = term
             self.initialSize = initialSize
@@ -581,6 +584,7 @@ final class ShellProcessController: @unchecked Sendable {
         let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
         let workingDirectory = configuration.workingDirectory
         let projectRoot = configuration.projectRoot
+        let processID = configuration.processID
         let agentID = configuration.agentID
         let term = configuration.term
         let startupCommand = configuration.startupCommand
@@ -626,6 +630,11 @@ final class ShellProcessController: @unchecked Sendable {
                 _ = setenv(CherryControl.projectRootEnvironmentKey, projectRoot, 1)
             } else {
                 _ = unsetenv(CherryControl.projectRootEnvironmentKey)
+            }
+            if let processID, !processID.isEmpty {
+                _ = setenv(CherryControl.processIDEnvironmentKey, processID, 1)
+            } else {
+                _ = unsetenv(CherryControl.processIDEnvironmentKey)
             }
             if let agentID, !agentID.isEmpty {
                 _ = setenv(CherryControl.agentIDEnvironmentKey, agentID, 1)

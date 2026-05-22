@@ -1,4 +1,5 @@
 import CherryControl
+import Darwin
 import Foundation
 import MCP
 
@@ -10,35 +11,30 @@ private func cherryMCPClient(timeout: TimeInterval?) -> CherryControlClient {
     CherryControlClient(timeout: timeout ?? 10)
 }
 
-final class CherryMCPToolContext: @unchecked Sendable {
-    let sessionID: String?
+public final class CherryMCPToolContext: @unchecked Sendable {
+    public let sessionID: String?
+    public let callerProcessID: String?
     private let lock = NSLock()
-    private var storedDefaultParentAgentID: String?
     private var storedBoundProcessID: String?
 
-    var defaultParentAgentID: String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storedDefaultParentAgentID
-    }
-
-    var boundProcessID: String? {
+    public var boundProcessID: String? {
         lock.lock()
         defer { lock.unlock() }
         return storedBoundProcessID
     }
 
-    private init(sessionID: String?, defaultParentAgentID: String?) {
+    private init(sessionID: String?, callerProcessID: String?) {
         self.sessionID = sessionID
-        self.storedDefaultParentAgentID = defaultParentAgentID
+        self.callerProcessID = callerProcessID
+        self.storedBoundProcessID = callerProcessID
     }
 
-    static func bound(sessionID: String? = nil, defaultParentAgentID: String?) -> CherryMCPToolContext {
-        CherryMCPToolContext(sessionID: sessionID, defaultParentAgentID: defaultParentAgentID)
+    public static func bound(sessionID: String? = nil, callerProcessID: String? = nil) -> CherryMCPToolContext {
+        CherryMCPToolContext(sessionID: sessionID, callerProcessID: callerProcessID)
     }
 
     @discardableResult
-    func bindProcessID(_ processID: String) -> String? {
+    public func bindProcessID(_ processID: String) -> String? {
         lock.lock()
         defer { lock.unlock() }
         let previous = storedBoundProcessID
@@ -47,8 +43,8 @@ final class CherryMCPToolContext: @unchecked Sendable {
     }
 }
 
-enum CherryMCPTools {
-    static let all: [Tool] = [
+public enum CherryMCPTools {
+    public static let all: [Tool] = [
         tool(
             "get_status",
             "Check Cherry MCP helper and app control socket status without changing the Cherry UI.",
@@ -158,7 +154,7 @@ enum CherryMCPTools {
                 "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Optional exact raw bytes to send after launch, base64-encoded."),
                 "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
-                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
+                "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the bound caller agent when available; unbound sessions create top-level agents."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -171,8 +167,8 @@ enum CherryMCPTools {
                 "name": string("Configured agent name."),
                 "title": string("Optional custom title."),
                 "message": string("Optional first message to submit after launch. A final Enter is added automatically when omitted."),
-                "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the current Cherry agent when available, then the selected or latest root agent."),
-                "bind_session": boolean("Whether to bind this MCP HTTP session to the spawned agent so later agent tools can omit process_id. Defaults to false; enable only for a single-agent conversation."),
+                "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the bound caller agent when available; unbound sessions create top-level agents."),
+                "bind_session": boolean("Whether to bind this MCP session to the spawned agent so later agent tools can omit process_id. Defaults to false; enable only for a single-agent conversation."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ],
@@ -417,12 +413,12 @@ enum CherryMCPTools {
         ),
         tool(
             "bind_session_process",
-            "Bind this MCP HTTP session to one Cherry process so later process tools can omit process_id. Does not change the Cherry UI.",
+            "Bind this MCP session to one Cherry process so later process tools can omit process_id. Does not change the Cherry UI.",
             properties: processSelectorProperties()
         )
     ]
 
-    static func call(
+    public static func call(
         name: String,
         arguments: [String: Value],
         context: CherryMCPToolContext? = nil
@@ -482,10 +478,10 @@ enum CherryMCPTools {
 
         return try encodedResult(MCPWhoamiPayload(
             mcpSessionID: context?.sessionID,
+            callerProcessID: context?.callerProcessID,
             activeProjectRoot: activeProjectRoot,
             effectiveProjectRoot: status.projectRoot,
             boundProcessID: context?.boundProcessID,
-            defaultParentAgentID: context?.defaultParentAgentID,
             selectedProcessID: status.selectedProcessID,
             selectedProcessName: status.selectedProcessName
         ))
@@ -625,21 +621,6 @@ enum CherryMCPTools {
             output: wait.output,
             wait: wait
         ))
-    }
-
-    @MainActor
-    static func defaultParentAgentIDForHTTPSession() -> String? {
-        guard let workspace = ProjectWindowRegistry.shared.activeWorkspace else {
-            return nil
-        }
-
-        if ProjectWindowRegistry.shared.activeChromeState?.isShowingTerminalContent ?? true,
-           let selectedSession = workspace.selectedSession,
-           selectedSession.kind == .agent {
-            return selectedSession.id.uuidString
-        }
-
-        return workspace.rootAgentSessions.last?.id.uuidString
     }
 
     private static func scopedRequest(_ request: CherryControlRequest, arguments: [String: Value] = [:]) -> CherryControlRequest {
@@ -1144,24 +1125,121 @@ enum CherryMCPTools {
         if boolArgument("top_level", in: arguments) == true {
             return CherryControl.topLevelAgentParentID
         }
-        if let context {
-            return explicitParentAgentID ?? context.defaultParentAgentID ?? CherryControl.selectedAgentParentID
+        if let explicitParentAgentID {
+            return explicitParentAgentID
         }
-        if let environmentAgentID = environmentAgentID() {
-            return explicitParentAgentID ?? environmentAgentID
+        if let callerProcessID = context?.callerProcessID,
+           implicitParentAgentIDIsUsable(callerProcessID, arguments: arguments) {
+            return callerProcessID
         }
-        return explicitParentAgentID ?? CherryControl.selectedAgentParentID
+        if context == nil,
+           let environmentProcessID = environmentProcessID(),
+           implicitParentAgentIDIsUsable(environmentProcessID, arguments: arguments) {
+            return environmentProcessID
+        }
+        return nil
     }
 
-    private static func environmentAgentID() -> String? {
-        guard let agentID = ProcessInfo.processInfo.environment[CherryControl.agentIDEnvironmentKey]?
+    private static func implicitParentAgentIDIsUsable(_ agentID: String, arguments: [String: Value]) -> Bool {
+        let request = scopedRequest(
+            .getProcessStatus(.init(processID: agentID, processName: nil)),
+            arguments: arguments
+        )
+        guard let response = try? cherryMCPClient(timeout: 2).send(request),
+              response.error == nil,
+              case .getProcessStatus(let status)? = response.result
+        else {
+            return false
+        }
+        return status.process.kind == "agent"
+    }
+
+    public static func environmentProcessID() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        let value = environment[CherryControl.processIDEnvironmentKey]
+            ?? environment[CherryControl.agentIDEnvironmentKey]
+        guard let processID = value?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-            !agentID.isEmpty,
-            UUID(uuidString: agentID) != nil
+            !processID.isEmpty,
+            UUID(uuidString: processID) != nil
         else {
             return nil
         }
-        return agentID
+        return processID
+    }
+
+    public static func callerProcessID(processPID: Int32, parentPID: Int32?) async -> String? {
+        if let processID = environmentProcessID() {
+            return processID
+        }
+        return await inferredCallerProcessID(parentPIDs: parentPIDs(processPID: processPID, parentPID: parentPID))
+    }
+
+    public static func callerProcessID(parentPID: Int32?) async -> String? {
+        if let processID = environmentProcessID() {
+            return processID
+        }
+        return await inferredCallerProcessID(parentPIDs: parentPID.map { [$0] } ?? [])
+    }
+
+    public static func inferredCallerProcessID(parentPID: Int32?) async -> String? {
+        guard let parentPID, parentPID > 0 else {
+            return nil
+        }
+        return await inferredCallerProcessID(parentPIDs: [parentPID])
+    }
+
+    public static func inferredCallerProcessID(parentPIDs: [Int32]) async -> String? {
+        let parentPIDs = parentPIDs.filter { $0 > 0 }
+        guard !parentPIDs.isEmpty else {
+            return nil
+        }
+        let response = try? cherryMCPClient(timeout: 2).send(scopedRequest(.listProcesses(.init())))
+        guard response?.error == nil,
+              case .listProcesses(let result)? = response?.result
+        else {
+            return nil
+        }
+
+        for parentPID in parentPIDs {
+            if let process = result.processes.first(where: { $0.pid == parentPID }) {
+                return process.id
+            }
+        }
+        return nil
+    }
+
+    public static func parentPIDs(processPID: Int32, parentPID: Int32?, maxDepth: Int = 12) -> [Int32] {
+        var output: [Int32] = []
+        var seen = Set<Int32>()
+        var currentPID = parentPID ?? Self.parentPID(of: processPID)
+
+        while let pid = currentPID, pid > 1, !seen.contains(pid), output.count < maxDepth {
+            output.append(pid)
+            seen.insert(pid)
+            currentPID = Self.parentPID(of: pid)
+        }
+
+        return output
+    }
+
+    private static func parentPID(of pid: Int32) -> Int32? {
+        guard pid > 1 else {
+            return nil
+        }
+
+        var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var processInfo = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        let result = mib.withUnsafeMutableBufferPointer { pointer in
+            sysctl(pointer.baseAddress, u_int(pointer.count), &processInfo, &size, nil, 0)
+        }
+        guard result == 0, size >= MemoryLayout<kinfo_proc>.stride else {
+            return nil
+        }
+
+        let parentPID = processInfo.kp_eproc.e_ppid
+        return parentPID > 0 ? parentPID : nil
     }
 
     private static func stringArrayArgument(_ key: String, in arguments: [String: Value]) throws -> [String]? {
@@ -1381,10 +1459,10 @@ private struct ErrorPayload: Codable {
 
 private struct MCPWhoamiPayload: Codable {
     let mcpSessionID: String?
+    let callerProcessID: String?
     let activeProjectRoot: String?
     let effectiveProjectRoot: String?
     let boundProcessID: String?
-    let defaultParentAgentID: String?
     let selectedProcessID: String?
     let selectedProcessName: String?
 }
@@ -1418,4 +1496,10 @@ private struct MCPStatusPayload: Codable {
     let terminalCount: Int?
     let selectedTerminalID: String?
     let error: CherryControlError?
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }

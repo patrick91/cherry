@@ -1,3 +1,4 @@
+import CherryMCP
 import Foundation
 import Darwin
 import Logging
@@ -29,15 +30,12 @@ final class CherryMCPHTTPServer: @unchecked Sendable {
         let app = CherryMCPHTTPApp(
             configuration: .init(host: Self.host, port: Self.port, endpoint: Self.endpoint),
             serverFactory: { sessionID, _ in
-                let toolContext = CherryMCPToolContext.bound(
-                    sessionID: sessionID,
-                    defaultParentAgentID: await CherryMCPTools.defaultParentAgentIDForHTTPSession()
-                )
+                let toolContext = CherryMCPToolContext.bound(sessionID: sessionID)
                 let server = Server(
                     name: "cherry",
                     version: "0.1.0",
                     title: "Cherry",
-                    instructions: "Control the visible Cherry terminal app through local-only IPC. Tools do not change Cherry's visible selection unless the tool name starts with select_. Agent creation must stay nested under the current, selected, or latest root agent unless the human explicitly asks for a root-level agent.",
+                    instructions: "Control the visible Cherry terminal app through local-only IPC. Tools do not change Cherry's visible selection unless the tool name starts with select_. Agent creation is parented to the bound caller process when available; unbound sessions create top-level agents unless parent_agent_id is explicit.",
                     capabilities: .init(tools: .init(listChanged: false))
                 )
 

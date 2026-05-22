@@ -1,32 +1,44 @@
 # Cherry MCP Guide
 
-Cherry exposes a local HTTP MCP server from the running macOS app. The MCP
-surface is process-first: terminals, agents, and configured project commands are
-all Cherry processes with a `process_id`.
+Cherry exposes MCP through a stdio helper launched inside each agent harness.
+The helper talks to the running macOS app over Cherry's local control socket.
+The MCP surface is process-first: terminals, agents, and configured project
+commands are all Cherry processes with a `process_id`.
 
 ## Setup
 
-Start Cherry first, then register the local endpoint with your agent harness:
+Start Cherry first, then register the helper shown in Settings > MCP with your
+agent harness. In a SwiftPM checkout, build the helper and install it like this:
 
 ```bash
-codex mcp add cherry --url http://127.0.0.1:61234/mcp
-claude mcp add --transport http --scope user cherry http://127.0.0.1:61234/mcp
+swift build --product CherryMCP
+codex mcp add cherry -- .build/debug/CherryMCP
+claude mcp add --transport stdio --scope user cherry -- .build/debug/CherryMCP
 ```
 
-The endpoint is local-only at `127.0.0.1:61234/mcp`. Cherry forwards MCP calls to
-its instance-scoped Unix control socket under `/tmp/cherry-$UID/`.
+Cherry still hosts a local-only HTTP MCP endpoint at `127.0.0.1:61234/mcp` for
+internal use and diagnostics. Direct HTTP clients are unbound: they do not infer
+identity from the currently selected Cherry UI process.
 
 ## Scope And Identity
 
-- `whoami` reports the MCP session ID, active/effective project root, selected
-  process, bound process, and default parent agent.
-- `bind_session_process` binds the current MCP HTTP session to a process. Later
+- `whoami` reports the MCP session ID, caller process, active/effective project
+  root, selected process, and bound process.
+- `CHERRY_PROCESS_ID` identifies the Cherry process that launched the helper.
+  `CHERRY_AGENT_ID` is still exported for agent processes as a compatibility
+  alias.
+- If an MCP client strips Cherry environment variables when launching the stdio
+  helper, the helper falls back to matching its parent process ancestry against
+  Cherry's live process list.
+- `bind_session_process` binds the current MCP session to a process. Later
   process tools can omit `process_id` unless they pass `process_name`.
 - `select_process` is the process-level UI selection tool. It is intentionally
   explicit; other process tools do not change the visible Cherry selection.
 
-Agent creation stays nested under the current, selected, or latest root agent
-unless `parent_agent_id` explicitly points somewhere else.
+Agent creation stays nested under the bound caller agent when the stdio helper
+is running inside a Cherry agent. If there is no bound caller, new agents are
+created at the top level unless `parent_agent_id` explicitly points somewhere
+else.
 
 ## Process Tools
 

@@ -1054,11 +1054,13 @@ private struct MCPSettingsPane: View {
 
                 SettingsDivider()
 
-                SettingsRow("MCP URL") {
-                    Text(MCPInstallCommandBuilder.serverURL)
+                SettingsRow("MCP helper") {
+                    Text(MCPInstallCommandBuilder.helperCommand)
                         .font(.callout.monospaced())
                         .textSelection(.enabled)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
 
                 SettingsDivider()

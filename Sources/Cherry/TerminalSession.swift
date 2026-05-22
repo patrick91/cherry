@@ -1860,6 +1860,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     shellPath: ShellProcessController.defaultShellPath,
                     workingDirectory: workingDirectory,
                     projectRoot: projectRoot,
+                    processID: id.uuidString,
                     agentID: kind == .agent ? id.uuidString : nil,
                     term: ShellProcessController.preferredTerminfo.term,
                     initialSize: viewportSize,

@@ -161,6 +161,13 @@ final class TerminalProcessor: @unchecked Sendable {
         scheduleChangeNotification(after: 0)
     }
 
+    func clearScreenAndScrollbackPreservingTerminalState() {
+        locked {
+            buffer.clearScreenAndScrollbackPreservingState()
+        }
+        scheduleChangeNotification(after: 0)
+    }
+
     func resize(to viewportSize: TerminalViewportSize) {
         locked {
             self.viewportSize = viewportSize
@@ -1638,11 +1645,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func clearScrollback() {
+        clearScrollback(preservingTerminalState: true)
+    }
+
+    private func clearScrollback(preservingTerminalState: Bool) {
         outputHoldUntil = nil
         resumeOutputIfPausedForInteraction()
         rawOutputStore.clear()
-        processor.clear()
-        ghosttyBridgeStorage?.reset()
+        if preservingTerminalState {
+            processor.clearScreenAndScrollbackPreservingTerminalState()
+            ghosttyBridgeStorage?.clearScreenAndScrollback()
+        } else {
+            processor.clear()
+            ghosttyBridgeStorage?.reset()
+        }
         lastHumanInputLine = nil
         clearUnreadNotification()
         bumpRevision()
@@ -1657,7 +1673,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func restart() {
         stop()
-        clearScrollback()
+        clearScrollback(preservingTerminalState: false)
         startShell()
     }
 
@@ -1668,7 +1684,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         case .launching, .live:
             return
         case .exited, .failed:
-            clearScrollback()
+            clearScrollback(preservingTerminalState: false)
             startShell()
         }
     }
@@ -1922,7 +1938,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             if kind == .command, restartOnExit {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                     guard let self, self.shellProcess == nil else { return }
-                    self.clearScrollback()
+                    self.clearScrollback(preservingTerminalState: false)
                     self.startShell()
                 }
             }

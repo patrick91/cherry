@@ -66,6 +66,14 @@ final class GhosttyOutputSink: @unchecked Sendable {
         }
     }
 
+    func discardPending() {
+        lock.withLock {
+            pendingChunks.removeAll(keepingCapacity: false)
+            pendingByteCount = 0
+            lastDrainUptimeNanoseconds = nil
+        }
+    }
+
     func receive(_ data: Data, suppressHostInput: Bool = false) {
         guard !data.isEmpty else { return }
 
@@ -305,6 +313,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.fitToSize()
         scrollContainer?.synchronizeScrollState()
         activateOutputFeedWhenSurfaceIsReady()
+    }
+
+    func clearScreenAndScrollback() {
+        guard !isReleased else { return }
+
+        outputSink.discardPending()
+        if terminalView.performBindingAction("clear_screen") {
+            scrollbarMetrics = nil
+            terminalView.performBindingAction("scroll_to_bottom")
+            scrollContainer?.synchronizeScrollState()
+        } else {
+            reset()
+        }
     }
 
     func releaseResources() {

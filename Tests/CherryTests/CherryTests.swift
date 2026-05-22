@@ -3337,6 +3337,39 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func terminalSessionUserClearPreservesLiveTerminalModes() async throws {
+    let session = TerminalSession(
+        title: "Live",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data((
+        "\u{1B}[?1h" +
+        "\u{1B}[?1000h\u{1B}[?1006h" +
+        "\u{1B}[?2004h" +
+        "~/repo main\r\n> "
+    ).utf8))
+
+    #expect(session.usesApplicationCursorKeys)
+    #expect(session.usesBracketedPasteMode)
+    #expect(session.mouseState.trackingMode == .normal)
+    #expect(session.mouseState.usesSGREncoding)
+
+    session.clearScrollback()
+
+    #expect(session.rawOutput(maxBytes: 1024).data.isEmpty)
+    let nonEmptyLines = session.snapshot(range: 0..<session.lineCount).filter { !$0.isEmpty }
+    #expect(nonEmptyLines.isEmpty)
+    #expect(session.usesApplicationCursorKeys)
+    #expect(session.usesBracketedPasteMode)
+    #expect(session.mouseState.trackingMode == .normal)
+    #expect(session.mouseState.usesSGREncoding)
+}
+
+@MainActor
 @Test func terminalSessionWritesTerminalQueryResponsesBackToPTY() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

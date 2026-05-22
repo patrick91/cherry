@@ -458,6 +458,7 @@ protocol TerminalBuffering {
     func selectedText(in selection: TerminalSelectionRange) -> String
 
     mutating func clear()
+    mutating func clearScreenAndScrollbackPreservingState()
     mutating func resize(to viewportSize: TerminalViewportSize)
     mutating func appendPlainLines(_ newLines: [String])
 
@@ -466,6 +467,10 @@ protocol TerminalBuffering {
 }
 
 extension TerminalBuffering {
+    mutating func clearScreenAndScrollbackPreservingState() {
+        clear()
+    }
+
     @discardableResult
     mutating func ingest(_ data: Data) -> [Data] {
         ingest(data, viewportSize: TerminalViewportSize(columns: 120, rows: 32))
@@ -675,6 +680,44 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
         activeGraphicCharsetSlot = .g0
         lastWrittenCharacter = nil
         isWraparoundMode = true
+    }
+
+    mutating func clearScreenAndScrollbackPreservingState() {
+        let preservedAlternateScreen = isUsingAlternateScreen
+        let preservedSavedCursorState = savedCursorState
+        let preservedCursorShape = cursorShape
+        let preservedCursorVisibility = isCursorVisible
+        let preservedApplicationCursorMode = isApplicationCursorMode
+        let preservedScrollRegionTop = scrollRegionTop
+        let preservedScrollRegionBottom = scrollRegionBottom
+        let preservedMouseState = currentMouseState
+        let preservedBracketedPasteMode = isBracketedPasteMode
+        let preservedStyle = currentStyle
+        let preservedG0Charset = g0Charset
+        let preservedG1Charset = g1Charset
+        let preservedG2Charset = g2Charset
+        let preservedG3Charset = g3Charset
+        let preservedGraphicCharsetSlot = activeGraphicCharsetSlot
+        let preservedWraparoundMode = isWraparoundMode
+
+        clear()
+
+        isUsingAlternateScreen = preservedAlternateScreen
+        savedCursorState = preservedSavedCursorState
+        cursorShape = preservedCursorShape
+        isCursorVisible = preservedCursorVisibility
+        isApplicationCursorMode = preservedApplicationCursorMode
+        scrollRegionTop = preservedScrollRegionTop
+        scrollRegionBottom = preservedScrollRegionBottom
+        currentMouseState = preservedMouseState
+        isBracketedPasteMode = preservedBracketedPasteMode
+        currentStyle = preservedStyle
+        g0Charset = preservedG0Charset
+        g1Charset = preservedG1Charset
+        g2Charset = preservedG2Charset
+        g3Charset = preservedG3Charset
+        activeGraphicCharsetSlot = preservedGraphicCharsetSlot
+        isWraparoundMode = preservedWraparoundMode
     }
 
     mutating func appendPlainLines(_ newLines: [String]) {
@@ -2217,6 +2260,24 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         cursorShape = .block
         isCursorVisible = true
         primaryScreenTopRow = nil
+    }
+
+    mutating func clearScreenAndScrollbackPreservingState() {
+        let preservedAlternateScreen = isUsingAlternateScreen
+        let preservedApplicationCursorMode = isApplicationCursorMode
+        let preservedBracketedPasteMode = isBracketedPasteMode
+        let preservedMouseState = currentMouseState
+        let preservedCursorShape = cursorShape
+        let preservedCursorVisibility = isCursorVisible
+
+        clear()
+
+        isUsingAlternateScreen = preservedAlternateScreen
+        isApplicationCursorMode = preservedApplicationCursorMode
+        isBracketedPasteMode = preservedBracketedPasteMode
+        currentMouseState = preservedMouseState
+        cursorShape = preservedCursorShape
+        isCursorVisible = preservedCursorVisibility
     }
 
     mutating func resize(to viewportSize: TerminalViewportSize) {

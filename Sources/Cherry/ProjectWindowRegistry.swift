@@ -455,6 +455,8 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
+    @Published var isTerminalSearchPresented = false
+    @Published var terminalSearchFocusRequest = 0
     @Published var isIconDebugOverlayPresented = false
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
@@ -512,6 +514,16 @@ final class ProjectWindowChromeState: ObservableObject {
     func presentCommandPalette() {
         isCommandPalettePresented = true
         commandPaletteFocusRequest &+= 1
+    }
+
+    func presentTerminalSearch() {
+        selectTerminal()
+        isTerminalSearchPresented = true
+        terminalSearchFocusRequest &+= 1
+    }
+
+    func dismissTerminalSearch() {
+        isTerminalSearchPresented = false
     }
 
     func toggleIconDebugOverlay() {

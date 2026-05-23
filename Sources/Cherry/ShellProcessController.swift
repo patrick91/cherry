@@ -238,21 +238,13 @@ final class ShellProcessController: @unchecked Sendable {
     }
 
     private static func isTerminfoEntryAvailable(_ name: String, environment: [String: String]?) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/infocmp")
-        process.arguments = [name]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        if let environment {
-            process.environment = environment
-        }
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
+        runProbeProcess(
+            executablePath: "/usr/bin/infocmp",
+            arguments: [name],
+            environment: environment,
+            capturesOutput: false,
+            timeout: 2
+        )?.exitCode == 0
     }
 
     private static func loginShellTerminfoProbe() -> (name: String, terminfoDirs: String?)? {
@@ -270,32 +262,15 @@ final class ShellProcessController: @unchecked Sendable {
         exit 1
         """
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: shellPath)
-        process.arguments = ["-l", "-c", probeScript]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        process.environment = ProcessInfo.processInfo.environment
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        guard let data = readProbeOutput(
-            from: pipe.fileHandleForReading,
-            process: process,
+        guard let probeResult = runProbeProcess(
+            executablePath: shellPath,
+            arguments: ["-l", "-c", probeScript],
+            environment: ProcessInfo.processInfo.environment,
+            capturesOutput: true,
             timeout: 2
-        ) else {
-            return nil
-        }
+        ), probeResult.exitCode == 0 else { return nil }
 
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-
-        let output = String(data: data, encoding: .utf8) ?? ""
+        let output = String(data: probeResult.output, encoding: .utf8) ?? ""
         var matched: String?
         var terminfoDirs: String?
         for line in output.split(separator: "\n") {
@@ -310,44 +285,170 @@ final class ShellProcessController: @unchecked Sendable {
         return (matched, terminfoDirs)
     }
 
-    private static func readProbeOutput(
-        from handle: FileHandle,
-        process: Process,
+    private struct ProbeProcessResult {
+        let exitCode: Int32
+        let output: Data
+    }
+
+    private static func runProbeProcess(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String]?,
+        capturesOutput: Bool,
         timeout: TimeInterval
-    ) -> Data? {
-        let fd = handle.fileDescriptor
-        let originalFlags = fcntl(fd, F_GETFL)
+    ) -> ProbeProcessResult? {
+        var outputPipe: [Int32] = [-1, -1]
+        if capturesOutput {
+            let pipeResult = outputPipe.withUnsafeMutableBufferPointer { buffer in
+                pipe(buffer.baseAddress!)
+            }
+            guard pipeResult == 0 else { return nil }
+        }
+
+        let nullFileDescriptor = open("/dev/null", O_RDWR)
+        guard nullFileDescriptor >= 0 else {
+            closeIfOpen(outputPipe[0])
+            closeIfOpen(outputPipe[1])
+            return nil
+        }
+
+        var fileActions: posix_spawn_file_actions_t? = nil
+        guard posix_spawn_file_actions_init(&fileActions) == 0 else {
+            closeIfOpen(outputPipe[0])
+            closeIfOpen(outputPipe[1])
+            close(nullFileDescriptor)
+            return nil
+        }
+        defer {
+            posix_spawn_file_actions_destroy(&fileActions)
+        }
+
+        let stdoutTarget = capturesOutput ? outputPipe[1] : nullFileDescriptor
+        guard stdoutTarget >= 0,
+              posix_spawn_file_actions_adddup2(&fileActions, stdoutTarget, STDOUT_FILENO) == 0,
+              posix_spawn_file_actions_adddup2(&fileActions, nullFileDescriptor, STDERR_FILENO) == 0
+        else {
+            closeIfOpen(outputPipe[0])
+            closeIfOpen(outputPipe[1])
+            close(nullFileDescriptor)
+            return nil
+        }
+
+        if capturesOutput {
+            _ = posix_spawn_file_actions_addclose(&fileActions, outputPipe[0])
+            _ = posix_spawn_file_actions_addclose(&fileActions, outputPipe[1])
+        }
+        _ = posix_spawn_file_actions_addclose(&fileActions, nullFileDescriptor)
+
+        let environmentValues = environment ?? ProcessInfo.processInfo.environment
+        let argvValues = [executablePath] + arguments
+        var argv: [UnsafeMutablePointer<CChar>?] = argvValues.map { strdup($0) } + [nil]
+        var envp: [UnsafeMutablePointer<CChar>?] = environmentValues.map { key, value in
+            strdup("\(key)=\(value)")
+        } + [nil]
+        defer {
+            for pointer in argv {
+                free(pointer)
+            }
+            for pointer in envp {
+                free(pointer)
+            }
+        }
+
+        var childPID = pid_t()
+        let spawnResult = executablePath.withCString { executableCString in
+            argv.withUnsafeMutableBufferPointer { argvBuffer in
+                envp.withUnsafeMutableBufferPointer { envBuffer in
+                    posix_spawn(
+                        &childPID,
+                        executableCString,
+                        &fileActions,
+                        nil,
+                        argvBuffer.baseAddress!,
+                        envBuffer.baseAddress!
+                    )
+                }
+            }
+        }
+
+        close(nullFileDescriptor)
+        if capturesOutput {
+            closeIfOpen(outputPipe[1])
+            outputPipe[1] = -1
+        }
+
+        guard spawnResult == 0 else {
+            closeIfOpen(outputPipe[0])
+            return nil
+        }
+
+        let outputFileDescriptor = outputPipe[0]
+        let originalFlags = capturesOutput ? fcntl(outputFileDescriptor, F_GETFL) : -1
         if originalFlags >= 0 {
-            _ = fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK)
+            _ = fcntl(outputFileDescriptor, F_SETFL, originalFlags | O_NONBLOCK)
         }
         defer {
             if originalFlags >= 0 {
-                _ = fcntl(fd, F_SETFL, originalFlags)
+                _ = fcntl(outputFileDescriptor, F_SETFL, originalFlags)
             }
+            closeIfOpen(outputFileDescriptor)
         }
 
         let deadline = Date().addingTimeInterval(timeout)
         var output = Data()
+        var waitStatus: Int32 = 0
 
-        while process.isRunning {
-            drainAvailableProbeOutput(from: fd, into: &output)
+        while true {
+            if capturesOutput {
+                drainAvailableProbeOutput(from: outputFileDescriptor, into: &output)
+            }
+
+            let waitedPID = waitpid(childPID, &waitStatus, WNOHANG)
+            if waitedPID == childPID {
+                break
+            }
+            if waitedPID < 0, errno != EINTR {
+                terminateProbeProcess(childPID)
+                return nil
+            }
             if Date() >= deadline {
-                process.terminate()
-                let terminateDeadline = Date().addingTimeInterval(0.2)
-                while process.isRunning, Date() < terminateDeadline {
-                    usleep(10_000)
-                }
-                if process.isRunning {
-                    kill(process.processIdentifier, SIGKILL)
-                }
-                process.waitUntilExit()
+                terminateProbeProcess(childPID)
                 return nil
             }
             usleep(10_000)
         }
 
-        drainAvailableProbeOutput(from: fd, into: &output)
-        return output
+        if capturesOutput {
+            drainAvailableProbeOutput(from: outputFileDescriptor, into: &output)
+        }
+        guard let exitCode = normalExitCode(fromWaitStatus: waitStatus) else { return nil }
+        return ProbeProcessResult(exitCode: exitCode, output: output)
+    }
+
+    private static func terminateProbeProcess(_ childPID: pid_t) {
+        kill(childPID, SIGTERM)
+        let terminateDeadline = Date().addingTimeInterval(0.2)
+        var status: Int32 = 0
+        while Date() < terminateDeadline {
+            let waitedPID = waitpid(childPID, &status, WNOHANG)
+            if waitedPID == childPID || (waitedPID < 0 && errno == ECHILD) {
+                return
+            }
+            usleep(10_000)
+        }
+        kill(childPID, SIGKILL)
+        _ = waitpid(childPID, &status, 0)
+    }
+
+    private static func normalExitCode(fromWaitStatus status: Int32) -> Int32? {
+        guard status & 0x7f == 0 else { return nil }
+        return (status >> 8) & 0xff
+    }
+
+    private static func closeIfOpen(_ fileDescriptor: Int32) {
+        if fileDescriptor >= 0 {
+            close(fileDescriptor)
+        }
     }
 
     private static func drainAvailableProbeOutput(from fd: Int32, into output: inout Data) {

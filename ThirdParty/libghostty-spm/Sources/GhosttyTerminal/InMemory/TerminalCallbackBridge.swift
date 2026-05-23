@@ -88,6 +88,41 @@ final class TerminalCallbackBridge {
             (delegate as? any TerminalSurfaceLinkHoverDelegate)?
                 .terminalDidHoverLink(url)
 
+        case GHOSTTY_ACTION_START_SEARCH:
+            let startSearch = action.action.start_search
+            let query = startSearch.needle.map { String(cString: $0) }
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=start_search query=\(TerminalDebugLog.describe(query ?? ""))"
+            )
+            (delegate as? any TerminalSurfaceSearchDelegate)?
+                .terminalDidRequestSearch(TerminalSearchStartRequest(query: query))
+
+        case GHOSTTY_ACTION_END_SEARCH:
+            TerminalDebugLog.log(.actions, "callback action=end_search")
+            (delegate as? any TerminalSurfaceSearchDelegate)?
+                .terminalDidEndSearch()
+
+        case GHOSTTY_ACTION_SEARCH_TOTAL:
+            let rawTotal = action.action.search_total.total
+            let total = rawTotal < 0 ? nil : Int(rawTotal)
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=search_total total=\(total.map(String.init) ?? "nil")"
+            )
+            (delegate as? any TerminalSurfaceSearchDelegate)?
+                .terminalDidUpdateSearchTotal(total)
+
+        case GHOSTTY_ACTION_SEARCH_SELECTED:
+            let rawSelected = action.action.search_selected.selected
+            let selected = rawSelected < 0 ? nil : Int(rawSelected)
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=search_selected selected=\(selected.map(String.init) ?? "nil")"
+            )
+            (delegate as? any TerminalSurfaceSearchDelegate)?
+                .terminalDidUpdateSearchSelection(selected)
+
         case GHOSTTY_ACTION_CONFIG_CHANGE:
             // Colors/theme may have changed (e.g. on system appearance
             // toggle). Ghostty applies the new config internally but won't

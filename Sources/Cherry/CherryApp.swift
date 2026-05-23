@@ -132,6 +132,35 @@ struct CherryApp: App {
                 .disabled(focusedChromeState == nil)
             }
 
+            CommandGroup(after: .pasteboard) {
+                Divider()
+
+                Button("Find") {
+                    focusedWorkspace?.selectedSession?.ghosttyBridge.startSearch()
+                }
+                .keyboardShortcut("f")
+                .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
+
+                Button("Find Next") {
+                    focusedWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: true)
+                }
+                .keyboardShortcut("g")
+                .disabled(focusedWorkspace?.selectedSession == nil)
+
+                Button("Find Previous") {
+                    focusedWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: false)
+                }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .disabled(focusedWorkspace?.selectedSession == nil)
+
+                Button("Hide Find Bar") {
+                    focusedWorkspace?.selectedSession?.ghosttyBridge.endSearch()
+                    focusedChromeState?.dismissTerminalSearch()
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
+            }
+
             CommandMenu("Prototype") {
                 Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
                     focusedChromeState?.toggleSidebar()

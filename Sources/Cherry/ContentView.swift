@@ -6868,18 +6868,37 @@ private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
+    @StateObject private var searchState = TerminalSearchState()
 
     var body: some View {
-        TerminalSurfaceView(session: session, chromeState: chromeState)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(
-                LinearGradient(
-                    colors: backgroundColors,
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+        ZStack(alignment: .topTrailing) {
+            TerminalSurfaceView(session: session, chromeState: chromeState)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(
+                    LinearGradient(
+                        colors: backgroundColors,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
                 )
-            )
-            .ignoresSafeArea(.container, edges: .top)
+                .ignoresSafeArea(.container, edges: .top)
+
+            if chromeState.isTerminalSearchPresented {
+                TerminalSearchOverlay(
+                    session: session,
+                    searchState: searchState,
+                    focusRequest: chromeState.terminalSearchFocusRequest,
+                    onClose: closeSearch
+                )
+                .padding(.top, 12)
+                .padding(.trailing, 12)
+                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
+            }
+        }
+        .onAppear(perform: configureSearchHandlers)
+        .onChange(of: session.id) { _, _ in
+            configureSearchHandlers()
+        }
     }
 
     private var backgroundColors: [Color] {
@@ -6900,5 +6919,158 @@ private struct TerminalSceneView: View {
                 Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
             ]
         }
+    }
+
+    private func configureSearchHandlers() {
+        session.ghosttyBridge.configureSearch(
+            state: searchState,
+            onRequest: { [weak chromeState] _ in
+                chromeState?.presentTerminalSearch()
+            },
+            onDismiss: { [weak chromeState] in
+                chromeState?.dismissTerminalSearch()
+            }
+        )
+    }
+
+    private func closeSearch() {
+        session.ghosttyBridge.endSearch()
+        chromeState.dismissTerminalSearch()
+        session.ghosttyBridge.focus(in: NSApp.keyWindow)
+    }
+}
+
+private struct TerminalSearchOverlay: View {
+    let session: TerminalSession
+    @ObservedObject var searchState: TerminalSearchState
+    let focusRequest: Int
+    let onClose: () -> Void
+
+    @FocusState private var isSearchFieldFocused: Bool
+    @State private var pendingSearchTask: Task<Void, Never>?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                TextField("Search", text: $searchState.query)
+                    .textFieldStyle(.plain)
+                    .focused($isSearchFieldFocused)
+                    .frame(width: 190)
+                    .onSubmit {
+                        navigate(next: true)
+                    }
+
+                if let resultCountDescription = searchState.resultCountDescription {
+                    Text(resultCountDescription)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 38, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.primary.opacity(0.08))
+            }
+
+            Button(action: { navigate(next: false) }) {
+                Image(systemName: "chevron.up")
+            }
+            .terminalSearchButtonStyle(help: "Find Previous")
+
+            Button(action: { navigate(next: true) }) {
+                Image(systemName: "chevron.down")
+            }
+            .terminalSearchButtonStyle(help: "Find Next")
+
+            Button(action: close) {
+                Image(systemName: "xmark")
+            }
+            .terminalSearchButtonStyle(help: "Close Find Bar")
+        }
+        .padding(8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+        .onAppear {
+            searchState.readQueryFromPasteboard()
+            focusSearchField()
+            scheduleSearch(searchState.query)
+        }
+        .onDisappear {
+            pendingSearchTask?.cancel()
+            pendingSearchTask = nil
+        }
+        .onChange(of: focusRequest) { _, _ in
+            searchState.readQueryFromPasteboard()
+            focusSearchField()
+        }
+        .onChange(of: searchState.query) { _, query in
+            searchState.writeQueryToPasteboard()
+            scheduleSearch(query)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            searchState.readQueryFromPasteboard()
+        }
+        .onExitCommand(perform: close)
+    }
+
+    private func focusSearchField() {
+        isSearchFieldFocused = true
+        guard searchState.consumeSelectsQueryOnNextFocus() else { return }
+        DispatchQueue.main.async {
+            NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+        }
+    }
+
+    private func scheduleSearch(_ query: String) {
+        pendingSearchTask?.cancel()
+        pendingSearchTask = Task { @MainActor in
+            if !query.isEmpty && query.count < 3 {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard !Task.isCancelled else { return }
+            session.ghosttyBridge.updateSearch(query: query)
+        }
+    }
+
+    private func navigate(next: Bool) {
+        session.ghosttyBridge.navigateSearch(next: next)
+    }
+
+    private func close() {
+        onClose()
+    }
+}
+
+private struct TerminalSearchButtonStyleModifier: ViewModifier {
+    let help: String
+
+    func body(content: Content) -> some View {
+        content
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.primary)
+            .frame(width: 26, height: 26)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.primary.opacity(0.08))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .help(help)
+    }
+}
+
+private extension View {
+    func terminalSearchButtonStyle(help: String) -> some View {
+        modifier(TerminalSearchButtonStyleModifier(help: help))
     }
 }

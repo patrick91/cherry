@@ -197,7 +197,8 @@ private final class GhosttySessionProxy: @unchecked Sendable {
 @MainActor
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
-    TerminalSurfaceLinkHoverDelegate, TerminalSurfaceHostInputDelegate, TerminalSurfaceScrollInputDelegate
+    TerminalSurfaceLinkHoverDelegate, TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
+    TerminalSurfaceScrollInputDelegate
 {
     private(set) static var liveBridgeCount = 0
     private(set) static var installedOutputObserverCount = 0
@@ -219,6 +220,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private(set) var gridMetrics: TerminalGridMetrics?
     private(set) var scrollbarMetrics: TerminalScrollbarMetrics?
     private weak var scrollContainer: GhosttyTerminalContainerView?
+    private weak var searchState: TerminalSearchState?
+    private var searchPresentationHandler: ((String?) -> Void)?
+    private var searchDismissalHandler: (() -> Void)?
     private var pointerStyle: TerminalPointerStyle = .text
     private var hoveredLink: String?
     private var isReleased = false
@@ -305,6 +309,36 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         applyTerminalSettings()
     }
 
+    func configureSearch(
+        state: TerminalSearchState,
+        onRequest: @escaping (String?) -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        searchState = state
+        searchPresentationHandler = onRequest
+        searchDismissalHandler = onDismiss
+    }
+
+    @discardableResult
+    func startSearch() -> Bool {
+        terminalView.performBindingAction("start_search")
+    }
+
+    @discardableResult
+    func updateSearch(query: String) -> Bool {
+        terminalView.performBindingAction("search:\(query)")
+    }
+
+    @discardableResult
+    func navigateSearch(next: Bool) -> Bool {
+        terminalView.performBindingAction(next ? "navigate_search:next" : "navigate_search:previous")
+    }
+
+    @discardableResult
+    func endSearch() -> Bool {
+        terminalView.performBindingAction("end_search")
+    }
+
     func reset() {
         guard !isReleased else { return }
         uninstallOutputObserver()
@@ -354,6 +388,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.delegate = nil
         terminalView.onPostRender = nil
+        searchState = nil
+        searchPresentationHandler = nil
+        searchDismissalHandler = nil
         terminalView.freeSurface()
         terminalView.controller = nil
     }
@@ -388,6 +425,30 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidHoverLink(_ url: String?) {
         hoveredLink = url
         updateTerminalPointerStyle()
+    }
+
+    func terminalDidRequestSearch(_ request: TerminalSearchStartRequest) {
+        if let query = request.query, !query.isEmpty {
+            searchState?.query = query
+            searchState?.writeQueryToPasteboard()
+        } else {
+            searchState?.readQueryFromPasteboard()
+        }
+        searchPresentationHandler?(request.query)
+    }
+
+    func terminalDidEndSearch() {
+        searchState?.update(total: nil)
+        searchState?.update(selected: nil)
+        searchDismissalHandler?()
+    }
+
+    func terminalDidUpdateSearchTotal(_ total: Int?) {
+        searchState?.update(total: total)
+    }
+
+    func terminalDidUpdateSearchSelection(_ selected: Int?) {
+        searchState?.update(selected: selected)
     }
 
     func scrollToBottomForHostInput() {

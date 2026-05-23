@@ -81,6 +81,10 @@ private final class LockedBool: @unchecked Sendable {
     }
 }
 
+private final class MockTerminalFindPasteboard: TerminalFindPasteboard {
+    var string: String?
+}
+
 private func environmentValue(_ key: String) -> String? {
     getenv(key).map { String(cString: $0) }
 }
@@ -270,6 +274,61 @@ private struct MCPWhoamiPayload: Decodable {
         case boundProcessID = "bound_process_id"
         case selectedProcessID = "selected_process_id"
     }
+}
+
+@MainActor
+@Test func terminalSearchStateSyncsWithFindPasteboard() {
+    let pasteboard = MockTerminalFindPasteboard()
+    pasteboard.string = "initial needle"
+
+    let state = TerminalSearchState(pasteboard: pasteboard)
+
+    #expect(state.query == "initial needle")
+    #expect(state.selectsQueryOnNextFocus)
+
+    state.query = "new query"
+    state.writeQueryToPasteboard()
+
+    #expect(pasteboard.string == "new query")
+
+    pasteboard.string = "external query"
+    state.readQueryFromPasteboard()
+
+    #expect(state.query == "external query")
+    #expect(state.selectsQueryOnNextFocus)
+}
+
+@MainActor
+@Test func terminalSearchStateFormatsSearchResultCounts() {
+    let state = TerminalSearchState(pasteboard: MockTerminalFindPasteboard())
+
+    #expect(state.resultCountDescription == nil)
+
+    state.update(total: 4)
+    #expect(state.resultCountDescription == "-/4")
+
+    state.update(selected: 2)
+    #expect(state.resultCountDescription == "3/4")
+
+    state.update(total: nil)
+    #expect(state.resultCountDescription == nil)
+}
+
+@MainActor
+@Test func chromeStatePresentsAndDismissesTerminalSearch() {
+    let chromeState = ProjectWindowChromeState()
+
+    chromeState.presentTerminalSearch()
+
+    #expect(chromeState.isTerminalSearchPresented)
+    #expect(chromeState.terminalSearchFocusRequest == 1)
+    #expect(chromeState.isShowingTerminalContent)
+
+    chromeState.presentTerminalSearch()
+    #expect(chromeState.terminalSearchFocusRequest == 2)
+
+    chromeState.dismissTerminalSearch()
+    #expect(!chromeState.isTerminalSearchPresented)
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {

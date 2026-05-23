@@ -123,6 +123,22 @@ public protocol TerminalSurfaceLinkHoverDelegate: TerminalSurfaceViewDelegate {
     func terminalDidHoverLink(_ url: String?)
 }
 
+public struct TerminalSearchStartRequest: Sendable, Equatable {
+    public let query: String?
+
+    public init(query: String?) {
+        self.query = query
+    }
+}
+
+@MainActor
+public protocol TerminalSurfaceSearchDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidRequestSearch(_ request: TerminalSearchStartRequest)
+    func terminalDidEndSearch()
+    func terminalDidUpdateSearchTotal(_ total: Int?)
+    func terminalDidUpdateSearchSelection(_ selected: Int?)
+}
+
 @MainActor
 public protocol TerminalSurfaceFocusDelegate: TerminalSurfaceViewDelegate {
     func terminalDidChangeFocus(_ focused: Bool)

@@ -9,6 +9,7 @@ struct ContentView: View {
     private let floatingSidebarLeadingInset: CGFloat = SidebarLayout.floatingOuterInset
     private let floatingSidebarTopInset: CGFloat = 3
     private let floatingSidebarBottomInset: CGFloat = 3
+    private let titlebarProjectPickerLeadingInset: CGFloat = 80
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
@@ -91,10 +92,11 @@ struct ContentView: View {
                 settings: AgentSettings.shared,
                 projectRoot: projectRoot,
                 presentation: isSidebarRevealed ? .floating : .docked,
+                maximumWidth: titlebarProjectPickerMaximumWidth,
                 openProject: openProject,
                 openSettings: { openSettings() }
             )
-            .padding(.leading, 80)
+            .padding(.leading, titlebarProjectPickerLeadingInset)
             .padding(.top, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             // Drive the picker's offset off the same animated
@@ -292,6 +294,13 @@ struct ContentView: View {
             sidebarRightEdge = sidebarWidth
         }
         return sidebarRightEdge + 10
+    }
+
+    private var titlebarProjectPickerMaximumWidth: CGFloat {
+        max(
+            0,
+            sidebarWidth - titlebarProjectPickerLeadingInset - SidebarLayout.trailingInset
+        )
     }
 
     private func canCloseAgentGroup(_ session: TerminalSession) -> Bool {
@@ -3271,12 +3280,20 @@ private struct SidebarTabsView: View {
 }
 
 private struct TitlebarProjectPicker: View {
+    private static let fontSize: CGFloat = 14
+    private static let fontWeight: NSFont.Weight = .semibold
+    private static let accentDiameter: CGFloat = 7
+    private static let titleSpacing: CGFloat = 6
+    private static let horizontalPadding: CGFloat = 8
+    private static let verticalPadding: CGFloat = 4
+
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
 
     @ObservedObject var settings: AgentSettings
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let maximumWidth: CGFloat
     let openProject: (CherryProject) -> Void
     let openSettings: () -> Void
 
@@ -3298,20 +3315,23 @@ private struct TitlebarProjectPicker: View {
         // A plain Button has no such interference — we present an NSMenu
         // programmatically on click.
         Button(action: presentMenu) {
-            HStack(spacing: 6) {
+            HStack(spacing: Self.titleSpacing) {
                 if palette.showsProjectAccent {
                     Circle()
                         .fill(palette.projectAccent)
-                        .frame(width: 7, height: 7)
+                        .frame(width: Self.accentDiameter, height: Self.accentDiameter)
                 }
 
-                Text(selectedProject?.name ?? "No Project")
+                Text(projectTitle)
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
-            .font(.system(size: 14, weight: .semibold))
+            .font(.system(size: Self.fontSize, weight: .semibold))
             .foregroundStyle(palette.rowText)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.vertical, Self.verticalPadding)
+            .frame(width: preferredWidth(showsProjectAccent: palette.showsProjectAccent), alignment: .leading)
+            .clipped()
             .background {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(palette.hoverFill.opacity(isHovering ? 1 : 0))
@@ -3320,7 +3340,7 @@ private struct TitlebarProjectPicker: View {
         }
         .buttonStyle(.plain)
         .background(TitlebarProjectMenuAnchor(ref: anchorRef))
-        .fixedSize()
+        .help(projectTitle)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 isHovering = hovering
@@ -3404,6 +3424,18 @@ private struct TitlebarProjectPicker: View {
 
     private var selectedProject: CherryProject? {
         settings.selectedProject(for: projectRoot)
+    }
+
+    private var projectTitle: String {
+        selectedProject?.name ?? "No Project"
+    }
+
+    private func preferredWidth(showsProjectAccent: Bool) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: Self.fontSize, weight: Self.fontWeight)
+        let titleWidth = ceil((projectTitle as NSString).size(withAttributes: [.font: font]).width)
+        let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
+        let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
+        return max(0, min(maximumWidth, paddedWidth))
     }
 }
 

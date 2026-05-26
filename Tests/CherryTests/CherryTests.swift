@@ -4644,6 +4644,36 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func renderedClaudeInputPromptOverridesDelayedPermissionSummary() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.ingestTestingData(Data("""
+    Claude Code v2.1.150
+    Opus 4.7 (1M context) with high effort · Claude Max
+    > [Image #1] fix the search
+    >> bypass permissions on (shift+tab to cycle)
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    session.applyAutomaticSummary(
+        "Requested search cleanup",
+        useAsTitle: true,
+        agentActivityState: .permission
+    )
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func renderedClaudeWorkingStatusKeepsAgentWorkingIndicator() async throws {
     let session = TerminalSession(
         title: "Claude",

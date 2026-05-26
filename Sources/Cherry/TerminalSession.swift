@@ -2097,7 +2097,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func applySummaryActivityState(_ nextState: AgentActivityState) -> Bool {
         guard agentActivityState != nextState else { return false }
-        if agentActivityStateIsLocked, nextState == .working { return false }
+        if agentActivityStateIsLocked {
+            if nextState == .working { return false }
+            if agentActivityState == .idle, nextState == .permission { return false }
+        }
         setAgentActivityState(nextState, locked: nextState == .permission || nextState == .error)
         return true
     }

@@ -7,8 +7,19 @@
 
 import GhosttyKit
 
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+#endif
+
 @MainActor
 public protocol TerminalSurfaceViewDelegate: AnyObject {}
+
+#if canImport(AppKit) && !canImport(UIKit)
+    @MainActor
+    public protocol TerminalSurfaceKeyEquivalentDelegate: TerminalSurfaceViewDelegate {
+        func terminalShouldHandleKeyEquivalent(_ event: NSEvent) -> Bool
+    }
+#endif
 
 @MainActor
 public protocol TerminalSurfaceTitleDelegate: TerminalSurfaceViewDelegate {

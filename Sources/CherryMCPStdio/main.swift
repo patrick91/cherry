@@ -29,7 +29,7 @@ struct CherryMCPStdioMain {
         }
 
         do {
-            try await server.start(transport: StdioTransport())
+            try await server.start(transport: CherryStdioTransport())
             await server.waitUntilCompleted()
         } catch {
             fputs("[mcp-stdio] failed: \(error.localizedDescription)\n", stderr)

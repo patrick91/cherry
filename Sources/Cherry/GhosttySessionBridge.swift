@@ -194,11 +194,27 @@ private final class GhosttySessionProxy: @unchecked Sendable {
     }
 }
 
+enum TerminalSearchArrowDirection {
+    case up
+    case down
+
+    var bindingAction: String {
+        // Ghostty's "next" walks newest-to-oldest, which is visually upward in terminal scrollback.
+        switch self {
+        case .up:
+            "navigate_search:next"
+        case .down:
+            "navigate_search:previous"
+        }
+    }
+}
+
 @MainActor
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
     TerminalSurfaceLinkHoverDelegate, TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
-    TerminalSurfaceScrollInputDelegate
+    TerminalSurfaceScrollInputDelegate,
+    TerminalSurfaceKeyEquivalentDelegate
 {
     private(set) static var liveBridgeCount = 0
     private(set) static var installedOutputObserverCount = 0
@@ -332,6 +348,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     @discardableResult
     func navigateSearch(next: Bool) -> Bool {
         terminalView.performBindingAction(next ? "navigate_search:next" : "navigate_search:previous")
+    }
+
+    @discardableResult
+    func navigateSearch(_ direction: TerminalSearchArrowDirection) -> Bool {
+        terminalView.performBindingAction(direction.bindingAction)
     }
 
     @discardableResult
@@ -472,8 +493,27 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return event.charactersIgnoringModifiers?.lowercased() == "v"
     }
 
+    static func isClearScrollbackShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command),
+              modifiers.isDisjoint(with: [.shift, .control, .option])
+        else {
+            return false
+        }
+
+        return event.charactersIgnoringModifiers?.lowercased() == "k"
+    }
+
     func terminalShouldSuppressScrollInput(isMomentum: Bool) -> Bool {
         scrollContainer?.shouldSuppressScrollInputForHostInput(isMomentum: isMomentum) ?? false
+    }
+
+    func terminalShouldHandleKeyEquivalent(_ event: NSEvent) -> Bool {
+        guard Self.isClearScrollbackShortcut(event),
+              let session = proxy.session else { return false }
+        session.clearScrollback()
+        return true
     }
 
     deinit {
@@ -1105,7 +1145,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            activeSession?.detachGhosttyBridge(from: self)
+            activeSession?.detachGhosttyBridge(from: self, preservingSurface: true)
             activeSession = session
             session.ghosttyBridge.attach(to: self)
             requestTerminalFocus()
@@ -1162,7 +1202,7 @@ final class GhosttyTerminalContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
-            detachActiveSession(clearsSession: false)
+            detachActiveSession(clearsSession: false, releasesBridge: false, preservingSurface: true)
         } else {
             activeSession?.ghosttyBridge.attach(to: self)
             requestTerminalFocus()

@@ -314,6 +314,11 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(state.resultCountDescription == nil)
 }
 
+@Test func terminalSearchArrowDirectionsMatchTerminalScrollback() {
+    #expect(TerminalSearchArrowDirection.up.bindingAction == "navigate_search:next")
+    #expect(TerminalSearchArrowDirection.down.bindingAction == "navigate_search:previous")
+}
+
 @MainActor
 @Test func chromeStatePresentsAndDismissesTerminalSearch() {
     let chromeState = ProjectWindowChromeState()
@@ -3866,7 +3871,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyContainerKeepsDetachedSurfaceBrieflyWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerPreservesDetachedSurfaceWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -3902,7 +3907,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     try await Task.sleep(for: .milliseconds(80))
 
-    #expect(first.rawOutputObserverCount == 0)
+    #expect(first.rawOutputObserverCount == 1)
 }
 
 @MainActor
@@ -3996,6 +4001,57 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyCommandKClearClearsSessionReplayStore() async throws {
+    let session = TerminalSession(
+        title: "Clear",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    session.ingestTestingData(Data("before clear\r\n".utf8))
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = container
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty == false)
+
+    window.makeFirstResponder(session.ghosttyBridge.terminalView)
+    let event = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.command],
+        timestamp: 1,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: "k",
+        charactersIgnoringModifiers: "k",
+        isARepeat: false,
+        keyCode: 40
+    ))
+
+    let handled = session.ghosttyBridge.terminalView.performKeyEquivalent(with: event)
+
+    #expect(handled)
+    #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty)
+}
+
+@MainActor
 @Test func ghosttyBridgeResetClearsCachedScrollGeometry() async throws {
     let session = TerminalSession(
         title: "Reset",
@@ -4077,6 +4133,47 @@ private struct MCPWhoamiPayload: Decodable {
 
     TerminalSurfaceView.dismantleNSView(container, coordinator: ())
 
+    #expect(session.ghosttyBridge === bridge)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+}
+
+@MainActor
+@Test func ghosttyContainerWindowDetachPreservesActiveBridgeForTransientRemoval() async throws {
+    let session = TerminalSession(
+        title: "Window Detach",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let rootView = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 640, height: 400))
+    let container = GhosttyTerminalContainerView(frame: rootView.bounds)
+    rootView.addSubview(container)
+    window.contentView = rootView
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    let bridge = session.ghosttyBridge
+    bridge.installOutputObserverForTesting()
+    #expect(session.rawOutputObserverCount == 1)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    container.removeFromSuperview()
+
+    #expect(session.rawOutputObserverCount == 1)
     #expect(session.ghosttyBridge === bridge)
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 }
@@ -4349,6 +4446,66 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(session.agentActivityState == .idle)
     #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.applyAutomaticSummary(
+        "No commands run; terminal ready",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Claude Code v2.1.150
+    Opus 4.7 (1M context) with high effort · Claude Max
+    > Try "fix lint errors"
+    >> bypass permissions on (shift+tab to cycle)
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedClaudeWorkingStatusKeepsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.applyAutomaticSummary(
+        "User requested lint error fix",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Read 1 file (ctrl+o to expand)
+    I'll review this plan against the actual codebase.
+    Reading 5 files... (ctrl+o to expand)
+    * Whisking... (20s . down 734 tokens . still thinking with high effort)
+    >
+    >> bypass permissions on (shift+tab to cycle)
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
 }
 
 @MainActor

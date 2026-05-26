@@ -2135,17 +2135,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         let lineCount = processor.lineCount
         guard lineCount > 0 else { return false }
 
+        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+        let markerLines = processor.snapshot(range: markerStart..<lineCount)
+        if Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName) {
+            return false
+        }
+
         let promptStart = max(0, lineCount - Self.agentInputPromptTailLineLimit)
         let promptLines = processor.snapshot(range: promptStart..<lineCount)
-        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
         if promptLines.contains(where: { line in
             Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
         }) {
             return true
         }
 
-        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = processor.snapshot(range: markerStart..<lineCount)
         return Self.outputContainsAgentInputMarker(markerLines, normalizedAgentName: normalizedAgentName)
     }
 
@@ -2167,7 +2171,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             return true
         }
 
-        if normalizedAgentName == "gemini" {
+        if normalizedAgentName == "claude" || normalizedAgentName == "gemini" {
             return isPromptLine(trimmed, prompt: ">")
         }
 
@@ -2195,6 +2199,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         default:
             return false
         }
+    }
+
+    private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
+        guard normalizedAgentName == "claude" else { return false }
+
+        let output = lines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .joined(separator: "\n")
+
+        return output.contains("whisking")
+            || output.contains("still thinking")
     }
 
     private static let agentCompletionPhrases: [String] = [

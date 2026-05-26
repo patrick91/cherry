@@ -6961,7 +6961,7 @@ private struct TerminalSearchOverlay: View {
                     .focused($isSearchFieldFocused)
                     .frame(width: 190)
                     .onSubmit {
-                        navigate(next: true)
+                        session.ghosttyBridge.navigateSearch(next: true)
                     }
 
                 if let resultCountDescription = searchState.resultCountDescription {
@@ -6978,20 +6978,26 @@ private struct TerminalSearchOverlay: View {
                     .fill(Color.primary.opacity(0.08))
             }
 
-            Button(action: { navigate(next: false) }) {
+            Button(action: { navigate(.up) }) {
                 Image(systemName: "chevron.up")
+                    .terminalSearchButtonLabel()
             }
-            .terminalSearchButtonStyle(help: "Find Previous")
+            .buttonStyle(.plain)
+            .help("Find Previous")
 
-            Button(action: { navigate(next: true) }) {
+            Button(action: { navigate(.down) }) {
                 Image(systemName: "chevron.down")
+                    .terminalSearchButtonLabel()
             }
-            .terminalSearchButtonStyle(help: "Find Next")
+            .buttonStyle(.plain)
+            .help("Find Next")
 
             Button(action: close) {
                 Image(systemName: "xmark")
+                    .terminalSearchButtonLabel()
             }
-            .terminalSearchButtonStyle(help: "Close Find Bar")
+            .buttonStyle(.plain)
+            .help("Close Find Bar")
         }
         .padding(8)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -7042,8 +7048,8 @@ private struct TerminalSearchOverlay: View {
         }
     }
 
-    private func navigate(next: Bool) {
-        session.ghosttyBridge.navigateSearch(next: next)
+    private func navigate(_ direction: TerminalSearchArrowDirection) {
+        session.ghosttyBridge.navigateSearch(direction)
     }
 
     private func close() {
@@ -7051,12 +7057,9 @@ private struct TerminalSearchOverlay: View {
     }
 }
 
-private struct TerminalSearchButtonStyleModifier: ViewModifier {
-    let help: String
-
+private struct TerminalSearchButtonLabelModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
-            .buttonStyle(.plain)
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.primary)
             .frame(width: 26, height: 26)
@@ -7065,12 +7068,11 @@ private struct TerminalSearchButtonStyleModifier: ViewModifier {
                     .fill(Color.primary.opacity(0.08))
             }
             .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .help(help)
     }
 }
 
 private extension View {
-    func terminalSearchButtonStyle(help: String) -> some View {
-        modifier(TerminalSearchButtonStyleModifier(help: help))
+    func terminalSearchButtonLabel() -> some View {
+        modifier(TerminalSearchButtonLabelModifier())
     }
 }

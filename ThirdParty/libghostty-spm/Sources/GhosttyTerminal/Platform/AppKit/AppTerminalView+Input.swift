@@ -25,6 +25,12 @@
             guard window?.firstResponder === self else { return false }
             guard let surface else { return false }
 
+            if let delegate = delegate as? any TerminalSurfaceKeyEquivalentDelegate,
+               delegate.terminalShouldHandleKeyEquivalent(event)
+            {
+                return true
+            }
+
             if keyIsBinding(event, on: surface) {
                 keyDown(with: event)
                 return true

@@ -97,6 +97,157 @@ private func setEnvironmentValue(_ value: String?, for key: String) {
     }
 }
 
+@MainActor
+private struct HostedContentViewWindow {
+    let window: NSWindow
+    let workspace: TerminalWorkspace
+    let chromeState: ProjectWindowChromeState
+    let projectDirectory: URL
+
+    func cleanup() {
+        for session in workspace.sessions {
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
+        window.close()
+        try? FileManager.default.removeItem(at: projectDirectory)
+    }
+}
+
+private struct ContentViewTestHost: View {
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    @State private var isSidebarHidden = false
+    @State private var isSidebarRevealed = false
+    @State private var isCursorOverSidebar = false
+    @State private var storedSidebarWidth = 320.0
+
+    var body: some View {
+        ContentView(
+            workspace: workspace,
+            chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
+            projectRoot: workspace.projectRoot,
+            openProject: { _ in },
+            isSidebarHidden: $isSidebarHidden,
+            isSidebarRevealed: $isSidebarRevealed,
+            isCursorOverSidebar: $isCursorOverSidebar,
+            storedSidebarWidth: $storedSidebarWidth
+        )
+    }
+}
+
+@MainActor
+private func makeHostedContentViewWindow() async throws -> HostedContentViewWindow {
+    let projectDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherrySidebarResize-\(UUID().uuidString)", isDirectory: true)
+    let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    let chromeState = ProjectWindowChromeState()
+    let noteStore = ProjectNoteStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
+    )
+    let todoStore = ProjectTodoStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
+    )
+    let contentRect = NSRect(x: 0, y: 0, width: 900, height: 600)
+    let window = NSWindow(
+        contentRect: contentRect,
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+
+    let rootView = ContentViewTestHost(
+        workspace: workspace,
+        chromeState: chromeState,
+        noteStore: noteStore,
+        todoStore: todoStore
+    )
+    let hostingView = NSHostingView(rootView: rootView)
+    hostingView.frame = contentRect
+    window.contentView = hostingView
+    window.orderFrontRegardless()
+    try await Task.sleep(for: .milliseconds(80))
+    hostingView.layoutSubtreeIfNeeded()
+    try await Task.sleep(for: .milliseconds(40))
+
+    return HostedContentViewWindow(
+        window: window,
+        workspace: workspace,
+        chromeState: chromeState,
+        projectDirectory: projectDirectory
+    )
+}
+
+@MainActor
+private func dragSidebarResizeHandle(in window: NSWindow, by deltaX: CGFloat) async throws {
+    let contentView = try #require(window.contentView)
+    let handle = try #require(findSubview(in: contentView) {
+        String(describing: type(of: $0)).contains("SidebarResizeHandleView")
+    })
+    let startLocation = NSPoint(x: 320, y: 300)
+    let draggedLocation = NSPoint(x: startLocation.x + deltaX, y: startLocation.y)
+    let down = try #require(NSEvent.mouseEvent(
+        with: .leftMouseDown,
+        location: startLocation,
+        modifierFlags: [],
+        timestamp: 1,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 1,
+        clickCount: 1,
+        pressure: 1
+    ))
+    let drag = try #require(NSEvent.mouseEvent(
+        with: .leftMouseDragged,
+        location: draggedLocation,
+        modifierFlags: [],
+        timestamp: 2,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 2,
+        clickCount: 1,
+        pressure: 1
+    ))
+    let up = try #require(NSEvent.mouseEvent(
+        with: .leftMouseUp,
+        location: draggedLocation,
+        modifierFlags: [],
+        timestamp: 3,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 3,
+        clickCount: 1,
+        pressure: 0
+    ))
+
+    handle.mouseDown(with: down)
+    handle.mouseDragged(with: drag)
+    handle.mouseUp(with: up)
+    try await Task.sleep(for: .milliseconds(80))
+}
+
+@MainActor
+private func findSubview(in view: NSView, matching predicate: (NSView) -> Bool) -> NSView? {
+    if predicate(view) {
+        return view
+    }
+    for subview in view.subviews {
+        if let match = findSubview(in: subview, matching: predicate) {
+            return match
+        }
+    }
+    return nil
+}
+
 private func installCodexLikeDeferredSubmitAgentScript(
     in directory: URL,
     name: String = "codex-ready-agent.sh"
@@ -334,6 +485,21 @@ private struct MCPWhoamiPayload: Decodable {
 
     chromeState.dismissTerminalSearch()
     #expect(!chromeState.isTerminalSearchPresented)
+}
+
+@MainActor
+@Test func sidebarResizeIsScopedToHostedWindow() async throws {
+    let first = try await makeHostedContentViewWindow()
+    let second = try await makeHostedContentViewWindow()
+    defer {
+        first.cleanup()
+        second.cleanup()
+    }
+
+    try await dragSidebarResizeHandle(in: first.window, by: 48)
+
+    #expect(first.chromeState.dockedSidebarWidth == 368)
+    #expect(second.chromeState.dockedSidebarWidth == 320)
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {

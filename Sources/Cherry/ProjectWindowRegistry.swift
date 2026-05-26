@@ -467,7 +467,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var pendingAgentGroupCloseSessionID: UUID?
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
-    // Mirrored from ContentView's @AppStorage("sidebar.width") so the
+    // Mirrored from ProjectWorkspaceView's scene-scoped sidebar width so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.
     @Published var dockedSidebarWidth: CGFloat = 320

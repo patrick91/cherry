@@ -331,6 +331,7 @@ private struct ProjectWorkspaceView: View {
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
     @StateObject private var todoStore: ProjectTodoStore
+    @SceneStorage("sidebar.width") private var storedSidebarWidth: Double = 320
     @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
@@ -349,7 +350,8 @@ private struct ProjectWorkspaceView: View {
             openProject: openProject,
             isSidebarHidden: $chromeState.isSidebarHidden,
             isSidebarRevealed: $chromeState.isSidebarRevealed,
-            isCursorOverSidebar: $chromeState.isCursorOverSidebar
+            isCursorOverSidebar: $chromeState.isCursorOverSidebar,
+            storedSidebarWidth: $storedSidebarWidth
         )
         .background(ProjectWindowBinder(
             projectRoot: workspace.projectRoot,

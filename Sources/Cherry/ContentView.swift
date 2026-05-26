@@ -21,7 +21,7 @@ struct ContentView: View {
     @Binding var isSidebarHidden: Bool
     @Binding var isSidebarRevealed: Bool
     @Binding var isCursorOverSidebar: Bool
-    @AppStorage("sidebar.width") private var storedSidebarWidth: Double = 320
+    @Binding var storedSidebarWidth: Double
     @State private var trafficLights = TrafficLightController()
 
     private var sidebarWidth: CGFloat {

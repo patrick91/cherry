@@ -15,3 +15,27 @@ import Testing
         leadingIconRendersAsTemplate: true
     ))
 }
+
+@Test func sidebarProjectCommandFormatterUsesCommandLineProgramIcon() async throws {
+    let command = ProjectCommandDefinition(
+        name: "fastapi dev",
+        command: "uv",
+        arguments: "run fastapi dev",
+        environment: [
+            "FASTAPI_ENV": "development",
+            "PYTHONUNBUFFERED": "1"
+        ]
+    )
+
+    #expect(SidebarProjectCommandFormatter.label(
+        for: command,
+        projectRoot: "/Users/patrick/github/farboon-dev/shot",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "fastapi dev",
+        detail: "FASTAPI_ENV=... PYTHONUNBUFFERED=... uv run fastapi dev",
+        leadingIconResourceName: "fastapi",
+        leadingIconFallback: "Fa",
+        leadingIconRendersAsTemplate: true
+    ))
+}

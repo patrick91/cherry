@@ -4423,23 +4423,27 @@ private struct SidebarCommandRow: View {
             projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
-        let subtitle = sidebarSubtitle()
+        let label = SidebarProjectCommandFormatter.label(for: command, projectRoot: projectRoot)
 
         Button(action: select) {
             HStack(spacing: 8) {
+                if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+                    SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+                }
+
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(command.name)
+                    Text(label.title)
                         .font(.system(size: 15, weight: .regular))
                         .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                         .lineLimit(1)
 
-                    if let subtitle {
+                    if let detail = label.detail {
                         HStack(spacing: 4) {
-                            if let resourceName = subtitle.iconResourceName {
+                            if let resourceName = label.detailIconResourceName {
                                 SidebarDetailIcon(resourceName: resourceName)
                             }
 
-                            Text(subtitle.text)
+                            Text(detail)
                                 .lineLimit(1)
                         }
                         .font(.system(size: 11, weight: .regular))
@@ -4464,7 +4468,7 @@ private struct SidebarCommandRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: subtitle == nil ? 42 : 46)
+            .frame(height: label.detail == nil ? 42 : 46)
             .padding(.leading, SidebarLayout.rowHorizontalInset)
             .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -4495,26 +4499,6 @@ private struct SidebarCommandRow: View {
         }
     }
 
-    private func sidebarSubtitle() -> SidebarCommandSubtitle? {
-        let hasArguments = !command.arguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if !hasArguments,
-           let projectRoot,
-           let repoPath = SidebarTerminalPathFormatter.githubRepositoryPath(
-               for: command.resolvedWorkingDirectory(projectRoot: projectRoot)
-           ) {
-            return SidebarCommandSubtitle(text: repoPath, iconResourceName: "github")
-        }
-
-        return command.commandLine
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            .map { SidebarCommandSubtitle(text: $0, iconResourceName: nil) }
-    }
-}
-
-private struct SidebarCommandSubtitle {
-    let text: String
-    let iconResourceName: String?
 }
 
 private extension TerminalSession {

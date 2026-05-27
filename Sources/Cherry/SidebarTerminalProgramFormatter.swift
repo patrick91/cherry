@@ -307,6 +307,84 @@ enum SidebarTerminalProgramFormatter {
     ]
 }
 
+enum SidebarProjectCommandFormatter {
+    static func label(
+        for command: ProjectCommandDefinition,
+        projectRoot: String?,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> SidebarTerminalPathLabel {
+        let title = command.name.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Command"
+        let subtitle = subtitle(for: command, projectRoot: projectRoot, homeDirectory: homeDirectory)
+        let programLabel = programLabel(for: command, projectRoot: projectRoot, homeDirectory: homeDirectory)
+
+        return SidebarTerminalPathLabel(
+            title: title,
+            detail: subtitle?.text,
+            detailIconResourceName: subtitle?.iconResourceName,
+            leadingIconResourceName: programLabel?.leadingIconResourceName,
+            leadingIconFallback: programLabel?.leadingIconFallback,
+            leadingIconRendersAsTemplate: programLabel?.leadingIconRendersAsTemplate ?? false
+        )
+    }
+
+    private static func programLabel(
+        for command: ProjectCommandDefinition,
+        projectRoot: String?,
+        homeDirectory: String
+    ) -> SidebarTerminalPathLabel? {
+        let commandLine = displayCommandLine(for: command)
+        guard !commandLine.isEmpty else { return nil }
+
+        let workingDirectory = projectRoot.map {
+            command.resolvedWorkingDirectory(projectRoot: $0)
+        } ?? homeDirectory
+        return SidebarTerminalProgramFormatter.label(
+            for: commandLine,
+            workingDirectory: workingDirectory,
+            homeDirectory: homeDirectory
+        )
+    }
+
+    private static func subtitle(
+        for command: ProjectCommandDefinition,
+        projectRoot: String?,
+        homeDirectory: String
+    ) -> SidebarProjectCommandSubtitle? {
+        let hasArguments = !command.arguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasArguments,
+           command.environment.isEmpty,
+           let projectRoot,
+           let repoPath = SidebarTerminalPathFormatter.githubRepositoryPath(
+               for: command.resolvedWorkingDirectory(projectRoot: projectRoot),
+               homeDirectory: homeDirectory
+           ) {
+            return SidebarProjectCommandSubtitle(text: repoPath, iconResourceName: "github")
+        }
+
+        return displayCommandLine(for: command)
+            .nilIfEmpty
+            .map { SidebarProjectCommandSubtitle(text: $0, iconResourceName: nil) }
+    }
+
+    private static func displayCommandLine(for command: ProjectCommandDefinition) -> String {
+        let commandLine = command.commandLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commandLine.isEmpty else { return "" }
+
+        let environmentPrefix = command.environment.keys
+            .filter(ProjectCommandEnvironmentExtraction.isValidEnvironmentName)
+            .sorted()
+            .map { "\($0)=..." }
+            .joined(separator: " ")
+        guard !environmentPrefix.isEmpty else { return commandLine }
+        return "\(environmentPrefix) \(commandLine)"
+    }
+}
+
+private struct SidebarProjectCommandSubtitle {
+    let text: String
+    let iconResourceName: String?
+}
+
 private struct ProgramDescriptor {
     let displayName: String
     let logoResourceName: String?

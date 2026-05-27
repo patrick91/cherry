@@ -58,6 +58,12 @@ struct AgentSummaryRunner {
     }
 }
 
+typealias AgentSummaryRun = @Sendable (
+    _ transcript: String,
+    _ workingDirectory: String,
+    _ model: String
+) async throws -> AgentSummaryRunner.Result
+
 func summaryPrompt(for transcript: String) -> String {
     """
     Analyze this AI agent terminal session and respond with ONLY a single-line JSON object.

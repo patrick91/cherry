@@ -5470,6 +5470,137 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(explicitNamespaceSocket.path.contains("/Cherry-Dev-Preview/control.sock"))
 }
 
+private actor DeferredAgentSummaryRunner {
+    private struct PendingCall {
+        let transcript: String
+        let workingDirectory: String
+        let model: String
+        let continuation: CheckedContinuation<AgentSummaryRunner.Result, any Error>
+    }
+
+    private var pendingCalls: [PendingCall] = []
+
+    var callCount: Int {
+        pendingCalls.count
+    }
+
+    func run(
+        transcript: String,
+        workingDirectory: String,
+        model: String
+    ) async throws -> AgentSummaryRunner.Result {
+        try await withCheckedThrowingContinuation { continuation in
+            pendingCalls.append(.init(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model,
+                continuation: continuation
+            ))
+        }
+    }
+
+    func transcript(at index: Int) -> String? {
+        guard pendingCalls.indices.contains(index) else { return nil }
+        return pendingCalls[index].transcript
+    }
+
+    func completeCall(at index: Int, summary: String, state: AgentActivityState = .working) {
+        guard pendingCalls.indices.contains(index) else { return }
+        let call = pendingCalls[index]
+        call.continuation.resume(returning: .init(
+            summary: summary,
+            state: state,
+            prompt: summaryPrompt(for: call.transcript)
+        ))
+    }
+}
+
+private func waitForSummaryCallCount(
+    _ count: Int,
+    runner: DeferredAgentSummaryRunner,
+    timeout: TimeInterval = 4
+) async throws {
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while await runner.callCount < count, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    #expect(await runner.callCount >= count)
+}
+
+@MainActor
+@Test func staleInFlightAgentSummaryIsDiscardedAfterNewOutput() async throws {
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        }
+    )
+
+    session.ingestTestingData(Data("diagnosing MCP startup failures\n".utf8))
+    try await waitForSummaryCallCount(1, runner: runner)
+    #expect(await runner.transcript(at: 0)?.contains("diagnosing MCP startup failures") == true)
+
+    session.ingestTestingData(Data("implementing blog backend conversion plan\n".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    await runner.completeCall(at: 0, summary: "diagnosing MCP startup failures")
+    try await waitForSummaryCallCount(2, runner: runner)
+    #expect(session.summary != "diagnosing MCP startup failures")
+    #expect(await runner.transcript(at: 1)?.contains("implementing blog backend conversion plan") == true)
+
+    await runner.completeCall(at: 1, summary: "implementing blog backend conversion")
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.summary == "implementing blog backend conversion")
+}
+
+@MainActor
+@Test func agentSummaryTranscriptDropsMCPStartupWarnings() async throws {
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        }
+    )
+
+    session.ingestTestingData(Data("""
+    MCP client for `paper` failed to start: MCP startup failed: Send message error Transport
+    [rmcp::transport::worker::WorkerTransport] error sending request for url (http://127.0.0.1:29979/mcp), when send initialize request
+    MCP client for `xcodebuildmcp` failed to start: connection closed: initialize response
+    MCP startup incomplete (failed: paper, xcodebuildmcp)
+    Writing backend route tests
+    """.utf8))
+
+    try await waitForSummaryCallCount(1, runner: runner)
+    let transcript = try #require(await runner.transcript(at: 0))
+    #expect(!transcript.contains("MCP client for"), Comment(rawValue: transcript))
+    #expect(!transcript.contains("MCP startup incomplete"), Comment(rawValue: transcript))
+    #expect(!transcript.contains("rmcp::transport"), Comment(rawValue: transcript))
+    #expect(!transcript.contains("initialize request"), Comment(rawValue: transcript))
+    #expect(transcript.contains("Writing backend route tests"), Comment(rawValue: transcript))
+
+    await runner.completeCall(at: 0, summary: "writing backend route tests")
+}
+
 @Test func agentSummaryRunnerSanitizesOutput() async throws {
     let result = try await AgentSummaryRunner(command: "printf '  Reviewing deploy flow\\nsecond line\\n'").run(transcript: "ignored")
 

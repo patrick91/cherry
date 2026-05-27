@@ -1436,6 +1436,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var restartOnExit: Bool
     private var systemTitle: String
     private var automaticTitle: String?
+    private let summaryRunner: AgentSummaryRun
 
     @Published private(set) var revision = 0
 
@@ -1482,7 +1483,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         parentAgentID: UUID? = nil,
         commandName: String? = nil,
         launchCommand: String? = nil,
-        restartOnExit: Bool = false
+        restartOnExit: Bool = false,
+        summaryRunner: @escaping AgentSummaryRun = { transcript, workingDirectory, model in
+            try await CodexMCPSummaryRunner.shared.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        }
     ) {
         self.title = title
         self.titleSource = titleSource
@@ -1498,6 +1506,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.restartOnExit = restartOnExit
+        self.summaryRunner = summaryRunner
         self.systemTitle = title
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
             ? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
@@ -2391,6 +2400,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func startSummary(generation: Int, command: String) {
         guard generation == summaryGeneration, kind == .agent else { return }
         let transcript = summaryTranscript()
+        let transcriptOutputVersion = outputVersion
         guard !transcript.text.isEmpty else {
             recordSummaryDebug(command: command, transcript: transcript, prompt: "", summary: nil, error: "No summarizable terminal output yet.")
             return
@@ -2406,18 +2416,25 @@ final class TerminalSession: ObservableObject, Identifiable {
         let summaryModel = settings.agentSummaryModel
         let prompt = summaryPrompt(for: transcript.text)
         let summaryWorkingDirectory = workingDirectory
+        let summaryRunner = self.summaryRunner
         recordSummaryDebug(command: command, transcript: transcript, prompt: prompt, summary: nil, error: nil)
         summaryTask = Task { [weak self] in
             do {
-                let result = try await CodexMCPSummaryRunner.shared.run(
-                    transcript: transcript.text,
-                    workingDirectory: summaryWorkingDirectory,
-                    model: summaryModel
-                )
+                let result = try await summaryRunner(transcript.text, summaryWorkingDirectory, summaryModel)
                 await MainActor.run {
                     guard let self else { return }
-                    defer { self.summaryTask = nil }
-                    guard generation == self.summaryGeneration else { return }
+                    guard !Task.isCancelled else {
+                        self.summaryTask = nil
+                        return
+                    }
+                    let outputChanged = self.outputVersion != transcriptOutputVersion
+                    self.summaryTask = nil
+                    guard generation == self.summaryGeneration, !outputChanged else {
+                        if outputChanged {
+                            self.scheduleSummaryIfNeeded()
+                        }
+                        return
+                    }
                     self.lastSummaryInput = transcript.text
                     self.lastSummaryDate = Date()
                     self.recordSummaryDebug(
@@ -2436,8 +2453,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             } catch {
                 await MainActor.run {
                     guard let self else { return }
-                    defer { self.summaryTask = nil }
-                    guard generation == self.summaryGeneration else { return }
+                    guard !Task.isCancelled else {
+                        self.summaryTask = nil
+                        return
+                    }
+                    let outputChanged = self.outputVersion != transcriptOutputVersion
+                    self.summaryTask = nil
+                    guard generation == self.summaryGeneration, !outputChanged else {
+                        if outputChanged {
+                            self.scheduleSummaryIfNeeded()
+                        }
+                        return
+                    }
                     self.lastSummaryDate = Date()
                     self.recordSummaryDebug(
                         command: command,
@@ -2514,7 +2541,32 @@ final class TerminalSession: ObservableObject, Identifiable {
             || trimmed.contains("gpt-5.") && trimmed.contains("· ~/") {
             return true
         }
+        if Self.isMCPStartupWarningLine(trimmed) {
+            return true
+        }
         if trimmed.contains("@filename") || trimmed.contains("{feature}") {
+            return true
+        }
+        return false
+    }
+
+    private static func isMCPStartupWarningLine(_ line: String) -> Bool {
+        if line.contains("MCP client for") && line.contains("failed to start") {
+            return true
+        }
+        if line.contains("MCP startup incomplete") {
+            return true
+        }
+        if line.contains("rmcp::transport")
+            || line.contains("StreamableHttpClient")
+            || line.contains("codex_rmcp_client") {
+            return true
+        }
+        if line.contains("connection closed: initialize response") {
+            return true
+        }
+        if line.contains("/mcp"),
+           line.contains("http://127.0.0.1") || line.contains("initialize request") {
             return true
         }
         return false

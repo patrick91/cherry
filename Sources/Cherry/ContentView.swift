@@ -571,11 +571,11 @@ private struct DetailPaneView: View {
                 NoteDetailView(note: note, noteStore: noteStore)
             } else if features.todosEnabled, chromeState.isTodoPanePresented {
                 TodoPaneView(todoStore: todoStore, chromeState: chromeState)
-            } else if let idleCommand = focusedIdleCommand {
+            } else if let idleCommand = idleCommandForDetail {
                 IdleCommandView(
                     command: idleCommand,
                     onStart: { startIdleCommand(idleCommand) },
-                    onClear: { chromeState.selectTerminal() }
+                    onCancel: focusedIdleCommand == nil ? nil : { chromeState.selectTerminal() }
                 )
             } else if let session = workspace.selectedSession {
                 TerminalSceneView(session: session, chromeState: chromeState)
@@ -619,19 +619,42 @@ private struct DetailPaneView: View {
             .first { $0.name == name }
     }
 
+    private var idleCommandForDetail: ProjectCommandDefinition? {
+        if let focusedIdleCommand {
+            return focusedIdleCommand
+        }
+
+        guard chromeState.isShowingTerminalContent,
+              let session = workspace.selectedSession,
+              session.kind == .command,
+              !session.isRunningCommand,
+              let commandName = session.commandName
+        else {
+            return nil
+        }
+
+        return agentSettings.launchableProjectCommands(for: projectRoot)
+            .first { $0.name == commandName }
+    }
+
     private func startIdleCommand(_ command: ProjectCommandDefinition) {
         guard command.isLaunchable,
               let root = agentSettings.resolvedProject(for: projectRoot).validProjectRoot
         else { return }
         chromeState.selectTerminal()
-        workspace.addCommandSession(command: command, projectRoot: root)
+        if let existingSession = workspace.commandSession(named: command.name) {
+            existingSession.restartManagedCommandIfNeeded()
+            workspace.select(existingSession)
+        } else {
+            workspace.addCommandSession(command: command, projectRoot: root)
+        }
     }
 }
 
 private struct IdleCommandView: View {
     let command: ProjectCommandDefinition
     let onStart: () -> Void
-    let onClear: () -> Void
+    let onCancel: (() -> Void)?
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @Environment(\.colorScheme) private var colorScheme
 
@@ -645,6 +668,10 @@ private struct IdleCommandView: View {
 
     private var themeForeground: Color {
         Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
+    }
+
+    private var dimOverlay: Color {
+        Color.black.opacity(colorScheme == .dark ? 0.28 : 0.07)
     }
 
     var body: some View {
@@ -683,13 +710,18 @@ private struct IdleCommandView: View {
                 .keyboardShortcut(.return, modifiers: [])
                 .disabled(!command.isLaunchable)
 
-                Button("Cancel", action: onClear)
-                    .keyboardShortcut(.escape, modifiers: [])
+                if let onCancel {
+                    Button("Cancel", action: onCancel)
+                        .keyboardShortcut(.escape, modifiers: [])
+                }
             }
             .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(themeBackground)
+        .background {
+            themeBackground
+            dimOverlay
+        }
     }
 }
 
@@ -3979,12 +4011,14 @@ private struct SidebarCommandSection: View {
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
                         start: { start(command, existingSession: session) },
-                        stop: { session?.stopManagedCommand() },
+                        stop: { stop(command, existingSession: session) },
                         restart: { restart(command, existingSession: session) },
                         select: {
-                            if let session {
+                            if let session, session.isRunningCommand {
                                 chromeState.selectNote(id: nil)
                                 workspace.select(session)
+                            } else {
+                                chromeState.focusIdleCommand(name: command.name)
                             }
                         }
                     )
@@ -4002,7 +4036,7 @@ private struct SidebarCommandSection: View {
                         }
 
                         Button("Stop") {
-                            session?.stopManagedCommand()
+                            stop(command, existingSession: session)
                         }
                         .disabled(session?.isRunningCommand != true)
 
@@ -4105,6 +4139,11 @@ private struct SidebarCommandSection: View {
         } else {
             start(command, existingSession: nil)
         }
+    }
+
+    private func stop(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+        existingSession?.stopManagedCommand()
+        chromeState.focusIdleCommand(name: command.name)
     }
 
     private func remove(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {

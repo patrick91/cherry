@@ -6490,6 +6490,51 @@ private func waitForSummaryCallCount(
 }
 
 @MainActor
+@Test func stoppedCommandSessionKillsStubbornForegroundProcess() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let pidFile = directory.appendingPathComponent("stubborn.pid")
+    let scriptURL = directory.appendingPathComponent("stubborn-command.sh")
+    try """
+    #!/bin/sh
+    trap '' HUP TERM
+    printf '%s\\n' "$$" > "\(pidFile.path)"
+    while true; do
+      sleep 1
+    done
+    """.write(to: scriptURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    var stubbornPID: pid_t?
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+        if let stubbornPID, isProcessAlive(stubbornPID) {
+            _ = Darwin.kill(stubbornPID, SIGKILL)
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let session = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Stubborn", command: scriptURL.path),
+        projectRoot: directory.path
+    )
+    stubbornPID = try await waitForPID(in: pidFile)
+    #expect(stubbornPID.map(isProcessAlive) == true)
+
+    session.stopManagedCommand()
+
+    let didExit = try await waitForProcessExit(pid: try #require(stubbornPID))
+    #expect(didExit)
+    if case .exited(let status) = session.state {
+        #expect(status == 0)
+    } else {
+        Issue.record("Expected stopped command session to be exited")
+    }
+}
+
+@MainActor
 @Test func workspaceUpdatesExistingCommandSessionAfterRename() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -6625,6 +6670,41 @@ private func waitForExit(_ session: TerminalSession) async throws {
         try await Task.sleep(for: .milliseconds(25))
     }
     Issue.record("Timed out waiting for session to exit")
+}
+
+private func waitForPID(in url: URL) async throws -> pid_t {
+    for _ in 0..<120 {
+        if let rawValue = try? String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           let pid = pid_t(rawValue),
+           pid > 0 {
+            return pid
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+
+    Issue.record("Timed out waiting for stubborn command PID")
+    throw POSIXError(.ETIMEDOUT)
+}
+
+private func waitForProcessExit(pid: pid_t, timeoutMilliseconds: Int = 2_000) async throws -> Bool {
+    let deadline = Date().addingTimeInterval(TimeInterval(timeoutMilliseconds) / 1_000)
+    while Date() < deadline {
+        if !isProcessAlive(pid) {
+            return true
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+
+    return !isProcessAlive(pid)
+}
+
+private func isProcessAlive(_ pid: pid_t) -> Bool {
+    if Darwin.kill(pid, 0) == 0 {
+        return true
+    }
+
+    return errno == EPERM
 }
 
 @MainActor

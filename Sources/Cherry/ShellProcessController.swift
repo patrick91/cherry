@@ -503,6 +503,7 @@ final class ShellProcessController: @unchecked Sendable {
     private var exitReported = false
     private var isTerminating = false
     private var retainedUntilExit: ShellProcessController?
+    private var terminationEscalationItems: [DispatchWorkItem] = []
 
     var processIdentifier: pid_t? {
         ioQueue.sync {
@@ -915,8 +916,10 @@ final class ShellProcessController: @unchecked Sendable {
         clearPendingWrite()
         cancelWriteSource()
 
-        if childPID > 0, !exitReported {
-            _ = kill(childPID, SIGHUP)
+        let terminationTargets = currentTerminationTargets()
+        if !exitReported {
+            Self.sendSignal(SIGHUP, to: terminationTargets)
+            scheduleTerminationEscalation(for: terminationTargets)
         }
 
         cancelReadSource()
@@ -928,9 +931,7 @@ final class ShellProcessController: @unchecked Sendable {
             exitReported = true
             cleanup()
         case .stillRunning:
-            if processSource == nil {
-                cleanup()
-            }
+            break
         }
     }
 
@@ -1150,12 +1151,88 @@ final class ShellProcessController: @unchecked Sendable {
         if shellTransportDebugEnabled {
             fputs("[pty cleanup] pid=\(childPID) fd=\(masterFD)\n", stderr)
         }
+        if !isTerminating {
+            cancelTerminationEscalation()
+        }
         clearPendingWrite()
         cancelWriteSource()
         cancelReadSource()
         processSource?.cancel()
         processSource = nil
         retainedUntilExit = nil
+    }
+
+    private struct TerminationTargets {
+        let processIDs: [pid_t]
+        let processGroupIDs: [pid_t]
+    }
+
+    private func currentTerminationTargets() -> TerminationTargets {
+        var processIDs: Set<pid_t> = []
+        var processGroupIDs: Set<pid_t> = []
+
+        if childPID > 1 {
+            processIDs.insert(childPID)
+            processGroupIDs.insert(childPID)
+        }
+
+        if masterFD >= 0 {
+            let foregroundProcessGroupID = tcgetpgrp(masterFD)
+            if foregroundProcessGroupID > 1 {
+                processGroupIDs.insert(foregroundProcessGroupID)
+            }
+        }
+
+        processGroupIDs.remove(getpgrp())
+        return TerminationTargets(
+            processIDs: Array(processIDs),
+            processGroupIDs: Array(processGroupIDs)
+        )
+    }
+
+    private static func sendSignal(_ signal: Int32, to targets: TerminationTargets) {
+        for processGroupID in targets.processGroupIDs where processGroupID > 1 {
+            _ = Darwin.kill(-processGroupID, signal)
+        }
+
+        for processID in targets.processIDs where processID > 1 {
+            _ = Darwin.kill(processID, signal)
+        }
+    }
+
+    private func scheduleTerminationEscalation(for targets: TerminationTargets) {
+        cancelTerminationEscalation()
+        scheduleTerminationSignal(SIGTERM, to: targets, after: .milliseconds(100))
+        scheduleTerminationSignal(SIGKILL, to: targets, after: .milliseconds(700))
+    }
+
+    private func scheduleTerminationSignal(
+        _ signal: Int32,
+        to targets: TerminationTargets,
+        after delay: DispatchTimeInterval
+    ) {
+        let item = DispatchWorkItem { [weak self] in
+            Self.sendSignal(signal, to: targets)
+
+            guard signal == SIGKILL, let self, !self.exitReported else { return }
+
+            switch self.reapChildIfAvailable() {
+            case .exited(let status):
+                self.finishAfterProcessExit(status: status)
+            case .unavailable:
+                self.exitReported = true
+                self.cleanup()
+            case .stillRunning:
+                break
+            }
+        }
+        terminationEscalationItems.append(item)
+        ioQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func cancelTerminationEscalation() {
+        terminationEscalationItems.forEach { $0.cancel() }
+        terminationEscalationItems.removeAll()
     }
 
     private func normalizedExitCode(_ status: Int32) -> Int32 {

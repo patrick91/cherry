@@ -1319,6 +1319,7 @@ final class TerminalWorkspace: ObservableObject {
             kind: .command,
             commandName: command.name,
             launchCommand: command.commandLine,
+            launchEnvironment: command.environment,
             restartOnExit: command.autoRestart
         )
     }
@@ -1433,6 +1434,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
     private var launchCommand: String?
+    private var launchEnvironment: [String: String]
     private var restartOnExit: Bool
     private var systemTitle: String
     private var automaticTitle: String?
@@ -1483,6 +1485,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         parentAgentID: UUID? = nil,
         commandName: String? = nil,
         launchCommand: String? = nil,
+        launchEnvironment: [String: String] = [:],
         restartOnExit: Bool = false,
         summaryRunner: @escaping AgentSummaryRun = { transcript, workingDirectory, model in
             try await CodexMCPSummaryRunner.shared.run(
@@ -1505,6 +1508,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
         self.summaryRunner = summaryRunner
         self.systemTitle = title
@@ -1793,6 +1797,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchWorkingDirectory = workingDirectory
         commandName = command.name
         launchCommand = command.commandLine.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        launchEnvironment = command.environment
         restartOnExit = command.autoRestart
         bumpRevision()
     }
@@ -1871,6 +1876,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     projectRoot: projectRoot,
                     processID: id.uuidString,
                     agentID: kind == .agent ? id.uuidString : nil,
+                    environment: launchEnvironment,
                     term: ShellProcessController.preferredTerminfo.term,
                     initialSize: viewportSize,
                     startupCommand: launchCommand

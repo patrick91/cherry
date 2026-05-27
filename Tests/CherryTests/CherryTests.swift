@@ -5953,6 +5953,19 @@ private func waitForSummaryCallCount(
     ) == nil)
 }
 
+@Test func commandEnvironmentExtractionParsesLeadingAssignments() {
+    let extraction = ProjectCommandEnvironmentExtraction.extractLeadingAssignments(
+        from: #"DEMO_DELAY_MIN_MS=250 DEMO_DELAY_MS=1200 DEMO_LABEL="slow path" uv run fastapi dev"#
+    )
+
+    #expect(extraction?.commandLine == "uv run fastapi dev")
+    #expect(extraction?.environment == [
+        "DEMO_DELAY_MIN_MS": "250",
+        "DEMO_DELAY_MS": "1200",
+        "DEMO_LABEL": "slow path"
+    ])
+}
+
 @MainActor
 @Test func agentSettingsPersistProjectCommandsPerProject() async throws {
     let defaultsName = "CherryTests.ProjectCommands.\(UUID().uuidString)"
@@ -5983,6 +5996,10 @@ private func waitForSummaryCallCount(
             command: "npm",
             arguments: "run dev",
             workingDirectory: firstWebDirectory.path,
+            environment: [
+                "DEMO_DELAY_MIN_MS": "250",
+                "DEMO_DELAY_MS": "1200"
+            ],
             autoStart: true,
             autoRestart: true
         ),
@@ -6000,6 +6017,10 @@ private func waitForSummaryCallCount(
             command: "npm",
             arguments: "run dev",
             workingDirectory: "web",
+            environment: [
+                "DEMO_DELAY_MIN_MS": "250",
+                "DEMO_DELAY_MS": "1200"
+            ],
             autoStart: true,
             autoRestart: true
         )
@@ -6038,6 +6059,10 @@ private func waitForSummaryCallCount(
             command: "npm",
             arguments: "run dev",
             workingDirectory: workerDirectory.path,
+            environment: [
+                "DEMO_DELAY_MIN_MS": "250",
+                "DEMO_DELAY_MS": "1200"
+            ],
             autoStart: true,
             autoRestart: true
         ),
@@ -6050,6 +6075,8 @@ private func waitForSummaryCallCount(
     #expect(contents.contains("[[commands]]"))
     #expect(contents.contains("name = \"Web\""))
     #expect(contents.contains("workingDirectory = \"workers\""))
+    #expect(contents.contains("environment.\"DEMO_DELAY_MIN_MS\" = \"250\""))
+    #expect(contents.contains("environment.\"DEMO_DELAY_MS\" = \"1200\""))
     #expect(!contents.contains(workerDirectory.path))
 
     let reloadedSettings = AgentSettings(defaults: defaults)
@@ -6059,6 +6086,10 @@ private func waitForSummaryCallCount(
             command: "npm",
             arguments: "run dev",
             workingDirectory: "workers",
+            environment: [
+                "DEMO_DELAY_MIN_MS": "250",
+                "DEMO_DELAY_MS": "1200"
+            ],
             autoStart: true,
             autoRestart: true
         )
@@ -6648,7 +6679,13 @@ private func waitForSummaryCallCount(
     }
 
     let session = workspace.addCommandSession(
-        command: ProjectCommandDefinition(name: "Env", command: "/usr/bin/env"),
+        command: ProjectCommandDefinition(
+            name: "Env",
+            command: "/usr/bin/env",
+            environment: [
+                "CHERRY_TEST_COMMAND_ENV": "present"
+            ]
+        ),
         projectRoot: directory.path,
         select: false
     )
@@ -6659,6 +6696,7 @@ private func waitForSummaryCallCount(
     #expect(rawOutput.contains("\(CherryControl.processIDEnvironmentKey)=\(session.id.uuidString)"))
     #expect(!rawOutput.contains("\(CherryControl.agentIDEnvironmentKey)="))
     #expect(rawOutput.contains("\(CherryControl.projectRootEnvironmentKey)=\(directory.path)"))
+    #expect(rawOutput.contains("CHERRY_TEST_COMMAND_ENV=present"))
 }
 
 @MainActor

@@ -2292,6 +2292,9 @@ private struct ProjectCommandRow: View {
 
 struct ProjectCommandEditor: View {
     @State private var draft: ProjectCommandDraft
+    @State private var isApplyingCommandExtraction = false
+    @AppStorage("ProjectCommandEditor.extractsEnvironmentAssignments")
+    private var extractsEnvironmentAssignments = true
 
     let projectRoot: String
     let canDelete: Bool
@@ -2341,6 +2344,9 @@ struct ProjectCommandEditor: View {
                     Text("Command")
                         .foregroundStyle(.secondary)
                     TextField("e.g., npm run dev", text: $draft.commandLine)
+                        .onChange(of: draft.commandLine) { oldValue, newValue in
+                            extractEnvironmentFromCommandIfNeeded(oldValue: oldValue, newValue: newValue)
+                        }
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
@@ -2359,6 +2365,8 @@ struct ProjectCommandEditor: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
+
+                environmentSection
 
                 Toggle("Auto-start when project starts", isOn: $draft.autoStart)
                 Toggle("Auto-restart if command exits", isOn: $draft.autoRestart)
@@ -2432,6 +2440,78 @@ struct ProjectCommandEditor: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         draft.workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(url.path, projectRoot: projectRoot)
     }
+
+    private var environmentSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Environment variables")
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button {
+                    draft.addEnvironmentRow()
+                } label: {
+                    Label("Add", systemImage: "plus")
+                }
+            }
+
+            if !draft.environmentRows.isEmpty {
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                    GridRow {
+                        Text("Name")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Value")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Color.clear
+                            .frame(width: 24)
+                    }
+
+                    ForEach($draft.environmentRows) { $row in
+                        GridRow {
+                            TextField("NAME", text: $row.name)
+                                .textFieldStyle(.roundedBorder)
+                            TextField("value", text: $row.value)
+                                .textFieldStyle(.roundedBorder)
+                            Button {
+                                draft.removeEnvironmentRow(id: row.id)
+                            } label: {
+                                Image(systemName: "minus.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove variable")
+                        }
+                    }
+                }
+            }
+
+            Toggle("Detect env vars pasted into Command", isOn: $extractsEnvironmentAssignments)
+                .font(.callout)
+        }
+    }
+
+    private func extractEnvironmentFromCommandIfNeeded(oldValue: String, newValue: String) {
+        guard extractsEnvironmentAssignments,
+              !isApplyingCommandExtraction,
+              isLikelyPaste(oldValue: oldValue, newValue: newValue),
+              let extraction = ProjectCommandEnvironmentExtraction.extractLeadingAssignments(from: newValue)
+        else {
+            return
+        }
+
+        isApplyingCommandExtraction = true
+        draft.commandLine = extraction.commandLine
+        draft.mergeEnvironment(extraction.environment)
+        isApplyingCommandExtraction = false
+    }
+
+    private func isLikelyPaste(oldValue: String, newValue: String) -> Bool {
+        guard newValue.contains("="), newValue.contains(where: \.isWhitespace) else { return false }
+        return oldValue.isEmpty || newValue.count > oldValue.count + 8
+    }
 }
 
 private struct ProjectCommandStorageOption: View {
@@ -2466,6 +2546,7 @@ private struct ProjectCommandDraft {
     var name: String
     var commandLine: String
     var workingDirectory: String
+    var environmentRows: [ProjectCommandEnvironmentVariableDraft]
     var autoStart: Bool
     var autoRestart: Bool
     var enabled: Bool
@@ -2479,6 +2560,14 @@ private struct ProjectCommandDraft {
             command.workingDirectory,
             projectRoot: projectRoot
         )
+        environmentRows = command.environment
+            .keys
+            .sorted()
+            .compactMap { name in
+                command.environment[name].map {
+                    ProjectCommandEnvironmentVariableDraft(name: name, value: $0)
+                }
+            }
         autoStart = command.autoStart
         autoRestart = command.autoRestart
         enabled = command.enabled
@@ -2499,10 +2588,40 @@ private struct ProjectCommandDraft {
                 workingDirectory,
                 projectRoot: projectRoot
             ),
+            environment: environment,
             autoStart: autoStart,
             autoRestart: autoRestart,
             enabled: enabled
         )
+    }
+
+    private var environment: [String: String] {
+        var environment: [String: String] = [:]
+        for row in environmentRows {
+            let name = row.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ProjectCommandEnvironmentExtraction.isValidEnvironmentName(name) else { continue }
+            environment[name] = row.value
+        }
+        return environment
+    }
+
+    mutating func addEnvironmentRow() {
+        environmentRows.append(ProjectCommandEnvironmentVariableDraft(name: "", value: ""))
+    }
+
+    mutating func removeEnvironmentRow(id: UUID) {
+        environmentRows.removeAll { $0.id == id }
+    }
+
+    mutating func mergeEnvironment(_ nextEnvironment: [String: String]) {
+        for name in nextEnvironment.keys.sorted() {
+            guard let value = nextEnvironment[name] else { continue }
+            if let index = environmentRows.firstIndex(where: { $0.name == name }) {
+                environmentRows[index].value = value
+            } else {
+                environmentRows.append(ProjectCommandEnvironmentVariableDraft(name: name, value: value))
+            }
+        }
     }
 
     private static func splitCommandLine(_ commandLine: String) -> (command: String, arguments: String) {
@@ -2514,6 +2633,18 @@ private struct ProjectCommandDraft {
         let command = String(trimmed[..<separator])
         let arguments = String(trimmed[separator...]).trimmingCharacters(in: .whitespacesAndNewlines)
         return (command, arguments)
+    }
+}
+
+private struct ProjectCommandEnvironmentVariableDraft: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var value: String
+
+    init(id: UUID = UUID(), name: String, value: String) {
+        self.id = id
+        self.name = name
+        self.value = value
     }
 }
 

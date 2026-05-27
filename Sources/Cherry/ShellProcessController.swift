@@ -167,6 +167,7 @@ final class ShellProcessController: @unchecked Sendable {
         let projectRoot: String?
         let processID: String?
         let agentID: String?
+        let environment: [String: String]
         let term: String
         let initialSize: TerminalViewportSize
         let startupCommand: String?
@@ -177,6 +178,7 @@ final class ShellProcessController: @unchecked Sendable {
             projectRoot: String? = nil,
             processID: String? = nil,
             agentID: String? = nil,
+            environment: [String: String] = [:],
             term: String,
             initialSize: TerminalViewportSize,
             startupCommand: String? = nil
@@ -186,6 +188,7 @@ final class ShellProcessController: @unchecked Sendable {
             self.projectRoot = projectRoot
             self.processID = processID
             self.agentID = agentID
+            self.environment = environment
             self.term = term
             self.initialSize = initialSize
             self.startupCommand = startupCommand
@@ -688,6 +691,7 @@ final class ShellProcessController: @unchecked Sendable {
         let projectRoot = configuration.projectRoot
         let processID = configuration.processID
         let agentID = configuration.agentID
+        let environment = configuration.environment
         let term = configuration.term
         let startupCommand = configuration.startupCommand
         let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
@@ -714,6 +718,9 @@ final class ShellProcessController: @unchecked Sendable {
         if pid == 0 {
             Self.closeInheritedFileDescriptorsForChild()
             _ = chdir(workingDirectory)
+            for (name, value) in environment {
+                _ = setenv(name, value, 1)
+            }
             _ = setenv("TERM", term, 1)
             if let mergedTerminfoDirs {
                 _ = setenv("TERMINFO_DIRS", mergedTerminfoDirs, 1)

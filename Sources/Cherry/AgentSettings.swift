@@ -45,6 +45,7 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
     var command: String
     var arguments: String
     var workingDirectory: String
+    var environment: [String: String]
     var autoStart: Bool
     var autoRestart: Bool
     var enabled: Bool
@@ -72,6 +73,7 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
         command: String,
         arguments: String = "",
         workingDirectory: String = "",
+        environment: [String: String] = [:],
         autoStart: Bool = false,
         autoRestart: Bool = false,
         enabled: Bool = true
@@ -80,6 +82,7 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
         self.command = command
         self.arguments = arguments
         self.workingDirectory = workingDirectory
+        self.environment = environment
         self.autoStart = autoStart
         self.autoRestart = autoRestart
         self.enabled = enabled
@@ -91,6 +94,7 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
         command = try container.decode(String.self, forKey: .command)
         arguments = try container.decodeIfPresent(String.self, forKey: .arguments) ?? ""
         workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory) ?? ""
+        environment = try container.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         autoStart = try container.decodeIfPresent(Bool.self, forKey: .autoStart) ?? false
         autoRestart = try container.decodeIfPresent(Bool.self, forKey: .autoRestart) ?? false
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
@@ -158,6 +162,117 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
 
         let relativeComponents = pathComponents.dropFirst(rootComponents.count)
         return relativeComponents.isEmpty ? "" : relativeComponents.joined(separator: "/")
+    }
+}
+
+struct ProjectCommandEnvironmentExtraction: Equatable {
+    let environment: [String: String]
+    let commandLine: String
+
+    static func extractLeadingAssignments(from commandLine: String) -> ProjectCommandEnvironmentExtraction? {
+        var cursor = commandLine.startIndex
+        var environment: [String: String] = [:]
+        var lastAssignmentEnd = commandLine.startIndex
+
+        while cursor < commandLine.endIndex {
+            while cursor < commandLine.endIndex, commandLine[cursor].isWhitespace {
+                cursor = commandLine.index(after: cursor)
+            }
+            guard cursor < commandLine.endIndex else { break }
+
+            let token = shellToken(from: commandLine, startingAt: &cursor)
+            guard let assignment = environmentAssignment(from: token.value) else {
+                break
+            }
+
+            environment[assignment.name] = assignment.value
+            lastAssignmentEnd = token.endIndex
+        }
+
+        guard !environment.isEmpty else { return nil }
+        let remainingCommand = commandLine[lastAssignmentEnd...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remainingCommand.isEmpty else { return nil }
+
+        return ProjectCommandEnvironmentExtraction(
+            environment: environment,
+            commandLine: remainingCommand
+        )
+    }
+
+    private static func shellToken(
+        from commandLine: String,
+        startingAt cursor: inout String.Index
+    ) -> (value: String, endIndex: String.Index) {
+        var value = ""
+        var quote: Character?
+
+        while cursor < commandLine.endIndex {
+            let character = commandLine[cursor]
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                    cursor = commandLine.index(after: cursor)
+                    continue
+                }
+                if activeQuote == "\"", character == "\\" {
+                    let nextIndex = commandLine.index(after: cursor)
+                    if nextIndex < commandLine.endIndex {
+                        value.append(commandLine[nextIndex])
+                        cursor = commandLine.index(after: nextIndex)
+                        continue
+                    }
+                }
+                value.append(character)
+                cursor = commandLine.index(after: cursor)
+                continue
+            }
+
+            if character.isWhitespace {
+                break
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                cursor = commandLine.index(after: cursor)
+                continue
+            }
+            if character == "\\" {
+                let nextIndex = commandLine.index(after: cursor)
+                if nextIndex < commandLine.endIndex {
+                    value.append(commandLine[nextIndex])
+                    cursor = commandLine.index(after: nextIndex)
+                    continue
+                }
+            }
+
+            value.append(character)
+            cursor = commandLine.index(after: cursor)
+        }
+
+        return (value, cursor)
+    }
+
+    private static func environmentAssignment(from token: String) -> (name: String, value: String)? {
+        guard let separator = token.firstIndex(of: "="), separator != token.startIndex else {
+            return nil
+        }
+
+        let name = String(token[..<separator])
+        guard isValidEnvironmentName(name) else { return nil }
+        let value = String(token[token.index(after: separator)...])
+        return (name, value)
+    }
+
+    static func isValidEnvironmentName(_ name: String) -> Bool {
+        guard let first = name.first,
+              first == "_" || first.isLetter
+        else {
+            return false
+        }
+
+        return name.allSatisfy { character in
+            character == "_" || character.isLetter || character.isNumber
+        }
     }
 }
 
@@ -479,6 +594,7 @@ enum ProjectCommandConfiguration {
             normalized.workingDirectory = NSString(
                 string: normalized.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
             ).expandingTildeInPath
+            normalized.environment = normalizedEnvironment(normalized.environment)
 
             guard !normalized.name.isEmpty else {
                 throw ProjectCommandConfigurationError.missingName
@@ -491,6 +607,16 @@ enum ProjectCommandConfiguration {
             }
             return normalized
         }
+    }
+
+    private static func normalizedEnvironment(_ environment: [String: String]) -> [String: String] {
+        var normalized: [String: String] = [:]
+        for (rawName, value) in environment {
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ProjectCommandEnvironmentExtraction.isValidEnvironmentName(name) else { continue }
+            normalized[name] = value
+        }
+        return normalized
     }
 }
 
@@ -1167,6 +1293,10 @@ enum CherryProjectFile {
             if !command.workingDirectory.isEmpty {
                 lines.append("workingDirectory = \(tomlString(command.workingDirectory))")
             }
+            for name in command.environment.keys.sorted() {
+                guard let value = command.environment[name] else { continue }
+                lines.append("environment.\(tomlString(name)) = \(tomlString(value))")
+            }
             lines.append("autoStart = \(command.autoStart ? "true" : "false")")
             lines.append("autoRestart = \(command.autoRestart ? "true" : "false")")
             lines.append("enabled = \(command.enabled ? "true" : "false")")
@@ -1194,6 +1324,7 @@ enum CherryProjectFile {
     private static func parseCommands(from source: String) -> [ProjectCommandDefinition] {
         var commands: [ProjectCommandDefinition] = []
         var fields: [String: String] = [:]
+        var environment: [String: String] = [:]
 
         func flushCommand() {
             guard !fields.isEmpty else { return }
@@ -1202,11 +1333,13 @@ enum CherryProjectFile {
                 command: fields["command"] ?? "",
                 arguments: fields["arguments"] ?? "",
                 workingDirectory: fields["workingDirectory"] ?? "",
+                environment: environment,
                 autoStart: boolValue(fields["autoStart"]) ?? false,
                 autoRestart: boolValue(fields["autoRestart"]) ?? false,
                 enabled: boolValue(fields["enabled"]) ?? true
             ))
             fields.removeAll()
+            environment.removeAll()
         }
 
         for rawLine in source.components(separatedBy: .newlines) {
@@ -1220,10 +1353,23 @@ enum CherryProjectFile {
             guard let separator = line.firstIndex(of: "=") else { continue }
             let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
             let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespacesAndNewlines)
-            fields[key] = tomlValue(value)
+            if let environmentName = environmentName(fromTomlKey: key) {
+                environment[environmentName] = tomlValue(value)
+            } else {
+                fields[key] = tomlValue(value)
+            }
         }
         flushCommand()
         return commands
+    }
+
+    private static func environmentName(fromTomlKey key: String) -> String? {
+        let prefix = "environment."
+        guard key.hasPrefix(prefix) else { return nil }
+        let rawName = String(key.dropFirst(prefix.count))
+        let name = tomlValue(rawName)
+        guard ProjectCommandEnvironmentExtraction.isValidEnvironmentName(name) else { return nil }
+        return name
     }
 
     private static func managedSection(in contents: String) -> String? {

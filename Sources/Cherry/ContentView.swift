@@ -5075,12 +5075,11 @@ private final class TrafficLightOverlayView: NSView {
 
     @MainActor
     private func configureButtons() {
-        // Re-apply each call: AppKit can reset autoresizingMask / isHidden
-        // during window state transitions, which would otherwise let the
-        // buttons drift back to default position or vanish entirely.
+        // Re-apply each call: AppKit can reset titlebar button chrome during
+        // window state transitions, which would otherwise let the buttons
+        // drift back to the default position or vanish entirely.
         for button in hostedButtons {
             button.autoresizingMask = []
-            button.isHidden = false
             button.wantsLayer = true
             button.layer?.mask = nil
         }
@@ -5111,7 +5110,10 @@ private final class TrafficLightOverlayView: NSView {
         configureButtons()
 
         let baseX = leftInset + translationX
+        let controlWidth = buttonSpacing * CGFloat(max(hostedButtons.count - 1, 0))
+            + (hostedButtons.last?.frame.width ?? 14)
         let controlHeight = hostedButtons.map(\.frame.height).max() ?? 14
+        let controlsAreFullyOffscreen = baseX + controlWidth <= 0
         let targetY = bounds.height - topInset - controlHeight
         let originInParent = convert(
             NSPoint(x: baseX, y: max(0, targetY)),
@@ -5126,6 +5128,7 @@ private final class TrafficLightOverlayView: NSView {
                 x: originInParent.x + CGFloat(index) * buttonSpacing,
                 y: originInParent.y + (controlHeight - button.frame.height) / 2
             ))
+            button.isHidden = controlsAreFullyOffscreen
         }
 
         CATransaction.commit()

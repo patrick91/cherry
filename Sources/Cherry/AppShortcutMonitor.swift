@@ -224,6 +224,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
         private func closeSelectedSessionOrWindow() {
             guard let workspace else { return }
+            if chromeState?.closeSelectedNoteIfNeeded() == true {
+                return
+            }
 
             if workspace.sessions.count > 1 {
                 guard let session = workspace.selectedSession else { return }

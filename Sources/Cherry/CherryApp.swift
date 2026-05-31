@@ -182,8 +182,11 @@ struct CherryApp: App {
                 .keyboardShortcut("t")
                 .disabled(focusedWorkspace == nil)
 
-                Button("Close Tab") {
+                Button(focusedChromeState?.selectedNoteID == nil ? "Close Tab" : "Close Note") {
                     guard let workspace = focusedWorkspace else { return }
+                    if focusedChromeState?.closeSelectedNoteIfNeeded() == true {
+                        return
+                    }
                     if workspace.sessions.count > 1 {
                         guard let session = workspace.selectedSession else { return }
                         if !workspace.descendantAgentSessions(of: session).isEmpty {

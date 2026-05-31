@@ -119,9 +119,6 @@ private struct ContentViewTestHost: View {
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
-    @State private var isSidebarHidden = false
-    @State private var isSidebarRevealed = false
-    @State private var isCursorOverSidebar = false
     @State private var storedSidebarWidth = 320.0
 
     var body: some View {
@@ -132,16 +129,18 @@ private struct ContentViewTestHost: View {
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: { _ in },
-            isSidebarHidden: $isSidebarHidden,
-            isSidebarRevealed: $isSidebarRevealed,
-            isCursorOverSidebar: $isCursorOverSidebar,
+            isSidebarHidden: $chromeState.isSidebarHidden,
+            isSidebarRevealed: $chromeState.isSidebarRevealed,
+            isCursorOverSidebar: $chromeState.isCursorOverSidebar,
             storedSidebarWidth: $storedSidebarWidth
         )
     }
 }
 
 @MainActor
-private func makeHostedContentViewWindow() async throws -> HostedContentViewWindow {
+private func makeHostedContentViewWindow(
+    styleMask: NSWindow.StyleMask = [.borderless]
+) async throws -> HostedContentViewWindow {
     let projectDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherrySidebarResize-\(UUID().uuidString)", isDirectory: true)
     let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
@@ -159,7 +158,7 @@ private func makeHostedContentViewWindow() async throws -> HostedContentViewWind
     let contentRect = NSRect(x: 0, y: 0, width: 900, height: 600)
     let window = NSWindow(
         contentRect: contentRect,
-        styleMask: [.borderless],
+        styleMask: styleMask,
         backing: .buffered,
         defer: false
     )
@@ -185,6 +184,26 @@ private func makeHostedContentViewWindow() async throws -> HostedContentViewWind
         chromeState: chromeState,
         projectDirectory: projectDirectory
     )
+}
+
+@MainActor
+private func trafficLightButtons(in window: NSWindow) throws -> [NSButton] {
+    try [
+        window.standardWindowButton(.closeButton),
+        window.standardWindowButton(.miniaturizeButton),
+        window.standardWindowButton(.zoomButton)
+    ].map { try #require($0) }
+}
+
+@MainActor
+private func trafficLightFrames(in window: NSWindow) throws -> [NSRect] {
+    let contentView = try #require(window.contentView)
+    let buttons = try trafficLightButtons(in: window)
+
+    return try buttons.map { button in
+        let parent = try #require(button.superview)
+        return parent.convert(button.frame, to: contentView)
+    }
 }
 
 @MainActor
@@ -500,6 +519,29 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(first.chromeState.dockedSidebarWidth == 368)
     #expect(second.chromeState.dockedSidebarWidth == 320)
+}
+
+@MainActor
+@Test func trafficLightsMoveOutsideContentWhenSidebarCloses() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer {
+        host.cleanup()
+    }
+
+    let visibleFrames = try trafficLightFrames(in: host.window)
+    #expect(visibleFrames.allSatisfy { $0.minX >= 0 })
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let hiddenFrames = try trafficLightFrames(in: host.window)
+    let hiddenButtons = try trafficLightButtons(in: host.window)
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(hiddenFrames.allSatisfy { $0.maxX < 0 })
+    #expect(hiddenButtons.allSatisfy { $0.isHidden })
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
@@ -5951,6 +5993,80 @@ private func waitForSummaryCallCount(
         charactersIgnoringModifiers: "s",
         modifiers: [.command, .shift]
     ) == nil)
+}
+
+@MainActor
+@Test func appShortcutMonitorCommandWClosesSelectedNoteBeforeSession() async throws {
+    let projectDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryShortcutNoteClose-\(UUID().uuidString)", isDirectory: true)
+    let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    let chromeState = ProjectWindowChromeState()
+    let noteStore = ProjectNoteStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
+    )
+    let todoStore = ProjectTodoStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
+    )
+    let secondSession = workspace.addSession(title: "Keep Me")
+    let note = try noteStore.create(title: "Active Note", markdown: "draft")
+    chromeState.selectNote(id: note.id)
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.orderFrontRegardless()
+
+    let coordinator = AppShortcutMonitor.Coordinator(
+        workspace: workspace,
+        chromeState: chromeState,
+        noteStore: noteStore,
+        todoStore: todoStore,
+        projectRoot: projectDirectory.path,
+        visibleCommandNames: [],
+        visibleCommands: [],
+        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+        openSettings: {}
+    )
+    coordinator.window = window
+
+    defer {
+        _ = coordinator
+        for session in workspace.sessions {
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
+        window.close()
+        try? FileManager.default.removeItem(at: projectDirectory)
+    }
+
+    let event = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.command],
+        timestamp: 1,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: "w",
+        charactersIgnoringModifiers: "w",
+        isARepeat: false,
+        keyCode: 13
+    ))
+
+    NSApp.sendEvent(event)
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(chromeState.selectedNoteID == nil)
+    #expect(workspace.sessions.contains { $0.id == secondSession.id })
+    #expect(workspace.sessions.count == 2)
 }
 
 @Test func commandEnvironmentExtractionParsesLeadingAssignments() {

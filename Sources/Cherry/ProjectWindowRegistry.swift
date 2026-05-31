@@ -551,6 +551,13 @@ final class ProjectWindowChromeState: ObservableObject {
         focusedIdleCommandName = nil
     }
 
+    @discardableResult
+    func closeSelectedNoteIfNeeded() -> Bool {
+        guard selectedNoteID != nil else { return false }
+        selectNote(id: nil)
+        return true
+    }
+
     func toggleAgentGroupCollapsed(_ id: UUID) {
         if collapsedAgentGroupIDs.contains(id) {
             collapsedAgentGroupIDs.remove(id)

@@ -2160,7 +2160,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             return false
         }
 
-        let promptStart = max(0, lineCount - Self.agentInputPromptTailLineLimit)
+        let promptStart = max(
+            lastHumanInputLine ?? 0,
+            lineCount - Self.agentInputPromptTailLineLimit
+        )
+        guard promptStart < lineCount else { return false }
+
         let promptLines = processor.snapshot(range: promptStart..<lineCount)
         if promptLines.contains(where: { line in
             Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)

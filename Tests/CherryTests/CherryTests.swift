@@ -4628,6 +4628,46 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func submittedAgentInputStaysWorkingWhenOldPromptRemainsInTail() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("""
+    Finished previous turn
+    \u{203A} Run tests
+    gpt-5.5 xhigh fast · ~/github/patrick91/cherry
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    session.send(text: "Run /review on my current changes\n")
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(Data("Starting review\n".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func renderedCodexInputPromptClearsAgentWorkingIndicator() async throws {
     let session = TerminalSession(
         title: "Codex",

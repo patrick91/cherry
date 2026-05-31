@@ -3275,7 +3275,7 @@ private struct SidebarTabsView: View {
                 // so the inner leading padding subtracts that amount.
                 .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
                 .padding(.trailing, SidebarLayout.trailingInset)
-                .padding(.top, 48 + dockedCompensation)
+                .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + dockedCompensation)
                 .padding(.bottom, 10 + dockedCompensation)
             }
         }
@@ -3283,6 +3283,9 @@ private struct SidebarTabsView: View {
             if presentation == .floating {
                 SidebarBackground(projectRoot: projectRoot, presentation: presentation)
             }
+        }
+        .overlay(alignment: .top) {
+            SidebarTopChromeShield(projectRoot: projectRoot, presentation: presentation)
         }
     }
 
@@ -5143,6 +5146,31 @@ private final class TrafficLightOverlayView: NSView {
         }
         hostedButtons = []
         controller?.detach(self)
+    }
+}
+
+private struct SidebarTopChromeShield: View {
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+                .frame(height: TopChromeShieldMetrics.projectSidebar.coverHeight)
+
+            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+                .mask {
+                    LinearGradient(
+                        colors: [.black, .clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .frame(height: TopChromeShieldMetrics.projectSidebar.fadeHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

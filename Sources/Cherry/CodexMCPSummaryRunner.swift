@@ -66,30 +66,17 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         defer { stopServer() }
 
         let id = nextID()
-        let summaryModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? AgentSummaryTool.codex.defaultModel
-            : model.trimmingCharacters(in: .whitespacesAndNewlines)
         let request: [String: Any] = [
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
             "params": [
                 "name": "codex",
-                "arguments": [
-                    "prompt": prompt,
-                    "approval-policy": "never",
-                    "sandbox": "workspace-write",
-                    "cwd": summaryRunnerWorkingDirectoryURL(
-                        workingDirectory,
-                        fallback: FileManager.default.homeDirectoryForCurrentUser
-                    ).path,
-                    "model": summaryModel,
-                    "include-plan-tool": false,
-                    "base-instructions": "Return only a single-line JSON object with keys state and summary. Do not use tools unless necessary.",
-                    "config": [
-                        "model_reasoning_effort": "low"
-                    ]
-                ] as [String: Any]
+                "arguments": codexMCPSummaryToolArguments(
+                    prompt: prompt,
+                    workingDirectory: workingDirectory,
+                    model: model
+                )
             ] as [String: Any]
         ]
 
@@ -99,6 +86,9 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         }
         guard let result = response["result"] as? [String: Any] else {
             throw RunnerError.invalidResponse
+        }
+        if let toolError = codexMCPToolErrorMessage(from: result) {
+            throw RunnerError.toolError(toolError)
         }
 
         let rawOutput = codexMCPText(from: result)
@@ -312,6 +302,37 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
             _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         }
     }
+}
+
+func codexMCPSummaryToolArguments(
+    prompt: String,
+    workingDirectory: String,
+    model: String
+) -> [String: Any] {
+    let summaryModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? AgentSummaryTool.codex.defaultModel
+        : model.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return [
+        "prompt": prompt,
+        "approval-policy": "never",
+        "sandbox": "workspace-write",
+        "cwd": summaryRunnerWorkingDirectoryURL(
+            workingDirectory,
+            fallback: FileManager.default.homeDirectoryForCurrentUser
+        ).path,
+        "model": summaryModel,
+        "base-instructions": "Return only a single-line JSON object with keys state and summary. Do not use tools unless necessary.",
+        "config": [
+            "model_reasoning_effort": "low"
+        ]
+    ] as [String: Any]
+}
+
+func codexMCPToolErrorMessage(from result: [String: Any]) -> String? {
+    guard result["isError"] as? Bool == true else { return nil }
+    let message = sanitizedSummary(codexMCPText(from: result), maxLength: 240)
+    return message.isEmpty ? "unknown error" : message
 }
 
 func codexMCPText(from result: [String: Any]) -> String {

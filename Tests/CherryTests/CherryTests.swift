@@ -5131,6 +5131,18 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(offSample.projectAccent == nil)
 }
 
+@Test func topChromeShieldMetricsReserveOpaqueAndFadeRegions() {
+    #expect(TopChromeShieldMetrics.settingsNativePane.coverHeight >= 96)
+    #expect(TopChromeShieldMetrics.settingsNativePane.fadeHeight >= 24)
+    #expect(TopChromeShieldMetrics.settingsNativePane.contentTopInset
+        >= TopChromeShieldMetrics.settingsNativePane.totalHeight)
+
+    #expect(TopChromeShieldMetrics.projectSidebar.coverHeight >= 44)
+    #expect(TopChromeShieldMetrics.projectSidebar.fadeHeight >= 20)
+    #expect(TopChromeShieldMetrics.projectSidebar.contentTopInset
+        >= TopChromeShieldMetrics.projectSidebar.totalHeight)
+}
+
 @MainActor
 @Test func terminalSessionTracksEnhancedKeyboardProtocol() async throws {
     let session = TerminalSession(
@@ -5887,6 +5899,33 @@ private func waitForSummaryCallCount(
     ])
 
     #expect(text == "{\"state\":\"WORKING\",\"summary\":\"reviewing check runs\"}")
+}
+
+@Test func codexMCPSummaryToolArgumentsOmitUnsupportedPlanFlag() {
+    let arguments = codexMCPSummaryToolArguments(
+        prompt: "Summarize recent output",
+        workingDirectory: "/tmp",
+        model: "gpt-5.4-mini"
+    )
+
+    #expect(arguments["prompt"] as? String == "Summarize recent output")
+    #expect(arguments["model"] as? String == "gpt-5.4-mini")
+    #expect(arguments["cwd"] as? String == "/tmp")
+    #expect(arguments["include-plan-tool"] == nil)
+}
+
+@Test func codexMCPToolErrorMessageExtractsTextContent() {
+    let message = codexMCPToolErrorMessage(from: [
+        "isError": true,
+        "content": [
+            [
+                "type": "text",
+                "text": "Failed to parse configuration for Codex tool: unknown field `include-plan-tool`"
+            ]
+        ]
+    ])
+
+    #expect(message == "Failed to parse configuration for Codex tool: unknown field `include-plan-tool`")
 }
 
 @Test func commandPaletteMatcherSupportsCaseInsensitiveSubsequenceTokens() {

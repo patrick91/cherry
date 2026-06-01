@@ -4697,6 +4697,70 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func unsubmittedAgentInputDoesNotHideRepaintedCodexPromptFromIdleDetection() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("MCP startup incomplete\n".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    session.send(text: "draft")
+    session.ingestTestingData(Data("\r\u{1B}[2K\u{203A} draft".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func renderedCodexWorkingStatusKeepsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.applyAutomaticSummary(
+        "Editing implementation plan",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    Edited plans/cli-ai.md (+2 -0)
+
+    Working (5m02s • esc to interrupt)
+
+    \u{203A} Summarize recent commits
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
     let session = TerminalSession(
         title: "Claude",
@@ -5171,16 +5235,12 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(offSample.projectAccent == nil)
 }
 
-@Test func topChromeShieldMetricsReserveOpaqueAndFadeRegions() {
-    #expect(TopChromeShieldMetrics.settingsNativePane.coverHeight >= 96)
-    #expect(TopChromeShieldMetrics.settingsNativePane.fadeHeight >= 24)
-    #expect(TopChromeShieldMetrics.settingsNativePane.contentTopInset
-        >= TopChromeShieldMetrics.settingsNativePane.totalHeight)
-
-    #expect(TopChromeShieldMetrics.projectSidebar.coverHeight >= 44)
-    #expect(TopChromeShieldMetrics.projectSidebar.fadeHeight >= 20)
+@Test func projectSidebarTopChromeShieldFitsWithinRestingContentInset() {
+    #expect(TopChromeShieldMetrics.projectSidebar.coverHeight == 32)
+    #expect(TopChromeShieldMetrics.projectSidebar.fadeHeight == 16)
+    #expect(TopChromeShieldMetrics.projectSidebar.contentTopInset == 48)
     #expect(TopChromeShieldMetrics.projectSidebar.contentTopInset
-        >= TopChromeShieldMetrics.projectSidebar.totalHeight)
+        == TopChromeShieldMetrics.projectSidebar.totalHeight)
 }
 
 @MainActor

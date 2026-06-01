@@ -2014,10 +2014,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
-        noteHumanInputIfNeeded()
         noteInputOutputBaseline()
         if kind == .agent {
             if Self.agentInputSubmitsTurn(input) {
+                noteHumanInputIfNeeded()
                 agentActivityStateIsLocked = false
                 setAgentActivityState(.working)
             }
@@ -2225,12 +2225,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
-        guard normalizedAgentName == "claude" else { return false }
-
         let output = lines
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .joined(separator: "\n")
 
+        if output.contains("working (") && output.contains("esc to interrupt") {
+            return true
+        }
+
+        guard normalizedAgentName == "claude" else { return false }
         return output.contains("whisking")
             || output.contains("still thinking")
     }

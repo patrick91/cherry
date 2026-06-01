@@ -129,7 +129,6 @@ private struct SettingsNativeTabView: View {
             }
         }
         .tabViewStyle(.sidebarAdaptable)
-        .environment(\.reservesSettingsNavigationTitleChrome, true)
         .tabViewSidebarHeader {
             VStack(alignment: .leading, spacing: 18) {
                 SettingsSearchField(text: $searchText)
@@ -269,7 +268,7 @@ private final class SettingsNativeWindowChromeView: NSView {
     func configureWindowChrome() {
         guard let window else { return }
         window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = true
+        window.titlebarAppearsTransparent = false
         window.titlebarSeparatorStyle = .none
         window.styleMask.insert(.fullSizeContentView)
         window.toolbarStyle = .unified
@@ -898,8 +897,6 @@ private extension View {
 }
 
 private struct SettingsPaneScroll<Content: View>: View {
-    @Environment(\.reservesSettingsNavigationTitleChrome) private var reservesNavigationTitleChrome
-
     let title: String
     let subtitle: String
     let systemImage: String
@@ -930,27 +927,13 @@ private struct SettingsPaneScroll<Content: View>: View {
                 content
             }
             .padding(.horizontal, 28)
-            .padding(.top, topContentPadding)
+            .padding(.top, 16)
             .padding(.bottom, 24)
             .frame(maxWidth: 660, alignment: .topLeading)
-        }
-        .overlay(alignment: .top) {
-            if reservesNavigationTitleChrome {
-                MaterialTopChromeShield(
-                    metrics: .settingsNativePane,
-                    material: .regularMaterial
-                )
-            }
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private var topContentPadding: CGFloat {
-        reservesNavigationTitleChrome
-            ? TopChromeShieldMetrics.settingsNativePane.contentTopInset
-            : 16
     }
 }
 

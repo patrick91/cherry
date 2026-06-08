@@ -4271,6 +4271,47 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerRefitsTerminalSurfaceAfterWindowResizeNotification() async throws {
+    let session = TerminalSession(
+        title: "Resize",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = container
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    container.layoutSubtreeIfNeeded()
+    try await Task.sleep(for: .milliseconds(40))
+    let revisionAfterInitialFit = session.revision
+
+    container.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
+    NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(container.bounds.size.width == 900)
+    #expect(container.bounds.size.height == 520)
+    #expect(session.ghosttyBridge.terminalView.frame.size.width == 900)
+    #expect(session.ghosttyBridge.terminalView.frame.size.height == 520)
+    #expect(session.revision > revisionAfterInitialFit)
+}
+
+@MainActor
 @Test func ghosttyCommandKClearClearsSessionReplayStore() async throws {
     let session = TerminalSession(
         title: "Clear",

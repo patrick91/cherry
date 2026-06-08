@@ -5231,22 +5231,117 @@ private struct SidebarShortcutHint: View {
     }
 }
 
-private struct SidebarAgentWorkingIndicator: View {
-    private static let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
+private struct SidebarAgentWorkingIndicator: NSViewRepresentable {
     let isSelected: Bool
     let palette: SidebarPalette
 
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.12)) { timeline in
-            let index = Int(timeline.date.timeIntervalSinceReferenceDate / 0.12) % Self.frames.count
+    func makeNSView(context: Context) -> SidebarAgentWorkingIndicatorView {
+        SidebarAgentWorkingIndicatorView()
+    }
 
-            Text(Self.frames[index])
-                .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.66))
-                .frame(width: 14, height: 18)
-                .accessibilityLabel("Agent working")
+    func updateNSView(_ nsView: SidebarAgentWorkingIndicatorView, context: Context) {
+        let color = NSColor(isSelected ? palette.selectedText : palette.rowText)
+            .withAlphaComponent(0.66)
+        nsView.update(color: color)
+    }
+}
+
+private final class SidebarAgentWorkingIndicatorView: NSView {
+    private static let viewSize = NSSize(width: 14, height: 18)
+    private static let animationKey = "sidebar-agent-working-spin"
+
+    private let arcLayer = CAShapeLayer()
+    private var indicatorColor = NSColor.labelColor.withAlphaComponent(0.66)
+
+    init() {
+        super.init(frame: NSRect(origin: .zero, size: Self.viewSize))
+        wantsLayer = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+
+        arcLayer.fillColor = nil
+        arcLayer.lineWidth = 1.7
+        arcLayer.lineCap = .round
+        layer?.addSublayer(arcLayer)
+
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        setAccessibilityLabel("Agent working")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        Self.viewSize
+    }
+
+    override func layout() {
+        super.layout()
+        updateLayerGeometry()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            arcLayer.removeAnimation(forKey: Self.animationKey)
+        } else {
+            startAnimating()
         }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLayerColor()
+    }
+
+    func update(color: NSColor) {
+        indicatorColor = color
+        updateLayerColor()
+        startAnimating()
+    }
+
+    private func updateLayerGeometry() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        arcLayer.frame = bounds
+
+        let diameter: CGFloat = 10
+        let radius = diameter / 2
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let path = CGMutablePath()
+        path.addArc(
+            center: center,
+            radius: radius,
+            startAngle: -CGFloat.pi / 2,
+            endAngle: CGFloat.pi * 0.95,
+            clockwise: false
+        )
+        arcLayer.path = path
+        updateLayerColor()
+        CATransaction.commit()
+    }
+
+    private func updateLayerColor() {
+        arcLayer.strokeColor = indicatorColor.cgColor
+    }
+
+    private func startAnimating() {
+        guard window != nil else { return }
+        guard arcLayer.animation(forKey: Self.animationKey) == nil else { return }
+
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = 0
+        animation.toValue = CGFloat.pi * 2
+        animation.duration = 0.72
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        arcLayer.add(animation, forKey: Self.animationKey)
     }
 }
 

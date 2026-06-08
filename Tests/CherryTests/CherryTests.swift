@@ -4760,6 +4760,27 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(session.agentActivityState.showsWorkingIndicator)
 }
 
+@Test func sidebarWorkingIndicatorAvoidsSwiftUITimelineInvalidation() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let repoRoot = testFile
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let sourceURL = repoRoot.appending(path: "Sources/Cherry/ContentView.swift")
+    let source = String(decoding: try Data(contentsOf: sourceURL), as: UTF8.self)
+
+    let start = try #require(source.range(of: "private struct SidebarAgentWorkingIndicator"))
+    let end = try #require(source.range(
+        of: "private struct SidebarAgentPermissionIndicator",
+        range: start.upperBound..<source.endIndex
+    ))
+    let indicatorSource = String(source[start.lowerBound..<end.lowerBound])
+
+    #expect(!indicatorSource.contains("TimelineView"))
+    #expect(!indicatorSource.contains(".periodic("))
+    #expect(indicatorSource.contains("NSViewRepresentable"))
+}
+
 @MainActor
 @Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
     let session = TerminalSession(

@@ -9,6 +9,10 @@ struct ContentView: View {
     private let floatingSidebarLeadingInset: CGFloat = SidebarLayout.floatingOuterInset
     private let floatingSidebarTopInset: CGFloat = 3
     private let floatingSidebarBottomInset: CGFloat = 3
+    private let sidebarRevealHotZoneWidth: CGFloat = 24
+    private let sidebarRevealHoverSlop: CGFloat = 10
+    private let sidebarRevealDelay: Duration = .milliseconds(85)
+    private let sidebarDismissDelay: Duration = .milliseconds(160)
     private let titlebarProjectPickerLeadingInset: CGFloat = 80
 
     @Environment(\.openSettings) private var openSettings
@@ -24,6 +28,9 @@ struct ContentView: View {
     @Binding var isCursorOverSidebar: Bool
     @Binding var storedSidebarWidth: Double
     @State private var trafficLights = TrafficLightController()
+    @State private var isCursorInsideSidebarRevealRegion = false
+    @State private var sidebarRevealTask: Task<Void, Never>?
+    @State private var sidebarDismissTask: Task<Void, Never>?
 
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
@@ -141,23 +148,15 @@ struct ContentView: View {
             }
 
             if isSidebarHidden {
-                // Wider hot-zone (24pt) avoids the macOS fullscreen edge
-                // gestures that reserve the leftmost few pixels. Using
-                // `.contentShape` + `onContinuousHover` is more robust than
-                // a near-transparent `Rectangle` + `onHover`, whose
-                // NSTrackingArea has been observed to go stale on window
-                // resize / fullscreen transitions.
-                Color.clear
-                    .frame(width: 24)
-                    .ignoresSafeArea(.all, edges: .vertical)
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        if case .active = phase, !isSidebarRevealed {
-                            withAnimation(.snappy(duration: 0.18)) {
-                                isSidebarRevealed = true
-                            }
-                        }
-                    }
+                // Passive tracking keeps the edge target alive while the
+                // floating sidebar appears under the cursor, then expands to
+                // the revealed sidebar so exits have a reliable close path.
+                SidebarRevealHoverTrackingOverlay { hovering in
+                    handleSidebarRevealHoverChange(hovering)
+                }
+                .frame(width: sidebarRevealTrackingWidth)
+                .frame(maxHeight: .infinity)
+                .ignoresSafeArea(.all, edges: .vertical)
             }
         }
         .ignoresSafeArea(.all, edges: .top)
@@ -238,10 +237,18 @@ struct ContentView: View {
             // "switch to floating" branch on the next Cmd+S.
             if hidden {
                 isCursorOverSidebar = false
+            } else {
+                resetSidebarRevealTracking()
             }
             syncTrafficLights()
         }
-        .onChange(of: isSidebarRevealed) { _, _ in
+        .onChange(of: isSidebarRevealed) { _, revealed in
+            if revealed {
+                isCursorInsideSidebarRevealRegion = true
+                cancelSidebarDismiss()
+            } else {
+                cancelSidebarDismiss()
+            }
             syncTrafficLights()
         }
         .onChange(of: sidebarWidth) { _, newWidth in
@@ -260,6 +267,9 @@ struct ContentView: View {
                 floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
                 sidebarWidth: sidebarWidth
             )
+        }
+        .onDisappear {
+            resetSidebarRevealTracking()
         }
     }
 
@@ -301,6 +311,13 @@ struct ContentView: View {
             0,
             sidebarWidth - titlebarProjectPickerLeadingInset - SidebarLayout.trailingInset
         )
+    }
+
+    private var sidebarRevealTrackingWidth: CGFloat {
+        if isSidebarRevealed {
+            return sidebarWidth + floatingSidebarLeadingInset + sidebarRevealHoverSlop
+        }
+        return sidebarRevealHotZoneWidth
     }
 
     private func canCloseAgentGroup(_ session: TerminalSession) -> Bool {
@@ -374,13 +391,6 @@ struct ContentView: View {
             .padding(.top, floatingSidebarTopInset)
             .padding(.bottom, floatingSidebarBottomInset)
             .ignoresSafeArea(.all, edges: .top)
-            .onHover { hovering in
-                if !hovering, isSidebarRevealed {
-                    withAnimation(.snappy(duration: 0.18)) {
-                        isSidebarRevealed = false
-                    }
-                }
-            }
     }
 
     private var sidebarResizeHandle: some View {
@@ -416,6 +426,141 @@ struct ContentView: View {
 
     private func clampedSidebarWidth(_ width: CGFloat) -> CGFloat {
         min(max(width, minimumSidebarWidth), maximumSidebarWidth)
+    }
+
+    private func handleSidebarRevealHoverChange(_ hovering: Bool) {
+        isCursorInsideSidebarRevealRegion = hovering
+
+        if hovering {
+            cancelSidebarDismiss()
+            scheduleSidebarReveal()
+        } else {
+            cancelSidebarReveal()
+            scheduleSidebarDismiss()
+        }
+    }
+
+    private func scheduleSidebarReveal() {
+        guard isSidebarHidden, !isSidebarRevealed else { return }
+        cancelSidebarReveal()
+        sidebarRevealTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: sidebarRevealDelay)
+            } catch {
+                return
+            }
+
+            guard isCursorInsideSidebarRevealRegion, isSidebarHidden, !isSidebarRevealed else { return }
+            withAnimation(.snappy(duration: 0.18)) {
+                isSidebarRevealed = true
+            }
+        }
+    }
+
+    private func scheduleSidebarDismiss() {
+        guard isSidebarHidden, isSidebarRevealed else { return }
+        cancelSidebarDismiss()
+        sidebarDismissTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: sidebarDismissDelay)
+            } catch {
+                return
+            }
+
+            guard !isCursorInsideSidebarRevealRegion, isSidebarHidden, isSidebarRevealed else { return }
+            withAnimation(.snappy(duration: 0.18)) {
+                isSidebarRevealed = false
+            }
+        }
+    }
+
+    private func cancelSidebarReveal() {
+        sidebarRevealTask?.cancel()
+        sidebarRevealTask = nil
+    }
+
+    private func cancelSidebarDismiss() {
+        sidebarDismissTask?.cancel()
+        sidebarDismissTask = nil
+    }
+
+    private func resetSidebarRevealTracking() {
+        isCursorInsideSidebarRevealRegion = false
+        cancelSidebarReveal()
+        cancelSidebarDismiss()
+    }
+}
+
+private struct SidebarRevealHoverTrackingOverlay: NSViewRepresentable {
+    let onHoverChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> SidebarRevealHoverTrackingView {
+        let view = SidebarRevealHoverTrackingView()
+        view.onHoverChange = onHoverChange
+        return view
+    }
+
+    func updateNSView(_ nsView: SidebarRevealHoverTrackingView, context: Context) {
+        nsView.onHoverChange = onHoverChange
+    }
+}
+
+private final class SidebarRevealHoverTrackingView: NSView {
+    var onHoverChange: ((Bool) -> Void)?
+
+    private var trackingArea: NSTrackingArea?
+    private var isHovering = false
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshHoverStateFromWindow()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        refreshHoverStateFromWindow()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(nextTrackingArea)
+        trackingArea = nextTrackingArea
+        refreshHoverStateFromWindow()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setHovering(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setHovering(false)
+    }
+
+    func refreshHoverStateFromWindow() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        setHovering(bounds.contains(location))
+    }
+
+    private func setHovering(_ hovering: Bool) {
+        guard hovering != isHovering else { return }
+        isHovering = hovering
+        onHoverChange?(hovering)
     }
 }
 

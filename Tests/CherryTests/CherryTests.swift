@@ -255,6 +255,29 @@ private func dragSidebarResizeHandle(in window: NSWindow, by deltaX: CGFloat) as
 }
 
 @MainActor
+private func sidebarRevealHoverTrackingView(in window: NSWindow) throws -> NSView {
+    let contentView = try #require(window.contentView)
+    return try #require(findSubview(in: contentView) {
+        String(describing: type(of: $0)).contains("SidebarRevealHoverTrackingView")
+    })
+}
+
+@MainActor
+private func sidebarHoverEvent(in window: NSWindow) throws -> NSEvent {
+    try #require(NSEvent.mouseEvent(
+        with: .mouseMoved,
+        location: NSPoint(x: 12, y: 300),
+        modifierFlags: [],
+        timestamp: 1,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 1,
+        clickCount: 0,
+        pressure: 0
+    ))
+}
+
+@MainActor
 private func findSubview(in view: NSView, matching predicate: (NSView) -> Bool) -> NSView? {
     if predicate(view) {
         return view
@@ -519,6 +542,45 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(first.chromeState.dockedSidebarWidth == 368)
     #expect(second.chromeState.dockedSidebarWidth == 320)
+}
+
+@MainActor
+@Test func collapsedSidebarHoverRevealUsesIntentDelayAndExitGrace() async throws {
+    let host = try await makeHostedContentViewWindow()
+    defer {
+        host.cleanup()
+    }
+
+    host.chromeState.isSidebarHidden = true
+    try await Task.sleep(for: .milliseconds(100))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let event = try sidebarHoverEvent(in: host.window)
+    var hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+
+    hoverView.mouseEntered(with: event)
+    try await Task.sleep(for: .milliseconds(30))
+    hoverView.mouseExited(with: event)
+    try await Task.sleep(for: .milliseconds(140))
+
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(!host.chromeState.isSidebarRevealed)
+
+    hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseEntered(with: event)
+    try await Task.sleep(for: .milliseconds(120))
+
+    #expect(host.chromeState.isSidebarRevealed)
+
+    hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseExited(with: event)
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(host.chromeState.isSidebarRevealed)
+
+    try await Task.sleep(for: .milliseconds(170))
+
+    #expect(!host.chromeState.isSidebarRevealed)
 }
 
 @MainActor

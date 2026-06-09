@@ -5107,6 +5107,7 @@ enum TrafficLightWindowLayout {
         NSWindow.didExitFullScreenNotification,
         NSWindow.didBecomeKeyNotification,
         NSWindow.didResignKeyNotification,
+        NSWindow.didUpdateNotification,
         NSWindow.didMiniaturizeNotification,
         NSWindow.didDeminiaturizeNotification
     ]

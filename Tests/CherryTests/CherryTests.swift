@@ -606,6 +606,52 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(hiddenButtons.allSatisfy { $0.isHidden })
 }
 
+@MainActor
+@Test func trafficLightsRecoverWhenWindowUpdateRestoresHiddenButtons() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer {
+        host.cleanup()
+    }
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let hiddenFrames = try trafficLightFrames(in: host.window)
+    let hiddenButtons = try trafficLightButtons(in: host.window)
+    #expect(hiddenFrames.allSatisfy { $0.maxX < 0 })
+    #expect(hiddenButtons.allSatisfy { $0.isHidden })
+
+    let contentView = try #require(host.window.contentView)
+    let parent = try #require(hiddenButtons.first?.superview)
+    let controlHeight = hiddenButtons.map(\.frame.height).max() ?? 14
+    let visibleOrigin = contentView.convert(
+        NSPoint(x: 18, y: contentView.bounds.height - 18 - controlHeight),
+        to: parent
+    )
+
+    for (index, button) in hiddenButtons.enumerated() {
+        button.isHidden = false
+        button.setFrameOrigin(NSPoint(
+            x: visibleOrigin.x + CGFloat(index) * 20,
+            y: visibleOrigin.y
+        ))
+    }
+
+    let restoredFrames = try trafficLightFrames(in: host.window)
+    #expect(restoredFrames.allSatisfy { $0.minX >= 0 })
+    #expect(hiddenButtons.allSatisfy { !$0.isHidden })
+
+    NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: host.window)
+    try await Task.sleep(for: .milliseconds(40))
+
+    let recoveredFrames = try trafficLightFrames(in: host.window)
+    #expect(recoveredFrames.allSatisfy { $0.maxX < 0 })
+    #expect(hiddenButtons.allSatisfy { $0.isHidden })
+}
+
 @Test func cherryControlRequestRoundTrips() async throws {
     let request = CherryControlRequest.sendInput(.init(
         terminalID: UUID().uuidString,
@@ -4078,6 +4124,11 @@ private struct MCPWhoamiPayload: Decodable {
 @MainActor
 @Test func trafficLightOverlayRefreshesWhenWindowResignsKey() {
     #expect(TrafficLightWindowLayout.refreshNotificationNames.contains(NSWindow.didResignKeyNotification))
+}
+
+@MainActor
+@Test func trafficLightOverlayRefreshesWhenWindowUpdates() {
+    #expect(TrafficLightWindowLayout.refreshNotificationNames.contains(NSWindow.didUpdateNotification))
 }
 
 @MainActor

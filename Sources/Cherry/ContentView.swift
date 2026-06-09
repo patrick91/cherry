@@ -5389,10 +5389,18 @@ private struct SidebarAgentWorkingIndicator: NSViewRepresentable {
             .withAlphaComponent(0.66)
         nsView.update(color: color)
     }
+
+    static func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: SidebarAgentWorkingIndicatorView,
+        context: Context
+    ) -> CGSize? {
+        SidebarAgentWorkingIndicatorView.viewSize
+    }
 }
 
 private final class SidebarAgentWorkingIndicatorView: NSView {
-    private static let viewSize = NSSize(width: 14, height: 18)
+    fileprivate static let viewSize = NSSize(width: 14, height: 18)
     private static let animationKey = "sidebar-agent-working-spin"
 
     private let arcLayer = CAShapeLayer()
@@ -5409,7 +5417,7 @@ private final class SidebarAgentWorkingIndicatorView: NSView {
         arcLayer.fillColor = nil
         arcLayer.lineWidth = 1.7
         arcLayer.lineCap = .round
-        layer?.addSublayer(arcLayer)
+        attachArcLayerIfNeeded()
 
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
@@ -5435,6 +5443,8 @@ private final class SidebarAgentWorkingIndicatorView: NSView {
         if window == nil {
             arcLayer.removeAnimation(forKey: Self.animationKey)
         } else {
+            attachArcLayerIfNeeded()
+            updateLayerGeometry()
             startAnimating()
         }
     }
@@ -5446,14 +5456,24 @@ private final class SidebarAgentWorkingIndicatorView: NSView {
 
     func update(color: NSColor) {
         indicatorColor = color
+        attachArcLayerIfNeeded()
         updateLayerColor()
         startAnimating()
+    }
+
+    private func attachArcLayerIfNeeded() {
+        wantsLayer = true
+        guard let layer, arcLayer.superlayer !== layer else { return }
+        arcLayer.removeFromSuperlayer()
+        layer.addSublayer(arcLayer)
     }
 
     private func updateLayerGeometry() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        attachArcLayerIfNeeded()
         arcLayer.frame = bounds
+        arcLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
 
         let diameter: CGFloat = 10
         let radius = diameter / 2

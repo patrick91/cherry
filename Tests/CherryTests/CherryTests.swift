@@ -4800,6 +4800,50 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func renderedCodexInputPromptAfterScreenClearClearsAgentWorkingIndicator() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    let previousTurn = (0..<40)
+        .map { "previous output line \($0)" }
+        .joined(separator: "\n")
+    session.ingestTestingData(Data("\(previousTurn)\n".utf8))
+
+    session.send(text: "Refactor auth flow\n")
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(Data("""
+    \u{1B}[3J\u{1B}[H
+    Renamed the shared module.
+
+    Worked for 2m 05s
+    \u{203A} Improve documentation in @filename
+    gpt-5.5 xhigh fast · ~/github/fastapilabs/fastapi-cloud-cli
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func unsubmittedAgentInputDoesNotHideRepaintedCodexPromptFromIdleDetection() async throws {
     TerminalNotificationCenter.shared.isDeliveryEnabled = false
     defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
@@ -4882,6 +4926,26 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!indicatorSource.contains("TimelineView"))
     #expect(!indicatorSource.contains(".periodic("))
     #expect(indicatorSource.contains("NSViewRepresentable"))
+}
+
+@Test func sidebarWorkingIndicatorPinsRepresentableLayoutSize() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let repoRoot = testFile
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let sourceURL = repoRoot.appending(path: "Sources/Cherry/ContentView.swift")
+    let source = String(decoding: try Data(contentsOf: sourceURL), as: UTF8.self)
+
+    let start = try #require(source.range(of: "private struct SidebarAgentWorkingIndicator"))
+    let end = try #require(source.range(
+        of: "private struct SidebarAgentPermissionIndicator",
+        range: start.upperBound..<source.endIndex
+    ))
+    let indicatorSource = String(source[start.lowerBound..<end.lowerBound])
+
+    #expect(indicatorSource.contains("sizeThatFits"))
+    #expect(indicatorSource.contains("SidebarAgentWorkingIndicatorView.viewSize"))
 }
 
 @MainActor

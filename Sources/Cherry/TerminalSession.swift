@@ -2160,9 +2160,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             return false
         }
 
-        let promptStart = max(
-            lastHumanInputLine ?? 0,
-            lineCount - Self.agentInputPromptTailLineLimit
+        let promptStart = Self.agentInputPromptSearchStart(
+            lineCount: lineCount,
+            lastHumanInputLine: lastHumanInputLine
         )
         guard promptStart < lineCount else { return false }
 
@@ -2184,6 +2184,13 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private static let agentInputPromptTailLineLimit = 8
     private static let agentInputMarkerTailLineLimit = 32
+
+    private static func agentInputPromptSearchStart(lineCount: Int, lastHumanInputLine: Int?) -> Int {
+        let tailStart = max(0, lineCount - agentInputPromptTailLineLimit)
+        guard let lastHumanInputLine else { return tailStart }
+        guard lastHumanInputLine <= lineCount else { return tailStart }
+        return max(lastHumanInputLine, tailStart)
+    }
 
     private static func isAgentInputPromptLine(_ line: String, normalizedAgentName: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)

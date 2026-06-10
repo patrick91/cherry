@@ -98,6 +98,20 @@ struct CherryApp: App {
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
+    // Menu actions resolve their target from the key window, not the
+    // focused values: `@FocusedValue` only updates while SwiftUI owns
+    // focus, so with the AppKit terminal view as first responder it can
+    // keep pointing at a previously focused window — sending shortcuts
+    // like ^C to the wrong window. Focused values stay in use for menu
+    // labels and enablement, where staleness is cosmetic.
+    private var keyWindowWorkspace: TerminalWorkspace? {
+        ProjectWindowRegistry.shared.keyWindowWorkspace ?? focusedWorkspace
+    }
+
+    private var keyWindowChromeState: ProjectWindowChromeState? {
+        ProjectWindowRegistry.shared.keyWindowChromeState ?? focusedChromeState
+    }
+
     var body: some Scene {
         WindowGroup("Cherry", for: String.self) { projectRoot in
             ProjectWindowView(projectRoot: projectRoot.wrappedValue)
@@ -126,7 +140,7 @@ struct CherryApp: App {
         .commands {
             CommandGroup(replacing: .printItem) {
                 Button("Command Palette") {
-                    focusedChromeState?.presentCommandPalette()
+                    keyWindowChromeState?.presentCommandPalette()
                 }
                 .keyboardShortcut("p")
                 .disabled(focusedChromeState == nil)
@@ -136,26 +150,26 @@ struct CherryApp: App {
                 Divider()
 
                 Button("Find") {
-                    focusedWorkspace?.selectedSession?.ghosttyBridge.startSearch()
+                    keyWindowWorkspace?.selectedSession?.ghosttyBridge.startSearch()
                 }
                 .keyboardShortcut("f")
                 .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
 
                 Button("Find Next") {
-                    focusedWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: true)
+                    keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: true)
                 }
                 .keyboardShortcut("g")
                 .disabled(focusedWorkspace?.selectedSession == nil)
 
                 Button("Find Previous") {
-                    focusedWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: false)
+                    keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: false)
                 }
                 .keyboardShortcut("g", modifiers: [.command, .shift])
                 .disabled(focusedWorkspace?.selectedSession == nil)
 
                 Button("Hide Find Bar") {
-                    focusedWorkspace?.selectedSession?.ghosttyBridge.endSearch()
-                    focusedChromeState?.dismissTerminalSearch()
+                    keyWindowWorkspace?.selectedSession?.ghosttyBridge.endSearch()
+                    keyWindowChromeState?.dismissTerminalSearch()
                 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
                 .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
@@ -163,35 +177,36 @@ struct CherryApp: App {
 
             CommandMenu("Prototype") {
                 Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
-                    focusedChromeState?.toggleSidebar()
+                    keyWindowChromeState?.toggleSidebar()
                 }
                 .keyboardShortcut("s")
                 .disabled(focusedChromeState == nil)
 
                 if PrototypeFeatureFlags.isIconDebugEnabled {
                     Button(focusedChromeState?.isIconDebugOverlayPresented == true ? "Hide Icon Debug Overlay" : "Show Icon Debug Overlay") {
-                        focusedChromeState?.toggleIconDebugOverlay()
+                        keyWindowChromeState?.toggleIconDebugOverlay()
                     }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(focusedChromeState == nil)
                 }
 
                 Button("New Tab") {
-                    focusedWorkspace?.addSession()
+                    keyWindowWorkspace?.addSession()
                 }
                 .keyboardShortcut("t")
                 .disabled(focusedWorkspace == nil)
 
                 Button(focusedChromeState?.selectedNoteID == nil ? "Close Tab" : "Close Note") {
-                    guard let workspace = focusedWorkspace else { return }
-                    if focusedChromeState?.closeSelectedNoteIfNeeded() == true {
+                    guard let workspace = keyWindowWorkspace else { return }
+                    let chromeState = keyWindowChromeState
+                    if chromeState?.closeSelectedNoteIfNeeded() == true {
                         return
                     }
                     if workspace.sessions.count > 1 {
                         guard let session = workspace.selectedSession else { return }
                         if !workspace.descendantAgentSessions(of: session).isEmpty {
-                            if let focusedChromeState {
-                                focusedChromeState.requestAgentGroupClose(sessionID: session.id)
+                            if let chromeState {
+                                chromeState.requestAgentGroupClose(sessionID: session.id)
                             } else {
                                 workspace.close(session)
                             }
@@ -206,31 +221,31 @@ struct CherryApp: App {
                 .disabled(focusedWorkspace == nil)
 
                 Button("Previous Tab") {
-                    focusedWorkspace?.selectPreviousSession()
+                    keyWindowWorkspace?.selectPreviousSession()
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
                 .disabled(focusedWorkspace == nil)
 
                 Button("Next Tab") {
-                    focusedWorkspace?.selectNextSession()
+                    keyWindowWorkspace?.selectNextSession()
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
                 .disabled(focusedWorkspace == nil)
 
                 Button("Interrupt Active Tab") {
-                    focusedWorkspace?.interruptSelectedSession()
+                    keyWindowWorkspace?.interruptSelectedSession()
                 }
                 .keyboardShortcut("c", modifiers: [.control])
                 .disabled(focusedWorkspace == nil)
 
                 Button("Restart Active Tab") {
-                    focusedWorkspace?.restartSelectedSession()
+                    keyWindowWorkspace?.restartSelectedSession()
                 }
                 .keyboardShortcut("r")
                 .disabled(focusedWorkspace == nil)
 
                 Button("Clear Scrollback") {
-                    focusedWorkspace?.clearSelectedSessionScrollback()
+                    keyWindowWorkspace?.clearSelectedSessionScrollback()
                 }
                 .keyboardShortcut("k")
                 .disabled(focusedWorkspace == nil)
@@ -244,8 +259,10 @@ struct CherryApp: App {
                 } else {
                     ForEach(project.launchableAgents) { agent in
                         Button(agent.name) {
-                            guard let workspace = focusedWorkspace, let projectRoot = project.validProjectRoot else { return }
-                            focusedChromeState?.selectTerminal()
+                            guard let workspace = keyWindowWorkspace,
+                                  let projectRoot = agentSettings.resolvedProject(for: workspace.projectRoot).validProjectRoot
+                            else { return }
+                            keyWindowChromeState?.selectTerminal()
                             workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot)
                         }
                     }

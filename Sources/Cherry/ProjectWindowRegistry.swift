@@ -57,6 +57,25 @@ final class ProjectWindowRegistry {
         return workspaces[projectRoot]?.workspace
     }
 
+    /// Workspace belonging to the current key window. Menu actions must
+    /// resolve their target through this rather than SwiftUI focused values:
+    /// `@FocusedValue` only updates while the SwiftUI hierarchy owns focus,
+    /// so with the AppKit terminal view as first responder it can keep
+    /// pointing at a previously focused window.
+    var keyWindowWorkspace: TerminalWorkspace? {
+        pruneStaleWindows()
+        guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
+        return workspaces[projectRoot]?.workspace
+    }
+
+    /// Chrome state belonging to the current key window. See
+    /// `keyWindowWorkspace` for why menu actions resolve through this.
+    var keyWindowChromeState: ProjectWindowChromeState? {
+        pruneStaleWindows()
+        guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
+        return chromeStates[projectRoot]?.chromeState
+    }
+
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
         return noteStores[projectRoot]?.noteStore

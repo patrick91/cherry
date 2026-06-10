@@ -1127,16 +1127,30 @@ final class AgentSettings: ObservableObject {
         return NSString(string: trimmed).expandingTildeInPath
     }
 
+    // Called from SwiftUI body evaluation on every render pass, so repeated
+    // filesystem stats add up. Only valid results are cached (with a short
+    // lifetime): a directory that exists rarely disappears, while caching a
+    // miss would delay noticing a freshly created project root.
+    private static var validDirectoryCache: [String: (expires: TimeInterval, root: String)] = [:]
+    private static let validDirectoryCacheLifetime: TimeInterval = 5
+
     static func validDirectory(_ path: String) -> String? {
         let normalized = normalizedPath(path)
         guard !normalized.isEmpty else { return nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let cached = validDirectoryCache[normalized], now < cached.expires {
+            return cached.root
+        }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: normalized, isDirectory: &isDirectory),
               isDirectory.boolValue
         else {
+            validDirectoryCache[normalized] = nil
             return nil
         }
-        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+        let root = URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+        validDirectoryCache[normalized] = (now + validDirectoryCacheLifetime, root)
+        return root
     }
 
     private enum Keys {
@@ -1168,43 +1182,79 @@ enum CherryProjectFile {
         FileManager.default.fileExists(atPath: fileURL(projectRoot: projectRoot).path)
     }
 
+    // The load accessors run inside SwiftUI body evaluation on every render
+    // pass; re-reading and re-parsing the file each time is main-thread disk
+    // I/O. Parses are cached per project root and revalidated with a single
+    // stat — modification date + size — so external edits are still noticed.
+    private struct ParsedFile {
+        var modificationDate: Date?
+        var fileSize: UInt64?
+        var commands: [ProjectCommandDefinition] = []
+        var features: ProjectFeatureSettings?
+        var appearance: ProjectAppearanceSettings?
+    }
+
+    @MainActor
+    private static var parseCache: [String: ParsedFile] = [:]
+
+    @MainActor
+    private static func invalidate(projectRoot: String) {
+        parseCache[projectRoot] = nil
+    }
+
+    @MainActor
+    private static func parsed(projectRoot: String) -> ParsedFile {
+        let url = fileURL(projectRoot: projectRoot)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modificationDate = attributes?[.modificationDate] as? Date
+        let fileSize = (attributes?[.size] as? NSNumber)?.uint64Value
+        if let cached = parseCache[projectRoot],
+           cached.modificationDate == modificationDate,
+           cached.fileSize == fileSize
+        {
+            return cached
+        }
+
+        var parsed = ParsedFile(modificationDate: modificationDate, fileSize: fileSize)
+        if let contents = try? String(contentsOf: url, encoding: .utf8) {
+            let commandSource = managedSection(in: contents) ?? contents
+            parsed.commands = (try? ProjectCommandConfiguration.validated(parseCommands(from: commandSource))) ?? []
+            if let featureSource = tableSection(named: "features", in: contents) {
+                let fields = parseKeyValues(from: featureSource)
+                parsed.features = ProjectFeatureSettings(
+                    notesEnabled: boolValue(fields["notes"]) ?? false,
+                    todosEnabled: boolValue(fields["todos"]) ?? false
+                )
+            }
+            if let appearanceSource = tableSection(named: "appearance", in: contents) {
+                let fields = parseKeyValues(from: appearanceSource)
+                parsed.appearance = ProjectAppearanceSettings(
+                    color: fields["color"].flatMap(ProjectIdentityColor.init(rawValue:))
+                )
+            }
+        }
+        parseCache[projectRoot] = parsed
+        return parsed
+    }
+
+    @MainActor
     static func loadCommands(projectRoot: String) -> [ProjectCommandDefinition] {
-        let url = fileURL(projectRoot: projectRoot)
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        let source = managedSection(in: contents) ?? contents
-        return (try? ProjectCommandConfiguration.validated(parseCommands(from: source))) ?? []
+        parsed(projectRoot: projectRoot).commands
     }
 
+    @MainActor
     static func loadFeatureSettings(projectRoot: String) -> ProjectFeatureSettings? {
-        let url = fileURL(projectRoot: projectRoot)
-        guard let contents = try? String(contentsOf: url, encoding: .utf8),
-              let source = tableSection(named: "features", in: contents)
-        else {
-            return nil
-        }
-
-        let fields = parseKeyValues(from: source)
-        return ProjectFeatureSettings(
-            notesEnabled: boolValue(fields["notes"]) ?? false,
-            todosEnabled: boolValue(fields["todos"]) ?? false
-        )
+        parsed(projectRoot: projectRoot).features
     }
 
+    @MainActor
     static func loadAppearanceSettings(projectRoot: String) -> ProjectAppearanceSettings? {
-        let url = fileURL(projectRoot: projectRoot)
-        guard let contents = try? String(contentsOf: url, encoding: .utf8),
-              let source = tableSection(named: "appearance", in: contents)
-        else {
-            return nil
-        }
-
-        let fields = parseKeyValues(from: source)
-        return ProjectAppearanceSettings(
-            color: fields["color"].flatMap(ProjectIdentityColor.init(rawValue:))
-        )
+        parsed(projectRoot: projectRoot).appearance
     }
 
+    @MainActor
     static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
+        defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let nextSection = renderFeatureSection(features)
@@ -1224,7 +1274,9 @@ enum CherryProjectFile {
             .write(to: url, atomically: true, encoding: .utf8)
     }
 
+    @MainActor
     static func writeAppearanceSettings(_ appearance: ProjectAppearanceSettings, projectRoot: String) throws {
+        defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let nextSection = renderAppearanceSection(appearance)
@@ -1244,6 +1296,7 @@ enum CherryProjectFile {
             .write(to: url, atomically: true, encoding: .utf8)
     }
 
+    @MainActor
     static func upsertCommand(
         _ command: ProjectCommandDefinition,
         projectRoot: String,
@@ -1258,13 +1311,16 @@ enum CherryProjectFile {
         try writeCommands(commands, projectRoot: projectRoot)
     }
 
+    @MainActor
     static func removeCommand(named name: String, projectRoot: String) throws {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         let commands = loadCommands(projectRoot: projectRoot).filter { $0.normalizedName != normalizedName }
         try writeCommands(commands, projectRoot: projectRoot)
     }
 
+    @MainActor
     private static func writeCommands(_ commands: [ProjectCommandDefinition], projectRoot: String) throws {
+        defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let nextSection = commands.isEmpty ? "" : renderManagedSection(commands)

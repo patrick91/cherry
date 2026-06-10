@@ -63,6 +63,7 @@ final class TerminalSurfaceCoordinator {
     var onPostRender: (() -> Void)?
 
     private var lastMetrics: TerminalViewportMetrics?
+    private var lastPixelSize: (width: UInt32, height: UInt32)?
     private var isDisplayVisible = true
     private var isSurfaceFocused = false
     private var pendingImmediateTick = true
@@ -168,6 +169,20 @@ final class TerminalSurfaceCoordinator {
 
         surface.setContentScale(x: scale, y: scale)
         surface.setSize(width: pixelWidth, height: pixelHeight)
+        let pixelSizeChanged = lastPixelSize?.width != pixelWidth
+            || lastPixelSize?.height != pixelHeight
+        lastPixelSize = (pixelWidth, pixelHeight)
+
+        defer {
+            // A pixel-size change swaps ghostty's IOSurface; until a full
+            // render pass the old (now wrongly-sized) surface would stay on
+            // screen. Paint synchronously so resizes never show stale or
+            // stretched content. Steady-state frames render off the main
+            // thread instead (see `tick()`).
+            if pixelSizeChanged {
+                drawImmediately()
+            }
+        }
 
         guard let surfaceSize = surface.size(),
               surfaceSize.columns > 0, surfaceSize.rows > 0
@@ -234,6 +249,21 @@ final class TerminalSurfaceCoordinator {
         TerminalDebugLog.log(.render, "tick")
         controller?.tick()
         surface?.refresh()
+        #if !os(macOS)
+        // iOS has no renderer thread (see Patches/ghostty/0005); the host
+        // drives every frame synchronously from the main run loop.
+        surface?.draw()
+        #endif
+        onPostRender?()
+    }
+
+    /// Synchronous main-thread render (`ghostty_surface_draw` →
+    /// `drawFrame(sync: true)`, which blocks on the GPU). Reserved for
+    /// moments that must not present a stale IOSurface — resizes and the
+    /// first frame after a rebuild. On macOS all other frames are drawn by
+    /// ghostty's renderer thread, woken via `refresh()`.
+    private func drawImmediately() {
+        TerminalDebugLog.log(.render, "draw immediately")
         surface?.draw()
         onPostRender?()
     }
@@ -279,6 +309,7 @@ final class TerminalSurfaceCoordinator {
         surface?.free()
         surface = nil
         lastMetrics = nil
+        lastPixelSize = nil
         pendingImmediateTick = true
         lastTickTimestamp = 0
         controller?.remove(bridge)

@@ -1263,16 +1263,34 @@ final class GhosttyTerminalContainerView: NSView {
     func synchronizeScrollState() {
         guard let terminalView = activeBridge?.terminalView else { return }
 
-        documentView.frame.size.width = max(scrollView.contentSize.width, 1)
-        documentView.frame.size.height = documentHeight()
+        // This runs after every rendered frame (scrollbar updates) and on
+        // every keystroke, so skip the AppKit mutations when nothing moved —
+        // `reflectScrolledClipView` alone dirties window-restoration state
+        // and re-evaluates scroller visibility each call.
+        var scrollStateChanged = false
+
+        let documentSize = NSSize(
+            width: max(scrollView.contentSize.width, 1),
+            height: documentHeight()
+        )
+        if documentView.frame.size != documentSize {
+            documentView.frame.size = documentSize
+            scrollStateChanged = true
+        }
 
         if !isLiveScrolling, let scrollbar = activeBridge?.scrollbarMetrics {
             let offsetY = scrollOffsetY(for: scrollbar)
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: clampedScrollOffset(offsetY)))
+            let target = NSPoint(x: 0, y: clampedScrollOffset(offsetY))
+            if scrollView.contentView.bounds.origin != target {
+                scrollView.contentView.scroll(to: target)
+                scrollStateChanged = true
+            }
             lastSentScrollRow = Int(scrollbar.offset)
         }
 
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        if scrollStateChanged {
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
 
         // While the sidebar is animating we want exactly zero resize-driven
         // re-fits; otherwise the terminal reflows on every scroll-bounds

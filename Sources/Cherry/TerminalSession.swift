@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 
 private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
+private let activityDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_ACTIVITY_DEBUG"] == "1"
 private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
 private let prototypeProcessorDisabledForPerf =
     ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
@@ -2342,6 +2343,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func recheckAgentActivityAfterQuiet() {
+        if activityDebugEnabled {
+            fputs("[activity] recheck state=\(agentActivityState) source=\(agentActivitySource) marker=\(renderedOutputShowsAgentWorkingMarker()) spinner=\(titleSpinnerEvidenceIsActive) prompt=\(renderedOutputShowsAgentInputPrompt())\n", stderr)
+        }
         guard kind == .agent, agentActivityState == .working else { return }
         guard agentActivitySource != .processExit else { return }
         guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
@@ -2452,8 +2456,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         return false
     }
 
+    // Claude Code separates the composer glyph from its ghost text with a
+    // no-break space, so any Unicode whitespace counts as the separator.
     private static func isPromptLine(_ trimmed: String, prompt: String) -> Bool {
-        trimmed == prompt || trimmed.hasPrefix("\(prompt) ")
+        guard trimmed.hasPrefix(prompt) else { return false }
+        let rest = trimmed.dropFirst(prompt.count)
+        guard let next = rest.first else { return true }
+        return next.isWhitespace
     }
 
     private static func outputContainsAgentInputMarker(_ lines: [String], normalizedAgentName: String) -> Bool {

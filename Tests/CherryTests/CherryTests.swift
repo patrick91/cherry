@@ -5279,6 +5279,86 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(!session.agentActivityState.showsWorkingIndicator)
 }
 
+
+@MainActor
+@Test func claudeStartupGhostSuggestionScreenSettlesIdle() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    // Real captured Claude Code 2.1.170 startup byte stream where the composer
+    // ghost text is rendered as "❯\u{00A0}Try ..." (no-break space): the sidebar
+    // spinner used to stay pinned at working on this screen.
+    let url = try #require(Bundle.module.url(
+        forResource: "claude-code-2.1.170-startup-ghost",
+        withExtension: "raw",
+        subdirectory: "Fixtures"
+    ))
+    let data = try Data(contentsOf: url)
+
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+    session.resize(columns: 261, rows: 83)
+
+    var offset = 0
+    while offset < data.count {
+        let end = min(offset + 1_024, data.count)
+        session.ingestTestingData(data[offset..<end])
+        offset = end
+        try await Task.sleep(for: .milliseconds(4))
+    }
+    try await Task.sleep(for: .milliseconds(700))
+
+    #expect(session.usesAlternateScreen)
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func escInterruptedTurnSettlesIdleDespiteStaleTitleAndGhostComposer() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
+    session.ingestTestingData(Data("\u{1B}]0;\u{2810} Running probe\u{7}".utf8))
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "\u{276F}\u{A0}run the thing",
+        "\u{2733} Stewing\u{2026}",
+        "\u{276F}\u{A0}",
+        "  \u{23F5}\u{23F5} bypass permissions on \u{B7} esc to interrupt"
+    ]))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    // ESC interrupts the turn: marker disappears, ghost suggestion returns to
+    // the composer (with a no-break space), but the braille title is never
+    // re-emitted clean.
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "\u{276F}\u{A0}run the thing",
+        "\u{23FA} Interrupted \u{B7} What should Claude do instead?",
+        "\u{276F}\u{A0}Try \"fix lint errors\"",
+        "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)"
+    ]))
+
+    try await Task.sleep(for: .milliseconds(5_000))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
 @MainActor
 @Test func identicalScreenRepaintDoesNotAdvanceContentVersion() async throws {
     let session = TerminalSession(

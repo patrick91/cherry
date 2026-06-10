@@ -2350,7 +2350,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard agentActivitySource != .processExit else { return }
         guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
 
-        let lineCount = processor.lineCount
+        let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return }
         let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
         let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
@@ -2367,8 +2367,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         setAgentActivityState(.idle, source: .promptMarker)
     }
 
-    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
+    // TUIs that park the cursor on the bottom screen row materialize dozens of
+    // empty rows below their content, so tail windows must anchor to the last
+    // row that actually holds text.
+    private static let agentTrailingBlankScanLimit = 600
+
+    private func effectiveAgentContentLineCount() -> Int {
         let lineCount = processor.lineCount
+        guard lineCount > 0 else { return 0 }
+        let scanStart = max(0, lineCount - Self.agentTrailingBlankScanLimit)
+        let scanLines = processor.snapshot(range: scanStart..<lineCount)
+        var effectiveEnd = lineCount
+        var index = scanLines.count - 1
+        while index >= 0,
+              scanLines[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            effectiveEnd -= 1
+            index -= 1
+        }
+        return effectiveEnd
+    }
+
+    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
+        let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return false }
         let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
@@ -2377,7 +2397,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func renderedOutputShowsAgentInputPrompt() -> Bool {
-        let lineCount = processor.lineCount
+        let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return false }
 
         let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
@@ -2782,7 +2802,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func summaryTranscript() -> SummaryTranscript {
-        let lineCount = processor.lineCount
+        let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return .empty }
         let recentStartLine = max(0, lineCount - Self.summaryTailLineLimit)
         let inputLines = processor.snapshot(range: recentStartLine..<lineCount)
@@ -2808,7 +2828,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func noteHumanInputIfNeeded() {
         guard kind == .agent else { return }
-        lastHumanInputLine = processor.lineCount
+        lastHumanInputLine = effectiveAgentContentLineCount()
     }
 
     private static func shouldDropSummaryLine(_ line: String) -> Bool {

@@ -5360,6 +5360,46 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
+@Test func codexStartupWithParkedCursorBelowContentSettlesIdle() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    // Real captured Codex v0.139.0 startup byte stream: content occupies the top
+    // ~29 rows while the cursor is parked on the bottom screen row, leaving ~54
+    // trailing blank rows that pushed the composer out of the prompt window.
+    let url = try #require(Bundle.module.url(
+        forResource: "codex-0.139.0-startup-parked-cursor",
+        withExtension: "raw",
+        subdirectory: "Fixtures"
+    ))
+    let data = try Data(contentsOf: url)
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    session.resize(columns: 220, rows: 83)
+
+    var offset = 0
+    while offset < data.count {
+        let end = min(offset + 1_024, data.count)
+        session.ingestTestingData(data[offset..<end])
+        offset = end
+        try await Task.sleep(for: .milliseconds(4))
+    }
+
+    // The braille title spinner from MCP-client startup must decay and the
+    // composer far above the parked cursor must be found by the recheck.
+    try await Task.sleep(for: .milliseconds(5_000))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func identicalScreenRepaintDoesNotAdvanceContentVersion() async throws {
     let session = TerminalSession(
         title: "Claude",

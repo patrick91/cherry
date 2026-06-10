@@ -1143,9 +1143,6 @@ final class TerminalWorkspace: ObservableObject {
         selectSession(offset: 1, visibleCommandNames: visibleCommandNames)
     }
 
-    func interruptSelectedSession() {
-        selectedSession?.sendInterrupt()
-    }
 
     func restartSelectedSession() {
         selectedSession?.restart()
@@ -1549,6 +1546,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         self.hostInputWriter.setInputHandler { [weak self] data in
             self?.noteInputBurst(data)
+            self?.discardPendingOutputForInterrupt(in: data)
         }
 
         if launchShell {
@@ -1663,6 +1661,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let outboundData = normalize ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
             noteInputBurst(outboundData)
+            discardPendingOutputForInterrupt(in: outboundData)
         }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -1678,6 +1677,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         processor.discardPendingOutput()
         shellProcess?.writeUrgent(Data([0x03]))
+    }
+
+    /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
+    /// when host input carries ^C, drop output we've already queued
+    /// internally so the interrupt takes effect immediately even when a
+    /// flooding process has megabytes buffered ahead of it. Kitty-protocol
+    /// encodings of ^C don't match the raw byte — protocol-aware apps
+    /// manage their own interrupt handling.
+    private func discardPendingOutputForInterrupt(in outboundData: Data) {
+        guard outboundData.contains(0x03) else { return }
+        processor.discardPendingOutput()
     }
 
     func clearScrollback() {

@@ -232,12 +232,6 @@ struct CherryApp: App {
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
                 .disabled(focusedWorkspace == nil)
 
-                Button("Interrupt Active Tab") {
-                    keyWindowWorkspace?.interruptSelectedSession()
-                }
-                .keyboardShortcut("c", modifiers: [.control])
-                .disabled(focusedWorkspace == nil)
-
                 Button("Restart Active Tab") {
                     keyWindowWorkspace?.restartSelectedSession()
                 }

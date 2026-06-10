@@ -1420,6 +1420,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var lastOutputAt: Date?
     @Published private(set) var outputVersion = 0
     @Published private(set) var lastInputOutputVersion: Int?
+    @Published private(set) var lastContentChangeAt: Date?
+    @Published private(set) var contentVersion = 0
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
     private(set) var isEnhancedKeyboardProtocolActive = false
@@ -1461,10 +1463,31 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastSummaryInput: String?
     private var lastSummaryDate: Date?
     private var lastHumanInputLine: Int?
-    private var agentActivityStateIsLocked = false
+    private var agentActivitySource: AgentActivitySource = .none
+    private var titleIndicatesAgentWorking = false
+    private var lastStrongWorkingEvidenceAt: Date?
+    private var agentIdleConfirmationTask: Task<Void, Never>?
+    private var agentIdleRecheckTask: Task<Void, Never>?
+    private var lastContentFingerprint: Int?
+
+    enum AgentActivitySource {
+        case none
+        case summary
+        case outputActivity
+        case inputSubmit
+        case promptMarker
+        case workingMarker
+        case titleSpinner
+        case notification
+        case processExit
+    }
 
     private static let defaultMaxScrollback = 50_000
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
+    private static let agentIdleConfirmationEvidenceWindow: TimeInterval = 1.0
+    private static let agentIdleConfirmationDelay: TimeInterval = 0.4
+    private static let agentIdleRecheckQuietInterval: TimeInterval = 4.0
+    private static let contentFingerprintTailLineLimit = 40
     private static let summaryIdleInterval: TimeInterval = 2
     private static let summaryMaximumIdleWait: TimeInterval = 20
     private static let summaryTailLineLimit = 80
@@ -1671,6 +1694,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             ghosttyBridgeStorage?.reset()
         }
         lastHumanInputLine = nil
+        lastContentFingerprint = nil
         clearUnreadNotification()
         bumpRevision()
     }
@@ -1752,6 +1776,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         summaryDebounceTask = nil
         summaryTask?.cancel()
         summaryTask = nil
+        cancelAgentIdleConfirmation()
+        cancelAgentIdleRecheck()
         resetKeyboardProtocolState()
         lastHumanInputLine = nil
         outputHoldUntil = nil
@@ -1864,6 +1890,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastOutputAt = nil
         childProcessID = nil
         exitCode = nil
+        if kind == .agent {
+            cancelAgentIdleConfirmation()
+            cancelAgentIdleRecheck()
+            titleIndicatesAgentWorking = false
+            lastStrongWorkingEvidenceAt = nil
+            setAgentActivityState(.unknown, source: .none)
+        }
         bumpRevision()
 
         do {
@@ -1934,7 +1967,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         exitCode = status
         exitedAt = Date()
         if kind == .agent {
-            setAgentActivityState(status == 0 ? .idle : .error, locked: true)
+            cancelAgentIdleConfirmation()
+            cancelAgentIdleRecheck()
+            titleIndicatesAgentWorking = false
+            setAgentActivityState(status == 0 ? .idle : .error, source: .processExit)
         }
         resetKeyboardProtocolState()
         outputHoldUntil = nil
@@ -2005,12 +2041,37 @@ final class TerminalSession: ObservableObject, Identifiable {
             state = .live
         }
         outputVersion &+= 1
-        if kind == .agent {
+        let contentChanged = updateContentFingerprint()
+        if contentChanged {
+            lastContentChangeAt = Date()
+            contentVersion &+= 1
+        }
+        if kind == .agent, contentChanged {
             lastSummaryOutputChangeDate = Date()
             recordAgentActivitySignal()
+            if agentActivityState == .working {
+                scheduleAgentIdleRecheck()
+            }
         }
-        scheduleSummaryIfNeeded()
+        if contentChanged {
+            scheduleSummaryIfNeeded()
+        }
         bumpRevision()
+    }
+
+    private func updateContentFingerprint() -> Bool {
+        let lineCount = processor.lineCount
+        let tailStart = max(0, lineCount - Self.contentFingerprintTailLineLimit)
+        var hasher = Hasher()
+        hasher.combine(lineCount)
+        hasher.combine(processor.usesAlternateScreen)
+        for line in processor.snapshot(range: tailStart..<lineCount) {
+            hasher.combine(line)
+        }
+        let fingerprint = hasher.finalize()
+        guard fingerprint != lastContentFingerprint else { return false }
+        lastContentFingerprint = fingerprint
+        return true
     }
 
     private func noteInputBurst(_ input: Data) {
@@ -2018,8 +2079,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         if kind == .agent {
             if Self.agentInputSubmitsTurn(input) {
                 noteHumanInputIfNeeded()
-                agentActivityStateIsLocked = false
-                setAgentActivityState(.working)
+                setAgentActivityState(.working, source: .inputSubmit)
+                scheduleAgentIdleRecheck()
             }
         }
     }
@@ -2099,31 +2160,63 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         let body = notification.body
         if Self.notificationBodyIndicatesPermission(body) {
-            setAgentActivityState(.permission, locked: true)
+            setAgentActivityState(.permission, source: .notification)
             return .passThrough
         }
         if Self.notificationBodyIndicatesCompletion(body) {
-            setAgentActivityState(.idle, locked: true)
+            setAgentActivityState(.idle, source: .notification)
             clearUnreadNotification()
             return .suppress
         }
         return .passThrough
     }
 
+    private var agentStateHasDirectEvidence: Bool {
+        switch agentActivitySource {
+        case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit:
+            true
+        case .none, .summary, .outputActivity, .inputSubmit:
+            false
+        }
+    }
+
+    // Agents without a recognizable prompt/working UI (e.g. plain REPLs) only
+    // ever produce weak evidence; idle waits fall back to quiet windows for them.
+    var agentActivityEvidenceIsStrong: Bool {
+        kind == .agent && agentStateHasDirectEvidence
+    }
+
     private func applySummaryActivityState(_ nextState: AgentActivityState) -> Bool {
         guard agentActivityState != nextState else { return false }
-        if agentActivityStateIsLocked {
-            if nextState == .working { return false }
-            if agentActivityState == .idle, nextState == .permission { return false }
-        }
-        setAgentActivityState(nextState, locked: nextState == .permission || nextState == .error)
+        guard !agentStateHasDirectEvidence else { return false }
+        setAgentActivityState(nextState, source: .summary)
         return true
     }
 
     @discardableResult
-    private func recordAgentTitleActivity(_: String) -> Bool {
-        guard agentUsesTitleActivitySignals else { return false }
-        return recordAgentActivitySignal()
+    private func recordAgentTitleActivity(_ title: String) -> Bool {
+        guard kind == .agent else { return false }
+
+        let spinnerActive = Self.titleIndicatesAgentWorking(title)
+        let spinnerCleared = titleIndicatesAgentWorking && !spinnerActive
+        titleIndicatesAgentWorking = spinnerActive
+
+        if spinnerActive {
+            lastStrongWorkingEvidenceAt = Date()
+            scheduleAgentIdleRecheck()
+            return markAgentWorking(source: .titleSpinner)
+        }
+        if spinnerCleared || agentUsesTitleActivitySignals {
+            return recordAgentActivitySignal()
+        }
+        return false
+    }
+
+    private static func titleIndicatesAgentWorking(_ title: String) -> Bool {
+        guard let first = title.trimmingCharacters(in: .whitespaces).unicodeScalars.first else {
+            return false
+        }
+        return (0x2800...0x28FF).contains(Int(first.value))
     }
 
     private var agentUsesTitleActivitySignals: Bool {
@@ -2142,11 +2235,127 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     @discardableResult
     private func recordAgentActivitySignal() -> Bool {
-        guard kind == .agent, !agentActivityStateIsLocked else { return false }
-        if renderedOutputShowsAgentInputPrompt() {
-            return markAgentIdleFromRenderedOutput()
+        guard kind == .agent else { return false }
+        guard agentActivitySource != .processExit else { return false }
+
+        if renderedOutputShowsAgentWorkingMarker() {
+            return markAgentWorking(source: .workingMarker)
         }
-        return setAgentActivityState(.working)
+        if titleIndicatesAgentWorking {
+            return markAgentWorking(source: .titleSpinner)
+        }
+        if renderedOutputShowsAgentInputPrompt() {
+            return requestAgentIdleFromRenderedOutput()
+        }
+        guard !agentStateResistsOutputActivity else { return false }
+        return setAgentActivityState(.working, source: .outputActivity)
+    }
+
+    private var agentStateResistsOutputActivity: Bool {
+        if agentActivityState == .permission || agentActivityState == .error {
+            return true
+        }
+        switch agentActivitySource {
+        case .promptMarker, .notification, .processExit:
+            return true
+        case .none, .summary, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func markAgentWorking(source: AgentActivitySource) -> Bool {
+        guard agentActivitySource != .processExit else { return false }
+        guard agentActivityState != .permission, agentActivityState != .error else { return false }
+        cancelAgentIdleConfirmation()
+        if source == .workingMarker || source == .titleSpinner {
+            lastStrongWorkingEvidenceAt = Date()
+        }
+        return setAgentActivityState(.working, source: source)
+    }
+
+    @discardableResult
+    private func requestAgentIdleFromRenderedOutput() -> Bool {
+        guard agentActivitySource != .processExit else { return false }
+        guard agentActivityState != .permission, agentActivityState != .error else { return false }
+
+        if let lastStrongWorkingEvidenceAt,
+           Date().timeIntervalSince(lastStrongWorkingEvidenceAt) < Self.agentIdleConfirmationEvidenceWindow {
+            scheduleAgentIdleConfirmation()
+            return false
+        }
+        cancelAgentIdleConfirmation()
+        return setAgentActivityState(.idle, source: .promptMarker)
+    }
+
+    private func scheduleAgentIdleConfirmation() {
+        guard agentIdleConfirmationTask == nil else { return }
+        agentIdleConfirmationTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleConfirmationDelay * 1_000)))
+            guard let self, !Task.isCancelled else { return }
+            self.agentIdleConfirmationTask = nil
+            self.confirmAgentIdleIfStillAtPrompt()
+        }
+    }
+
+    private func cancelAgentIdleConfirmation() {
+        agentIdleConfirmationTask?.cancel()
+        agentIdleConfirmationTask = nil
+    }
+
+    private func confirmAgentIdleIfStillAtPrompt() {
+        guard kind == .agent, agentActivitySource != .processExit else { return }
+        guard agentActivityState != .permission, agentActivityState != .error else { return }
+        guard !renderedOutputShowsAgentWorkingMarker(), !titleIndicatesAgentWorking else { return }
+        guard renderedOutputShowsAgentInputPrompt() else { return }
+        setAgentActivityState(.idle, source: .promptMarker)
+    }
+
+    private func scheduleAgentIdleRecheck() {
+        guard kind == .agent else { return }
+        agentIdleRecheckTask?.cancel()
+        agentIdleRecheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleRecheckQuietInterval * 1_000)))
+            guard let self, !Task.isCancelled else { return }
+            self.agentIdleRecheckTask = nil
+            self.recheckAgentActivityAfterQuiet()
+        }
+    }
+
+    private func cancelAgentIdleRecheck() {
+        agentIdleRecheckTask?.cancel()
+        agentIdleRecheckTask = nil
+    }
+
+    private func recheckAgentActivityAfterQuiet() {
+        guard kind == .agent, agentActivityState == .working else { return }
+        guard agentActivitySource != .processExit else { return }
+        guard !renderedOutputShowsAgentWorkingMarker(), !titleIndicatesAgentWorking else { return }
+
+        let lineCount = processor.lineCount
+        guard lineCount > 0 else { return }
+        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+        let scanLines = processor.snapshot(range: scanStart..<lineCount)
+        let promptLines = agentPromptWindowLines(
+            scanStart: scanStart,
+            scanLines: scanLines,
+            applyInputFloor: false
+        )
+        let promptVisible = promptLines.contains { line in
+            Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
+        } || Self.outputContainsAgentInputMarker(scanLines, normalizedAgentName: normalizedAgentName)
+        guard promptVisible else { return }
+        setAgentActivityState(.idle, source: .promptMarker)
+    }
+
+    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
+        let lineCount = processor.lineCount
+        guard lineCount > 0 else { return false }
+        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+        let markerLines = processor.snapshot(range: markerStart..<lineCount)
+        return Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName)
     }
 
     private func renderedOutputShowsAgentInputPrompt() -> Bool {
@@ -2160,13 +2369,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             return false
         }
 
-        let promptStart = Self.agentInputPromptSearchStart(
-            lineCount: lineCount,
-            lastHumanInputLine: lastHumanInputLine
+        let promptLines = agentPromptWindowLines(
+            scanStart: markerStart,
+            scanLines: markerLines,
+            applyInputFloor: true
         )
-        guard promptStart < lineCount else { return false }
-
-        let promptLines = processor.snapshot(range: promptStart..<lineCount)
         if promptLines.contains(where: { line in
             Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
         }) {
@@ -2176,10 +2383,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         return Self.outputContainsAgentInputMarker(markerLines, normalizedAgentName: normalizedAgentName)
     }
 
-    @discardableResult
-    private func markAgentIdleFromRenderedOutput() -> Bool {
-        agentActivityStateIsLocked = true
-        return setAgentActivityState(.idle, locked: true)
+    // Alternate-screen grids and PTY echo can leave blank rows below the visible
+    // content, so the prompt window is anchored to the last non-blank row.
+    private func agentPromptWindowLines(
+        scanStart: Int,
+        scanLines: [String],
+        applyInputFloor: Bool
+    ) -> [String] {
+        var effectiveEndOffset = scanLines.count
+        while effectiveEndOffset > 0,
+              scanLines[effectiveEndOffset - 1]
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+                  .isEmpty {
+            effectiveEndOffset -= 1
+        }
+        guard effectiveEndOffset > 0 else { return [] }
+
+        let effectiveEnd = scanStart + effectiveEndOffset
+        let promptStart = Self.agentInputPromptSearchStart(
+            lineCount: effectiveEnd,
+            lastHumanInputLine: applyInputFloor ? lastHumanInputLine : nil
+        )
+        guard promptStart < effectiveEnd, promptStart >= scanStart else { return [] }
+        return Array(scanLines[(promptStart - scanStart)..<effectiveEndOffset])
     }
 
     private static let agentInputPromptTailLineLimit = 8
@@ -2187,8 +2413,12 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private static func agentInputPromptSearchStart(lineCount: Int, lastHumanInputLine: Int?) -> Int {
         let tailStart = max(0, lineCount - agentInputPromptTailLineLimit)
-        guard let lastHumanInputLine else { return tailStart }
-        guard lastHumanInputLine <= lineCount else { return tailStart }
+        guard let lastHumanInputLine, lastHumanInputLine < lineCount else {
+            // Fixed-size screens (alternate-screen TUIs) repaint in place, so the
+            // buffer never grows past the line recorded at submit time; a floor
+            // there would disable idle detection permanently.
+            return tailStart
+        }
         return max(lastHumanInputLine, tailStart)
     }
 
@@ -2236,13 +2466,19 @@ final class TerminalSession: ObservableObject, Identifiable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .joined(separator: "\n")
 
-        if output.contains("working (") && output.contains("esc to interrupt") {
+        // Claude Code 2.x and Codex both surface "esc to interrupt" only while a
+        // turn is in flight; older Codex builds used "Working (Xs · esc to interrupt)".
+        if output.contains("esc to interrupt") {
+            return true
+        }
+        if output.contains("working (") {
             return true
         }
 
         guard normalizedAgentName == "claude" else { return false }
         return output.contains("whisking")
             || output.contains("still thinking")
+            || output.contains("shell still running")
     }
 
     private static let agentCompletionPhrases: [String] = [
@@ -2326,11 +2562,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     @discardableResult
-    private func setAgentActivityState(_ nextState: AgentActivityState, locked: Bool = false) -> Bool {
+    private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
         guard kind == .agent else { return false }
         let stateChanged = agentActivityState != nextState
         agentActivityState = nextState
-        agentActivityStateIsLocked = locked
+        agentActivitySource = source
         guard stateChanged else { return false }
         bumpRevision()
         return true
@@ -2531,9 +2767,15 @@ final class TerminalSession: ObservableObject, Identifiable {
             .filter { !$0.isEmpty }
         let lines = inputLines.filter { !Self.shouldDropSummaryLine($0) }
         let text = lines.joined(separator: "\n")
-        let trimmedText = text.count > Self.summaryMaximumCharacters
+        var trimmedText = text.count > Self.summaryMaximumCharacters
             ? String(text.suffix(Self.summaryMaximumCharacters))
             : text
+        if kind == .agent {
+            let promptVisible = !renderedOutputShowsAgentWorkingMarker()
+                && !titleIndicatesAgentWorking
+                && renderedOutputShowsAgentInputPrompt()
+            trimmedText += "\n[terminal status: input prompt waiting for user = \(promptVisible ? "yes" : "no")]"
+        }
         return SummaryTranscript(
             text: trimmedText,
             inputLineCount: inputLines.count,

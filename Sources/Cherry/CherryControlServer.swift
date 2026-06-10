@@ -1000,7 +1000,11 @@ final class CherryControlServer: @unchecked Sendable {
             agentName: session.agentName,
             commandName: session.commandName,
             parentAgentID: session.parentAgentID?.uuidString,
-            childAgentCount: workspace.childAgentCount(of: session)
+            childAgentCount: workspace.childAgentCount(of: session),
+            agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
+            usesAlternateScreen: session.usesAlternateScreen,
+            lastContentChangeAt: session.lastContentChangeAt,
+            contentVersion: session.contentVersion
         )
     }
 
@@ -1259,6 +1263,7 @@ final class CherryControlServer: @unchecked Sendable {
                 sinceOutputVersion: sinceOutputVersion,
                 outputVersion: session.outputVersion,
                 lastOutputAt: session.lastOutputAt,
+                agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
                 output: terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
             )
         }
@@ -1277,7 +1282,30 @@ final class CherryControlServer: @unchecked Sendable {
             }
 
             let now = Date()
-            if ProcessIdleDetector.isQuiet(
+            if session.kind == .agent, session.agentActivityState != .unknown {
+                let quietInterval = TimeInterval(quietMilliseconds) / 1_000
+                let contentQuietSince = session.lastContentChangeAt ?? startedAt
+                let contentIsQuiet = (!requireNewOutput || observedNewOutput)
+                    && now.timeIntervalSince(contentQuietSince) >= quietInterval
+
+                switch session.agentActivityState {
+                case .permission:
+                    return result(reason: .permission)
+                case .error:
+                    return result(reason: .agentError)
+                case .idle:
+                    if contentIsQuiet {
+                        return result(reason: .idle)
+                    }
+                case .working, .unknown:
+                    // Agents without recognizable prompt/working UI never reach
+                    // .idle on their own; fall back to the content-quiet window
+                    // unless a provider-specific working signal is active.
+                    if !session.agentActivityEvidenceIsStrong, contentIsQuiet {
+                        return result(reason: .idle)
+                    }
+                }
+            } else if ProcessIdleDetector.isQuiet(
                 now: now,
                 lastOutputAt: session.lastOutputAt,
                 startedAt: startedAt,
@@ -2180,6 +2208,8 @@ final class CherryControlServer: @unchecked Sendable {
             endLineExclusive: endLine,
             totalLines: totalLines,
             outputVersion: session.outputVersion,
+            screen: session.usesAlternateScreen ? "alternate" : "primary",
+            contentVersion: session.contentVersion,
             lines: lines
         )
     }
@@ -2188,12 +2218,31 @@ final class CherryControlServer: @unchecked Sendable {
     private func rawOutput(for session: TerminalSession, maxBytes requestedMaxBytes: Int?) -> TerminalRawOutputResult {
         let maxBytes = min(max(requestedMaxBytes ?? 65_536, 1), 1_048_576)
         let snapshot = session.rawOutput(maxBytes: maxBytes)
+        let data = snapshot.truncated
+            ? Self.trimmedRawOutputSuffix(snapshot.data)
+            : snapshot.data
         return TerminalRawOutputResult(
             terminalID: session.id.uuidString,
-            text: String(decoding: snapshot.data, as: UTF8.self),
-            byteCount: snapshot.data.count,
+            text: String(decoding: data, as: UTF8.self),
+            byteCount: data.count,
             truncated: snapshot.truncated
         )
+    }
+
+    // A truncated raw-output suffix can start mid-UTF-8-codepoint or in the
+    // middle of an escape sequence; trim to the first clean decode boundary.
+    nonisolated static func trimmedRawOutputSuffix(_ data: Data) -> Data {
+        var bytes = data[...]
+        while let first = bytes.first, (0x80...0xBF).contains(first) {
+            bytes = bytes.dropFirst()
+        }
+        if let first = bytes.first, first != 0x1B, (0x30...0x3F).contains(first) {
+            let window = bytes.prefix(256)
+            if let boundary = window.firstIndex(where: { $0 == 0x1B || $0 == 0x0A }) {
+                bytes = bytes[boundary...]
+            }
+        }
+        return Data(bytes)
     }
 
     @MainActor

@@ -2157,6 +2157,11 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private var cursorShape = TerminalCursorShape.block
     private var isCursorVisible = true
     private var primaryScreenTopRow: Int?
+    private var primaryScrollRegion: (top: Int, bottom: Int)?
+    private var alternateScrollRegion: (top: Int, bottom: Int)?
+    private var savedPrimaryCursor: (row: Int, column: Int)?
+    private var savedAlternateCursor: (row: Int, column: Int)?
+    private var lastPrintedCharacter: Character?
 
     init(maxScrollback: Int?) {
         self.maxScrollback = maxScrollback
@@ -2260,6 +2265,11 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         cursorShape = .block
         isCursorVisible = true
         primaryScreenTopRow = nil
+        primaryScrollRegion = nil
+        alternateScrollRegion = nil
+        savedPrimaryCursor = nil
+        savedAlternateCursor = nil
+        lastPrintedCharacter = nil
     }
 
     mutating func clearScreenAndScrollbackPreservingState() {
@@ -2424,6 +2434,30 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         screenTopRow + viewportRowCount - 1
     }
 
+    private var activeScrollRegion: (top: Int, bottom: Int)? {
+        get {
+            isUsingAlternateScreen ? alternateScrollRegion : primaryScrollRegion
+        }
+        set {
+            if isUsingAlternateScreen {
+                alternateScrollRegion = newValue
+            } else {
+                primaryScrollRegion = newValue
+            }
+        }
+    }
+
+    private var scrollBounds: (top: Int, bottom: Int) {
+        guard let region = activeScrollRegion else {
+            return (screenTopRow, screenBottomRow)
+        }
+
+        let top = screenTopRow + min(max(0, region.top), viewportRowCount - 1)
+        let bottom = min(screenTopRow + max(0, region.bottom), screenBottomRow)
+        guard top <= bottom else { return (screenTopRow, screenBottomRow) }
+        return (top, bottom)
+    }
+
     private func activeLineText(at row: Int) -> String {
         line(at: row) ?? ""
     }
@@ -2527,13 +2561,13 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             parserState = .escape
         case 0x0A:
             flushPendingText()
-            appendNewLine()
+            lineFeed(resetColumn: true)
         case 0x0D:
             flushPendingText()
             cursorColumn = 0
         case 0x08, 0x7F:
             flushPendingText()
-            removeCharacterBeforeCursor()
+            cursorColumn = max(0, cursorColumn - 1)
         case 0x09:
             flushPendingText()
             let spaces = max(1, 8 - (cursorColumn % 8))
@@ -2560,7 +2594,19 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         case UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"), UInt8(ascii: "+"):
             parserState = .charsetDesignation
         case UInt8(ascii: "M"):
-            moveCursorRow(by: -1)
+            reverseIndex()
+            parserState = .ground
+        case UInt8(ascii: "D"):
+            lineFeed(resetColumn: false)
+            parserState = .ground
+        case UInt8(ascii: "E"):
+            lineFeed(resetColumn: true)
+            parserState = .ground
+        case UInt8(ascii: "7"):
+            saveCursor()
+            parserState = .ground
+        case UInt8(ascii: "8"):
+            restoreCursor()
             parserState = .ground
         default:
             parserState = .ground
@@ -2681,6 +2727,34 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             handleCursorRestoreOrKeyboardProtocol(rawPayload: payload, responses: &responses)
         case "q":
             applyCursorShape(parameter(at: 0, default: 0))
+        case "s":
+            guard payload.isEmpty else { return }
+            saveCursor()
+        case "r":
+            guard payload.first != "?" else { return }
+            setScrollRegion(top: parameter(at: 0, default: 1), bottom: parameter(at: 1, default: viewportRowCount))
+        case "S":
+            guard payload.first != "?" else { return }
+            scrollRowsUp(top: scrollBounds.top, bottom: scrollBounds.bottom, count: parameter(at: 0, default: 1))
+        case "T":
+            guard payload.isEmpty || parameters.count == 1 else { return }
+            scrollRowsDown(top: scrollBounds.top, bottom: scrollBounds.bottom, count: parameter(at: 0, default: 1))
+        case "L":
+            insertLines(parameter(at: 0, default: 1))
+        case "M":
+            deleteLines(parameter(at: 0, default: 1))
+        case "P":
+            deleteCharacters(parameter(at: 0, default: 1))
+        case "@":
+            insertBlankCharacters(parameter(at: 0, default: 1))
+        case "X":
+            eraseCharacters(parameter(at: 0, default: 1))
+        case "d":
+            moveCursor(toScreenRow: parameter(at: 0, default: 1) - 1, column: cursorColumn)
+        case "`":
+            cursorColumn = max(0, parameter(at: 0, default: 1) - 1)
+        case "b":
+            repeatLastPrintedCharacter(parameter(at: 0, default: 1))
         case "A":
             moveCursorRow(by: -parameter(at: 0, default: 1))
         case "B":
@@ -2725,6 +2799,8 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             responses.append(Data("\u{1B}[?0u".utf8))
         case ">", "<", "=":
             return
+        case nil:
+            restoreCursor()
         default:
             return
         }
@@ -2797,11 +2873,25 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
                 isApplicationCursorMode = isSet
             case 25:
                 isCursorVisible = isSet
-            case 47, 1047, 1049:
+            case 47, 1047:
                 if isSet {
                     enterAlternateScreen()
                 } else {
                     leaveAlternateScreen()
+                }
+            case 1048:
+                if isSet {
+                    saveCursor()
+                } else {
+                    restoreCursor()
+                }
+            case 1049:
+                if isSet {
+                    saveCursor()
+                    enterAlternateScreen()
+                } else if isUsingAlternateScreen {
+                    leaveAlternateScreen()
+                    restoreCursor()
                 }
             case 1000:
                 currentMouseState.trackingMode = isSet ? .normal : .disabled
@@ -2858,6 +2948,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     private mutating func appendText(_ text: String) {
         guard !text.isEmpty else { return }
 
+        lastPrintedCharacter = text.last
         ensureActiveLineExists(at: cursorRow)
         var line = activeLineText(at: cursorRow)
         if cursorColumn <= 0 {
@@ -2886,8 +2977,24 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         cursorColumn += text.count
     }
 
-    private mutating func appendNewLine() {
+    private mutating func lineFeed(resetColumn: Bool) {
         ensureActiveLineExists(at: cursorRow)
+        if resetColumn {
+            cursorColumn = 0
+        }
+
+        if activeScrollRegion != nil {
+            let bounds = scrollBounds
+            if cursorRow == bounds.bottom {
+                scrollRowsUp(top: bounds.top, bottom: bounds.bottom, count: 1)
+            } else if cursorRow < screenBottomRow {
+                cursorRow += 1
+                ensureActiveLineExists(at: cursorRow)
+            }
+            trimIfNeeded()
+            return
+        }
+
         if cursorRow >= activeCompletedLineCount {
             appendCompletedLine(activeCurrentLineText)
             clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
@@ -2896,18 +3003,136 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             cursorRow = min(cursorRow + 1, screenBottomRow)
             ensureActiveLineExists(at: cursorRow)
         }
-        cursorColumn = 0
         trimIfNeeded()
     }
 
-    private mutating func removeCharacterBeforeCursor() {
+    private mutating func reverseIndex() {
+        ensureActiveLineExists(at: cursorRow)
+        let bounds = scrollBounds
+        if cursorRow == bounds.top, activeScrollRegion != nil || isUsingAlternateScreen {
+            scrollRowsDown(top: bounds.top, bottom: bounds.bottom, count: 1)
+            return
+        }
+
+        moveCursorRow(by: -1)
+    }
+
+    private mutating func setScrollRegion(top: Int, bottom: Int) {
+        let maximumRow = viewportRowCount - 1
+        let normalizedTop = min(max(top - 1, 0), maximumRow)
+        let normalizedBottom = min(max(bottom - 1, 0), maximumRow)
+        if normalizedTop == 0, normalizedBottom == maximumRow {
+            activeScrollRegion = nil
+        } else {
+            guard normalizedTop < normalizedBottom else { return }
+            activeScrollRegion = (top: normalizedTop, bottom: normalizedBottom)
+        }
+        moveCursor(toScreenRow: 0, column: 0)
+    }
+
+    private mutating func scrollRowsUp(top: Int, bottom: Int, count: Int) {
+        guard count > 0, top <= bottom else { return }
+
+        var rows = (top...bottom).map { activeLineText(at: $0) }
+        let amount = min(count, rows.count)
+        rows.removeFirst(amount)
+        rows.append(contentsOf: Array(repeating: "", count: amount))
+        replaceRows(rows, startingAt: top)
+    }
+
+    private mutating func scrollRowsDown(top: Int, bottom: Int, count: Int) {
+        guard count > 0, top <= bottom else { return }
+
+        var rows = (top...bottom).map { activeLineText(at: $0) }
+        let amount = min(count, rows.count)
+        rows.removeLast(amount)
+        rows.insert(contentsOf: Array(repeating: "", count: amount), at: 0)
+        replaceRows(rows, startingAt: top)
+    }
+
+    private mutating func replaceRows(_ rows: [String], startingAt top: Int) {
+        guard !rows.isEmpty else { return }
+
+        ensureActiveLineExists(at: top + rows.count - 1)
+        for (offset, text) in rows.enumerated() {
+            setActiveLineText(text, at: top + offset)
+        }
+    }
+
+    private mutating func insertLines(_ count: Int) {
+        guard count > 0 else { return }
+
+        let bounds = scrollBounds
+        guard cursorRow >= bounds.top, cursorRow <= bounds.bottom else { return }
+        scrollRowsDown(top: cursorRow, bottom: bounds.bottom, count: count)
+    }
+
+    private mutating func deleteLines(_ count: Int) {
+        guard count > 0 else { return }
+
+        let bounds = scrollBounds
+        guard cursorRow >= bounds.top, cursorRow <= bounds.bottom else { return }
+        scrollRowsUp(top: cursorRow, bottom: bounds.bottom, count: count)
+    }
+
+    private mutating func deleteCharacters(_ count: Int) {
+        guard count > 0 else { return }
+
         ensureActiveLineExists(at: cursorRow)
         var line = activeLineText(at: cursorRow)
-        guard cursorColumn > 0, !line.isEmpty else { return }
-        let removalColumn = cursorColumn - 1
-        line.replaceByCharacterColumns(removalColumn..<cursorColumn, with: "")
+        guard cursorColumn < line.count else { return }
+        line.replaceByCharacterColumns(cursorColumn..<(cursorColumn + count), with: "")
         setActiveLineText(line, at: cursorRow)
-        cursorColumn = removalColumn
+    }
+
+    private mutating func insertBlankCharacters(_ count: Int) {
+        guard count > 0 else { return }
+
+        ensureActiveLineExists(at: cursorRow)
+        var line = activeLineText(at: cursorRow)
+        guard cursorColumn < line.count else { return }
+
+        let maximumLength = max(max(1, currentViewportSize.columns), line.count)
+        let insertCount = min(count, maximumLength - cursorColumn)
+        guard insertCount > 0 else { return }
+        line.replaceByCharacterColumns(cursorColumn..<cursorColumn, with: String(repeating: " ", count: insertCount))
+        if line.count > maximumLength {
+            line = line.substringByCharacterColumns(0..<maximumLength)
+        }
+        setActiveLineText(line, at: cursorRow)
+    }
+
+    private mutating func eraseCharacters(_ count: Int) {
+        guard count > 0 else { return }
+
+        ensureActiveLineExists(at: cursorRow)
+        var line = activeLineText(at: cursorRow)
+        guard cursorColumn < line.count else { return }
+
+        let upperBound = min(cursorColumn + count, line.count)
+        line.replaceByCharacterColumns(cursorColumn..<upperBound, with: String(repeating: " ", count: upperBound - cursorColumn))
+        setActiveLineText(line, at: cursorRow)
+    }
+
+    private mutating func repeatLastPrintedCharacter(_ count: Int) {
+        guard count > 0, let lastPrintedCharacter else { return }
+
+        let repeatCount = min(count, max(1, currentViewportSize.columns))
+        appendText(String(repeating: String(lastPrintedCharacter), count: repeatCount))
+    }
+
+    private mutating func saveCursor() {
+        let saved = (row: max(0, cursorRow - screenTopRow), column: max(0, cursorColumn))
+        if isUsingAlternateScreen {
+            savedAlternateCursor = saved
+        } else {
+            savedPrimaryCursor = saved
+        }
+    }
+
+    private mutating func restoreCursor() {
+        guard let saved = isUsingAlternateScreen ? savedAlternateCursor : savedPrimaryCursor else { return }
+        moveCursor(toScreenRow: saved.row, column: saved.column)
     }
 
     private mutating func moveCursorRow(by delta: Int) {
@@ -2930,6 +3155,12 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         case 0:
             eraseInLine(mode: 0)
             makeActiveLineCurrent(at: cursorRow)
+        case 1:
+            ensureActiveLineExists(at: cursorRow)
+            for row in screenTopRow..<cursorRow {
+                setActiveLineText("", at: row)
+            }
+            eraseInLine(mode: 1)
         case 2 where isUsingAlternateScreen:
             clearActiveCompletedLines(keepingCapacity: false)
             clearCurrentLine(keepingCapacity: false)
@@ -3004,15 +3235,36 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         isUsingAlternateScreen = true
         alternateCompletedLines.removeAll(keepingCapacity: false)
         alternateCurrentLine.removeAll(keepingCapacity: false)
+        alternateScrollRegion = nil
+        savedAlternateCursor = nil
         cursorRow = 0
         cursorColumn = 0
     }
 
     private mutating func leaveAlternateScreen() {
         guard isUsingAlternateScreen else { return }
+
+        var retainedLines = alternateCompletedLines
+        retainedLines.append(alternateCurrentLine)
+        while let last = retainedLines.last, last.allSatisfy(\.isWhitespace) {
+            retainedLines.removeLast()
+        }
+
         alternateCompletedLines.removeAll(keepingCapacity: false)
         alternateCurrentLine.removeAll(keepingCapacity: false)
+        alternateScrollRegion = nil
+        savedAlternateCursor = nil
         isUsingAlternateScreen = false
+
+        if !retainedLines.isEmpty {
+            if !currentLine.isEmpty {
+                completedLines.append(currentLine)
+                currentLine.removeAll(keepingCapacity: true)
+            }
+            completedLines.append(contentsOf: retainedLines)
+            trimIfNeeded()
+        }
+
         cursorRow = max(0, lineCount - 1)
         cursorColumn = activeCurrentLineCount
     }

@@ -1033,6 +1033,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let commandName: String?
     public let parentAgentID: String?
     public let childAgentCount: Int?
+    public let agentActivityState: String?
+    public let usesAlternateScreen: Bool?
+    public let lastContentChangeAt: Date?
+    public let contentVersion: Int?
 
     public init(
         id: String,
@@ -1056,7 +1060,11 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         agentName: String?,
         commandName: String?,
         parentAgentID: String? = nil,
-        childAgentCount: Int? = nil
+        childAgentCount: Int? = nil,
+        agentActivityState: String? = nil,
+        usesAlternateScreen: Bool? = nil,
+        lastContentChangeAt: Date? = nil,
+        contentVersion: Int? = nil
     ) {
         self.id = id
         self.link = link
@@ -1080,6 +1088,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.commandName = commandName
         self.parentAgentID = parentAgentID
         self.childAgentCount = childAgentCount
+        self.agentActivityState = agentActivityState
+        self.usesAlternateScreen = usesAlternateScreen
+        self.lastContentChangeAt = lastContentChangeAt
+        self.contentVersion = contentVersion
     }
 }
 
@@ -1184,6 +1196,8 @@ public enum ProcessIdleWaitReason: String, Codable, Equatable, Sendable {
     case idle
     case exited
     case timedOut = "timed_out"
+    case permission
+    case agentError = "agent_error"
 }
 
 public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
@@ -1194,6 +1208,7 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
     public let sinceOutputVersion: Int
     public let outputVersion: Int
     public let lastOutputAt: Date?
+    public let agentActivityState: String?
     public let output: TerminalOutputResult
 
     public init(
@@ -1203,6 +1218,7 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
         sinceOutputVersion: Int,
         outputVersion: Int,
         lastOutputAt: Date?,
+        agentActivityState: String? = nil,
         output: TerminalOutputResult
     ) {
         self.process = process
@@ -1212,6 +1228,7 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
         self.sinceOutputVersion = sinceOutputVersion
         self.outputVersion = outputVersion
         self.lastOutputAt = lastOutputAt
+        self.agentActivityState = agentActivityState
         self.output = output
     }
 }
@@ -1719,6 +1736,8 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
     public let endLineExclusive: Int
     public let totalLines: Int
     public let outputVersion: Int
+    public let screen: String?
+    public let contentVersion: Int?
     public let lines: [String]
 
     public init(
@@ -1727,6 +1746,8 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
         endLineExclusive: Int,
         totalLines: Int,
         outputVersion: Int = 0,
+        screen: String? = nil,
+        contentVersion: Int? = nil,
         lines: [String]
     ) {
         self.terminalID = terminalID
@@ -1734,6 +1755,8 @@ public struct TerminalOutputResult: Codable, Equatable, Sendable {
         self.endLineExclusive = endLineExclusive
         self.totalLines = totalLines
         self.outputVersion = outputVersion
+        self.screen = screen
+        self.contentVersion = contentVersion
         self.lines = lines
     }
 }

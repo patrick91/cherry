@@ -5115,6 +5115,208 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(session.agentActivityState == .idle)
 }
 
+private func claudeAlternateScreenFrame(rows: [String]) -> Data {
+    var payload = ""
+    for (index, row) in rows.enumerated() {
+        payload += "\u{1B}[\(index + 1);1H\(row)\u{1B}[K"
+    }
+    return Data(payload.utf8)
+}
+
+@MainActor
+@Test func claudeAlternateScreenIdlePromptClearsWorkingAfterSubmit() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Claude",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "Claude Code v2.1.170",
+        "",
+        "────────────────────────────",
+        "❯ Try \"fix lint errors\"",
+        "────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ]))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    session.send(text: "run the probe\n")
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "❯ run the probe",
+        "",
+        "✻ Stewing…",
+        "❯ ",
+        "────────────────────────────",
+        "  ⏵⏵ bypass permissions on · esc to interrupt"
+    ]))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "❯ run the probe",
+        "⏺ Done!",
+        "✻ Cooked for 4s",
+        "❯ ",
+        "────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ]))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    try await Task.sleep(for: .milliseconds(700))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func claudeBackgroundShellStatusKeepsAgentWorkingIndicator() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    session.applyAutomaticSummary(
+        "Running probe command",
+        useAsTitle: true,
+        agentActivityState: .working
+    )
+
+    session.ingestTestingData(Data("""
+    ⏺ The command is running in the background.
+    ✻ Sautéed for 23s · 1 shell still running
+    ❯
+      ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func brailleSpinnerTitleMarksAgentWorkingAndClearedTitleRestoresIdle() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.ingestTestingData(Data("""
+    Finished previous turn
+    \u{203A} Summarize recent commits
+    gpt-5.5 xhigh fast · ~/github/patrick91/cherry
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    session.ingestTestingData(Data("\u{1B}]0;⠹ cherry\u{7}".utf8))
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+
+    session.ingestTestingData(Data("\u{1B}]0;cherry\u{7}".utf8))
+    try await Task.sleep(for: .milliseconds(700))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
+@Test func identicalScreenRepaintDoesNotAdvanceContentVersion() async throws {
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Claude"
+    )
+
+    let frame = claudeAlternateScreenFrame(rows: [
+        "⏺ Done!",
+        "❯ ",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    ])
+    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
+    session.ingestTestingData(frame)
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    let contentVersionBefore = session.contentVersion
+    let outputVersionBefore = session.outputVersion
+    session.ingestTestingData(frame)
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.contentVersion == contentVersionBefore)
+    #expect(session.outputVersion > outputVersionBefore)
+    #expect(session.agentActivityState == .idle)
+}
+
+@MainActor
+@Test func emptySubmitOnIdlePromptRecoversToIdleAfterQuietRecheck() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Claude",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
+        "❯ Try \"fix lint errors\"",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    ]))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .idle)
+
+    session.send(text: "\n")
+    #expect(session.agentActivityState == .working)
+
+    try await Task.sleep(for: .milliseconds(4_700))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
 @MainActor
 @Test func terminalSidebarOmitsGenericShellSubtitle() async throws {
     let session = TerminalSession(
@@ -7563,7 +7765,12 @@ private func serviceRecord(
     buffer.ingest(Data("\u{1B}[?1049hfullscreen\r\nstatus\r\n\u{1B}[?1049l".utf8))
 
     #expect(!buffer.usesAlternateScreen)
-    #expect(buffer.snapshot(range: 0..<buffer.lineCount) == ["alpha", "bravo", "charlie"])
+    let lines = buffer.snapshot(range: 0..<buffer.lineCount)
+    #expect(Array(lines.prefix(3)) == ["alpha", "bravo", "charlie"])
+    // The final alternate-screen frame is retained in scrollback so MCP readers
+    // and activity heuristics can still see what the TUI last displayed.
+    #expect(lines.contains("fullscreen"))
+    #expect(lines.contains("status"))
 }
 
 @Test func liveTerminalOutputBufferPreservesScrollbackAcrossPrimaryScreenClear() async throws {

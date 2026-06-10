@@ -53,6 +53,9 @@ let package = Package(
                 "CherryControl",
                 "CherryMCP",
                 .product(name: "MCP", package: "swift-sdk"),
+            ],
+            resources: [
+                .copy("Fixtures")
             ]
         ),
     ],

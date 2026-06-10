@@ -54,6 +54,26 @@ Use process tools for new automation:
 The older terminal-tab MCP namespace has been removed. Use `process_id` with the
 process tools instead.
 
+## Process Activity Fields
+
+Process summaries from `list_processes`, `get_process_status`, and the other
+process tools include activity metadata:
+
+- `agent_activity_state` (agent processes only): `working`, `idle`,
+  `permission` (the agent is blocked waiting for an approval), `error`, or
+  `unknown` when Cherry has not classified the agent yet.
+- `uses_alternate_screen`: whether the process is currently showing a
+  fullscreen TUI on the terminal's alternate screen.
+- `last_content_change_at` / `content_version`: when and how often the rendered
+  content actually changed. `output_version` advances on every redraw,
+  including cosmetic churn such as spinner repaints; `content_version` only
+  advances on real content changes.
+
+Rendered output results (`get_process_output` and the `output` field of other
+tools) include `screen` and `content_version`. `screen` is `"alternate"` when
+you are reading a fullscreen TUI's live screen rather than scrollback, and
+`"primary"` otherwise.
+
 ## Waiting For Agent Output
 
 Avoid fixed sleeps after sending input. Use `wait_for_process_idle`, which waits
@@ -70,10 +90,24 @@ for new output and then a quiet period:
 ```
 
 The default `require_new_output: true` prevents a false idle result immediately
-after a prompt is submitted. The result includes `reason` (`idle`, `exited`, or
-`timed_out`), `observed_new_output`, `since_output_version`, `output_version`,
-process status, and the rendered output tail. Timeouts return a normal result
-with partial output rather than a tool error.
+after a prompt is submitted. The result includes `reason` (`idle`, `exited`,
+`timed_out`, `permission`, or `agent_error`), `observed_new_output`,
+`since_output_version`, `output_version`, `agent_activity_state`, process
+status, and the rendered output tail. Timeouts return a normal result with
+partial output rather than a tool error.
+
+For agent processes with a known activity state, the wait is state-aware:
+
+- `permission` returns immediately when the agent becomes blocked on an
+  approval prompt, so orchestrators can react instead of timing out.
+- `agent_error` returns when the agent enters an error state.
+- `idle` requires `agent_activity_state == idle` plus the usual new-output
+  baseline, and the quiet window is measured against real content changes
+  (`last_content_change_at`) instead of raw output. Spinner repaints do not
+  starve the wait, and echoed input bytes do not satisfy it prematurely.
+
+Non-agent processes (and agents Cherry has not classified yet) keep the
+original output-quiet behavior.
 
 A typical agent-native flow:
 

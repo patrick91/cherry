@@ -1465,6 +1465,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastHumanInputLine: Int?
     private var agentActivitySource: AgentActivitySource = .none
     private var titleIndicatesAgentWorking = false
+    private var lastTitleSpinnerAt: Date?
     private var lastStrongWorkingEvidenceAt: Date?
     private var agentIdleConfirmationTask: Task<Void, Never>?
     private var agentIdleRecheckTask: Task<Void, Never>?
@@ -1894,6 +1895,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             cancelAgentIdleConfirmation()
             cancelAgentIdleRecheck()
             titleIndicatesAgentWorking = false
+            lastTitleSpinnerAt = nil
             lastStrongWorkingEvidenceAt = nil
             setAgentActivityState(.unknown, source: .none)
         }
@@ -1970,6 +1972,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             cancelAgentIdleConfirmation()
             cancelAgentIdleRecheck()
             titleIndicatesAgentWorking = false
+            lastTitleSpinnerAt = nil
             setAgentActivityState(status == 0 ? .idle : .error, source: .processExit)
         }
         resetKeyboardProtocolState()
@@ -2202,6 +2205,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         titleIndicatesAgentWorking = spinnerActive
 
         if spinnerActive {
+            lastTitleSpinnerAt = Date()
             lastStrongWorkingEvidenceAt = Date()
             scheduleAgentIdleRecheck()
             return markAgentWorking(source: .titleSpinner)
@@ -2217,6 +2221,16 @@ final class TerminalSession: ObservableObject, Identifiable {
             return false
         }
         return (0x2800...0x28FF).contains(Int(first.value))
+    }
+
+    // Codex/Claude pulse the title spinner several times per second while a turn
+    // is in flight, but may leave the last spinner frame behind when they settle,
+    // so the title only counts as working evidence while the pulses are fresh.
+    private static let titleSpinnerFreshnessWindow: TimeInterval = 3.0
+
+    private var titleSpinnerEvidenceIsActive: Bool {
+        guard titleIndicatesAgentWorking, let lastTitleSpinnerAt else { return false }
+        return Date().timeIntervalSince(lastTitleSpinnerAt) < Self.titleSpinnerFreshnessWindow
     }
 
     private var agentUsesTitleActivitySignals: Bool {
@@ -2241,7 +2255,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if renderedOutputShowsAgentWorkingMarker() {
             return markAgentWorking(source: .workingMarker)
         }
-        if titleIndicatesAgentWorking {
+        if titleSpinnerEvidenceIsActive {
             return markAgentWorking(source: .titleSpinner)
         }
         if renderedOutputShowsAgentInputPrompt() {
@@ -2306,7 +2320,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func confirmAgentIdleIfStillAtPrompt() {
         guard kind == .agent, agentActivitySource != .processExit else { return }
         guard agentActivityState != .permission, agentActivityState != .error else { return }
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleIndicatesAgentWorking else { return }
+        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
         guard renderedOutputShowsAgentInputPrompt() else { return }
         setAgentActivityState(.idle, source: .promptMarker)
     }
@@ -2330,7 +2344,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func recheckAgentActivityAfterQuiet() {
         guard kind == .agent, agentActivityState == .working else { return }
         guard agentActivitySource != .processExit else { return }
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleIndicatesAgentWorking else { return }
+        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
 
         let lineCount = processor.lineCount
         guard lineCount > 0 else { return }
@@ -2772,7 +2786,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             : text
         if kind == .agent {
             let promptVisible = !renderedOutputShowsAgentWorkingMarker()
-                && !titleIndicatesAgentWorking
+                && !titleSpinnerEvidenceIsActive
                 && renderedOutputShowsAgentInputPrompt()
             trimmedText += "\n[terminal status: input prompt waiting for user = \(promptVisible ? "yes" : "no")]"
         }

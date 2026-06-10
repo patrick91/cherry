@@ -5249,6 +5249,37 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
+@Test func staleBrailleSpinnerTitleDoesNotPinWorkingAfterStartupSettles() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+
+    session.ingestTestingData(Data("\u{1B}]0;⠹ cherry\u{7}".utf8))
+    session.ingestTestingData(Data("MCP startup incomplete (failed: cloudflare-api, paper)\n".utf8))
+    session.ingestTestingData(Data("\u{1B}]0;⠴ cherry\u{7}".utf8))
+    session.ingestTestingData(Data("""
+    \u{203A} Use /skills to list available skills
+    gpt-5.5 xhigh fast · ~/github/fastapilabs/fastapi-cloud-cli
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    // No clean title ever arrives: the stale spinner frame must decay and the
+    // quiet recheck must restore idle from the visible composer.
+    try await Task.sleep(for: .milliseconds(4_800))
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func identicalScreenRepaintDoesNotAdvanceContentVersion() async throws {
     let session = TerminalSession(
         title: "Claude",

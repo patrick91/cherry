@@ -5150,6 +5150,9 @@ private final class TrafficLightOverlayView: NSView {
     private weak var attachedWindow: NSWindow?
     private var lastTranslationX: CGFloat = 0
     private var windowObservers: Set<AnyCancellable> = []
+    private var lastAppliedPlacements: [(origin: NSPoint, isHidden: Bool)] = []
+    private var stompRecheckScheduled = false
+    private var stompRecheckBudget = 0
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -5272,15 +5275,57 @@ private final class TrafficLightOverlayView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
-        for (index, button) in hostedButtons.enumerated() {
-            button.setFrameOrigin(NSPoint(
+        lastAppliedPlacements = hostedButtons.enumerated().map { index, button in
+            let origin = NSPoint(
                 x: originInParent.x + CGFloat(index) * buttonSpacing,
                 y: originInParent.y + (controlHeight - button.frame.height) / 2
-            ))
+            )
+            button.setFrameOrigin(origin)
             button.isHidden = controlsAreFullyOffscreen
+            return (origin: origin, isHidden: controlsAreFullyOffscreen)
         }
 
         CATransaction.commit()
+
+        // AppKit's titlebar layout can stomp the placement we just made
+        // within the same runloop turn (it re-lays the standard buttons
+        // after us, restoring their default origin or visibility). During
+        // animations the next tick re-applies, and any user event triggers
+        // `didUpdateNotification` — but an unanimated change on an idle
+        // window (hover-grace timers, MCP-driven chrome updates) has
+        // neither, so the stomped state would stay on screen until the
+        // user next interacts. Verify asynchronously and re-apply if so.
+        stompRecheckBudget = 3
+        scheduleStompRecheck()
+    }
+
+    @MainActor
+    private func scheduleStompRecheck() {
+        guard !stompRecheckScheduled else { return }
+        stompRecheckScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stompRecheckScheduled = false
+            guard self.window != nil, self.stompRecheckBudget > 0 else { return }
+            self.stompRecheckBudget -= 1
+
+            let stomped = self.hostedButtons.isEmpty
+                || self.hostedButtons.count != self.lastAppliedPlacements.count
+                || zip(self.hostedButtons, self.lastAppliedPlacements).contains { button, expected in
+                    button.superview == nil
+                        || button.frame.origin != expected.origin
+                        || button.isHidden != expected.isHidden
+                }
+            guard stomped else { return }
+
+            let budget = self.stompRecheckBudget
+            self.refreshButtonState()
+            // `applyButtonTranslation` resets the budget; restore the
+            // decremented one so a persistent stomper can't ping-pong
+            // with us indefinitely.
+            self.stompRecheckBudget = budget
+            self.scheduleStompRecheck()
+        }
     }
 
     @MainActor

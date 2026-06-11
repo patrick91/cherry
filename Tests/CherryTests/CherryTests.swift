@@ -606,6 +606,128 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(hiddenButtons.allSatisfy { $0.isHidden })
 }
 
+// The floating sidebar reveal/dismiss cycle must end with the lights
+// hidden offscreen, matching the collapsed docked sidebar.
+@MainActor
+@Test func trafficLightsHideAfterFloatingSidebarDismiss() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let event = try sidebarHoverEvent(in: host.window)
+    var hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseEntered(with: event)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(host.chromeState.isSidebarRevealed)
+
+    hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseExited(with: event)
+    try await Task.sleep(for: .milliseconds(600))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(!host.chromeState.isSidebarRevealed)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "dismiss left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
+// Rapid hover in/out interrupts the reveal animation mid-flight; the
+// lights must still settle hidden.
+@MainActor
+@Test func trafficLightsHideAfterInterruptedHoverReveal() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let event = try sidebarHoverEvent(in: host.window)
+    for pause in [UInt64(130), 150, 180, 210] {
+        var hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+        hoverView.mouseEntered(with: event)
+        try await Task.sleep(for: .milliseconds(pause))
+        hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+        hoverView.mouseExited(with: event)
+        try await Task.sleep(for: .milliseconds(60))
+    }
+    try await Task.sleep(for: .milliseconds(800))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(!host.chromeState.isSidebarRevealed)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "interrupted reveal left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
+// Unanimated chrome-state writes (hover-grace timers, MCP-driven
+// updates) have no animation ticks and no user event afterwards, so
+// AppKit's titlebar layout stomping our placement used to stick until
+// the next interaction — the "detached traffic lights" bug.
+@MainActor
+@Test func trafficLightsRecoverFromUnanimatedRevealToggle() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.isSidebarHidden = true
+    try await Task.sleep(for: .milliseconds(250))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    host.chromeState.isSidebarRevealed = true
+    try await Task.sleep(for: .milliseconds(100))
+    host.chromeState.isSidebarRevealed = false
+    try await Task.sleep(for: .milliseconds(400))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "unanimated toggle left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
+// Resizing the sidebar before collapsing exercises the translation
+// clamp with a non-default sidebarWidth.
+@MainActor
+@Test func trafficLightsHideAfterRevealDismissWithResizedSidebar() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    try await dragSidebarResizeHandle(in: host.window, by: 120)
+    try await Task.sleep(for: .milliseconds(150))
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let event = try sidebarHoverEvent(in: host.window)
+    var hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseEntered(with: event)
+    try await Task.sleep(for: .milliseconds(200))
+    hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseExited(with: event)
+    try await Task.sleep(for: .milliseconds(600))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "resized reveal left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
 @MainActor
 @Test func trafficLightsRecoverWhenWindowUpdateRestoresHiddenButtons() async throws {
     let host = try await makeHostedContentViewWindow(

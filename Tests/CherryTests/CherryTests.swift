@@ -697,6 +697,90 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(buttons.allSatisfy { $0.isHidden })
 }
 
+// Cmd+S with a stale isCursorOverSidebar flag (hover exits are not
+// delivered when the sidebar disappears under the cursor or the window
+// resigns key) used to take the unanimated docked→floating swap branch.
+// The floating sidebar then appeared with no cursor over it, so no
+// mouseExited ever dismissed it — isSidebarRevealed stuck forever, the
+// traffic lights parked at translation 0 over the content, and every
+// subsequent Cmd+S was the unanimated swap. The real cursor position must
+// veto the stale flag.
+@MainActor
+@Test func staleCursorFlagDoesNotTriggerPhantomSidebarSwap() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.cursorOverSidebarProbeForTesting = { _ in false }
+    host.chromeState.isCursorOverSidebar = true
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(700))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(!host.chromeState.isSidebarRevealed, "stale cursor flag must not produce a floating swap")
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "phantom swap left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
+// A floating sidebar revealed while the cursor is elsewhere (programmatic
+// chrome change, any future stale-flag path) can never receive the
+// mouseExited that normally dismisses it; the reveal watchdog must
+// auto-dismiss it instead of letting isSidebarRevealed stick.
+@MainActor
+@Test func strandedFloatingSidebarAutoDismisses() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.cursorOverSidebarProbeForTesting = { _ in false }
+
+    host.chromeState.isSidebarHidden = true
+    try await Task.sleep(for: .milliseconds(250))
+    host.chromeState.isSidebarRevealed = true
+    try await Task.sleep(for: .milliseconds(700))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    #expect(!host.chromeState.isSidebarRevealed, "stranded floating sidebar never dismissed")
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "stranded reveal left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
+// The intended swap — Cmd+S with the cursor genuinely over the docked
+// sidebar — still hands off to the floating sidebar in place, and the
+// floating sidebar stays up while the cursor remains over it.
+@MainActor
+@Test func cmdSOverSidebarStillSwapsToFloatingSidebar() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    host.chromeState.cursorOverSidebarProbeForTesting = { _ in true }
+    host.chromeState.isCursorOverSidebar = true
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(700))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(host.chromeState.isSidebarRevealed, "legit swap should hand off to the floating sidebar")
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(frames.allSatisfy { $0.minX >= 0 }, "swap should keep lights on the floating sidebar, got \(frames)")
+    #expect(buttons.allSatisfy { !$0.isHidden })
+}
+
 // Resizing the sidebar before collapsing exercises the translation
 // clamp with a non-default sidebarWidth.
 @MainActor

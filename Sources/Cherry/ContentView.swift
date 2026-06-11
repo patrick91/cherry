@@ -224,12 +224,13 @@ struct ContentView: View {
                 }
                 // The docked sidebar's `.onHover` won't fire when it
                 // appears under a stationary cursor (NSTrackingArea fires on
-                // entry, not on becoming active). The cursor was just over
-                // the floating sidebar — so it's almost certainly over the
-                // new docked sidebar too. Mark it explicitly so a
-                // subsequent Cmd+S can switch back to floating without
-                // requiring a mouse wiggle.
-                isCursorOverSidebar = true
+                // entry, not on becoming active). Seed the flag from the
+                // real cursor position so a subsequent Cmd+S can switch
+                // back to floating without requiring a mouse wiggle —
+                // but never assume: blindly forcing `true` here is how the
+                // flag went stale and made keyboard-only Cmd+S take the
+                // unanimated phantom-swap branch.
+                isCursorOverSidebar = chromeState.isCursorActuallyOverLeadingSidebar(width: sidebarWidth)
             }
             // The docked sidebar's `.onHover` only fires when its hit area
             // is active, so once it's hidden it can't update this flag. Reset
@@ -244,8 +245,23 @@ struct ContentView: View {
         }
         .onChange(of: isSidebarRevealed) { _, revealed in
             if revealed {
-                isCursorInsideSidebarRevealRegion = true
-                cancelSidebarDismiss()
+                if isCursorInsideSidebarRevealRegion
+                    || chromeState.isCursorActuallyOverLeadingSidebar(
+                        width: sidebarWidth + floatingSidebarLeadingInset
+                    )
+                {
+                    isCursorInsideSidebarRevealRegion = true
+                    cancelSidebarDismiss()
+                } else {
+                    // The floating sidebar became revealed with the cursor
+                    // somewhere else (stale-flag Cmd+S swap, programmatic
+                    // chrome change). Hover tracking will never deliver the
+                    // mouseExited that normally dismisses it, so without
+                    // this watchdog `isSidebarRevealed` sticks forever —
+                    // parking the traffic lights over the content and
+                    // locking Cmd+S into its unanimated swap branch.
+                    scheduleSidebarDismiss()
+                }
             } else {
                 cancelSidebarDismiss()
             }

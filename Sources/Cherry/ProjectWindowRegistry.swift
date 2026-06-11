@@ -76,6 +76,14 @@ final class ProjectWindowRegistry {
         return chromeStates[projectRoot]?.chromeState
     }
 
+    func window(for chromeState: ProjectWindowChromeState) -> NSWindow? {
+        pruneStaleWindows()
+        guard let projectRoot = chromeStates.first(where: { _, weakState in
+            weakState.chromeState === chromeState
+        })?.key else { return nil }
+        return windows[projectRoot]?.window
+    }
+
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
         return noteStores[projectRoot]?.noteStore
@@ -509,6 +517,31 @@ final class ProjectWindowChromeState: ObservableObject {
     // corrective `synchronizeTerminalFrame` (the second flash).
     private static let detailPaneLeadingInsetSwap: CGFloat = 5
 
+    /// Test seam for `isCursorActuallyOverLeadingSidebar(width:)`.
+    var cursorOverSidebarProbeForTesting: ((CGFloat) -> Bool)?
+
+    /// Hit-test the real mouse position against the leading sidebar region
+    /// of this state's window. The `isCursorOverSidebar` /
+    /// `isCursorInsideSidebarRevealRegion` flags are inferred from hover
+    /// events, which AppKit does not deliver when the hovered view is
+    /// removed under the cursor or the window resigns key — so they can go
+    /// stale. Flows that would visibly misbehave on a stale flag (the
+    /// docked→floating Cmd+S swap, forced cursor-flag seeding) must verify
+    /// against the actual cursor before trusting them.
+    func isCursorActuallyOverLeadingSidebar(width: CGFloat) -> Bool {
+        if let probe = cursorOverSidebarProbeForTesting {
+            return probe(width)
+        }
+        guard let window = ProjectWindowRegistry.shared.window(for: self) ?? NSApp.keyWindow,
+              let contentView = window.contentView
+        else {
+            return false
+        }
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let viewPoint = contentView.convert(windowPoint, from: nil)
+        return contentView.bounds.contains(viewPoint) && viewPoint.x <= width
+    }
+
     func toggleSidebar() {
         if isSidebarHidden {
             if isSidebarRevealed {
@@ -518,7 +551,8 @@ final class ProjectWindowChromeState: ObservableObject {
                     self.isSidebarHidden.toggle()
                 }
             }
-        } else if isCursorOverSidebar {
+        } else if isCursorOverSidebar,
+                  isCursorActuallyOverLeadingSidebar(width: dockedSidebarWidth) {
             withAnimation(nil) {
                 isSidebarHidden = true
                 isSidebarRevealed = true

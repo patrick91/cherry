@@ -13,7 +13,8 @@ struct ContentView: View {
     private let sidebarRevealHoverSlop: CGFloat = 10
     private let sidebarRevealDelay: Duration = .milliseconds(85)
     private let sidebarDismissDelay: Duration = .milliseconds(160)
-    private let titlebarProjectPickerLeadingInset: CGFloat = 80
+    private let trafficLightAnimatedFinalSyncDelay: Duration = .milliseconds(600)
+    private let titlebarProjectPickerLeadingInset = TitlebarProjectPickerLayout.leadingInset
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
@@ -31,6 +32,8 @@ struct ContentView: View {
     @State private var isCursorInsideSidebarRevealRegion = false
     @State private var sidebarRevealTask: Task<Void, Never>?
     @State private var sidebarDismissTask: Task<Void, Never>?
+    @State private var trafficLightFinalSyncTask: Task<Void, Never>?
+    @State private var floatingSidebarAnimationDepth = 0
 
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
@@ -219,6 +222,7 @@ struct ContentView: View {
             // the floating sidebar within the same animation so it fades
             // out in place while the docked sidebar grows in.
             if !hidden, isSidebarRevealed {
+                beginFloatingSidebarAnimation()
                 withAnimation(.snappy(duration: 0.18)) {
                     isSidebarRevealed = false
                 }
@@ -241,7 +245,7 @@ struct ContentView: View {
             } else {
                 resetSidebarRevealTracking()
             }
-            syncTrafficLights()
+            syncTrafficLightsForCurrentTransition()
         }
         .onChange(of: isSidebarRevealed) { _, revealed in
             if revealed {
@@ -265,7 +269,7 @@ struct ContentView: View {
             } else {
                 cancelSidebarDismiss()
             }
-            syncTrafficLights()
+            syncTrafficLightsForCurrentTransition()
         }
         .onChange(of: sidebarWidth) { _, newWidth in
             syncTrafficLights()
@@ -286,6 +290,7 @@ struct ContentView: View {
         }
         .onDisappear {
             resetSidebarRevealTracking()
+            cancelTrafficLightFinalSync()
         }
     }
 
@@ -419,16 +424,37 @@ struct ContentView: View {
         .frame(maxHeight: .infinity)
     }
 
-    // Belt-and-suspenders: SwiftUI's Animatable setter only fires inside an
-    // animation transaction, and the modifier's `body` side effect can be
-    // skipped by SwiftUI's render diffing. Calling this from every
-    // `.onChange(...)` guarantees the controller catches the new state.
+    // Belt-and-suspenders for non-animated updates: SwiftUI's Animatable
+    // setter only fires inside an animation transaction. Animated sidebar
+    // changes schedule this after the animation window so the controller
+    // catches the final state without snapping ahead mid-flight.
     private func syncTrafficLights() {
         trafficLights.update(
             docked: isSidebarHidden ? 0 : sidebarWidth,
             floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
             sidebarWidth: sidebarWidth
         )
+    }
+
+    private func syncTrafficLightsForCurrentTransition() {
+        if chromeState.isSidebarAnimating || floatingSidebarAnimationDepth > 0 {
+            scheduleTrafficLightFinalSync()
+        } else {
+            cancelTrafficLightFinalSync()
+            syncTrafficLights()
+        }
+    }
+
+    private func scheduleTrafficLightFinalSync() {
+        cancelTrafficLightFinalSync()
+        trafficLightFinalSyncTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: trafficLightAnimatedFinalSyncDelay)
+            } catch {
+                return
+            }
+            syncTrafficLights()
+        }
     }
 
     private func syncDisabledFeatureSelection(features: ProjectFeatureSettings) {
@@ -467,6 +493,7 @@ struct ContentView: View {
             }
 
             guard isCursorInsideSidebarRevealRegion, isSidebarHidden, !isSidebarRevealed else { return }
+            beginFloatingSidebarAnimation()
             withAnimation(.snappy(duration: 0.18)) {
                 isSidebarRevealed = true
             }
@@ -484,9 +511,23 @@ struct ContentView: View {
             }
 
             guard !isCursorInsideSidebarRevealRegion, isSidebarHidden, isSidebarRevealed else { return }
+            beginFloatingSidebarAnimation()
             withAnimation(.snappy(duration: 0.18)) {
                 isSidebarRevealed = false
             }
+        }
+    }
+
+    private func beginFloatingSidebarAnimation() {
+        floatingSidebarAnimationDepth += 1
+        Task { @MainActor in
+            do {
+                try await Task.sleep(for: trafficLightAnimatedFinalSyncDelay)
+            } catch {
+                return
+            }
+            floatingSidebarAnimationDepth = max(0, floatingSidebarAnimationDepth - 1)
+            syncTrafficLightsForCurrentTransition()
         }
     }
 
@@ -498,6 +539,11 @@ struct ContentView: View {
     private func cancelSidebarDismiss() {
         sidebarDismissTask?.cancel()
         sidebarDismissTask = nil
+    }
+
+    private func cancelTrafficLightFinalSync() {
+        trafficLightFinalSyncTask?.cancel()
+        trafficLightFinalSyncTask = nil
     }
 
     private func resetSidebarRevealTracking() {
@@ -3274,11 +3320,32 @@ private enum SidebarPresentation {
 }
 
 private enum SidebarLayout {
-    static let trafficLightLeadingInset: CGFloat = 18
+    static let trafficLightLeadingInset = TrafficLightLayout.leadingInset
     static let floatingOuterInset: CGFloat = 3
     static let trailingInset: CGFloat = 8
     static let rowHorizontalInset: CGFloat = 12
     static let agentTreeRowSpacing: CGFloat = 4
+}
+
+private enum TrafficLightLayout {
+    static let leadingInset: CGFloat = 18
+    static let topInset: CGFloat = 18
+    static let buttonSpacing: CGFloat = 20
+    static let fallbackButtonDiameter: CGFloat = 14
+
+    static var clusterWidth: CGFloat {
+        buttonSpacing * 2 + fallbackButtonDiameter
+    }
+}
+
+private enum TitlebarProjectPickerLayout {
+    private static let trafficLightClearance: CGFloat = 13
+
+    static var leadingInset: CGFloat {
+        TrafficLightLayout.leadingInset
+            + TrafficLightLayout.clusterWidth
+            + trafficLightClearance
+    }
 }
 
 private enum AgentTreeLayout {
@@ -3658,13 +3725,21 @@ private struct TitlebarProjectMenuAnchor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
+        view.identifier = .titlebarProjectPickerAnchor
         ref.view = view
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.identifier = .titlebarProjectPickerAnchor
         ref.view = nsView
     }
+}
+
+extension NSUserInterfaceItemIdentifier {
+    static let titlebarProjectPickerAnchor = NSUserInterfaceItemIdentifier(
+        "Cherry.TitlebarProjectPickerAnchor"
+    )
 }
 
 private struct SidebarAgentSessionSection: View {
@@ -5027,21 +5102,7 @@ private struct ChromeWidthAnimator: ViewModifier, @preconcurrency Animatable {
     }
 
     func body(content: Content) -> some View {
-        // SwiftUI only invokes `animatableData.set` while an animation
-        // transaction is active. When `.animation(...)` resolves to `nil`
-        // (e.g., the floating → docked snap), the setter is skipped and the
-        // controller would otherwise hold the previous values forever — so
-        // the buttons stay at their old translation. Pushing the current
-        // values from `body` keeps the controller in sync regardless of
-        // whether an animation is in scope. During a real animation the
-        // setter still runs and overrides this with interpolated values
-        // each tick, so the body update is harmless in that case.
-        controller.update(
-            docked: dockedWidth,
-            floating: floatingWidth,
-            sidebarWidth: sidebarWidth
-        )
-        return content
+        content
     }
 }
 
@@ -5158,9 +5219,9 @@ private final class TrafficLightOverlayView: NSView {
         }
     }
 
-    private let leftInset: CGFloat = SidebarLayout.trafficLightLeadingInset
-    private let topInset: CGFloat = 18
-    private let buttonSpacing: CGFloat = 20
+    private let leftInset = TrafficLightLayout.leadingInset
+    private let topInset = TrafficLightLayout.topInset
+    private let buttonSpacing = TrafficLightLayout.buttonSpacing
 
     private var hostedButtons: [NSButton] = []
     private weak var attachedWindow: NSWindow?
@@ -5279,8 +5340,9 @@ private final class TrafficLightOverlayView: NSView {
 
         let baseX = leftInset + translationX
         let controlWidth = buttonSpacing * CGFloat(max(hostedButtons.count - 1, 0))
-            + (hostedButtons.last?.frame.width ?? 14)
-        let controlHeight = hostedButtons.map(\.frame.height).max() ?? 14
+            + (hostedButtons.last?.frame.width ?? TrafficLightLayout.fallbackButtonDiameter)
+        let controlHeight = hostedButtons.map(\.frame.height).max()
+            ?? TrafficLightLayout.fallbackButtonDiameter
         let controlsAreFullyOffscreen = baseX + controlWidth <= 0
         let targetY = bounds.height - topInset - controlHeight
         let originInParent = convert(

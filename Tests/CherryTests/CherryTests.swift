@@ -207,6 +207,22 @@ private func trafficLightFrames(in window: NSWindow) throws -> [NSRect] {
 }
 
 @MainActor
+private func trafficLightClusterFrame(in window: NSWindow) throws -> NSRect {
+    let frames = try trafficLightFrames(in: window)
+    let firstFrame = try #require(frames.first)
+    return frames.dropFirst().reduce(firstFrame) { $0.union($1) }
+}
+
+@MainActor
+private func titlebarProjectPickerFrame(in window: NSWindow) throws -> NSRect {
+    let contentView = try #require(window.contentView)
+    let anchor = try #require(findSubview(in: contentView) {
+        $0.identifier == .titlebarProjectPickerAnchor
+    })
+    return anchor.convert(anchor.bounds, to: contentView)
+}
+
+@MainActor
 private func dragSidebarResizeHandle(in window: NSWindow, by deltaX: CGFloat) async throws {
     let contentView = try #require(window.contentView)
     let handle = try #require(findSubview(in: contentView) {
@@ -584,6 +600,28 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func sidebarAnimationStateSurvivesOverlappingDockedToggles() async throws {
+    let chromeState = ProjectWindowChromeState()
+
+    chromeState.toggleSidebar()
+    #expect(chromeState.isSidebarAnimating)
+    try await Task.sleep(for: .milliseconds(80))
+
+    chromeState.toggleSidebar()
+    #expect(chromeState.isSidebarAnimating)
+
+    // The first animation has completed, but the second one is still inside
+    // its animation window. A single Boolean completion used to flip this
+    // false here, making ContentView treat fast Cmd+S changes as non-animated.
+    try await Task.sleep(for: .milliseconds(130))
+    #expect(chromeState.isSidebarAnimating)
+
+    try await Task.sleep(for: .milliseconds(180))
+    #expect(!chromeState.isSidebarAnimating)
+    #expect(chromeState.pendingPostAnimationDelta == 0)
+}
+
+@MainActor
 @Test func trafficLightsMoveOutsideContentWhenSidebarCloses() async throws {
     let host = try await makeHostedContentViewWindow(
         styleMask: [.titled, .closable, .miniaturizable, .resizable]
@@ -604,6 +642,107 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(host.chromeState.isSidebarHidden)
     #expect(hiddenFrames.allSatisfy { $0.maxX < 0 })
     #expect(hiddenButtons.allSatisfy { $0.isHidden })
+}
+
+@MainActor
+@Test func titlebarProjectPickerStaysClearOfTrafficLightsDuringSidebarMovement() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer {
+        host.cleanup()
+    }
+
+    let restingLights = try trafficLightClusterFrame(in: host.window)
+    let restingPicker = try titlebarProjectPickerFrame(in: host.window)
+    let restingPickerToLightOffset = restingPicker.minX - restingLights.minX
+
+    func expectPickerClear(_ phase: String) throws {
+        host.window.contentView?.layoutSubtreeIfNeeded()
+        let lights = try trafficLightClusterFrame(in: host.window)
+        let picker = try titlebarProjectPickerFrame(in: host.window)
+        let pickerToLightOffset = picker.minX - lights.minX
+        #expect(
+            picker.minX >= lights.maxX + 12,
+            "\(phase): picker \(picker) overlaps or crowds traffic lights \(lights)"
+        )
+        #expect(
+            abs(pickerToLightOffset - restingPickerToLightOffset) <= 8,
+            "\(phase): picker/lights relative offset drifted from \(restingPickerToLightOffset) to \(pickerToLightOffset); picker \(picker), lights \(lights)"
+        )
+    }
+
+    try expectPickerClear("visible")
+
+    host.chromeState.toggleSidebar()
+    for delay in [30, 60, 90, 140, 220, 350] {
+        try await Task.sleep(for: .milliseconds(delay))
+        try expectPickerClear("hide +\(delay)ms")
+    }
+
+    let event = try sidebarHoverEvent(in: host.window)
+    var hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseEntered(with: event)
+    for delay in [90, 30, 60, 90, 140, 220] {
+        try await Task.sleep(for: .milliseconds(delay))
+        try expectPickerClear("hover reveal +\(delay)ms")
+    }
+
+    hoverView = try sidebarRevealHoverTrackingView(in: host.window)
+    hoverView.mouseExited(with: event)
+    try await Task.sleep(for: .milliseconds(500))
+    try expectPickerClear("floating dismissed")
+
+    host.chromeState.isSidebarHidden = false
+    host.chromeState.isSidebarRevealed = false
+    host.chromeState.cursorOverSidebarProbeForTesting = { _ in true }
+    host.chromeState.isCursorOverSidebar = true
+    try await Task.sleep(for: .milliseconds(100))
+    try expectPickerClear("restored docked")
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(100))
+    try expectPickerClear("docked-to-floating handoff")
+}
+
+@MainActor
+@Test func titlebarProjectPickerTracksTrafficLightsDuringRapidSidebarToggles() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer {
+        host.cleanup()
+    }
+
+    let restingLights = try trafficLightClusterFrame(in: host.window)
+    let restingPicker = try titlebarProjectPickerFrame(in: host.window)
+    let restingPickerToLightOffset = restingPicker.minX - restingLights.minX
+
+    func expectPickerClear(_ phase: String) throws {
+        host.window.contentView?.layoutSubtreeIfNeeded()
+        let lights = try trafficLightClusterFrame(in: host.window)
+        let picker = try titlebarProjectPickerFrame(in: host.window)
+        let pickerToLightOffset = picker.minX - lights.minX
+        #expect(
+            picker.minX >= lights.maxX + 12,
+            "\(phase): picker \(picker) overlaps or crowds traffic lights \(lights)"
+        )
+        #expect(
+            abs(pickerToLightOffset - restingPickerToLightOffset) <= 10,
+            "\(phase): picker/lights relative offset drifted from \(restingPickerToLightOffset) to \(pickerToLightOffset); picker \(picker), lights \(lights)"
+        )
+    }
+
+    for toggleIndex in 0..<5 {
+        host.chromeState.toggleSidebar()
+        try await Task.sleep(for: .milliseconds(55))
+        try expectPickerClear("rapid toggle \(toggleIndex)")
+    }
+
+    for sampleIndex in 0..<8 {
+        try await Task.sleep(for: .milliseconds(45))
+        try expectPickerClear("rapid settle \(sampleIndex)")
+    }
 }
 
 // The floating sidebar reveal/dismiss cycle must end with the lights

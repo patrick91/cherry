@@ -516,6 +516,8 @@ final class ProjectWindowChromeState: ObservableObject {
     // pre-fit lands ~5px off and AppKit's next layout pass kicks off a
     // corrective `synchronizeTerminalFrame` (the second flash).
     private static let detailPaneLeadingInsetSwap: CGFloat = 5
+    private static let dockedSidebarAnimationStateDuration: Duration = .milliseconds(280)
+    private var dockedSidebarAnimationDepth = 0
 
     /// Test seam for `isCursorActuallyOverLeadingSidebar(width:)`.
     var cursorOverSidebarProbeForTesting: ((CGFloat) -> Bool)?
@@ -645,12 +647,23 @@ final class ProjectWindowChromeState: ObservableObject {
         // be authoritative — it tells the container exactly how much
         // the pane is about to grow or shrink.
         pendingPostAnimationDelta = deltaWidth
+        dockedSidebarAnimationDepth += 1
         isSidebarAnimating = true
         withAnimation(.snappy(duration: 0.18)) {
             body()
-        } completion: { [weak self] in
-            self?.isSidebarAnimating = false
-            self?.pendingPostAnimationDelta = 0
+        }
+        Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: Self.dockedSidebarAnimationStateDuration)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.dockedSidebarAnimationDepth = max(0, self.dockedSidebarAnimationDepth - 1)
+            self.isSidebarAnimating = self.dockedSidebarAnimationDepth > 0
+            if self.dockedSidebarAnimationDepth == 0 {
+                self.pendingPostAnimationDelta = 0
+            }
         }
     }
 }

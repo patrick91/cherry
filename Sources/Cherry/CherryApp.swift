@@ -4,7 +4,9 @@ import SwiftUI
 import UserNotifications
 
 final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    var openDefaultProjectWindow: (@MainActor @Sendable () -> Void)?
     private var isQuitConfirmed = false
+    private var didScheduleInitialWindowOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -17,16 +19,24 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            self.scheduleDefaultWindowOpenIfNeeded()
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            sender.windows.first?.makeKeyAndOrderFront(nil)
+            if let window = sender.windows.first {
+                window.makeKeyAndOrderFront(nil)
+            } else {
+                let openDefaultProjectWindow = openDefaultProjectWindow
+                Task { @MainActor in
+                    openDefaultProjectWindow?()
+                }
+            }
         }
 
         sender.activate(ignoringOtherApps: true)
-        return true
+        return false
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -64,6 +74,28 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         return .terminateCancel
     }
 
+    private func scheduleDefaultWindowOpenIfNeeded() {
+        guard !didScheduleInitialWindowOpen else { return }
+        didScheduleInitialWindowOpen = true
+        let openDefaultProjectWindow = openDefaultProjectWindow
+
+        Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+
+            guard !ProjectWindowRegistry.shared.hasRegisteredProjectWindow,
+                  !NSApp.windows.contains(where: \.isVisible)
+            else {
+                return
+            }
+
+            openDefaultProjectWindow?()
+        }
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
@@ -90,6 +122,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
 @main
 struct CherryApp: App {
+    private static let projectWindowSceneID = "project"
+
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var agentSettings = AgentSettings.shared
@@ -113,7 +147,9 @@ struct CherryApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Cherry", for: String.self) { projectRoot in
+        let _ = configureDefaultWindowOpener()
+
+        WindowGroup("Cherry", id: Self.projectWindowSceneID, for: String.self) { projectRoot in
             ProjectWindowView(projectRoot: projectRoot.wrappedValue)
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
@@ -129,13 +165,15 @@ struct CherryApp: App {
                     }, openProjectProvider: { projectRoot in
                         agentSettings.markProjectOpened(projectRoot)
                         guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
-                        openWindow(value: projectRoot)
+                        openWindow(id: Self.projectWindowSceneID, value: projectRoot)
                     })
                     server.start()
                     controlServer = server
                 }
         }
         .defaultSize(width: 1_340, height: 840)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.automatic)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .printItem) {
@@ -259,6 +297,18 @@ struct CherryApp: App {
         Settings {
             SettingsView()
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
+        }
+    }
+
+    private func configureDefaultWindowOpener() {
+        appDelegate.openDefaultProjectWindow = {
+            if let projectRoot = agentSettings.projectRoot(for: nil) {
+                agentSettings.markProjectOpened(projectRoot)
+                guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
+                openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+            } else {
+                openWindow(id: Self.projectWindowSceneID)
+            }
         }
     }
 }

@@ -1407,18 +1407,15 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func captureSnapshotIfPossible() {
-        // Best-effort screenshot of the live terminal area. Tries the
-        // window-list compositor first (captures Metal contents), then falls
-        // back to AppKit's `cacheDisplay` which won't capture the GPU surface
-        // but still provides the surrounding chrome. If both fail we just
-        // proceed without a snapshot — the freeze still suppresses the
-        // flicker, the cross-fade just becomes a no-op.
+        // Best-effort screenshot of the live terminal area. AppKit's
+        // `cacheDisplay` may not capture every GPU-backed surface; if it
+        // fails we still suppress resize re-fits, the cross-fade just becomes
+        // a no-op.
         guard scrollView.frame.width > 0,
               scrollView.frame.height > 0 else { return }
 
         let captureRect = scrollView.frame
-        let cgImage = captureWindowSnapshot(of: scrollView, rect: captureRect)
-            ?? captureViewBitmap(scrollView, rect: scrollView.bounds)
+        let cgImage = captureViewBitmap(scrollView, rect: scrollView.bounds)
 
         guard let cgImage else { return }
 
@@ -1464,32 +1461,6 @@ final class GhosttyTerminalContainerView: NSView {
         let resolved = NSColor(hexRGB: themeColors.background)
             ?? (activeColorScheme == .light ? NSColor.white : NSColor.black)
         return resolved.cgColor
-    }
-
-    private func captureWindowSnapshot(of view: NSView, rect: NSRect) -> CGImage? {
-        guard let window = view.window,
-              window.windowNumber > 0 else { return nil }
-
-        let viewRectInWindow = view.convert(rect, to: nil)
-        let screenRect = window.convertToScreen(viewRectInWindow)
-
-        // CGWindowListCreateImage takes screen coords with a top-left origin.
-        // AppKit screen coords have a bottom-left origin from the primary
-        // display, so flip the Y.
-        guard let primary = NSScreen.screens.first else { return nil }
-        let flipped = CGRect(
-            x: screenRect.origin.x,
-            y: primary.frame.maxY - screenRect.origin.y - screenRect.height,
-            width: screenRect.width,
-            height: screenRect.height
-        )
-
-        return CGWindowListCreateImage(
-            flipped,
-            .optionIncludingWindow,
-            CGWindowID(window.windowNumber),
-            [.bestResolution, .boundsIgnoreFraming]
-        )
     }
 
     private func captureViewBitmap(_ view: NSView, rect: NSRect) -> CGImage? {

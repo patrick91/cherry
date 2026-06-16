@@ -176,6 +176,10 @@ struct ContentView: View {
             openSettings: { openSettings() }
         ))
         .background(WindowConfigurator())
+        .background(AgentCloseAlertPresenter(
+            workspace: workspace,
+            chromeState: chromeState
+        ))
         .frame(minWidth: 320, minHeight: 460)
         .confirmationDialog(
             "Close Agent Group?",
@@ -759,6 +763,86 @@ private struct WindowConfigurator: NSViewRepresentable {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.styleMask.insert(.fullSizeContentView)
+    }
+}
+
+private struct AgentCloseAlertPresenter: NSViewRepresentable {
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+
+    func makeNSView(context: Context) -> AgentCloseAlertPresenterView {
+        let view = AgentCloseAlertPresenterView()
+        view.workspace = workspace
+        view.chromeState = chromeState
+        return view
+    }
+
+    func updateNSView(_ nsView: AgentCloseAlertPresenterView, context: Context) {
+        nsView.workspace = workspace
+        nsView.chromeState = chromeState
+        nsView.presentIfNeeded()
+    }
+}
+
+@MainActor
+private final class AgentCloseAlertPresenterView: NSView {
+    weak var workspace: TerminalWorkspace?
+    weak var chromeState: ProjectWindowChromeState?
+    private var presentedSessionID: UUID?
+
+    func presentIfNeeded() {
+        guard let workspace,
+              let chromeState,
+              let sessionID = chromeState.pendingAgentCloseSessionID,
+              presentedSessionID != sessionID
+        else {
+            return
+        }
+
+        guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else {
+            chromeState.pendingAgentCloseSessionID = nil
+            return
+        }
+
+        guard session.kind == .agent, session.isRunning else {
+            workspace.close(session)
+            chromeState.pendingAgentCloseSessionID = nil
+            return
+        }
+
+        presentedSessionID = sessionID
+        let alert = NSAlert()
+        alert.messageText = "Close agent?"
+        alert.informativeText = "This agent is running. It will be stopped and removed."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Stop and close")
+        alert.addButton(withTitle: "Cancel")
+
+        if let window {
+            alert.beginSheetModal(for: window) { [weak self, weak workspace, weak chromeState] response in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if response == .alertFirstButtonReturn,
+                       let workspace,
+                       let session = workspace.sessions.first(where: { $0.id == sessionID }) {
+                        workspace.close(session)
+                    }
+                    if chromeState?.pendingAgentCloseSessionID == sessionID {
+                        chromeState?.pendingAgentCloseSessionID = nil
+                    }
+                    self.presentedSessionID = nil
+                }
+            }
+        } else {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                workspace.close(session)
+            }
+            if chromeState.pendingAgentCloseSessionID == sessionID {
+                chromeState.pendingAgentCloseSessionID = nil
+            }
+            presentedSessionID = nil
+        }
     }
 }
 
@@ -3852,11 +3936,7 @@ private struct SidebarAgentSessionSection: View {
     }
 
     private func close(_ session: TerminalSession) {
-        if !workspace.descendantAgentSessions(of: session).isEmpty {
-            chromeState.requestAgentGroupClose(sessionID: session.id)
-        } else {
-            workspace.close(session)
-        }
+        SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState)
     }
 
     private func agentRow(

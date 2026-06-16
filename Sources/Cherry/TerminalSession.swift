@@ -845,6 +845,10 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .agent }
     }
 
+    var runningAgentSessions: [TerminalSession] {
+        agentSessions.filter(\.isRunning)
+    }
+
     var rootAgentSessions: [TerminalSession] {
         agentSessions.filter { session in
             guard let parentAgentID = session.parentAgentID else { return true }
@@ -1128,6 +1132,16 @@ final class TerminalWorkspace: ObservableObject {
     func closeAgentPromotingChildren(_ session: TerminalSession) {
         promoteChildAgents(of: session)
         closeSessions(withIDs: Set([session.id]))
+    }
+
+    func closeAllSessions() {
+        let removedSessions = sessions
+        sessions.removeAll()
+        selectedSessionID = nil
+        removedSessions.forEach { session in
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
     }
 
     func closeSelectedSession() {
@@ -1590,6 +1604,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         return false
+    }
+
+    var isRunning: Bool {
+        activeLaunchID != nil
     }
 
     var restartPolicy: String? {

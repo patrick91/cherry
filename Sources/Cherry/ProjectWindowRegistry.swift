@@ -491,6 +491,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
     @Published var collapsedAgentGroupIDs: Set<UUID> = []
+    @Published var pendingAgentCloseSessionID: UUID?
     @Published var pendingAgentGroupCloseSessionID: UUID?
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
@@ -625,6 +626,10 @@ final class ProjectWindowChromeState: ObservableObject {
         pendingAgentGroupCloseSessionID = sessionID
     }
 
+    func requestAgentClose(sessionID: UUID) {
+        pendingAgentCloseSessionID = sessionID
+    }
+
     func focusIdleCommand(name: String) {
         selectedNoteID = nil
         selectedTodoID = nil
@@ -705,6 +710,7 @@ private final class ProjectWindowBinderView: NSView {
     weak var boundWindow: NSWindow?
     var projectRoot: String?
     private nonisolated(unsafe) var notificationObserver: NSObjectProtocol?
+    private var closeDelegate: ProjectWindowCloseDelegate?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -724,6 +730,7 @@ private final class ProjectWindowBinderView: NSView {
         if !claimed {
             // Another window already owns this project. Close this duplicate
             // and bring the existing one forward.
+            workspace.closeAllSessions()
             if let projectRoot {
                 _ = ProjectWindowRegistry.shared.focus(projectRoot: projectRoot)
             }
@@ -734,9 +741,25 @@ private final class ProjectWindowBinderView: NSView {
         }
         let shouldInstallObserver = boundWindow !== window
         boundWindow = window
+        installCloseDelegate(for: window)
         if shouldInstallObserver {
             installObserver()
         }
+    }
+
+    private func installCloseDelegate(for window: NSWindow) {
+        if closeDelegate?.window !== window {
+            let delegate = ProjectWindowCloseDelegate(window: window)
+            delegate.previousDelegate = window.delegate
+            closeDelegate = delegate
+            window.delegate = delegate
+        } else if window.delegate !== closeDelegate {
+            closeDelegate?.previousDelegate = window.delegate
+            window.delegate = closeDelegate
+        }
+
+        closeDelegate?.projectRoot = projectRoot
+        closeDelegate?.workspace = workspace
     }
 
     private func installObserver() {
@@ -765,15 +788,99 @@ private final class ProjectWindowBinderView: NSView {
     }
 
     deinit {
-        if let notificationObserver {
-            NotificationCenter.default.removeObserver(notificationObserver)
-        }
+        let notificationObserver = notificationObserver
+        let boundWindow = boundWindow
+        let closeDelegate = closeDelegate
+        let projectRoot = projectRoot
+
         if let boundWindow {
-            let projectRoot = projectRoot
             Task { @MainActor in
+                if let notificationObserver {
+                    NotificationCenter.default.removeObserver(notificationObserver)
+                }
+                if boundWindow.delegate === closeDelegate {
+                    boundWindow.delegate = closeDelegate?.previousDelegate
+                }
                 ProjectWindowRegistry.shared.unregister(window: boundWindow, projectRoot: projectRoot)
             }
+        } else if let notificationObserver {
+            NotificationCenter.default.removeObserver(notificationObserver)
         }
+    }
+}
+
+@MainActor
+private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
+    weak var window: NSWindow?
+    weak var workspace: TerminalWorkspace?
+    weak var previousDelegate: NSWindowDelegate?
+    var projectRoot: String?
+    private var isCloseConfirmed = false
+    private var isPresentingCloseAlert = false
+    private var didCloseWorkspace = false
+
+    init(window: NSWindow) {
+        self.window = window
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !isCloseConfirmed else { return true }
+
+        guard let workspace else {
+            return previousWindowShouldClose(sender)
+        }
+
+        let runningAgentCount = workspace.runningAgentSessions.count
+        guard runningAgentCount > 0 else {
+            return previousWindowShouldClose(sender)
+        }
+
+        presentCloseAlert(for: sender, runningAgentCount: runningAgentCount)
+        return false
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let window = notification.object as? NSWindow {
+            closeWorkspaceIfNeeded()
+            ProjectWindowRegistry.shared.unregister(window: window, projectRoot: projectRoot)
+        }
+
+        previousDelegate?.windowWillClose?(notification)
+    }
+
+    private func presentCloseAlert(for window: NSWindow, runningAgentCount: Int) {
+        guard !isPresentingCloseAlert else { return }
+        isPresentingCloseAlert = true
+
+        let alert = NSAlert()
+        alert.messageText = "Close window?"
+        alert.informativeText = runningAgentCount == 1
+            ? "This window has a running agent. It will be stopped and removed."
+            : "This window has \(runningAgentCount) running agents. They will be stopped and removed."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Stop and close")
+        alert.addButton(withTitle: "Cancel")
+
+        alert.beginSheetModal(for: window) { [weak self, weak window] response in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isPresentingCloseAlert = false
+                guard response == .alertFirstButtonReturn, let window else { return }
+                self.isCloseConfirmed = true
+                self.closeWorkspaceIfNeeded()
+                window.performClose(nil)
+            }
+        }
+    }
+
+    private func closeWorkspaceIfNeeded() {
+        guard !didCloseWorkspace else { return }
+        didCloseWorkspace = true
+        workspace?.closeAllSessions()
+    }
+
+    private func previousWindowShouldClose(_ sender: NSWindow) -> Bool {
+        previousDelegate?.windowShouldClose?(sender) ?? true
     }
 }
 

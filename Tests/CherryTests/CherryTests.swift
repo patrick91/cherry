@@ -7603,6 +7603,52 @@ private func waitForSummaryCallCount(
 }
 
 @MainActor
+@Test func sessionCloseCoordinatorPromptsForRunningStandaloneAgents() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let chromeState = ProjectWindowChromeState()
+    let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
+    let agent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
+
+    SessionCloseCoordinator.close(agent, in: workspace, chromeState: chromeState)
+
+    #expect(chromeState.pendingAgentCloseSessionID == agent.id)
+    #expect(workspace.sessions.contains { $0.id == agent.id })
+}
+
+@MainActor
+@Test func workspaceCloseAllSessionsRemovesAndStopsEverySession() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
+    let agent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
+
+    #expect(agent.isRunning)
+
+    workspace.closeAllSessions()
+
+    #expect(workspace.sessions.isEmpty)
+    #expect(workspace.selectedSessionID == nil)
+    #expect(!agent.isRunning)
+}
+
+@MainActor
 @Test func workspaceInstallsPreviewAgentTreeWithoutLaunchingAgents() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

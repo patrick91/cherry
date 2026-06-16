@@ -204,15 +204,7 @@ struct CherryApp: App {
                     }
                     if workspace.sessions.count > 1 {
                         guard let session = workspace.selectedSession else { return }
-                        if !workspace.descendantAgentSessions(of: session).isEmpty {
-                            if let chromeState {
-                                chromeState.requestAgentGroupClose(sessionID: session.id)
-                            } else {
-                                workspace.close(session)
-                            }
-                        } else {
-                            workspace.close(session)
-                        }
+                        SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState)
                     } else {
                         NSApp.keyWindow?.performClose(nil)
                     }

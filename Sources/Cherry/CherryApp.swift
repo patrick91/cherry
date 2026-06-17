@@ -228,6 +228,11 @@ struct CherryApp: App {
                     .disabled(focusedChromeState == nil)
                 }
 
+                Button(focusedChromeState?.isSidebarPlaygroundPresented == true ? "Hide Sidebar Icon Playground" : "Show Sidebar Icon Playground") {
+                    keyWindowChromeState?.toggleSidebarPlayground()
+                }
+                .disabled(focusedChromeState == nil)
+
                 Button("New Tab") {
                     keyWindowWorkspace?.addSession()
                 }

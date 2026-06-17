@@ -485,6 +485,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isTerminalSearchPresented = false
     @Published var terminalSearchFocusRequest = 0
     @Published var isIconDebugOverlayPresented = false
+    @Published var isSidebarPlaygroundPresented = false
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
@@ -584,6 +585,16 @@ final class ProjectWindowChromeState: ObservableObject {
 
     func toggleIconDebugOverlay() {
         isIconDebugOverlayPresented.toggle()
+        if isIconDebugOverlayPresented {
+            isSidebarPlaygroundPresented = false
+        }
+    }
+
+    func toggleSidebarPlayground() {
+        isSidebarPlaygroundPresented.toggle()
+        if isSidebarPlaygroundPresented {
+            isIconDebugOverlayPresented = false
+        }
     }
 
     func selectNote(id: UUID?) {

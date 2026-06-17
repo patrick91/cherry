@@ -519,9 +519,15 @@ private enum TerminalMetadataEvent: Equatable {
     case title(String)
     case workingDirectory(String)
     case notification(TerminalNotificationRequest)
+    case nixShell(NixShellMetadataEvent)
     case keyboardProtocolPush(Int)
     case keyboardProtocolPop(Int)
     case keyboardProtocolSet(flags: Int, mode: Int)
+}
+
+private enum NixShellMetadataEvent: Equatable {
+    case enter(NixShellEnvironment)
+    case exit
 }
 
 struct TerminalNotificationRequest: Equatable {
@@ -672,10 +678,29 @@ private final class TerminalMetadataParser {
                 source: .osc9
             ))
         case "777":
+            if let event = cherryNixShellEvent(from: value) {
+                return event
+            }
             return osc777NotificationEvent(from: value)
         default:
             return nil
         }
+    }
+
+    private static func cherryNixShellEvent(from value: String) -> TerminalMetadataEvent? {
+        let prefix = "cherry-nix;"
+        guard value.hasPrefix(prefix) else { return nil }
+
+        let payload = value.dropFirst(prefix.count)
+        if payload == "exit" || payload.hasPrefix("exit;") {
+            return .nixShell(.exit)
+        }
+
+        let enterPrefix = "enter;"
+        guard payload.hasPrefix(enterPrefix) else { return nil }
+        let command = String(payload.dropFirst(enterPrefix.count))
+        guard let environment = NixShellCommandParser.environment(from: command) else { return nil }
+        return .nixShell(.enter(environment))
     }
 
     private static func osc777NotificationEvent(from value: String) -> TerminalMetadataEvent? {
@@ -1436,6 +1461,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var contentVersion = 0
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
+    @Published private(set) var nixShellEnvironment: NixShellEnvironment?
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
@@ -1806,6 +1832,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         summaryDebounceTask = nil
         summaryTask?.cancel()
         summaryTask = nil
+        nixShellEnvironment = nil
         cancelAgentIdleConfirmation()
         cancelAgentIdleRecheck()
         resetKeyboardProtocolState()
@@ -1920,6 +1947,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastOutputAt = nil
         childProcessID = nil
         exitCode = nil
+        nixShellEnvironment = nil
         if kind == .agent {
             cancelAgentIdleConfirmation()
             cancelAgentIdleRecheck()
@@ -1996,6 +2024,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         shellProcess = nil
         childProcessID = nil
         exitCode = status
+        nixShellEnvironment = nil
         exitedAt = Date()
         if kind == .agent {
             cancelAgentIdleConfirmation()
@@ -2148,6 +2177,20 @@ final class TerminalSession: ObservableObject, Identifiable {
                     handleTerminalNotification(notification)
                 }
                 didChange = true
+
+            case .nixShell(let event):
+                switch event {
+                case .enter(let environment):
+                    if nixShellEnvironment != environment {
+                        nixShellEnvironment = environment
+                        didChange = true
+                    }
+                case .exit:
+                    if nixShellEnvironment != nil {
+                        nixShellEnvironment = nil
+                        didChange = true
+                    }
+                }
 
             case .keyboardProtocolPush(let flags):
                 keyboardProtocolFlagStack.append(keyboardProtocolFlags)

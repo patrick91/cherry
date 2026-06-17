@@ -150,6 +150,16 @@ struct ContentView: View {
                 .zIndex(2_100)
             }
 
+            if chromeState.isSidebarPlaygroundPresented {
+                SidebarPlaygroundOverlay(
+                    projectRoot: projectRoot,
+                    livePresentation: isSidebarRevealed ? .floating : .docked,
+                    leadingOffset: iconDebugOverlayLeadingOffset,
+                    isPresented: $chromeState.isSidebarPlaygroundPresented
+                )
+                .zIndex(2_120)
+            }
+
             if isSidebarHidden {
                 // Passive tracking keeps the edge target alive while the
                 // floating sidebar appears under the cursor, then expands to
@@ -3495,6 +3505,79 @@ private func copyCherryLink(_ link: String?) {
     NSPasteboard.general.setString(link, forType: .string)
 }
 
+@ViewBuilder
+private func nixShellContextMenuItems(for environment: NixShellEnvironment?) -> some View {
+    if let environment {
+        Divider()
+
+        Button("Inspect Nix Shell...") {
+            presentNixShellInspector(environment)
+        }
+
+        Button("Copy Nix Package Refs") {
+            copyNixPackageReferences(environment)
+        }
+        .disabled(environment.packageReferences.isEmpty)
+
+        Button("Copy Nix Command") {
+            copyNixCommand(environment)
+        }
+    }
+}
+
+@MainActor
+private func presentNixShellInspector(_ environment: NixShellEnvironment) {
+    let alert = NSAlert()
+    alert.messageText = environment.displayName
+    alert.informativeText = environment.packageSummary.map {
+        "Packages from the launch command: \($0)"
+    } ?? "No package refs were found in the launch command."
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "Done")
+
+    let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 160))
+    textView.isEditable = false
+    textView.isSelectable = true
+    textView.drawsBackground = false
+    textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    textView.string = nixShellInspectorText(for: environment)
+
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 160))
+    scrollView.hasVerticalScroller = true
+    scrollView.documentView = textView
+    alert.accessoryView = scrollView
+
+    alert.runModal()
+}
+
+private func nixShellInspectorText(for environment: NixShellEnvironment) -> String {
+    var sections = [
+        "Mode: \(environment.displayName)"
+    ]
+
+    if environment.packageReferences.isEmpty {
+        sections.append("Packages: none parsed from command")
+    } else {
+        sections.append("Packages:\n" + environment.packageReferences
+            .map { "- \($0.rawValue)" }
+            .joined(separator: "\n"))
+    }
+
+    sections.append("Command:\n\(environment.command)")
+    return sections.joined(separator: "\n\n")
+}
+
+private func copyNixPackageReferences(_ environment: NixShellEnvironment) {
+    guard !environment.packageList.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(environment.packageList, forType: .string)
+}
+
+private func copyNixCommand(_ environment: NixShellEnvironment) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(environment.command, forType: .string)
+}
+
 private func cherryLink(for note: ProjectNote) -> String {
     CherryDeepLink.noteURL(projectRoot: note.projectRoot, noteID: note.id)
 }
@@ -3927,7 +4010,8 @@ private struct SidebarAgentSessionSection: View {
     }
 
     private var isIconDebugActive: Bool {
-        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
+        chromeState.isSidebarPlaygroundPresented
+            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 
     private func select(_ session: TerminalSession) {
@@ -3983,6 +4067,8 @@ private struct SidebarAgentSessionSection: View {
             Button("Clear Scrollback") {
                 session.clearScrollback()
             }
+
+            nixShellContextMenuItems(for: session.nixShellEnvironment)
 
             Divider()
 
@@ -4367,6 +4453,8 @@ private struct SidebarCommandSection: View {
                             Button("Clear Scrollback") {
                                 session.clearScrollback()
                             }
+
+                            nixShellContextMenuItems(for: session.nixShellEnvironment)
                         }
 
                         Divider()
@@ -4477,7 +4565,8 @@ private struct SidebarCommandSection: View {
     }
 
     private var isIconDebugActive: Bool {
-        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
+        chromeState.isSidebarPlaygroundPresented
+            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 }
 
@@ -4952,6 +5041,8 @@ private struct SidebarSessionSection: View {
                         session.clearScrollback()
                     }
 
+                    nixShellContextMenuItems(for: session.nixShellEnvironment)
+
                     Divider()
 
                     Button("Close", role: .destructive) {
@@ -4997,7 +5088,8 @@ private struct SidebarSessionSection: View {
     }
 
     private var isIconDebugActive: Bool {
-        PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented
+        chromeState.isSidebarPlaygroundPresented
+            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 }
 
@@ -5838,10 +5930,21 @@ private struct SidebarTabRow: View {
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(label.title)
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(label.title)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+
+                    if let nixShellEnvironment = rowState.nixShellEnvironment {
+                        NixShellBadge(
+                            environment: nixShellEnvironment,
+                            isSelected: isSelected,
+                            palette: palette
+                        )
+                        .help(nixShellEnvironment.tooltip)
+                    }
+                }
 
                 if let detail = label.detail {
                     HStack(spacing: 4) {
@@ -5901,6 +6004,7 @@ private struct SidebarTabRow: View {
         .onChange(of: pathDisplayMode) { _, mode in
             rowState.updatePathDisplayMode(mode)
         }
+        .help(rowState.helpText)
     }
 
     @ViewBuilder
@@ -5937,6 +6041,7 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var label: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
     @Published private(set) var agentActivityState: AgentActivityState
+    @Published private(set) var nixShellEnvironment: NixShellEnvironment?
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -5954,8 +6059,17 @@ private final class SidebarTabRowState: ObservableObject {
         self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
+        self.nixShellEnvironment = session.nixShellEnvironment
 
         observe(session)
+    }
+
+    var helpText: String {
+        guard let nixShellEnvironment else { return label.title }
+        if let detail = label.detail, !detail.isEmpty {
+            return "\(label.title)\n\(detail)\n\(nixShellEnvironment.tooltip)"
+        }
+        return "\(label.title)\n\(nixShellEnvironment.tooltip)"
     }
 
     func updatePathDisplayMode(_ mode: SidebarTerminalPathDisplayMode) {
@@ -5988,6 +6102,15 @@ private final class SidebarTabRowState: ObservableObject {
             .sink { [weak self] state in
                 Task { @MainActor [weak self] in
                     self?.agentActivityState = state
+                }
+            }
+            .store(in: &cancellables)
+
+        session.$nixShellEnvironment
+            .removeDuplicates()
+            .sink { [weak self] environment in
+                Task { @MainActor [weak self] in
+                    self?.nixShellEnvironment = environment
                 }
             }
             .store(in: &cancellables)
@@ -6042,6 +6165,38 @@ private final class SidebarTabRowState: ObservableObject {
     }
 }
 
+private struct NixShellBadge: View {
+    let environment: NixShellEnvironment
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        let accent = Color(nsColor: .systemCyan)
+        let foreground = isSelected ? palette.selectedText : accent
+
+        HStack(spacing: 2) {
+            Image(systemName: "snowflake")
+                .font(.system(size: 8, weight: .semibold))
+
+            Text("Nix")
+                .font(.system(size: 9, weight: .semibold))
+        }
+        .foregroundStyle(foreground)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background {
+            Capsule(style: .continuous)
+                .fill(accent.opacity(isSelected ? 0.18 : 0.12))
+                .overlay {
+                    Capsule(style: .continuous)
+                        .strokeBorder(accent.opacity(isSelected ? 0.28 : 0.22), lineWidth: 1)
+                }
+        }
+        .fixedSize()
+        .accessibilityLabel(environment.tooltip)
+    }
+}
+
 private struct AgentToolIconDescriptor {
     let label: String
     let logoResourceName: String?
@@ -6089,12 +6244,14 @@ private enum SidebarIconMetrics {
     static let agentGlyphScaleKey = "sidebar.icons.agentGlyphScale"
     static let usesInlineProgramDetailIconsKey = "sidebar.icons.usesInlineDetailIcons"
     static let usesInlineAgentDetailIconsKey = "sidebar.icons.usesInlineAgentDetailIcons"
+    static let usesIconBackgroundCirclesKey = "sidebar.icons.usesIconBackgroundCircles"
 
-    static let defaultProgramGlyphScale = 1.20
-    static let defaultDetailGlyphScale = 1.0
-    static let defaultAgentGlyphScale = 0.90
-    static let defaultUsesInlineProgramDetailIcons = true
+    static let defaultProgramGlyphScale = 1.00
+    static let defaultDetailGlyphScale = 1.20
+    static let defaultAgentGlyphScale = 1.15
+    static let defaultUsesInlineProgramDetailIcons = false
     static let defaultUsesInlineAgentDetailIcons = false
+    static let defaultUsesIconBackgroundCircles = false
 
     static let programFrameSize: CGFloat = 20
     static let programGlyphSize: CGFloat = 18
@@ -6109,6 +6266,7 @@ private enum SidebarIconMetrics {
         defaults.set(defaultAgentGlyphScale, forKey: agentGlyphScaleKey)
         defaults.set(defaultUsesInlineProgramDetailIcons, forKey: usesInlineProgramDetailIconsKey)
         defaults.set(defaultUsesInlineAgentDetailIcons, forKey: usesInlineAgentDetailIconsKey)
+        defaults.set(defaultUsesIconBackgroundCircles, forKey: usesIconBackgroundCirclesKey)
     }
 }
 
@@ -6118,14 +6276,17 @@ private struct AgentToolIcon: View {
     let palette: SidebarPalette
 
     @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let iconColor = isSelected ? palette.selectedText : palette.rowText
         let glyphSize = SidebarIconMetrics.agentGlyphSize * CGFloat(agentGlyphScale)
 
         ZStack {
-            Circle()
-                .fill(iconColor.opacity(isSelected ? 0.18 : 0.10))
+            if usesIconBackgroundCircles {
+                Circle()
+                    .fill(iconColor.opacity(isSelected ? 0.18 : 0.10))
+            }
 
             if let logoResourceName = descriptor.logoResourceName {
                 AgentLogoImage(
@@ -6153,6 +6314,7 @@ private struct SidebarProgramIcon: View {
     let palette: SidebarPalette
 
     @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let iconColor = isSelected ? palette.selectedText : palette.rowText
@@ -6166,14 +6328,17 @@ private struct SidebarProgramIcon: View {
                     fallbackLabel: label.leadingIconFallback ?? ""
                 )
                 .frame(width: glyphSize, height: glyphSize)
-            } else if let fallback = label.leadingIconFallback {
-                Circle()
-                    .fill(iconColor.opacity(isSelected ? 0.16 : 0.10))
+            } else if label.leadingIconFallback != nil {
+                if usesIconBackgroundCircles {
+                    Circle()
+                        .fill(iconColor.opacity(isSelected ? 0.16 : 0.10))
+                }
 
-                Text(fallback)
-                    .font(.system(size: 8, weight: .bold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: glyphSize, height: glyphSize)
+                    .opacity(0.68)
             }
         }
         .foregroundStyle(iconColor)
@@ -6205,6 +6370,7 @@ private struct AgentToolInlineIcon: View {
     let descriptor: AgentToolIconDescriptor
 
     @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
@@ -6218,8 +6384,10 @@ private struct AgentToolInlineIcon: View {
                 )
                 .frame(width: glyphSize, height: glyphSize)
             } else {
-                Circle()
-                    .fill(.primary.opacity(0.14))
+                if usesIconBackgroundCircles {
+                    Circle()
+                        .fill(.primary.opacity(0.14))
+                }
 
                 Text(descriptor.label)
                     .font(.system(size: 7, weight: .bold))
@@ -6236,6 +6404,7 @@ private struct SidebarProgramInlineIcon: View {
     let label: SidebarTerminalPathLabel
 
     @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
@@ -6248,14 +6417,17 @@ private struct SidebarProgramInlineIcon: View {
                     fallbackLabel: label.leadingIconFallback ?? ""
                 )
                 .frame(width: glyphSize, height: glyphSize)
-            } else if let fallback = label.leadingIconFallback {
-                Circle()
-                    .fill(.primary.opacity(0.14))
+            } else if label.leadingIconFallback != nil {
+                if usesIconBackgroundCircles {
+                    Circle()
+                        .fill(.primary.opacity(0.14))
+                }
 
-                Text(fallback)
-                    .font(.system(size: 7, weight: .bold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: glyphSize, height: glyphSize)
+                    .opacity(0.68)
             }
         }
         .frame(width: SidebarIconMetrics.detailGlyphSize, height: SidebarIconMetrics.detailGlyphSize)
@@ -6318,6 +6490,211 @@ private struct AgentLogoImage: View {
     private static var imageCache: [String: NSImage] = [:]
 }
 
+private struct SidebarPlaygroundOverlay: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var agentSettings = AgentSettings.shared
+
+    let projectRoot: String?
+    let livePresentation: SidebarPresentation
+    let leadingOffset: CGFloat
+    @Binding var isPresented: Bool
+
+    @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+    @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+    @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
+    @State private var didCopyValues = false
+
+    private let panelWidth: CGFloat = 430
+    private let topInset: CGFloat = 22
+    private let minimumInset: CGFloat = 8
+    private let trailingInset: CGFloat = 18
+
+    var body: some View {
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: livePresentation
+        )
+
+        GeometryReader { geometry in
+            panel(palette: palette)
+                .padding(.top, topInset)
+                .padding(.leading, clampedLeadingOffset(in: geometry.size))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .transition(.opacity)
+    }
+
+    private func reset() {
+        SidebarIconMetrics.reset()
+        programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
+        detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
+        agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
+        usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+        usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+        usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
+    }
+
+    private func copyValues() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(copiedValuesText, forType: .string)
+        didCopyValues = true
+
+        Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(900))
+            } catch {
+                return
+            }
+            didCopyValues = false
+        }
+    }
+
+    private var copiedValuesText: String {
+        """
+        static let defaultProgramGlyphScale = \(formatted(programGlyphScale))
+        static let defaultDetailGlyphScale = \(formatted(detailGlyphScale))
+        static let defaultAgentGlyphScale = \(formatted(agentGlyphScale))
+        static let defaultUsesInlineProgramDetailIcons = \(usesInlineProgramDetailIcons)
+        static let defaultUsesInlineAgentDetailIcons = \(usesInlineAgentDetailIcons)
+        static let defaultUsesIconBackgroundCircles = \(usesIconBackgroundCircles)
+        """
+    }
+
+    private func formatted(_ value: Double) -> String {
+        String(format: "%.2f", value)
+    }
+
+    private func clampedLeadingOffset(in size: CGSize) -> CGFloat {
+        max(minimumInset, min(leadingOffset, size.width - panelWidth - trailingInset))
+    }
+
+    private func panel(palette: SidebarPalette) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Text("Sidebar Icons")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(palette.rowText)
+
+                Spacer()
+
+                Button(action: copyValues) {
+                    Label(didCopyValues ? "Copied" : "Copy Values", systemImage: didCopyValues ? "checkmark" : "doc.on.doc")
+                        .labelStyle(.titleAndIcon)
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 7)
+                        .frame(height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.rowText.opacity(0.76))
+                .background {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(palette.rowText.opacity(0.08))
+                }
+                .help("Copy icon tuning values")
+
+                Button(action: reset) {
+                    Image(systemName: "arrow.counterclockwise")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .help("Reset icon tuning")
+
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .help("Close")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $usesInlineProgramDetailIcons) {
+                    Text("Small terminal icons in detail line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+
+                Toggle(isOn: $usesInlineAgentDetailIcons) {
+                    Text("Small agent icons in detail line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+
+                Toggle(isOn: $usesIconBackgroundCircles) {
+                    Text("Icon background circles")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                SidebarIconDebugSlider(
+                    title: "Program",
+                    value: $programGlyphScale,
+                    range: 0.70...1.30,
+                    step: 0.05,
+                    palette: palette
+                )
+
+                SidebarIconDebugSlider(
+                    title: "Detail",
+                    value: $detailGlyphScale,
+                    range: 0.70...1.45,
+                    step: 0.05,
+                    palette: palette
+                )
+
+                SidebarIconDebugSlider(
+                    title: "Agent",
+                    value: $agentGlyphScale,
+                    range: 0.70...1.35,
+                    step: 0.05,
+                    palette: palette
+                )
+            }
+
+            SidebarIconDebugLivePreview(palette: palette)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(SidebarIconDebugResource.Kind.allCases, id: \.self) { kind in
+                        SidebarIconDebugResourceSection(
+                            title: kind.title,
+                            resources: SidebarIconDebugResource.resources(for: kind),
+                            palette: palette
+                        )
+                    }
+                }
+                .padding(.trailing, 2)
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .padding(14)
+        .frame(width: panelWidth)
+        .frame(maxHeight: 690)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(palette.rowText.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 22, y: 14)
+    }
+
+}
+
 private struct SidebarIconDebugOverlay: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
@@ -6333,6 +6710,7 @@ private struct SidebarIconDebugOverlay: View {
     @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
     @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
     @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     private let panelWidth: CGFloat = 430
     private let topInset: CGFloat = 22
@@ -6365,6 +6743,7 @@ private struct SidebarIconDebugOverlay: View {
         agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
         usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
         usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
+        usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
     }
 
     private func clampedLeadingOffset(in size: CGSize) -> CGFloat {
@@ -6410,6 +6789,14 @@ private struct SidebarIconDebugOverlay: View {
 
                 Toggle(isOn: $usesInlineAgentDetailIcons) {
                     Text("Small agent icons in detail line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.72))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                Toggle(isOn: $usesIconBackgroundCircles) {
+                    Text("Icon background circles")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(palette.rowText.opacity(0.72))
                 }
@@ -6939,7 +7326,7 @@ private struct SidebarIconDebugPreviewRow: View {
     }
 
     private var shouldShowLeadingIcon: Bool {
-        !shouldShowInlineIcon
+        !shouldShowInlineIcon && !isEmptyIcon
     }
 
     private var shouldShowInlineIcon: Bool {

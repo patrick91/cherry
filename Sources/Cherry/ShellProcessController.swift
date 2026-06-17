@@ -130,13 +130,164 @@ struct ShellIntegrationBootstrap {
                 print -n -- $'\\e]7;kitty-shell-cwd://'"$HOST$directory"$'\\a'
               }
 
+              _cherry_emit_nix_shell_metadata() {
+                emulate -L zsh
+                local state="$1"
+                local command="${2-}"
+                command="${command//$'\\e'/}"
+                command="${command//$'\\a'/}"
+                print -n -- $'\\e]777;cherry-nix;'"$state"';'"$command"$'\\a'
+              }
+
+              _cherry_is_nix_shell_command() {
+                emulate -L zsh
+                setopt EXTENDED_GLOB
+                local command="$1"
+                local -a tokens
+                tokens=("${(z)command}")
+                local index=1
+                local token name
+
+                while (( index <= ${#tokens} )); do
+                  token="${tokens[$index]}"
+                  name="${token:t}"
+                  name="${name:l}"
+
+                  if [[ "$token" == [A-Za-z_][A-Za-z0-9_]#=* ]]; then
+                    (( index++ ))
+                    continue
+                  fi
+
+                  if [[ "$name" == "command" || "$name" == "exec" || "$name" == "noglob" || "$name" == "time" ]]; then
+                    (( index++ ))
+                    continue
+                  fi
+
+                  if [[ "$name" == "arch" ]]; then
+                    (( index++ ))
+                    if (( index <= ${#tokens} )) && [[ "${tokens[$index]}" == -* ]]; then
+                      (( index++ ))
+                    fi
+                    continue
+                  fi
+
+                  if [[ "$name" == "sudo" || "$name" == "doas" ]]; then
+                    (( index++ ))
+                    while (( index <= ${#tokens} )) && [[ "${tokens[$index]}" == -* ]]; do
+                      case "${tokens[$index]}" in
+                        -C|-E|-H|-P|-S|-c|-g|-h|-p|-u|--cwd|--directory|--preserve-env|--user)
+                          (( index += 2 ))
+                          ;;
+                        *)
+                          (( index++ ))
+                          ;;
+                      esac
+                    done
+                    continue
+                  fi
+
+                  if [[ "$name" == "env" ]]; then
+                    (( index++ ))
+                    while (( index <= ${#tokens} )); do
+                      token="${tokens[$index]}"
+                      if [[ "$token" == [A-Za-z_][A-Za-z0-9_]#=* ]]; then
+                        (( index++ ))
+                      elif [[ "$token" == -* ]]; then
+                        case "$token" in
+                          -C|-S|-u|--chdir|--ignore-signal|--split-string|--unset)
+                            (( index += 2 ))
+                            ;;
+                          *)
+                            (( index++ ))
+                            ;;
+                        esac
+                      else
+                        break
+                      fi
+                    done
+                    continue
+                  fi
+
+                  break
+                done
+
+                (( index <= ${#tokens} )) || return 1
+                token="${tokens[$index]}"
+                name="${token:t}"
+                name="${name:l}"
+
+                if [[ "$name" == "nix-shell" ]]; then
+                  return 0
+                fi
+                [[ "$name" == "nix" ]] || return 1
+
+                (( index++ ))
+                while (( index <= ${#tokens} )); do
+                  token="${tokens[$index]}"
+                  case "$token" in
+                    shell|develop)
+                      return 0
+                      ;;
+                    --)
+                      return 1
+                      ;;
+                    --option|--override-input)
+                      (( index += 3 ))
+                      ;;
+                    --access-tokens|--builders|--commit-lock-file-summary|--cores|--eval-store|--experimental-features|--extra-experimental-features|--flake-registry|--log-format|--max-jobs|--store|-j)
+                      (( index += 2 ))
+                      ;;
+                    -*)
+                      (( index++ ))
+                      ;;
+                    *)
+                      return 1
+                      ;;
+                  esac
+                done
+
+                return 1
+              }
+
               _cherry_preexec() {
                 emulate -L zsh
                 _cherry_set_title "$1"
+                if _cherry_is_nix_shell_command "$1"; then
+                  typeset -g CHERRY_NIX_SHELL_METADATA_ACTIVE=1
+                  _cherry_emit_nix_shell_metadata enter "$1"
+
+                  if [[ -n "${CHERRY_BOOTSTRAP_ZDOTDIR-}" ]]; then
+                    if [[ -n "${ZDOTDIR+x}" ]]; then
+                      typeset -g CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR="$ZDOTDIR"
+                      typeset -g CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR_WAS_SET=1
+                    else
+                      unset CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR
+                      typeset -g CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR_WAS_SET=0
+                    fi
+                    typeset -g CHERRY_NIX_SHELL_ZDOTDIR_OVERRIDE=1
+                    export ZDOTDIR="${CHERRY_BOOTSTRAP_ZDOTDIR}"
+                  fi
+                fi
               }
 
               _cherry_precmd() {
                 emulate -L zsh
+                if [[ -n "${CHERRY_NIX_SHELL_METADATA_ACTIVE-}" ]]; then
+                  _cherry_emit_nix_shell_metadata exit
+                  unset CHERRY_NIX_SHELL_METADATA_ACTIVE
+                fi
+
+                if [[ -n "${CHERRY_NIX_SHELL_ZDOTDIR_OVERRIDE-}" ]]; then
+                  if [[ "${CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR_WAS_SET-}" == "1" ]]; then
+                    export ZDOTDIR="${CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR}"
+                  else
+                    unset ZDOTDIR
+                  fi
+                  unset CHERRY_NIX_SHELL_ZDOTDIR_OVERRIDE
+                  unset CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR
+                  unset CHERRY_NIX_SHELL_PREVIOUS_ZDOTDIR_WAS_SET
+                fi
+
                 local directory="${PWD/#$HOME/~}"
                 _cherry_set_working_directory
                 _cherry_set_title "$directory"

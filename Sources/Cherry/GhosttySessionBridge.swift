@@ -17,30 +17,42 @@ private func sidebarResizeLog(_ message: @autoclosure () -> String) {
 
 final class GhosttyOutputSink: @unchecked Sendable {
     private static let maximumRetainedPendingBytes = 1_048_576
-    private static let burstCoalescingDelay: DispatchTimeInterval = .milliseconds(4)
-    private static let burstDetectionWindowNanoseconds: UInt64 = 12_000_000
+    private static let defaultBurstCoalescingDelay: DispatchTimeInterval = .milliseconds(80)
+    private static let defaultBurstDetectionWindowNanoseconds: UInt64 = 160_000_000
+    private static let defaultInputLatencyBypassWindowNanoseconds: UInt64 = 180_000_000
 
     private struct PendingChunk {
         var data: Data
         let suppressHostInput: Bool
+        var containsOverwrittenProgressFrameMarker: Bool
     }
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "Cherry.GhosttyOutputSink", qos: .userInitiated)
     private let receiveData: (InMemoryTerminalSession?, Data) -> Void
     private let hostInputSuppressor: (@escaping () -> Void) -> Void
+    private let burstCoalescingDelay: DispatchTimeInterval
+    private let burstDetectionWindowNanoseconds: UInt64
+    private let inputLatencyBypassWindowNanoseconds: UInt64
     private var session: InMemoryTerminalSession?
     private var pendingChunks: [PendingChunk] = []
     private var pendingByteCount = 0
     private var isDrainScheduled = false
     private var lastDrainUptimeNanoseconds: UInt64?
+    private var lastHostInputUptimeNanoseconds: UInt64?
 
     init(
         session: InMemoryTerminalSession,
-        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() }
+        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
+        burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
+        burstDetectionWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultBurstDetectionWindowNanoseconds,
+        inputLatencyBypassWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultInputLatencyBypassWindowNanoseconds
     ) {
         self.session = session
         self.hostInputSuppressor = hostInputSuppressor
+        self.burstCoalescingDelay = burstCoalescingDelay
+        self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
+        self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
         self.receiveData = { session, data in
             session?.receive(data)
         }
@@ -48,10 +60,16 @@ final class GhosttyOutputSink: @unchecked Sendable {
 
     init(
         receiveForTesting: @escaping (Data) -> Void,
-        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() }
+        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
+        burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
+        burstDetectionWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultBurstDetectionWindowNanoseconds,
+        inputLatencyBypassWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultInputLatencyBypassWindowNanoseconds
     ) {
         self.session = nil
         self.hostInputSuppressor = hostInputSuppressor
+        self.burstCoalescingDelay = burstCoalescingDelay
+        self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
+        self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
         self.receiveData = { _, data in
             receiveForTesting(data)
         }
@@ -63,6 +81,7 @@ final class GhosttyOutputSink: @unchecked Sendable {
             pendingChunks.removeAll(keepingCapacity: false)
             pendingByteCount = 0
             lastDrainUptimeNanoseconds = nil
+            lastHostInputUptimeNanoseconds = nil
         }
     }
 
@@ -71,12 +90,21 @@ final class GhosttyOutputSink: @unchecked Sendable {
             pendingChunks.removeAll(keepingCapacity: false)
             pendingByteCount = 0
             lastDrainUptimeNanoseconds = nil
+            lastHostInputUptimeNanoseconds = nil
+        }
+    }
+
+    func noteHostInput() {
+        lock.withLock {
+            lastHostInputUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         }
     }
 
     func receive(_ data: Data, suppressHostInput: Bool = false) {
         guard !data.isEmpty else { return }
 
+        let containsOverwrittenProgressFrameMarker =
+            GhosttySessionBridge.containsOverwrittenProgressFrameMarker(data)
         let drainDelay: DispatchTimeInterval? = lock.withLock {
             if pendingByteCount + data.count > Self.maximumRetainedPendingBytes {
                 pendingChunks.removeAll(keepingCapacity: true)
@@ -86,19 +114,37 @@ final class GhosttyOutputSink: @unchecked Sendable {
                pendingChunks[lastIndex].suppressHostInput == suppressHostInput
             {
                 pendingChunks[lastIndex].data.append(data)
+                pendingChunks[lastIndex].containsOverwrittenProgressFrameMarker =
+                    pendingChunks[lastIndex].containsOverwrittenProgressFrameMarker ||
+                    containsOverwrittenProgressFrameMarker
             } else {
-                pendingChunks.append(PendingChunk(data: data, suppressHostInput: suppressHostInput))
+                pendingChunks.append(PendingChunk(
+                    data: data,
+                    suppressHostInput: suppressHostInput,
+                    containsOverwrittenProgressFrameMarker: containsOverwrittenProgressFrameMarker
+                ))
             }
             pendingByteCount += data.count
-            guard !isDrainScheduled else { return nil }
-            isDrainScheduled = true
             let now = DispatchTime.now().uptimeNanoseconds
+            let isRecentHostInput = if let lastHostInputUptimeNanoseconds {
+                now >= lastHostInputUptimeNanoseconds &&
+                    now - lastHostInputUptimeNanoseconds <= inputLatencyBypassWindowNanoseconds
+            } else {
+                false
+            }
+            let shouldDelayForCoalescing = containsOverwrittenProgressFrameMarker && !isRecentHostInput
+            guard !isDrainScheduled else {
+                return shouldDelayForCoalescing ? nil : .never
+            }
+
+            isDrainScheduled = true
+            guard shouldDelayForCoalescing else { return .never }
             guard let lastDrainUptimeNanoseconds else { return .never }
             let elapsed = now >= lastDrainUptimeNanoseconds
                 ? now - lastDrainUptimeNanoseconds
                 : .max
-            return elapsed <= Self.burstDetectionWindowNanoseconds
-                ? Self.burstCoalescingDelay
+            return elapsed <= burstDetectionWindowNanoseconds
+                ? burstCoalescingDelay
                 : .never
         }
 
@@ -137,8 +183,13 @@ final class GhosttyOutputSink: @unchecked Sendable {
 
             guard let next else { return }
             for chunk in next.chunks {
-                TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: chunk.data.count)
-                let receive = { [receiveData, session = next.session, data = chunk.data] in
+                let data = chunk.containsOverwrittenProgressFrameMarker
+                    ? GhosttySessionBridge.collapseOverwrittenProgressFramesForTerminalFeed(chunk.data)
+                    : chunk.data
+                guard !data.isEmpty else { continue }
+
+                TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: data.count)
+                let receive = { [receiveData, session = next.session, data] in
                     receiveData(session, data)
                 }
                 if chunk.suppressHostInput {
@@ -478,7 +529,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         scrollContainer?.scheduleHostInputScrollSynchronization()
     }
 
+    func noteHostInputForOutputLatency() {
+        outputSink.noteHostInput()
+    }
+
     func terminalWillSendHostInput() {
+        noteHostInputForOutputLatency()
         guard Self.shouldScrollToBottomForHostInput(currentEvent: NSApp.currentEvent) else { return }
         scrollToBottomForHostInput()
     }
@@ -666,11 +722,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
-        return collapseOverwrittenProgressFramesForReplay(querySanitized)
+        return collapseOverwrittenProgressFramesForTerminalFeed(querySanitized)
     }
 
-    nonisolated private static func collapseOverwrittenProgressFramesForReplay(_ data: Data) -> Data {
+    nonisolated fileprivate static func collapseOverwrittenProgressFramesForTerminalFeed(_ data: Data) -> Data {
         guard !data.isEmpty else { return data }
+        guard containsOverwrittenProgressFrameMarker(data) else { return data }
 
         let bytes = Array(data)
         var collapsed: [UInt8] = []
@@ -728,8 +785,38 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     nonisolated private static var eraseLineCarriageReturnMarkerLength: Int { 5 }
 
+    nonisolated fileprivate static func containsOverwrittenProgressFrameMarker(_ data: Data) -> Bool {
+        guard data.count >= eraseLineCarriageReturnMarkerLength else { return false }
+
+        return data.withUnsafeBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            guard bytes.count >= eraseLineCarriageReturnMarkerLength else { return false }
+
+            var index = 0
+            while index + eraseLineCarriageReturnMarkerLength <= bytes.count {
+                if isEraseLineCarriageReturnMarker(in: bytes, at: index) {
+                    return true
+                }
+                index += 1
+            }
+            return false
+        }
+    }
+
     nonisolated private static func isEraseLineCarriageReturnMarker(
         in bytes: [UInt8],
+        at index: Int
+    ) -> Bool {
+        index + eraseLineCarriageReturnMarkerLength <= bytes.count
+            && bytes[index] == 0x1B
+            && bytes[index + 1] == UInt8(ascii: "[")
+            && bytes[index + 2] == UInt8(ascii: "2")
+            && bytes[index + 3] == UInt8(ascii: "K")
+            && bytes[index + 4] == UInt8(ascii: "\r")
+    }
+
+    nonisolated private static func isEraseLineCarriageReturnMarker(
+        in bytes: UnsafeBufferPointer<UInt8>,
         at index: Int
     ) -> Bool {
         index + eraseLineCarriageReturnMarkerLength <= bytes.count

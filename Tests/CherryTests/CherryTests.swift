@@ -4220,6 +4220,66 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(observedSuppression.values == [true])
 }
 
+@Test func ghosttyOutputSinkDoesNotCoalescePlainOutputAfterRecentDrain() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) },
+        burstCoalescingDelay: .milliseconds(100),
+        burstDetectionWindowNanoseconds: 1_000_000_000
+    )
+
+    sink.receive(Data("prime".utf8))
+    sink.flushForTesting()
+
+    sink.receive(Data("a".utf8))
+    sink.flushForTesting()
+    sink.receive(Data("b".utf8))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["prime", "a", "b"])
+}
+
+@Test func ghosttyOutputSinkBypassesRedrawCoalescingAfterHostInput() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) },
+        burstCoalescingDelay: .milliseconds(100),
+        burstDetectionWindowNanoseconds: 1_000_000_000,
+        inputLatencyBypassWindowNanoseconds: 1_000_000_000
+    )
+
+    sink.receive(Data("prime".utf8))
+    sink.flushForTesting()
+
+    sink.noteHostInput()
+    sink.receive(Data("\u{1B}[2K\rtyped".utf8))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["prime", "\u{1B}[2K\rtyped"])
+}
+
+@Test func ghosttyOutputSinkCollapsesCoalescedProgressFramesBeforeRendering() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) },
+        burstCoalescingDelay: .milliseconds(2),
+        burstDetectionWindowNanoseconds: 1_000_000_000
+    )
+
+    sink.receive(Data("prime".utf8))
+    sink.flushForTesting()
+
+    sink.receive(Data("\u{1B}[2K\r[0/2] Preparing".utf8))
+    sink.receive(Data("\u{1B}[2K\r[1/2] Building\r\n".utf8))
+    try await Task.sleep(for: .milliseconds(20))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["prime", "\u{1B}[2K\r[1/2] Building\r\n"])
+}
+
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
     let replay = Data((
         "before" +

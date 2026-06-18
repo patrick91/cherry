@@ -2136,6 +2136,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
+        ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         if kind == .agent {
             if Self.agentInputSubmitsTurn(input) {

@@ -1,0 +1,96 @@
+{
+  "fill" : "system-dark",
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass-specializations" : [
+            {
+              "value" : false
+            },
+            {
+              "appearance" : "tinted",
+              "value" : false
+            }
+          ],
+          "image-name" : "layer.png",
+          "name" : "layer",
+          "position" : {
+            "scale" : 0.4,
+            "translation-in-points" : [
+              -1.1400000000001,
+              -130.3649999999999
+            ]
+          }
+        },
+        {
+          "glass-specializations" : [
+            {
+              "value" : false
+            },
+            {
+              "appearance" : "tinted",
+              "value" : false
+            }
+          ],
+          "image-name" : "Layer 2 - darker.png",
+          "name" : "Layer 2 - darker",
+          "position" : {
+            "scale" : 0.4,
+            "translation-in-points" : [
+              -0.030000000000086402,
+              0.6999999999999886
+            ]
+          }
+        },
+        {
+          "glass-specializations" : [
+            {
+              "value" : false
+            },
+            {
+              "appearance" : "tinted",
+              "value" : false
+            }
+          ],
+          "image-name" : "Layer 3 - darkest.png",
+          "name" : "Layer 3 - darkest",
+          "position" : {
+            "scale" : 0.4,
+            "translation-in-points" : [
+              0.33999999999991815,
+              131.96499999999992
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

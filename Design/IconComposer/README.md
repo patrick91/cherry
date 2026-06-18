@@ -15,4 +15,7 @@ Recommended workflow:
 5. Preview macOS Default, Dark, and Mono appearances at small sizes.
 6. Save the result as `Cherry.icon`.
 
-For this SwiftPM app, `Scripts/install-local-app` currently consumes `Sources/Cherry/Resources/AppIcon.icns`. To ship an Icon Composer result here, export a flattened 1024 PNG from Icon Composer, then regenerate `AppIcon.icns` with `iconutil` using the same size set in `.build/icon-work/AppIcon.iconset`.
+For this SwiftPM app, keep the source Icon Composer package at `Sources/Cherry/Resources/AppIcon.icon`.
+`Scripts/install-local-app` compiles it with `xcrun actool` for macOS 26+, producing the bundle's `Assets.car`,
+`AppIcon.icns`, and `CFBundleIconName` metadata. `Sources/Cherry/Resources/AppIcon.icns` is only the checked-in
+fallback/runtime icon used when the app is launched outside the packaged bundle.

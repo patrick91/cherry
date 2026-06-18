@@ -10,6 +10,9 @@ CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
 BUILD_DIR="$ROOT/.build/install"
 APP_PATH="$BUILD_DIR/$APP_NAME.app"
 INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
+ICON_SOURCE="$ROOT/Sources/Cherry/Resources/AppIcon.icon"
+ICON_FALLBACK="$ROOT/Sources/Cherry/Resources/AppIcon.icns"
+ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
 
 cd "$ROOT"
 
@@ -26,7 +29,31 @@ rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/Cherry"
 cp "$MCP_HELPER_PATH" "$APP_PATH/Contents/MacOS/CherryMCP"
-cp "$ROOT/Sources/Cherry/Resources/AppIcon.icns" "$APP_PATH/Contents/Resources/AppIcon.icns"
+
+if [[ -d "$ICON_SOURCE" ]] && xcrun --find actool >/dev/null 2>&1; then
+  if xcrun actool "$ICON_SOURCE" \
+    --compile "$APP_PATH/Contents/Resources" \
+    --output-format human-readable-text \
+    --notices \
+    --warnings \
+    --output-partial-info-plist "$ICON_INFO_PLIST" \
+    --app-icon AppIcon \
+    --standalone-icon-behavior all \
+    --include-all-app-icons \
+    --compress-pngs \
+    --development-region en \
+    --target-device mac \
+    --minimum-deployment-target 26.0 \
+    --platform macosx \
+    --bundle-identifier "$BUNDLE_ID" >/dev/null; then
+    :
+  else
+    echo "warning: failed to compile AppIcon.icon with actool; using AppIcon.icns fallback" >&2
+    cp "$ICON_FALLBACK" "$APP_PATH/Contents/Resources/AppIcon.icns"
+  fi
+else
+  cp "$ICON_FALLBACK" "$APP_PATH/Contents/Resources/AppIcon.icns"
+fi
 
 cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,6 +67,8 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key>
   <string>Cherry</string>
   <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
@@ -67,7 +96,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key>
-  <string>14.0</string>
+  <string>26.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSSupportsAutomaticTermination</key>

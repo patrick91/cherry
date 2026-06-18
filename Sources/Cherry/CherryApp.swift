@@ -10,7 +10,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        if let iconURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+        if Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") == nil,
+           let iconURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
            let icon = NSImage(contentsOf: iconURL) {
             NSApp.applicationIconImage = icon
         }

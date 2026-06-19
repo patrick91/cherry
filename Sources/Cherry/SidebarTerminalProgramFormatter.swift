@@ -24,7 +24,8 @@ enum SidebarTerminalProgramFormatter {
     static func label(
         for title: String,
         workingDirectory: String,
-        homeDirectory: String = NSHomeDirectory()
+        homeDirectory: String = NSHomeDirectory(),
+        resolvedCommandLine: String? = nil
     ) -> SidebarTerminalPathLabel? {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTitle.isEmpty else { return nil }
@@ -33,7 +34,10 @@ enum SidebarTerminalProgramFormatter {
             return appLabel
         }
 
-        let tokens = effectiveCommandTokens(ShellCommandTokenizer.tokens(from: trimmedTitle))
+        let commandLine = resolvedCommandLine?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty ?? trimmedTitle
+        let tokens = effectiveCommandTokens(ShellCommandTokenizer.tokens(from: commandLine))
         guard let firstToken = tokens.first else { return nil }
 
         if let runnerLabel = runnerLabel(for: tokens, rawCommand: trimmedTitle) {

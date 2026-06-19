@@ -6097,6 +6097,15 @@ private final class SidebarTabRowState: ObservableObject {
             }
             .store(in: &cancellables)
 
+        session.$resolvedCommandLine
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshLabel()
+                }
+            }
+            .store(in: &cancellables)
+
         session.$agentActivityState
             .removeDuplicates()
             .sink { [weak self] state in
@@ -6146,7 +6155,8 @@ private final class SidebarTabRowState: ObservableObject {
 
         if let programLabel = SidebarTerminalProgramFormatter.label(
             for: session.title,
-            workingDirectory: session.workingDirectory
+            workingDirectory: session.workingDirectory,
+            resolvedCommandLine: session.resolvedCommandLine
         ) {
             return programLabel
         }

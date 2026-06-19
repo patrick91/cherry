@@ -139,6 +139,14 @@ struct ShellIntegrationBootstrap {
                 print -n -- $'\\e]777;cherry-nix;'"$state"';'"$command"$'\\a'
               }
 
+              _cherry_emit_command_metadata() {
+                emulate -L zsh
+                local command="$1"
+                command="${command//$'\\e'/}"
+                command="${command//$'\\a'/}"
+                print -n -- $'\\e]777;cherry-command;'"$command"$'\\a'
+              }
+
               _cherry_is_nix_shell_command() {
                 emulate -L zsh
                 setopt EXTENDED_GLOB
@@ -251,10 +259,15 @@ struct ShellIntegrationBootstrap {
 
               _cherry_preexec() {
                 emulate -L zsh
-                _cherry_set_title "$1"
-                if _cherry_is_nix_shell_command "$1"; then
+                local typed_command="$1"
+                local expanded_command="${2:-$typed_command}"
+                if [[ -n "$expanded_command" && "$expanded_command" != "$typed_command" ]]; then
+                  _cherry_emit_command_metadata "$expanded_command"
+                fi
+                _cherry_set_title "$typed_command"
+                if _cherry_is_nix_shell_command "$expanded_command"; then
                   typeset -g CHERRY_NIX_SHELL_METADATA_ACTIVE=1
-                  _cherry_emit_nix_shell_metadata enter "$1"
+                  _cherry_emit_nix_shell_metadata enter "$expanded_command"
 
                   if [[ -n "${CHERRY_BOOTSTRAP_ZDOTDIR-}" ]]; then
                     if [[ -n "${ZDOTDIR+x}" ]]; then

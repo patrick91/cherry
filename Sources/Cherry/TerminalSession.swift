@@ -621,6 +621,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 private enum TerminalMetadataEvent: Equatable {
     case title(String)
     case workingDirectory(String)
+    case resolvedCommandLine(String)
     case notification(TerminalNotificationRequest)
     case nixShell(NixShellMetadataEvent)
     case keyboardProtocolPush(Int)
@@ -786,6 +787,9 @@ private final class TerminalMetadataParser {
                 source: .osc9
             ))
         case "777":
+            if let event = cherryCommandEvent(from: value) {
+                return event
+            }
             if let event = cherryNixShellEvent(from: value) {
                 return event
             }
@@ -809,6 +813,14 @@ private final class TerminalMetadataParser {
         let command = String(payload.dropFirst(enterPrefix.count))
         guard let environment = NixShellCommandParser.environment(from: command) else { return nil }
         return .nixShell(.enter(environment))
+    }
+
+    private static func cherryCommandEvent(from value: String) -> TerminalMetadataEvent? {
+        let prefix = "cherry-command;"
+        guard value.hasPrefix(prefix) else { return nil }
+
+        let command = sanitized(String(value.dropFirst(prefix.count))).nilIfEmpty
+        return command.map(TerminalMetadataEvent.resolvedCommandLine)
     }
 
     private static func osc777NotificationEvent(from value: String) -> TerminalMetadataEvent? {
@@ -1571,6 +1583,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var title: String
     @Published private(set) var titleSource: TitleSource
     @Published private(set) var subtitle: String
+    @Published private(set) var resolvedCommandLine: String?
     @Published private(set) var summary: String?
     @Published private(set) var workingDirectory: String
     @Published private(set) var state: SessionState = .launching
@@ -1603,6 +1616,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var restartOnExit: Bool
     private var systemTitle: String
     private var automaticTitle: String?
+    private var pendingResolvedCommandLine: String?
     private let summaryRunner: AgentSummaryRun
 
     @Published private(set) var revision = 0
@@ -2097,6 +2111,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         resetKeyboardProtocolState()
         lastHumanInputLine = nil
         outputHoldUntil = nil
+        pendingResolvedCommandLine = nil
+        resolvedCommandLine = nil
         processor.endLaunch(launchID)
         updateShellOutputPauseState()
         hostInputWriter.set(nil)
@@ -2491,9 +2507,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         for event in metadataParser.parse(data) {
             switch event {
             case .title(let nextTitle):
+                let nextResolvedCommandLine = kind == .terminal ? pendingResolvedCommandLine : nil
+                pendingResolvedCommandLine = nil
+
                 if kind == .agent {
                     didChange = recordAgentTitleActivity(nextTitle) || didChange
                 } else {
+                    if resolvedCommandLine != nextResolvedCommandLine {
+                        resolvedCommandLine = nextResolvedCommandLine
+                        didChange = true
+                    }
                     guard systemTitle != nextTitle else { continue }
                     updateSystemTitle(nextTitle)
                     didChange = true
@@ -2513,6 +2536,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                     handleTerminalNotification(notification)
                 }
                 didChange = true
+
+            case .resolvedCommandLine(let commandLine):
+                pendingResolvedCommandLine = commandLine
 
             case .nixShell(let event):
                 switch event {

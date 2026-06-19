@@ -53,6 +53,27 @@ import Testing
     #expect(session.nixShellEnvironment == nil)
 }
 
+@MainActor
+@Test func terminalSessionTracksResolvedCommandMetadataForNextTitle() async throws {
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data((
+        "\u{1B}]777;cherry-command;git add -p\u{7}" +
+        "\u{1B}]2;ga -p\u{7}"
+    ).utf8))
+
+    #expect(session.title == "ga -p")
+    #expect(session.resolvedCommandLine == "git add -p")
+
+    session.ingestTestingData(Data("\u{1B}]2;~/github/patrick91/cherry\u{7}".utf8))
+    #expect(session.resolvedCommandLine == nil)
+}
+
 @Test func zshShellIntegrationBootstrapInstallsNixShellHooks() async throws {
     let temporaryDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -70,6 +91,8 @@ import Testing
     let integration = try String(contentsOf: integrationURL, encoding: .utf8)
 
     #expect(integration.contains("cherry-nix"))
+    #expect(integration.contains("cherry-command"))
+    #expect(integration.contains("_cherry_emit_command_metadata"))
     #expect(integration.contains("_cherry_is_nix_shell_command"))
     #expect(integration.contains("CHERRY_NIX_SHELL_ZDOTDIR_OVERRIDE"))
 

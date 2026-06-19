@@ -16,6 +16,21 @@ import Testing
     ))
 }
 
+@Test func sidebarTerminalProgramFormatterUsesResolvedAliasCommandForProgramIcon() async throws {
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: "ga -p",
+        workingDirectory: "/Users/patrick/github/patrick91/cherry",
+        homeDirectory: "/Users/patrick",
+        resolvedCommandLine: "git add -p"
+    ) == SidebarTerminalPathLabel(
+        title: "Git add",
+        detail: "ga -p",
+        leadingIconResourceName: "git",
+        leadingIconFallback: "Gt",
+        leadingIconRendersAsTemplate: true
+    ))
+}
+
 @Test func sidebarProjectCommandFormatterUsesCommandLineProgramIcon() async throws {
     let command = ProjectCommandDefinition(
         name: "fastapi dev",

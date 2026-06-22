@@ -477,6 +477,44 @@ extension TerminalBuffering {
     }
 }
 
+private func terminalNumericParameters(from payload: String) -> [Int?] {
+    var parameters: [Int?] = []
+    parameters.reserveCapacity(4)
+
+    var value: Int?
+    var overflowed = false
+
+    func appendParameter() {
+        parameters.append(overflowed ? nil : value)
+        value = nil
+        overflowed = false
+    }
+
+    for byte in payload.utf8 {
+        if byte == UInt8(ascii: ";") {
+            appendParameter()
+            continue
+        }
+
+        guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else {
+            continue
+        }
+
+        guard !overflowed else { continue }
+        let digit = Int(byte - UInt8(ascii: "0"))
+        let current = value ?? 0
+        if current > (Int.max - digit) / 10 {
+            value = nil
+            overflowed = true
+        } else {
+            value = current * 10 + digit
+        }
+    }
+
+    appendParameter()
+    return parameters
+}
+
 struct PrototypeTerminalBuffer: TerminalBuffering {
     private enum ParserState {
         case ground
@@ -964,12 +1002,7 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
     ) {
         let rawPayload = String(decoding: payload, as: UTF8.self)
         let isPrivateMode = rawPayload.first == "?"
-        let parameters = rawPayload
-            .split(separator: ";", omittingEmptySubsequences: false)
-            .map { segment -> Int? in
-                let digits = segment.filter(\.isNumber)
-                return digits.isEmpty ? nil : Int(digits)
-            }
+        let parameters = terminalNumericParameters(from: rawPayload)
 
         func parameter(at index: Int, default fallback: Int) -> Int {
             guard parameters.indices.contains(index), let value = parameters[index] else {
@@ -2916,12 +2949,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
     }
 
     private func numericParameters(from payload: String) -> [Int?] {
-        payload
-            .split(separator: ";", omittingEmptySubsequences: false)
-            .map { segment -> Int? in
-                let digits = segment.filter(\.isNumber)
-                return digits.isEmpty ? nil : Int(digits)
-            }
+        terminalNumericParameters(from: payload)
     }
 
     private mutating func handlePrivateMode(isSet: Bool, parameters: [Int]) {

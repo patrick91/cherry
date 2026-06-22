@@ -3712,6 +3712,8 @@ private struct SidebarTabsView: View {
 private struct TitlebarProjectPicker: View {
     private static let fontSize: CGFloat = 14
     private static let fontWeight: NSFont.Weight = .semibold
+    private static let titleFont = NSFont.systemFont(ofSize: fontSize, weight: fontWeight)
+    private static let titleWidthCache = NSCache<NSString, NSNumber>()
     private static let accentDiameter: CGFloat = 7
     private static let titleSpacing: CGFloat = 6
     private static let horizontalPadding: CGFloat = 8
@@ -3861,11 +3863,21 @@ private struct TitlebarProjectPicker: View {
     }
 
     private func preferredWidth(showsProjectAccent: Bool) -> CGFloat {
-        let font = NSFont.systemFont(ofSize: Self.fontSize, weight: Self.fontWeight)
-        let titleWidth = ceil((projectTitle as NSString).size(withAttributes: [.font: font]).width)
+        let titleWidth = Self.measuredTitleWidth(projectTitle)
         let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))
+    }
+
+    private static func measuredTitleWidth(_ title: String) -> CGFloat {
+        let cacheKey = title as NSString
+        if let cached = titleWidthCache.object(forKey: cacheKey) {
+            return CGFloat(truncating: cached)
+        }
+
+        let width = ceil((title as NSString).size(withAttributes: [.font: titleFont]).width)
+        titleWidthCache.setObject(NSNumber(value: Double(width)), forKey: cacheKey)
+        return width
     }
 }
 

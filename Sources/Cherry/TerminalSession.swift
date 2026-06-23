@@ -964,9 +964,48 @@ struct AgentSessionTreeItem: Identifiable {
     var id: UUID { session.id }
 }
 
+enum TerminalDisplayItem: Identifiable, Equatable {
+    case single(UUID)
+    case split(UUID)
+
+    var id: UUID {
+        switch self {
+        case .single(let sessionID), .split(let sessionID):
+            sessionID
+        }
+    }
+}
+
+struct TerminalSplitGroup: Identifiable, Equatable {
+    let id: UUID
+    var paneSessionIDs: [UUID]
+    var activeSessionID: UUID
+    var widthWeights: [Double]
+
+    init(
+        id: UUID = UUID(),
+        paneSessionIDs: [UUID],
+        activeSessionID: UUID,
+        widthWeights: [Double]? = nil
+    ) {
+        self.id = id
+        self.paneSessionIDs = paneSessionIDs
+        self.activeSessionID = activeSessionID
+        self.widthWeights = widthWeights ?? Self.balancedWeights(count: paneSessionIDs.count)
+    }
+
+    static func balancedWeights(count: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        return Array(repeating: 1 / Double(count), count: count)
+    }
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
+    @Published private(set) var terminalDisplayItems: [TerminalDisplayItem]
+    @Published private(set) var terminalSplitGroups: [TerminalSplitGroup] = []
+    @Published private(set) var terminalDetailWidth: CGFloat = 0
     @Published var selectedSessionID: UUID? {
         didSet {
             updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
@@ -979,6 +1018,7 @@ final class TerminalWorkspace: ObservableObject {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
         let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot, projectRoot: self.projectRoot)
         sessions = [firstSession]
+        terminalDisplayItems = [.single(firstSession.id)]
         selectedSessionID = firstSession.id
     }
 
@@ -1006,16 +1046,39 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .terminal }
     }
 
+    var terminalDisplaySessions: [TerminalSession] {
+        terminalDisplayItems.compactMap { displayItem in
+            switch displayItem {
+            case .single(let sessionID):
+                sessions.first { $0.id == sessionID }
+            case .split(let groupID):
+                terminalSplitGroups.first { $0.id == groupID }
+                    .flatMap { group in sessions.first { $0.id == group.activeSessionID } }
+            }
+        }
+    }
+
+    var visibleTerminalSessionIDs: Set<UUID> {
+        Set(terminalDisplayItems.flatMap { displayItem in
+            switch displayItem {
+            case .single(let sessionID):
+                [sessionID]
+            case .split(let groupID):
+                terminalSplitGroups.first { $0.id == groupID }?.paneSessionIDs ?? []
+            }
+        })
+    }
+
     var commandSessions: [TerminalSession] {
         sessions.filter { $0.kind == .command }
     }
 
     var sidebarOrderedSessions: [TerminalSession] {
-        visibleAgentSessions() + terminalSessions + commandSessions
+        visibleAgentSessions() + terminalDisplaySessions + commandSessions
     }
 
     func sidebarOrderedSessions(visibleCommandNames: [String]) -> [TerminalSession] {
-        visibleAgentSessions() + terminalSessions + commandSessions(orderedBy: visibleCommandNames)
+        visibleAgentSessions() + terminalDisplaySessions + commandSessions(orderedBy: visibleCommandNames)
     }
 
     func childAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
@@ -1044,6 +1107,9 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func select(_ session: TerminalSession) {
+        if let groupIndex = terminalSplitGroups.firstIndex(where: { $0.paneSessionIDs.contains(session.id) }) {
+            terminalSplitGroups[groupIndex].activeSessionID = session.id
+        }
         selectedSessionID = session.id
     }
 
@@ -1072,6 +1138,11 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func moveSession(id sessionID: UUID, to targetIndex: Int, within kind: TerminalSession.SessionKind) {
+        if kind == .terminal {
+            moveTerminalDisplayItem(containing: sessionID, to: targetIndex)
+            return
+        }
+
         let scopedSessions = sessions.filter { $0.kind == kind }
         guard let currentScopedIndex = scopedSessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
@@ -1097,12 +1168,37 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    func moveTerminalDisplayItem(containing sessionID: UUID, to targetIndex: Int) {
+        guard let currentIndex = terminalDisplayItems.firstIndex(where: { displayItemContains($0, sessionID: sessionID) }) else {
+            return
+        }
+
+        moveTerminalDisplayItem(at: currentIndex, to: targetIndex)
+    }
+
+    func moveTerminalDisplayItem(id displayItemID: UUID, to targetIndex: Int) {
+        guard let currentIndex = terminalDisplayItems.firstIndex(where: { $0.id == displayItemID }) else {
+            return
+        }
+
+        moveTerminalDisplayItem(at: currentIndex, to: targetIndex)
+    }
+
+    private func moveTerminalDisplayItem(at currentIndex: Int, to targetIndex: Int) {
+        let clampedIndex = min(max(targetIndex, 0), terminalDisplayItems.count - 1)
+        guard currentIndex != clampedIndex else { return }
+
+        let item = terminalDisplayItems.remove(at: currentIndex)
+        terminalDisplayItems.insert(item, at: clampedIndex)
+    }
+
     @discardableResult
     func addSession(
         title: String? = nil,
         workingDirectory: String? = nil,
         command: String? = nil,
-        select: Bool = true
+        select: Bool = true,
+        displayAsStandalone: Bool = true
     ) -> TerminalSession {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
         // inherit the selected session's last trusted OSC 7 cwd report.
@@ -1114,8 +1210,11 @@ final class TerminalWorkspace: ObservableObject {
             projectRoot: projectRoot
         )
         sessions.append(session)
+        if displayAsStandalone {
+            terminalDisplayItems.append(.single(session.id))
+        }
         if select {
-            selectedSessionID = session.id
+            self.select(session)
         } else {
             session.scheduleAuxiliaryProcessingSuspensionAfterStartupGrace()
         }
@@ -1145,7 +1244,7 @@ final class TerminalWorkspace: ObservableObject {
         )
         sessions.append(session)
         if select {
-            selectedSessionID = session.id
+            self.select(session)
         }
         return session
     }
@@ -1158,7 +1257,7 @@ final class TerminalWorkspace: ObservableObject {
     ) -> TerminalSession {
         if let session = commandSession(named: command.name) {
             if select {
-                selectedSessionID = session.id
+                self.select(session)
             }
             return session
         }
@@ -1171,7 +1270,7 @@ final class TerminalWorkspace: ObservableObject {
         )
         sessions.append(session)
         if select {
-            selectedSessionID = session.id
+            self.select(session)
         }
         return session
     }
@@ -1279,11 +1378,177 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    func splitGroup(id groupID: UUID) -> TerminalSplitGroup? {
+        terminalSplitGroups.first { $0.id == groupID }
+    }
+
+    func splitGroup(containing sessionID: UUID) -> TerminalSplitGroup? {
+        terminalSplitGroups.first { $0.paneSessionIDs.contains(sessionID) }
+    }
+
+    func sessions(for displayItem: TerminalDisplayItem) -> [TerminalSession] {
+        switch displayItem {
+        case .single(let sessionID):
+            return sessions.first { $0.id == sessionID }.map { [$0] } ?? []
+        case .split(let groupID):
+            guard let group = splitGroup(id: groupID) else { return [] }
+            return group.paneSessionIDs.compactMap { paneID in
+                sessions.first { $0.id == paneID }
+            }
+        }
+    }
+
+    func activeSession(for displayItem: TerminalDisplayItem) -> TerminalSession? {
+        switch displayItem {
+        case .single(let sessionID):
+            return sessions.first { $0.id == sessionID }
+        case .split(let groupID):
+            guard let group = splitGroup(id: groupID) else { return nil }
+            return sessions.first { $0.id == group.activeSessionID }
+        }
+    }
+
+    func canAddSplitPane(to sessionID: UUID) -> Bool {
+        guard session(withID: sessionID)?.kind == .terminal else { return false }
+        guard let group = splitGroup(containing: sessionID) else { return true }
+        guard group.paneSessionIDs.count < Self.maximumSplitPaneCount else { return false }
+        let nextPaneCount = group.paneSessionIDs.count + 1
+        guard nextPaneCount >= Self.maximumSplitPaneCount, terminalDetailWidth > 0 else { return true }
+        return terminalDetailWidth >= CGFloat(nextPaneCount) * Self.minimumSplitPaneWidth
+    }
+
+    func updateTerminalDetailWidth(_ width: CGFloat) {
+        let clampedWidth = max(0, width)
+        guard abs(terminalDetailWidth - clampedWidth) > 1 else { return }
+        terminalDetailWidth = clampedWidth
+    }
+
+    @discardableResult
+    func splitDuplicateActiveTerminal() -> TerminalSession? {
+        guard let activeSession = selectedSession,
+              activeSession.kind == .terminal,
+              canAddSplitPane(to: activeSession.id)
+        else {
+            return nil
+        }
+
+        let session = addSession(
+            workingDirectory: activeSession.workingDirectory,
+            select: false,
+            displayAsStandalone: false
+        )
+        guard addTerminalPane(session.id, after: activeSession.id) else {
+            closeSessions(withIDs: Set([session.id]))
+            return nil
+        }
+        select(session)
+        return session
+    }
+
+    @discardableResult
+    func splitActiveTerminal(with session: TerminalSession) -> Bool {
+        guard terminalDisplayItems.contains(where: { $0 == .single(session.id) }),
+              splitGroup(containing: session.id) == nil,
+              let activeSession = selectedSession,
+              activeSession.id != session.id,
+              activeSession.kind == .terminal,
+              session.kind == .terminal,
+              canAddSplitPane(to: activeSession.id)
+        else {
+            return false
+        }
+
+        guard addTerminalPane(session.id, after: activeSession.id) else {
+            return false
+        }
+        select(session)
+        return true
+    }
+
+    @discardableResult
+    func focusPreviousPane() -> Bool {
+        focusPane(offset: -1)
+    }
+
+    @discardableResult
+    func focusNextPane() -> Bool {
+        focusPane(offset: 1)
+    }
+
+    func balanceSplitGroup(id groupID: UUID) {
+        guard let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }) else { return }
+        terminalSplitGroups[groupIndex].widthWeights = TerminalSplitGroup.balancedWeights(
+            count: terminalSplitGroups[groupIndex].paneSessionIDs.count
+        )
+    }
+
+    func balanceActiveSplitGroup() {
+        guard let selectedSessionID,
+              let group = splitGroup(containing: selectedSessionID)
+        else {
+            return
+        }
+        balanceSplitGroup(id: group.id)
+    }
+
+    func setSplitGroupWidthWeights(id groupID: UUID, weights: [Double]) {
+        guard let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }),
+              let normalizedWeights = Self.normalizedWidthWeights(
+                weights,
+                count: terminalSplitGroups[groupIndex].paneSessionIDs.count
+              )
+        else {
+            return
+        }
+
+        terminalSplitGroups[groupIndex].widthWeights = normalizedWeights
+    }
+
+    func separateSplitGroup(id groupID: UUID) {
+        guard let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }),
+              let displayIndex = terminalDisplayItems.firstIndex(where: { $0 == .split(groupID) })
+        else {
+            return
+        }
+
+        let group = terminalSplitGroups.remove(at: groupIndex)
+        terminalDisplayItems.replaceSubrange(
+            displayIndex...displayIndex,
+            with: group.paneSessionIDs.map { .single($0) }
+        )
+    }
+
+    func separateActiveSplitGroup() {
+        guard let selectedSessionID,
+              let group = splitGroup(containing: selectedSessionID)
+        else {
+            return
+        }
+        separateSplitGroup(id: group.id)
+    }
+
+    func canCloseSplitGroup(id groupID: UUID) -> Bool {
+        guard let group = splitGroup(id: groupID) else { return false }
+        return sessions.count > group.paneSessionIDs.count
+    }
+
+    func closeSplitGroup(id groupID: UUID) {
+        guard let group = splitGroup(id: groupID),
+              canCloseSplitGroup(id: groupID)
+        else {
+            return
+        }
+        closeSessions(withIDs: Set(group.paneSessionIDs))
+    }
+
     func close(_ session: TerminalSession) {
         if session.kind == .agent {
             promoteChildAgents(of: session)
         }
-        closeSessions(withIDs: Set([session.id]))
+        closeSessions(
+            withIDs: Set([session.id]),
+            replacementSelectionID: replacementPaneSelection(afterClosing: session.id)
+        )
     }
 
     func closeAgentGroup(_ session: TerminalSession) {
@@ -1299,6 +1564,8 @@ final class TerminalWorkspace: ObservableObject {
     func closeAllSessions() {
         let removedSessions = sessions
         sessions.removeAll()
+        terminalDisplayItems.removeAll()
+        terminalSplitGroups.removeAll()
         selectedSessionID = nil
         removedSessions.forEach { session in
             session.releaseGhosttyBridge()
@@ -1307,6 +1574,11 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func closeSelectedSession() {
+        guard let selectedSession else { return }
+        close(selectedSession)
+    }
+
+    func closeActivePane() {
         guard let selectedSession else { return }
         close(selectedSession)
     }
@@ -1341,7 +1613,7 @@ final class TerminalWorkspace: ObservableObject {
                 orderedSessions.firstIndex(where: { $0.id == selectedSession.id })
             } ?? 0
         let nextIndex = (currentIndex + offset + orderedSessions.count) % orderedSessions.count
-        selectedSessionID = orderedSessions[nextIndex].id
+        select(orderedSessions[nextIndex])
     }
 
     func clearUnreadNotificationForSelectedSession() {
@@ -1365,6 +1637,105 @@ final class TerminalWorkspace: ObservableObject {
     func session(id terminalID: String) -> TerminalSession? {
         guard let uuid = UUID(uuidString: terminalID) else { return nil }
         return sessions.first(where: { $0.id == uuid })
+    }
+
+    func session(withID sessionID: UUID) -> TerminalSession? {
+        sessions.first { $0.id == sessionID }
+    }
+
+    static let minimumSplitPaneWidth: CGFloat = 280
+    private static let maximumSplitPaneCount = 3
+
+    private func displayItemContains(_ item: TerminalDisplayItem, sessionID: UUID) -> Bool {
+        switch item {
+        case .single(let itemSessionID):
+            itemSessionID == sessionID
+        case .split(let groupID):
+            splitGroup(id: groupID)?.paneSessionIDs.contains(sessionID) == true
+        }
+    }
+
+    private func addTerminalPane(_ paneSessionID: UUID, after activeSessionID: UUID) -> Bool {
+        guard paneSessionID != activeSessionID,
+              session(withID: paneSessionID)?.kind == .terminal,
+              session(withID: activeSessionID)?.kind == .terminal,
+              splitGroup(containing: paneSessionID) == nil
+        else {
+            return false
+        }
+
+        if let groupIndex = terminalSplitGroups.firstIndex(where: { $0.paneSessionIDs.contains(activeSessionID) }) {
+            guard terminalSplitGroups[groupIndex].paneSessionIDs.count < Self.maximumSplitPaneCount,
+                  let activePaneIndex = terminalSplitGroups[groupIndex].paneSessionIDs.firstIndex(of: activeSessionID)
+            else {
+                return false
+            }
+
+            removeStandaloneTerminalDisplayItem(sessionID: paneSessionID)
+            terminalSplitGroups[groupIndex].paneSessionIDs.insert(paneSessionID, at: activePaneIndex + 1)
+            terminalSplitGroups[groupIndex].activeSessionID = paneSessionID
+            terminalSplitGroups[groupIndex].widthWeights = TerminalSplitGroup.balancedWeights(
+                count: terminalSplitGroups[groupIndex].paneSessionIDs.count
+            )
+            return true
+        }
+
+        removeStandaloneTerminalDisplayItem(sessionID: paneSessionID)
+        guard let activeDisplayIndex = terminalDisplayItems.firstIndex(where: { $0 == .single(activeSessionID) }) else {
+            return false
+        }
+
+        let group = TerminalSplitGroup(
+            paneSessionIDs: [activeSessionID, paneSessionID],
+            activeSessionID: paneSessionID
+        )
+        terminalSplitGroups.append(group)
+        terminalDisplayItems[activeDisplayIndex] = .split(group.id)
+        return true
+    }
+
+    private func removeStandaloneTerminalDisplayItem(sessionID: UUID) {
+        terminalDisplayItems.removeAll { $0 == .single(sessionID) }
+    }
+
+    private func focusPane(offset: Int) -> Bool {
+        guard let selectedSessionID,
+              let group = splitGroup(containing: selectedSessionID),
+              let currentIndex = group.paneSessionIDs.firstIndex(of: selectedSessionID),
+              group.paneSessionIDs.count > 1
+        else {
+            return false
+        }
+
+        let nextIndex = (currentIndex + offset + group.paneSessionIDs.count) % group.paneSessionIDs.count
+        guard let session = session(withID: group.paneSessionIDs[nextIndex]) else { return false }
+        select(session)
+        return true
+    }
+
+    private func replacementPaneSelection(afterClosing sessionID: UUID) -> UUID? {
+        guard let group = splitGroup(containing: sessionID),
+              group.activeSessionID == sessionID,
+              let currentIndex = group.paneSessionIDs.firstIndex(of: sessionID),
+              group.paneSessionIDs.count > 1
+        else {
+            return nil
+        }
+
+        if currentIndex > 0 {
+            return group.paneSessionIDs[currentIndex - 1]
+        }
+        return group.paneSessionIDs[1]
+    }
+
+    private static func normalizedWidthWeights(_ weights: [Double], count: Int) -> [Double]? {
+        guard count > 0, weights.count == count else { return nil }
+        let sanitized = weights.map { weight in
+            weight.isFinite ? max(weight, 0.01) : 0.01
+        }
+        let total = sanitized.reduce(0, +)
+        guard total > 0 else { return TerminalSplitGroup.balancedWeights(count: count) }
+        return sanitized.map { $0 / total }
     }
 
     private func childAgentSessions(parentID: UUID) -> [TerminalSession] {
@@ -1412,12 +1783,16 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
-    private func closeSessions(withIDs removedIDs: Set<UUID>) {
+    private func closeSessions(
+        withIDs removedIDs: Set<UUID>,
+        replacementSelectionID: UUID? = nil
+    ) {
         guard !removedIDs.isEmpty, sessions.count > removedIDs.count else { return }
 
         let removedIndex = sessions.firstIndex { removedIDs.contains($0.id) }
         let removedSessions = sessions.filter { removedIDs.contains($0.id) }
         sessions.removeAll { removedIDs.contains($0.id) }
+        removeClosedSessionsFromTerminalDisplay(removedIDs)
         removedSessions.forEach { session in
             session.releaseGhosttyBridge()
             session.stop()
@@ -1427,10 +1802,74 @@ final class TerminalWorkspace: ObservableObject {
               removedIDs.contains(currentSelectedSessionID)
         else { return }
 
+        if let replacementSelectionID,
+           let replacementSession = session(withID: replacementSelectionID) {
+            select(replacementSession)
+            return
+        }
+
         if let removedIndex, sessions.indices.contains(removedIndex) {
-            selectedSessionID = sessions[removedIndex].id
+            select(sessions[removedIndex])
         } else {
-            selectedSessionID = sessions.last?.id
+            if let session = sessions.last {
+                select(session)
+            } else {
+                selectedSessionID = nil
+            }
+        }
+    }
+
+    private func removeClosedSessionsFromTerminalDisplay(_ removedIDs: Set<UUID>) {
+        guard !removedIDs.isEmpty else { return }
+
+        var updatedGroups: [TerminalSplitGroup] = []
+        var groupByID: [UUID: TerminalSplitGroup] = [:]
+
+        for group in terminalSplitGroups {
+            var filteredPaneIDs: [UUID] = []
+            var filteredWeights: [Double] = []
+            for (index, paneID) in group.paneSessionIDs.enumerated() where !removedIDs.contains(paneID) {
+                filteredPaneIDs.append(paneID)
+                if group.widthWeights.indices.contains(index) {
+                    filteredWeights.append(group.widthWeights[index])
+                }
+            }
+
+            guard filteredPaneIDs.count >= 2 else { continue }
+
+            let activeSessionID = filteredPaneIDs.contains(group.activeSessionID)
+                ? group.activeSessionID
+                : filteredPaneIDs[0]
+            let widthWeights = Self.normalizedWidthWeights(filteredWeights, count: filteredPaneIDs.count)
+                ?? TerminalSplitGroup.balancedWeights(count: filteredPaneIDs.count)
+            let updatedGroup = TerminalSplitGroup(
+                id: group.id,
+                paneSessionIDs: filteredPaneIDs,
+                activeSessionID: activeSessionID,
+                widthWeights: widthWeights
+            )
+            updatedGroups.append(updatedGroup)
+            groupByID[group.id] = updatedGroup
+        }
+
+        let previousGroupsByID = Dictionary(uniqueKeysWithValues: terminalSplitGroups.map { ($0.id, $0) })
+        terminalSplitGroups = updatedGroups
+
+        terminalDisplayItems = terminalDisplayItems.compactMap { item in
+            switch item {
+            case .single(let sessionID):
+                return removedIDs.contains(sessionID) ? nil : item
+            case .split(let groupID):
+                if let updatedGroup = groupByID[groupID] {
+                    return .split(updatedGroup.id)
+                }
+                guard let previousGroup = previousGroupsByID[groupID] else { return nil }
+                let remainingPaneIDs = previousGroup.paneSessionIDs.filter { !removedIDs.contains($0) }
+                if remainingPaneIDs.count == 1 {
+                    return .single(remainingPaneIDs[0])
+                }
+                return nil
+            }
         }
     }
 

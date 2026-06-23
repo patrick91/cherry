@@ -1179,6 +1179,8 @@ final class GhosttyTerminalContainerView: NSView {
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
     private var allowsAutoFocus = true
+    private var isActivePane = true
+    private var activatePane: (() -> Void)?
     private var pendingTerminalFocus = false
     private var isSidebarAnimating = false
     private var isSyncFrozen = false
@@ -1221,9 +1223,14 @@ final class GhosttyTerminalContainerView: NSView {
     func configure(
         with session: TerminalSession,
         colorScheme: ColorScheme,
-        allowsAutoFocus: Bool = true
+        allowsAutoFocus: Bool = true,
+        isActivePane: Bool = true,
+        onActivate: (() -> Void)? = nil
     ) {
         TerminalPerformanceMonitor.recordContainerConfigure()
+        let wasActivePane = self.isActivePane
+        self.isActivePane = isActivePane
+        activatePane = onActivate
         self.allowsAutoFocus = allowsAutoFocus
         if !allowsAutoFocus {
             pendingTerminalFocus = false
@@ -1233,9 +1240,15 @@ final class GhosttyTerminalContainerView: NSView {
             activeSession?.detachGhosttyBridge(from: self, preservingSurface: true)
             activeSession = session
             session.ghosttyBridge.attach(to: self)
-            requestTerminalFocus()
+            if isActivePane {
+                requestTerminalFocus()
+            }
         } else {
             session.ghosttyBridge.attach(to: self)
+        }
+
+        if isActivePane, !wasActivePane {
+            requestTerminalFocus()
         }
 
         activeColorScheme = colorScheme
@@ -1290,7 +1303,9 @@ final class GhosttyTerminalContainerView: NSView {
             detachActiveSession(clearsSession: false, releasesBridge: false, preservingSurface: true)
         } else {
             activeSession?.ghosttyBridge.attach(to: self)
-            requestTerminalFocus()
+            if isActivePane {
+                requestTerminalFocus()
+            }
         }
     }
 
@@ -1298,6 +1313,14 @@ final class GhosttyTerminalContainerView: NSView {
         if let window {
             if !window.isKeyWindow {
                 window.makeKeyAndOrderFront(nil)
+            }
+            guard isActivePane else {
+                activatePane?()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isActivePane else { return }
+                    self.activeSession?.ghosttyBridge.focus(in: window)
+                }
+                return
             }
             activeSession?.ghosttyBridge.focus(in: window)
         }

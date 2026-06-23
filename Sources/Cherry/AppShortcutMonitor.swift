@@ -28,6 +28,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case presentCommandPalette
         case toggleSidebar
         case addSession
+        case splitDuplicate
+        case focusPreviousPane
+        case focusNextPane
         case closeSelectedSessionOrWindow
         case terminate
         case openSettings
@@ -54,6 +57,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
             return .toggleSidebar
         case "t":
             return .addSession
+        case "d":
+            return .splitDuplicate
+        case "[":
+            return .focusPreviousPane
+        case "]":
+            return .focusNextPane
         case "w":
             return .closeSelectedSessionOrWindow
         case "q":
@@ -213,6 +222,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 chromeState?.toggleSidebar()
             case .addSession:
                 workspace?.addSession()
+            case .splitDuplicate:
+                workspace?.splitDuplicateActiveTerminal()
+            case .focusPreviousPane:
+                workspace?.focusPreviousPane()
+            case .focusNextPane:
+                workspace?.focusNextPane()
             case .closeSelectedSessionOrWindow:
                 closeSelectedSessionOrWindow()
             case .terminate:
@@ -256,7 +271,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             items += workspace.visibleAgentSessions(
                 collapsedIDs: chromeState?.collapsedAgentGroupIDs ?? []
             ).map { .session($0) }
-            items += workspace.terminalSessions.map { .session($0) }
+            items += workspace.terminalDisplaySessions.map { .session($0) }
             items += visibleCommands.map { .command($0) }
             if projectFeatures.todosEnabled {
                 items.append(.todoBoard)

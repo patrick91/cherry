@@ -147,6 +147,29 @@ struct CherryApp: App {
         ProjectWindowRegistry.shared.keyWindowChromeState ?? focusedChromeState
     }
 
+    private var canSplitFocusedTerminal: Bool {
+        guard let workspace = focusedWorkspace,
+              let session = workspace.selectedSession,
+              session.kind == .terminal
+        else {
+            return false
+        }
+        return workspace.canAddSplitPane(to: session.id)
+    }
+
+    private var focusedWorkspaceHasActiveSplit: Bool {
+        guard let workspace = focusedWorkspace,
+              let selectedSessionID = workspace.selectedSessionID
+        else {
+            return false
+        }
+        return workspace.splitGroup(containing: selectedSessionID) != nil
+    }
+
+    private var closeTabTitle: String {
+        focusedWorkspaceHasActiveSplit ? "Close Pane" : "Close Tab"
+    }
+
     var body: some Scene {
         let _ = configureDefaultWindowOpener()
 
@@ -240,7 +263,13 @@ struct CherryApp: App {
                 .keyboardShortcut("t")
                 .disabled(focusedWorkspace == nil)
 
-                Button(focusedChromeState?.selectedNoteID == nil ? "Close Tab" : "Close Note") {
+                Button("Split Right") {
+                    keyWindowWorkspace?.splitDuplicateActiveTerminal()
+                }
+                .keyboardShortcut("d")
+                .disabled(!canSplitFocusedTerminal)
+
+                Button(focusedChromeState?.selectedNoteID == nil ? closeTabTitle : "Close Note") {
                     guard let workspace = keyWindowWorkspace else { return }
                     let chromeState = keyWindowChromeState
                     if chromeState?.closeSelectedNoteIfNeeded() == true {
@@ -255,6 +284,18 @@ struct CherryApp: App {
                 }
                 .keyboardShortcut("w")
                 .disabled(focusedWorkspace == nil)
+
+                Button("Previous Pane") {
+                    keyWindowWorkspace?.focusPreviousPane()
+                }
+                .keyboardShortcut("[")
+                .disabled(!focusedWorkspaceHasActiveSplit)
+
+                Button("Next Pane") {
+                    keyWindowWorkspace?.focusNextPane()
+                }
+                .keyboardShortcut("]")
+                .disabled(!focusedWorkspaceHasActiveSplit)
 
                 Button("Previous Tab") {
                     keyWindowWorkspace?.selectPreviousSession()

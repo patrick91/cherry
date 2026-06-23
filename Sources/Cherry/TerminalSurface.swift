@@ -514,6 +514,8 @@ enum TerminalPasteboardContent {
 struct TerminalSurfaceView: NSViewRepresentable {
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let isActivePane: Bool
+    let onActivate: (UUID) -> Void
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
         TerminalPerformanceMonitor.recordRepresentableUpdate()
@@ -521,7 +523,9 @@ struct TerminalSurfaceView: NSViewRepresentable {
         containerView.configure(
             with: session,
             colorScheme: context.environment.colorScheme,
-            allowsAutoFocus: !chromeState.isCommandPalettePresented
+            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
+            isActivePane: isActivePane,
+            onActivate: { onActivate(session.id) }
         )
         containerView.applySidebarAnimationState(
             isAnimating: chromeState.isSidebarAnimating,
@@ -535,7 +539,9 @@ struct TerminalSurfaceView: NSViewRepresentable {
         nsView.configure(
             with: session,
             colorScheme: context.environment.colorScheme,
-            allowsAutoFocus: !chromeState.isCommandPalettePresented
+            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
+            isActivePane: isActivePane,
+            onActivate: { onActivate(session.id) }
         )
         nsView.applySidebarAnimationState(
             isAnimating: chromeState.isSidebarAnimating,

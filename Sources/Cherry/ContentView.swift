@@ -878,8 +878,8 @@ private struct DetailPaneView: View {
                     onStart: { startIdleCommand(idleCommand) },
                     onCancel: focusedIdleCommand == nil ? nil : { chromeState.selectTerminal() }
                 )
-            } else if let session = workspace.selectedSession {
-                TerminalSceneView(session: session, chromeState: chromeState)
+            } else if workspace.selectedSession != nil {
+                TerminalSplitSceneView(workspace: workspace, chromeState: chromeState)
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3622,8 +3622,7 @@ private struct SidebarTabsView: View {
 
                     SidebarSessionSection(
                         title: "Terminals",
-                        sessions: workspace.terminalSessions,
-                        kind: .terminal,
+                        displayItems: workspace.terminalDisplayItems,
                         workspace: workspace,
                         chromeState: chromeState,
                         projectRoot: projectRoot,
@@ -3638,7 +3637,7 @@ private struct SidebarTabsView: View {
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutStartIndex: visibleAgentCount + workspace.terminalSessions.count,
+                        shortcutStartIndex: visibleAgentCount + workspace.terminalDisplayItems.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
@@ -3696,14 +3695,14 @@ private struct SidebarTabsView: View {
 
     private var todoBoardShortcutNumber: Int {
         workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
-            + workspace.terminalSessions.count
+            + workspace.terminalDisplayItems.count
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + 1
     }
 
     private func notesShortcutStartIndex(features: ProjectFeatureSettings) -> Int {
         workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
-            + workspace.terminalSessions.count
+            + workspace.terminalDisplayItems.count
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + (features.todosEnabled ? 1 : 0)
     }
@@ -4979,8 +4978,7 @@ private struct SidebarSessionSection: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
 
     let title: String
-    let sessions: [TerminalSession]
-    let kind: TerminalSession.SessionKind
+    let displayItems: [TerminalDisplayItem]
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
@@ -4988,7 +4986,7 @@ private struct SidebarSessionSection: View {
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
-    @State private var draggedSessionID: UUID?
+    @State private var draggedDisplayItemID: UUID?
     @State private var draggedRowOffsetY: CGFloat = 0
 
     var body: some View {
@@ -5004,15 +5002,113 @@ private struct SidebarSessionSection: View {
         VStack(alignment: .leading, spacing: 4) {
             SidebarSectionHeader(
                 title: title,
-                count: sessions.count + (isIconDebugActive && kind == .terminal ? SidebarIconDebugFixtures.terminalCount : 0),
+                count: displayItems.count + (isIconDebugActive ? SidebarIconDebugFixtures.terminalCount : 0),
                 palette: palette
             )
 
-            if isIconDebugActive, kind == .terminal {
+            if isIconDebugActive {
                 SidebarIconDebugTerminalPreview(palette: palette)
             }
 
-            ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
+            ForEach(Array(displayItems.enumerated()), id: \.element.id) { index, item in
+                displayRow(item, index: index, palette: palette)
+                    .offset(y: draggedDisplayItemID == item.id ? draggedRowOffsetY : 0)
+                    .zIndex(draggedDisplayItemID == item.id ? 1 : 0)
+                    .anchorPreference(key: SidebarInteractionAnchorsPreferenceKey.self, value: .bounds) { anchor in
+                        .row(item.id, anchor)
+                    }
+            }
+        }
+        .overlayPreferenceValue(SidebarInteractionAnchorsPreferenceKey.self) { interactionAnchors in
+            GeometryReader { geometry in
+                SidebarInteractionOverlay(
+                    rows: displayItems.compactMap { item in
+                        interactionAnchors.rows[item.id].map { anchor in
+                            SidebarRowFrame(
+                                id: item.id,
+                                rect: geometry[anchor].insetBy(dx: -4, dy: -3),
+                                primarySelectionID: primarySelectionID(for: item),
+                                paneSelectors: paneSelectors(
+                                    for: item,
+                                    anchors: interactionAnchors,
+                                    geometry: geometry
+                                )
+                            )
+                        }
+                    },
+                    onSelect: { sessionID in
+                        guard let session = workspace.session(withID: sessionID) else { return }
+                        chromeState.selectNote(id: nil)
+                        chromeState.selectTerminal()
+                        workspace.select(session)
+                    },
+                    onDragChanged: { displayItemID, offsetY in
+                        draggedDisplayItemID = displayItemID
+                        draggedRowOffsetY = offsetY
+                    },
+                    onMove: { displayItemID, targetIndex in
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            workspace.moveTerminalDisplayItem(id: displayItemID, to: targetIndex)
+                        }
+                    },
+                    onDragEnded: {
+                        withAnimation(.snappy(duration: 0.16)) {
+                            draggedDisplayItemID = nil
+                            draggedRowOffsetY = 0
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private var isIconDebugActive: Bool {
+        chromeState.isSidebarPlaygroundPresented
+            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
+    }
+
+    private func primarySelectionID(for item: TerminalDisplayItem) -> UUID {
+        switch item {
+        case .single(let sessionID):
+            return sessionID
+        case .split(let groupID):
+            return workspace.splitGroup(id: groupID)?.activeSessionID ?? groupID
+        }
+    }
+
+    private func paneSelectors(
+        for item: TerminalDisplayItem,
+        anchors: SidebarInteractionAnchors,
+        geometry: GeometryProxy
+    ) -> [SidebarPaneSelectorFrame] {
+        guard case .split(let groupID) = item,
+              let group = workspace.splitGroup(id: groupID),
+              let selectorAnchors = anchors.paneSelectors[groupID]
+        else {
+            return []
+        }
+
+        return group.paneSessionIDs.compactMap { sessionID in
+            selectorAnchors[sessionID].map { anchor in
+                SidebarPaneSelectorFrame(
+                    id: sessionID,
+                    rect: geometry[anchor].insetBy(dx: -3, dy: -4)
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func displayRow(
+        _ item: TerminalDisplayItem,
+        index: Int,
+        palette: SidebarPalette
+    ) -> some View {
+        switch item {
+        case .single(let sessionID):
+            if let session = workspace.session(withID: sessionID) {
                 SidebarTabRow(
                     session: session,
                     isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
@@ -5026,83 +5122,438 @@ private struct SidebarSessionSection: View {
                         workspace.select(session)
                     }
                 )
-                .offset(y: draggedSessionID == session.id ? draggedRowOffsetY : 0)
-                .zIndex(draggedSessionID == session.id ? 1 : 0)
-                .anchorPreference(key: SidebarRowBoundsPreferenceKey.self, value: .bounds) { anchor in
-                    [session.id: anchor]
-                }
                 .contextMenu {
-                    Button("Copy Link") {
-                        copyCherryLink(cherryLink(for: session, projectRoot: workspace.projectRoot))
-                    }
-                    .disabled(workspace.projectRoot == nil)
-
-                    Divider()
-
-                    Button("Rename...") {
-                        promptRenameSession(session)
-                    }
-
-                    Divider()
-
-                    Button("Restart") {
-                        session.restart()
-                    }
-
-                    Button("Clear Scrollback") {
-                        session.clearScrollback()
-                    }
-
-                    nixShellContextMenuItems(for: session.nixShellEnvironment)
-
-                    Divider()
-
-                    Button("Close", role: .destructive) {
-                        workspace.close(session)
-                    }
-                    .disabled(workspace.sessions.count <= 1)
+                    terminalContextMenuItems(for: session)
                 }
             }
-        }
-        .overlayPreferenceValue(SidebarRowBoundsPreferenceKey.self) { rowBounds in
-            GeometryReader { geometry in
-                SidebarInteractionOverlay(
-                    rows: sessions.compactMap { session in
-                        rowBounds[session.id].map { anchor in
-                            SidebarRowFrame(id: session.id, rect: geometry[anchor].insetBy(dx: -4, dy: -3))
-                        }
-                    },
-                    onSelect: { sessionID in
-                        guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else { return }
-                        chromeState.selectNote(id: nil)
-                        workspace.select(session)
-                    },
-                    onDragChanged: { sessionID, offsetY in
-                        draggedSessionID = sessionID
-                        draggedRowOffsetY = offsetY
-                    },
-                    onMove: { sessionID, targetIndex in
-                        var transaction = Transaction()
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            workspace.moveSession(id: sessionID, to: targetIndex, within: kind)
-                        }
-                    },
-                    onDragEnded: {
-                        withAnimation(.snappy(duration: 0.16)) {
-                            draggedSessionID = nil
-                            draggedRowOffsetY = 0
-                        }
-                    }
+        case .split(let groupID):
+            if let group = workspace.splitGroup(id: groupID) {
+                SidebarSplitTabRow(
+                    group: group,
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    shortcutNumber: shortcutStartIndex + index + 1,
+                    showShortcutHint: showShortcutHints,
+                    palette: palette
                 )
             }
         }
     }
 
-    private var isIconDebugActive: Bool {
-        chromeState.isSidebarPlaygroundPresented
-            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
+    @ViewBuilder
+    private func terminalContextMenuItems(for session: TerminalSession) -> some View {
+        Button("Copy Link") {
+            copyCherryLink(cherryLink(for: session, projectRoot: workspace.projectRoot))
+        }
+        .disabled(workspace.projectRoot == nil)
+
+        Divider()
+
+        Button("Rename...") {
+            promptRenameSession(session)
+        }
+
+        Divider()
+
+        Button("Restart") {
+            session.restart()
+        }
+
+        Button("Clear Scrollback") {
+            session.clearScrollback()
+        }
+
+        nixShellContextMenuItems(for: session.nixShellEnvironment)
+
+        Divider()
+
+        Button("Close", role: .destructive) {
+            workspace.close(session)
+        }
+        .disabled(workspace.sessions.count <= 1)
     }
+}
+
+private struct SidebarSplitTabRow: View {
+    let group: TerminalSplitGroup
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
+    let shortcutNumber: Int
+    let showShortcutHint: Bool
+    let palette: SidebarPalette
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let activeSession {
+                SidebarSplitActivePaneSummary(
+                    session: activeSession,
+                    pathDisplayMode: pathDisplayMode,
+                    isSelected: isSelected,
+                    palette: palette
+                )
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 4) {
+                ForEach(paneSessions) { session in
+                    SidebarSplitPaneIconSelector(
+                        groupID: group.id,
+                        session: session,
+                        workspace: workspace,
+                        chromeState: chromeState,
+                        pathDisplayMode: pathDisplayMode,
+                        isActive: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+                        isRowSelected: isSelected,
+                        palette: palette,
+                        onSelect: {
+                            chromeState.selectTerminal()
+                            workspace.select(session)
+                        }
+                    )
+                }
+            }
+
+            if showShortcutHint, shortcutNumber <= 9 {
+                SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 50)
+        .padding(.leading, SidebarLayout.rowHorizontalInset)
+        .padding(.trailing, SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background {
+            rowBackground
+        }
+        .padding(.leading, -SidebarLayout.rowHorizontalInset)
+        .onTapGesture {
+            if let session = workspace.session(withID: group.activeSessionID) {
+                chromeState.selectTerminal()
+                workspace.select(session)
+            }
+        }
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .help(helpText)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Split terminal group")
+        .contextMenu {
+            Button("Balance Panes") {
+                workspace.balanceSplitGroup(id: group.id)
+            }
+
+            Button("Separate Panes") {
+                workspace.separateSplitGroup(id: group.id)
+            }
+
+            Divider()
+
+            Button("Close Split Group...", role: .destructive) {
+                confirmCloseSplitGroup()
+            }
+            .disabled(!workspace.canCloseSplitGroup(id: group.id))
+        }
+    }
+
+    private var paneSessions: [TerminalSession] {
+        group.paneSessionIDs.compactMap { workspace.session(withID: $0) }
+    }
+
+    private var activeSession: TerminalSession? {
+        workspace.session(withID: group.activeSessionID) ?? paneSessions.first
+    }
+
+    private var isSelected: Bool {
+        guard chromeState.isShowingTerminalContent,
+              let selectedSessionID = workspace.selectedSessionID
+        else {
+            return false
+        }
+        return group.paneSessionIDs.contains(selectedSessionID)
+    }
+
+    private var helpText: String {
+        paneSessions.map(\.title).joined(separator: " | ")
+    }
+
+    @ViewBuilder
+    private var rowBackground: some View {
+        if isSelected {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.selectedFill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
+        } else if isHovered {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.hoverFill)
+        }
+    }
+
+    private func confirmCloseSplitGroup() {
+        let alert = NSAlert()
+        alert.messageText = "Close Split Group?"
+        alert.informativeText = "This will stop and close \(group.paneSessionIDs.count) terminal panes."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Close Split Group")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+        workspace.closeSplitGroup(id: group.id)
+    }
+}
+
+private struct SidebarSplitActivePaneSummary: View {
+    let session: TerminalSession
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    @StateObject private var rowState: SidebarTabRowState
+    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons =
+        SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
+
+    init(
+        session: TerminalSession,
+        pathDisplayMode: SidebarTerminalPathDisplayMode,
+        isSelected: Bool,
+        palette: SidebarPalette
+    ) {
+        self.session = session
+        self.pathDisplayMode = pathDisplayMode
+        self.isSelected = isSelected
+        self.palette = palette
+        _rowState = StateObject(wrappedValue: SidebarTabRowState(
+            session: session,
+            pathDisplayMode: pathDisplayMode
+        ))
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if shouldShowLeadingIcon {
+                SidebarProgramIcon(label: rowState.label, isSelected: isSelected, palette: palette)
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(rowState.label.title)
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+
+                    if let nixShellEnvironment = rowState.nixShellEnvironment {
+                        NixShellBadge(
+                            environment: nixShellEnvironment,
+                            isSelected: isSelected,
+                            palette: palette
+                        )
+                        .help(nixShellEnvironment.tooltip)
+                    }
+                }
+
+                if let detail = rowState.label.detail {
+                    HStack(spacing: 4) {
+                        if let resourceName = rowState.label.detailIconResourceName {
+                            SidebarDetailIcon(resourceName: resourceName)
+                        } else if usesInlineProgramDetailIcons,
+                                  rowState.label.leadingIconResourceName != nil
+                                      || rowState.label.leadingIconFallback != nil {
+                            SidebarProgramInlineIcon(label: rowState.label)
+                        }
+
+                        Text(detail)
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.56))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear {
+            rowState.updatePathDisplayMode(pathDisplayMode)
+        }
+        .onChange(of: pathDisplayMode) { _, mode in
+            rowState.updatePathDisplayMode(mode)
+        }
+    }
+
+    private var shouldShowLeadingIcon: Bool {
+        rowState.label.detail == nil
+            && (rowState.label.leadingIconResourceName != nil || rowState.label.leadingIconFallback != nil)
+    }
+}
+
+private struct SidebarSplitPaneIconSelector: View {
+    let groupID: UUID
+    let session: TerminalSession
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
+    let isActive: Bool
+    let isRowSelected: Bool
+    let palette: SidebarPalette
+    let onSelect: () -> Void
+
+    @StateObject private var rowState: SidebarTabRowState
+
+    init(
+        groupID: UUID,
+        session: TerminalSession,
+        workspace: TerminalWorkspace,
+        chromeState: ProjectWindowChromeState,
+        pathDisplayMode: SidebarTerminalPathDisplayMode,
+        isActive: Bool,
+        isRowSelected: Bool,
+        palette: SidebarPalette,
+        onSelect: @escaping () -> Void
+    ) {
+        self.groupID = groupID
+        self.session = session
+        self.workspace = workspace
+        self.chromeState = chromeState
+        self.pathDisplayMode = pathDisplayMode
+        self.isActive = isActive
+        self.isRowSelected = isRowSelected
+        self.palette = palette
+        self.onSelect = onSelect
+        _rowState = StateObject(wrappedValue: SidebarTabRowState(
+            session: session,
+            pathDisplayMode: pathDisplayMode
+        ))
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            ZStack(alignment: .topTrailing) {
+                paneIcon
+                    .frame(width: 24, height: 24)
+
+                Circle()
+                    .fill(Color(nsColor: rowState.tint))
+                    .frame(width: 6, height: 6)
+                    .offset(x: 1, y: -1)
+                    .opacity(rowState.hasUnreadNotification ? 1 : 0)
+            }
+            .frame(width: 26, height: 26)
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background {
+                selectorBackground
+            }
+        }
+        .buttonStyle(.plain)
+        .help(rowState.helpText)
+        .accessibilityLabel("\(rowState.label.title), split pane")
+        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+        .onAppear {
+            rowState.updatePathDisplayMode(pathDisplayMode)
+        }
+        .onChange(of: pathDisplayMode) { _, mode in
+            rowState.updatePathDisplayMode(mode)
+        }
+        .anchorPreference(key: SidebarInteractionAnchorsPreferenceKey.self, value: .bounds) { anchor in
+            .paneSelector(groupID: groupID, sessionID: session.id, anchor)
+        }
+        .contextMenu {
+            Button("Copy Link") {
+                copyCherryLink(cherryLink(for: session, projectRoot: workspace.projectRoot))
+            }
+            .disabled(workspace.projectRoot == nil)
+
+            Divider()
+
+            Button("Rename...") {
+                promptRenameSession(session)
+            }
+
+            Divider()
+
+            Button("Restart") {
+                session.restart()
+            }
+
+            Button("Clear Scrollback") {
+                session.clearScrollback()
+            }
+
+            nixShellContextMenuItems(for: session.nixShellEnvironment)
+
+            Divider()
+
+            Button("Close Pane", role: .destructive) {
+                workspace.close(session)
+            }
+            .disabled(workspace.sessions.count <= 1)
+
+            if let group = workspace.splitGroup(containing: session.id) {
+                Divider()
+
+                Button("Balance Panes") {
+                    workspace.balanceSplitGroup(id: group.id)
+                }
+
+                Button("Separate Panes") {
+                    workspace.separateSplitGroup(id: group.id)
+                }
+
+                Button("Close Split Group...", role: .destructive) {
+                    confirmCloseSplitGroup(group)
+                }
+                .disabled(!workspace.canCloseSplitGroup(id: group.id))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var paneIcon: some View {
+        if rowState.label.leadingIconResourceName != nil || rowState.label.leadingIconFallback != nil {
+            SidebarProgramIcon(label: rowState.label, isSelected: isRowSelected, palette: palette)
+                .opacity(isActive ? 1 : 0.50)
+        } else {
+            Image(systemName: "terminal")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle((isRowSelected ? palette.selectedText : palette.rowText).opacity(isActive ? 1 : 0.50))
+        }
+    }
+
+    @ViewBuilder
+    private var selectorBackground: some View {
+        if isActive {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill((isRowSelected ? palette.selectedText : palette.rowText).opacity(0.14))
+        }
+    }
+
+    private func confirmCloseSplitGroup(_ group: TerminalSplitGroup) {
+        let alert = NSAlert()
+        alert.messageText = "Close Split Group?"
+        alert.informativeText = "This will stop and close \(group.paneSessionIDs.count) terminal panes."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Close Split Group")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        workspace.closeSplitGroup(id: group.id)
+    }
+}
+
+private struct SidebarPaneSelectorFrame: Equatable {
+    let id: UUID
+    let rect: CGRect
 }
 
 private struct SidebarRowBoundsPreferenceKey: PreferenceKey {
@@ -5113,9 +5564,50 @@ private struct SidebarRowBoundsPreferenceKey: PreferenceKey {
     }
 }
 
+private struct SidebarInteractionAnchors {
+    var rows: [UUID: Anchor<CGRect>] = [:]
+    var paneSelectors: [UUID: [UUID: Anchor<CGRect>]] = [:]
+
+    static func row(_ id: UUID, _ anchor: Anchor<CGRect>) -> Self {
+        var anchors = Self()
+        anchors.rows[id] = anchor
+        return anchors
+    }
+
+    static func paneSelector(groupID: UUID, sessionID: UUID, _ anchor: Anchor<CGRect>) -> Self {
+        var anchors = Self()
+        anchors.paneSelectors[groupID] = [sessionID: anchor]
+        return anchors
+    }
+
+    mutating func merge(_ other: Self) {
+        rows.merge(other.rows, uniquingKeysWith: { _, next in next })
+        for (groupID, selectors) in other.paneSelectors {
+            paneSelectors[groupID, default: [:]].merge(selectors, uniquingKeysWith: { _, next in next })
+        }
+    }
+}
+
+private struct SidebarInteractionAnchorsPreferenceKey: PreferenceKey {
+    static let defaultValue = SidebarInteractionAnchors()
+
+    static func reduce(value: inout SidebarInteractionAnchors, nextValue: () -> SidebarInteractionAnchors) {
+        value.merge(nextValue())
+    }
+}
+
 private struct SidebarRowFrame: Equatable {
     let id: UUID
     let rect: CGRect
+    var primarySelectionID: UUID? = nil
+    var paneSelectors: [SidebarPaneSelectorFrame] = []
+
+    func selectionID(at point: CGPoint) -> UUID {
+        if let paneSelector = paneSelectors.first(where: { $0.rect.contains(point) }) {
+            return paneSelector.id
+        }
+        return primarySelectionID ?? id
+    }
 }
 
 private struct SidebarInteractionOverlay: NSViewRepresentable {
@@ -5187,7 +5679,7 @@ private final class SidebarInteractionOverlayView: NSView {
         dragStartY = point.y
         dragOffsetY = 0
         rowOrder = rows.map(\.id)
-        onSelect?(row.id)
+        onSelect?(row.selectionID(at: point))
         onDragChanged?(row.id, 0)
     }
 
@@ -7823,15 +8315,380 @@ extension NSColor {
     }
 }
 
+private struct TerminalSplitSceneView: View {
+    private static let dividerWidth: CGFloat = 5
+    private static let paneCornerRadius: CGFloat = 9
+
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @State private var dividerDragState: DividerDragState?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let panes = paneSessions
+            let group = activeGroup
+            let contentWidth = max(0, geometry.size.width - Self.dividerWidth * CGFloat(max(0, panes.count - 1)))
+            let widths = paneWidths(
+                for: group,
+                paneCount: panes.count,
+                contentWidth: contentWidth,
+                overrideWeights: previewWeights(for: group, paneCount: panes.count)
+            )
+
+            HStack(spacing: 0) {
+                ForEach(Array(panes.enumerated()), id: \.element.id) { index, session in
+                    TerminalSceneView(
+                        session: session,
+                        chromeState: chromeState,
+                        isActivePane: workspace.selectedSessionID == session.id,
+                        onActivate: activate
+                    )
+                    .frame(width: width(at: index, in: widths))
+                    .roundedTerminalSplitPane(
+                        isEnabled: panes.count > 1,
+                        radius: Self.paneCornerRadius
+                    )
+
+                    if index < panes.count - 1 {
+                        TerminalSplitDivider(
+                            onDragChanged: { translation in
+                                guard let group else { return }
+                                resizeDivider(
+                                    group: group,
+                                    dividerIndex: index,
+                                    translation: translation,
+                                    contentWidth: contentWidth
+                                )
+                            },
+                            onDragEnded: {
+                                commitDividerDrag()
+                            }
+                        )
+                        .frame(width: Self.dividerWidth)
+                    }
+                }
+            }
+            .transaction { transaction in
+                if dividerDragState != nil {
+                    transaction.animation = nil
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .clipped()
+            .onAppear {
+                workspace.updateTerminalDetailWidth(geometry.size.width)
+            }
+            .onChange(of: geometry.size.width) { _, width in
+                workspace.updateTerminalDetailWidth(width)
+            }
+        }
+    }
+
+    private var activeGroup: TerminalSplitGroup? {
+        guard let selectedSessionID = workspace.selectedSessionID else { return nil }
+        return workspace.splitGroup(containing: selectedSessionID)
+    }
+
+    private var paneSessions: [TerminalSession] {
+        if let group = activeGroup {
+            return group.paneSessionIDs.compactMap { workspace.session(withID: $0) }
+        }
+        return workspace.selectedSession.map { [$0] } ?? []
+    }
+
+    private func activate(_ sessionID: UUID) {
+        guard let session = workspace.session(withID: sessionID) else { return }
+        chromeState.selectTerminal()
+        workspace.select(session)
+    }
+
+    private func width(at index: Int, in widths: [CGFloat]) -> CGFloat {
+        widths.indices.contains(index) ? widths[index] : 0
+    }
+
+    private func paneWidths(
+        for group: TerminalSplitGroup?,
+        paneCount: Int,
+        contentWidth: CGFloat,
+        overrideWeights: [Double]? = nil
+    ) -> [CGFloat] {
+        guard paneCount > 0 else { return [] }
+        guard paneCount > 1, contentWidth > 0 else { return [max(0, contentWidth)] }
+
+        let weights = effectiveWeights(for: group, paneCount: paneCount, overrideWeights: overrideWeights)
+        var widths = weights.map { CGFloat($0) * contentWidth }
+        let minimumWidth = contentWidth >= CGFloat(paneCount) * TerminalWorkspace.minimumSplitPaneWidth
+            ? TerminalWorkspace.minimumSplitPaneWidth
+            : 0
+
+        guard minimumWidth > 0 else { return widths }
+
+        var deficit: CGFloat = 0
+        for index in widths.indices where widths[index] < minimumWidth {
+            deficit += minimumWidth - widths[index]
+            widths[index] = minimumWidth
+        }
+
+        guard deficit > 0 else { return widths }
+
+        let flexibleIndices = widths.indices.filter { widths[$0] > minimumWidth }
+        let flexibleCapacity = flexibleIndices.reduce(CGFloat(0)) { partial, index in
+            partial + widths[index] - minimumWidth
+        }
+        guard flexibleCapacity > 0 else { return widths }
+
+        for index in flexibleIndices {
+            let capacity = widths[index] - minimumWidth
+            widths[index] -= deficit * (capacity / flexibleCapacity)
+        }
+        return widths
+    }
+
+    private func resizeDivider(
+        group: TerminalSplitGroup,
+        dividerIndex: Int,
+        translation: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        guard contentWidth > 0,
+              dividerIndex >= 0,
+              dividerIndex + 1 < group.paneSessionIDs.count
+        else {
+            return
+        }
+
+        let dragState: DividerDragState
+        if let dividerDragState,
+           dividerDragState.groupID == group.id,
+           dividerDragState.dividerIndex == dividerIndex,
+           dividerDragState.paneCount == group.paneSessionIDs.count {
+            dragState = dividerDragState
+        } else {
+            let startWeights = paneWidths(
+                for: group,
+                paneCount: group.paneSessionIDs.count,
+                contentWidth: contentWidth
+            ).map { Double($0 / contentWidth) }
+            dragState = DividerDragState(
+                groupID: group.id,
+                dividerIndex: dividerIndex,
+                paneCount: group.paneSessionIDs.count,
+                contentWidth: contentWidth,
+                startWeights: startWeights,
+                previewWeights: startWeights
+            )
+        }
+
+        let dragContentWidth = max(dragState.contentWidth, 1)
+        var widths = dragState.startWeights.map { CGFloat($0) * dragContentWidth }
+        let pairTotal = widths[dividerIndex] + widths[dividerIndex + 1]
+        let minimumPairWidth = min(TerminalWorkspace.minimumSplitPaneWidth, pairTotal / 2)
+        let proposedLeft = widths[dividerIndex] + translation
+        let left = min(max(proposedLeft, minimumPairWidth), pairTotal - minimumPairWidth)
+        widths[dividerIndex] = left
+        widths[dividerIndex + 1] = pairTotal - left
+
+        dividerDragState = DividerDragState(
+            groupID: dragState.groupID,
+            dividerIndex: dragState.dividerIndex,
+            paneCount: dragState.paneCount,
+            contentWidth: dragContentWidth,
+            startWeights: dragState.startWeights,
+            previewWeights: widths.map { Double($0 / dragContentWidth) }
+        )
+    }
+
+    private func previewWeights(for group: TerminalSplitGroup?, paneCount: Int) -> [Double]? {
+        guard let group,
+              let dividerDragState,
+              dividerDragState.groupID == group.id,
+              dividerDragState.paneCount == paneCount,
+              dividerDragState.previewWeights.count == paneCount
+        else {
+            return nil
+        }
+        return dividerDragState.previewWeights
+    }
+
+    private func commitDividerDrag() {
+        defer {
+            dividerDragState = nil
+        }
+
+        guard let dividerDragState,
+              workspace.splitGroup(id: dividerDragState.groupID)?.paneSessionIDs.count == dividerDragState.paneCount
+        else {
+            return
+        }
+
+        workspace.setSplitGroupWidthWeights(
+            id: dividerDragState.groupID,
+            weights: dividerDragState.previewWeights
+        )
+    }
+
+    private func effectiveWeights(
+        for group: TerminalSplitGroup?,
+        paneCount: Int,
+        overrideWeights: [Double]? = nil
+    ) -> [Double] {
+        if let overrideWeights,
+           overrideWeights.count == paneCount {
+            return overrideWeights
+        }
+
+        guard let group,
+              group.widthWeights.count == paneCount
+        else {
+            return TerminalSplitGroup.balancedWeights(count: paneCount)
+        }
+        return group.widthWeights
+    }
+
+    private struct DividerDragState {
+        let groupID: UUID
+        let dividerIndex: Int
+        let paneCount: Int
+        let contentWidth: CGFloat
+        let startWeights: [Double]
+        let previewWeights: [Double]
+    }
+}
+
+private struct TerminalSplitDivider: View {
+    let onDragChanged: (CGFloat) -> Void
+    let onDragEnded: () -> Void
+
+    var body: some View {
+        TerminalSplitDividerHandle(onDragChanged: onDragChanged, onDragEnded: onDragEnded)
+            .frame(maxHeight: .infinity)
+            .help("Drag to resize panes")
+    }
+}
+
+private struct TerminalSplitDividerHandle: NSViewRepresentable {
+    let onDragChanged: (CGFloat) -> Void
+    let onDragEnded: () -> Void
+
+    func makeNSView(context: Context) -> TerminalSplitDividerHandleView {
+        let view = TerminalSplitDividerHandleView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ nsView: TerminalSplitDividerHandleView, context: Context) {
+        nsView.onDragChanged = onDragChanged
+        nsView.onDragEnded = onDragEnded
+        nsView.window?.invalidateCursorRects(for: nsView)
+    }
+}
+
+private final class TerminalSplitDividerHandleView: NSView {
+    var onDragChanged: ((CGFloat) -> Void)?
+    var onDragEnded: (() -> Void)?
+
+    private var dragStartLocationX: CGFloat?
+    private var trackingArea: NSTrackingArea?
+    private var didPushCursor = false
+    private var isDragging = false
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(nextTrackingArea)
+        trackingArea = nextTrackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pushResizeCursor()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard !isDragging else { return }
+        popResizeCursorIfNeeded()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        isDragging = true
+        dragStartLocationX = event.locationInWindow.x
+        pushResizeCursor()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let dragStartLocationX else { return }
+        onDragChanged?(event.locationInWindow.x - dragStartLocationX)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragStartLocationX = nil
+        isDragging = false
+        onDragEnded?()
+
+        let location = convert(event.locationInWindow, from: nil)
+        if bounds.contains(location) {
+            pushResizeCursor()
+        } else {
+            popResizeCursorIfNeeded()
+        }
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeLeftRight)
+    }
+
+    private func pushResizeCursor() {
+        guard !didPushCursor else {
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+
+        NSCursor.resizeLeftRight.push()
+        didPushCursor = true
+    }
+
+    private func popResizeCursorIfNeeded() {
+        guard didPushCursor else { return }
+        NSCursor.pop()
+        didPushCursor = false
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            popResizeCursorIfNeeded()
+        }
+    }
+}
+
 private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let isActivePane: Bool
+    let onActivate: (UUID) -> Void
     @StateObject private var searchState = TerminalSearchState()
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            TerminalSurfaceView(session: session, chromeState: chromeState)
+            TerminalSurfaceView(
+                session: session,
+                chromeState: chromeState,
+                isActivePane: isActivePane,
+                onActivate: onActivate
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(
                     LinearGradient(
@@ -7842,7 +8699,7 @@ private struct TerminalSceneView: View {
                 )
                 .ignoresSafeArea(.container, edges: .top)
 
-            if chromeState.isTerminalSearchPresented {
+            if isActivePane, chromeState.isTerminalSearchPresented {
                 TerminalSearchOverlay(
                     session: session,
                     searchState: searchState,
@@ -7854,9 +8711,16 @@ private struct TerminalSceneView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
             }
         }
-        .onAppear(perform: configureSearchHandlers)
+        .onAppear {
+            configureSearchHandlersIfActive()
+        }
         .onChange(of: session.id) { _, _ in
-            configureSearchHandlers()
+            configureSearchHandlersIfActive()
+        }
+        .onChange(of: isActivePane) { _, isActivePane in
+            if isActivePane {
+                configureSearchHandlersIfActive()
+            }
         }
     }
 
@@ -7880,7 +8744,8 @@ private struct TerminalSceneView: View {
         }
     }
 
-    private func configureSearchHandlers() {
+    private func configureSearchHandlersIfActive() {
+        guard isActivePane else { return }
         session.ghosttyBridge.configureSearch(
             state: searchState,
             onRequest: { [weak chromeState] _ in
@@ -8030,8 +8895,25 @@ private struct TerminalSearchButtonLabelModifier: ViewModifier {
     }
 }
 
+private struct RoundedTerminalSplitPaneModifier: ViewModifier {
+    let isEnabled: Bool
+    let radius: CGFloat
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            content
+        }
+    }
+}
+
 private extension View {
     func terminalSearchButtonLabel() -> some View {
         modifier(TerminalSearchButtonLabelModifier())
+    }
+
+    func roundedTerminalSplitPane(isEnabled: Bool, radius: CGFloat) -> some View {
+        modifier(RoundedTerminalSplitPaneModifier(isEnabled: isEnabled, radius: radius))
     }
 }

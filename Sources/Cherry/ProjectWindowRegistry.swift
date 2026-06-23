@@ -289,12 +289,18 @@ final class ProjectWindowRegistry {
         for (projectRoot, weakWorkspace) in workspaces {
             guard let workspace = weakWorkspace.workspace,
                   workspace.sessions.contains(where: { $0.id == session.id }),
-                  workspace.selectedSessionID == session.id,
                   chromeStates[projectRoot]?.chromeState?.isShowingTerminalContent ?? true,
                   let window = windows[projectRoot]?.window
             else {
                 continue
             }
+
+            let isVisibleSession = if session.kind == .terminal {
+                workspace.visibleTerminalSessionIDs.contains(session.id)
+            } else {
+                workspace.selectedSessionID == session.id
+            }
+            guard isVisibleSession else { continue }
 
             return Self.isTerminalWindowVisible(
                 windowIsKey: window.isKeyWindow,

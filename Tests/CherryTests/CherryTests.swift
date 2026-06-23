@@ -4108,6 +4108,57 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerSelectTerminalActivatesGroupedPane() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    harness.server.start()
+    harness.workspace.updateTerminalDetailWidth(1_200)
+    let firstSession = try #require(harness.workspace.terminalSessions.first)
+    let secondSession = try #require(harness.workspace.splitDuplicateActiveTerminal())
+    let groupID = try #require(harness.workspace.splitGroup(containing: firstSession.id)?.id)
+
+    let initialListResponse = try await harness.send(.listTerminals)
+    guard case .listTerminals(let initialList)? = initialListResponse.result else {
+        Issue.record("Expected listTerminals result, got \(String(describing: initialListResponse))")
+        return
+    }
+    #expect(initialList.terminals.count == 2)
+    #expect(initialList.selectedTerminalID == secondSession.id.uuidString)
+    #expect(initialList.terminals.filter(\.selected).map(\.id) == [secondSession.id.uuidString])
+
+    let selectResponse = try await harness.send(.selectTerminal(.init(terminalID: firstSession.id.uuidString)))
+    guard case .selectTerminal(let selected)? = selectResponse.result else {
+        Issue.record("Expected selectTerminal result, got \(String(describing: selectResponse))")
+        return
+    }
+    #expect(selected.selected)
+    #expect(selected.terminalID == firstSession.id.uuidString)
+    #expect(harness.workspace.selectedSessionID == firstSession.id)
+    #expect(harness.workspace.splitGroup(id: groupID)?.activeSessionID == firstSession.id)
+
+    let selectedListResponse = try await harness.send(.listTerminals)
+    guard case .listTerminals(let selectedList)? = selectedListResponse.result else {
+        Issue.record("Expected listTerminals result, got \(String(describing: selectedListResponse))")
+        return
+    }
+    #expect(selectedList.terminals.filter(\.selected).map(\.id) == [firstSession.id.uuidString])
+
+    harness.workspace.closeActivePane()
+    #expect(harness.workspace.splitGroup(id: groupID) == nil)
+    #expect(harness.workspace.selectedSessionID == secondSession.id)
+    let dissolvedSelectResponse = try await harness.send(.selectTerminal(.init(terminalID: secondSession.id.uuidString)))
+    guard case .selectTerminal(let dissolvedSelected)? = dissolvedSelectResponse.result else {
+        Issue.record("Expected selectTerminal result, got \(String(describing: dissolvedSelectResponse))")
+        return
+    }
+    #expect(dissolvedSelected.selected)
+    #expect(harness.workspace.selectedSessionID == secondSession.id)
+}
+
+@MainActor
 @Test func controlServerRejectsUnknownAndDisabledAgents() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -6568,6 +6619,150 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
+@Test func workspaceSplitDuplicateCreatesDisplayGroup() async throws {
+    let workspace = TerminalWorkspace()
+    workspace.updateTerminalDetailWidth(1_200)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let firstSession = try #require(workspace.terminalSessions.first)
+    let secondSession = try #require(workspace.splitDuplicateActiveTerminal())
+    let group = try #require(workspace.splitGroup(containing: firstSession.id))
+
+    #expect(workspace.terminalSessions.map(\.id) == [firstSession.id, secondSession.id])
+    #expect(workspace.terminalDisplayItems == [.split(group.id)])
+    #expect(group.paneSessionIDs == [firstSession.id, secondSession.id])
+    #expect(group.activeSessionID == secondSession.id)
+    #expect(group.widthWeights.count == 2)
+    #expect(workspace.visibleTerminalSessionIDs == Set([firstSession.id, secondSession.id]))
+    #expect(workspace.selectedSessionID == secondSession.id)
+}
+
+@MainActor
+@Test func workspaceSplitRejectsDuplicateAndNonTerminalPanes() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    workspace.updateTerminalDetailWidth(1_200)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let firstTerminal = try #require(workspace.terminalSessions.first)
+    let secondTerminal = workspace.addSession(title: "Second", select: false)
+    let agent = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+    let command = workspace.addCommandSession(
+        command: ProjectCommandDefinition(name: "Web", command: "/bin/cat"),
+        projectRoot: directory.path,
+        select: false
+    )
+
+    workspace.select(firstTerminal)
+    #expect(workspace.splitActiveTerminal(with: secondTerminal))
+    #expect(!workspace.splitActiveTerminal(with: secondTerminal))
+    workspace.select(agent)
+    #expect(workspace.splitDuplicateActiveTerminal() == nil)
+    workspace.select(command)
+    #expect(workspace.splitDuplicateActiveTerminal() == nil)
+    workspace.select(firstTerminal)
+    #expect(!workspace.splitActiveTerminal(with: agent))
+    #expect(!workspace.splitActiveTerminal(with: command))
+}
+
+@MainActor
+@Test func workspaceSplitEnforcesThreePaneLimitAndDetailWidth() async throws {
+    let workspace = TerminalWorkspace()
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    workspace.updateTerminalDetailWidth(700)
+    let first = try #require(workspace.terminalSessions.first)
+    let second = try #require(workspace.splitDuplicateActiveTerminal())
+    #expect(workspace.splitDuplicateActiveTerminal() == nil)
+
+    workspace.updateTerminalDetailWidth(1_000)
+    workspace.select(second)
+    let third = try #require(workspace.splitDuplicateActiveTerminal())
+    #expect(workspace.splitDuplicateActiveTerminal() == nil)
+
+    let group = try #require(workspace.splitGroup(containing: first.id))
+    #expect(group.paneSessionIDs == [first.id, second.id, third.id])
+}
+
+@MainActor
+@Test func workspaceCanMoveSplitDisplayRows() async throws {
+    let workspace = TerminalWorkspace()
+    workspace.updateTerminalDetailWidth(1_200)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let first = try #require(workspace.terminalSessions.first)
+    let second = workspace.addSession(title: "Second", select: false)
+    let third = workspace.addSession(title: "Third", select: false)
+
+    workspace.select(first)
+    #expect(workspace.splitActiveTerminal(with: third))
+    let group = try #require(workspace.splitGroup(containing: first.id))
+
+    #expect(workspace.terminalDisplayItems == [.split(group.id), .single(second.id)])
+    workspace.moveTerminalDisplayItem(id: group.id, to: 1)
+    #expect(workspace.terminalDisplayItems == [.single(second.id), .split(group.id)])
+}
+
+@MainActor
+@Test func workspaceSplitFocusCloseDissolveAndSeparateActions() async throws {
+    let workspace = TerminalWorkspace()
+    workspace.updateTerminalDetailWidth(1_200)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let first = try #require(workspace.terminalSessions.first)
+    let second = try #require(workspace.splitDuplicateActiveTerminal())
+    let third = try #require(workspace.splitDuplicateActiveTerminal())
+    let groupID = try #require(workspace.splitGroup(containing: first.id)?.id)
+
+    #expect(workspace.focusPreviousPane())
+    #expect(workspace.selectedSessionID == second.id)
+    #expect(workspace.focusNextPane())
+    #expect(workspace.selectedSessionID == third.id)
+
+    workspace.setSplitGroupWidthWeights(id: groupID, weights: [2, 1, 1])
+    #expect(workspace.splitGroup(id: groupID)?.widthWeights == [0.5, 0.25, 0.25])
+    workspace.balanceSplitGroup(id: groupID)
+    #expect(workspace.splitGroup(id: groupID)?.widthWeights == [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
+
+    workspace.closeActivePane()
+    #expect(workspace.selectedSessionID == second.id)
+    #expect(workspace.splitGroup(id: groupID)?.paneSessionIDs == [first.id, second.id])
+
+    workspace.closeActivePane()
+    #expect(workspace.selectedSessionID == first.id)
+    #expect(workspace.splitGroup(id: groupID) == nil)
+    #expect(workspace.terminalDisplayItems == [.single(first.id)])
+    #expect(workspace.visibleTerminalSessionIDs == Set([first.id]))
+
+    let newSecond = workspace.addSession(title: "Second Again", select: false)
+    #expect(workspace.splitActiveTerminal(with: newSecond))
+    let newGroupID = try #require(workspace.splitGroup(containing: first.id)?.id)
+    workspace.separateSplitGroup(id: newGroupID)
+    #expect(workspace.splitGroup(id: newGroupID) == nil)
+    #expect(workspace.terminalDisplayItems == [.single(first.id), .single(newSecond.id)])
+}
+
+@MainActor
 @Test func workspaceShortcutSelectionFollowsSidebarOrder() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -6632,6 +6827,29 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
     workspace.selectPreviousSession()
     #expect(workspace.selectedSessionID == command.id)
+}
+
+@MainActor
+@Test func workspaceShortcutSelectionTreatsSplitGroupAsOneRow() async throws {
+    let workspace = TerminalWorkspace()
+    workspace.updateTerminalDetailWidth(1_200)
+    defer {
+        workspace.sessions.forEach { $0.stop() }
+    }
+
+    let firstTerminal = try #require(workspace.terminalSessions.first)
+    let secondTerminal = workspace.addSession(title: "Second", select: false)
+    let thirdTerminal = workspace.addSession(title: "Third", select: false)
+
+    workspace.select(firstTerminal)
+    #expect(workspace.splitActiveTerminal(with: secondTerminal))
+    #expect(workspace.terminalDisplaySessions.map(\.id) == [secondTerminal.id, thirdTerminal.id])
+
+    workspace.selectNextSession()
+    #expect(workspace.selectedSessionID == thirdTerminal.id)
+
+    workspace.selectPreviousSession()
+    #expect(workspace.selectedSessionID == secondTerminal.id)
 }
 
 @MainActor
@@ -7290,6 +7508,18 @@ private func waitForSummaryCallCount(
         modifiers: [.command]
     ) == .toggleSidebar)
     #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "d",
+        modifiers: [.command]
+    ) == .splitDuplicate)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "[",
+        modifiers: [.command]
+    ) == .focusPreviousPane)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "]",
+        modifiers: [.command]
+    ) == .focusNextPane)
+    #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "s",
         modifiers: [.command, .shift]
     ) == nil)
@@ -7367,6 +7597,83 @@ private func waitForSummaryCallCount(
     #expect(chromeState.selectedNoteID == nil)
     #expect(workspace.sessions.contains { $0.id == secondSession.id })
     #expect(workspace.sessions.count == 2)
+}
+
+@MainActor
+@Test func appShortcutMonitorCommandWClosesActiveSplitPane() async throws {
+    let projectDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryShortcutSplitClose-\(UUID().uuidString)", isDirectory: true)
+    let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    workspace.updateTerminalDetailWidth(1_200)
+    let chromeState = ProjectWindowChromeState()
+    let noteStore = ProjectNoteStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
+    )
+    let todoStore = ProjectTodoStore(
+        projectRoot: projectDirectory.path,
+        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
+    )
+    let firstSession = try #require(workspace.terminalSessions.first)
+    let secondSession = try #require(workspace.splitDuplicateActiveTerminal())
+    let groupID = try #require(workspace.splitGroup(containing: firstSession.id)?.id)
+    chromeState.selectTerminal()
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.orderFrontRegardless()
+
+    let coordinator = AppShortcutMonitor.Coordinator(
+        workspace: workspace,
+        chromeState: chromeState,
+        noteStore: noteStore,
+        todoStore: todoStore,
+        projectRoot: projectDirectory.path,
+        visibleCommandNames: [],
+        visibleCommands: [],
+        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+        openSettings: {}
+    )
+    coordinator.window = window
+
+    defer {
+        _ = coordinator
+        for session in workspace.sessions {
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
+        window.close()
+        try? FileManager.default.removeItem(at: projectDirectory)
+    }
+
+    let event = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.command],
+        timestamp: 1,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: "w",
+        charactersIgnoringModifiers: "w",
+        isARepeat: false,
+        keyCode: 13
+    ))
+
+    NSApp.sendEvent(event)
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(!workspace.sessions.contains { $0.id == secondSession.id })
+    #expect(workspace.selectedSessionID == firstSession.id)
+    #expect(workspace.splitGroup(id: groupID) == nil)
+    #expect(workspace.terminalDisplayItems == [.single(firstSession.id)])
 }
 
 @Test func commandEnvironmentExtractionParsesLeadingAssignments() {

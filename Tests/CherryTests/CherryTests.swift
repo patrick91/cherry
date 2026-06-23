@@ -4781,7 +4781,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyContainerPreservesDetachedSurfaceBrieflyWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerReleasesDetachedSurfaceWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -4795,11 +4795,7 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: false
     )
     let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
-    let previousDelay = GhosttySessionBridge.detachedSurfaceReleaseDelay
-    GhosttySessionBridge.detachedSurfaceReleaseDelay = .milliseconds(50)
-
     defer {
-        GhosttySessionBridge.detachedSurfaceReleaseDelay = previousDelay
         container.detachActiveSession()
         first.releaseGhosttyBridge()
         second.releaseGhosttyBridge()
@@ -4813,15 +4809,8 @@ private struct MCPWhoamiPayload: Decodable {
 
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
-    #expect(first.rawOutputObserverCount == 1)
-
-    try await Task.sleep(for: .milliseconds(20))
-
-    #expect(first.rawOutputObserverCount == 1)
-
-    try await Task.sleep(for: .milliseconds(80))
-
     #expect(first.rawOutputObserverCount == 0)
+    #expect(first.ghosttyBridge.gridMetrics == nil)
 }
 
 @MainActor

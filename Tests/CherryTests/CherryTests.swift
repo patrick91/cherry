@@ -4855,6 +4855,40 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerStopsDrivingBridgeAfterTransferToAnotherContainer() {
+    let session = TerminalSession(
+        title: "Transfer",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let firstContainer = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+    let secondContainer = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+
+    defer {
+        firstContainer.detachActiveSession()
+        secondContainer.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    firstContainer.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    firstContainer.layoutSubtreeIfNeeded()
+
+    let bridge = session.ghosttyBridge
+    secondContainer.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    secondContainer.layoutSubtreeIfNeeded()
+
+    let secondContainerFrame = NSRect(x: 0, y: 0, width: 640, height: 400)
+    bridge.terminalView.frame = secondContainerFrame
+
+    firstContainer.layoutSubtreeIfNeeded()
+    firstContainer.synchronizeScrollState()
+
+    #expect(bridge.terminalView.frame == secondContainerFrame)
+}
+
+@MainActor
 @Test func ghosttyBridgeAttachLaysOutTerminalSurfaceBeforeOutputReplay() async throws {
     let first = TerminalSession(
         title: "First",

@@ -328,8 +328,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func attach(to container: GhosttyTerminalContainerView) {
         guard !isReleased else { return }
         cancelDetachedSurfaceRelease()
-        let isAlreadyInstalled = scrollContainer === container && terminalView.superview != nil
+        let previousContainer = scrollContainer
+        let isAlreadyInstalled = previousContainer === container && terminalView.superview != nil
         TerminalPerformanceMonitor.recordBridgeAttach(reused: isAlreadyInstalled)
+        if previousContainer !== container {
+            previousContainer?.detachTransferredTerminalView(terminalView)
+        }
         scrollContainer = container
         if !isAlreadyInstalled {
             container.install(terminalView: terminalView, bridge: self)
@@ -1342,6 +1346,19 @@ final class GhosttyTerminalContainerView: NSView {
         if activeBridge?.terminalView === terminalView {
             activeBridge = nil
         }
+    }
+
+    func detachTransferredTerminalView(_ terminalView: TerminalView) {
+        let ownedTransferredView = activeBridge?.terminalView === terminalView
+        if terminalView.superview === documentView {
+            terminalView.removeFromSuperview()
+        }
+        guard ownedTransferredView else { return }
+
+        activeSession = nil
+        activeBridge = nil
+        pendingTerminalFocus = false
+        removeSnapshotLayer(animated: false)
     }
 
     func detachActiveSession(

@@ -636,8 +636,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private func installOutputObserver() {
         guard !isReleased, outputObserverID == nil, let session = proxy.session else { return }
 
-        let existingOutput = session.rawOutput(maxBytes: 1_048_576).data
-        let replayOutput = Self.sanitizeReplayOutputForHostManagedTerminal(existingOutput)
+        let replayOutput = Self.renderedReplayOutput(for: session)
         if !replayOutput.isEmpty {
             outputSink.receive(replayOutput, suppressHostInput: true)
         }
@@ -646,6 +645,103 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             outputSink.receive(data)
         }
         Self.installedOutputObserverCount += 1
+    }
+
+    static func renderedReplayOutput(
+        for session: TerminalSession,
+        maxBytes: Int = 1_048_576,
+        maxLines: Int = 5_000
+    ) -> Data {
+        let totalLines = session.lineCount
+        guard totalLines > 0 else { return Data() }
+
+        let startLine = max(0, totalLines - maxLines)
+        let lines = session.styledSnapshot(range: startLine..<totalLines)
+        guard !lines.isEmpty else { return Data() }
+
+        var chunks: [Data] = []
+        chunks.reserveCapacity(lines.count)
+        var byteCount = 0
+
+        for (index, line) in lines.enumerated() {
+            var chunk = Data()
+            encodeRenderedLine(line, into: &chunk)
+            if index < lines.count - 1 {
+                chunk.append(contentsOf: [0x0D, 0x0A])
+            }
+
+            chunks.append(chunk)
+            byteCount += chunk.count
+            while byteCount > maxBytes, chunks.count > 1 {
+                byteCount -= chunks.removeFirst().count
+            }
+        }
+
+        var output = Data()
+        output.reserveCapacity(byteCount + Self.ansiResetData.count * 2)
+        output.append(Self.ansiResetData)
+        for chunk in chunks {
+            output.append(chunk)
+        }
+        output.append(Self.ansiResetData)
+        return output
+    }
+
+    private static func encodeRenderedLine(_ line: TerminalRenderedLine, into output: inout Data) {
+        var currentStyle = TerminalTextStyle()
+        for run in line.runs {
+            guard !run.text.isEmpty else { continue }
+            if run.style != currentStyle {
+                appendSGR(for: run.style, to: &output)
+                currentStyle = run.style
+            }
+            output.append(Data(run.text.utf8))
+        }
+        if currentStyle != TerminalTextStyle() {
+            output.append(Self.ansiResetData)
+        }
+    }
+
+    private static let ansiResetData = Data("\u{1B}[0m".utf8)
+
+    private static func appendSGR(for style: TerminalTextStyle, to output: inout Data) {
+        var parameters = ["0"]
+
+        if style.isBold {
+            parameters.append("1")
+        }
+        if style.isDim {
+            parameters.append("2")
+        }
+        if style.isInverse {
+            parameters.append("7")
+        }
+        if let foreground = style.foreground {
+            parameters.append(contentsOf: sgrColorParameters(for: foreground, isBackground: false))
+        }
+        if let background = style.background {
+            parameters.append(contentsOf: sgrColorParameters(for: background, isBackground: true))
+        }
+
+        output.append(Data("\u{1B}[\(parameters.joined(separator: ";"))m".utf8))
+    }
+
+    private static func sgrColorParameters(
+        for color: TerminalANSIColor,
+        isBackground: Bool
+    ) -> [String] {
+        switch color {
+        case .ansi16(let value):
+            let normalized = max(0, min(value, 15))
+            if normalized < 8 {
+                return [String((isBackground ? 40 : 30) + normalized)]
+            }
+            return [String((isBackground ? 100 : 90) + normalized - 8)]
+        case .palette256(let value):
+            return [isBackground ? "48" : "38", "5", String(max(0, min(value, 255)))]
+        case let .rgb(red, green, blue):
+            return [isBackground ? "48" : "38", "2", String(red), String(green), String(blue)]
+        }
     }
 
     func installOutputObserverForTesting() {

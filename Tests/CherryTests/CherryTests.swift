@@ -4506,6 +4506,44 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output.contains("\u{1B}[1;32m❯\u{1B}[0m "))
 }
 
+@MainActor
+@Test func ghosttyReplayUsesRenderedSnapshotInsteadOfTransientRawFrames() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[3;3H\u{1B}[1mStarting MCP servers (6/8): mobbin, paper, xcodebuildmcp\u{1B}[0m" +
+        "\u{1B}[?2026l"
+    ).utf8))
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "⚠ MCP client for `mobbin` failed to start: MCP startup failed\r\n" +
+        "\r\n" +
+        "› Explain this codebase" +
+        "\u{1B}[?2026l"
+    ).utf8))
+
+    let rawOutput = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
+    let replayOutput = String(decoding: GhosttySessionBridge.renderedReplayOutput(for: session), as: UTF8.self)
+
+    #expect(rawOutput.contains("Starting MCP servers (6/8): mobbin, paper, xcodebuildmcp"))
+    #expect(!replayOutput.contains("Starting MCP servers"))
+    #expect(replayOutput.contains("⚠ MCP client for `mobbin` failed to start"))
+    #expect(replayOutput.contains("› Explain this codebase"))
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +

@@ -6,6 +6,25 @@ enum TerminalPerformanceMonitor {
 
     private static let store = Store()
 
+    struct CounterSnapshot: Equatable, Sendable {
+        let ptyChunks: Int
+        let ptyBytes: Int
+        let ghosttyFeedChunks: Int
+        let ghosttyFeedBytes: Int
+        let processorBacklogDropCount: Int
+        let processorBacklogDroppedBytes: Int
+        let backgroundOutputThrottleCount: Int
+        let processorChanges: Int
+        let representableUpdates: Int
+        let containerConfigures: Int
+        let bridgeAttaches: Int
+        let reusedBridgeAttaches: Int
+        let fitToSizeCalls: Int
+        let settingsApplies: Int
+        let settingsReconfigures: Int
+        let renderTicks: Int
+    }
+
     static func recordPTYOutputChunk(bytes: Int) {
         guard isEnabled else { return }
         store.record { counters in
@@ -25,6 +44,19 @@ enum TerminalPerformanceMonitor {
     static func recordProcessorChange() {
         guard isEnabled else { return }
         store.record { $0.processorChanges += 1 }
+    }
+
+    static func recordProcessorBacklogDrop(bytes: Int) {
+        guard isEnabled, bytes > 0 else { return }
+        store.record { counters in
+            counters.processorBacklogDropCount += 1
+            counters.processorBacklogDroppedBytes += bytes
+        }
+    }
+
+    static func recordBackgroundOutputThrottle() {
+        guard isEnabled else { return }
+        store.record { $0.backgroundOutputThrottleCount += 1 }
     }
 
     static func recordRepresentableUpdate() {
@@ -67,11 +99,18 @@ enum TerminalPerformanceMonitor {
         store.record { $0.renderTicks += 1 }
     }
 
+    static func snapshot() -> CounterSnapshot {
+        store.snapshot()
+    }
+
     private struct Counters {
         var ptyChunks = 0
         var ptyBytes = 0
         var ghosttyFeedChunks = 0
         var ghosttyFeedBytes = 0
+        var processorBacklogDropCount = 0
+        var processorBacklogDroppedBytes = 0
+        var backgroundOutputThrottleCount = 0
         var processorChanges = 0
         var representableUpdates = 0
         var containerConfigures = 0
@@ -81,6 +120,27 @@ enum TerminalPerformanceMonitor {
         var settingsApplies = 0
         var settingsReconfigures = 0
         var renderTicks = 0
+
+        var snapshot: CounterSnapshot {
+            CounterSnapshot(
+                ptyChunks: ptyChunks,
+                ptyBytes: ptyBytes,
+                ghosttyFeedChunks: ghosttyFeedChunks,
+                ghosttyFeedBytes: ghosttyFeedBytes,
+                processorBacklogDropCount: processorBacklogDropCount,
+                processorBacklogDroppedBytes: processorBacklogDroppedBytes,
+                backgroundOutputThrottleCount: backgroundOutputThrottleCount,
+                processorChanges: processorChanges,
+                representableUpdates: representableUpdates,
+                containerConfigures: containerConfigures,
+                bridgeAttaches: bridgeAttaches,
+                reusedBridgeAttaches: reusedBridgeAttaches,
+                fitToSizeCalls: fitToSizeCalls,
+                settingsApplies: settingsApplies,
+                settingsReconfigures: settingsReconfigures,
+                renderTicks: renderTicks
+            )
+        }
     }
 
     private struct Snapshot {
@@ -93,10 +153,12 @@ enum TerminalPerformanceMonitor {
         private let lock = NSLock()
         private var windowStart = Date()
         private var counters = Counters()
+        private var totalCounters = Counters()
 
         func record(_ update: (inout Counters) -> Void) {
             let snapshot: Snapshot? = lock.withLock {
                 update(&counters)
+                update(&totalCounters)
 
                 let now = Date()
                 let interval = now.timeIntervalSince(windowStart)
@@ -113,6 +175,12 @@ enum TerminalPerformanceMonitor {
             }
         }
 
+        func snapshot() -> CounterSnapshot {
+            lock.withLock {
+                totalCounters.snapshot
+            }
+        }
+
         private func log(_ snapshot: Snapshot) {
             let interval = String(format: "%.2f", snapshot.interval)
             let c = snapshot.counters
@@ -121,6 +189,8 @@ enum TerminalPerformanceMonitor {
                 interval=\(interval, privacy: .public)s \
                 pty=\(c.ptyChunks, privacy: .public)/\(c.ptyBytes, privacy: .public)B \
                 ghosttyFeed=\(c.ghosttyFeedChunks, privacy: .public)/\(c.ghosttyFeedBytes, privacy: .public)B \
+                processorDrop=\(c.processorBacklogDropCount, privacy: .public)/\(c.processorBacklogDroppedBytes, privacy: .public)B \
+                backgroundThrottle=\(c.backgroundOutputThrottleCount, privacy: .public) \
                 processor=\(c.processorChanges, privacy: .public) \
                 render=\(c.renderTicks, privacy: .public) \
                 representableUpdate=\(c.representableUpdates, privacy: .public) \

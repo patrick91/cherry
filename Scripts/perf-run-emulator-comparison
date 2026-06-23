@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run a matched Cherry app-soak and Ghostty workload, then compare their reports."
+    )
+    parser.add_argument("--scale", choices=("smoke", "standard", "soak"), default="smoke")
+    parser.add_argument("--mode", choices=("scrollback", "tui", "mixed"), default="mixed")
+    parser.add_argument("--windows", type=int, default=1, help="Cherry project windows to drive.")
+    parser.add_argument("--tabs", type=int, default=2, help="Cherry terminal tabs per project window.")
+    parser.add_argument("--duration", type=float, help="Override workload duration in seconds.")
+    parser.add_argument("--lines", type=int)
+    parser.add_argument("--frames", type=int)
+    parser.add_argument("--progress-frames", type=int)
+    parser.add_argument("--sleep-ms", type=float)
+    parser.add_argument("--sample-interval", type=float)
+    parser.add_argument("--select-interval", type=float)
+    parser.add_argument(
+        "--spawn-interval",
+        type=float,
+        default=0.05,
+        help="Seconds to pause after each Cherry workload starts.",
+    )
+    parser.add_argument("--settle-after-close", type=float, default=1.5)
+    parser.add_argument("--settle-after-complete", type=float, default=1.0)
+    parser.add_argument("--launch-timeout", type=float, default=60.0)
+    parser.add_argument("--log-dir", default=str(REPO_ROOT / ".build" / "perf"))
+    parser.add_argument("--cherry-command", default="swift run Cherry")
+    parser.add_argument("--keep-cherry-open", action="store_true")
+    parser.add_argument("--keep-project-roots", action="store_true")
+    parser.add_argument(
+        "--cherry-only",
+        action="store_true",
+        help="Launch Cherry and run the app soak, but skip the matched Ghostty control run.",
+    )
+    parser.add_argument("--max-rss-per-workload-ratio", type=float)
+    parser.add_argument("--max-cpu-per-workload-ratio", type=float)
+    return parser.parse_args()
+
+
+def scale_flag(scale):
+    return f"--{scale}"
+
+
+def run_command(command, *, cwd=REPO_ROOT, env=None):
+    print("[pair] running:", " ".join(shlex.quote(str(part)) for part in command))
+    completed = subprocess.run(
+        [str(part) for part in command],
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    print(completed.stdout, end="")
+    if completed.returncode != 0:
+        raise RuntimeError(f"command failed with exit code {completed.returncode}: {command[0]}")
+    return completed.stdout
+
+
+def parse_written_json(output, label):
+    matches = re.findall(r"wrote\s+(.+?\.json)", output)
+    if not matches:
+        raise RuntimeError(f"could not find JSON report path in {label} output")
+    return Path(matches[-1]).expanduser().resolve()
+
+
+def control_socket(namespace):
+    return Path(f"/tmp/cherry-{os.getuid()}") / namespace / "control.sock"
+
+
+def send(socket_path, request, timeout=10):
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(socket_path))
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+        data = bytearray()
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if data.endswith(b"\n"):
+                break
+    response = json.loads(data.decode("utf-8"))
+    if response.get("error"):
+        error = response["error"]
+        raise RuntimeError(f"{error.get('code')}: {error.get('message')}")
+    return response["result"]
+
+
+def wait_for_cherry(socket_path, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"Cherry exited before control socket was ready (exit {process.returncode})")
+        if socket_path.exists():
+            try:
+                send(socket_path, {"listProjects": {}}, timeout=2)
+                return
+            except Exception:
+                pass
+        time.sleep(0.25)
+    raise RuntimeError(f"Cherry control socket did not become ready: {socket_path}")
+
+
+def terminate_process(process):
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def make_project_roots(windows, log_dir):
+    roots = [str(REPO_ROOT)]
+    temp_roots = []
+    for _ in range(max(0, windows - 1)):
+        temp_roots.append(tempfile.mkdtemp(prefix="cherry-perf-project-"))
+    roots.extend(temp_roots)
+
+    root_file = log_dir / f"paired-project-roots-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    root_file.write_text("\n".join(roots) + "\n", encoding="utf-8")
+    return roots, temp_roots, root_file
+
+
+def add_optional(command, flag, value):
+    if value is not None:
+        command.extend([flag, str(value)])
+
+
+def main():
+    args = parse_args()
+    if args.windows < 1:
+        raise SystemExit("--windows must be at least 1")
+    if args.tabs < 1:
+        raise SystemExit("--tabs must be at least 1")
+
+    log_dir = Path(args.log_dir).expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    roots, temp_roots, root_file = make_project_roots(args.windows, log_dir)
+    namespace = f"perf-pair-{int(time.time())}-{os.getpid()}"
+    socket_path = control_socket(namespace)
+    cherry_log_path = log_dir / f"paired-cherry-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    comparison_path = log_dir / f"emulator-comparison-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+
+    env = os.environ.copy()
+    env["CHERRY_TERMINAL_PERF"] = "1"
+    env["CHERRY_PERF_PROJECT_ROOTS"] = ":".join(roots)
+    env["CHERRY_CONTROL_NAMESPACE"] = namespace
+
+    print(f"[pair] project_roots={root_file}")
+    print(f"[pair] cherry_socket={socket_path}")
+    print(f"[pair] cherry_log={cherry_log_path}")
+
+    cherry_process = None
+    cherry_report = None
+    ghostty_report = None
+    try:
+        cherry_command = shlex.split(args.cherry_command)
+        with cherry_log_path.open("w", encoding="utf-8") as cherry_log:
+            cherry_process = subprocess.Popen(
+                cherry_command,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=cherry_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            wait_for_cherry(socket_path, cherry_process, args.launch_timeout)
+
+            app_command = [
+                REPO_ROOT / "Scripts" / "perf-app-soak",
+                "--socket",
+                socket_path,
+                "--scale",
+                args.scale,
+                "--mode",
+                args.mode,
+                "--windows",
+                args.windows,
+                "--tabs",
+                args.tabs,
+                "--settle-after-close",
+                args.settle_after_close,
+                "--spawn-interval",
+                args.spawn_interval,
+                "--log-dir",
+                log_dir,
+            ]
+            add_optional(app_command, "--duration", args.duration)
+            add_optional(app_command, "--lines", args.lines)
+            add_optional(app_command, "--frames", args.frames)
+            add_optional(app_command, "--progress-frames", args.progress_frames)
+            add_optional(app_command, "--sleep-ms", args.sleep_ms)
+            add_optional(app_command, "--sample-interval", args.sample_interval)
+            add_optional(app_command, "--select-interval", args.select_interval)
+            for root in roots:
+                app_command.extend(["--project-root", root])
+
+            app_output = run_command(app_command, env=env)
+            cherry_report = parse_written_json(app_output, "Cherry app soak")
+
+        if args.cherry_only:
+            manifest = {
+                "scale": args.scale,
+                "mode": args.mode,
+                "windows": args.windows,
+                "tabs": args.tabs,
+                "duration": args.duration,
+                "sleep_ms": args.sleep_ms,
+                "project_roots_file": str(root_file),
+                "cherry_log": str(cherry_log_path),
+                "cherry_report": str(cherry_report),
+                "ghostty_report": None,
+                "comparison_report": None,
+                "cherry_only": True,
+            }
+            manifest_path = log_dir / f"cherry-app-soak-run-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"[pair] wrote {manifest_path}")
+            return
+
+        ghostty_windows = args.windows * args.tabs
+        ghostty_command = [
+            REPO_ROOT / "Scripts" / "perf-ghostty-workload",
+            scale_flag(args.scale),
+            "--mode",
+            args.mode,
+            "--windows",
+            ghostty_windows,
+            "--settle-after-complete",
+            args.settle_after_complete,
+            "--log-dir",
+            log_dir,
+        ]
+        add_optional(ghostty_command, "--duration", args.duration)
+        add_optional(ghostty_command, "--lines", args.lines)
+        add_optional(ghostty_command, "--frames", args.frames)
+        add_optional(ghostty_command, "--progress-frames", args.progress_frames)
+        add_optional(ghostty_command, "--sleep-ms", args.sleep_ms)
+        add_optional(ghostty_command, "--sample-interval", args.sample_interval)
+
+        ghostty_output = run_command(ghostty_command)
+        ghostty_report = parse_written_json(ghostty_output, "Ghostty workload")
+
+        compare_command = [
+            REPO_ROOT / "Scripts" / "perf-compare-emulators",
+            "--cherry",
+            cherry_report,
+            "--ghostty",
+            ghostty_report,
+            "--require-shape-match",
+            "--json-out",
+            comparison_path,
+        ]
+        add_optional(compare_command, "--max-rss-per-workload-ratio", args.max_rss_per_workload_ratio)
+        add_optional(compare_command, "--max-cpu-per-workload-ratio", args.max_cpu_per_workload_ratio)
+        run_command(compare_command)
+
+        manifest = {
+            "scale": args.scale,
+            "mode": args.mode,
+            "windows": args.windows,
+            "tabs": args.tabs,
+            "duration": args.duration,
+            "sleep_ms": args.sleep_ms,
+            "project_roots_file": str(root_file),
+            "cherry_log": str(cherry_log_path),
+            "cherry_report": str(cherry_report),
+            "ghostty_report": str(ghostty_report),
+            "comparison_report": str(comparison_path),
+        }
+        manifest_path = log_dir / f"paired-emulator-run-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[pair] wrote {manifest_path}")
+    finally:
+        if cherry_process is not None and not args.keep_cherry_open:
+            terminate_process(cherry_process)
+        if temp_roots and not args.keep_project_roots:
+            for root in temp_roots:
+                shutil.rmtree(root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        print(f"[pair] error: {error}", file=sys.stderr)
+        sys.exit(1)

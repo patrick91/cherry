@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKLOAD_SCRIPT = REPO_ROOT / "Scripts" / "perf-terminal-workload"
+
+SCALES = {
+    "smoke": {
+        "duration": 20,
+        "lines": 8_000,
+        "frames": 150,
+        "progress_frames": 300,
+        "sleep_ms": 0,
+        "sample_interval": 2.0,
+    },
+    "standard": {
+        "duration": 180,
+        "lines": 50_000,
+        "frames": 1_000,
+        "progress_frames": 2_000,
+        "sleep_ms": 0,
+        "sample_interval": 5.0,
+    },
+    "soak": {
+        "duration": 7_200,
+        "lines": 120_000,
+        "frames": 6_000,
+        "progress_frames": 10_000,
+        "sleep_ms": 0,
+        "sample_interval": 30.0,
+    },
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Launch Ghostty with Cherry's deterministic terminal perf workload and sample process metrics."
+    )
+    scale = parser.add_mutually_exclusive_group()
+    scale.add_argument("--smoke", action="store_const", dest="scale", const="smoke")
+    scale.add_argument("--standard", action="store_const", dest="scale", const="standard")
+    scale.add_argument("--soak", action="store_const", dest="scale", const="soak")
+    parser.set_defaults(scale="smoke")
+    parser.add_argument("--mode", choices=("scrollback", "tui", "mixed"), default="mixed")
+    parser.add_argument("--windows", type=int, default=1)
+    parser.add_argument("--duration", type=float, help="Seconds to keep the workload running.")
+    parser.add_argument("--lines", type=int, help="Scrollback lines per workload cycle.")
+    parser.add_argument("--frames", type=int, help="TUI frames per workload cycle.")
+    parser.add_argument("--progress-frames", type=int, help="Progress frames per mixed workload cycle.")
+    parser.add_argument("--sleep-ms", type=float, help="Delay between TUI frames in each workload.")
+    parser.add_argument("--sample-interval", type=float, help="Seconds between RSS/CPU samples.")
+    parser.add_argument("--settle-after-complete", type=float, default=1.0)
+    parser.add_argument("--keep-open", action="store_true", help="Leave newly launched Ghostty processes running.")
+    parser.add_argument("--log-dir", default=str(REPO_ROOT / ".build" / "perf"))
+    return parser.parse_args()
+
+
+def setting(args, key):
+    value = getattr(args, key)
+    return value if value is not None else SCALES[args.scale][key]
+
+
+def ghostty_pids():
+    pids = set()
+    for name in ("Ghostty", "ghostty"):
+        try:
+            output = subprocess.check_output(
+                ["/usr/bin/pgrep", "-x", name],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        for line in output.splitlines():
+            if line.strip().isdigit():
+                pids.add(int(line))
+    return sorted(pids)
+
+
+def sample_processes(pids):
+    live_pids = [pid for pid in pids if pid_exists(pid)]
+    if not live_pids:
+        return {"processes": [], "total_rss_bytes": 0, "total_cpu_percent": 0.0}
+
+    try:
+        output = subprocess.check_output(
+            [
+                "/bin/ps",
+                "-o",
+                "pid=,rss=,pcpu=,etime=",
+                "-p",
+                ",".join(str(pid) for pid in live_pids),
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception as error:
+        return {
+            "processes": [],
+            "total_rss_bytes": 0,
+            "total_cpu_percent": 0.0,
+            "error": str(error),
+        }
+
+    processes = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            rss_bytes = int(parts[1]) * 1024
+            cpu_percent = float(parts[2])
+        except ValueError:
+            continue
+        processes.append({
+            "pid": pid,
+            "rss_bytes": rss_bytes,
+            "cpu_percent": cpu_percent,
+            "elapsed": parts[3],
+        })
+
+    return {
+        "processes": processes,
+        "total_rss_bytes": sum(process["rss_bytes"] for process in processes),
+        "total_cpu_percent": sum(process["cpu_percent"] for process in processes),
+    }
+
+
+def summarize_samples(samples):
+    if not samples:
+        return {
+            "sample_count": 0,
+            "first_total_rss_bytes": 0,
+            "last_total_rss_bytes": 0,
+            "min_total_rss_bytes": 0,
+            "max_total_rss_bytes": 0,
+            "rss_delta_bytes": 0,
+            "rss_growth_bytes_per_second": 0.0,
+            "rss_growth_mib_per_hour": 0.0,
+            "max_total_cpu_percent": 0.0,
+            "max_process_rss_bytes": 0,
+        }
+
+    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
+    first = ordered[0]
+    last = ordered[-1]
+    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
+    first_rss = int(first.get("total_rss_bytes", 0))
+    last_rss = int(last.get("total_rss_bytes", 0))
+    rss_delta = last_rss - first_rss
+    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
+
+    max_process_rss = 0
+    for sample in ordered:
+        for process in sample.get("processes", []):
+            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
+
+    return {
+        "sample_count": len(ordered),
+        "first_total_rss_bytes": first_rss,
+        "last_total_rss_bytes": last_rss,
+        "min_total_rss_bytes": min(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "rss_delta_bytes": rss_delta,
+        "rss_growth_bytes_per_second": rss_growth,
+        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
+        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
+        "max_process_rss_bytes": max_process_rss,
+    }
+
+
+def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
+    command = [
+        str(WORKLOAD_SCRIPT),
+        mode,
+        "--duration",
+        str(max(1, int(duration))),
+        "--lines",
+        str(lines),
+        "--frames",
+        str(frames),
+        "--progress-frames",
+        str(progress_frames),
+        "--sleep-ms",
+        str(max(0, sleep_ms)),
+    ]
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def launch_ghostty(command):
+    subprocess.run(
+        ["open", "-na", "Ghostty.app", "--args", "-e", "/bin/zsh", "-lc", command],
+        check=True,
+    )
+
+
+def pid_exists(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pids(pids):
+    for pid in pids:
+        if pid_exists(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
+def main():
+    args = parse_args()
+    if args.windows < 1:
+        raise SystemExit("--windows must be at least 1")
+    if not Path("/usr/bin/open").exists():
+        raise SystemExit("open(1) is required on macOS.")
+
+    duration = setting(args, "duration")
+    lines = setting(args, "lines")
+    frames = setting(args, "frames")
+    progress_frames = setting(args, "progress_frames")
+    sleep_ms = setting(args, "sleep_ms")
+    sample_interval = setting(args, "sample_interval")
+    command = shell_command(args.mode, duration, lines, frames, progress_frames, sleep_ms)
+
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    start_time = time.monotonic()
+
+    before = ghostty_pids()
+    print(f"[ghostty] scale={args.scale} mode={args.mode} windows={args.windows}")
+    print(f"[ghostty] command={command}")
+    print(f"[ghostty] pids_before={','.join(str(pid) for pid in before) or '<none>'}")
+
+    for index in range(args.windows):
+        launch_ghostty(command)
+        print(f"[ghostty] launched_window={index + 1}")
+
+    time.sleep(2)
+    after_launch = ghostty_pids()
+    launched_pids = sorted(set(after_launch) - set(before))
+    sampled_pids = launched_pids if launched_pids else after_launch
+    print(f"[ghostty] pids_after_launch={','.join(str(pid) for pid in after_launch) or '<none>'}")
+    print(f"[ghostty] sampled_pids={','.join(str(pid) for pid in sampled_pids) or '<none>'}")
+
+    report = {
+        "started_at": started_at,
+        "completed_at": None,
+        "scale": args.scale,
+        "mode": args.mode,
+        "duration": duration,
+        "sleep_ms": sleep_ms,
+        "windows": args.windows,
+        "sample_interval": sample_interval,
+        "settle_after_complete": args.settle_after_complete,
+        "command": command,
+        "pids_before": before,
+        "pids_after_launch": after_launch,
+        "sampled_pids": sampled_pids,
+        "samples": [],
+    }
+
+    def add_sample(label):
+        sample = sample_processes(sampled_pids)
+        sample["label"] = label
+        sample["elapsed_seconds"] = round(time.monotonic() - start_time, 3)
+        sample["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        report["samples"].append(sample)
+
+    add_sample("after_launch")
+    deadline = start_time + duration
+    next_sample_at = time.monotonic() + max(0.1, sample_interval)
+    while time.monotonic() < deadline:
+        sleep_for = min(max(0.1, next_sample_at - time.monotonic()), max(0.1, deadline - time.monotonic()))
+        time.sleep(sleep_for)
+        now = time.monotonic()
+        if now >= next_sample_at:
+            add_sample("during_workload")
+            next_sample_at = now + max(0.1, sample_interval)
+
+    if args.settle_after_complete > 0:
+        time.sleep(args.settle_after_complete)
+    add_sample("after_complete")
+    report["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    report["pids_after_complete"] = ghostty_pids()
+    report["sample_summary"] = summarize_samples(report["samples"])
+
+    if not args.keep_open:
+        terminate_pids(launched_pids)
+        time.sleep(0.5)
+        report["pids_after_cleanup"] = ghostty_pids()
+
+    report_path = log_dir / f"ghostty-workload-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary = report["sample_summary"]
+    print(f"[ghostty] wrote {report_path}")
+    print(
+        "[ghostty] sample_summary "
+        f"samples={summary['sample_count']} "
+        f"first_total_rss_mib={summary['first_total_rss_bytes'] / 1_048_576:.1f} "
+        f"last_total_rss_mib={summary['last_total_rss_bytes'] / 1_048_576:.1f} "
+        f"max_total_rss_mib={summary['max_total_rss_bytes'] / 1_048_576:.1f} "
+        f"rss_delta_mib={summary['rss_delta_bytes'] / 1_048_576:.1f} "
+        f"rss_growth_mib_per_hour={summary['rss_growth_mib_per_hour']:.1f} "
+        f"max_cpu_percent={summary['max_total_cpu_percent']:.1f}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        print(f"[ghostty] error: {error}", file=sys.stderr)
+        sys.exit(1)

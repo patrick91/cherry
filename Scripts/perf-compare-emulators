@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import sys
+
+
+def load_report(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sample_summary(report):
+    summary = report.get("sample_summary") or {}
+    if summary:
+        return summary
+
+    samples = report.get("samples", [])
+    if not samples:
+        return {}
+
+    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
+    first = ordered[0]
+    last = ordered[-1]
+    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
+    first_rss = int(first.get("total_rss_bytes", 0))
+    last_rss = int(last.get("total_rss_bytes", 0))
+    rss_delta = last_rss - first_rss
+    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
+    max_process_rss = 0
+    for sample in ordered:
+        for process in sample.get("processes", []):
+            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
+
+    return {
+        "sample_count": len(ordered),
+        "first_total_rss_bytes": first_rss,
+        "last_total_rss_bytes": last_rss,
+        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "rss_delta_bytes": rss_delta,
+        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
+        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
+        "max_process_rss_bytes": max_process_rss,
+    }
+
+
+def cherry_workload_count(report):
+    windows = int(report.get("windows") or 0)
+    tabs = int(report.get("tabs_per_window") or 0)
+    if windows > 0 and tabs > 0:
+        return windows * tabs
+
+    projects = report.get("projects") or []
+    count = sum(len(project.get("processes") or []) for project in projects)
+    return count or windows or 1
+
+
+def ghostty_workload_count(report):
+    sampled = report.get("sampled_pids") or []
+    return len(sampled) or int(report.get("windows") or 1)
+
+
+def metric_values(report, workload_count):
+    summary = sample_summary(report)
+    max_rss = summary.get("max_total_rss_bytes", 0)
+    last_rss = summary.get("last_total_rss_bytes", 0)
+    rss_delta = summary.get("rss_delta_bytes", 0)
+    max_cpu = summary.get("max_total_cpu_percent", 0.0)
+    max_process_rss = summary.get("max_process_rss_bytes", 0)
+    return {
+        "sample_count": summary.get("sample_count", 0),
+        "max_total_rss_mib": max_rss / 1_048_576,
+        "last_total_rss_mib": last_rss / 1_048_576,
+        "rss_delta_mib": rss_delta / 1_048_576,
+        "rss_growth_mib_per_hour": summary.get("rss_growth_mib_per_hour", 0.0),
+        "max_cpu_percent": max_cpu,
+        "max_process_rss_mib": max_process_rss / 1_048_576,
+        "max_rss_per_workload_mib": (max_rss / 1_048_576) / max(1, workload_count),
+        "last_rss_per_workload_mib": (last_rss / 1_048_576) / max(1, workload_count),
+        "max_cpu_per_workload_percent": max_cpu / max(1, workload_count),
+    }
+
+
+def ratio(numerator, denominator):
+    if denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def format_ratio(value):
+    return "n/a" if value is None else f"{value:.2f}x"
+
+
+def print_metric(name, cherry_value, ghostty_value):
+    print(
+        "[compare] "
+        f"{name} cherry={cherry_value:.2f} ghostty={ghostty_value:.2f} "
+        f"ratio={format_ratio(ratio(cherry_value, ghostty_value))}"
+    )
+
+
+def shape_warnings(cherry, ghostty, cherry_workloads, ghostty_workloads):
+    warnings = []
+    for key in ("scale", "mode"):
+        if cherry.get(key) and ghostty.get(key) and cherry.get(key) != ghostty.get(key):
+            warnings.append(f"{key} differs: cherry={cherry.get(key)!r} ghostty={ghostty.get(key)!r}")
+    cherry_duration = cherry.get("duration")
+    ghostty_duration = ghostty.get("duration")
+    if cherry_duration and ghostty_duration:
+        delta = abs(float(cherry_duration) - float(ghostty_duration))
+        if delta > max(1.0, float(cherry_duration) * 0.05):
+            warnings.append(f"duration differs: cherry={cherry_duration!r} ghostty={ghostty_duration!r}")
+    cherry_sleep_ms = cherry.get("sleep_ms")
+    ghostty_sleep_ms = ghostty.get("sleep_ms")
+    if cherry_sleep_ms is not None and ghostty_sleep_ms is not None:
+        if abs(float(cherry_sleep_ms) - float(ghostty_sleep_ms)) > 0.001:
+            warnings.append(f"sleep_ms differs: cherry={cherry_sleep_ms!r} ghostty={ghostty_sleep_ms!r}")
+    if cherry_workloads != ghostty_workloads:
+        warnings.append(f"workload count differs: cherry={cherry_workloads} ghostty={ghostty_workloads}")
+    return warnings
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare Cherry app-soak reports against Ghostty workload reports.")
+    parser.add_argument("--cherry", type=Path, required=True, help="Cherry app-soak JSON report.")
+    parser.add_argument("--ghostty", type=Path, required=True, help="Ghostty workload JSON report.")
+    parser.add_argument("--json-out", type=Path, help="Write comparison JSON.")
+    parser.add_argument("--require-shape-match", action="store_true", help="Fail if scale/mode/duration/workload counts differ.")
+    parser.add_argument("--max-rss-per-workload-ratio", type=float, help="Fail when Cherry/Ghostty max RSS per workload exceeds this ratio.")
+    parser.add_argument("--max-cpu-per-workload-ratio", type=float, help="Fail when Cherry/Ghostty max CPU per workload exceeds this ratio.")
+    args = parser.parse_args()
+
+    cherry = load_report(args.cherry)
+    ghostty = load_report(args.ghostty)
+    cherry_workloads = cherry_workload_count(cherry)
+    ghostty_workloads = ghostty_workload_count(ghostty)
+    cherry_metrics = metric_values(cherry, cherry_workloads)
+    ghostty_metrics = metric_values(ghostty, ghostty_workloads)
+    warnings = shape_warnings(cherry, ghostty, cherry_workloads, ghostty_workloads)
+
+    print(
+        "[compare] "
+        f"cherry={args.cherry} ghostty={args.ghostty}"
+    )
+    print(
+        "[compare] "
+        f"shape cherry(scale={cherry.get('scale')} mode={cherry.get('mode')} "
+        f"duration={cherry.get('duration')} windows={cherry.get('windows')} "
+        f"sleep_ms={cherry.get('sleep_ms')} tabs={cherry.get('tabs_per_window')} workloads={cherry_workloads}) "
+        f"ghostty(scale={ghostty.get('scale')} mode={ghostty.get('mode')} "
+        f"duration={ghostty.get('duration')} windows={ghostty.get('windows')} "
+        f"sleep_ms={ghostty.get('sleep_ms')} workloads={ghostty_workloads})"
+    )
+    for warning in warnings:
+        print(f"[compare] warning: {warning}", file=sys.stderr)
+
+    print_metric("max_total_rss_mib", cherry_metrics["max_total_rss_mib"], ghostty_metrics["max_total_rss_mib"])
+    print_metric("last_total_rss_mib", cherry_metrics["last_total_rss_mib"], ghostty_metrics["last_total_rss_mib"])
+    print_metric("max_rss_per_workload_mib", cherry_metrics["max_rss_per_workload_mib"], ghostty_metrics["max_rss_per_workload_mib"])
+    print_metric("last_rss_per_workload_mib", cherry_metrics["last_rss_per_workload_mib"], ghostty_metrics["last_rss_per_workload_mib"])
+    print_metric("rss_delta_mib", cherry_metrics["rss_delta_mib"], ghostty_metrics["rss_delta_mib"])
+    print_metric("rss_growth_mib_per_hour", cherry_metrics["rss_growth_mib_per_hour"], ghostty_metrics["rss_growth_mib_per_hour"])
+    print_metric("max_cpu_percent", cherry_metrics["max_cpu_percent"], ghostty_metrics["max_cpu_percent"])
+    print_metric("max_cpu_per_workload_percent", cherry_metrics["max_cpu_per_workload_percent"], ghostty_metrics["max_cpu_per_workload_percent"])
+
+    cherry_summary = sample_summary(cherry)
+    if "last_ghostty_live_bridge_count" in cherry_summary:
+        print(
+            "[compare] cherry_diagnostics "
+            f"last_bridges={cherry_summary.get('last_ghostty_live_bridge_count', 0)} "
+            f"last_observers={cherry_summary.get('last_ghostty_output_observer_count', 0)} "
+            f"last_raw_observers={cherry_summary.get('last_raw_output_observer_count', 0)} "
+            f"last_raw_mib={cherry_summary.get('last_raw_output_retained_bytes', 0) / 1_048_576:.2f}"
+        )
+
+    result = {
+        "cherry_report": str(args.cherry),
+        "ghostty_report": str(args.ghostty),
+        "warnings": warnings,
+        "cherry_workloads": cherry_workloads,
+        "ghostty_workloads": ghostty_workloads,
+        "cherry": cherry_metrics,
+        "ghostty": ghostty_metrics,
+        "ratios": {
+            "max_total_rss": ratio(cherry_metrics["max_total_rss_mib"], ghostty_metrics["max_total_rss_mib"]),
+            "last_total_rss": ratio(cherry_metrics["last_total_rss_mib"], ghostty_metrics["last_total_rss_mib"]),
+            "max_rss_per_workload": ratio(cherry_metrics["max_rss_per_workload_mib"], ghostty_metrics["max_rss_per_workload_mib"]),
+            "max_cpu_per_workload": ratio(cherry_metrics["max_cpu_per_workload_percent"], ghostty_metrics["max_cpu_per_workload_percent"]),
+        },
+    }
+
+    failures = []
+    if args.require_shape_match and warnings:
+        failures.extend(warnings)
+    max_rss_ratio = result["ratios"]["max_rss_per_workload"]
+    if args.max_rss_per_workload_ratio is not None and max_rss_ratio is not None:
+        if max_rss_ratio > args.max_rss_per_workload_ratio:
+            failures.append(
+                f"max RSS per workload ratio exceeded: {max_rss_ratio:.3f} > {args.max_rss_per_workload_ratio:.3f}"
+            )
+    max_cpu_ratio = result["ratios"]["max_cpu_per_workload"]
+    if args.max_cpu_per_workload_ratio is not None and max_cpu_ratio is not None:
+        if max_cpu_ratio > args.max_cpu_per_workload_ratio:
+            failures.append(
+                f"max CPU per workload ratio exceeded: {max_cpu_ratio:.3f} > {args.max_cpu_per_workload_ratio:.3f}"
+            )
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[compare] wrote {args.json_out}")
+
+    if failures:
+        print("[compare] comparison failed:", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

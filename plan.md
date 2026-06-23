@@ -66,6 +66,7 @@ Add native notifications for events that matter while Cherry is not frontmost.
 Ghostty is already the right foundation. The work here is to make Cherry feel like a reliable daily-driver terminal around that foundation.
 
 - Verify resize, focus, selection, copy, paste, scrollback, and alternate-screen behavior across common TUIs.
+- Keep long-session and multi-window performance measurable with opt-in stress tests, app-level soak runs, and Ghostty side-by-side baselines.
 - Add link detection/opening if Ghostty does not already expose enough of this through the current bridge.
 - Make terminal bell, title changes, working directory updates, and process exit states feed the sidebar/project model.
 - Tighten keyboard behavior for tab switching, interrupt, clear, search, paste, and focus restoration.

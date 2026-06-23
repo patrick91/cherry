@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import sys
+
+
+SHAPE_KEYS = ("scale", "mode", "duration", "sleep_ms", "tabs_per_window", "windows")
+
+
+def load_report(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_report(path, report):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def performance_totals(sample):
+    statuses = [
+        entry["status"]
+        for entry in sample.get("performance", [])
+        if isinstance(entry, dict) and isinstance(entry.get("status"), dict)
+    ]
+    if not statuses:
+        return None
+
+    def value(status, key, default=0):
+        return status.get(key, default) or default
+
+    def counter(status, key, default=0):
+        return (status.get("terminalPerfCounters") or {}).get(key, default) or default
+
+    return {
+        "process_count": sum((status.get("processCounts") or {}).get("total", 0) for status in statuses),
+        "ghostty_live_bridge_count": max(value(status, "ghosttyLiveBridgeCount") for status in statuses),
+        "ghostty_output_observer_count": max(value(status, "ghosttyInstalledOutputObserverCount") for status in statuses),
+        "raw_output_observer_count": sum(value(status, "rawOutputObserverCount") for status in statuses),
+        "raw_output_retained_bytes": sum(value(status, "rawOutputRetainedBytes") for status in statuses),
+        "raw_output_retained_chunk_count": sum(value(status, "rawOutputRetainedChunkCount") for status in statuses),
+        "terminal_perf_enabled": any(bool(status.get("terminalPerfEnabled")) for status in statuses),
+        "pty_chunks": max(counter(status, "ptyChunks") for status in statuses),
+        "pty_bytes": max(counter(status, "ptyBytes") for status in statuses),
+        "ghostty_feed_chunks": max(counter(status, "ghosttyFeedChunks") for status in statuses),
+        "ghostty_feed_bytes": max(counter(status, "ghosttyFeedBytes") for status in statuses),
+        "processor_backlog_drop_count": max(counter(status, "processorBacklogDropCount") for status in statuses),
+        "processor_backlog_dropped_bytes": max(counter(status, "processorBacklogDroppedBytes") for status in statuses),
+        "background_output_throttle_count": max(counter(status, "backgroundOutputThrottleCount") for status in statuses),
+        "bridge_attaches": max(counter(status, "bridgeAttaches") for status in statuses),
+        "render_ticks": max(counter(status, "renderTicks") for status in statuses),
+    }
+
+
+def rss_drift(prefix, start, end):
+    elapsed = max(0.0, float(end.get("elapsed_seconds", 0.0)) - float(start.get("elapsed_seconds", 0.0)))
+    start_rss = int(start.get("total_rss_bytes", 0))
+    end_rss = int(end.get("total_rss_bytes", 0))
+    delta = end_rss - start_rss
+    growth = (delta / elapsed) if elapsed > 0 else 0.0
+    return {
+        f"{prefix}_start_label": start.get("label", ""),
+        f"{prefix}_end_label": end.get("label", ""),
+        f"{prefix}_elapsed_seconds": elapsed,
+        f"{prefix}_start_total_rss_bytes": start_rss,
+        f"{prefix}_end_total_rss_bytes": end_rss,
+        f"{prefix}_rss_delta_bytes": delta,
+        f"{prefix}_rss_growth_mib_per_hour": (growth * 3600) / 1_048_576,
+    }
+
+
+def steady_state_drift(ordered_samples):
+    empty = {
+        "steady_state_start_label": "",
+        "steady_state_end_label": "",
+        "steady_state_elapsed_seconds": 0.0,
+        "steady_state_start_total_rss_bytes": 0,
+        "steady_state_end_total_rss_bytes": 0,
+        "steady_state_rss_delta_bytes": 0,
+        "steady_state_rss_growth_mib_per_hour": 0.0,
+    }
+    start = next((sample for sample in ordered_samples if sample.get("label") == "after_spawn"), None)
+    if start is None:
+        return empty
+
+    start_elapsed = float(start.get("elapsed_seconds", 0.0))
+    end_labels = {"during_selection", "before_close", "failure"}
+    candidates = [
+        sample for sample in ordered_samples
+        if sample is not start
+        and float(sample.get("elapsed_seconds", 0.0)) >= start_elapsed
+        and sample.get("label") in end_labels
+    ]
+    end = candidates[-1] if candidates else start
+    return rss_drift("steady_state", start, end)
+
+
+def summarize_samples(samples):
+    if not samples:
+        return {
+            "sample_count": 0,
+            "first_total_rss_bytes": 0,
+            "last_total_rss_bytes": 0,
+            "min_total_rss_bytes": 0,
+            "max_total_rss_bytes": 0,
+            "rss_delta_bytes": 0,
+            "rss_growth_bytes_per_second": 0.0,
+            "rss_growth_mib_per_hour": 0.0,
+            "max_total_cpu_percent": 0.0,
+            "max_process_rss_bytes": 0,
+            "performance_sample_count": 0,
+            "max_ghostty_live_bridge_count": 0,
+            "last_ghostty_live_bridge_count": 0,
+            "max_ghostty_output_observer_count": 0,
+            "last_ghostty_output_observer_count": 0,
+            "max_raw_output_observer_count": 0,
+            "last_raw_output_observer_count": 0,
+            "max_raw_output_retained_bytes": 0,
+            "last_raw_output_retained_bytes": 0,
+            "max_raw_output_retained_chunk_count": 0,
+            "last_raw_output_retained_chunk_count": 0,
+            "last_terminal_perf_background_output_throttle_count": 0,
+            "steady_state_start_label": "",
+            "steady_state_end_label": "",
+            "steady_state_elapsed_seconds": 0.0,
+            "steady_state_start_total_rss_bytes": 0,
+            "steady_state_end_total_rss_bytes": 0,
+            "steady_state_rss_delta_bytes": 0,
+            "steady_state_rss_growth_mib_per_hour": 0.0,
+        }
+
+    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
+    first = ordered[0]
+    last = ordered[-1]
+    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
+    first_rss = int(first.get("total_rss_bytes", 0))
+    last_rss = int(last.get("total_rss_bytes", 0))
+    rss_delta = last_rss - first_rss
+    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
+
+    max_process_rss = 0
+    for sample in ordered:
+        for process in sample.get("processes", []):
+            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
+
+    performance_samples = [
+        totals for sample in ordered
+        if (totals := performance_totals(sample)) is not None
+    ]
+    last_performance = performance_samples[-1] if performance_samples else {}
+    steady_state = steady_state_drift(ordered)
+
+    return {
+        "sample_count": len(ordered),
+        "first_total_rss_bytes": first_rss,
+        "last_total_rss_bytes": last_rss,
+        "min_total_rss_bytes": min(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "rss_delta_bytes": rss_delta,
+        "rss_growth_bytes_per_second": rss_growth,
+        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
+        **steady_state,
+        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
+        "max_process_rss_bytes": max_process_rss,
+        "performance_sample_count": len(performance_samples),
+        "max_ghostty_live_bridge_count": max((sample["ghostty_live_bridge_count"] for sample in performance_samples), default=0),
+        "last_ghostty_live_bridge_count": last_performance.get("ghostty_live_bridge_count", 0),
+        "max_ghostty_output_observer_count": max((sample["ghostty_output_observer_count"] for sample in performance_samples), default=0),
+        "last_ghostty_output_observer_count": last_performance.get("ghostty_output_observer_count", 0),
+        "max_raw_output_observer_count": max((sample["raw_output_observer_count"] for sample in performance_samples), default=0),
+        "last_raw_output_observer_count": last_performance.get("raw_output_observer_count", 0),
+        "max_raw_output_retained_bytes": max((sample["raw_output_retained_bytes"] for sample in performance_samples), default=0),
+        "last_raw_output_retained_bytes": last_performance.get("raw_output_retained_bytes", 0),
+        "max_raw_output_retained_chunk_count": max((sample["raw_output_retained_chunk_count"] for sample in performance_samples), default=0),
+        "last_raw_output_retained_chunk_count": last_performance.get("raw_output_retained_chunk_count", 0),
+        "last_terminal_perf_pty_chunks": last_performance.get("pty_chunks", 0),
+        "last_terminal_perf_pty_bytes": last_performance.get("pty_bytes", 0),
+        "last_terminal_perf_ghostty_feed_chunks": last_performance.get("ghostty_feed_chunks", 0),
+        "last_terminal_perf_ghostty_feed_bytes": last_performance.get("ghostty_feed_bytes", 0),
+        "last_terminal_perf_processor_backlog_drop_count": last_performance.get("processor_backlog_drop_count", 0),
+        "last_terminal_perf_processor_backlog_dropped_bytes": last_performance.get("processor_backlog_dropped_bytes", 0),
+        "last_terminal_perf_background_output_throttle_count": last_performance.get("background_output_throttle_count", 0),
+        "last_terminal_perf_bridge_attaches": last_performance.get("bridge_attaches", 0),
+        "last_terminal_perf_render_ticks": last_performance.get("render_ticks", 0),
+    }
+
+
+def sample_summary(report):
+    derived = summarize_samples(report.get("samples", []))
+    stored = report.get("sample_summary") or {}
+    merged = dict(derived)
+    merged.update(stored)
+    return merged
+
+
+def chunks_per_mib(chunks, byte_count):
+    if not byte_count or byte_count <= 0:
+        return 0.0
+    return chunks / (byte_count / 1_048_576)
+
+
+def summary(report):
+    samples = sample_summary(report)
+    pty_chunks = samples.get("last_terminal_perf_pty_chunks", 0)
+    pty_bytes = samples.get("last_terminal_perf_pty_bytes", 0)
+    return {
+        "first_total_rss_bytes": samples.get("first_total_rss_bytes", 0),
+        "last_total_rss_bytes": samples.get("last_total_rss_bytes", 0),
+        "min_total_rss_bytes": samples.get("min_total_rss_bytes", 0),
+        "max_total_rss_bytes": samples.get("max_total_rss_bytes", 0),
+        "rss_delta_bytes": samples.get("rss_delta_bytes", 0),
+        "rss_growth_mib_per_hour": samples.get("rss_growth_mib_per_hour", 0.0),
+        "steady_state_start_label": samples.get("steady_state_start_label", ""),
+        "steady_state_end_label": samples.get("steady_state_end_label", ""),
+        "steady_state_elapsed_seconds": samples.get("steady_state_elapsed_seconds", 0.0),
+        "steady_state_start_total_rss_bytes": samples.get("steady_state_start_total_rss_bytes", 0),
+        "steady_state_end_total_rss_bytes": samples.get("steady_state_end_total_rss_bytes", 0),
+        "steady_state_rss_delta_bytes": samples.get("steady_state_rss_delta_bytes", 0),
+        "steady_state_rss_growth_mib_per_hour": samples.get("steady_state_rss_growth_mib_per_hour", 0.0),
+        "max_total_cpu_percent": samples.get("max_total_cpu_percent", 0.0),
+        "max_process_rss_bytes": samples.get("max_process_rss_bytes", 0),
+        "sample_count": samples.get("sample_count", 0),
+        "performance_sample_count": samples.get("performance_sample_count", 0),
+        "max_ghostty_live_bridge_count": samples.get("max_ghostty_live_bridge_count", 0),
+        "last_ghostty_live_bridge_count": samples.get("last_ghostty_live_bridge_count", 0),
+        "max_ghostty_output_observer_count": samples.get("max_ghostty_output_observer_count", 0),
+        "last_ghostty_output_observer_count": samples.get("last_ghostty_output_observer_count", 0),
+        "max_raw_output_observer_count": samples.get("max_raw_output_observer_count", 0),
+        "last_raw_output_observer_count": samples.get("last_raw_output_observer_count", 0),
+        "max_raw_output_retained_bytes": samples.get("max_raw_output_retained_bytes", 0),
+        "last_raw_output_retained_bytes": samples.get("last_raw_output_retained_bytes", 0),
+        "max_raw_output_retained_chunk_count": samples.get("max_raw_output_retained_chunk_count", 0),
+        "last_raw_output_retained_chunk_count": samples.get("last_raw_output_retained_chunk_count", 0),
+        "last_terminal_perf_pty_chunks": pty_chunks,
+        "last_terminal_perf_pty_bytes": pty_bytes,
+        "last_terminal_perf_pty_chunks_per_mib": chunks_per_mib(pty_chunks, pty_bytes),
+        "last_terminal_perf_ghostty_feed_chunks": samples.get("last_terminal_perf_ghostty_feed_chunks", 0),
+        "last_terminal_perf_ghostty_feed_bytes": samples.get("last_terminal_perf_ghostty_feed_bytes", 0),
+        "last_terminal_perf_processor_backlog_drop_count": samples.get("last_terminal_perf_processor_backlog_drop_count", 0),
+        "last_terminal_perf_processor_backlog_dropped_bytes": samples.get("last_terminal_perf_processor_backlog_dropped_bytes", 0),
+        "last_terminal_perf_background_output_throttle_count": samples.get("last_terminal_perf_background_output_throttle_count", 0),
+        "last_terminal_perf_bridge_attaches": samples.get("last_terminal_perf_bridge_attaches", 0),
+        "last_terminal_perf_render_ticks": samples.get("last_terminal_perf_render_ticks", 0),
+        "selection_count": report.get("selection_count", 0),
+    }
+
+
+def compare(
+    candidate,
+    baseline,
+    max_regression_pct,
+    rss_growth_slack_mib,
+    cherry_count_slack,
+    raw_retention_slack_mib,
+):
+    tolerance = max_regression_pct / 100.0
+    failures = []
+
+    for key in SHAPE_KEYS:
+        candidate_value = candidate.get(key)
+        baseline_value = baseline.get(key)
+        if candidate_value is not None and baseline_value is not None and candidate_value != baseline_value:
+            failures.append(f"{key} mismatch: candidate {candidate_value!r} != baseline {baseline_value!r}")
+
+    candidate_summary = summary(candidate)
+    baseline_summary = summary(baseline)
+
+    compare_upper(
+        failures,
+        "max_total_rss_bytes",
+        candidate_summary["max_total_rss_bytes"],
+        baseline_summary["max_total_rss_bytes"],
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "max_process_rss_bytes",
+        candidate_summary["max_process_rss_bytes"],
+        baseline_summary["max_process_rss_bytes"],
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "last_total_rss_bytes",
+        candidate_summary["last_total_rss_bytes"],
+        baseline_summary["last_total_rss_bytes"],
+        tolerance,
+    )
+    compare_with_slack(
+        failures,
+        "rss_delta_bytes",
+        candidate_summary["rss_delta_bytes"],
+        baseline_summary["rss_delta_bytes"],
+        tolerance,
+        rss_growth_slack_mib * 1_048_576,
+    )
+    compare_with_slack(
+        failures,
+        "steady_state_rss_delta_bytes",
+        candidate_summary["steady_state_rss_delta_bytes"],
+        baseline_summary["steady_state_rss_delta_bytes"],
+        tolerance,
+        rss_growth_slack_mib * 1_048_576,
+    )
+    compare_upper(
+        failures,
+        "max_total_cpu_percent",
+        candidate_summary["max_total_cpu_percent"],
+        baseline_summary["max_total_cpu_percent"],
+        tolerance,
+    )
+    compare_with_slack(
+        failures,
+        "last_ghostty_live_bridge_count",
+        candidate_summary["last_ghostty_live_bridge_count"],
+        baseline_summary["last_ghostty_live_bridge_count"],
+        tolerance,
+        cherry_count_slack,
+    )
+    compare_with_slack(
+        failures,
+        "last_ghostty_output_observer_count",
+        candidate_summary["last_ghostty_output_observer_count"],
+        baseline_summary["last_ghostty_output_observer_count"],
+        tolerance,
+        cherry_count_slack,
+    )
+    compare_with_slack(
+        failures,
+        "last_raw_output_observer_count",
+        candidate_summary["last_raw_output_observer_count"],
+        baseline_summary["last_raw_output_observer_count"],
+        tolerance,
+        cherry_count_slack,
+    )
+    compare_with_slack(
+        failures,
+        "last_raw_output_retained_bytes",
+        candidate_summary["last_raw_output_retained_bytes"],
+        baseline_summary["last_raw_output_retained_bytes"],
+        tolerance,
+        raw_retention_slack_mib * 1_048_576,
+    )
+    compare_lower(
+        failures,
+        "selection_count",
+        candidate_summary["selection_count"],
+        baseline_summary["selection_count"],
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "last_terminal_perf_pty_chunks_per_mib",
+        candidate_summary["last_terminal_perf_pty_chunks_per_mib"],
+        baseline_summary["last_terminal_perf_pty_chunks_per_mib"],
+        tolerance,
+    )
+
+    return failures
+
+
+def hard_limit_failures(
+    values,
+    max_total_cpu_percent,
+    max_rss_growth_mib_per_hour,
+    max_steady_state_rss_growth_mib_per_hour,
+    max_raw_output_retained_mib,
+    max_pty_chunks_per_mib,
+):
+    failures = []
+    if values["sample_count"] == 0:
+        failures.append("candidate has no process samples")
+
+    if (
+        max_total_cpu_percent is not None
+        and values["max_total_cpu_percent"] > max_total_cpu_percent
+    ):
+        failures.append(
+            "max_total_cpu_percent exceeded hard limit: "
+            f"{values['max_total_cpu_percent']:.3f} > {max_total_cpu_percent:.3f}"
+        )
+
+    if (
+        max_rss_growth_mib_per_hour is not None
+        and values["rss_growth_mib_per_hour"] > max_rss_growth_mib_per_hour
+    ):
+        failures.append(
+            "rss_growth_mib_per_hour exceeded hard limit: "
+            f"{values['rss_growth_mib_per_hour']:.3f} > {max_rss_growth_mib_per_hour:.3f}"
+        )
+
+    if (
+        max_steady_state_rss_growth_mib_per_hour is not None
+        and values["steady_state_rss_growth_mib_per_hour"] > max_steady_state_rss_growth_mib_per_hour
+    ):
+        failures.append(
+            "steady_state_rss_growth_mib_per_hour exceeded hard limit: "
+            f"{values['steady_state_rss_growth_mib_per_hour']:.3f} > "
+            f"{max_steady_state_rss_growth_mib_per_hour:.3f}"
+        )
+
+    if (
+        max_raw_output_retained_mib is not None
+        and values["last_raw_output_retained_bytes"] > max_raw_output_retained_mib * 1_048_576
+    ):
+        failures.append(
+            "last_raw_output_retained_mib exceeded hard limit: "
+            f"{values['last_raw_output_retained_bytes'] / 1_048_576:.3f} > {max_raw_output_retained_mib:.3f}"
+        )
+
+    if (
+        max_pty_chunks_per_mib is not None
+        and values["last_terminal_perf_pty_chunks_per_mib"] > max_pty_chunks_per_mib
+    ):
+        failures.append(
+            "last_terminal_perf_pty_chunks_per_mib exceeded hard limit: "
+            f"{values['last_terminal_perf_pty_chunks_per_mib']:.3f} > {max_pty_chunks_per_mib:.3f}"
+        )
+
+    return failures
+
+
+def compare_upper(failures, metric, current, baseline, tolerance):
+    if current is None or baseline is None or baseline <= 0:
+        return
+    limit = baseline * (1 + tolerance)
+    if current > limit:
+        failures.append(
+            f"{metric} regressed: {current:.3f} > {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
+        )
+
+
+def compare_lower(failures, metric, current, baseline, tolerance):
+    if current is None or baseline is None or baseline <= 0:
+        return
+    limit = baseline * (1 - tolerance)
+    if current < limit:
+        failures.append(
+            f"{metric} regressed: {current:.3f} < {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
+        )
+
+
+def compare_with_slack(failures, metric, current, baseline, tolerance, slack):
+    if current is None or baseline is None:
+        return
+    limit = max(baseline, 0) * (1 + tolerance) + slack
+    if current > limit:
+        failures.append(
+            f"{metric} regressed: {current:.3f} > {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%, slack {slack:.3f})"
+        )
+
+
+def print_summary(path, report):
+    values = summary(report)
+    print(
+        "[app-report] "
+        f"scale={report.get('scale', 'unknown')} "
+        f"mode={report.get('mode', 'unknown')} "
+        f"windows={report.get('windows', 'unknown')} "
+        f"tabs={report.get('tabs_per_window', 'unknown')} "
+        f"log={path}"
+    )
+    print(
+        "[app-report] "
+        f"samples={values['sample_count']} "
+        f"selection_count={values['selection_count']} "
+        f"first_total_rss_mib={values['first_total_rss_bytes'] / 1_048_576:.1f} "
+        f"last_total_rss_mib={values['last_total_rss_bytes'] / 1_048_576:.1f} "
+        f"max_total_rss_mib={values['max_total_rss_bytes'] / 1_048_576:.1f} "
+        f"rss_delta_mib={values['rss_delta_bytes'] / 1_048_576:.1f} "
+        f"rss_growth_mib_per_hour={values['rss_growth_mib_per_hour']:.1f} "
+        f"max_process_rss_mib={values['max_process_rss_bytes'] / 1_048_576:.1f} "
+        f"max_cpu_percent={values['max_total_cpu_percent']:.1f}"
+    )
+    if values["steady_state_elapsed_seconds"] > 0:
+        print(
+            "[app-report] "
+            f"steady_state={values['steady_state_start_label']}->{values['steady_state_end_label']} "
+            f"steady_elapsed={values['steady_state_elapsed_seconds']:.1f}s "
+            f"steady_start_rss_mib={values['steady_state_start_total_rss_bytes'] / 1_048_576:.1f} "
+            f"steady_end_rss_mib={values['steady_state_end_total_rss_bytes'] / 1_048_576:.1f} "
+            f"steady_delta_mib={values['steady_state_rss_delta_bytes'] / 1_048_576:.1f} "
+            f"steady_growth_mib_per_hour={values['steady_state_rss_growth_mib_per_hour']:.1f}"
+        )
+    if values["performance_sample_count"]:
+        print(
+            "[app-report] "
+            f"performance_samples={values['performance_sample_count']} "
+            f"last_bridges={values['last_ghostty_live_bridge_count']} "
+            f"max_bridges={values['max_ghostty_live_bridge_count']} "
+            f"last_observers={values['last_ghostty_output_observer_count']} "
+            f"max_observers={values['max_ghostty_output_observer_count']} "
+            f"last_raw_observers={values['last_raw_output_observer_count']} "
+            f"max_raw_observers={values['max_raw_output_observer_count']} "
+            f"last_raw_mib={values['last_raw_output_retained_bytes'] / 1_048_576:.1f} "
+            f"max_raw_mib={values['max_raw_output_retained_bytes'] / 1_048_576:.1f} "
+            f"last_raw_chunks={values['last_raw_output_retained_chunk_count']}"
+        )
+        print(
+            "[app-report] "
+            f"pty_chunks={values['last_terminal_perf_pty_chunks']} "
+            f"pty_mib={values['last_terminal_perf_pty_bytes'] / 1_048_576:.1f} "
+            f"pty_chunks_per_mib={values['last_terminal_perf_pty_chunks_per_mib']:.1f} "
+            f"ghostty_feed_chunks={values['last_terminal_perf_ghostty_feed_chunks']} "
+            f"ghostty_feed_mib={values['last_terminal_perf_ghostty_feed_bytes'] / 1_048_576:.1f} "
+        f"processor_backlog_drops={values['last_terminal_perf_processor_backlog_drop_count']} "
+        f"processor_backlog_dropped_mib={values['last_terminal_perf_processor_backlog_dropped_bytes'] / 1_048_576:.1f} "
+        f"background_throttles={values['last_terminal_perf_background_output_throttle_count']} "
+        f"bridge_attaches={values['last_terminal_perf_bridge_attaches']} "
+            f"render_ticks={values['last_terminal_perf_render_ticks']}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Summarize and compare Cherry app-soak JSON reports.")
+    parser.add_argument("report", type=Path, help="JSON report written by Scripts/perf-app-soak.")
+    parser.add_argument("--write-baseline", type=Path, help="Write this report as a local baseline JSON.")
+    parser.add_argument("--baseline", type=Path, help="Compare this report against a baseline JSON.")
+    parser.add_argument(
+        "--max-regression-pct",
+        type=float,
+        default=25.0,
+        help="Allowed regression percentage for RSS, CPU, and inverse selection count.",
+    )
+    parser.add_argument(
+        "--rss-growth-slack-mib",
+        type=float,
+        default=64.0,
+        help="Extra RSS growth allowed over baseline before failing drift comparison.",
+    )
+    parser.add_argument(
+        "--cherry-count-slack",
+        type=float,
+        default=1.0,
+        help="Extra Cherry diagnostic count growth allowed over baseline before failing comparison.",
+    )
+    parser.add_argument(
+        "--raw-retention-slack-mib",
+        type=float,
+        default=64.0,
+        help="Extra retained raw-output bytes allowed over baseline before failing comparison.",
+    )
+    parser.add_argument(
+        "--max-total-cpu-percent",
+        type=float,
+        help="Hard fail when summed Cherry process CPU percent exceeds this value.",
+    )
+    parser.add_argument(
+        "--max-rss-growth-mib-per-hour",
+        type=float,
+        help="Hard fail when app RSS growth rate exceeds this value, independent of baseline.",
+    )
+    parser.add_argument(
+        "--max-steady-state-rss-growth-mib-per-hour",
+        type=float,
+        help="Hard fail when post-spawn RSS growth rate exceeds this value.",
+    )
+    parser.add_argument(
+        "--max-raw-output-retained-mib",
+        type=float,
+        help="Hard fail when retained Cherry raw output exceeds this value at the end of the run.",
+    )
+    parser.add_argument(
+        "--max-pty-chunks-per-mib",
+        type=float,
+        help="Hard fail when PTY callback density exceeds this many chunks per MiB of PTY output.",
+    )
+    args = parser.parse_args()
+
+    report = load_report(args.report)
+    print_summary(args.report, report)
+    report_summary = summary(report)
+    failures = hard_limit_failures(
+        report_summary,
+        args.max_total_cpu_percent,
+        args.max_rss_growth_mib_per_hour,
+        args.max_steady_state_rss_growth_mib_per_hour,
+        args.max_raw_output_retained_mib,
+        args.max_pty_chunks_per_mib,
+    )
+
+    if args.write_baseline:
+        write_report(args.write_baseline, report)
+        print(f"[app-report] wrote baseline {args.write_baseline}")
+
+    if args.baseline:
+        failures.extend(compare(
+            report,
+            load_report(args.baseline),
+            args.max_regression_pct,
+            args.rss_growth_slack_mib,
+            args.cherry_count_slack,
+            args.raw_retention_slack_mib,
+        ))
+
+    if failures:
+        print("[app-report] regression check failed:", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+
+    if args.baseline:
+        print(f"[app-report] regression check passed against {args.baseline}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

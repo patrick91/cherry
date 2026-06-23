@@ -664,7 +664,12 @@ final class AgentSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        projects = Self.loadProjects(from: defaults)
+        var loadedProjects = Self.loadProjects(from: defaults)
+        for projectRoot in Self.performanceProjectRoots(environment: ProcessInfo.processInfo.environment)
+            where !loadedProjects.contains(where: { $0.root == projectRoot }) {
+            loadedProjects.append(CherryProject(root: projectRoot))
+        }
+        projects = loadedProjects
         lastOpenedProjectRoot = Self.loadLastOpenedProjectRoot(from: defaults)
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
@@ -1125,6 +1130,22 @@ final class AgentSettings: ObservableObject {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         return NSString(string: trimmed).expandingTildeInPath
+    }
+
+    static func performanceProjectRoots(environment: [String: String]) -> [String] {
+        guard environment["CHERRY_TERMINAL_PERF"] == "1",
+              let rawValue = environment["CHERRY_PERF_PROJECT_ROOTS"]
+        else {
+            return []
+        }
+
+        var seen = Set<String>()
+        return rawValue
+            .split { character in
+                character == ":" || character == "\n"
+            }
+            .compactMap { validDirectory(String($0)) }
+            .filter { seen.insert($0).inserted }
     }
 
     // Called from SwiftUI body evaluation on every render pass, so repeated

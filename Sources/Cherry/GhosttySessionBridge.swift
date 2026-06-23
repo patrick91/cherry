@@ -356,9 +356,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased || scrollContainer === container else { return }
         terminalView.setSurfaceVisible(false)
-        if !preservingSurface {
-            scheduleDetachedSurfaceRelease()
-        }
+        scheduleDetachedSurfaceRelease()
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         if scrollContainer === container {
@@ -446,6 +444,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func releaseResources() {
         guard !isReleased else { return }
         isReleased = true
+        Self.liveBridgeCount -= 1
         cancelDetachedSurfaceRelease()
         pendingFeedActivation = false
         uninstallOutputObserver()
@@ -576,7 +575,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         MainActor.assumeIsolated {
             releaseResources()
             uninstallSettingsObserver()
-            Self.liveBridgeCount -= 1
         }
     }
 

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import sys
+
+
+SHAPE_KEYS = ("scale", "mode", "duration", "sleep_ms", "windows")
+
+
+def load_report(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_report(path, report):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def summary(report):
+    sample_summary = report.get("sample_summary", {})
+    return {
+        "max_total_rss_bytes": sample_summary.get("max_total_rss_bytes", 0),
+        "last_total_rss_bytes": sample_summary.get("last_total_rss_bytes", 0),
+        "rss_delta_bytes": sample_summary.get("rss_delta_bytes", 0),
+        "rss_growth_mib_per_hour": sample_summary.get("rss_growth_mib_per_hour", 0.0),
+        "max_total_cpu_percent": sample_summary.get("max_total_cpu_percent", 0.0),
+        "max_process_rss_bytes": sample_summary.get("max_process_rss_bytes", 0),
+        "sample_count": sample_summary.get("sample_count", 0),
+    }
+
+
+def compare(candidate, baseline, max_regression_pct, rss_growth_slack_mib, max_rss_growth_mib_per_hour):
+    tolerance = max_regression_pct / 100.0
+    failures = []
+
+    for key in SHAPE_KEYS:
+        candidate_value = candidate.get(key)
+        baseline_value = baseline.get(key)
+        if candidate_value is not None and baseline_value is not None and candidate_value != baseline_value:
+            failures.append(f"{key} mismatch: candidate {candidate_value!r} != baseline {baseline_value!r}")
+
+    candidate_summary = summary(candidate)
+    baseline_summary = summary(baseline)
+    compare_upper(
+        failures,
+        "max_total_rss_bytes",
+        candidate_summary["max_total_rss_bytes"],
+        baseline_summary["max_total_rss_bytes"],
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "max_process_rss_bytes",
+        candidate_summary["max_process_rss_bytes"],
+        baseline_summary["max_process_rss_bytes"],
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "last_total_rss_bytes",
+        candidate_summary["last_total_rss_bytes"],
+        baseline_summary["last_total_rss_bytes"],
+        tolerance,
+    )
+    compare_with_slack(
+        failures,
+        "rss_delta_bytes",
+        candidate_summary["rss_delta_bytes"],
+        baseline_summary["rss_delta_bytes"],
+        tolerance,
+        rss_growth_slack_mib * 1_048_576,
+    )
+    compare_upper(
+        failures,
+        "max_total_cpu_percent",
+        candidate_summary["max_total_cpu_percent"],
+        baseline_summary["max_total_cpu_percent"],
+        tolerance,
+    )
+
+    if candidate_summary["sample_count"] == 0:
+        failures.append("candidate has no process samples")
+
+    if (
+        max_rss_growth_mib_per_hour is not None
+        and candidate_summary["rss_growth_mib_per_hour"] > max_rss_growth_mib_per_hour
+    ):
+        failures.append(
+            "rss_growth_mib_per_hour exceeded hard limit: "
+            f"{candidate_summary['rss_growth_mib_per_hour']:.3f} > {max_rss_growth_mib_per_hour:.3f}"
+        )
+
+    return failures
+
+
+def compare_upper(failures, metric, current, baseline, tolerance):
+    if current is None or baseline is None or baseline <= 0:
+        return
+    limit = baseline * (1 + tolerance)
+    if current > limit:
+        failures.append(
+            f"{metric} regressed: {current:.3f} > {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
+        )
+
+
+def compare_with_slack(failures, metric, current, baseline, tolerance, slack):
+    if current is None or baseline is None:
+        return
+    limit = max(baseline, 0) * (1 + tolerance) + slack
+    if current > limit:
+        failures.append(
+            f"{metric} regressed: {current:.3f} > {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%, slack {slack:.3f})"
+        )
+
+
+def print_summary(path, report):
+    values = summary(report)
+    print(
+        "[ghostty-report] "
+        f"scale={report.get('scale', 'unknown')} "
+        f"mode={report.get('mode', 'unknown')} "
+        f"windows={report.get('windows', 'unknown')} "
+        f"log={path}"
+    )
+    print(
+        "[ghostty-report] "
+        f"samples={values['sample_count']} "
+        f"first_pids={','.join(str(pid) for pid in report.get('sampled_pids', [])) or '<none>'} "
+        f"last_total_rss_mib={values['last_total_rss_bytes'] / 1_048_576:.1f} "
+        f"max_total_rss_mib={values['max_total_rss_bytes'] / 1_048_576:.1f} "
+        f"rss_delta_mib={values['rss_delta_bytes'] / 1_048_576:.1f} "
+        f"rss_growth_mib_per_hour={values['rss_growth_mib_per_hour']:.1f} "
+        f"max_process_rss_mib={values['max_process_rss_bytes'] / 1_048_576:.1f} "
+        f"max_cpu_percent={values['max_total_cpu_percent']:.1f}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Summarize and compare Ghostty workload JSON reports.")
+    parser.add_argument("report", type=Path)
+    parser.add_argument("--write-baseline", type=Path)
+    parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--max-regression-pct", type=float, default=25.0)
+    parser.add_argument("--rss-growth-slack-mib", type=float, default=64.0)
+    parser.add_argument("--max-rss-growth-mib-per-hour", type=float)
+    args = parser.parse_args()
+
+    report = load_report(args.report)
+    print_summary(args.report, report)
+
+    if args.write_baseline:
+        write_report(args.write_baseline, report)
+        print(f"[ghostty-report] wrote baseline {args.write_baseline}")
+
+    if args.baseline:
+        failures = compare(
+            report,
+            load_report(args.baseline),
+            args.max_regression_pct,
+            args.rss_growth_slack_mib,
+            args.max_rss_growth_mib_per_hour,
+        )
+        if failures:
+            print("[ghostty-report] regression check failed:", file=sys.stderr)
+            for failure in failures:
+                print(f"  - {failure}", file=sys.stderr)
+            return 1
+        print(f"[ghostty-report] regression check passed against {args.baseline}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

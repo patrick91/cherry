@@ -2618,7 +2618,14 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         guard (0x40...0x7E).contains(byte) else { return }
 
         let finalByte = byte
-        let payload = String(decoding: controlBuffer.dropLast(), as: UTF8.self)
+        let rawPayload = controlBuffer.dropLast()
+        if handleFastCSI(finalByte: finalByte, payload: rawPayload) {
+            controlBuffer.removeAll(keepingCapacity: true)
+            parserState = .ground
+            return
+        }
+
+        let payload = String(decoding: rawPayload, as: UTF8.self)
         handleCSI(finalByte: finalByte, payload: payload, responses: &responses)
 
         controlBuffer.removeAll(keepingCapacity: true)
@@ -2780,6 +2787,57 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         default:
             return
         }
+    }
+
+    private mutating func handleFastCSI(finalByte: UInt8, payload: ArraySlice<UInt8>) -> Bool {
+        guard payload.first != UInt8(ascii: "?"),
+              payload.first != UInt8(ascii: ">"),
+              payload.first != UInt8(ascii: "<"),
+              payload.first != UInt8(ascii: "=")
+        else {
+            return false
+        }
+
+        switch finalByte {
+        case UInt8(ascii: "H"), UInt8(ascii: "f"):
+            guard payload.isEmpty || payload.elementsEqual([
+                UInt8(ascii: "1"),
+                UInt8(ascii: ";"),
+                UInt8(ascii: "1")
+            ]) else {
+                return false
+            }
+            moveCursor(toScreenRow: 0, column: 0)
+            return true
+        case UInt8(ascii: "J"):
+            guard let mode = singleDigitCSIParameter(payload, default: 0, maximum: 3) else { return false }
+            eraseInDisplay(mode: mode)
+            return true
+        case UInt8(ascii: "K"):
+            guard let mode = singleDigitCSIParameter(payload, default: 0, maximum: 2) else { return false }
+            eraseInLine(mode: mode)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func singleDigitCSIParameter(
+        _ payload: ArraySlice<UInt8>,
+        default fallback: Int,
+        maximum: Int
+    ) -> Int? {
+        guard !payload.isEmpty else { return fallback }
+        guard payload.count == 1,
+              let byte = payload.first,
+              byte >= UInt8(ascii: "0"),
+              byte <= UInt8(ascii: "9")
+        else {
+            return nil
+        }
+
+        let value = Int(byte - UInt8(ascii: "0"))
+        return value <= maximum ? value : nil
     }
 
     private func handleDeviceAttributes(rawPayload: String, responses: inout [Data]) {

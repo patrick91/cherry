@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+import argparse
+import errno
+import glob
+import json
+import os
+from pathlib import Path
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKLOAD_SCRIPT = REPO_ROOT / "Scripts" / "perf-terminal-workload"
+
+
+SCALES = {
+    "smoke": {
+        "duration": 20,
+        "tabs": 4,
+        "windows": 1,
+        "lines": 8_000,
+        "frames": 150,
+        "progress_frames": 300,
+        "sleep_ms": 0,
+        "select_interval": 0.25,
+        "sample_interval": 2.0,
+    },
+    "standard": {
+        "duration": 180,
+        "tabs": 12,
+        "windows": 1,
+        "lines": 50_000,
+        "frames": 1_000,
+        "progress_frames": 2_000,
+        "sleep_ms": 0,
+        "select_interval": 0.5,
+        "sample_interval": 5.0,
+    },
+    "soak": {
+        "duration": 7_200,
+        "tabs": 24,
+        "windows": 3,
+        "lines": 120_000,
+        "frames": 6_000,
+        "progress_frames": 10_000,
+        "sleep_ms": 0,
+        "select_interval": 1.0,
+        "sample_interval": 30.0,
+    },
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Drive a running Cherry app through app-level terminal perf workloads."
+    )
+    parser.add_argument("--socket", help="Cherry control socket path. Defaults to CHERRY_CONTROL_SOCKET or newest /tmp/cherry-$UID socket.")
+    parser.add_argument("--scale", choices=sorted(SCALES), default="smoke")
+    parser.add_argument("--mode", choices=("scrollback", "tui", "mixed"), default="mixed")
+    parser.add_argument("--duration", type=float, help="Seconds to cycle tab selection and keep workloads running.")
+    parser.add_argument("--tabs", type=int, help="Terminal tabs per window/project.")
+    parser.add_argument("--windows", type=int, help="Project windows to open and drive.")
+    parser.add_argument("--lines", type=int, help="Scrollback lines per workload cycle.")
+    parser.add_argument("--frames", type=int, help="TUI frames per workload cycle.")
+    parser.add_argument("--progress-frames", type=int, help="Progress frames per mixed workload cycle.")
+    parser.add_argument("--sleep-ms", type=float, help="Delay between TUI frames in each workload.")
+    parser.add_argument("--select-interval", type=float, help="Seconds between select_process calls.")
+    parser.add_argument("--sample-interval", type=float, help="Seconds between Cherry process RSS/CPU samples.")
+    parser.add_argument(
+        "--spawn-interval",
+        type=float,
+        default=0.05,
+        help="Seconds to pause after each spawned workload starts. Use this to pace large many-session setup.",
+    )
+    parser.add_argument(
+        "--settle-after-close",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after closing spawned processes before the final leak-check sample.",
+    )
+    parser.add_argument("--project-root", action="append", help="Project root to open. Repeat for multiple windows.")
+    parser.add_argument("--keep-open", action="store_true", help="Leave spawned Cherry processes open at the end.")
+    parser.add_argument("--log-dir", default=str(REPO_ROOT / ".build" / "perf"), help="Directory for JSON report.")
+    return parser.parse_args()
+
+
+def setting(args, key):
+    value = getattr(args, key)
+    return value if value is not None else SCALES[args.scale][key]
+
+
+def find_socket(explicit):
+    if explicit:
+        return Path(explicit)
+    if os.environ.get("CHERRY_CONTROL_SOCKET"):
+        return Path(os.environ["CHERRY_CONTROL_SOCKET"])
+
+    candidates = [Path(path) for path in glob.glob(f"/tmp/cherry-{os.getuid()}/*/control.sock")]
+    candidates = [path for path in candidates if path.exists()]
+    if not candidates:
+        raise SystemExit(
+            "No Cherry control socket found. Start Cherry first or pass --socket/CHERRY_CONTROL_SOCKET."
+        )
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    if len(candidates) > 1:
+        print(f"[soak] multiple Cherry sockets found; using newest: {candidates[0]}", file=sys.stderr)
+    return candidates[0]
+
+
+def enum_case(name, payload=None):
+    return {name: {"_0": payload} if payload is not None else {}}
+
+
+def scoped(project_root, request):
+    return enum_case("scoped", {"projectRoot": str(project_root), "request": request})
+
+
+def send(socket_path, request, timeout=15):
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(str(socket_path))
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not connect to Cherry at {socket_path}. Start Cherry first or pass --socket. ({error})"
+            ) from error
+        sock.sendall(payload)
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            if error.errno != errno.ENOTCONN:
+                raise
+        data = bytearray()
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if data.endswith(b"\n"):
+                break
+
+    if not data:
+        raise RuntimeError("Cherry returned an empty control response.")
+    response = json.loads(data.decode("utf-8"))
+    if response.get("error"):
+        error = response["error"]
+        raise RuntimeError(f"{error.get('code')}: {error.get('message')}")
+    return response["result"]
+
+
+def result_payload(result, case_name):
+    payload = result.get(case_name)
+    if payload is None:
+        raise RuntimeError(f"Expected result case {case_name}, got {result}")
+    return payload.get("_0", payload)
+
+
+def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
+    command = [
+        str(WORKLOAD_SCRIPT),
+        mode,
+        "--duration",
+        str(max(1, int(duration))),
+        "--lines",
+        str(lines),
+        "--frames",
+        str(frames),
+        "--progress-frames",
+        str(progress_frames),
+        "--sleep-ms",
+        str(max(0, sleep_ms)),
+    ]
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def process_snapshot(socket_path, project_root):
+    result = send(socket_path, scoped(project_root, enum_case("listProcesses", {})))
+    return result_payload(result, "listProcesses")
+
+
+def process_status(socket_path, project_root, process_id):
+    result = send(
+        socket_path,
+        scoped(project_root, enum_case("getProcessStatus", {"processID": process_id})),
+        timeout=10,
+    )
+    return result_payload(result, "getProcessStatus")["process"]
+
+
+def performance_snapshot(socket_path, project_roots):
+    snapshots = []
+    for project_root in project_roots:
+        entry = {"root": str(project_root)}
+        try:
+            result = send(socket_path, scoped(project_root, enum_case("getPerformanceStatus")), timeout=5)
+            entry["status"] = result_payload(result, "getPerformanceStatus")
+        except Exception as error:
+            entry["error"] = str(error)
+        snapshots.append(entry)
+    return snapshots
+
+
+def list_projects(socket_path):
+    result = send(socket_path, enum_case("listProjects"), timeout=15)
+    return result_payload(result, "listProjects")
+
+
+def standardized(path):
+    return str(Path(path).expanduser().resolve())
+
+
+def choose_project_roots(socket_path, args, windows):
+    if args.project_root:
+        return [standardized(root) for root in args.project_root][:windows]
+
+    payload = list_projects(socket_path)
+    projects = payload.get("projects", [])
+    active = payload.get("activeProjectRoot")
+    ordered = []
+    if active:
+        ordered.append(active)
+    ordered.extend(project["root"] for project in projects if project.get("open") and project["root"] not in ordered)
+    ordered.extend(project["root"] for project in projects if project["root"] not in ordered)
+
+    if len(ordered) < windows:
+        raise SystemExit(
+            f"Cherry knows about {len(ordered)} project(s), but --windows requested {windows}. "
+            "Open or configure more projects in Cherry, or pass fewer windows."
+        )
+    return ordered[:windows]
+
+
+def wait_until_project_open(socket_path, project_root, timeout=10):
+    deadline = time.monotonic() + timeout
+    target = standardized(project_root)
+    while time.monotonic() < deadline:
+        payload = list_projects(socket_path)
+        for project in payload.get("projects", []):
+            if standardized(project["root"]) == target and project.get("open"):
+                return
+        time.sleep(0.2)
+    raise RuntimeError(f"Project did not become open in Cherry: {project_root}")
+
+
+def cherry_pid_for_socket(socket_path):
+    try:
+        output = subprocess.check_output(
+            ["/usr/sbin/lsof", "-t", str(socket_path)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        return sorted({int(line) for line in output.splitlines() if line.strip().isdigit()})
+    except Exception:
+        return []
+
+
+def sample_processes(pids):
+    if not pids:
+        return {"processes": [], "total_rss_bytes": 0, "total_cpu_percent": 0.0}
+
+    try:
+        output = subprocess.check_output(
+            [
+                "/bin/ps",
+                "-o",
+                "pid=,rss=,pcpu=,etime=",
+                "-p",
+                ",".join(str(pid) for pid in pids),
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception as error:
+        return {
+            "processes": [],
+            "total_rss_bytes": 0,
+            "total_cpu_percent": 0.0,
+            "error": str(error),
+        }
+
+    processes = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            rss_bytes = int(parts[1]) * 1024
+            cpu_percent = float(parts[2])
+        except ValueError:
+            continue
+        processes.append({
+            "pid": pid,
+            "rss_bytes": rss_bytes,
+            "cpu_percent": cpu_percent,
+            "elapsed": parts[3],
+        })
+
+    return {
+        "processes": processes,
+        "total_rss_bytes": sum(process["rss_bytes"] for process in processes),
+        "total_cpu_percent": sum(process["cpu_percent"] for process in processes),
+    }
+
+
+def wait_for_workload_start(socket_path, project_root, process_id, mode, timeout=5):
+    deadline = time.monotonic() + timeout
+    min_lines = 8 if mode == "tui" else 100
+    last_status = None
+    while time.monotonic() < deadline:
+        status = process_status(socket_path, project_root, process_id)
+        last_status = status
+        line_count = int(status.get("lineCount") or 0)
+        output_version = int(status.get("outputVersion") or 0)
+        if status.get("usesAlternateScreen"):
+            return status
+        if output_version > 8 and line_count >= min_lines:
+            return status
+        time.sleep(0.1)
+
+    raise RuntimeError(
+        "Workload did not appear to start for "
+        f"{process_id}: last lineCount={last_status.get('lineCount') if last_status else '<none>'} "
+        f"outputVersion={last_status.get('outputVersion') if last_status else '<none>'} "
+        f"alternate={last_status.get('usesAlternateScreen') if last_status else '<none>'}. "
+        "The perf harness expects real terminal output; check command submission."
+    )
+
+
+def performance_totals(sample):
+    statuses = [
+        entry["status"]
+        for entry in sample.get("performance", [])
+        if isinstance(entry, dict) and isinstance(entry.get("status"), dict)
+    ]
+    if not statuses:
+        return None
+
+    def value(status, key, default=0):
+        return status.get(key, default) or default
+
+    def counter(status, key, default=0):
+        return (status.get("terminalPerfCounters") or {}).get(key, default) or default
+
+    return {
+        "process_count": sum((status.get("processCounts") or {}).get("total", 0) for status in statuses),
+        "ghostty_live_bridge_count": max(value(status, "ghosttyLiveBridgeCount") for status in statuses),
+        "ghostty_output_observer_count": max(value(status, "ghosttyInstalledOutputObserverCount") for status in statuses),
+        "raw_output_observer_count": sum(value(status, "rawOutputObserverCount") for status in statuses),
+        "raw_output_retained_bytes": sum(value(status, "rawOutputRetainedBytes") for status in statuses),
+        "raw_output_retained_chunk_count": sum(value(status, "rawOutputRetainedChunkCount") for status in statuses),
+        "terminal_perf_enabled": any(bool(status.get("terminalPerfEnabled")) for status in statuses),
+        "pty_chunks": max(counter(status, "ptyChunks") for status in statuses),
+        "pty_bytes": max(counter(status, "ptyBytes") for status in statuses),
+        "ghostty_feed_chunks": max(counter(status, "ghosttyFeedChunks") for status in statuses),
+        "ghostty_feed_bytes": max(counter(status, "ghosttyFeedBytes") for status in statuses),
+        "processor_backlog_drop_count": max(counter(status, "processorBacklogDropCount") for status in statuses),
+        "processor_backlog_dropped_bytes": max(counter(status, "processorBacklogDroppedBytes") for status in statuses),
+        "background_output_throttle_count": max(counter(status, "backgroundOutputThrottleCount") for status in statuses),
+        "bridge_attaches": max(counter(status, "bridgeAttaches") for status in statuses),
+        "render_ticks": max(counter(status, "renderTicks") for status in statuses),
+    }
+
+
+def rss_drift(prefix, start, end):
+    elapsed = max(0.0, float(end.get("elapsed_seconds", 0.0)) - float(start.get("elapsed_seconds", 0.0)))
+    start_rss = int(start.get("total_rss_bytes", 0))
+    end_rss = int(end.get("total_rss_bytes", 0))
+    delta = end_rss - start_rss
+    growth = (delta / elapsed) if elapsed > 0 else 0.0
+    return {
+        f"{prefix}_start_label": start.get("label", ""),
+        f"{prefix}_end_label": end.get("label", ""),
+        f"{prefix}_elapsed_seconds": elapsed,
+        f"{prefix}_start_total_rss_bytes": start_rss,
+        f"{prefix}_end_total_rss_bytes": end_rss,
+        f"{prefix}_rss_delta_bytes": delta,
+        f"{prefix}_rss_growth_mib_per_hour": (growth * 3600) / 1_048_576,
+    }
+
+
+def steady_state_drift(ordered_samples):
+    empty = {
+        "steady_state_start_label": "",
+        "steady_state_end_label": "",
+        "steady_state_elapsed_seconds": 0.0,
+        "steady_state_start_total_rss_bytes": 0,
+        "steady_state_end_total_rss_bytes": 0,
+        "steady_state_rss_delta_bytes": 0,
+        "steady_state_rss_growth_mib_per_hour": 0.0,
+    }
+    start = next((sample for sample in ordered_samples if sample.get("label") == "after_spawn"), None)
+    if start is None:
+        return empty
+
+    start_elapsed = float(start.get("elapsed_seconds", 0.0))
+    end_labels = {"during_selection", "before_close", "failure"}
+    candidates = [
+        sample for sample in ordered_samples
+        if sample is not start
+        and float(sample.get("elapsed_seconds", 0.0)) >= start_elapsed
+        and sample.get("label") in end_labels
+    ]
+    end = candidates[-1] if candidates else start
+    return rss_drift("steady_state", start, end)
+
+
+def summarize_samples(samples):
+    if not samples:
+        return {
+            "sample_count": 0,
+            "first_total_rss_bytes": 0,
+            "last_total_rss_bytes": 0,
+            "min_total_rss_bytes": 0,
+            "max_total_rss_bytes": 0,
+            "rss_delta_bytes": 0,
+            "rss_growth_bytes_per_second": 0.0,
+            "rss_growth_mib_per_hour": 0.0,
+            "max_total_cpu_percent": 0.0,
+            "max_process_rss_bytes": 0,
+            "performance_sample_count": 0,
+            "max_ghostty_live_bridge_count": 0,
+            "last_ghostty_live_bridge_count": 0,
+            "max_ghostty_output_observer_count": 0,
+            "last_ghostty_output_observer_count": 0,
+            "max_raw_output_observer_count": 0,
+            "last_raw_output_observer_count": 0,
+            "max_raw_output_retained_bytes": 0,
+            "last_raw_output_retained_bytes": 0,
+            "max_raw_output_retained_chunk_count": 0,
+            "last_raw_output_retained_chunk_count": 0,
+            "last_terminal_perf_background_output_throttle_count": 0,
+            "steady_state_start_label": "",
+            "steady_state_end_label": "",
+            "steady_state_elapsed_seconds": 0.0,
+            "steady_state_start_total_rss_bytes": 0,
+            "steady_state_end_total_rss_bytes": 0,
+            "steady_state_rss_delta_bytes": 0,
+            "steady_state_rss_growth_mib_per_hour": 0.0,
+        }
+
+    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
+    first = ordered[0]
+    last = ordered[-1]
+    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
+    first_rss = int(first.get("total_rss_bytes", 0))
+    last_rss = int(last.get("total_rss_bytes", 0))
+    rss_delta = last_rss - first_rss
+    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
+
+    max_process_rss = 0
+    for sample in ordered:
+        for process in sample.get("processes", []):
+            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
+
+    performance_samples = [
+        totals for sample in ordered
+        if (totals := performance_totals(sample)) is not None
+    ]
+    last_performance = performance_samples[-1] if performance_samples else {}
+    steady_state = steady_state_drift(ordered)
+
+    return {
+        "sample_count": len(ordered),
+        "first_total_rss_bytes": first_rss,
+        "last_total_rss_bytes": last_rss,
+        "min_total_rss_bytes": min(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
+        "rss_delta_bytes": rss_delta,
+        "rss_growth_bytes_per_second": rss_growth,
+        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
+        **steady_state,
+        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
+        "max_process_rss_bytes": max_process_rss,
+        "performance_sample_count": len(performance_samples),
+        "max_ghostty_live_bridge_count": max((sample["ghostty_live_bridge_count"] for sample in performance_samples), default=0),
+        "last_ghostty_live_bridge_count": last_performance.get("ghostty_live_bridge_count", 0),
+        "max_ghostty_output_observer_count": max((sample["ghostty_output_observer_count"] for sample in performance_samples), default=0),
+        "last_ghostty_output_observer_count": last_performance.get("ghostty_output_observer_count", 0),
+        "max_raw_output_observer_count": max((sample["raw_output_observer_count"] for sample in performance_samples), default=0),
+        "last_raw_output_observer_count": last_performance.get("raw_output_observer_count", 0),
+        "max_raw_output_retained_bytes": max((sample["raw_output_retained_bytes"] for sample in performance_samples), default=0),
+        "last_raw_output_retained_bytes": last_performance.get("raw_output_retained_bytes", 0),
+        "max_raw_output_retained_chunk_count": max((sample["raw_output_retained_chunk_count"] for sample in performance_samples), default=0),
+        "last_raw_output_retained_chunk_count": last_performance.get("raw_output_retained_chunk_count", 0),
+        "last_terminal_perf_pty_chunks": last_performance.get("pty_chunks", 0),
+        "last_terminal_perf_pty_bytes": last_performance.get("pty_bytes", 0),
+        "last_terminal_perf_ghostty_feed_chunks": last_performance.get("ghostty_feed_chunks", 0),
+        "last_terminal_perf_ghostty_feed_bytes": last_performance.get("ghostty_feed_bytes", 0),
+        "last_terminal_perf_processor_backlog_drop_count": last_performance.get("processor_backlog_drop_count", 0),
+        "last_terminal_perf_processor_backlog_dropped_bytes": last_performance.get("processor_backlog_dropped_bytes", 0),
+        "last_terminal_perf_background_output_throttle_count": last_performance.get("background_output_throttle_count", 0),
+        "last_terminal_perf_bridge_attaches": last_performance.get("bridge_attaches", 0),
+        "last_terminal_perf_render_ticks": last_performance.get("render_ticks", 0),
+    }
+
+
+def main():
+    args = parse_args()
+    duration = setting(args, "duration")
+    tabs = setting(args, "tabs")
+    windows = setting(args, "windows")
+    lines = setting(args, "lines")
+    frames = setting(args, "frames")
+    progress_frames = setting(args, "progress_frames")
+    sleep_ms = setting(args, "sleep_ms")
+    select_interval = setting(args, "select_interval")
+    sample_interval = setting(args, "sample_interval")
+    socket_path = find_socket(args.socket)
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    project_roots = choose_project_roots(socket_path, args, windows)
+
+    command = shell_command(args.mode, duration, lines, frames, progress_frames, sleep_ms)
+    cherry_pids = cherry_pid_for_socket(socket_path)
+    start_time = time.monotonic()
+    report = {
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "socket": str(socket_path),
+        "cherry_pids": cherry_pids,
+        "scale": args.scale,
+        "mode": args.mode,
+        "duration": duration,
+        "sleep_ms": sleep_ms,
+        "tabs_per_window": tabs,
+        "windows": len(project_roots),
+        "sample_interval": sample_interval,
+        "settle_after_close": args.settle_after_close,
+        "command": command,
+        "projects": [],
+        "samples": [],
+    }
+
+    spawned = []
+
+    def add_sample(label):
+        sample = sample_processes(cherry_pids)
+        sample["label"] = label
+        sample["elapsed_seconds"] = round(time.monotonic() - start_time, 3)
+        sample["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        sample["performance"] = performance_snapshot(socket_path, project_roots)
+        report["samples"].append(sample)
+
+    print(f"[soak] socket={socket_path}")
+    print(f"[soak] command={command}")
+    print(f"[soak] cherry_pids={','.join(str(pid) for pid in cherry_pids) or '<none>'}")
+    add_sample("start")
+
+    failure = None
+    try:
+        try:
+            for project_index, project_root in enumerate(project_roots):
+                print(f"[soak] opening project {project_root}")
+                send(socket_path, enum_case("openProject", {"projectRoot": project_root}), timeout=30)
+                wait_until_project_open(socket_path, project_root)
+                project_entry = {"root": project_root, "processes": []}
+                report["projects"].append(project_entry)
+
+                for tab_index in range(tabs):
+                    title = f"perf {args.scale} {project_index + 1}.{tab_index + 1}"
+                    spawn = send(
+                        socket_path,
+                        scoped(project_root, enum_case("spawnProcess", {
+                            "kind": "terminal",
+                            "title": title,
+                            "workingDirectory": str(REPO_ROOT),
+                        })),
+                        timeout=30,
+                    )
+                    process = result_payload(spawn, "spawnProcess")["process"]
+                    process_id = process["id"]
+                    spawned.append((project_root, process_id))
+                    project_entry["processes"].append({"id": process_id, "title": title})
+                    send(
+                        socket_path,
+                        scoped(project_root, enum_case("sendProcessInput", {
+                            "processID": process_id,
+                            "text": f"{command}\n",
+                            "submit": True,
+                            "waitMilliseconds": 100,
+                            "lineLimit": 5,
+                        })),
+                        timeout=30,
+                    )
+                    wait_for_workload_start(socket_path, project_root, process_id, args.mode)
+                    print(f"[soak] spawned {title} {process_id}")
+                    if args.spawn_interval > 0:
+                        time.sleep(args.spawn_interval)
+
+            add_sample("after_spawn")
+            deadline = time.monotonic() + duration
+            next_sample_at = time.monotonic() + max(0.1, sample_interval)
+            selections = 0
+            while time.monotonic() < deadline:
+                for project_root, process_id in spawned:
+                    send(
+                        socket_path,
+                        scoped(project_root, enum_case("selectProcess", {"processID": process_id})),
+                        timeout=10,
+                    )
+                    selections += 1
+                    if time.monotonic() >= next_sample_at:
+                        add_sample("during_selection")
+                        next_sample_at = time.monotonic() + max(0.1, sample_interval)
+                    time.sleep(max(0.01, select_interval))
+                    if time.monotonic() >= deadline:
+                        break
+
+            report["selection_count"] = selections
+            report["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            report["final_snapshots"] = [
+                {"root": str(root), "snapshot": process_snapshot(socket_path, root)}
+                for root in project_roots
+            ]
+            add_sample("before_close")
+        except Exception as error:
+            failure = error
+            report["error"] = str(error)
+            report["failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            try:
+                add_sample("failure")
+            except Exception as sample_error:
+                report["failure_sample_error"] = str(sample_error)
+    finally:
+        if not args.keep_open:
+            for project_root, process_id in reversed(spawned):
+                try:
+                    send(
+                        socket_path,
+                        scoped(project_root, enum_case("closeProcess", {
+                            "processID": process_id,
+                            "agentClosePolicy": "promote_sub_agents",
+                        })),
+                        timeout=10,
+                    )
+                except Exception as error:
+                    print(f"[soak] failed to close {process_id}: {error}", file=sys.stderr)
+
+    if not args.keep_open and args.settle_after_close > 0:
+        time.sleep(args.settle_after_close)
+    add_sample("after_close" if not args.keep_open else "kept_open")
+    report["sample_summary"] = summarize_samples(report["samples"])
+    report_path = log_dir / f"app-soak-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"[soak] wrote {report_path}")
+    summary = report["sample_summary"]
+    print(
+        "[soak] sample_summary "
+        f"samples={summary['sample_count']} "
+        f"first_total_rss_mib={summary['first_total_rss_bytes'] / 1_048_576:.1f} "
+        f"last_total_rss_mib={summary['last_total_rss_bytes'] / 1_048_576:.1f} "
+        f"max_total_rss_mib={summary['max_total_rss_bytes'] / 1_048_576:.1f} "
+        f"rss_delta_mib={summary['rss_delta_bytes'] / 1_048_576:.1f} "
+        f"rss_growth_mib_per_hour={summary['rss_growth_mib_per_hour']:.1f} "
+        f"steady_delta_mib={summary['steady_state_rss_delta_bytes'] / 1_048_576:.1f} "
+        f"steady_growth_mib_per_hour={summary['steady_state_rss_growth_mib_per_hour']:.1f} "
+        f"last_bridges={summary['last_ghostty_live_bridge_count']} "
+        f"last_observers={summary['last_ghostty_output_observer_count']} "
+        f"last_raw_observers={summary['last_raw_output_observer_count']} "
+        f"last_raw_mib={summary['last_raw_output_retained_bytes'] / 1_048_576:.1f} "
+        f"processor_backlog_dropped_mib={summary['last_terminal_perf_processor_backlog_dropped_bytes'] / 1_048_576:.1f} "
+        f"background_throttles={summary['last_terminal_perf_background_output_throttle_count']} "
+        f"max_cpu_percent={summary['max_total_cpu_percent']:.1f}"
+    )
+    if failure is not None:
+        raise failure
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        print(f"[soak] error: {error}", file=sys.stderr)
+        sys.exit(1)

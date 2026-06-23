@@ -4482,6 +4482,30 @@ private struct MCPWhoamiPayload: Decodable {
     ))
 }
 
+@Test func ghosttyReplayOutputDropsZshPromptEndOfLineMarks() async throws {
+    let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 120) +
+        "\r \r"
+    let replay = Data((
+        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}" +
+        promptEndMark +
+        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}" +
+        "\u{1B}]2;~/github/strawberry-graphql/strawberry\u{07}" +
+        "\r\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J" +
+        "\u{1B}[1;36m~/github/strawberry-graphql/strawberry\u{1B}[0m " +
+        "\u{1B}[1;35m 2026-06-14-add-support-for-sse\u{1B}[0m\r\n" +
+        "\u{1B}[1;32m❯\u{1B}[0m "
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let output = String(decoding: sanitized, as: UTF8.self)
+
+    #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
+    #expect(!output.contains(String(repeating: " ", count: 120) + "\r \r"))
+    #expect(output.contains("\u{1B}[1;36m~/github/strawberry-graphql/strawberry\u{1B}[0m"))
+    #expect(output.contains("\u{1B}[1;32m❯\u{1B}[0m "))
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +
@@ -4742,7 +4766,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyContainerRetainsPreviousBridgeWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerRecreatesBridgeWhenSwitchingBackToSession() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -4771,17 +4795,20 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+    let secondBridge = second.ghosttyBridge
 
-    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    let recreatedFirstBridge = first.ghosttyBridge
 
-    #expect(first.ghosttyBridge === firstBridge)
-    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
+    #expect(recreatedFirstBridge !== firstBridge)
+    #expect(recreatedFirstBridge !== secondBridge)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 }
 
 @MainActor
-@Test func ghosttyContainerReleasesDetachedSurfaceWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerReleasesDetachedBridgeWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -4795,6 +4822,7 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: false
     )
     let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
     defer {
         container.detachActiveSession()
         first.releaseGhosttyBridge()
@@ -4804,13 +4832,115 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
-    first.ghosttyBridge.installOutputObserverForTesting()
+    let firstBridge = first.ghosttyBridge
+    firstBridge.installOutputObserverForTesting()
     #expect(first.rawOutputObserverCount == 1)
 
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
     #expect(first.rawOutputObserverCount == 0)
-    #expect(first.ghosttyBridge.gridMetrics == nil)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+    withExtendedLifetime(firstBridge) {}
+}
+
+@MainActor
+@Test func ghosttyContainerClearsSidebarSnapshotWhenSwitchingSessions() {
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Agent",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+
+    defer {
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    container.simulateSidebarSnapshotForTesting()
+
+    #expect(container.hasSidebarSnapshotForTesting)
+    #expect(container.isSidebarSyncFrozenForTesting)
+    #expect(container.isSidebarAnimationActiveForTesting)
+
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    #expect(!container.hasSidebarSnapshotForTesting)
+    #expect(!container.isSidebarSyncFrozenForTesting)
+    #expect(!container.isSidebarAnimationActiveForTesting)
+    #expect(second.ghosttyBridge.terminalView.superview != nil)
+}
+
+@MainActor
+@Test func ghosttyBridgeIgnoresTinyHostResizeForWideMountedSurface() async throws {
+    let session = TerminalSession(
+        title: "Resize Gate",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = container
+    window.orderFrontRegardless()
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    container.layoutSubtreeIfNeeded()
+    try await Task.sleep(for: .milliseconds(20))
+
+    let bridge = session.ghosttyBridge
+    let revisionBeforeTinyResize = session.revision
+    let scale = bridge.terminalView.window?.backingScaleFactor ?? window.backingScaleFactor
+    let mountedWidthPixels = UInt32((bridge.terminalView.bounds.width * scale).rounded())
+    let mountedHeightPixels = UInt32((bridge.terminalView.bounds.height * scale).rounded())
+
+    bridge.applyHostResize(InMemoryTerminalViewport(
+        columns: 6,
+        rows: 24,
+        widthPixels: max(1, mountedWidthPixels / 10),
+        heightPixels: mountedHeightPixels,
+        cellWidthPixels: 10,
+        cellHeightPixels: 20
+    ))
+
+    #expect(session.revision == revisionBeforeTinyResize)
+
+    bridge.applyHostResize(InMemoryTerminalViewport(
+        columns: 123,
+        rows: 45,
+        widthPixels: mountedWidthPixels,
+        heightPixels: mountedHeightPixels,
+        cellWidthPixels: 10,
+        cellHeightPixels: 20
+    ))
+
+    #expect(session.revision > revisionBeforeTinyResize)
 }
 
 @MainActor

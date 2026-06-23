@@ -208,6 +208,7 @@ private final class GhosttySessionProxy: @unchecked Sendable {
     private var isHostInputSuppressed = false
 
     weak var session: TerminalSession?
+    weak var bridge: GhosttySessionBridge?
 
     init(session: TerminalSession) {
         self.session = session
@@ -225,9 +226,14 @@ private final class GhosttySessionProxy: @unchecked Sendable {
         inputWriter.write(sanitizedData)
     }
 
-    func resize(columns: Int, rows: Int) {
+    func resize(_ viewport: InMemoryTerminalViewport) {
         Task { @MainActor [weak self] in
-            self?.session?.resize(columns: columns, rows: rows)
+            guard let self else { return }
+            if let bridge {
+                bridge.applyHostResize(viewport)
+            } else {
+                session?.resize(columns: Int(viewport.columns), rows: Int(viewport.rows))
+            }
         }
     }
 
@@ -322,6 +328,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.controller = controller
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
+        proxy.bridge = self
         observeSettingsChanges()
     }
 
@@ -610,7 +617,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.fitToSize()
         guard let gridMetrics,
               gridMetrics.columns > 0,
-              gridMetrics.rows > 0
+              gridMetrics.rows > 0,
+              isViewportConsistentWithMountedSurface(
+                  columns: Int(gridMetrics.columns),
+                  rows: Int(gridMetrics.rows),
+                  widthPixels: Int(gridMetrics.widthPixels),
+                  heightPixels: Int(gridMetrics.heightPixels),
+                  cellWidthPixels: Int(gridMetrics.cellWidthPixels),
+                  cellHeightPixels: Int(gridMetrics.cellHeightPixels)
+              )
         else {
             return false
         }
@@ -727,7 +742,68 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
-        return collapseOverwrittenProgressFramesForTerminalFeed(querySanitized)
+        let promptSanitized = stripZshPromptEndOfLineMarks(querySanitized)
+        return collapseOverwrittenProgressFramesForTerminalFeed(promptSanitized)
+    }
+
+    nonisolated private static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
+        guard !data.isEmpty else { return data }
+
+        let bytes = Array(data)
+        var stripped: [UInt8] = []
+        stripped.reserveCapacity(bytes.count)
+
+        var index = 0
+        var didStrip = false
+        while index < bytes.count {
+            if let markEnd = zshPromptEndOfLineMarkEnd(in: bytes, at: index) {
+                didStrip = true
+                index = markEnd
+                continue
+            }
+
+            stripped.append(bytes[index])
+            index += 1
+        }
+
+        return didStrip ? Data(stripped) : data
+    }
+
+    nonisolated private static func zshPromptEndOfLineMarkEnd(
+        in bytes: [UInt8],
+        at index: Int
+    ) -> Int? {
+        let marker = Array("\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m".utf8)
+        guard index + marker.count < bytes.count,
+              bytes[index..<(index + marker.count)].elementsEqual(marker)
+        else {
+            return nil
+        }
+
+        var scan = index + marker.count
+        let spacesStart = scan
+        while scan < bytes.count, bytes[scan] == UInt8(ascii: " ") {
+            scan += 1
+        }
+
+        guard scan > spacesStart,
+              scan < bytes.count,
+              bytes[scan] == UInt8(ascii: "\r")
+        else {
+            return nil
+        }
+
+        scan += 1
+        if scan + 1 < bytes.count,
+           bytes[scan] == UInt8(ascii: " "),
+           bytes[scan + 1] == UInt8(ascii: "\r")
+        {
+            scan += 2
+        } else if scan < bytes.count, bytes[scan] == UInt8(ascii: "\r") {
+            scan += 1
+        }
+
+        return scan
     }
 
     nonisolated fileprivate static func collapseOverwrittenProgressFramesForTerminalFeed(_ data: Data) -> Data {
@@ -1094,9 +1170,77 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
                 proxy.send(data)
             },
             resize: { viewport in
-                proxy.resize(columns: Int(viewport.columns), rows: Int(viewport.rows))
+                proxy.resize(viewport)
             }
         )
+    }
+
+    func applyHostResize(_ viewport: InMemoryTerminalViewport) {
+        guard isViewportConsistentWithMountedSurface(
+            columns: Int(viewport.columns),
+            rows: Int(viewport.rows),
+            widthPixels: Int(viewport.widthPixels),
+            heightPixels: Int(viewport.heightPixels),
+            cellWidthPixels: Int(viewport.cellWidthPixels),
+            cellHeightPixels: Int(viewport.cellHeightPixels)
+        ) else {
+            return
+        }
+
+        proxy.session?.resize(columns: Int(viewport.columns), rows: Int(viewport.rows))
+    }
+
+    private func isViewportConsistentWithMountedSurface(
+        columns: Int,
+        rows: Int,
+        widthPixels: Int,
+        heightPixels: Int,
+        cellWidthPixels: Int,
+        cellHeightPixels: Int
+    ) -> Bool {
+        guard !isReleased, columns > 0, rows > 0 else { return false }
+        guard scrollContainer != nil,
+              terminalView.superview != nil,
+              let window = terminalView.window
+        else {
+            return false
+        }
+
+        let bounds = terminalView.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return false }
+
+        let expectedWidthPixels = bounds.width * window.backingScaleFactor
+        let expectedHeightPixels = bounds.height * window.backingScaleFactor
+
+        if widthPixels > 0,
+           expectedWidthPixels >= 200,
+           CGFloat(widthPixels) < expectedWidthPixels * 0.5
+        {
+            return false
+        }
+
+        if heightPixels > 0,
+           expectedHeightPixels >= 200,
+           CGFloat(heightPixels) < expectedHeightPixels * 0.5
+        {
+            return false
+        }
+
+        if widthPixels == 0, cellWidthPixels > 0 {
+            let expectedColumns = Int(expectedWidthPixels / CGFloat(cellWidthPixels))
+            if expectedColumns >= 40, columns < expectedColumns / 2 {
+                return false
+            }
+        }
+
+        if heightPixels == 0, cellHeightPixels > 0 {
+            let expectedRows = Int(expectedHeightPixels / CGFloat(cellHeightPixels))
+            if expectedRows >= 20, rows < expectedRows / 2 {
+                return false
+            }
+        }
+
+        return true
     }
 
     private static func makeOptions(
@@ -1244,7 +1388,11 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            activeSession?.detachGhosttyBridge(from: self)
+            resetSidebarAnimationStateForSurfaceChange()
+            if let activeSession {
+                activeSession.detachGhosttyBridge(from: self)
+                activeSession.releaseGhosttyBridge()
+            }
             activeSession = session
             session.ghosttyBridge.attach(to: self)
             if isActivePane {
@@ -1349,6 +1497,7 @@ final class GhosttyTerminalContainerView: NSView {
         guard terminalView.superview === documentView else { return }
         terminalView.removeFromSuperview()
         if activeBridge?.terminalView === terminalView {
+            resetSidebarAnimationStateForSurfaceChange()
             activeBridge = nil
         }
     }
@@ -1363,7 +1512,7 @@ final class GhosttyTerminalContainerView: NSView {
         activeSession = nil
         activeBridge = nil
         pendingTerminalFocus = false
-        removeSnapshotLayer(animated: false)
+        resetSidebarAnimationStateForSurfaceChange()
     }
 
     func detachActiveSession(
@@ -1373,6 +1522,8 @@ final class GhosttyTerminalContainerView: NSView {
     ) {
         guard let session = activeSession else {
             activeBridge = nil
+            pendingTerminalFocus = false
+            resetSidebarAnimationStateForSurfaceChange()
             return
         }
 
@@ -1385,7 +1536,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
         activeBridge = nil
         pendingTerminalFocus = false
-        removeSnapshotLayer(animated: false)
+        resetSidebarAnimationStateForSurfaceChange()
     }
 
     func synchronizeScrollState() {
@@ -1492,6 +1643,14 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         didApplyEarlyFit = false
+    }
+
+    private func resetSidebarAnimationStateForSurfaceChange() {
+        isSidebarAnimating = false
+        isSyncFrozen = false
+        didApplyEarlyFit = false
+        pendingPostAnimationDelta = 0
+        removeSnapshotLayer(animated: false)
     }
 
     private func applyEarlyFitIfPossible() {
@@ -1905,6 +2064,31 @@ final class GhosttyTerminalContainerView: NSView {
     private func clampedScrollOffset(_ offsetY: CGFloat) -> CGFloat {
         let maximumOffset = max(0, documentView.frame.height - scrollView.contentSize.height)
         return min(max(offsetY, 0), maximumOffset)
+    }
+
+    func simulateSidebarSnapshotForTesting() {
+        wantsLayer = true
+        let layer = CALayer()
+        layer.frame = bounds
+        layer.zPosition = 1_000
+        self.layer?.addSublayer(layer)
+        snapshotLayer = layer
+        isSidebarAnimating = true
+        isSyncFrozen = true
+        didApplyEarlyFit = true
+        pendingPostAnimationDelta = 120
+    }
+
+    var hasSidebarSnapshotForTesting: Bool {
+        snapshotLayer?.superlayer != nil
+    }
+
+    var isSidebarSyncFrozenForTesting: Bool {
+        isSyncFrozen
+    }
+
+    var isSidebarAnimationActiveForTesting: Bool {
+        isSidebarAnimating
     }
 
     private var terminalCellHeight: CGFloat? {

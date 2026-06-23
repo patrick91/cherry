@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+
+
+HEADER_RE = re.compile(r"^  (?P<key>[a-zA-Z][a-zA-Z0-9_ -]*): (?P<value>.*)$")
+PERF_RE = re.compile(
+    r"^\[perf\] (?P<name>\S+) (?P<meta>.*?) "
+    r"elapsed=(?P<elapsed>[0-9.]+)s "
+    r"bytes=(?P<bytes_mib>[0-9.]+)MiB "
+    r"throughput=(?P<throughput>[0-9.]+)MiB/s "
+    r"maxRSS=(?P<max_rss>[0-9.]+)MiB"
+    r"(?P<extra>.*)$"
+)
+TIME_RE = re.compile(r"^real (?P<seconds>[0-9.]+)$")
+MAX_RESIDENT_RE = re.compile(r"^\s*(?P<bytes>[0-9]+)\s+maximum resident set size$")
+PEAK_FOOTPRINT_RE = re.compile(r"^\s*(?P<bytes>[0-9]+)\s+peak memory footprint$")
+
+
+def parse_key_values(value):
+    result = {}
+    for token in value.split():
+        if "=" not in token:
+            continue
+        key, raw = token.split("=", 1)
+        result[key] = parse_scalar(raw)
+    return result
+
+
+def parse_scalar(value):
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def parse_log(path):
+    header = {}
+    measurements = {}
+    time_metrics = {}
+
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if match := HEADER_RE.match(line):
+            key = match.group("key").strip().lower().replace(" ", "_")
+            header[key] = match.group("value").strip()
+            continue
+
+        if match := PERF_RE.match(line):
+            metadata = parse_key_values(match.group("meta"))
+            extra = parse_key_values(match.group("extra"))
+            name = match.group("name")
+            measurements[name] = {
+                "elapsed_seconds": float(match.group("elapsed")),
+                "bytes_mib": float(match.group("bytes_mib")),
+                "throughput_mib_per_second": float(match.group("throughput")),
+                "max_rss_mib": float(match.group("max_rss")),
+                "metadata": metadata,
+                "extra": extra,
+            }
+            continue
+
+        if match := TIME_RE.match(line):
+            time_metrics["real_seconds"] = float(match.group("seconds"))
+            continue
+
+        if match := MAX_RESIDENT_RE.match(line):
+            time_metrics["maximum_resident_bytes"] = int(match.group("bytes"))
+            continue
+
+        if match := PEAK_FOOTPRINT_RE.match(line):
+            time_metrics["peak_memory_footprint_bytes"] = int(match.group("bytes"))
+            continue
+
+    report = {
+        "source_log": str(path),
+        "header": header,
+        "measurements": measurements,
+        "time": time_metrics,
+    }
+    return report
+
+
+def load_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def compare(candidate, baseline, max_regression_pct):
+    tolerance = max_regression_pct / 100.0
+    failures = []
+
+    candidate_header = candidate.get("header", {})
+    baseline_header = baseline.get("header", {})
+    for key in ("scale", "configuration"):
+        candidate_value = candidate_header.get(key)
+        baseline_value = baseline_header.get(key)
+        if baseline_value and candidate_value and candidate_value != baseline_value:
+            failures.append(
+                f"header.{key} mismatch: candidate {candidate_value!r} != baseline {baseline_value!r}"
+            )
+
+    baseline_measurements = baseline.get("measurements", {})
+    candidate_measurements = candidate.get("measurements", {})
+
+    for name, base in baseline_measurements.items():
+        if name not in candidate_measurements:
+            failures.append(f"missing measurement: {name}")
+            continue
+
+        current = candidate_measurements[name]
+        compare_upper(
+            failures,
+            name,
+            "elapsed_seconds",
+            current.get("elapsed_seconds"),
+            base.get("elapsed_seconds"),
+            tolerance,
+        )
+        compare_upper(
+            failures,
+            name,
+            "max_rss_mib",
+            current.get("max_rss_mib"),
+            base.get("max_rss_mib"),
+            tolerance,
+        )
+        if base.get("throughput_mib_per_second", 0) > 0:
+            compare_lower(
+                failures,
+                name,
+                "throughput_mib_per_second",
+                current.get("throughput_mib_per_second"),
+                base.get("throughput_mib_per_second"),
+                tolerance,
+            )
+
+    compare_upper(
+        failures,
+        "process",
+        "real_seconds",
+        candidate.get("time", {}).get("real_seconds"),
+        baseline.get("time", {}).get("real_seconds"),
+        tolerance,
+    )
+    compare_upper(
+        failures,
+        "process",
+        "maximum_resident_bytes",
+        candidate.get("time", {}).get("maximum_resident_bytes"),
+        baseline.get("time", {}).get("maximum_resident_bytes"),
+        tolerance,
+    )
+    return failures
+
+
+def compare_upper(failures, name, metric, current, baseline, tolerance):
+    if current is None or baseline is None or baseline <= 0:
+        return
+    limit = baseline * (1 + tolerance)
+    if current > limit:
+        failures.append(
+            f"{name}.{metric} regressed: {current:.3f} > {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
+        )
+
+
+def compare_lower(failures, name, metric, current, baseline, tolerance):
+    if current is None or baseline is None or baseline <= 0:
+        return
+    limit = baseline * (1 - tolerance)
+    if current < limit:
+        failures.append(
+            f"{name}.{metric} regressed: {current:.3f} < {limit:.3f} "
+            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
+        )
+
+
+def print_summary(report):
+    header = report.get("header", {})
+    scale = header.get("scale", "unknown")
+    configuration = header.get("configuration", "unknown")
+    print(f"[report] scale={scale} configuration={configuration} log={report['source_log']}")
+    for name, measurement in sorted(report["measurements"].items()):
+        print(
+            "[report] "
+            f"{name} elapsed={measurement['elapsed_seconds']:.3f}s "
+            f"throughput={measurement['throughput_mib_per_second']:.1f}MiB/s "
+            f"maxRSS={measurement['max_rss_mib']:.1f}MiB"
+        )
+    time_metrics = report.get("time", {})
+    if "real_seconds" in time_metrics:
+        print(f"[report] process real={time_metrics['real_seconds']:.3f}s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Parse and compare Cherry terminal stress logs.")
+    parser.add_argument("log", type=Path, help="Log written by Scripts/perf-terminal-stress.")
+    parser.add_argument("--json-out", type=Path, help="Write parsed report JSON.")
+    parser.add_argument("--write-baseline", type=Path, help="Write this report as a local baseline JSON.")
+    parser.add_argument("--baseline", type=Path, help="Compare this report against a baseline JSON.")
+    parser.add_argument(
+        "--max-regression-pct",
+        type=float,
+        default=25.0,
+        help="Allowed regression percentage for elapsed time, max RSS, and inverse throughput.",
+    )
+    args = parser.parse_args()
+
+    report = parse_log(args.log)
+    if not report["measurements"]:
+        print(f"[report] no [perf] measurements found in {args.log}", file=sys.stderr)
+        return 2
+
+    print_summary(report)
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[report] wrote {args.json_out}")
+
+    if args.write_baseline:
+        args.write_baseline.parent.mkdir(parents=True, exist_ok=True)
+        args.write_baseline.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[report] wrote baseline {args.write_baseline}")
+
+    if args.baseline:
+        failures = compare(report, load_json(args.baseline), args.max_regression_pct)
+        if failures:
+            print("[report] regression check failed:", file=sys.stderr)
+            for failure in failures:
+                print(f"  - {failure}", file=sys.stderr)
+            return 1
+        print(f"[report] regression check passed against {args.baseline}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

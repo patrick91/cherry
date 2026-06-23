@@ -179,6 +179,20 @@ import Testing
         #expect(buffer.snapshot(range: 0..<3) == ["", "   ", "three"])
     }
 
+    @Test func commonRedrawCSISequencesUpdateFinalFrame() throws {
+        let viewport = TerminalViewportSize(columns: 20, rows: 4)
+        var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
+
+        buffer.ingest(Data("\u{1B}[?1049hold-one\r\nold-two\r\nold-three".utf8), viewportSize: viewport)
+        buffer.ingest(Data("\u{1B}[H\u{1B}[2Knew-one\r\n\u{1B}[2Knew-two".utf8), viewportSize: viewport)
+
+        #expect(buffer.snapshot(range: 0..<3) == ["new-one", "new-two", "old-three"])
+
+        buffer.ingest(Data("\u{1B}[1;1H\u{1B}[2Kabcdef\u{1B}[3G\u{1B}[K".utf8), viewportSize: viewport)
+
+        #expect(buffer.snapshot(range: 0..<3) == ["ab", "new-two", "old-three"])
+    }
+
     @Test func decscAndDecrcSaveAndRestoreCursor() throws {
         var buffer = LiveTerminalOutputBuffer(maxScrollback: 100)
 

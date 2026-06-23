@@ -95,3 +95,27 @@ Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
 ```
 
 Raw traces can include terminal output and prompt text, so treat them like logs.
+
+## Performance Stress
+
+Run the opt-in terminal stress suite:
+
+```bash
+Scripts/perf-terminal-stress --standard
+```
+
+Use `--smoke` for a quick check and `--soak` before perf-sensitive changes. For
+real app UI soak runs, start Cherry and run `Scripts/perf-app-soak --scale
+standard`. `Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS
+drift, MiB/hour growth, Ghostty bridge/observer counts, and raw replay
+retention, with hard gates for CPU, memory drift, retained output, and PTY
+callback density so long-session leaks are visible. Use paced TUI soaks such as
+`--mode tui --sleep-ms 4` for long-session stability, and keep unpaced `mixed`
+runs as overload/flood stress. `Scripts/perf-ghostty-workload` and
+`Scripts/perf-ghostty-report` capture the same workload in Ghostty as a control
+baseline, and `Scripts/perf-compare-emulators` prints Cherry/Ghostty ratios for
+matched runs. `Scripts/perf-run-emulator-comparison` performs the paired
+Cherry/Ghostty run end to end. The perf report scripts compare runs against
+local baselines. See
+[docs/performance.md](docs/performance.md) for the full performance goal,
+app-level soak plan, and Ghostty comparison workflow.

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: Scripts/perf-terminal-stress [--smoke|--standard|--soak]
+
+Runs Cherry's opt-in terminal performance stress suite under /usr/bin/time.
+
+Environment:
+  CHERRY_PERF_SCALE          smoke, standard, or soak (default: standard)
+  CHERRY_PERF_CONFIGURATION  debug or release (default: release)
+  CHERRY_PERF_LOG_DIR        output directory (default: .build/perf)
+  CHERRY_PERF_BASELINE       optional report JSON to compare against
+  CHERRY_PERF_MAX_REGRESSION_PCT
+                             allowed regression percent (default: 25)
+USAGE
+}
+
+scale="${CHERRY_PERF_SCALE:-standard}"
+while (($#)); do
+    case "$1" in
+        --smoke)
+            scale="smoke"
+            ;;
+        --standard)
+            scale="standard"
+            ;;
+        --soak)
+            scale="soak"
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown argument: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+case "$scale" in
+    smoke|standard|soak) ;;
+    *)
+        printf 'CHERRY_PERF_SCALE must be smoke, standard, or soak; got %s\n' "$scale" >&2
+        exit 2
+        ;;
+esac
+
+configuration="${CHERRY_PERF_CONFIGURATION:-release}"
+log_dir="${CHERRY_PERF_LOG_DIR:-.build/perf}"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+log_file="${log_dir}/terminal-stress-${scale}-${timestamp}.log"
+report_file="${log_file%.log}.json"
+
+mkdir -p "$log_dir"
+
+{
+    printf 'Cherry terminal performance stress\n'
+    printf '  date: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '  scale: %s\n' "$scale"
+    printf '  configuration: %s\n' "$configuration"
+    printf '  swift: '
+    swift --version | head -n 1
+    if command -v ghostty >/dev/null 2>&1; then
+        printf '  ghostty: '
+        ghostty --version 2>/dev/null || printf 'installed, version unavailable\n'
+    else
+        printf '  ghostty: not found on PATH\n'
+    fi
+    if command -v xctrace >/dev/null 2>&1; then
+        printf '  xctrace: '
+        xcrun xctrace version 2>/dev/null || printf 'available\n'
+    fi
+    printf '\n'
+
+    env -u CHERRY_PERF_STRESS swift test \
+        -c "$configuration" \
+        --no-parallel \
+        --filter TerminalPerformanceStressTests
+    printf '\n'
+
+    /usr/bin/time -lp env \
+        CHERRY_PERF_STRESS=1 \
+        CHERRY_PERF_SCALE="$scale" \
+        swift test \
+            -c "$configuration" \
+            --skip-build \
+            --no-parallel \
+            --filter TerminalPerformanceStressTests
+} 2>&1 | tee "$log_file"
+
+printf '\nWrote %s\n' "$log_file"
+
+report_args=("$log_file" --json-out "$report_file")
+if [[ -n "${CHERRY_PERF_BASELINE:-}" ]]; then
+    report_args+=(--baseline "$CHERRY_PERF_BASELINE")
+fi
+if [[ -n "${CHERRY_PERF_MAX_REGRESSION_PCT:-}" ]]; then
+    report_args+=(--max-regression-pct "$CHERRY_PERF_MAX_REGRESSION_PCT")
+fi
+
+"$(dirname "$0")/perf-terminal-report" "${report_args[@]}"

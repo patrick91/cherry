@@ -641,7 +641,10 @@ final class ShellProcessController: @unchecked Sendable {
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
     private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
     private let masterFDLock = NSLock()
-    private let maximumReadBatchBytes = 64 * 1024
+    private let readBufferBytes = 16 * 1024
+    private let maximumReadBatchBytes = 256 * 1024
+    private let outputCoalesceTargetBytes = 256 * 1024
+    private let outputCoalesceInterval: DispatchTimeInterval = .milliseconds(8)
     private let highVolumeReadThrottleInterval: DispatchTimeInterval = .milliseconds(1)
 
     private var masterFD: Int32 = -1
@@ -651,6 +654,8 @@ final class ShellProcessController: @unchecked Sendable {
     private var processSource: DispatchSourceProcess?
     private var pendingWrite = Data()
     private var pendingWriteStartOffset = 0
+    private var pendingOutput = Data()
+    private var isOutputFlushScheduled = false
     private var isReadSourcePaused = false
     private var isReadSourceThrottled = false
     private var isReadSourceSuspended = false
@@ -1001,7 +1006,7 @@ final class ShellProcessController: @unchecked Sendable {
     private func drainReadableData() {
         guard masterFD >= 0 else { return }
 
-        var buffer = [UInt8](repeating: 0, count: 4_096)
+        var buffer = [UInt8](repeating: 0, count: readBufferBytes)
         var output = Data()
         output.reserveCapacity(maximumReadBatchBytes)
         var didCloseReadSide = false
@@ -1039,7 +1044,7 @@ final class ShellProcessController: @unchecked Sendable {
         }
 
         if !output.isEmpty {
-            onData(output)
+            enqueueOutput(output)
             if output.count >= maximumReadBatchBytes {
                 throttleReadSourceBriefly()
             }
@@ -1142,10 +1147,39 @@ final class ShellProcessController: @unchecked Sendable {
         if shellTransportDebugEnabled {
             fputs("[pty exit] pid=\(childPID) status=\(exitCode)\n", stderr)
         }
+        flushPendingOutput()
         if !isTerminating {
             onExit(exitCode)
         }
         cleanup()
+    }
+
+    private func enqueueOutput(_ data: Data) {
+        guard !data.isEmpty else { return }
+
+        pendingOutput.append(data)
+        if pendingOutput.count >= outputCoalesceTargetBytes {
+            flushPendingOutput()
+        } else {
+            scheduleOutputFlush()
+        }
+    }
+
+    private func scheduleOutputFlush() {
+        guard !isOutputFlushScheduled else { return }
+        isOutputFlushScheduled = true
+        ioQueue.asyncAfter(deadline: .now() + outputCoalesceInterval) { [weak self] in
+            self?.flushPendingOutput()
+        }
+    }
+
+    private func flushPendingOutput() {
+        isOutputFlushScheduled = false
+        guard !pendingOutput.isEmpty else { return }
+
+        let output = pendingOutput
+        pendingOutput.removeAll(keepingCapacity: true)
+        onData(output)
     }
 
     private func flushPendingWrites() {
@@ -1309,6 +1343,7 @@ final class ShellProcessController: @unchecked Sendable {
         if shellTransportDebugEnabled {
             fputs("[pty cleanup] pid=\(childPID) fd=\(masterFD)\n", stderr)
         }
+        flushPendingOutput()
         if !isTerminating {
             cancelTerminationEscalation()
         }

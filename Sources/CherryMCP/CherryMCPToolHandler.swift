@@ -954,6 +954,8 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .getProjectStatus(let payload):
             return try encodedResult(payload)
+        case .getPerformanceStatus(let payload):
+            return try encodedResult(payload)
         case .resolveLink(let payload):
             return try encodedResult(payload)
         case .listProcesses(let payload):

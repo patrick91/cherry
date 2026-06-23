@@ -105,6 +105,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listProjects
     case openProject(OpenProjectRequest)
     case getProjectStatus
+    case getPerformanceStatus
     case resolveLink(ResolveDeepLinkRequest)
     case listProcesses(ListProcessesRequest)
     case getProcessStatus(ProcessSelectorRequest)
@@ -784,6 +785,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listProjects(ListProjectsResult)
     case openProject(OpenProjectResult)
     case getProjectStatus(ProjectStatusResult)
+    case getPerformanceStatus(PerformanceStatusResult)
     case resolveLink(ResolveDeepLinkResult)
     case listProcesses(ListProcessesResult)
     case getProcessStatus(ProcessStatusResult)
@@ -1007,6 +1009,98 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
         self.selectedProcessID = selectedProcessID
         self.selectedProcessName = selectedProcessName
         self.health = health
+    }
+}
+
+public struct TerminalPerformanceCounters: Codable, Equatable, Sendable {
+    public let ptyChunks: Int
+    public let ptyBytes: Int
+    public let ghosttyFeedChunks: Int
+    public let ghosttyFeedBytes: Int
+    public let processorBacklogDropCount: Int
+    public let processorBacklogDroppedBytes: Int
+    public let backgroundOutputThrottleCount: Int
+    public let processorChanges: Int
+    public let representableUpdates: Int
+    public let containerConfigures: Int
+    public let bridgeAttaches: Int
+    public let reusedBridgeAttaches: Int
+    public let fitToSizeCalls: Int
+    public let settingsApplies: Int
+    public let settingsReconfigures: Int
+    public let renderTicks: Int
+
+    public init(
+        ptyChunks: Int = 0,
+        ptyBytes: Int = 0,
+        ghosttyFeedChunks: Int = 0,
+        ghosttyFeedBytes: Int = 0,
+        processorBacklogDropCount: Int = 0,
+        processorBacklogDroppedBytes: Int = 0,
+        backgroundOutputThrottleCount: Int = 0,
+        processorChanges: Int = 0,
+        representableUpdates: Int = 0,
+        containerConfigures: Int = 0,
+        bridgeAttaches: Int = 0,
+        reusedBridgeAttaches: Int = 0,
+        fitToSizeCalls: Int = 0,
+        settingsApplies: Int = 0,
+        settingsReconfigures: Int = 0,
+        renderTicks: Int = 0
+    ) {
+        self.ptyChunks = ptyChunks
+        self.ptyBytes = ptyBytes
+        self.ghosttyFeedChunks = ghosttyFeedChunks
+        self.ghosttyFeedBytes = ghosttyFeedBytes
+        self.processorBacklogDropCount = processorBacklogDropCount
+        self.processorBacklogDroppedBytes = processorBacklogDroppedBytes
+        self.backgroundOutputThrottleCount = backgroundOutputThrottleCount
+        self.processorChanges = processorChanges
+        self.representableUpdates = representableUpdates
+        self.containerConfigures = containerConfigures
+        self.bridgeAttaches = bridgeAttaches
+        self.reusedBridgeAttaches = reusedBridgeAttaches
+        self.fitToSizeCalls = fitToSizeCalls
+        self.settingsApplies = settingsApplies
+        self.settingsReconfigures = settingsReconfigures
+        self.renderTicks = renderTicks
+    }
+}
+
+public struct PerformanceStatusResult: Codable, Equatable, Sendable {
+    public let activeProjectRoot: String?
+    public let processCounts: ProcessCounts
+    public let selectedProcessID: String?
+    public let ghosttyLiveBridgeCount: Int
+    public let ghosttyInstalledOutputObserverCount: Int
+    public let rawOutputObserverCount: Int
+    public let rawOutputRetainedBytes: Int
+    public let rawOutputRetainedChunkCount: Int
+    public let terminalPerfEnabled: Bool
+    public let terminalPerfCounters: TerminalPerformanceCounters
+
+    public init(
+        activeProjectRoot: String?,
+        processCounts: ProcessCounts,
+        selectedProcessID: String?,
+        ghosttyLiveBridgeCount: Int,
+        ghosttyInstalledOutputObserverCount: Int,
+        rawOutputObserverCount: Int,
+        rawOutputRetainedBytes: Int,
+        rawOutputRetainedChunkCount: Int,
+        terminalPerfEnabled: Bool,
+        terminalPerfCounters: TerminalPerformanceCounters
+    ) {
+        self.activeProjectRoot = activeProjectRoot
+        self.processCounts = processCounts
+        self.selectedProcessID = selectedProcessID
+        self.ghosttyLiveBridgeCount = ghosttyLiveBridgeCount
+        self.ghosttyInstalledOutputObserverCount = ghosttyInstalledOutputObserverCount
+        self.rawOutputObserverCount = rawOutputObserverCount
+        self.rawOutputRetainedBytes = rawOutputRetainedBytes
+        self.rawOutputRetainedChunkCount = rawOutputRetainedChunkCount
+        self.terminalPerfEnabled = terminalPerfEnabled
+        self.terminalPerfCounters = terminalPerfCounters
     }
 }
 

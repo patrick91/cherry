@@ -308,6 +308,8 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .openProject(try openProject(request, fallbackWorkspace: workspace)))
         case .getProjectStatus:
             return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
+        case .getPerformanceStatus:
+            return .init(result: .getPerformanceStatus(performanceStatus(workspace: workspace)))
         case .resolveLink(let request):
             return .init(result: .resolveLink(try resolveDeepLink(request, fallbackWorkspace: workspace)))
         case .listProcesses(let request):
@@ -947,18 +949,57 @@ final class CherryControlServer: @unchecked Sendable {
         let features = projectFeatureAvailability(for: workspace.projectRoot)
         return ProjectStatusResult(
             projectRoot: workspace.projectRoot,
-            processCounts: .init(
-                total: workspace.sessions.count,
-                terminals: workspace.terminalSessions.count,
-                agents: workspace.agentSessions.count,
-                commands: workspace.commandSessions.count
-            ),
+            processCounts: processCounts(workspace: workspace),
             noteCount: noteStore?.notes.count,
             todoCount: todoStore?.todos.count,
             features: features,
             selectedProcessID: selectedSession?.id.uuidString,
             selectedProcessName: selectedSession.map(processName),
             health: workspace.projectRoot == nil ? "no_project" : "ok"
+        )
+    }
+
+    @MainActor
+    private func performanceStatus(workspace: TerminalWorkspace) -> PerformanceStatusResult {
+        let counters = TerminalPerformanceMonitor.snapshot()
+        return PerformanceStatusResult(
+            activeProjectRoot: workspace.projectRoot,
+            processCounts: processCounts(workspace: workspace),
+            selectedProcessID: workspace.selectedSessionID?.uuidString,
+            ghosttyLiveBridgeCount: GhosttySessionBridge.liveBridgeCount,
+            ghosttyInstalledOutputObserverCount: GhosttySessionBridge.installedOutputObserverCount,
+            rawOutputObserverCount: workspace.sessions.reduce(0) { $0 + $1.rawOutputObserverCount },
+            rawOutputRetainedBytes: workspace.sessions.reduce(0) { $0 + $1.rawOutputRetainedByteCount },
+            rawOutputRetainedChunkCount: workspace.sessions.reduce(0) { $0 + $1.rawOutputRetainedChunkCount },
+            terminalPerfEnabled: TerminalPerformanceMonitor.isEnabled,
+            terminalPerfCounters: TerminalPerformanceCounters(
+                ptyChunks: counters.ptyChunks,
+                ptyBytes: counters.ptyBytes,
+                ghosttyFeedChunks: counters.ghosttyFeedChunks,
+                ghosttyFeedBytes: counters.ghosttyFeedBytes,
+                processorBacklogDropCount: counters.processorBacklogDropCount,
+                processorBacklogDroppedBytes: counters.processorBacklogDroppedBytes,
+                backgroundOutputThrottleCount: counters.backgroundOutputThrottleCount,
+                processorChanges: counters.processorChanges,
+                representableUpdates: counters.representableUpdates,
+                containerConfigures: counters.containerConfigures,
+                bridgeAttaches: counters.bridgeAttaches,
+                reusedBridgeAttaches: counters.reusedBridgeAttaches,
+                fitToSizeCalls: counters.fitToSizeCalls,
+                settingsApplies: counters.settingsApplies,
+                settingsReconfigures: counters.settingsReconfigures,
+                renderTicks: counters.renderTicks
+            )
+        )
+    }
+
+    @MainActor
+    private func processCounts(workspace: TerminalWorkspace) -> ProcessCounts {
+        ProcessCounts(
+            total: workspace.sessions.count,
+            terminals: workspace.terminalSessions.count,
+            agents: workspace.agentSessions.count,
+            commands: workspace.commandSessions.count
         )
     }
 

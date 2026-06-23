@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import argparse
+import itertools
+import os
+import sys
+import time
+
+
+ESC = "\x1b"
+CSI = f"{ESC}["
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Emit deterministic terminal output for Cherry/Ghostty perf runs."
+    )
+    parser.add_argument(
+        "mode",
+        choices=("scrollback", "tui", "mixed"),
+        help="Workload shape to emit.",
+    )
+    parser.add_argument("--lines", type=int, default=50_000, help="Scrollback lines for scrollback/mixed mode.")
+    parser.add_argument("--frames", type=int, default=1_000, help="Alternate-screen redraw frames for tui/mixed mode.")
+    parser.add_argument("--rows", type=int, default=40, help="Rows to repaint in TUI mode.")
+    parser.add_argument("--columns", type=int, default=120, help="Columns to fill in generated rows.")
+    parser.add_argument("--duration", type=float, default=0, help="Minimum seconds to keep emitting output.")
+    parser.add_argument("--sleep-ms", type=float, default=0, help="Delay between TUI frames, in milliseconds.")
+    parser.add_argument("--progress-frames", type=int, default=1_000, help="Carriage-return progress frames for mixed mode.")
+    return parser.parse_args()
+
+
+def write(value):
+    sys.stdout.write(value)
+
+
+def flush():
+    sys.stdout.flush()
+
+
+def fill(width, seed):
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    offset = seed % len(alphabet)
+    rotated = alphabet[offset:] + alphabet[:offset]
+    return (rotated * ((width // len(rotated)) + 1))[:width]
+
+
+def emit_scrollback(lines, columns, prefix="scrollback"):
+    body_width = max(8, columns - 32)
+    for index in range(max(0, lines)):
+        write(f"{prefix}-{index:07d} {fill(body_width, index)}\r\n")
+        if index % 512 == 0:
+            flush()
+    flush()
+
+
+def emit_progress(frames, columns):
+    body_width = max(8, columns - 36)
+    for index in range(max(0, frames)):
+        write(f"{CSI}2K\rprogress {index:07d} {fill(body_width, index)}")
+        if index % 128 == 0:
+            flush()
+    write("\r\n")
+    flush()
+
+
+def emit_tui(frames, rows, columns, sleep_ms=0):
+    body_width = max(8, columns - 32)
+    frame_delay = max(0, sleep_ms) / 1000
+    write(f"{CSI}?1049h{CSI}?25l")
+    try:
+        for frame in range(max(0, frames)):
+            write(f"{CSI}H")
+            for row in range(max(1, rows)):
+                write(f"{CSI}2Kframe={frame:07d} row={row:03d} {fill(body_width, frame + row)}")
+                if row + 1 < rows:
+                    write("\r\n")
+            flush()
+            if frame_delay:
+                time.sleep(frame_delay)
+    finally:
+        write(f"{CSI}?25h")
+        flush()
+
+
+def emit_for_duration(args):
+    deadline = time.monotonic() + args.duration
+    cycle = 0
+    while time.monotonic() < deadline:
+        if args.mode == "scrollback":
+            emit_scrollback(args.lines, args.columns, prefix=f"scrollback-cycle-{cycle}")
+        elif args.mode == "tui":
+            emit_tui(args.frames, args.rows, args.columns, args.sleep_ms)
+        else:
+            emit_scrollback(max(1, args.lines // 5), args.columns, prefix=f"mixed-cycle-{cycle}")
+            emit_progress(args.progress_frames, args.columns)
+            emit_tui(max(1, args.frames // 5), args.rows, args.columns, args.sleep_ms)
+        cycle += 1
+
+
+def main():
+    args = parse_args()
+    write(f"Cherry perf workload pid={os.getpid()} mode={args.mode}\r\n")
+    flush()
+
+    if args.duration > 0:
+        emit_for_duration(args)
+    elif args.mode == "scrollback":
+        emit_scrollback(args.lines, args.columns)
+    elif args.mode == "tui":
+        emit_tui(args.frames, args.rows, args.columns, args.sleep_ms)
+    else:
+        emit_scrollback(args.lines, args.columns, prefix="mixed")
+        emit_progress(args.progress_frames, args.columns)
+        emit_tui(args.frames, args.rows, args.columns, args.sleep_ms)
+
+    write("\r\nCherry perf workload complete\r\n")
+    flush()
+
+
+if __name__ == "__main__":
+    main()

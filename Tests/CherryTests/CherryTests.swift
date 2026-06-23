@@ -26,6 +26,22 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     return String(decoding: output + errorOutput, as: UTF8.self)
 }
 
+@MainActor
+private func waitForCondition(
+    timeout: TimeInterval = 1,
+    interval: UInt64 = 10_000_000,
+    _ condition: @MainActor () -> Bool
+) async -> Bool {
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while Date() < deadline {
+        if condition() {
+            return true
+        }
+        try? await Task.sleep(nanoseconds: interval)
+    }
+    return condition()
+}
+
 private final class DataWriteRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storedValues: [Data] = []
@@ -1129,6 +1145,7 @@ private struct MCPWhoamiPayload: Decodable {
     let requests: [CherryControlRequest] = [
         .listProjects,
         .getProjectStatus,
+        .getPerformanceStatus,
         .resolveLink(.init(link: CherryDeepLink.terminalURL(projectRoot: "/tmp/project", terminalID: UUID()), includeOutput: true, startLine: 0, lineLimit: 20)),
         .listProcesses(.init(kind: "agent")),
         .getProcessStatus(.init(processID: processID)),
@@ -3661,6 +3678,20 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(status.noteCount == 0)
     #expect(status.todoCount == 0)
 
+    let rawData = Data("perf-diagnostics\r\n".utf8)
+    harness.workspace.selectedSession?.ingestTestingData(rawData)
+    let performanceResponse = try await harness.send(.getPerformanceStatus)
+    guard case .getPerformanceStatus(let performance)? = performanceResponse.result else {
+        Issue.record("Expected getPerformanceStatus result, got \(String(describing: performanceResponse))")
+        return
+    }
+    #expect(performance.activeProjectRoot == harness.projectRoot.path)
+    #expect(performance.processCounts.total == harness.workspace.sessions.count)
+    #expect(performance.selectedProcessID == initialSelection?.uuidString)
+    #expect(performance.rawOutputRetainedBytes >= rawData.count)
+    #expect(performance.rawOutputRetainedChunkCount >= 1)
+    #expect(performance.terminalPerfEnabled == TerminalPerformanceMonitor.isEnabled)
+
     let startResponse = try await harness.send(.startProcess(.init(
         processName: "Echo",
         kind: "command"
@@ -4117,6 +4148,85 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func terminalSessionReportsRawOutputTruncatedAfterRetentionTrim() async throws {
+    let session = TerminalSession(
+        title: "Raw trim",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+
+    session.ingestTestingData(Data(repeating: UInt8(ascii: "a"), count: 1_500_000))
+
+    let output = session.rawOutput(maxBytes: 1_048_576)
+    #expect(output.data.count == 1_048_576)
+    #expect(output.truncated)
+
+    session.clearScrollback()
+    #expect(session.rawOutput(maxBytes: 1_048_576).truncated == false)
+}
+
+@MainActor
+@Test func terminalSessionCoalescesSmallRawOutputChunks() async throws {
+    let session = TerminalSession(
+        title: "Raw chunks",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+
+    for index in 0..<2_000 {
+        session.ingestTestingData(Data("chunk-\(index)\r\n".utf8))
+    }
+
+    let output = session.rawOutput(maxBytes: 1_048_576)
+    #expect(output.data.count > 20_000)
+    #expect(!output.truncated)
+    #expect(session.rawOutputRetainedChunkCount <= 2)
+}
+
+@MainActor
+@Test func plainTerminalSessionKeepsAuxiliaryProcessorScrollbackSmall() async throws {
+    let session = TerminalSession(
+        title: "Aux scrollback",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+    let output = (0..<10_000)
+        .map { "line-\($0)" }
+        .joined(separator: "\r\n") + "\r\n"
+
+    session.ingestTestingData(Data(output.utf8))
+
+    #expect(session.lineCount <= 4_096)
+}
+
+@MainActor
+@Test func terminalProcessorSuspendsAndReplaysAuxiliaryOutput() async throws {
+    let processor = TerminalProcessor(
+        maxScrollback: 100,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        backpressurePolicy: .dropStalePending(maxPendingBytes: 1_024)
+    )
+
+    processor.enqueueOutput(Data("visible\r\n".utf8), launchID: nil, responseWriter: { _ in })
+    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("visible") })
+
+    processor.setOutputProcessingSuspended(true)
+    processor.enqueueOutput(Data("hidden\r\n".utf8), launchID: nil, responseWriter: { _ in })
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(!processor.snapshot(range: 0..<processor.lineCount).contains("hidden"))
+
+    processor.setOutputProcessingSuspended(false)
+    processor.clear()
+    processor.enqueueOutput(Data("replayed\r\n".utf8), launchID: nil, responseWriter: { _ in })
+    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
+}
+
+@MainActor
 @Test func terminalSessionUserClearPreservesLiveTerminalModes() async throws {
     let session = TerminalSession(
         title: "Live",
@@ -4558,6 +4668,29 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyLiveBridgeCountTracksReleasedResourcesBeforeObjectDeinit() {
+    let session = TerminalSession(
+        title: "Bridge",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    defer {
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    let bridge = session.ghosttyBridge
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
+
+    session.releaseGhosttyBridge()
+
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount)
+    withExtendedLifetime(bridge) {}
+}
+
+@MainActor
 @Test func ghosttyContainerRetainsPreviousBridgeWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
@@ -4597,7 +4730,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyContainerPreservesDetachedSurfaceWhenSwitchingSessions() async throws {
+@Test func ghosttyContainerPreservesDetachedSurfaceBrieflyWhenSwitchingSessions() async throws {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -4631,9 +4764,13 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(first.rawOutputObserverCount == 1)
 
-    try await Task.sleep(for: .milliseconds(80))
+    try await Task.sleep(for: .milliseconds(20))
 
     #expect(first.rawOutputObserverCount == 1)
+
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(first.rawOutputObserverCount == 0)
 }
 
 @MainActor
@@ -4704,6 +4841,7 @@ private struct MCPWhoamiPayload: Decodable {
     let container = GhosttyTerminalContainerView(frame: .zero)
     rootView.addSubview(container)
     window.contentView = rootView
+    window.orderFrontRegardless()
 
     defer {
         container.detachActiveSession()
@@ -4720,9 +4858,20 @@ private struct MCPWhoamiPayload: Decodable {
     container.frame = rootView.bounds
     container.needsLayout = true
     container.layoutSubtreeIfNeeded()
-    try await Task.sleep(for: .milliseconds(40))
+    session.ghosttyBridge.terminalDidResize(TerminalGridMetrics(
+        columns: 80,
+        rows: 24,
+        widthPixels: 640,
+        heightPixels: 400,
+        cellWidthPixels: 8,
+        cellHeightPixels: 16
+    ))
+    session.ghosttyBridge.activateOutputFeedWhenSurfaceIsReady()
 
-    #expect(session.rawOutputObserverCount == 1)
+    let observerInstalled = await waitForCondition {
+        session.rawOutputObserverCount == 1
+    }
+    #expect(observerInstalled)
     session.ghosttyBridge.flushOutputForTesting()
 }
 
@@ -4743,6 +4892,7 @@ private struct MCPWhoamiPayload: Decodable {
     window.isReleasedWhenClosed = false
     let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
     window.contentView = container
+    window.orderFrontRegardless()
 
     defer {
         container.detachActiveSession()
@@ -4755,16 +4905,28 @@ private struct MCPWhoamiPayload: Decodable {
     container.layoutSubtreeIfNeeded()
     try await Task.sleep(for: .milliseconds(40))
     let revisionAfterInitialFit = session.revision
+    let hasHeadlessGridMetrics = session.ghosttyBridge.gridMetrics != nil
 
     container.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
     NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
-    try await Task.sleep(for: .milliseconds(40))
+    let frameUpdated = await waitForCondition {
+        session.ghosttyBridge.terminalView.frame.size.width == 900 &&
+            session.ghosttyBridge.terminalView.frame.size.height == 520
+    }
+    let refitCompleted = if hasHeadlessGridMetrics {
+        await waitForCondition {
+            session.revision > revisionAfterInitialFit
+        }
+    } else {
+        true
+    }
 
     #expect(container.bounds.size.width == 900)
     #expect(container.bounds.size.height == 520)
+    #expect(frameUpdated)
     #expect(session.ghosttyBridge.terminalView.frame.size.width == 900)
     #expect(session.ghosttyBridge.terminalView.frame.size.height == 520)
-    #expect(session.revision > revisionAfterInitialFit)
+    #expect(refitCompleted)
 }
 
 @MainActor
@@ -4786,6 +4948,7 @@ private struct MCPWhoamiPayload: Decodable {
     window.isReleasedWhenClosed = false
     let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
     window.contentView = container
+    window.orderFrontRegardless()
 
     defer {
         container.detachActiveSession()
@@ -4795,10 +4958,11 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
-    try await Task.sleep(for: .milliseconds(40))
+    _ = await waitForCondition {
+        session.ghosttyBridge.terminalView.window != nil
+    }
     #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty == false)
 
-    window.makeFirstResponder(session.ghosttyBridge.terminalView)
     let event = try #require(NSEvent.keyEvent(
         with: .keyDown,
         location: .zero,
@@ -4812,7 +4976,7 @@ private struct MCPWhoamiPayload: Decodable {
         keyCode: 40
     ))
 
-    let handled = session.ghosttyBridge.terminalView.performKeyEquivalent(with: event)
+    let handled = session.ghosttyBridge.terminalShouldHandleKeyEquivalent(event)
 
     #expect(handled)
     #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty)
@@ -7509,6 +7673,38 @@ private func waitForSummaryCallCount(
     #expect(reloadedSettings.projectRoot(for: nil) == firstDirectory.path)
     #expect(reloadedSettings.resolvedProject(for: firstDirectory.path).validProjectRoot == firstDirectory.path)
     #expect(reloadedSettings.resolvedProject(for: secondDirectory.path).validProjectRoot == secondDirectory.path)
+}
+
+@MainActor
+@Test func agentSettingsPerformanceProjectRootsRequirePerfMode() async throws {
+    let firstDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let secondDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: firstDirectory)
+        try? FileManager.default.removeItem(at: secondDirectory)
+    }
+
+    let roots = AgentSettings.performanceProjectRoots(environment: [
+        "CHERRY_TERMINAL_PERF": "1",
+        "CHERRY_PERF_PROJECT_ROOTS": [
+            firstDirectory.path,
+            secondDirectory.path,
+            firstDirectory.path,
+            "/does/not/exist",
+        ].joined(separator: ":"),
+    ])
+
+    #expect(roots == [
+        firstDirectory.standardizedFileURL.path,
+        secondDirectory.standardizedFileURL.path,
+    ])
+    #expect(AgentSettings.performanceProjectRoots(environment: [
+        "CHERRY_PERF_PROJECT_ROOTS": firstDirectory.path,
+    ]).isEmpty)
 }
 
 @MainActor

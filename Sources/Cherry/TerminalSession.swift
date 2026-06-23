@@ -71,21 +71,37 @@ private final class TerminalTraceRecorder {
 }
 
 final class TerminalProcessor: @unchecked Sendable {
+    enum BackpressurePolicy {
+        case preserveAll
+        case dropStalePending(maxPendingBytes: Int)
+    }
+
     private static let changeNotificationInterval: TimeInterval = 1.0 / 30.0
+    static let defaultTerminalPendingOutputLimit = 8 * 1024 * 1024
+    private static let suspendedDropReportThreshold = 1 * 1024 * 1024
 
     private let processingQueue = DispatchQueue(label: "Cherry.TerminalProcessor", qos: .userInitiated)
     private let lock = NSLock()
     private let notificationLock = NSLock()
+    private let backpressurePolicy: BackpressurePolicy
 
     private var buffer: any TerminalBuffering
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var activeLaunchID: UUID?
     private var outputEpoch = 0
+    private var pendingOutputBytes = 0
+    private var isOutputProcessingSuspended = false
+    private var unreportedSuspendedDroppedBytes = 0
     private var isChangeNotificationScheduled = false
     private var onDidChange: (@Sendable () -> Void)?
 
-    init(maxScrollback: Int?, buffer: (any TerminalBuffering)? = nil) {
+    init(
+        maxScrollback: Int?,
+        buffer: (any TerminalBuffering)? = nil,
+        backpressurePolicy: BackpressurePolicy = .preserveAll
+    ) {
         self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
+        self.backpressurePolicy = backpressurePolicy
     }
 
     var lineCount: Int {
@@ -191,6 +207,25 @@ final class TerminalProcessor: @unchecked Sendable {
     func discardPendingOutput() {
         locked {
             outputEpoch &+= 1
+            pendingOutputBytes = 0
+        }
+    }
+
+    func setOutputProcessingSuspended(_ isSuspended: Bool) {
+        let droppedPendingBytes = locked {
+            let droppedPendingBytes = unreportedSuspendedDroppedBytes
+            unreportedSuspendedDroppedBytes = 0
+            return droppedPendingBytes
+        }
+        if droppedPendingBytes > 0 {
+            TerminalPerformanceMonitor.recordProcessorBacklogDrop(bytes: droppedPendingBytes)
+        }
+
+        locked {
+            guard isOutputProcessingSuspended != isSuspended else { return }
+            isOutputProcessingSuspended = isSuspended
+            outputEpoch &+= 1
+            pendingOutputBytes = 0
         }
     }
 
@@ -201,10 +236,50 @@ final class TerminalProcessor: @unchecked Sendable {
     ) {
         guard !data.isEmpty else { return }
 
-        let epoch = locked { outputEpoch }
+        let (epoch, droppedPendingBytes) = locked { () -> (Int?, Int) in
+            if isOutputProcessingSuspended {
+                unreportedSuspendedDroppedBytes += data.count
+                if unreportedSuspendedDroppedBytes >= Self.suspendedDropReportThreshold {
+                    let droppedBytes = unreportedSuspendedDroppedBytes
+                    unreportedSuspendedDroppedBytes = 0
+                    return (nil, droppedBytes)
+                }
+                return (nil, 0)
+            }
+            let droppedPendingBytes = applyBackpressureIfNeeded(forIncomingByteCount: data.count)
+            pendingOutputBytes += data.count
+            return (outputEpoch, droppedPendingBytes)
+        }
+        if droppedPendingBytes > 0 {
+            TerminalPerformanceMonitor.recordProcessorBacklogDrop(bytes: droppedPendingBytes)
+        }
+        guard let epoch else { return }
+
         processingQueue.async { [self] in
+            defer {
+                locked {
+                    if outputEpoch == epoch {
+                        pendingOutputBytes = max(0, pendingOutputBytes - data.count)
+                    }
+                }
+            }
             processOutput(data, launchID: launchID, expectedEpoch: epoch, responseWriter: responseWriter)
         }
+    }
+
+    private func applyBackpressureIfNeeded(forIncomingByteCount byteCount: Int) -> Int {
+        guard case .dropStalePending(let maxPendingBytes) = backpressurePolicy,
+              pendingOutputBytes > 0,
+              pendingOutputBytes + byteCount > maxPendingBytes
+        else {
+            return 0
+        }
+
+        let droppedBytes = pendingOutputBytes
+        outputEpoch &+= 1
+        pendingOutputBytes = 0
+        buffer.clear()
+        return droppedBytes
     }
 
     func processOutput(
@@ -379,11 +454,14 @@ private struct SummaryTranscript {
 }
 
 private final class TerminalRawOutputStore: @unchecked Sendable {
+    private static let retainedChunkTargetBytes = 64 * 1024
+
     private let lock = NSLock()
     private let maximumBytes: Int
     private let trimThresholdBytes: Int
     private var chunks: [Data] = []
     private var byteCount = 0
+    private var hasDiscardedBytes = false
     private var observers: [UUID: @Sendable (Data) -> Void] = [:]
 
     init(maximumBytes: Int = 1_048_576) {
@@ -427,6 +505,18 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         }
     }
 
+    var chunkCount: Int {
+        lock.withLock {
+            chunks.count
+        }
+    }
+
+    var retainedByteCount: Int {
+        lock.withLock {
+            byteCount
+        }
+    }
+
     func snapshot(maxBytes requestedMaxBytes: Int) -> (data: Data, truncated: Bool) {
         lock.withLock {
             let maxBytes = max(0, min(requestedMaxBytes, maximumBytes))
@@ -438,23 +528,34 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         lock.withLock {
             chunks.removeAll(keepingCapacity: false)
             byteCount = 0
+            hasDiscardedBytes = false
         }
     }
 
     private func appendLocked(_ chunk: Data) {
-        var retainedChunk = Data()
+        let retainedChunk: Data
         if chunk.count > maximumBytes {
-            retainedChunk.reserveCapacity(maximumBytes)
-            retainedChunk.append(chunk.suffix(maximumBytes))
+            retainedChunk = Data(chunk.suffix(maximumBytes))
+            hasDiscardedBytes = true
         } else {
-            retainedChunk.reserveCapacity(chunk.count)
-            retainedChunk.append(chunk)
+            retainedChunk = chunk
         }
-        chunks.append(retainedChunk)
+        appendRetainedChunkLocked(retainedChunk)
         byteCount += retainedChunk.count
 
         guard byteCount > trimThresholdBytes else { return }
         trimLocked(to: maximumBytes)
+    }
+
+    private func appendRetainedChunkLocked(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        let targetBytes = max(1, min(maximumBytes, Self.retainedChunkTargetBytes))
+        if let lastIndex = chunks.indices.last,
+           chunks[lastIndex].count + chunk.count <= targetBytes {
+            chunks[lastIndex].append(chunk)
+        } else {
+            chunks.append(chunk)
+        }
     }
 
     private func trimLocked(to targetBytes: Int) {
@@ -474,11 +575,13 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 
         if removeCount > 0 {
             chunks.removeFirst(removeCount)
+            hasDiscardedBytes = true
         }
 
         if excessBytes > 0, let first = chunks.first {
             chunks[0] = Data(first.dropFirst(excessBytes))
             byteCount -= excessBytes
+            hasDiscardedBytes = true
         }
 
         if chunks.isEmpty {
@@ -488,7 +591,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
 
     private func snapshotLocked(maxBytes: Int) -> (data: Data, truncated: Bool) {
         guard maxBytes > 0, byteCount > 0 else {
-            return (Data(), byteCount > 0)
+            return (Data(), hasDiscardedBytes || byteCount > 0)
         }
 
         let outputByteCount = min(maxBytes, byteCount)
@@ -511,7 +614,7 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         for slice in slices.reversed() {
             output.append(slice)
         }
-        return (output, byteCount > maxBytes)
+        return (output, hasDiscardedBytes || byteCount > maxBytes)
     }
 }
 
@@ -556,6 +659,11 @@ private final class TerminalMetadataParser {
 
     private var state = ParserState.ground
     private var controlBuffer = [UInt8]()
+
+    func reset() {
+        state = .ground
+        controlBuffer.removeAll(keepingCapacity: true)
+    }
 
     func parse(_ data: Data) -> [TerminalMetadataEvent] {
         if isGround, !Self.containsEscape(in: data) {
@@ -849,6 +957,7 @@ final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
     @Published var selectedSessionID: UUID? {
         didSet {
+            updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
             clearUnreadNotificationForSelectedSession()
         }
     }
@@ -926,6 +1035,20 @@ final class TerminalWorkspace: ObservableObject {
         selectedSessionID = session.id
     }
 
+    private func updateAuxiliaryProcessingForSelection(previousSelectedSessionID: UUID?) {
+        guard previousSelectedSessionID != selectedSessionID else {
+            selectedSession?.setAuxiliaryProcessingActive(true)
+            return
+        }
+
+        if let previousSelectedSessionID,
+           let previousSession = sessions.first(where: { $0.id == previousSelectedSessionID }) {
+            previousSession.setAuxiliaryProcessingActive(false)
+        }
+
+        selectedSession?.setAuxiliaryProcessingActive(true)
+    }
+
     func moveSession(id sessionID: UUID, to targetIndex: Int) {
         guard let currentIndex = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
@@ -981,6 +1104,8 @@ final class TerminalWorkspace: ObservableObject {
         sessions.append(session)
         if select {
             selectedSessionID = session.id
+        } else {
+            session.scheduleAuxiliaryProcessingSuspensionAfterStartupGrace()
         }
 
         if let command, !command.isEmpty {
@@ -1485,6 +1610,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private let processor: TerminalProcessor
     private let rawOutputStore = TerminalRawOutputStore()
     private let metadataParser = TerminalMetadataParser()
+    private let metadataOutputLock = NSLock()
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
@@ -1492,6 +1618,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var traceRecorder: TerminalTraceRecorder?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
+    private var isOutputPausedForBackgroundThrottle = false
+    private var backgroundOutputThrottleTask: Task<Void, Never>?
+    private var backgroundOutputBytesSinceThrottle = 0
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
     private var summaryDebounceTask: Task<Void, Never>?
@@ -1507,7 +1636,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastStrongWorkingEvidenceAt: Date?
     private var agentIdleConfirmationTask: Task<Void, Never>?
     private var agentIdleRecheckTask: Task<Void, Never>?
+    private var auxiliaryProcessingSuspensionTask: Task<Void, Never>?
     private var lastContentFingerprint: Int?
+    private var pendingMetadataOutput = Data()
+    private var hasPendingOutputActivity = false
+    private var isMetadataOutputFlushScheduled = false
+    private var shouldResetMetadataParserBeforeFlush = false
+    private var isAuxiliaryProcessingActive = true
 
     enum AgentActivitySource {
         case none
@@ -1522,6 +1657,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private static let defaultMaxScrollback = 50_000
+    private static let auxiliaryTerminalProcessorMaxScrollback = 4_096
+    private static let auxiliaryTerminalProcessorReplayByteLimit = 256 * 1024
+    private static let auxiliaryTerminalProcessorStartupGrace: TimeInterval = 3.0
+    private static let metadataOutputPendingByteLimit = 512 * 1024
+    private static let metadataOutputFlushInterval: TimeInterval = 0.2
+    private static let backgroundOutputThrottleByteInterval = 256 * 1024
+    private static let backgroundOutputThrottleDuration: TimeInterval = 0.5
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
     private static let agentIdleConfirmationEvidenceWindow: TimeInterval = 1.0
     private static let agentIdleConfirmationDelay: TimeInterval = 0.4
@@ -1574,10 +1716,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.restartOnExit = restartOnExit
         self.summaryRunner = summaryRunner
         self.systemTitle = title
+        let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
-            ? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
+            ? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
             : nil)
-        self.processor = TerminalProcessor(maxScrollback: maxScrollback, buffer: processorBuffer)
+        let processorBackpressurePolicy: TerminalProcessor.BackpressurePolicy = kind == .terminal
+            ? .dropStalePending(maxPendingBytes: TerminalProcessor.defaultTerminalPendingOutputLimit)
+            : .preserveAll
+        self.processor = TerminalProcessor(
+            maxScrollback: processorMaxScrollback,
+            buffer: processorBuffer,
+            backpressurePolicy: processorBackpressurePolicy
+        )
         self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
             Task { @MainActor [weak self] in
@@ -1593,6 +1743,109 @@ final class TerminalSession: ObservableObject, Identifiable {
             startShell()
         } else {
             state = .exited(0)
+        }
+    }
+
+    private static func processorMaxScrollback(
+        for kind: SessionKind,
+        configuredMaxScrollback: Int?
+    ) -> Int? {
+        guard kind == .terminal else { return configuredMaxScrollback }
+        return min(
+            max(0, configuredMaxScrollback ?? auxiliaryTerminalProcessorMaxScrollback),
+            auxiliaryTerminalProcessorMaxScrollback
+        )
+    }
+
+    func scheduleAuxiliaryProcessingSuspensionAfterStartupGrace() {
+        setAuxiliaryProcessingActive(false, suspensionDelay: Self.auxiliaryTerminalProcessorStartupGrace)
+    }
+
+    func setAuxiliaryProcessingActive(_ isActive: Bool, suspensionDelay: TimeInterval = 0) {
+        guard kind == .terminal else { return }
+        auxiliaryProcessingSuspensionTask?.cancel()
+        auxiliaryProcessingSuspensionTask = nil
+
+        if !isActive, suspensionDelay > 0 {
+            auxiliaryProcessingSuspensionTask = Task { [weak self] in
+                let nanoseconds = UInt64(suspensionDelay * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    self?.setAuxiliaryProcessingActive(false)
+                }
+            }
+            return
+        }
+
+        guard isAuxiliaryProcessingActive != isActive else { return }
+
+        isAuxiliaryProcessingActive = isActive
+        processor.setOutputProcessingSuspended(!isActive)
+
+        if isActive {
+            cancelBackgroundOutputThrottle()
+        } else {
+            backgroundOutputBytesSinceThrottle = 0
+        }
+
+        guard isActive else { return }
+
+        processor.clear()
+        let replay = rawOutputStore.snapshot(maxBytes: Self.auxiliaryTerminalProcessorReplayByteLimit).data
+        guard !replay.isEmpty else { return }
+
+        ingestTerminalMetadata(replay)
+        guard !prototypeProcessorDisabledForPerf else { return }
+        processor.enqueueOutput(replay, launchID: activeLaunchID, responseWriter: { _ in })
+    }
+
+    private var shouldParseMetadataForProcessOutput: Bool {
+        kind != .terminal || isAuxiliaryProcessingActive
+    }
+
+    private func noteProcessOutputForBackgroundThrottle(bytes: Int) {
+        guard kind == .terminal,
+              !isAuxiliaryProcessingActive,
+              bytes > 0,
+              !isOutputPausedForBackgroundThrottle
+        else {
+            return
+        }
+
+        backgroundOutputBytesSinceThrottle += bytes
+        guard backgroundOutputBytesSinceThrottle >= Self.backgroundOutputThrottleByteInterval else { return }
+        backgroundOutputBytesSinceThrottle = 0
+        isOutputPausedForBackgroundThrottle = true
+        TerminalPerformanceMonitor.recordBackgroundOutputThrottle()
+        updateShellOutputPauseState()
+
+        backgroundOutputThrottleTask?.cancel()
+        backgroundOutputThrottleTask = Task { [weak self] in
+            let nanoseconds = UInt64(Self.backgroundOutputThrottleDuration * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                self.isOutputPausedForBackgroundThrottle = false
+                self.updateShellOutputPauseState()
+            }
+        }
+    }
+
+    private func cancelBackgroundOutputThrottle() {
+        backgroundOutputThrottleTask?.cancel()
+        backgroundOutputThrottleTask = nil
+        isOutputPausedForBackgroundThrottle = false
+        backgroundOutputBytesSinceThrottle = 0
+        updateShellOutputPauseState()
+    }
+
+    private func updateShellOutputPauseState() {
+        if isOutputPausedForInteraction || isOutputPausedForBackgroundThrottle {
+            shellProcess?.pauseOutput()
+        } else {
+            shellProcess?.resumeOutput()
         }
     }
 
@@ -1832,6 +2085,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         summaryDebounceTask = nil
         summaryTask?.cancel()
         summaryTask = nil
+        auxiliaryProcessingSuspensionTask?.cancel()
+        auxiliaryProcessingSuspensionTask = nil
+        backgroundOutputThrottleTask?.cancel()
+        backgroundOutputThrottleTask = nil
+        isOutputPausedForBackgroundThrottle = false
+        backgroundOutputBytesSinceThrottle = 0
         nixShellEnvironment = nil
         cancelAgentIdleConfirmation()
         cancelAgentIdleRecheck()
@@ -1839,7 +2098,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastHumanInputLine = nil
         outputHoldUntil = nil
         processor.endLaunch(launchID)
-        resumeOutputIfPausedForInteraction()
+        updateShellOutputPauseState()
         hostInputWriter.set(nil)
         shellProcess?.terminate()
         shellProcess = nil
@@ -1924,6 +2183,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         rawOutputStore.observerCount
     }
 
+    var rawOutputRetainedChunkCount: Int {
+        rawOutputStore.chunkCount
+    }
+
+    var rawOutputRetainedByteCount: Int {
+        rawOutputStore.retainedByteCount
+    }
+
     var ghosttyBridge: GhosttySessionBridge {
         if let ghosttyBridgeStorage {
             return ghosttyBridgeStorage
@@ -1939,8 +2206,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeLaunchID = launchID
         resetKeyboardProtocolState()
         outputHoldUntil = nil
+        backgroundOutputThrottleTask?.cancel()
+        backgroundOutputThrottleTask = nil
+        isOutputPausedForInteraction = false
+        isOutputPausedForBackgroundThrottle = false
+        backgroundOutputBytesSinceThrottle = 0
         processor.beginLaunch(launchID)
-        resumeOutputIfPausedForInteraction()
+        updateShellOutputPauseState()
         state = .launching
         startedAt = Date()
         exitedAt = nil
@@ -1977,10 +2249,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
                     traceRecorder?.recordOutput(data)
                     self.rawOutputStore.append(data)
-                    DispatchQueue.main.async { [weak self] in
-                        self?.lastOutputAt = Date()
-                        self?.ingestTerminalMetadata(data)
-                    }
+                    self.enqueueTerminalMetadata(data, parseMetadata: self.shouldParseMetadataForProcessOutput)
+                    self.noteProcessOutputForBackgroundThrottle(bytes: data.count)
                     if !prototypeProcessorDisabledForPerf {
                         processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
                             self.hostInputWriter.write(response, normalize: false, notifyInput: false)
@@ -2061,7 +2331,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func pauseOutputForInteractionIfNeeded() {
         guard !isOutputPausedForInteraction else { return }
         isOutputPausedForInteraction = true
-        shellProcess?.pauseOutput()
+        updateShellOutputPauseState()
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.userScrollOutputHoldInterval) { [weak self] in
             self?.resumeOutputIfScrollHoldExpired()
         }
@@ -2088,7 +2358,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func resumeOutputIfPausedForInteraction() {
         guard isOutputPausedForInteraction else { return }
         isOutputPausedForInteraction = false
-        shellProcess?.resumeOutput()
+        updateShellOutputPauseState()
     }
 
     private func handleProcessorDidChange() {
@@ -2149,6 +2419,71 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func noteInputOutputBaseline() {
         lastInputOutputVersion = outputVersion
+    }
+
+    private func enqueueTerminalMetadata(_ data: Data, parseMetadata: Bool = true) {
+        let shouldSchedule = metadataOutputLock.withLock {
+            hasPendingOutputActivity = true
+            if parseMetadata, !data.isEmpty {
+                if pendingMetadataOutput.count + data.count > Self.metadataOutputPendingByteLimit {
+                    pendingMetadataOutput.removeAll(keepingCapacity: true)
+                    if data.count > Self.metadataOutputPendingByteLimit {
+                        pendingMetadataOutput.append(data.suffix(Self.metadataOutputPendingByteLimit))
+                    } else {
+                        pendingMetadataOutput.append(data)
+                    }
+                    shouldResetMetadataParserBeforeFlush = true
+                } else {
+                    pendingMetadataOutput.append(data)
+                }
+            }
+
+            guard !isMetadataOutputFlushScheduled else { return false }
+            isMetadataOutputFlushScheduled = true
+            return true
+        }
+
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in
+                self?.flushTerminalMetadata()
+            }
+        }
+    }
+
+    private func flushTerminalMetadata() {
+        let (data, didOutput, shouldResetParser) = metadataOutputLock.withLock {
+            let data = pendingMetadataOutput
+            let didOutput = hasPendingOutputActivity
+            let shouldResetParser = shouldResetMetadataParserBeforeFlush
+            pendingMetadataOutput.removeAll(keepingCapacity: true)
+            hasPendingOutputActivity = false
+            shouldResetMetadataParserBeforeFlush = false
+            return (data, didOutput, shouldResetParser)
+        }
+
+        if didOutput {
+            lastOutputAt = Date()
+        }
+        if shouldResetParser {
+            metadataParser.reset()
+        }
+        if !data.isEmpty {
+            ingestTerminalMetadata(data)
+        }
+
+        let shouldReschedule = metadataOutputLock.withLock {
+            if pendingMetadataOutput.isEmpty, !hasPendingOutputActivity {
+                isMetadataOutputFlushScheduled = false
+                return false
+            }
+            return true
+        }
+
+        if shouldReschedule {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.metadataOutputFlushInterval) { [weak self] in
+                self?.flushTerminalMetadata()
+            }
+        }
     }
 
     private func ingestTerminalMetadata(_ data: Data) {

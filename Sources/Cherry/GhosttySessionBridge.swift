@@ -354,14 +354,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
-        guard !isReleased || scrollContainer === container else { return }
+        guard !isReleased, scrollContainer === container else { return }
         terminalView.setSurfaceVisible(false)
         scheduleDetachedSurfaceRelease()
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
-        if scrollContainer === container {
-            scrollContainer = nil
-        }
+        scrollContainer = nil
     }
 
     func focus(in window: NSWindow?) {

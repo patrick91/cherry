@@ -4825,6 +4825,36 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerIgnoresStaleDetachAfterBridgeReattachesElsewhere() {
+    let session = TerminalSession(
+        title: "Reattach",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let firstContainer = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let secondContainer = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+
+    defer {
+        firstContainer.detachActiveSession()
+        secondContainer.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    firstContainer.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    let bridge = session.ghosttyBridge
+
+    secondContainer.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    let activeSuperview = bridge.terminalView.superview
+    #expect(activeSuperview != nil)
+
+    firstContainer.detachActiveSession(releasesBridge: false, preservingSurface: true)
+
+    #expect(bridge.terminalView.superview === activeSuperview)
+}
+
+@MainActor
 @Test func ghosttyBridgeAttachLaysOutTerminalSurfaceBeforeOutputReplay() async throws {
     let first = TerminalSession(
         title: "First",

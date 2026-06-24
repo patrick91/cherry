@@ -4699,6 +4699,9 @@ private struct MCPWhoamiPayload: Decodable {
     ).utf8))
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    let replayString = String(decoding: replayData, as: UTF8.self)
+    #expect(replayString.contains("\u{1B}[K"))
+
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
     replayedBuffer.ingest(replayData)
     let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
@@ -4735,6 +4738,47 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(promptRun.style.foreground == .rgb(219, 227, 235))
     #expect(promptRun.style.isDim)
+}
+
+@MainActor
+@Test func ghosttyRenderedReplayUsesEraseLineForStyledTrailingSpaces() async throws {
+    let session = TerminalSession(
+        title: "Styled trailing spaces",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+    session.resize(columns: 24, rows: 8)
+    session.ingestTestingData(Data((
+        "\u{1B}[1;1H\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[2;1H\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[2;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mExplain"
+    ).utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    let replayString = String(decoding: replayData, as: UTF8.self)
+
+    #expect(replayString.contains("\u{1B}[K"))
+    #expect(!replayString.contains(String(repeating: " ", count: 24)))
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.resize(to: TerminalViewportSize(columns: 24, rows: 8))
+    replayedBuffer.ingest(replayData, viewportSize: TerminalViewportSize(columns: 24, rows: 8))
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let promptLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Explain") }
+    })
+    let promptRun = try #require(promptLine.runs.first { $0.text.contains("Explain") })
+    let trailingRun = try #require(promptLine.runs.last)
+
+    #expect(promptRun.style.foreground == .rgb(219, 227, 235))
+    #expect(promptRun.style.background == .rgb(46, 45, 50))
+    #expect(promptRun.style.isDim)
+    #expect(trailingRun.style.background == .rgb(46, 45, 50))
 }
 
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {

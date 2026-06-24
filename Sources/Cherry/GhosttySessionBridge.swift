@@ -766,20 +766,54 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private static func encodeRenderedLine(_ line: TerminalRenderedLine, into output: inout Data) {
         var currentStyle = TerminalTextStyle()
-        for run in line.runs {
+        for (index, run) in line.runs.enumerated() {
             guard !run.text.isEmpty else { continue }
-            if run.style != currentStyle {
-                appendSGR(for: run.style, to: &output)
-                currentStyle = run.style
+            let isFinalRun = index == line.runs.index(before: line.runs.endIndex)
+            let textToEmit: Substring
+            let shouldEraseTrailingSpaces: Bool
+            if isFinalRun {
+                // Use EL for the styled trailing cells so replay never writes
+                // the last column and leaves Ghostty in wrap-pending state.
+                (textToEmit, shouldEraseTrailingSpaces) = splitTrailingSpaces(in: run.text)
+            } else {
+                textToEmit = Substring(run.text)
+                shouldEraseTrailingSpaces = false
             }
-            output.append(Data(run.text.utf8))
+
+            if !textToEmit.isEmpty {
+                if run.style != currentStyle {
+                    appendSGR(for: run.style, to: &output)
+                    currentStyle = run.style
+                }
+                output.append(Data(textToEmit.utf8))
+            }
+
+            if shouldEraseTrailingSpaces {
+                if run.style != currentStyle {
+                    appendSGR(for: run.style, to: &output)
+                    currentStyle = run.style
+                }
+                output.append(Self.ansiEraseToEndOfLineData)
+            }
         }
         if currentStyle != TerminalTextStyle() {
             output.append(Self.ansiResetData)
         }
     }
 
+    private static func splitTrailingSpaces(in text: String) -> (Substring, Bool) {
+        var end = text.endIndex
+        while end > text.startIndex {
+            let previous = text.index(before: end)
+            guard text[previous] == " " else { break }
+            end = previous
+        }
+
+        return (text[..<end], end < text.endIndex)
+    }
+
     private static let ansiResetData = Data("\u{1B}[0m".utf8)
+    private static let ansiEraseToEndOfLineData = Data("\u{1B}[K".utf8)
     private static let styledReplayFallbackMaxBytes = 256 * 1024
     private static let styledReplayFallbackMinimumLines = 200
     private static let styledReplayFallbackViewportMultiplier = 4

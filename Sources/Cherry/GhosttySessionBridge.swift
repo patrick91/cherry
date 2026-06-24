@@ -805,7 +805,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         if style.isInverse {
             parameters.append("7")
         }
-        if let foreground = style.foreground {
+        if let foreground = replayForeground(for: style) {
             parameters.append(contentsOf: sgrColorParameters(for: foreground, isBackground: false))
         }
         if let background = style.background {
@@ -814,6 +814,23 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         output.append(Data("\u{1B}[\(parameters.joined(separator: ";"))m".utf8))
     }
+
+    private static func replayForeground(for style: TerminalTextStyle) -> TerminalANSIColor? {
+        if let foreground = style.foreground {
+            return foreground
+        }
+
+        // Cherry answers OSC 10 foreground queries with this color. When an app
+        // paints a custom background but relies on that default foreground, a
+        // freshly rebuilt Ghostty surface can otherwise render dark-on-dark.
+        if style.background != nil {
+            return reportedDefaultForegroundColor
+        }
+
+        return nil
+    }
+
+    private static let reportedDefaultForegroundColor = TerminalANSIColor.rgb(219, 227, 235)
 
     private static func sgrColorParameters(
         for color: TerminalANSIColor,

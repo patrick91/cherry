@@ -4583,7 +4583,7 @@ private struct MCPWhoamiPayload: Decodable {
         TerminalTextRun(text: " ", style: TerminalTextStyle()),
         TerminalTextRun(
             text: "true bg",
-            style: TerminalTextStyle(background: .rgb(12, 34, 56))
+            style: TerminalTextStyle(foreground: .rgb(219, 227, 235), background: .rgb(12, 34, 56))
         ),
         TerminalTextRun(text: " ", style: TerminalTextStyle()),
         TerminalTextRun(
@@ -4675,6 +4675,41 @@ private struct MCPWhoamiPayload: Decodable {
     let secondRun = try #require(secondLine.runs.first { $0.text.contains("second") })
 
     #expect(secondRun.style == TerminalTextStyle(foreground: .ansi16(2)))
+}
+
+@MainActor
+@Test func ghosttyRenderedReplayMaterializesDefaultForegroundOnPaintedPromptBackground() async throws {
+    let session = TerminalSession(
+        title: "Styled prompt",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data((
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[10;1H\u{1B}[22m\u{1B}[39;48;2;46;45;50m " +
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mRun /review on my current changes" +
+        "\u{1B}[12;1H\u{1B}[22m " +
+        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 xhigh fast\u{1B}[0m"
+    ).utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayData)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let promptLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Run /review") }
+    })
+    let promptRun = try #require(promptLine.runs.first { $0.text.contains("Run /review") })
+
+    #expect(promptRun.style.foreground == .rgb(219, 227, 235))
+    #expect(promptRun.style.background == .rgb(46, 45, 50))
+    #expect(promptRun.style.isDim)
 }
 
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {

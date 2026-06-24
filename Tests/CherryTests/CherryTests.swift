@@ -5027,6 +5027,44 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(replayedBuffer.snapshot(range: 10..<11).first?.contains("Write tests for @filename") == true)
 }
 
+@MainActor
+@Test func ghosttyRenderedReplayRestoresCursorInsideScrolledReplayWindow() async throws {
+    let session = TerminalSession(
+        title: "Scrolled cursor",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 200),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+    let viewportSize = TerminalViewportSize(columns: 80, rows: 8)
+    let treeOutput = (0..<18)
+        .map { "│   │   ├── tree-\($0)" }
+        .joined(separator: "\r\n")
+
+    session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
+    session.ingestTestingData(Data((treeOutput + "\r\n~/repo main\r\n> ").utf8))
+    session.ingestTestingData(Data((
+        String(repeating: "\n", count: viewportSize.rows) +
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3" +
+        "\u{1B}[3;1H\u{1B}[J" +
+        "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K"
+    ).utf8))
+
+    let sourceCursor = session.cursorState
+    #expect(sourceCursor.row < session.lineCount - 1)
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.resize(to: viewportSize)
+    replayedBuffer.ingest(replayData, viewportSize: viewportSize)
+
+    #expect(replayedBuffer.cursorState == sourceCursor)
+    #expect(replayedBuffer.snapshot(range: sourceCursor.row..<sourceCursor.row + 1).first == "> ")
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +
@@ -9849,6 +9887,30 @@ private func serviceRecord(
 
     let secondProbe = buffer.ingest(openAtuin, viewportSize: viewport)
     #expect(secondProbe == firstProbe)
+}
+
+@Test func liveTerminalOutputBufferKeepsPrimaryScreenBlanksAfterAtuinExit() async throws {
+    let viewport = TerminalViewportSize(columns: 80, rows: 8)
+    var buffer = LiveTerminalOutputBuffer(maxScrollback: 200)
+    let treeOutput = (0..<18)
+        .map { "tree-\($0)" }
+        .joined(separator: "\r\n")
+
+    buffer.ingest(Data((treeOutput + "\r\n~/repo main\r\n> ").utf8), viewportSize: viewport)
+    buffer.ingest(Data((
+        String(repeating: "\n", count: 8) +
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3" +
+        "\u{1B}[3;1H\u{1B}[J" +
+        "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K"
+    ).utf8), viewportSize: viewport)
+
+    let visibleLines = Array(buffer.snapshot(range: max(0, buffer.lineCount - viewport.rows)..<buffer.lineCount))
+    let promptIndex = try #require(visibleLines.firstIndex(where: { $0.contains("~/repo main") }))
+
+    #expect(!visibleLines.contains { $0.hasPrefix("tree-") })
+    #expect(visibleLines[..<promptIndex].allSatisfy { $0.isEmpty })
+    #expect(Array(visibleLines[promptIndex...].prefix(2)) == ["~/repo main", "> "])
+    #expect(visibleLines.dropFirst(promptIndex + 2).allSatisfy { $0.isEmpty })
 }
 
 @Test func pagedScrollbackStoresLinesAcrossPageBoundaries() async throws {

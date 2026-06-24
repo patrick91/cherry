@@ -3259,7 +3259,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         switch mode {
         case 0:
             eraseInLine(mode: 0)
-            makeActiveLineCurrent(at: cursorRow)
+            clearRows(in: (cursorRow + 1)..<(screenBottomRow + 1))
         case 1:
             ensureActiveLineExists(at: cursorRow)
             for row in screenTopRow..<cursorRow {
@@ -3272,11 +3272,13 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             cursorRow = 0
             cursorColumn = 0
         case 2:
+            let newScreenTop = activeCompletedLineCount + 1
             appendCompletedLine(activeCurrentLineText)
             clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
-            cursorRow = activeCompletedLineCount
+            cursorRow = newScreenTop
             cursorColumn = 0
-            primaryScreenTopRow = cursorRow
+            primaryScreenTopRow = newScreenTop
+            clearRows(in: newScreenTop..<(newScreenTop + viewportRowCount))
         case 3:
             clearActiveCompletedLines(keepingCapacity: false)
             clearCurrentLine(keepingCapacity: false)
@@ -3285,6 +3287,15 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             primaryScreenTopRow = nil
         default:
             break
+        }
+    }
+
+    private mutating func clearRows(in range: Range<Int>) {
+        guard !range.isEmpty else { return }
+
+        ensureActiveLineExists(at: range.upperBound - 1)
+        for row in range {
+            setActiveLineText("", at: row)
         }
     }
 

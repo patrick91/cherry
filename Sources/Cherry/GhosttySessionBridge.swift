@@ -1200,8 +1200,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         viewportSize: TerminalViewportSize,
         to output: inout Data
     ) {
-        let maximumReplayRow = max(0, replayLineCount - 1)
-        let row = min(max(cursor.row - replayStartLine, 0), maximumReplayRow)
+        let viewportRows = max(1, viewportSize.rows)
+        let visibleReplayStartLine = replayStartLine + max(0, replayLineCount - viewportRows)
+        let maximumReplayRow = min(viewportRows - 1, max(0, replayLineCount - 1))
+        let row = min(max(cursor.row - visibleReplayStartLine, 0), maximumReplayRow)
         let maximumColumn = max(0, viewportSize.columns - 1)
         let column = min(max(cursor.column, 0), maximumColumn)
 

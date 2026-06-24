@@ -4612,6 +4612,87 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyRenderedReplayKeepsCodexPromptAfterColorQueryRepaint() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    defer {
+        session.stop()
+    }
+    let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
+    session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[2;1H\u{1B}[2m╭─────────────────────────────────────────────╮" +
+        "\u{1B}[3;1H│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │" +
+        "\u{1B}[4;1H╰─────────────────────────────────────────────╯" +
+        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m" +
+        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K" +
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mImprove documentation in @filename" +
+        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K" +
+        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m" +
+        "\u{1B}[11;3H" +
+        "\u{1B}[?2026l"
+    ).utf8))
+    session.ingestTestingData(Data((
+        "\u{1B}]10;?\u{1B}\\" +
+        "\u{1B}]11;?\u{1B}\\" +
+        "\u{1B}[?2026h" +
+        "\u{1B}[10;2H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
+        "\u{1B}[11;37H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[12;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[13;42H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
+        "\u{1B}[0m\u{1B}[?25h\u{1B}[11;3H" +
+        "\u{1B}[?2026l"
+    ).utf8))
+
+    let directLines = session.snapshot(range: 0..<session.lineCount)
+    #expect(directLines.contains { $0.contains("Improve documentation in @filename") })
+    #expect(directLines.contains { $0.contains("gpt-5.5 low") })
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    let replayOutput = String(decoding: replayData, as: UTF8.self)
+    #expect(replayOutput.contains("Improve documentation in @filename"))
+    #expect(replayOutput.contains("gpt-5.5 low"))
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.resize(to: viewportSize)
+    replayedBuffer.ingest(replayData, viewportSize: viewportSize)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let promptLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Improve documentation") }
+    })
+    let promptRun = try #require(promptLine.runs.first { $0.text.contains("Improve documentation") })
+    let warningLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Heads up") }
+    })
+    let warningRun = try #require(warningLine.runs.first { $0.text.contains("Heads up") })
+    let statusLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("gpt-5.5 low") }
+    })
+    let modelRun = try #require(statusLine.runs.first { $0.text.contains("gpt-5.5 low") })
+    let pathRun = try #require(statusLine.runs.first { $0.text.contains("~/github/patrick91/cherry") })
+
+    #expect(promptRun.style.foreground == .rgb(219, 227, 235))
+    #expect(promptRun.style.background == .rgb(46, 45, 50))
+    #expect(promptRun.style.isDim)
+    #expect(warningRun.style.foreground == .palette256(3))
+    #expect(modelRun.style.foreground == .rgb(246, 226, 183))
+    #expect(pathRun.style.foreground == .rgb(171, 223, 167))
+    #expect(promptLine.runs.reduce(0) { $0 + $1.cellWidth } >= viewportSize.columns)
+    #expect(promptLine.runs.last?.style.background == .rgb(46, 45, 50))
+    #expect(replayedBuffer.cursorState.row == session.cursorState.row)
+    #expect(replayedBuffer.cursorState.column == session.cursorState.column)
+}
+
+@MainActor
 @Test func ghosttyRenderedReplayPreservesRichTextStylesWhenSwitchingSessions() async throws {
     let session = TerminalSession(
         title: "Styled",
@@ -4767,7 +4848,10 @@ private struct MCPWhoamiPayload: Decodable {
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     let replayString = String(decoding: replayData, as: UTF8.self)
-    #expect(replayString.contains("\u{1B}[K"))
+    #expect(!replayString.contains("\u{1B}[K"))
+    #expect(replayString.contains("\u{1B}[?6l\u{1B}[r\u{1B}[?69l"))
+    #expect(replayString.contains("\u{1B}[?7l"))
+    #expect(replayString.contains("\u{1B}[?7h"))
 
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
     replayedBuffer.ingest(replayData)
@@ -4808,7 +4892,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttyRenderedReplayUsesEraseLineForStyledTrailingSpaces() async throws {
+@Test func ghosttyRenderedReplayWritesStyledTrailingSpacesWithoutWrapPending() async throws {
     let session = TerminalSession(
         title: "Styled trailing spaces",
         subtitle: "No shell",
@@ -4829,8 +4913,11 @@ private struct MCPWhoamiPayload: Decodable {
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     let replayString = String(decoding: replayData, as: UTF8.self)
 
-    #expect(replayString.contains("\u{1B}[K"))
-    #expect(!replayString.contains(String(repeating: " ", count: 24)))
+    #expect(!replayString.contains("\u{1B}[K"))
+    #expect(replayString.contains("\u{1B}[?6l\u{1B}[r\u{1B}[?69l"))
+    #expect(replayString.contains("\u{1B}[?7l"))
+    #expect(replayString.contains("\u{1B}[?7h"))
+    #expect(replayString.contains(String(repeating: " ", count: 24)))
 
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
     replayedBuffer.resize(to: TerminalViewportSize(columns: 24, rows: 8))
@@ -4885,6 +4972,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     let replayString = String(decoding: replayData, as: UTF8.self)
+    #expect(replayString.contains("\u{1B}[?6l\u{1B}[r\u{1B}[?69l"))
     #expect(replayString.contains("\u{1B}[H\u{1B}[J"))
     #expect(replayString.contains("\u{1B}[11;3H"))
 
@@ -5309,28 +5397,68 @@ private struct MCPWhoamiPayload: Decodable {
     let scale = bridge.terminalView.window?.backingScaleFactor ?? window.backingScaleFactor
     let mountedWidthPixels = UInt32((bridge.terminalView.bounds.width * scale).rounded())
     let mountedHeightPixels = UInt32((bridge.terminalView.bounds.height * scale).rounded())
+    let cellWidthPixels: UInt32 = 10
+    let cellHeightPixels: UInt32 = 20
+    let mountedColumns = UInt16(mountedWidthPixels / cellWidthPixels)
+    let mountedRows = UInt16(mountedHeightPixels / cellHeightPixels)
 
     bridge.applyHostResize(InMemoryTerminalViewport(
         columns: 6,
         rows: 24,
         widthPixels: max(1, mountedWidthPixels / 10),
         heightPixels: mountedHeightPixels,
-        cellWidthPixels: 10,
-        cellHeightPixels: 20
+        cellWidthPixels: cellWidthPixels,
+        cellHeightPixels: cellHeightPixels
     ))
 
     #expect(session.revision == revisionBeforeTinyResize)
 
+    try await Task.sleep(for: .milliseconds(950))
+
     bridge.applyHostResize(InMemoryTerminalViewport(
-        columns: 123,
-        rows: 45,
+        columns: mountedColumns,
+        rows: mountedRows,
         widthPixels: mountedWidthPixels,
         heightPixels: mountedHeightPixels,
-        cellWidthPixels: 10,
-        cellHeightPixels: 20
+        cellWidthPixels: cellWidthPixels,
+        cellHeightPixels: cellHeightPixels
     ))
 
     #expect(session.revision > revisionBeforeTinyResize)
+}
+
+@MainActor
+@Test func ghosttyBridgeIgnoresDetachedHostResizeCallback() async throws {
+    let session = TerminalSession(
+        title: "Detached Resize",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+
+    defer {
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    session.resize(columns: 120, rows: 40)
+    let viewportBeforeDetachedResize = session.replayViewportSize
+
+    GhosttySessionBridge.dispatchDetachedResizeForTesting(
+        session: session,
+        viewport: InMemoryTerminalViewport(
+            columns: 44,
+            rows: 12,
+            widthPixels: 440,
+            heightPixels: 240,
+            cellWidthPixels: 10,
+            cellHeightPixels: 20
+        )
+    )
+
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(session.replayViewportSize == viewportBeforeDetachedResize)
 }
 
 @MainActor
@@ -5482,13 +5610,18 @@ private struct MCPWhoamiPayload: Decodable {
     container.frame = rootView.bounds
     container.needsLayout = true
     container.layoutSubtreeIfNeeded()
+    let scale = window.backingScaleFactor
+    let widthPixels = UInt32((rootView.bounds.width * scale).rounded(.down))
+    let heightPixels = UInt32((rootView.bounds.height * scale).rounded(.down))
+    let cellWidthPixels: UInt32 = 8
+    let cellHeightPixels: UInt32 = 16
     session.ghosttyBridge.terminalDidResize(TerminalGridMetrics(
-        columns: 80,
-        rows: 24,
-        widthPixels: 640,
-        heightPixels: 400,
-        cellWidthPixels: 8,
-        cellHeightPixels: 16
+        columns: UInt16(widthPixels / cellWidthPixels),
+        rows: UInt16(heightPixels / cellHeightPixels),
+        widthPixels: widthPixels,
+        heightPixels: heightPixels,
+        cellWidthPixels: cellWidthPixels,
+        cellHeightPixels: cellHeightPixels
     ))
     session.ghosttyBridge.activateOutputFeedWhenSurfaceIsReady()
 
@@ -5496,6 +5629,77 @@ private struct MCPWhoamiPayload: Decodable {
         session.rawOutputObserverCount == 1
     }
     #expect(observerInstalled)
+    session.ghosttyBridge.flushOutputForTesting()
+}
+
+@MainActor
+@Test func ghosttyBridgeSynchronizesSessionViewportBeforeOutputReplayAfterSwitchBack() async throws {
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    session.resize(columns: 32, rows: 12)
+    session.ingestTestingData(Data("\u{1B}[35mCodex\u{1B}[0m ready\r\n\u{1B}[42m› prompt\u{1B}[0m".utf8))
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 720, height: 420),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let rootView = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 720, height: 420))
+    let container = GhosttyTerminalContainerView(frame: .zero)
+    rootView.addSubview(container)
+    window.contentView = rootView
+    window.orderFrontRegardless()
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(session.rawOutputObserverCount == 0)
+    #expect(session.replayViewportSize.columns == 32)
+    #expect(session.replayViewportSize.rows == 12)
+
+    container.frame = rootView.bounds
+    container.needsLayout = true
+    container.layoutSubtreeIfNeeded()
+    let scale = window.backingScaleFactor
+    let widthPixels = UInt32((container.bounds.width * scale).rounded(.down))
+    let heightPixels = UInt32((container.bounds.height * scale).rounded(.down))
+    let cellWidthPixels: UInt32 = 8
+    let cellHeightPixels: UInt32 = 16
+    session.ghosttyBridge.terminalDidResize(TerminalGridMetrics(
+        columns: UInt16(widthPixels / cellWidthPixels),
+        rows: UInt16(heightPixels / cellHeightPixels),
+        widthPixels: widthPixels,
+        heightPixels: heightPixels,
+        cellWidthPixels: cellWidthPixels,
+        cellHeightPixels: cellHeightPixels
+    ))
+
+    let observerInstalled = await waitForCondition {
+        session.rawOutputObserverCount == 1
+    }
+    let mountedMetrics = session.ghosttyBridge.gridMetrics
+
+    #expect(observerInstalled)
+    #expect(mountedMetrics != nil)
+    if let mountedMetrics {
+        #expect(Int(mountedMetrics.columns) > 32)
+        #expect(Int(mountedMetrics.rows) > 12)
+        #expect(session.replayViewportSize.columns > 32)
+        #expect(session.replayViewportSize.rows > 12)
+    }
     session.ghosttyBridge.flushOutputForTesting()
 }
 

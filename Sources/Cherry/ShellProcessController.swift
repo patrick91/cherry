@@ -325,6 +325,10 @@ struct ShellIntegrationBootstrap {
 }
 
 final class ShellProcessController: @unchecked Sendable {
+    private final class IOQueueIdentity {}
+
+    private static let ioQueueSpecificKey = DispatchSpecificKey<ObjectIdentifier>()
+
     struct Configuration {
         let shellPath: String
         let workingDirectory: String
@@ -651,6 +655,7 @@ final class ShellProcessController: @unchecked Sendable {
     private let configuration: Configuration
     private let onData: (Data) -> Void
     private let onExit: (Int32) -> Void
+    private let ioQueueIdentity = IOQueueIdentity()
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
     private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
     private let masterFDLock = NSLock()
@@ -692,6 +697,7 @@ final class ShellProcessController: @unchecked Sendable {
         self.configuration = configuration
         self.onData = onData
         self.onExit = onExit
+        ioQueue.setSpecific(key: Self.ioQueueSpecificKey, value: ObjectIdentifier(ioQueueIdentity))
 
         try launch()
     }
@@ -809,8 +815,8 @@ final class ShellProcessController: @unchecked Sendable {
     }
 
     func resize(columns: Int, rows: Int) {
-        ioQueue.async { [weak self] in
-            guard let self, self.masterFD >= 0 else { return }
+        syncOnIOQueue { [self] in
+            guard self.masterFD >= 0 else { return }
 
             var size = winsize(
                 ws_row: UInt16(rows),
@@ -821,6 +827,16 @@ final class ShellProcessController: @unchecked Sendable {
 
             _ = ioctl(self.masterFD, TIOCSWINSZ, &size)
         }
+    }
+
+    private func syncOnIOQueue(_ work: () -> Void) {
+        let identity = ObjectIdentifier(ioQueueIdentity)
+        if DispatchQueue.getSpecific(key: Self.ioQueueSpecificKey) == identity {
+            work()
+            return
+        }
+
+        ioQueue.sync(execute: work)
     }
 
     func pauseOutput() {

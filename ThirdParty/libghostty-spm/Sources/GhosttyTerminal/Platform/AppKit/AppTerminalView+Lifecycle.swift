@@ -179,12 +179,14 @@
 
         override func setFrameSize(_ newSize: NSSize) {
             super.setFrameSize(newSize)
+            updateMetalLayerMetrics()
             core.synchronizeMetrics()
             core.requestImmediateTick()
         }
 
         override func layout() {
             super.layout()
+            updateMetalLayerMetrics()
             core.synchronizeMetrics()
             core.requestImmediateTick()
         }
@@ -197,12 +199,18 @@
         }
 
         func fitToSize() {
+            updateMetalLayerMetrics()
             core.fitToSize()
+        }
+
+        func drawImmediately() {
+            core.drawImmediately()
         }
 
         internal func updateMetalLayerMetrics() {
             guard bounds.width > 0, bounds.height > 0 else { return }
             let scale = core.scaleFactor()
+            metalLayer?.frame = bounds
             metalLayer?.contentsScale = scale
             metalLayer?.drawableSize = CGSize(
                 width: bounds.width * scale,

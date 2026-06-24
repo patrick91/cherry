@@ -12,7 +12,19 @@ private let sidebarResizeDebugEnabled =
 @inline(__always)
 private func sidebarResizeLog(_ message: @autoclosure () -> String) {
     guard sidebarResizeDebugEnabled else { return }
-    print("[sidebar.resize] \(message())")
+    let line = "[sidebar.resize] \(message())"
+    print(line)
+    if let data = (line + "\n").data(using: .utf8) {
+        let url = URL(fileURLWithPath: "/tmp/cherry-sidebar-resize.log")
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
 }
 
 final class GhosttyOutputSink: @unchecked Sendable {
@@ -229,11 +241,8 @@ private final class GhosttySessionProxy: @unchecked Sendable {
     func resize(_ viewport: InMemoryTerminalViewport) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if let bridge {
-                bridge.applyHostResize(viewport)
-            } else {
-                session?.resize(columns: Int(viewport.columns), rows: Int(viewport.rows))
-            }
+            guard let bridge else { return }
+            bridge.applyHostResize(viewport)
         }
     }
 
@@ -276,6 +285,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private(set) static var liveBridgeCount = 0
     private(set) static var installedOutputObserverCount = 0
     static var detachedSurfaceReleaseDelay: Duration = .milliseconds(750)
+    private static let transientStartupShrinkInterval: TimeInterval = 0.9
 
     let terminalView: TerminalView
 
@@ -288,6 +298,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var appliedTerminalColorScheme: TerminalColorScheme?
     private var outputObserverID: UUID?
     private var pendingFeedActivation = false
+    private var outputFeedActivationRetryCount = 0
+    fileprivate var isPreparingOutputReplay = false
+    private var postAttachGeometryRefreshGeneration = 0
+    private var attachedAt: Date?
+    private var lastReplayedGridSize: TerminalViewportSize?
     private var activeColorScheme: ColorScheme?
     private nonisolated(unsafe) var settingsObserver: Any?
     private(set) var gridMetrics: TerminalGridMetrics?
@@ -342,6 +357,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             previousContainer?.detachTransferredTerminalView(terminalView)
         }
         scrollContainer = container
+        attachedAt = Date()
+        outputFeedActivationRetryCount = 0
         if !isAlreadyInstalled {
             container.install(terminalView: terminalView, bridge: self)
         }
@@ -356,8 +373,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             // wrong column and stay there after layout widens the grid.
             container.needsLayout = true
             container.layoutSubtreeIfNeeded()
-            TerminalPerformanceMonitor.recordFitToSize()
-            terminalView.fitToSize()
+            container.synchronizeScrollState(forceTerminalFrame: true)
+            synchronizeMountedSurfaceGeometry()
         }
         if terminalView.window != nil {
             activateOutputFeedWhenSurfaceIsReady()
@@ -366,11 +383,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased, scrollContainer === container else { return }
+        let canPreserveSurface = preservingSurface
+            && container.bounds.width > 0
+            && container.bounds.height > 0
         terminalView.setSurfaceVisible(false)
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         scrollContainer = nil
-        if preservingSurface {
+        if canPreserveSurface {
             scheduleDetachedSurfaceRelease()
         } else {
             cancelDetachedSurfaceRelease()
@@ -436,6 +456,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         if let terminalSession = proxy.session {
             terminalView.configuration = Self.makeOptions(for: terminalSession, inMemorySession: nextSession)
         }
+        lastReplayedGridSize = nil
         TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
         scrollContainer?.synchronizeScrollState()
@@ -493,8 +514,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func terminalDidResize(_ size: TerminalGridMetrics) {
+        sidebarResizeLog(
+            "terminalDidResize grid=\(size.columns)x\(size.rows) " +
+            "pixels=\(size.widthPixels)x\(size.heightPixels) " +
+            "terminalBounds=\(terminalView.bounds.size)"
+        )
         gridMetrics = size
         scrollContainer?.synchronizeScrollState()
+        activateOutputFeedWhenSurfaceIsReady()
     }
 
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
@@ -600,7 +627,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             guard let self else { return }
             self.pendingFeedActivation = false
             guard !self.isReleased else { return }
-            guard self.prepareSurfaceForOutputReplay() else { return }
+            self.isPreparingOutputReplay = true
+            let isReady = self.prepareSurfaceForOutputReplay()
+            self.isPreparingOutputReplay = false
+            guard isReady else {
+                self.scheduleOutputFeedActivationRetry()
+                return
+            }
+            self.outputFeedActivationRetryCount = 0
             self.installOutputObserver()
         }
     }
@@ -613,8 +647,20 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return false
         }
 
-        TerminalPerformanceMonitor.recordFitToSize()
-        terminalView.fitToSize()
+        scrollContainer?.synchronizeScrollState(forceTerminalFrame: true)
+        synchronizeMountedSurfaceGeometry()
+        if let gridMetrics {
+            let sessionViewport = proxy.session?.replayViewportSize
+            sidebarResizeLog(
+                "prepare replay bounds=\(terminalView.bounds.size) " +
+                "grid=\(gridMetrics.columns)x\(gridMetrics.rows) " +
+                "pixels=\(gridMetrics.widthPixels)x\(gridMetrics.heightPixels) " +
+                "cell=\(gridMetrics.cellWidthPixels)x\(gridMetrics.cellHeightPixels) " +
+                "session=\(sessionViewport?.columns ?? 0)x\(sessionViewport?.rows ?? 0)"
+            )
+        } else {
+            sidebarResizeLog("prepare replay skipped: missing grid metrics bounds=\(terminalView.bounds.size)")
+        }
         guard let gridMetrics,
               gridMetrics.columns > 0,
               gridMetrics.rows > 0,
@@ -630,21 +676,128 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return false
         }
 
+        if shouldIgnoreTransientStartupShrink(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows)
+        ) {
+            return true
+        }
+
+        proxy.session?.resize(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows),
+            forceShellResize: true
+        )
         return true
+    }
+
+    private func scheduleOutputFeedActivationRetry() {
+        guard !isReleased,
+              outputObserverID == nil,
+              terminalView.window != nil,
+              outputFeedActivationRetryCount < 20
+        else {
+            return
+        }
+
+        outputFeedActivationRetryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            self?.activateOutputFeedWhenSurfaceIsReady()
+        }
+    }
+
+    private func synchronizeMountedSurfaceGeometry() {
+        terminalView.needsLayout = true
+        terminalView.layoutSubtreeIfNeeded()
+        TerminalPerformanceMonitor.recordFitToSize()
+        terminalView.fitToSize()
     }
 
     private func installOutputObserver() {
         guard !isReleased, outputObserverID == nil, let session = proxy.session else { return }
 
-        let replayOutput = Self.renderedReplayOutput(for: session)
-        if !replayOutput.isEmpty {
-            outputSink.receive(replayOutput, suppressHostInput: true)
-        }
+        replayCurrentFrameForMountedGrid(force: true)
 
         outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
             outputSink.receive(data)
         }
         Self.installedOutputObserverCount += 1
+        schedulePostAttachGeometryRefresh()
+    }
+
+    private func schedulePostAttachGeometryRefresh() {
+        postAttachGeometryRefreshGeneration &+= 1
+        let generation = postAttachGeometryRefreshGeneration
+        for delay in [0.05, 0.15, 0.35, 0.75, 1.25, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      self.postAttachGeometryRefreshGeneration == generation
+                else {
+                    return
+                }
+                self.refreshMountedGeometryAndForceShellResize()
+            }
+        }
+    }
+
+    private func refreshMountedGeometryAndForceShellResize() {
+        guard !isReleased, outputObserverID != nil else { return }
+        scrollContainer?.synchronizeScrollState(forceTerminalFrame: true)
+        synchronizeMountedSurfaceGeometry()
+        guard let gridMetrics,
+              gridMetrics.columns > 0,
+              gridMetrics.rows > 0,
+              isViewportConsistentWithMountedSurface(
+                  columns: Int(gridMetrics.columns),
+                  rows: Int(gridMetrics.rows),
+                  widthPixels: Int(gridMetrics.widthPixels),
+                  heightPixels: Int(gridMetrics.heightPixels),
+                  cellWidthPixels: Int(gridMetrics.cellWidthPixels),
+                  cellHeightPixels: Int(gridMetrics.cellHeightPixels)
+              )
+        else {
+            return
+        }
+        if shouldIgnoreTransientStartupShrink(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows)
+        ) {
+            return
+        }
+        proxy.session?.resize(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows),
+            forceShellResize: true
+        )
+        replayCurrentFrameForMountedGrid(force: true)
+    }
+
+    private func replayCurrentFrameForMountedGrid(force: Bool) {
+        guard let session = proxy.session,
+              let gridSize = currentGridSize()
+        else {
+            return
+        }
+
+        guard force || lastReplayedGridSize != gridSize else { return }
+        let replayOutput = Self.renderedReplayOutput(for: session)
+        if !replayOutput.isEmpty {
+            outputSink.receive(replayOutput, suppressHostInput: true)
+            synchronizeMountedSurfaceGeometry()
+            terminalView.drawImmediately()
+        }
+        lastReplayedGridSize = gridSize
+    }
+
+    private func currentGridSize() -> TerminalViewportSize? {
+        guard let gridMetrics,
+              gridMetrics.columns > 0,
+              gridMetrics.rows > 0
+        else {
+            return nil
+        }
+
+        return TerminalViewportSize(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows))
     }
 
     static func renderedReplayOutput(
@@ -683,10 +836,13 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         var output = Data()
         output.reserveCapacity(byteCount + Self.ansiResetData.count * 2 + 64)
         output.append(Self.ansiResetData)
+        output.append(Self.ansiResetViewportData)
         output.append(Self.ansiHomeAndClearData)
+        output.append(Self.ansiDisableWraparoundData)
         for chunk in chunks {
             output.append(chunk)
         }
+        output.append(Self.ansiEnableWraparoundData)
         output.append(Self.ansiResetData)
         appendCursorRestore(
             for: session.cursorState,
@@ -735,37 +891,245 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             )
         )
 
-        var styledReplayBuffer = PrototypeTerminalBuffer(maxScrollback: styledReplayLineLimit)
-        styledReplayBuffer.resize(to: session.replayViewportSize)
-        styledReplayBuffer.ingest(
-            sanitizeReplayOutputForHostManagedTerminal(rawOutput),
-            viewportSize: session.replayViewportSize
+        let replayLines = styledReplayLines(
+            from: rawOutput,
+            lineLimit: styledReplayLineLimit,
+            viewportSize: session.replayViewportSize,
+            rawWasTruncated: rawSnapshot.truncated
         )
-
-        let replayLineCount = styledReplayBuffer.lineCount
-        guard replayLineCount > 0 else {
-            return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
-        }
-
-        let replayStartLine = max(0, replayLineCount - styledReplayLineLimit)
-        var replayLines = styledReplayBuffer.styledSnapshot(range: replayStartLine..<replayLineCount)
-        if rawSnapshot.truncated, replayLines.count > 1 {
-            replayLines.removeFirst()
-        }
         guard !replayLines.isEmpty else {
             return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
         }
 
-        if directLines.count > replayLines.count {
-            return RenderedReplaySnapshot(
-                lines: Array(directLines.dropLast(replayLines.count)) + replayLines,
-                startLine: startLine
-            )
-        }
-        return RenderedReplaySnapshot(
-            lines: replayLines,
-            startLine: max(0, totalLines - replayLines.count)
+        var bestMerge = mergedStyledReplayLines(
+            replayLines,
+            totalLineCount: totalLines,
+            directLines: directLines,
+            directStartLine: startLine
         )
+        if let queryStart = lastResponseGeneratingQueryStart(in: rawOutput), queryStart > 0 {
+            let prefixReplayLines = styledReplayLines(
+                from: Data(rawOutput.prefix(queryStart)),
+                lineLimit: styledReplayLineLimit,
+                viewportSize: session.replayViewportSize,
+                rawWasTruncated: rawSnapshot.truncated
+            )
+            if !prefixReplayLines.isEmpty {
+                let prefixMerge = mergedStyledReplayLines(
+                    prefixReplayLines,
+                    totalLineCount: totalLines,
+                    directLines: directLines,
+                    directStartLine: startLine
+                )
+                if prefixMerge.isBetter(than: bestMerge) {
+                    bestMerge = prefixMerge
+                }
+            }
+        }
+
+        return RenderedReplaySnapshot(
+            lines: bestMerge.lines,
+            startLine: startLine
+        )
+    }
+
+    private struct StyledReplayMerge {
+        let lines: [TerminalRenderedLine]
+        let incompatibleLineCount: Int
+        let styledCompatibleLineCount: Int
+        let styledCellCount: Int
+        let paintedBackgroundCellCount: Int
+
+        func isBetter(than other: StyledReplayMerge) -> Bool {
+            if incompatibleLineCount != other.incompatibleLineCount {
+                return incompatibleLineCount < other.incompatibleLineCount
+            }
+            if paintedBackgroundCellCount != other.paintedBackgroundCellCount {
+                return paintedBackgroundCellCount > other.paintedBackgroundCellCount
+            }
+            if styledCellCount != other.styledCellCount {
+                return styledCellCount > other.styledCellCount
+            }
+            return styledCompatibleLineCount > other.styledCompatibleLineCount
+        }
+    }
+
+    private static func styledReplayLines(
+        from rawOutput: Data,
+        lineLimit: Int,
+        viewportSize: TerminalViewportSize,
+        rawWasTruncated: Bool
+    ) -> [TerminalRenderedLine] {
+        var styledReplayBuffer = PrototypeTerminalBuffer(maxScrollback: lineLimit)
+        styledReplayBuffer.resize(to: viewportSize)
+        styledReplayBuffer.ingest(
+            sanitizeReplayOutputForHostManagedTerminal(rawOutput),
+            viewportSize: viewportSize
+        )
+
+        let replayLineCount = styledReplayBuffer.lineCount
+        guard replayLineCount > 0 else { return [] }
+
+        let replayStartLine = max(0, replayLineCount - lineLimit)
+        var replayLines = styledReplayBuffer.styledSnapshot(range: replayStartLine..<replayLineCount)
+        if rawWasTruncated, replayLines.count > 1 {
+            replayLines.removeFirst()
+        }
+        return replayLines
+    }
+
+    private static func mergedStyledReplayLines(
+        _ replayLines: [TerminalRenderedLine],
+        totalLineCount: Int,
+        directLines: [TerminalRenderedLine],
+        directStartLine: Int
+    ) -> StyledReplayMerge {
+        let replayOffset = alignedReplayOffset(
+            replayLines: replayLines,
+            totalLineCount: totalLineCount,
+            directLines: directLines,
+            directStartLine: directStartLine
+        )
+        return mergedStyledReplayLines(
+            replayLines,
+            directLines: directLines,
+            replayOffset: replayOffset
+        )
+    }
+
+    private static func mergedStyledReplayLines(
+        _ replayLines: [TerminalRenderedLine],
+        directLines: [TerminalRenderedLine],
+        replayOffset: Int
+    ) -> StyledReplayMerge {
+        var mergedLines: [TerminalRenderedLine] = []
+        mergedLines.reserveCapacity(directLines.count)
+        var incompatibleLineCount = 0
+        var styledCompatibleLineCount = 0
+        var styledCellCount = 0
+        var paintedBackgroundCellCount = 0
+
+        for (offset, directLine) in directLines.enumerated() {
+            let replayIndex = replayOffset + offset
+            guard replayLines.indices.contains(replayIndex) else {
+                if !normalizedReplayText(directLine.plainText).isEmpty {
+                    incompatibleLineCount += 1
+                }
+                mergedLines.append(directLine)
+                continue
+            }
+
+            let replayLine = replayLines[replayIndex]
+            if canUseStyledReplayLine(replayLine, for: directLine) {
+                if !replayLine.isPlainDefaultStyled {
+                    styledCompatibleLineCount += 1
+                }
+                if !normalizedReplayText(replayLine.plainText).isEmpty {
+                    styledCellCount += replayLine.styledCellCount
+                    paintedBackgroundCellCount += replayLine.paintedBackgroundCellCount
+                }
+                mergedLines.append(replayLine)
+            } else {
+                let directText = normalizedReplayText(directLine.plainText)
+                let replayText = normalizedReplayText(replayLine.plainText)
+                if !directText.isEmpty || !replayText.isEmpty {
+                    incompatibleLineCount += 1
+                }
+                mergedLines.append(directLine)
+            }
+        }
+
+        return StyledReplayMerge(
+            lines: mergedLines,
+            incompatibleLineCount: incompatibleLineCount,
+            styledCompatibleLineCount: styledCompatibleLineCount,
+            styledCellCount: styledCellCount,
+            paintedBackgroundCellCount: paintedBackgroundCellCount
+        )
+    }
+
+    private static func alignedReplayOffset(
+        replayLines: [TerminalRenderedLine],
+        totalLineCount: Int,
+        directLines: [TerminalRenderedLine],
+        directStartLine: Int
+    ) -> Int {
+        guard !replayLines.isEmpty, !directLines.isEmpty else { return 0 }
+
+        let expectedReplayStartLine = max(0, totalLineCount - replayLines.count)
+        let expectedOffset = expectedReplayStartLine - directStartLine
+        let minimumOffset = -directLines.count + 1
+        let maximumOffset = replayLines.count - 1
+
+        var replayIndicesByText: [String: [Int]] = [:]
+        for (index, line) in replayLines.enumerated() {
+            let text = normalizedReplayText(line.plainText)
+            guard !text.isEmpty else { continue }
+            replayIndicesByText[text, default: []].append(index)
+        }
+
+        var matchCountsByOffset: [Int: Int] = [:]
+        for (directIndex, directLine) in directLines.enumerated() {
+            let text = normalizedReplayText(directLine.plainText)
+            guard !text.isEmpty, let replayIndices = replayIndicesByText[text] else { continue }
+            for replayIndex in replayIndices {
+                let candidateOffset = replayIndex - directIndex
+                guard candidateOffset >= minimumOffset, candidateOffset <= maximumOffset else { continue }
+                matchCountsByOffset[candidateOffset, default: 0] += 1
+            }
+        }
+
+        var candidateOffsets = Set<Int>()
+        candidateOffsets.insert(min(max(expectedOffset, minimumOffset), maximumOffset))
+        candidateOffsets.insert(min(max(0, minimumOffset), maximumOffset))
+        for offset in matchCountsByOffset
+            .sorted(by: { lhs, rhs in
+                if lhs.value != rhs.value {
+                    return lhs.value > rhs.value
+                }
+                return abs(lhs.key - expectedOffset) < abs(rhs.key - expectedOffset)
+            })
+            .prefix(8)
+            .map(\.key)
+        {
+            candidateOffsets.insert(offset)
+        }
+
+        let sortedCandidateOffsets = candidateOffsets.sorted { lhs, rhs in
+            if abs(lhs - expectedOffset) != abs(rhs - expectedOffset) {
+                return abs(lhs - expectedOffset) < abs(rhs - expectedOffset)
+            }
+            return lhs < rhs
+        }
+        var bestOffset = sortedCandidateOffsets.first ?? expectedOffset
+        var bestMerge = mergedStyledReplayLines(
+            replayLines,
+            directLines: directLines,
+            replayOffset: bestOffset
+        )
+        for offset in sortedCandidateOffsets.dropFirst() {
+            let merge = mergedStyledReplayLines(
+                replayLines,
+                directLines: directLines,
+                replayOffset: offset
+            )
+            if merge.isBetter(than: bestMerge) {
+                bestOffset = offset
+                bestMerge = merge
+            }
+        }
+        return bestOffset
+    }
+
+    private static func canUseStyledReplayLine(
+        _ replayLine: TerminalRenderedLine,
+        for directLine: TerminalRenderedLine
+    ) -> Bool {
+        normalizedReplayText(replayLine.plainText) == normalizedReplayText(directLine.plainText)
+    }
+
+    private static func normalizedReplayText(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func containsSGRStyleSequence(_ data: Data) -> Bool {
@@ -793,55 +1157,34 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private static func encodeRenderedLine(_ line: TerminalRenderedLine, into output: inout Data) {
         var currentStyle = TerminalTextStyle()
-        for (index, run) in line.runs.enumerated() {
-            guard !run.text.isEmpty else { continue }
-            let isFinalRun = index == line.runs.index(before: line.runs.endIndex)
-            let textToEmit: Substring
-            let shouldEraseTrailingSpaces: Bool
-            if isFinalRun {
-                // Use EL for the styled trailing cells so replay never writes
-                // the last column and leaves Ghostty in wrap-pending state.
-                (textToEmit, shouldEraseTrailingSpaces) = splitTrailingSpaces(in: run.text)
-            } else {
-                textToEmit = Substring(run.text)
-                shouldEraseTrailingSpaces = false
-            }
+        for run in line.runs {
+            let text = replayText(for: run)
+            guard !text.isEmpty else { continue }
 
-            if !textToEmit.isEmpty {
-                if run.style != currentStyle {
-                    appendSGR(for: run.style, to: &output)
-                    currentStyle = run.style
-                }
-                output.append(Data(textToEmit.utf8))
+            if run.style != currentStyle {
+                appendSGR(for: run.style, to: &output)
+                currentStyle = run.style
             }
-
-            if shouldEraseTrailingSpaces {
-                if run.style != currentStyle {
-                    appendSGR(for: run.style, to: &output)
-                    currentStyle = run.style
-                }
-                output.append(Self.ansiEraseToEndOfLineData)
-            }
+            output.append(Data(text.utf8))
         }
         if currentStyle != TerminalTextStyle() {
             output.append(Self.ansiResetData)
         }
     }
 
-    private static func splitTrailingSpaces(in text: String) -> (Substring, Bool) {
-        var end = text.endIndex
-        while end > text.startIndex {
-            let previous = text.index(before: end)
-            guard text[previous] == " " else { break }
-            end = previous
+    private static func replayText(for run: TerminalTextRun) -> String {
+        if !run.text.isEmpty {
+            return run.text
         }
-
-        return (text[..<end], end < text.endIndex)
+        guard run.cellWidth > 0, run.style.paintsBackground else { return "" }
+        return String(repeating: " ", count: run.cellWidth)
     }
 
     private static let ansiResetData = Data("\u{1B}[0m".utf8)
+    private static let ansiResetViewportData = Data("\u{1B}[?6l\u{1B}[r\u{1B}[?69l".utf8)
     private static let ansiHomeAndClearData = Data("\u{1B}[H\u{1B}[J".utf8)
-    private static let ansiEraseToEndOfLineData = Data("\u{1B}[K".utf8)
+    private static let ansiDisableWraparoundData = Data("\u{1B}[?7l".utf8)
+    private static let ansiEnableWraparoundData = Data("\u{1B}[?7h".utf8)
     private static let styledReplayFallbackMaxBytes = 256 * 1024
     private static let styledReplayFallbackMinimumLines = 200
     private static let styledReplayFallbackViewportMultiplier = 4
@@ -951,10 +1294,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         outputSink.flushForTesting()
     }
 
+    static func dispatchDetachedResizeForTesting(
+        session: TerminalSession,
+        viewport: InMemoryTerminalViewport
+    ) {
+        let proxy = GhosttySessionProxy(session: session)
+        proxy.resize(viewport)
+    }
+
     private func uninstallOutputObserver() {
         guard let outputObserverID else { return }
         proxy.session?.removeRawOutputObserver(id: outputObserverID)
         self.outputObserverID = nil
+        lastReplayedGridSize = nil
         Self.installedOutputObserverCount -= 1
     }
 
@@ -977,6 +1329,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private func releaseDetachedSurface() {
         pendingFeedActivation = false
         uninstallOutputObserver()
+        lastReplayedGridSize = nil
         terminalView.freeSurface()
         gridMetrics = nil
         scrollbarMetrics = nil
@@ -1039,6 +1392,54 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
         let promptSanitized = stripZshPromptEndOfLineMarks(querySanitized)
         return collapseOverwrittenProgressFramesForTerminalFeed(promptSanitized)
+    }
+
+    nonisolated private static func lastResponseGeneratingQueryStart(in data: Data) -> Int? {
+        guard !data.isEmpty else { return nil }
+
+        let bytes = Array(data)
+        var lastQueryStart: Int?
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x1B, index + 1 < bytes.count {
+                switch bytes[index + 1] {
+                case UInt8(ascii: "]"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isResponseGeneratingOSCQuery(payload) {
+                            lastQueryStart = index
+                        }
+                        index = bounds.endIndex
+                        continue
+                    }
+                case UInt8(ascii: "["):
+                    if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<finalIndex]
+                        let finalByte = bytes[finalIndex]
+                        if isResponseGeneratingCSIQuery(payload, finalByte: finalByte) {
+                            lastQueryStart = index
+                        }
+                        index = finalIndex + 1
+                        continue
+                    }
+                case UInt8(ascii: "P"):
+                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                        let payload = bytes[index + 2..<bounds.payloadEnd]
+                        if isResponseGeneratingDCSQuery(payload) {
+                            lastQueryStart = index
+                        }
+                        index = bounds.endIndex
+                        continue
+                    }
+                default:
+                    break
+                }
+            }
+
+            index += 1
+        }
+
+        return lastQueryStart
     }
 
     nonisolated private static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
@@ -1471,6 +1872,13 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func applyHostResize(_ viewport: InMemoryTerminalViewport) {
+        if shouldIgnoreTransientStartupShrink(
+            columns: Int(viewport.columns),
+            rows: Int(viewport.rows)
+        ) {
+            return
+        }
+
         guard isViewportConsistentWithMountedSurface(
             columns: Int(viewport.columns),
             rows: Int(viewport.rows),
@@ -1482,7 +1890,37 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return
         }
 
-        proxy.session?.resize(columns: Int(viewport.columns), rows: Int(viewport.rows))
+        sidebarResizeLog(
+            "host resize accepted viewport=\(viewport.columns)x\(viewport.rows) " +
+            "pixels=\(viewport.widthPixels)x\(viewport.heightPixels) " +
+            "terminalBounds=\(terminalView.bounds.size)"
+        )
+        proxy.session?.resize(
+            columns: Int(viewport.columns),
+            rows: Int(viewport.rows),
+            forceShellResize: true
+        )
+    }
+
+    private func shouldIgnoreTransientStartupShrink(columns: Int, rows: Int) -> Bool {
+        guard let attachedAt,
+              Date().timeIntervalSince(attachedAt) < Self.transientStartupShrinkInterval,
+              let currentViewport = proxy.session?.replayViewportSize
+        else {
+            return false
+        }
+
+        let minimumColumnDelta = max(8, Int((Double(currentViewport.columns) * 0.2).rounded(.up)))
+        let minimumRowDelta = max(4, Int((Double(currentViewport.rows) * 0.2).rounded(.up)))
+        let collapsedColumns = currentViewport.columns - columns >= minimumColumnDelta
+        let collapsedRows = currentViewport.rows - rows >= minimumRowDelta
+        guard collapsedColumns || collapsedRows else { return false }
+
+        sidebarResizeLog(
+            "reject transient startup shrink current=\(currentViewport.columns)x\(currentViewport.rows) " +
+            "incoming=\(columns)x\(rows)"
+        )
+        return true
     }
 
     private func isViewportConsistentWithMountedSurface(
@@ -1493,44 +1931,71 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         cellWidthPixels: Int,
         cellHeightPixels: Int
     ) -> Bool {
-        guard !isReleased, columns > 0, rows > 0 else { return false }
+        guard !isReleased, columns > 0, rows > 0 else {
+            sidebarResizeLog("reject viewport: released=\(isReleased) size=\(columns)x\(rows)")
+            return false
+        }
         guard scrollContainer != nil,
               terminalView.superview != nil,
               let window = terminalView.window
         else {
+            sidebarResizeLog("reject viewport: surface not mounted")
             return false
         }
 
         let bounds = terminalView.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return false }
+        guard bounds.width > 0, bounds.height > 0 else {
+            sidebarResizeLog("reject viewport: empty bounds=\(bounds.size)")
+            return false
+        }
 
         let expectedWidthPixels = bounds.width * window.backingScaleFactor
         let expectedHeightPixels = bounds.height * window.backingScaleFactor
 
-        if widthPixels > 0,
-           expectedWidthPixels >= 200,
-           CGFloat(widthPixels) < expectedWidthPixels * 0.5
-        {
-            return false
-        }
-
-        if heightPixels > 0,
-           expectedHeightPixels >= 200,
-           CGFloat(heightPixels) < expectedHeightPixels * 0.5
-        {
-            return false
-        }
-
-        if widthPixels == 0, cellWidthPixels > 0 {
-            let expectedColumns = Int(expectedWidthPixels / CGFloat(cellWidthPixels))
-            if expectedColumns >= 40, columns < expectedColumns / 2 {
+        if widthPixels > 0, expectedWidthPixels >= 200 {
+            let cellTolerance = CGFloat(max(cellWidthPixels, 1) * 2)
+            let tolerance = max(cellTolerance, expectedWidthPixels * 0.08)
+            if abs(CGFloat(widthPixels) - expectedWidthPixels) > tolerance {
+                sidebarResizeLog(
+                    "reject viewport: width pixels actual=\(widthPixels) " +
+                    "expected=\(expectedWidthPixels) tolerance=\(tolerance)"
+                )
                 return false
             }
         }
 
-        if heightPixels == 0, cellHeightPixels > 0 {
+        if heightPixels > 0, expectedHeightPixels >= 200 {
+            let cellTolerance = CGFloat(max(cellHeightPixels, 1) * 2)
+            let tolerance = max(cellTolerance, expectedHeightPixels * 0.08)
+            if abs(CGFloat(heightPixels) - expectedHeightPixels) > tolerance {
+                sidebarResizeLog(
+                    "reject viewport: height pixels actual=\(heightPixels) " +
+                    "expected=\(expectedHeightPixels) tolerance=\(tolerance)"
+                )
+                return false
+            }
+        }
+
+        if cellWidthPixels > 0 {
+            let expectedColumns = Int(expectedWidthPixels / CGFloat(cellWidthPixels))
+            let tolerance = max(2, Int((CGFloat(expectedColumns) * 0.08).rounded(.up)))
+            if expectedColumns >= 40, abs(columns - expectedColumns) > tolerance {
+                sidebarResizeLog(
+                    "reject viewport: columns actual=\(columns) " +
+                    "expected=\(expectedColumns) tolerance=\(tolerance)"
+                )
+                return false
+            }
+        }
+
+        if cellHeightPixels > 0 {
             let expectedRows = Int(expectedHeightPixels / CGFloat(cellHeightPixels))
-            if expectedRows >= 20, rows < expectedRows / 2 {
+            let tolerance = max(2, Int((CGFloat(expectedRows) * 0.08).rounded(.up)))
+            if expectedRows >= 20, abs(rows - expectedRows) > tolerance {
+                sidebarResizeLog(
+                    "reject viewport: rows actual=\(rows) " +
+                    "expected=\(expectedRows) tolerance=\(tolerance)"
+                )
                 return false
             }
         }
@@ -1834,8 +2299,12 @@ final class GhosttyTerminalContainerView: NSView {
         resetSidebarAnimationStateForSurfaceChange()
     }
 
-    func synchronizeScrollState() {
+    func synchronizeScrollState(forceTerminalFrame: Bool = false) {
         guard let terminalView = activeBridge?.terminalView else { return }
+        if forceTerminalFrame {
+            scrollView.frame = bounds
+            scrollView.layoutSubtreeIfNeeded()
+        }
 
         // This runs after every rendered frame (scrollbar updates) and on
         // every keystroke, so skip the AppKit mutations when nothing moved —
@@ -1844,7 +2313,7 @@ final class GhosttyTerminalContainerView: NSView {
         var scrollStateChanged = false
 
         let documentSize = NSSize(
-            width: max(scrollView.contentSize.width, 1),
+            width: max(scrollView.contentSize.width, bounds.width),
             height: documentHeight()
         )
         if documentView.frame.size != documentSize {
@@ -1870,7 +2339,10 @@ final class GhosttyTerminalContainerView: NSView {
         // re-fits; otherwise the terminal reflows on every scroll-bounds
         // change and the prompt visibly walks up/down under the snapshot.
         if !isSyncFrozen {
-            synchronizeTerminalFrame(terminalView)
+            synchronizeTerminalFrame(terminalView, force: forceTerminalFrame)
+        }
+        if activeBridge?.isPreparingOutputReplay != true {
+            activeBridge?.activateOutputFeedWhenSurfaceIsReady()
         }
     }
 
@@ -1976,7 +2448,10 @@ final class GhosttyTerminalContainerView: NSView {
         // briefly clipped at the wrong width.
         documentView.frame.size.width = max(documentView.frame.size.width, targetWidth)
 
-        terminalView.frame = NSRect(origin: .zero, size: targetSize)
+        terminalView.setFrameOrigin(.zero)
+        terminalView.setFrameSize(targetSize)
+        terminalView.needsLayout = true
+        terminalView.layoutSubtreeIfNeeded()
         TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
         didApplyEarlyFit = true
@@ -2306,11 +2781,14 @@ final class GhosttyTerminalContainerView: NSView {
         bridge.terminalView.performBindingAction("scroll_to_row:\(row)")
     }
 
-    private func synchronizeTerminalFrame(_ terminalView: TerminalView) {
+    private func synchronizeTerminalFrame(_ terminalView: TerminalView, force: Bool = false) {
         let visibleRect = scrollView.contentView.documentVisibleRect
         let targetFrame = NSRect(
             origin: visibleRect.origin,
-            size: CGSize(width: scrollView.contentSize.width, height: scrollView.contentSize.height)
+            size: CGSize(
+                width: max(scrollView.contentSize.width, bounds.width),
+                height: max(scrollView.contentSize.height, bounds.height)
+            )
         )
         // Skip when the terminal is essentially at the target size. The
         // tolerance covers SwiftUI's sub-pixel layout rounding around the
@@ -2325,16 +2803,19 @@ final class GhosttyTerminalContainerView: NSView {
             abs(terminalView.frame.origin.x - targetFrame.origin.x),
             abs(terminalView.frame.origin.y - targetFrame.origin.y)
         )
-        guard widthDelta > 1.0 || heightDelta > 1.0 || originDelta > 1.0 else { return }
+        guard force || widthDelta > 1.0 || heightDelta > 1.0 || originDelta > 1.0 else { return }
 
         sidebarResizeLog("synchronizeTerminalFrame -> \(targetFrame.size)")
-        terminalView.frame = targetFrame
+        terminalView.setFrameOrigin(targetFrame.origin)
+        terminalView.setFrameSize(targetFrame.size)
+        terminalView.needsLayout = true
+        terminalView.layoutSubtreeIfNeeded()
         TerminalPerformanceMonitor.recordFitToSize()
         terminalView.fitToSize()
     }
 
     private func documentHeight() -> CGFloat {
-        let contentHeight = scrollView.contentSize.height
+        let contentHeight = max(scrollView.contentSize.height, bounds.height)
         guard let scrollbar = activeBridge?.scrollbarMetrics,
               let cellHeight = terminalCellHeight,
               cellHeight > 0
@@ -2458,6 +2939,20 @@ private extension TerminalPointerStyle {
             .crosshair
         case .operationNotAllowed:
             .operationNotAllowed
+        }
+    }
+}
+
+private extension TerminalRenderedLine {
+    var styledCellCount: Int {
+        runs.reduce(0) { count, run in
+            run.style == TerminalTextStyle() ? count : count + run.cellWidth
+        }
+    }
+
+    var paintedBackgroundCellCount: Int {
+        runs.reduce(0) { count, run in
+            run.style.paintsBackground ? count + run.cellWidth : count
         }
     }
 }

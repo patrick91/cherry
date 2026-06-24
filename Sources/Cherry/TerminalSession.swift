@@ -2637,9 +2637,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
-    func resize(columns: Int, rows: Int) {
+    func resize(columns: Int, rows: Int, forceShellResize: Bool = false) {
         let nextSize = TerminalViewportSize(columns: columns, rows: rows)
-        guard nextSize.columns > 0, nextSize.rows > 0, nextSize != viewportSize else { return }
+        guard nextSize.columns > 0, nextSize.rows > 0 else { return }
+        guard nextSize != viewportSize else {
+            if forceShellResize {
+                shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
+            }
+            return
+        }
 
         viewportSize = nextSize
         renderedReplayCache = nil

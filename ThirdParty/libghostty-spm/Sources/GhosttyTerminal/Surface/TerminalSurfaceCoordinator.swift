@@ -262,7 +262,7 @@ final class TerminalSurfaceCoordinator {
     /// moments that must not present a stale IOSurface — resizes and the
     /// first frame after a rebuild. On macOS all other frames are drawn by
     /// ghostty's renderer thread, woken via `refresh()`.
-    private func drawImmediately() {
+    func drawImmediately() {
         TerminalDebugLog.log(.render, "draw immediately")
         surface?.draw()
         onPostRender?()

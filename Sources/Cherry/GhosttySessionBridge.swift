@@ -1469,6 +1469,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         while index < bytes.count {
             if let markEnd = zshPromptEndOfLineMarkEnd(in: bytes, at: index) {
                 didStrip = true
+                stripped.append(UInt8(ascii: "\r"))
                 index = markEnd
                 continue
             }

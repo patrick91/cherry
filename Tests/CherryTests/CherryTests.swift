@@ -4597,7 +4597,7 @@ private struct MCPWhoamiPayload: Decodable {
     sink.flushForTesting()
 
     let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
-    #expect(output == ["output\r\n\u{1B}[0mprompt"])
+    #expect(output == ["output\r\n\r\u{1B}[0mprompt"])
 }
 
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
@@ -4676,7 +4676,7 @@ private struct MCPWhoamiPayload: Decodable {
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
-    #expect(output == "before\r\n\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
+    #expect(output == "before\r\n\r\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
 }
 
 @Test func ghosttyReplayOutputKeepsPaletteColoredPercentLines() async throws {
@@ -4685,6 +4685,29 @@ private struct MCPWhoamiPayload: Decodable {
     let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
 
     #expect(sanitized == replay)
+}
+
+@Test func ghosttyReplayOutputKeepsPromptRepaintReturnAfterDroppingZshMark() async throws {
+    let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 20) +
+        "\r \r"
+    let replay = Data((
+        "❯ ls\r\n" +
+        "file\r\n" +
+        promptEndMark +
+        "\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J❯ \u{1B}[K" +
+        "a\u{08}as"
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+
+    #expect(!String(decoding: sanitized, as: UTF8.self).contains("\u{1B}[7m%\u{1B}[27m"))
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(sanitized)
+    let lines = replayedBuffer.snapshot(range: 0..<replayedBuffer.lineCount)
+    let promptLine = try #require(lines.last)
+    #expect(promptLine == "❯ as")
+    #expect(!promptLine.contains("ls"))
 }
 
 @MainActor

@@ -772,6 +772,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         replayCurrentFrameForMountedGrid(force: true)
     }
 
+    func refreshMountedGeometryAndReplayForSidebarAnimation() {
+        refreshMountedGeometryAndForceShellResize()
+    }
+
     private func replayCurrentFrameForMountedGrid(force: Bool) {
         guard let session = proxy.session,
               let gridSize = currentGridSize()
@@ -1910,6 +1914,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return false
         }
 
+        if scrollContainer?.isApplyingSidebarGeometryChangeForBridge == true {
+            sidebarResizeLog(
+                "accept sidebar geometry resize current=\(currentViewport.columns)x\(currentViewport.rows) " +
+                "incoming=\(columns)x\(rows)"
+            )
+            return false
+        }
+
         let minimumColumnDelta = max(8, Int((Double(currentViewport.columns) * 0.2).rounded(.up)))
         let minimumRowDelta = max(4, Int((Double(currentViewport.rows) * 0.2).rounded(.up)))
         let collapsedColumns = currentViewport.columns - columns >= minimumColumnDelta
@@ -2101,6 +2113,10 @@ final class GhosttyTerminalContainerView: NSView {
     private var didApplyEarlyFit = false
     private var shouldSuppressMomentumScrollAfterHostInput = false
     private var isHostInputScrollSyncScheduled = false
+
+    var isApplyingSidebarGeometryChangeForBridge: Bool {
+        isSidebarAnimating || isSyncFrozen || didApplyEarlyFit
+    }
 
     override var acceptsFirstResponder: Bool {
         true
@@ -2386,6 +2402,10 @@ final class GhosttyTerminalContainerView: NSView {
         // size changes happens here — under cover — so when the snapshot
         // eventually fades there's no pending fit and no flash to reveal.
         applyEarlyFitIfPossible()
+        if didApplyEarlyFit {
+            activeBridge?.refreshMountedGeometryAndReplayForSidebarAnimation()
+            refreshSnapshotContentsAfterEarlyFitIfPossible()
+        }
     }
 
     private func endSidebarAnimation() {
@@ -2401,6 +2421,9 @@ final class GhosttyTerminalContainerView: NSView {
             // the document-view metrics + scroll offset.
             updateDocumentViewMetrics()
         }
+
+        activeBridge?.refreshMountedGeometryAndReplayForSidebarAnimation()
+        refreshSnapshotContentsAfterEarlyFitIfPossible()
 
         // Hand a runloop tick to Core Animation / Metal so the live
         // surface is fully painted behind the snapshot before opacity
@@ -2513,6 +2536,32 @@ final class GhosttyTerminalContainerView: NSView {
         snapshotLayer = layer
     }
 
+    private func refreshSnapshotContentsAfterEarlyFitIfPossible() {
+        guard let snapshotLayer,
+              let terminalView = activeBridge?.terminalView,
+              scrollView.bounds.width > 0,
+              scrollView.bounds.height > 0
+        else {
+            return
+        }
+
+        let visibleOrigin = scrollView.contentView.bounds.origin
+        let captureSize = NSSize(
+            width: max(scrollView.bounds.width, terminalView.frame.width),
+            height: scrollView.bounds.height
+        )
+        let captureRect = NSRect(origin: visibleOrigin, size: captureSize)
+        guard let cgImage = captureViewBitmap(documentView, rect: captureRect) else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        snapshotLayer.contents = cgImage
+        if let scale = window?.backingScaleFactor {
+            snapshotLayer.contentsScale = scale
+        }
+        CATransaction.commit()
+    }
+
     private func terminalBackgroundCGColor() -> CGColor {
         let themeColors = TerminalSettings.shared.ghosttyThemeColors(for: activeColorScheme)
         let resolved = NSColor(hexRGB: themeColors.background)
@@ -2532,20 +2581,23 @@ final class GhosttyTerminalContainerView: NSView {
             removeSnapshotLayer(animated: false)
             return
         }
+        let fadingLayer = snapshotLayer
 
         let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = snapshotLayer.opacity
+        fade.fromValue = fadingLayer.opacity
         fade.toValue = 0
         fade.duration = 0.12
         fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         CATransaction.begin()
         CATransaction.setCompletionBlock { [weak self] in
-            self?.snapshotLayer?.removeFromSuperlayer()
-            self?.snapshotLayer = nil
+            fadingLayer.removeFromSuperlayer()
+            if self?.snapshotLayer === fadingLayer {
+                self?.snapshotLayer = nil
+            }
         }
-        snapshotLayer.opacity = 0
-        snapshotLayer.add(fade, forKey: "fadeOut")
+        fadingLayer.opacity = 0
+        fadingLayer.add(fade, forKey: "fadeOut")
         CATransaction.commit()
     }
 
@@ -2859,12 +2911,20 @@ final class GhosttyTerminalContainerView: NSView {
         snapshotLayer?.superlayer != nil
     }
 
+    var sidebarSnapshotIdentityForTesting: ObjectIdentifier? {
+        snapshotLayer.map(ObjectIdentifier.init)
+    }
+
     var isSidebarSyncFrozenForTesting: Bool {
         isSyncFrozen
     }
 
     var isSidebarAnimationActiveForTesting: Bool {
         isSidebarAnimating
+    }
+
+    func crossfadeSidebarSnapshotForTesting() {
+        crossfadeOutSnapshotLayer()
     }
 
     private var terminalCellHeight: CGFloat? {

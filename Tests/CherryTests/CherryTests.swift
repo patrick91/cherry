@@ -5363,6 +5363,110 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttySidebarSnapshotFadeDoesNotRemoveNewerSnapshot() async throws {
+    let session = TerminalSession(
+        title: "Sidebar Fade",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    container.simulateSidebarSnapshotForTesting()
+    let firstSnapshotID = container.sidebarSnapshotIdentityForTesting
+
+    container.crossfadeSidebarSnapshotForTesting()
+    container.simulateSidebarSnapshotForTesting()
+    let secondSnapshotID = container.sidebarSnapshotIdentityForTesting
+
+    #expect(firstSnapshotID != nil)
+    #expect(secondSnapshotID != nil)
+    #expect(firstSnapshotID != secondSnapshotID)
+
+    try await Task.sleep(for: .milliseconds(180))
+
+    #expect(container.hasSidebarSnapshotForTesting)
+    #expect(container.sidebarSnapshotIdentityForTesting == secondSnapshotID)
+}
+
+@MainActor
+@Test func ghosttySidebarEarlyFitShrinkUpdatesSessionDuringStartupGuard() async throws {
+    let session = TerminalSession(
+        title: "Sidebar Shrink",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 1330, height: 835),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = container
+    window.orderFrontRegardless()
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+        window.close()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    container.layoutSubtreeIfNeeded()
+
+    let bridge = session.ghosttyBridge
+    var wideGrid: TerminalGridMetrics?
+    for _ in 0..<10 {
+        if let metrics = bridge.gridMetrics, metrics.columns > 0, metrics.rows > 0 {
+            wideGrid = metrics
+            break
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+
+    let initialGrid = try #require(wideGrid)
+    let initialColumns = Int(initialGrid.columns)
+    let initialRows = Int(initialGrid.rows)
+    session.resize(columns: initialColumns, rows: initialRows)
+    let revisionBeforeShrink = session.revision
+
+    container.applySidebarAnimationState(isAnimating: true, postAnimationDeltaWidth: -315)
+
+    var shrunkenGrid: TerminalGridMetrics?
+    for _ in 0..<10 {
+        if let metrics = bridge.gridMetrics,
+           metrics.columns > 0,
+           metrics.rows > 0,
+           Int(metrics.columns) < initialColumns,
+           session.replayViewportSize.columns == Int(metrics.columns)
+        {
+            shrunkenGrid = metrics
+            break
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+
+    let finalGrid = try #require(shrunkenGrid)
+    #expect(Int(finalGrid.columns) < initialColumns)
+    #expect(session.replayViewportSize == TerminalViewportSize(
+        columns: Int(finalGrid.columns),
+        rows: Int(finalGrid.rows)
+    ))
+    #expect(session.revision > revisionBeforeShrink)
+}
+
+@MainActor
 @Test func ghosttyBridgeIgnoresTinyHostResizeForWideMountedSurface() async throws {
     let session = TerminalSession(
         title: "Resize Gate",

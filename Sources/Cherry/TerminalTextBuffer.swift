@@ -12,6 +12,9 @@ struct TerminalTextStyle: Equatable {
     var isBold = false
     var isDim = false
     var isInverse = false
+    var isItalic = false
+    var isUnderline = false
+    var isStrikethrough = false
 
     var paintsBackground: Bool {
         background != nil || isInverse
@@ -82,6 +85,10 @@ struct TerminalRenderedLine: Equatable {
 
     var plainText: String {
         runs.map(\.text).joined()
+    }
+
+    var isPlainDefaultStyled: Bool {
+        runs.allSatisfy { $0.style == TerminalTextStyle() }
     }
 }
 
@@ -1421,13 +1428,25 @@ struct PrototypeTerminalBuffer: TerminalBuffering {
                 currentStyle.isBold = true
             case 2:
                 currentStyle.isDim = true
+            case 3:
+                currentStyle.isItalic = true
+            case 4:
+                currentStyle.isUnderline = true
+            case 9:
+                currentStyle.isStrikethrough = true
             case 22:
                 currentStyle.isBold = false
                 currentStyle.isDim = false
+            case 23:
+                currentStyle.isItalic = false
+            case 24:
+                currentStyle.isUnderline = false
             case 7:
                 currentStyle.isInverse = true
             case 27:
                 currentStyle.isInverse = false
+            case 29:
+                currentStyle.isStrikethrough = false
             case 30...37:
                 currentStyle.foreground = .ansi16(code - 30)
             case 40...47:

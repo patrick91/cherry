@@ -975,10 +975,16 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
     private func drawLine(_ line: TerminalRenderedLine, row: Int) {
         var column = 0
         for run in line.runs {
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: run.style.isBold ? boldFont : regularFont,
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: font(for: run.style),
                 .foregroundColor: resolvedForegroundColor(for: run.style)
             ]
+            if run.style.isUnderline {
+                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            if run.style.isStrikethrough {
+                attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            }
 
             for character in run.text {
                 let point = NSPoint(
@@ -992,6 +998,12 @@ private final class TerminalCanvasView: NSView, @preconcurrency NSTextInputClien
             let measuredWidth = run.text.reduce(0) { $0 + TerminalTextRun.cellWidth(for: $1) }
             column += max(0, run.cellWidth - measuredWidth)
         }
+    }
+
+    private func font(for style: TerminalTextStyle) -> NSFont {
+        let baseFont = style.isBold ? boldFont : regularFont
+        guard style.isItalic else { return baseFont }
+        return NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
     }
 
     private func resolvedForegroundColor(for style: TerminalTextStyle) -> NSColor {

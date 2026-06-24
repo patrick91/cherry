@@ -652,12 +652,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         maxBytes: Int = 1_048_576,
         maxLines: Int = 5_000
     ) -> Data {
-        let totalLines = session.lineCount
-        guard totalLines > 0 else { return Data() }
+        if let cachedOutput = session.cachedRenderedReplayOutput(maxBytes: maxBytes, maxLines: maxLines) {
+            return cachedOutput
+        }
 
-        let startLine = max(0, totalLines - maxLines)
-        let lines = session.styledSnapshot(range: startLine..<totalLines)
-        guard !lines.isEmpty else { return Data() }
+        let lines = renderedReplayLines(for: session, maxBytes: maxBytes, maxLines: maxLines)
+        guard !lines.isEmpty else {
+            session.cacheRenderedReplayOutput(Data(), maxBytes: maxBytes, maxLines: maxLines)
+            return Data()
+        }
 
         var chunks: [Data] = []
         chunks.reserveCapacity(lines.count)
@@ -684,7 +687,81 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             output.append(chunk)
         }
         output.append(Self.ansiResetData)
+        session.cacheRenderedReplayOutput(output, maxBytes: maxBytes, maxLines: maxLines)
         return output
+    }
+
+    private static func renderedReplayLines(
+        for session: TerminalSession,
+        maxBytes: Int,
+        maxLines: Int
+    ) -> [TerminalRenderedLine] {
+        let totalLines = session.lineCount
+        guard totalLines > 0 else { return [] }
+
+        let startLine = max(0, totalLines - maxLines)
+        let directLines = session.styledSnapshot(range: startLine..<totalLines)
+        guard directLines.allSatisfy(\.isPlainDefaultStyled) else {
+            return directLines
+        }
+
+        let styledReplayMaxBytes = min(maxBytes, Self.styledReplayFallbackMaxBytes)
+        let rawSnapshot = session.rawOutput(maxBytes: styledReplayMaxBytes)
+        let rawOutput = rawSnapshot.data
+        guard containsSGRStyleSequence(rawOutput) else { return directLines }
+
+        let styledReplayLineLimit = min(
+            maxLines,
+            max(
+                Self.styledReplayFallbackMinimumLines,
+                session.replayViewportSize.rows * Self.styledReplayFallbackViewportMultiplier
+            )
+        )
+
+        var styledReplayBuffer = PrototypeTerminalBuffer(maxScrollback: styledReplayLineLimit)
+        styledReplayBuffer.resize(to: session.replayViewportSize)
+        styledReplayBuffer.ingest(
+            sanitizeReplayOutputForHostManagedTerminal(rawOutput),
+            viewportSize: session.replayViewportSize
+        )
+
+        let replayLineCount = styledReplayBuffer.lineCount
+        guard replayLineCount > 0 else { return directLines }
+
+        let replayStartLine = max(0, replayLineCount - styledReplayLineLimit)
+        var replayLines = styledReplayBuffer.styledSnapshot(range: replayStartLine..<replayLineCount)
+        if rawSnapshot.truncated, replayLines.count > 1 {
+            replayLines.removeFirst()
+        }
+        guard !replayLines.isEmpty else { return directLines }
+
+        if directLines.count > replayLines.count {
+            return Array(directLines.dropLast(replayLines.count)) + replayLines
+        }
+        return replayLines
+    }
+
+    private static func containsSGRStyleSequence(_ data: Data) -> Bool {
+        let bytes = Array(data)
+        var index = 0
+        while index + 2 < bytes.count {
+            guard bytes[index] == 0x1B, bytes[index + 1] == UInt8(ascii: "[") else {
+                index += 1
+                continue
+            }
+
+            var scan = index + 2
+            while scan < bytes.count, !(0x40...0x7E).contains(bytes[scan]) {
+                scan += 1
+            }
+            guard scan < bytes.count else { return false }
+            if bytes[scan] == UInt8(ascii: "m") {
+                return true
+            }
+            index = scan + 1
+        }
+
+        return false
     }
 
     private static func encodeRenderedLine(_ line: TerminalRenderedLine, into output: inout Data) {
@@ -703,6 +780,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     private static let ansiResetData = Data("\u{1B}[0m".utf8)
+    private static let styledReplayFallbackMaxBytes = 256 * 1024
+    private static let styledReplayFallbackMinimumLines = 200
+    private static let styledReplayFallbackViewportMultiplier = 4
 
     private static func appendSGR(for style: TerminalTextStyle, to output: inout Data) {
         var parameters = ["0"]
@@ -712,6 +792,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         if style.isDim {
             parameters.append("2")
+        }
+        if style.isItalic {
+            parameters.append("3")
+        }
+        if style.isUnderline {
+            parameters.append("4")
+        }
+        if style.isStrikethrough {
+            parameters.append("9")
         }
         if style.isInverse {
             parameters.append("7")

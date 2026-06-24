@@ -2076,6 +2076,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var backgroundOutputBytesSinceThrottle = 0
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
+    private var renderedReplayCache: RenderedReplayCache?
     private var summaryDebounceTask: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
     private var summaryGeneration = 0
@@ -2107,6 +2108,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         case titleSpinner
         case notification
         case processExit
+    }
+
+    private struct RenderedReplayCache {
+        let outputVersion: Int
+        let viewportSize: TerminalViewportSize
+        let maxBytes: Int
+        let maxLines: Int
+        let output: Data
     }
 
     private static let defaultMaxScrollback = 50_000
@@ -2368,6 +2377,33 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.styledSnapshot(range: range)
     }
 
+    func cachedRenderedReplayOutput(maxBytes: Int, maxLines: Int) -> Data? {
+        guard let renderedReplayCache,
+              renderedReplayCache.outputVersion == outputVersion,
+              renderedReplayCache.viewportSize == viewportSize,
+              renderedReplayCache.maxBytes == maxBytes,
+              renderedReplayCache.maxLines == maxLines
+        else {
+            return nil
+        }
+
+        return renderedReplayCache.output
+    }
+
+    func cacheRenderedReplayOutput(_ output: Data, maxBytes: Int, maxLines: Int) {
+        renderedReplayCache = RenderedReplayCache(
+            outputVersion: outputVersion,
+            viewportSize: viewportSize,
+            maxBytes: maxBytes,
+            maxLines: maxLines,
+            output: output
+        )
+    }
+
+    var replayViewportSize: TerminalViewportSize {
+        viewportSize
+    }
+
     func lineLength(at row: Int) -> Int {
         processor.lineLength(at: row)
     }
@@ -2447,6 +2483,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func clearScrollback(preservingTerminalState: Bool) {
         outputHoldUntil = nil
         resumeOutputIfPausedForInteraction()
+        renderedReplayCache = nil
         rawOutputStore.clear()
         if preservingTerminalState {
             processor.clearScreenAndScrollbackPreservingTerminalState()
@@ -2578,6 +2615,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         stop()
         state = .exited(0)
         let hideCursor = Data("\u{1B}[?25l".utf8)
+        renderedReplayCache = nil
         rawOutputStore.append(hideCursor)
         processor.ingestTestingData(hideCursor)
         bumpRevision()
@@ -2604,6 +2642,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard nextSize.columns > 0, nextSize.rows > 0, nextSize != viewportSize else { return }
 
         viewportSize = nextSize
+        renderedReplayCache = nil
         processor.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
         revision &+= 1
@@ -2615,6 +2654,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestTestingData(_ data: Data) {
+        renderedReplayCache = nil
         rawOutputStore.append(data)
         lastOutputAt = Date()
         ingestTerminalMetadata(data)
@@ -2703,6 +2743,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 onData: { data in
                     TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
                     traceRecorder?.recordOutput(data)
+                    self.renderedReplayCache = nil
                     self.rawOutputStore.append(data)
                     self.enqueueTerminalMetadata(data, parseMetadata: self.shouldParseMetadataForProcessOutput)
                     self.noteProcessOutputForBackgroundThrottle(bytes: data.count)
@@ -2765,6 +2806,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         state = .exited(status)
         if kind == .agent || kind == .command {
             let hideCursor = Data("\u{1B}[?25l".utf8)
+            renderedReplayCache = nil
             rawOutputStore.append(hideCursor)
             processor.ingestTestingData(hideCursor)
             if kind == .command, restartOnExit {
@@ -2818,6 +2860,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func handleProcessorDidChange() {
         TerminalPerformanceMonitor.recordProcessorChange()
+        renderedReplayCache = nil
         if inputDebugEnabled {
             let tailStart = max(0, processor.lineCount - 4)
             let tail = processor.snapshot(range: tailStart..<processor.lineCount)

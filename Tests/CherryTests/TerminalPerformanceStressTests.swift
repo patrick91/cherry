@@ -99,6 +99,61 @@ import Testing
     }
 
     @MainActor
+    @Test func ghosttyRenderedReplayRestoresStyledLiveBufferSnapshotEfficiently() throws {
+        guard TerminalPerfHarness.isEnabled else { return }
+        let scale = TerminalPerfHarness.scale
+        let workload = TerminalPerfHarness.makeStyledScrollbackWorkload(
+            lineCount: scale.sessionLines,
+            columns: Self.viewport.columns
+        )
+        let session = TerminalSession(
+            title: "Perf Styled Replay",
+            subtitle: "No shell",
+            tint: .systemGreen,
+            buffer: LiveTerminalOutputBuffer(maxScrollback: 50_000),
+            launchShell: false
+        )
+        defer {
+            session.releaseGhosttyBridge()
+            session.stop()
+        }
+        session.resize(columns: Self.viewport.columns, rows: Self.viewport.rows)
+        TerminalPerfHarness.ingest(workload, chunkSize: scale.chunkSize) { chunk in
+            session.ingestTestingData(chunk)
+        }
+
+        let rawBytes = session.rawOutput(maxBytes: 1_048_576).data.count
+        let iterations = max(3, scale.churnRounds)
+        var replayOutput = Data()
+
+        let result = TerminalPerfHarness.measure(
+            name: "ghostty-rendered-styled-live-buffer-replay",
+            bytes: rawBytes * iterations,
+            metadata: scale.description
+        ) {
+            for _ in 0..<iterations {
+                replayOutput = GhosttySessionBridge.renderedReplayOutput(for: session)
+            }
+        }
+
+        let finalLineIndex = scale.sessionLines - 1
+        let finalColor = TerminalANSIColor.palette256(16 + (finalLineIndex % 216))
+        var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+        replayedBuffer.ingest(replayOutput)
+        let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+        let finalLine = try #require(replayedLines.first { line in
+            line.runs.contains { $0.text.contains("styled-\(finalLineIndex)") }
+        })
+        let finalRun = try #require(finalLine.runs.first { $0.text.contains("styled-\(finalLineIndex)") })
+
+        #expect(finalRun.style.foreground == finalColor)
+        TerminalPerfHarness.printResult(
+            result,
+            extra: "iterations=\(iterations) rawBytes=\(rawBytes) replayBytes=\(replayOutput.count)"
+        )
+    }
+
+    @MainActor
     @Test func ghosttyBridgeChurnsAcrossManySessions() throws {
         guard TerminalPerfHarness.isEnabled else { return }
         let scale = TerminalPerfHarness.scale
@@ -398,6 +453,18 @@ private enum TerminalPerfHarness {
             }
         }
         data.append(Data("\u{1B}[?25h".utf8))
+        return data
+    }
+
+    static func makeStyledScrollbackWorkload(lineCount: Int, columns: Int) -> Data {
+        var data = Data()
+        data.reserveCapacity(lineCount * min(columns, 96))
+        let fillWidth = max(16, columns - 44)
+        let fill = String(repeating: "s", count: fillWidth)
+        for index in 0..<lineCount {
+            let color = 16 + (index % 216)
+            data.append(Data("\u{1B}[38;5;\(color)mstyled-\(index) \(fill)\u{1B}[0m\r\n".utf8))
+        }
         return data
     }
 

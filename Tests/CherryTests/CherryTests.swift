@@ -4544,6 +4544,139 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(replayOutput.contains("› Explain this codebase"))
 }
 
+@MainActor
+@Test func ghosttyRenderedReplayPreservesRichTextStylesWhenSwitchingSessions() async throws {
+    let session = TerminalSession(
+        title: "Styled",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data((
+        "\u{1B}[1;32mbold green\u{1B}[0m " +
+        "\u{1B}[2;38;5;203mdim 256\u{1B}[0m " +
+        "\u{1B}[48;2;12;34;56mtrue bg\u{1B}[0m " +
+        "\u{1B}[7minverse\u{1B}[0m " +
+        "\u{1B}[3;4;9mdecorated\u{1B}[0m"
+    ).utf8))
+
+    let replayOutput = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayOutput)
+    let replayedLine = try #require(replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount).first)
+
+    #expect(replayedLine.runs == [
+        TerminalTextRun(
+            text: "bold green",
+            style: TerminalTextStyle(foreground: .ansi16(2), isBold: true)
+        ),
+        TerminalTextRun(text: " ", style: TerminalTextStyle()),
+        TerminalTextRun(
+            text: "dim 256",
+            style: TerminalTextStyle(foreground: .palette256(203), isDim: true)
+        ),
+        TerminalTextRun(text: " ", style: TerminalTextStyle()),
+        TerminalTextRun(
+            text: "true bg",
+            style: TerminalTextStyle(background: .rgb(12, 34, 56))
+        ),
+        TerminalTextRun(text: " ", style: TerminalTextStyle()),
+        TerminalTextRun(
+            text: "inverse",
+            style: TerminalTextStyle(isInverse: true)
+        ),
+        TerminalTextRun(text: " ", style: TerminalTextStyle()),
+        TerminalTextRun(
+            text: "decorated",
+            style: TerminalTextStyle(isItalic: true, isUnderline: true, isStrikethrough: true)
+        ),
+    ])
+}
+
+@MainActor
+@Test func ghosttyRenderedReplayRestoresStyledFinalFrameForLiveBufferRedraw() async throws {
+    let session = TerminalSession(
+        title: "Styled redraw",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[1;31mStarting MCP servers\u{1B}[0m" +
+        "\u{1B}[?2026l"
+    ).utf8))
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[38;5;82mReady\u{1B}[0m\r\n" +
+        "› Prompt" +
+        "\u{1B}[?2026l"
+    ).utf8))
+
+    let rawOutput = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    let replayOutput = String(decoding: replayData, as: UTF8.self)
+
+    #expect(rawOutput.contains("Starting MCP servers"))
+    #expect(!replayOutput.contains("Starting MCP servers"))
+    #expect(replayOutput.contains("Ready"))
+    #expect(replayOutput.contains("› Prompt"))
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayData)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let readyLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Ready") }
+    })
+    let readyRun = try #require(readyLine.runs.first { $0.text.contains("Ready") })
+
+    #expect(readyRun.style == TerminalTextStyle(foreground: .palette256(82)))
+}
+
+@MainActor
+@Test func ghosttyRenderedReplayCacheInvalidatesAfterStyledLiveOutput() async throws {
+    let session = TerminalSession(
+        title: "Styled cache",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data("\u{1B}[31mfirst\u{1B}[0m".utf8))
+    let firstReplay = GhosttySessionBridge.renderedReplayOutput(for: session)
+    #expect(String(decoding: firstReplay, as: UTF8.self).contains("first"))
+
+    session.ingestTestingData(Data("\r\n\u{1B}[32msecond\u{1B}[0m".utf8))
+    let secondReplay = GhosttySessionBridge.renderedReplayOutput(for: session)
+    #expect(String(decoding: secondReplay, as: UTF8.self).contains("second"))
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(secondReplay)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let secondLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("second") }
+    })
+    let secondRun = try #require(secondLine.runs.first { $0.text.contains("second") })
+
+    #expect(secondRun.style == TerminalTextStyle(foreground: .ansi16(2)))
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +

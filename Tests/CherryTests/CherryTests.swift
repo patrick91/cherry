@@ -4936,6 +4936,49 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyRenderedReplayPreservesCodexTypedComposerBackground() async throws {
+    let session = TerminalSession(
+        title: "Typed composer",
+        subtitle: "codex --yolo",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    defer {
+        session.stop()
+    }
+    let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
+    session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[14;2H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
+        "\u{1B}[15;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[16;9H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[17;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
+        "\u{1B}[18;42H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
+        "\u{1B}[16;3H\u{1B}[39;48;2;46;45;50masdasd\u{1B}[39m\u{1B}[49m\u{1B}[0m" +
+        "\u{1B}[0 q\u{1B}[?25h\u{1B}[16;9H\u{1B}[?2026l"
+    ).utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.resize(to: viewportSize)
+    replayedBuffer.ingest(replayData, viewportSize: viewportSize)
+
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let composerLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("asdasd") }
+    })
+    let typedRun = try #require(composerLine.runs.first { $0.text.contains("asdasd") })
+    let trailingRun = try #require(composerLine.runs.last)
+
+    #expect(typedRun.style.background == .rgb(46, 45, 50))
+    #expect(trailingRun.style.background == .rgb(46, 45, 50))
+}
+
+@MainActor
 @Test func ghosttyRenderedReplayRestoresCodexComposerCursorWhenSwitchingBack() async throws {
     let session = TerminalSession(
         title: "Codex cursor",

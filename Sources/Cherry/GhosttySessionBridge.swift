@@ -821,9 +821,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         // Cherry answers OSC 10 foreground queries with this color. When an app
-        // paints a custom background but relies on that default foreground, a
-        // freshly rebuilt Ghostty surface can otherwise render dark-on-dark.
-        if style.background != nil {
+        // relies on that default foreground for styled text, a freshly rebuilt
+        // Ghostty surface can otherwise render it too dark to read.
+        if style.background != nil || style.isDim {
             return reportedDefaultForegroundColor
         }
 

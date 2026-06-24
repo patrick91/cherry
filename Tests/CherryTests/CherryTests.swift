@@ -4712,6 +4712,31 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(promptRun.style.isDim)
 }
 
+@MainActor
+@Test func ghosttyRenderedReplayMaterializesDefaultForegroundForDimPromptText() async throws {
+    let session = TerminalSession(
+        title: "Dim prompt",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data("\u{1B}[2mImprove documentation in @filename\u{1B}[0m".utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayData)
+    let replayedLine = try #require(replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount).first)
+    let promptRun = try #require(replayedLine.runs.first { $0.text.contains("Improve documentation") })
+
+    #expect(promptRun.style.foreground == .rgb(219, 227, 235))
+    #expect(promptRun.style.isDim)
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +

@@ -887,6 +887,9 @@ final class ShellProcessController: @unchecked Sendable {
         if pid == 0 {
             Self.closeInheritedFileDescriptorsForChild()
             _ = chdir(workingDirectory)
+            // Cherry is a color-capable terminal; do not let launcher or
+            // automation environment leak NO_COLOR into interactive children.
+            _ = unsetenv("NO_COLOR")
             for (name, value) in environment {
                 _ = setenv(name, value, 1)
             }

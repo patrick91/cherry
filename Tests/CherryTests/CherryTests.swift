@@ -1400,6 +1400,73 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!capturedOutput.contains("inherited-fd"), Comment(rawValue: capturedOutput))
 }
 
+@Test func shellProcessClearsInheritedNoColorForColorCapableChildren() throws {
+    func captureEnvironment(environment: [String: String] = [:]) throws -> String {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let outputLock = NSLock()
+        var output = Data()
+        var exitCode: Int32?
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        let startupCommand = #"/bin/sh -c 'printf "NO_COLOR=%s\n" "${NO_COLOR-unset}"; printf "COLORTERM=%s\n" "${COLORTERM-unset}"; printf "TERM_PROGRAM=%s\n" "${TERM_PROGRAM-unset}"; printf "CHERRY_TERM_PROGRAM=%s\n" "${CHERRY_TERM_PROGRAM-unset}"; printf "TERM=%s\n" "$TERM"; exit 0'"#
+        let process = try ShellProcessController(
+            configuration: .init(
+                shellPath: "/bin/bash",
+                workingDirectory: directory.path,
+                environment: environment,
+                term: "xterm-ghostty",
+                initialSize: TerminalViewportSize(columns: 80, rows: 24),
+                startupCommand: startupCommand
+            ),
+            onData: { data in
+                outputLock.lock()
+                output.append(data)
+                outputLock.unlock()
+            },
+            onExit: { status in
+                outputLock.lock()
+                exitCode = status
+                outputLock.unlock()
+                exitSemaphore.signal()
+            }
+        )
+        defer {
+            process.terminate()
+        }
+
+        let waitResult = exitSemaphore.wait(timeout: .now() + 5)
+        outputLock.lock()
+        let capturedOutput = String(decoding: output, as: UTF8.self)
+        let capturedExitCode = exitCode
+        outputLock.unlock()
+
+        #expect(waitResult == .success, Comment(rawValue: capturedOutput))
+        #expect(capturedExitCode == 0, Comment(rawValue: capturedOutput))
+        return capturedOutput
+    }
+
+    let previousNoColor = environmentValue("NO_COLOR")
+    setEnvironmentValue("1", for: "NO_COLOR")
+    defer {
+        setEnvironmentValue(previousNoColor, for: "NO_COLOR")
+    }
+
+    let inheritedOutput = try captureEnvironment()
+    #expect(inheritedOutput.contains("NO_COLOR=unset"), Comment(rawValue: inheritedOutput))
+    #expect(inheritedOutput.contains("COLORTERM=truecolor"), Comment(rawValue: inheritedOutput))
+    #expect(inheritedOutput.contains("TERM_PROGRAM=Ghostty"), Comment(rawValue: inheritedOutput))
+    #expect(inheritedOutput.contains("CHERRY_TERM_PROGRAM=Cherry"), Comment(rawValue: inheritedOutput))
+    #expect(inheritedOutput.contains("TERM=xterm-ghostty"), Comment(rawValue: inheritedOutput))
+
+    let explicitOutput = try captureEnvironment(environment: ["NO_COLOR": "1"])
+    #expect(explicitOutput.contains("NO_COLOR=1"), Comment(rawValue: explicitOutput))
+}
+
 @MainActor
 @Test func projectNoteStorePersistsProjectNotes() async throws {
     let projectRoot = FileManager.default.temporaryDirectory

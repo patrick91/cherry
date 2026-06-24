@@ -195,9 +195,11 @@ final class GhosttyOutputSink: @unchecked Sendable {
 
             guard let next else { return }
             for chunk in next.chunks {
+                let promptSanitizedData =
+                    GhosttySessionBridge.stripZshPromptEndOfLineMarks(chunk.data)
                 let data = chunk.containsOverwrittenProgressFrameMarker
-                    ? GhosttySessionBridge.collapseOverwrittenProgressFramesForTerminalFeed(chunk.data)
-                    : chunk.data
+                    ? GhosttySessionBridge.collapseOverwrittenProgressFramesForTerminalFeed(promptSanitizedData)
+                    : promptSanitizedData
                 guard !data.isEmpty else { continue }
 
                 TerminalPerformanceMonitor.recordGhosttyFeedChunk(bytes: data.count)
@@ -1450,8 +1452,13 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return lastQueryStart
     }
 
-    nonisolated private static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
+    nonisolated fileprivate static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
         guard !data.isEmpty else { return data }
+        guard data.contains(0x1B),
+              data.contains(UInt8(ascii: "%")) || data.contains(UInt8(ascii: "#"))
+        else {
+            return data
+        }
 
         let bytes = Array(data)
         var stripped: [UInt8] = []
@@ -1477,21 +1484,33 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         in bytes: [UInt8],
         at index: Int
     ) -> Int? {
-        let marker = Array("\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m".utf8)
-        guard index + marker.count < bytes.count,
-              bytes[index..<(index + marker.count)].elementsEqual(marker)
+        var scan = index
+        var sawInverse = false
+        while let sequence = sgrSequence(in: bytes, at: scan) {
+            sawInverse = sawInverse || sequence.containsInverse
+            scan = sequence.endIndex
+        }
+
+        guard sawInverse,
+              scan < bytes.count,
+              bytes[scan] == UInt8(ascii: "%") || bytes[scan] == UInt8(ascii: "#")
         else {
             return nil
         }
+        scan += 1
 
-        var scan = index + marker.count
-        let spacesStart = scan
+        var sawReset = false
+        while let sequence = sgrSequence(in: bytes, at: scan) {
+            sawReset = sawReset || sequence.containsResetOrInverseOff
+            scan = sequence.endIndex
+        }
+        guard sawReset else { return nil }
+
         while scan < bytes.count, bytes[scan] == UInt8(ascii: " ") {
             scan += 1
         }
 
-        guard scan > spacesStart,
-              scan < bytes.count,
+        guard scan < bytes.count,
               bytes[scan] == UInt8(ascii: "\r")
         else {
             return nil
@@ -1508,6 +1527,79 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         return scan
+    }
+
+    nonisolated private static func sgrSequence(
+        in bytes: [UInt8],
+        at index: Int
+    ) -> (endIndex: Int, containsInverse: Bool, containsResetOrInverseOff: Bool)? {
+        guard index + 2 < bytes.count,
+              bytes[index] == 0x1B,
+              bytes[index + 1] == UInt8(ascii: "[")
+        else {
+            return nil
+        }
+
+        var scan = index + 2
+        while scan < bytes.count {
+            let byte = bytes[scan]
+            if byte == UInt8(ascii: "m") {
+                let payload = bytes[(index + 2)..<scan]
+                let codes = String(decoding: payload, as: UTF8.self)
+                    .split(whereSeparator: { $0 == ";" || $0 == ":" })
+                let normalizedCodes = codes.isEmpty ? ["0"] : codes.map(String.init)
+                let flags = sgrFlags(in: normalizedCodes)
+                return (
+                    endIndex: scan + 1,
+                    containsInverse: flags.containsInverse,
+                    containsResetOrInverseOff: flags.containsResetOrInverseOff
+                )
+            }
+            guard (0x30...0x3F).contains(byte) else { return nil }
+            scan += 1
+        }
+
+        return nil
+    }
+
+    nonisolated private static func sgrFlags(
+        in codes: [String]
+    ) -> (containsInverse: Bool, containsResetOrInverseOff: Bool) {
+        var containsInverse = false
+        var containsResetOrInverseOff = false
+        var index = 0
+
+        while index < codes.count {
+            let code = codes[index].isEmpty ? "0" : codes[index]
+            switch code {
+            case "0":
+                containsResetOrInverseOff = true
+                index += 1
+            case "7":
+                containsInverse = true
+                index += 1
+            case "27":
+                containsResetOrInverseOff = true
+                index += 1
+            case "38", "48", "58":
+                if index + 1 < codes.count {
+                    switch codes[index + 1] {
+                    case "2":
+                        index += 5
+                    case "5":
+                        index += 3
+                    default:
+                        index += 2
+                    }
+                } else {
+                    index += 1
+                }
+            default:
+                index += 1
+            }
+        }
+
+        return (containsInverse, containsResetOrInverseOff)
     }
 
     nonisolated fileprivate static func collapseOverwrittenProgressFramesForTerminalFeed(_ data: Data) -> Data {

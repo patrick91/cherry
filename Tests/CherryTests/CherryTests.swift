@@ -4584,6 +4584,22 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output == ["prime", "\u{1B}[2K\r[1/2] Building\r\n"])
 }
 
+@Test func ghosttyOutputSinkDropsZshPromptEndOfLineMarksBeforeRendering() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) }
+    )
+    let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 20) +
+        "\r \r"
+
+    sink.receive(Data(("output\r\n" + promptEndMark + "\u{1B}[0mprompt").utf8))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["output\r\n\u{1B}[0mprompt"])
+}
+
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
     let replay = Data((
         "before" +
@@ -4647,6 +4663,28 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!output.contains(String(repeating: " ", count: 120) + "\r \r"))
     #expect(output.contains("\u{1B}[1;36m~/github/strawberry-graphql/strawberry\u{1B}[0m"))
     #expect(output.contains("\u{1B}[1;32m❯\u{1B}[0m "))
+}
+
+@Test func ghosttyReplayOutputDropsCompactZshPromptEndOfLineMarks() async throws {
+    let replay = Data((
+        "before\r\n" +
+        "\u{1B}[7m%\u{1B}[27m\r" +
+        "\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n"
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let output = String(decoding: sanitized, as: UTF8.self)
+
+    #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
+    #expect(output == "before\r\n\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
+}
+
+@Test func ghosttyReplayOutputKeepsPaletteColoredPercentLines() async throws {
+    let replay = Data("progress \u{1B}[38;5;7m%\u{1B}[0m\r\n".utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+
+    #expect(sanitized == replay)
 }
 
 @MainActor

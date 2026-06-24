@@ -4848,6 +4848,54 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(trailingRun.style.background == .rgb(46, 45, 50))
 }
 
+@MainActor
+@Test func ghosttyRenderedReplayRestoresCodexComposerCursorWhenSwitchingBack() async throws {
+    let session = TerminalSession(
+        title: "Codex cursor",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex"
+    )
+    defer {
+        session.stop()
+    }
+    let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
+    session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
+    session.ingestTestingData(Data((
+        "\u{1B}[?2026h" +
+        "\u{1B}[1;1H\u{1B}[J" +
+        "\u{1B}[1;1H\u{1B}[2m╭─────────────────────────────────────────────╮\u{1B}[0m" +
+        "\u{1B}[2;1H\u{1B}[2m│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │\u{1B}[0m" +
+        "\u{1B}[3;1H\u{1B}[2m╰─────────────────────────────────────────────╯\u{1B}[0m" +
+        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m" +
+        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K" +
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mWrite tests for @filename" +
+        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K" +
+        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m" +
+        "\u{1B}[11;3H" +
+        "\u{1B}[?2026l"
+    ).utf8))
+
+    let sourceCursor = session.cursorState
+    #expect(sourceCursor.row == 10)
+    #expect(sourceCursor.column == 2)
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    let replayString = String(decoding: replayData, as: UTF8.self)
+    #expect(replayString.contains("\u{1B}[H\u{1B}[J"))
+    #expect(replayString.contains("\u{1B}[11;3H"))
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.resize(to: viewportSize)
+    replayedBuffer.ingest(replayData, viewportSize: viewportSize)
+
+    #expect(replayedBuffer.cursorState == sourceCursor)
+    #expect(replayedBuffer.snapshot(range: 10..<11).first?.contains("Write tests for @filename") == true)
+}
+
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
     let input = Data((
         "keep" +

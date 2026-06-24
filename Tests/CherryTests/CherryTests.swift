@@ -171,7 +171,7 @@ private func makeHostedContentViewWindow(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
     )
-    let contentRect = NSRect(x: 0, y: 0, width: 900, height: 600)
+    let contentRect = hostedContentViewWindowRectAvoidingPointer(size: NSSize(width: 900, height: 600))
     let window = NSWindow(
         contentRect: contentRect,
         styleMask: styleMask,
@@ -199,6 +199,59 @@ private func makeHostedContentViewWindow(
         workspace: workspace,
         chromeState: chromeState,
         projectDirectory: projectDirectory
+    )
+}
+
+@MainActor
+private func hostedContentViewWindowRectAvoidingPointer(size: NSSize) -> NSRect {
+    let mouse = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+    let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let revealSafeWidth: CGFloat = 440
+
+    func clampedX(_ x: CGFloat) -> CGFloat {
+        min(max(x, visibleFrame.minX), visibleFrame.maxX - size.width)
+    }
+
+    func clampedY(_ y: CGFloat) -> CGFloat {
+        min(max(y, visibleFrame.minY), visibleFrame.maxY - size.height)
+    }
+
+    let xCandidates = [
+        mouse.x + 120,
+        mouse.x - size.width + 120,
+        visibleFrame.maxX - size.width - 40,
+        visibleFrame.minX + 40,
+        visibleFrame.midX - size.width / 2
+    ].map(clampedX)
+
+    let yCandidates = [
+        mouse.y + 80,
+        mouse.y - size.height + 80,
+        visibleFrame.maxY - size.height - 40,
+        visibleFrame.minY + 40,
+        visibleFrame.midY - size.height / 2
+    ].map(clampedY)
+
+    for y in yCandidates {
+        for x in xCandidates {
+            let rect = NSRect(origin: NSPoint(x: x, y: y), size: size)
+            let localMouse = NSPoint(x: mouse.x - rect.minX, y: mouse.y - rect.minY)
+            let pointerIsInRevealStrip = localMouse.x >= 0
+                && localMouse.x <= revealSafeWidth
+                && localMouse.y >= 0
+                && localMouse.y <= rect.height
+            if !pointerIsInRevealStrip {
+                return rect
+            }
+        }
+    }
+
+    return NSRect(
+        x: clampedX(visibleFrame.maxX - size.width),
+        y: clampedY(visibleFrame.maxY - size.height),
+        width: size.width,
+        height: size.height
     )
 }
 
@@ -4342,6 +4395,29 @@ private struct MCPWhoamiPayload: Decodable {
     processor.clear()
     processor.enqueueOutput(Data("replayed\r\n".utf8), launchID: nil, responseWriter: { _ in })
     #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
+}
+
+@MainActor
+@Test func terminalProcessorReplayReplacementRebuildsAfterDroppedOutput() async throws {
+    let processor = TerminalProcessor(
+        maxScrollback: 100,
+        buffer: LiveTerminalOutputBuffer(maxScrollback: 100),
+        backpressurePolicy: .dropStalePending(maxPendingBytes: 1_024)
+    )
+
+    processor.ingestTestingData(Data("stale\r\n".utf8))
+    processor.discardPendingOutput()
+    #expect(processor.needsReplayResynchronization)
+
+    processor.replaceWithReplayOutput(
+        Data("\u{1B}[32mfresh\u{1B}[0m\r\n".utf8),
+        viewportSize: TerminalViewportSize(columns: 80, rows: 24)
+    )
+
+    let snapshot = processor.snapshot(range: 0..<processor.lineCount)
+    #expect(!processor.needsReplayResynchronization)
+    #expect(!snapshot.contains("stale"))
+    #expect(snapshot.contains("fresh"))
 }
 
 @MainActor

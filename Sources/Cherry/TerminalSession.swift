@@ -90,6 +90,7 @@ final class TerminalProcessor: @unchecked Sendable {
     private var activeLaunchID: UUID?
     private var outputEpoch = 0
     private var pendingOutputBytes = 0
+    private var needsRawReplayResynchronization = false
     private var isOutputProcessingSuspended = false
     private var unreportedSuspendedDroppedBytes = 0
     private var isChangeNotificationScheduled = false
@@ -208,6 +209,7 @@ final class TerminalProcessor: @unchecked Sendable {
         locked {
             outputEpoch &+= 1
             pendingOutputBytes = 0
+            needsRawReplayResynchronization = true
         }
     }
 
@@ -215,6 +217,9 @@ final class TerminalProcessor: @unchecked Sendable {
         let droppedPendingBytes = locked {
             let droppedPendingBytes = unreportedSuspendedDroppedBytes
             unreportedSuspendedDroppedBytes = 0
+            if droppedPendingBytes > 0 {
+                needsRawReplayResynchronization = true
+            }
             return droppedPendingBytes
         }
         if droppedPendingBytes > 0 {
@@ -242,6 +247,7 @@ final class TerminalProcessor: @unchecked Sendable {
                 if unreportedSuspendedDroppedBytes >= Self.suspendedDropReportThreshold {
                     let droppedBytes = unreportedSuspendedDroppedBytes
                     unreportedSuspendedDroppedBytes = 0
+                    needsRawReplayResynchronization = true
                     return (nil, droppedBytes)
                 }
                 return (nil, 0)
@@ -278,8 +284,30 @@ final class TerminalProcessor: @unchecked Sendable {
         let droppedBytes = pendingOutputBytes
         outputEpoch &+= 1
         pendingOutputBytes = 0
+        needsRawReplayResynchronization = true
         buffer.clear()
         return droppedBytes
+    }
+
+    var needsReplayResynchronization: Bool {
+        locked {
+            pendingOutputBytes > 0
+                || unreportedSuspendedDroppedBytes > 0
+                || needsRawReplayResynchronization
+        }
+    }
+
+    func replaceWithReplayOutput(_ data: Data, viewportSize: TerminalViewportSize) {
+        locked {
+            outputEpoch &+= 1
+            pendingOutputBytes = 0
+            unreportedSuspendedDroppedBytes = 0
+            needsRawReplayResynchronization = false
+            self.viewportSize = viewportSize
+            buffer.clear()
+        }
+
+        processOutput(data, launchID: nil, responseWriter: { _ in })
     }
 
     func processOutput(
@@ -2120,7 +2148,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private static let defaultMaxScrollback = 50_000
     private static let auxiliaryTerminalProcessorMaxScrollback = 4_096
-    private static let auxiliaryTerminalProcessorReplayByteLimit = 256 * 1024
+    private static let auxiliaryTerminalProcessorReplayByteLimit = 1_048_576
     private static let auxiliaryTerminalProcessorStartupGrace: TimeInterval = 3.0
     private static let metadataOutputPendingByteLimit = 512 * 1024
     private static let metadataOutputFlushInterval: TimeInterval = 0.2
@@ -2388,6 +2416,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         return renderedReplayCache.output
+    }
+
+    func synchronizeReplayModelIfNeededForRenderedReplay() {
+        guard kind == .terminal,
+              processor.needsReplayResynchronization
+        else {
+            return
+        }
+
+        let replay = rawOutputStore.snapshot(maxBytes: Self.auxiliaryTerminalProcessorReplayByteLimit).data
+        guard !replay.isEmpty else { return }
+
+        renderedReplayCache = nil
+        ingestTerminalMetadata(replay)
+        processor.replaceWithReplayOutput(replay, viewportSize: viewportSize)
     }
 
     func cacheRenderedReplayOutput(_ output: Data, maxBytes: Int, maxLines: Int) {

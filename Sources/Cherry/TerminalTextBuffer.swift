@@ -3379,6 +3379,7 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
             }
             completedLines.append(contentsOf: retainedLines)
             trimIfNeeded()
+            primaryScreenTopRow = completedLines.count
         }
 
         cursorRow = max(0, lineCount - 1)

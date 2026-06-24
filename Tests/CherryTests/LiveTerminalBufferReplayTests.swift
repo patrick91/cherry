@@ -235,13 +235,36 @@ import Testing
         buffer.ingest(Data("\u{1B}[?1049htui-line-1\r\n\r\ntui-line-3\r\n\r\n\u{1B}[?1049l".utf8))
 
         #expect(!buffer.usesAlternateScreen)
-        #expect(buffer.snapshot(range: 0..<buffer.lineCount) == [
+        let lines = buffer.snapshot(range: 0..<buffer.lineCount)
+        #expect(Array(lines.prefix(5)) == [
             "alpha",
             "bravo",
             "tui-line-1",
             "",
-            "tui-line-3",
-            ""
+            "tui-line-3"
         ])
+        #expect(lines.dropFirst(5).allSatisfy { $0.isEmpty })
+    }
+
+    @Test func primaryScreenClearAfterAlternateScreenExitDoesNotReuseRetainedFrameRows() throws {
+        let viewport = TerminalViewportSize(columns: 120, rows: 8)
+        var buffer = LiveTerminalOutputBuffer(maxScrollback: 200)
+        let retainedFrame = (0..<12)
+            .map { "TUI cycle=17 frame=15 row=\($0) " + String(repeating: "\($0)", count: 24) }
+            .joined(separator: "\r\n")
+
+        buffer.ingest(Data("\u{1B}[?1049h\(retainedFrame)\u{1B}[?1049l".utf8), viewportSize: viewport)
+        buffer.ingest(Data((
+            String(repeating: "\n", count: 10) +
+            "\u{1B}[3;1H\u{1B}[JAtuin-like overlay" +
+            "\u{1B}[3;1H\u{1B}[J" +
+            "\u{1B}[A\r\u{1B}[A~/github/patrick91/cherry main [17]\r\n> \u{1B}[K"
+        ).utf8), viewportSize: viewport)
+
+        let lines = buffer.snapshot(range: 0..<buffer.lineCount)
+        #expect(lines.contains { $0.hasPrefix("TUI cycle=17 frame=15 row=11") })
+
+        let promptLine = try #require(lines.first { $0.contains("~/github/patrick91/cherry main [17]") })
+        #expect(promptLine == "~/github/patrick91/cherry main [17]")
     }
 }

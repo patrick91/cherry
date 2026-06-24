@@ -809,6 +809,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         maxBytes: Int = 1_048_576,
         maxLines: Int = 5_000
     ) -> Data {
+        session.synchronizeReplayModelIfNeededForRenderedReplay()
+
         if let cachedOutput = session.cachedRenderedReplayOutput(maxBytes: maxBytes, maxLines: maxLines) {
             return cachedOutput
         }

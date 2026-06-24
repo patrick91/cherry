@@ -10696,6 +10696,26 @@ private func serviceRecord(
     ) == Data("#".utf8))
 }
 
+@Test func appKitOptionDigitTextFallsBackToKeyboardLayout() async throws {
+    let optionOne = try #require(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 18,
+        characters: nil,
+        charactersIgnoringModifiers: nil,
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ))
+    let optionTwo = try #require(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 19,
+        characters: "",
+        charactersIgnoringModifiers: nil,
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ))
+
+    #expect(!optionOne.isEmpty)
+    #expect(!optionTwo.isEmpty)
+}
+
 @Test func appKitOptionDigitTextRejectsNonDigitShortcuts() async throws {
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 0,

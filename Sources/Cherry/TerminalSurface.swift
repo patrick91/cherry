@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Carbon.HIToolbox
 import SwiftUI
 
 private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
@@ -237,18 +238,21 @@ enum TerminalInputEncoder {
         guard modifiers.contains(.option),
               !modifiers.contains(.control),
               !modifiers.contains(.command),
-              isAppKitTopRowDigitKey(keyCode: keyCode, charactersIgnoringModifiers: charactersIgnoringModifiers),
-              let characters,
-              !characters.isEmpty,
-              !isAppKitFunctionKeyText(characters),
-              characters.unicodeScalars.allSatisfy({ scalar in
-                  scalar.value >= 0x20 && scalar.value != 0x7F
-              })
+              isAppKitTopRowDigitKey(keyCode: keyCode, charactersIgnoringModifiers: charactersIgnoringModifiers)
         else {
             return nil
         }
 
-        return terminalTextData(characters, keyboardProtocolFlags: keyboardProtocolFlags)
+        if let characters, !characters.isEmpty {
+            guard let text = printableTerminalText(characters) else { return nil }
+            return terminalTextData(text, keyboardProtocolFlags: keyboardProtocolFlags)
+        }
+
+        guard let text = translatedAppKitText(keyCode: keyCode, modifiers: modifiers) else {
+            return nil
+        }
+
+        return terminalTextData(text, keyboardProtocolFlags: keyboardProtocolFlags)
     }
 
     private static func isAppKitTopRowDigitKey(
@@ -267,6 +271,68 @@ enum TerminalInputEncoder {
         }
 
         return ignoredScalar.value >= 0x30 && ignoredScalar.value <= 0x39
+    }
+
+    private static func printableTerminalText(_ text: String?) -> String? {
+        guard let text,
+              !text.isEmpty,
+              !isAppKitFunctionKeyText(text),
+              text.unicodeScalars.allSatisfy({ scalar in
+                  scalar.value >= 0x20 && scalar.value != 0x7F
+              })
+        else {
+            return nil
+        }
+
+        return text
+    }
+
+    static func translatedAppKitText(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags
+    ) -> String? {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let rawLayoutData = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else {
+            return nil
+        }
+
+        let layoutData = unsafeBitCast(rawLayoutData, to: CFData.self)
+        guard let bytes = CFDataGetBytePtr(layoutData) else { return nil }
+        let keyboardLayout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+
+        var carbonModifiers: UInt32 = 0
+        if modifiers.contains(.shift) {
+            carbonModifiers |= UInt32(shiftKey)
+        }
+        if modifiers.contains(.option) {
+            carbonModifiers |= UInt32(optionKey)
+        }
+
+        let modifierKeyState = (carbonModifiers >> 8) & 0xFF
+        var deadKeyState: UInt32 = 0
+        var chars = [UniChar](repeating: 0, count: 8)
+        var actualLength = 0
+        let status = UCKeyTranslate(
+            keyboardLayout,
+            keyCode,
+            UInt16(kUCKeyActionDown),
+            modifierKeyState,
+            UInt32(LMGetKbdType()),
+            OptionBits(kUCKeyTranslateNoDeadKeysBit),
+            &deadKeyState,
+            chars.count,
+            &actualLength,
+            &chars
+        )
+
+        guard status == noErr,
+              actualLength > 0
+        else {
+            return nil
+        }
+
+        return printableTerminalText(String(utf16CodeUnits: chars, count: actualLength))
     }
 
     static func shiftEnterSequence(

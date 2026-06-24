@@ -4907,6 +4907,66 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyRenderedReplayRecoversFlattenedLinesWhenOtherLinesStillHaveStyle() async throws {
+    let directBuffer = StaticStyledTerminalBuffer(
+        lines: [
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(
+                    text: "~/github/patrick91/cherry  main",
+                    style: TerminalTextStyle(foreground: .rgb(94, 234, 212))
+                ),
+            ]),
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(
+                    text: "drwxr-xr-x  Sources",
+                    style: TerminalTextStyle()
+                ),
+            ]),
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(
+                    text: "gpt-5.5 low",
+                    style: TerminalTextStyle(foreground: .rgb(246, 226, 183))
+                ),
+            ]),
+        ],
+        cursorState: TerminalCursorState(row: 2, column: 0, shape: .block, isVisible: true)
+    )
+    let session = TerminalSession(
+        title: "Mixed style recovery",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: directBuffer,
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    session.ingestTestingData(Data((
+        "\u{1B}[38;2;94;234;212m~/github/patrick91/cherry\u{1B}[0m  " +
+        "\u{1B}[35mmain\u{1B}[0m\r\n" +
+        "\u{1B}[38;5;33mdrwxr-xr-x  Sources\u{1B}[0m\r\n" +
+        "\u{1B}[38;2;246;226;183mgpt-5.5 low\u{1B}[0m"
+    ).utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayData)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let directoryLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("Sources") }
+    })
+    let directoryRun = try #require(directoryLine.runs.first { $0.text.contains("Sources") })
+    let statusLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("gpt-5.5 low") }
+    })
+    let statusRun = try #require(statusLine.runs.first { $0.text.contains("gpt-5.5 low") })
+
+    #expect(directoryRun.style.foreground == .palette256(33))
+    #expect(statusRun.style.foreground == .rgb(246, 226, 183))
+}
+
+@MainActor
 @Test func ghosttyRenderedReplayRestoresStyledFinalFrameForLiveBufferRedraw() async throws {
     let session = TerminalSession(
         title: "Styled redraw",
@@ -10972,6 +11032,74 @@ private func serviceRecord(
 
     let snapshot = buffer.snapshot(range: 0..<buffer.lineCount)
     #expect(snapshot.last?.contains("abc") == true)
+}
+
+private struct StaticStyledTerminalBuffer: TerminalBuffering {
+    var lines: [TerminalRenderedLine]
+    var cursorState: TerminalCursorState
+
+    var lineCount: Int {
+        lines.count
+    }
+
+    var storedLineCount: Int {
+        lines.count
+    }
+
+    var usesAlternateScreen: Bool {
+        false
+    }
+
+    var usesApplicationCursorKeys: Bool {
+        false
+    }
+
+    var usesBracketedPasteMode: Bool {
+        false
+    }
+
+    var mouseState: TerminalMouseState {
+        TerminalMouseState()
+    }
+
+    func snapshot(range: Range<Int>) -> [String] {
+        styledSnapshot(range: range).map(\.plainText)
+    }
+
+    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
+        Array(lines[range])
+    }
+
+    func lineLength(at row: Int) -> Int {
+        lines[row].runs.reduce(0) { $0 + $1.cellWidth }
+    }
+
+    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
+        TerminalGridPoint(row: row, column: column)
+    }
+
+    func selectedText(in selection: TerminalSelectionRange) -> String {
+        ""
+    }
+
+    mutating func clear() {
+        lines.removeAll(keepingCapacity: false)
+        cursorState = TerminalCursorState(row: 0, column: 0, shape: .block, isVisible: true)
+    }
+
+    mutating func resize(to viewportSize: TerminalViewportSize) {}
+
+    mutating func appendPlainLines(_ newLines: [String]) {
+        lines.append(contentsOf: newLines.map { line in
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(text: line, style: TerminalTextStyle()),
+            ])
+        })
+    }
+
+    mutating func ingest(_ data: Data, viewportSize: TerminalViewportSize) -> [Data] {
+        []
+    }
 }
 
 private extension Data {

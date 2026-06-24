@@ -893,7 +893,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         let startLine = max(0, totalLines - maxLines)
         let directLines = session.styledSnapshot(range: startLine..<totalLines)
-        guard directLines.allSatisfy(\.isPlainDefaultStyled) else {
+        guard directLinesNeedStyleRecovery(directLines) else {
             return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
         }
 
@@ -1042,14 +1042,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
             let replayLine = replayLines[replayIndex]
             if canUseStyledReplayLine(replayLine, for: directLine) {
-                if !replayLine.isPlainDefaultStyled {
+                let selectedLine = preferredStyledLine(replayLine, over: directLine)
+                if !selectedLine.isPlainDefaultStyled {
                     styledCompatibleLineCount += 1
                 }
-                if !normalizedReplayText(replayLine.plainText).isEmpty {
-                    styledCellCount += replayLine.styledCellCount
-                    paintedBackgroundCellCount += replayLine.paintedBackgroundCellCount
+                if !normalizedReplayText(selectedLine.plainText).isEmpty {
+                    styledCellCount += selectedLine.styledCellCount
+                    paintedBackgroundCellCount += selectedLine.paintedBackgroundCellCount
                 }
-                mergedLines.append(replayLine)
+                mergedLines.append(selectedLine)
             } else {
                 let directText = normalizedReplayText(directLine.plainText)
                 let replayText = normalizedReplayText(replayLine.plainText)
@@ -1147,6 +1148,30 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         for directLine: TerminalRenderedLine
     ) -> Bool {
         normalizedReplayText(replayLine.plainText) == normalizedReplayText(directLine.plainText)
+    }
+
+    private static func preferredStyledLine(
+        _ replayLine: TerminalRenderedLine,
+        over directLine: TerminalRenderedLine
+    ) -> TerminalRenderedLine {
+        if replayLine.paintedBackgroundCellCount != directLine.paintedBackgroundCellCount {
+            return replayLine.paintedBackgroundCellCount > directLine.paintedBackgroundCellCount
+                ? replayLine
+                : directLine
+        }
+        if replayLine.styledCellCount != directLine.styledCellCount {
+            return replayLine.styledCellCount > directLine.styledCellCount
+                ? replayLine
+                : directLine
+        }
+
+        return directLine
+    }
+
+    private static func directLinesNeedStyleRecovery(_ lines: [TerminalRenderedLine]) -> Bool {
+        lines.contains { line in
+            !normalizedReplayText(line.plainText).isEmpty && line.hasDefaultStyledText
+        }
     }
 
     private static func normalizedReplayText(_ text: String) -> String {
@@ -3241,6 +3266,10 @@ private extension TerminalPointerStyle {
 }
 
 private extension TerminalRenderedLine {
+    var hasDefaultStyledText: Bool {
+        runs.contains { !$0.text.isEmpty && $0.style == TerminalTextStyle() }
+    }
+
     var styledCellCount: Int {
         runs.reduce(0) { count, run in
             run.style == TerminalTextStyle() ? count : count + run.cellWidth

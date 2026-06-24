@@ -30,6 +30,7 @@ private func sidebarResizeLog(_ message: @autoclosure () -> String) {
 final class GhosttyOutputSink: @unchecked Sendable {
     private static let maximumRetainedPendingBytes = 1_048_576
     private static let defaultBurstCoalescingDelay: DispatchTimeInterval = .milliseconds(80)
+    private static let defaultPromptMarkCoalescingDelay: DispatchTimeInterval = .milliseconds(12)
     private static let defaultBurstDetectionWindowNanoseconds: UInt64 = 160_000_000
     private static let defaultInputLatencyBypassWindowNanoseconds: UInt64 = 180_000_000
 
@@ -44,6 +45,7 @@ final class GhosttyOutputSink: @unchecked Sendable {
     private let receiveData: (InMemoryTerminalSession?, Data) -> Void
     private let hostInputSuppressor: (@escaping () -> Void) -> Void
     private let burstCoalescingDelay: DispatchTimeInterval
+    private let promptMarkCoalescingDelay: DispatchTimeInterval
     private let burstDetectionWindowNanoseconds: UInt64
     private let inputLatencyBypassWindowNanoseconds: UInt64
     private var session: InMemoryTerminalSession?
@@ -57,12 +59,14 @@ final class GhosttyOutputSink: @unchecked Sendable {
         session: InMemoryTerminalSession,
         hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
         burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
+        promptMarkCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultPromptMarkCoalescingDelay,
         burstDetectionWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultBurstDetectionWindowNanoseconds,
         inputLatencyBypassWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultInputLatencyBypassWindowNanoseconds
     ) {
         self.session = session
         self.hostInputSuppressor = hostInputSuppressor
         self.burstCoalescingDelay = burstCoalescingDelay
+        self.promptMarkCoalescingDelay = promptMarkCoalescingDelay
         self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
         self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
         self.receiveData = { session, data in
@@ -74,12 +78,14 @@ final class GhosttyOutputSink: @unchecked Sendable {
         receiveForTesting: @escaping (Data) -> Void,
         hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
         burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
+        promptMarkCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultPromptMarkCoalescingDelay,
         burstDetectionWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultBurstDetectionWindowNanoseconds,
         inputLatencyBypassWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultInputLatencyBypassWindowNanoseconds
     ) {
         self.session = nil
         self.hostInputSuppressor = hostInputSuppressor
         self.burstCoalescingDelay = burstCoalescingDelay
+        self.promptMarkCoalescingDelay = promptMarkCoalescingDelay
         self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
         self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
         self.receiveData = { _, data in
@@ -117,6 +123,8 @@ final class GhosttyOutputSink: @unchecked Sendable {
 
         let containsOverwrittenProgressFrameMarker =
             GhosttySessionBridge.containsOverwrittenProgressFrameMarker(data)
+        let endsWithIncompletePromptEndMark =
+            GhosttySessionBridge.endsWithIncompleteZshPromptEndOfLineMark(data)
         let drainDelay: DispatchTimeInterval? = lock.withLock {
             if pendingByteCount + data.count > Self.maximumRetainedPendingBytes {
                 pendingChunks.removeAll(keepingCapacity: true)
@@ -144,13 +152,18 @@ final class GhosttyOutputSink: @unchecked Sendable {
             } else {
                 false
             }
-            let shouldDelayForCoalescing = containsOverwrittenProgressFrameMarker && !isRecentHostInput
+            let shouldDelayForProgressCoalescing = containsOverwrittenProgressFrameMarker && !isRecentHostInput
+            let shouldDelayForCoalescing =
+                endsWithIncompletePromptEndMark || shouldDelayForProgressCoalescing
             guard !isDrainScheduled else {
                 return shouldDelayForCoalescing ? nil : .never
             }
 
             isDrainScheduled = true
             guard shouldDelayForCoalescing else { return .never }
+            if endsWithIncompletePromptEndMark {
+                return promptMarkCoalescingDelay
+            }
             guard let lastDrainUptimeNanoseconds else { return .never }
             let elapsed = now >= lastDrainUptimeNanoseconds
                 ? now - lastDrainUptimeNanoseconds
@@ -1481,6 +1494,76 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return didStrip ? Data(stripped) : data
     }
 
+    nonisolated fileprivate static func endsWithIncompleteZshPromptEndOfLineMark(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+
+        let bytes = Array(data.suffix(512))
+        for index in bytes.indices where bytes[index] == 0x1B {
+            if isIncompleteZshPromptEndOfLineMarkPrefix(in: bytes, at: index) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    nonisolated private static func isIncompleteZshPromptEndOfLineMarkPrefix(
+        in bytes: [UInt8],
+        at index: Int
+    ) -> Bool {
+        var scan = index
+        var sawAnySGR = false
+        var sawInverse = false
+        leadingSGRs: while true {
+            switch sgrSequencePrefix(in: bytes, at: scan) {
+            case .complete(let endIndex, let containsInverse, _):
+                sawAnySGR = true
+                sawInverse = sawInverse || containsInverse
+                scan = endIndex
+            case .incomplete:
+                return sawAnySGR || scan == index
+            case .noMatch:
+                break leadingSGRs
+            }
+        }
+
+        guard sawInverse else { return false }
+        guard scan < bytes.count else { return true }
+        guard bytes[scan] == UInt8(ascii: "%") || bytes[scan] == UInt8(ascii: "#") else {
+            return false
+        }
+        scan += 1
+        guard scan < bytes.count else { return true }
+
+        var sawReset = false
+        trailingSGRs: while true {
+            switch sgrSequencePrefix(in: bytes, at: scan) {
+            case .complete(let endIndex, _, let containsResetOrInverseOff):
+                sawReset = sawReset || containsResetOrInverseOff
+                scan = endIndex
+            case .incomplete:
+                return true
+            case .noMatch:
+                break trailingSGRs
+            }
+        }
+
+        guard sawReset else { return false }
+        while scan < bytes.count, bytes[scan] == UInt8(ascii: " ") {
+            scan += 1
+        }
+        guard scan < bytes.count else { return true }
+        guard bytes[scan] == UInt8(ascii: "\r") else { return false }
+
+        scan += 1
+        guard scan < bytes.count else { return false }
+        if bytes[scan] == UInt8(ascii: " ") {
+            return scan + 1 == bytes.count
+        }
+
+        return false
+    }
+
     nonisolated private static func zshPromptEndOfLineMarkEnd(
         in bytes: [UInt8],
         at index: Int
@@ -1528,6 +1611,51 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         return scan
+    }
+
+    private enum SGRSequencePrefix {
+        case complete(endIndex: Int, containsInverse: Bool, containsResetOrInverseOff: Bool)
+        case incomplete
+        case noMatch
+    }
+
+    nonisolated private static func sgrSequencePrefix(
+        in bytes: [UInt8],
+        at index: Int
+    ) -> SGRSequencePrefix {
+        guard index < bytes.count, bytes[index] == 0x1B else {
+            return .noMatch
+        }
+        guard index + 1 < bytes.count else {
+            return .incomplete
+        }
+        guard bytes[index + 1] == UInt8(ascii: "[") else {
+            return .noMatch
+        }
+        guard index + 2 < bytes.count else {
+            return .incomplete
+        }
+
+        var scan = index + 2
+        while scan < bytes.count {
+            let byte = bytes[scan]
+            if byte == UInt8(ascii: "m") {
+                let payload = bytes[(index + 2)..<scan]
+                let codes = String(decoding: payload, as: UTF8.self)
+                    .split(whereSeparator: { $0 == ";" || $0 == ":" })
+                let normalizedCodes = codes.isEmpty ? ["0"] : codes.map(String.init)
+                let flags = sgrFlags(in: normalizedCodes)
+                return .complete(
+                    endIndex: scan + 1,
+                    containsInverse: flags.containsInverse,
+                    containsResetOrInverseOff: flags.containsResetOrInverseOff
+                )
+            }
+            guard (0x30...0x3F).contains(byte) else { return .noMatch }
+            scan += 1
+        }
+
+        return .incomplete
     }
 
     nonisolated private static func sgrSequence(
@@ -2861,6 +2989,17 @@ final class GhosttyTerminalContainerView: NSView {
         ) {
             activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: sequence)
+            return true
+        }
+
+        if let data = TerminalInputEncoder.appKitOptionDigitTextData(
+            characters: event.characters,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: event.modifierFlags,
+            keyboardProtocolFlags: activeSession.keyboardProtocolFlags
+        ) {
+            activeBridge?.scrollToBottomForHostInput()
+            activeSession.send(data: data)
             return true
         }
 

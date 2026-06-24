@@ -4600,6 +4600,29 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output == ["output\r\n\r\u{1B}[0mprompt"])
 }
 
+@Test func ghosttyOutputSinkDropsSplitZshPromptEndOfLineMarksBeforeRendering() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) },
+        promptMarkCoalescingDelay: .milliseconds(2)
+    )
+    let promptEndMarkPrefix = "\u{1B}[1m\u{1B}[7m%"
+    let promptEndMarkSuffix = "\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 20) +
+        "\r \r"
+
+    sink.receive(Data(("output\r\n" + promptEndMarkPrefix).utf8))
+    sink.flushForTesting()
+    #expect(observedData.values.isEmpty)
+
+    sink.receive(Data((promptEndMarkSuffix + "\u{1B}[0mprompt").utf8))
+    try await Task.sleep(for: .milliseconds(20))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["output\r\n\r\u{1B}[0mprompt"])
+}
+
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
     let replay = Data((
         "before" +
@@ -10645,6 +10668,45 @@ private func serviceRecord(
     #expect(TerminalInputEncoder.commandSequence(
         for: #selector(NSResponder.deleteWordBackward(_:))
     ) == Data([0x1B, 0x7F]))
+}
+
+@Test func appKitOptionDigitTextUsesAppKitCharacters() async throws {
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        characters: "#",
+        charactersIgnoringModifiers: "3",
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ) == Data("#".utf8))
+
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        characters: "€",
+        charactersIgnoringModifiers: "2",
+        modifiers: [.option, .shift],
+        keyboardProtocolFlags: 0
+    ) == Data("€".utf8))
+}
+
+@Test func appKitOptionDigitTextRejectsNonDigitShortcuts() async throws {
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        characters: "å",
+        charactersIgnoringModifiers: "a",
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ) == nil)
+
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        characters: "#",
+        charactersIgnoringModifiers: "3",
+        modifiers: [.option, .command],
+        keyboardProtocolFlags: 0
+    ) == nil)
+
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+        charactersIgnoringModifiers: "3",
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ) == nil)
 }
 
 @MainActor

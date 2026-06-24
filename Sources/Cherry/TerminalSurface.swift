@@ -214,6 +214,34 @@ enum TerminalInputEncoder {
         return Data([0x1B, 0x7F])
     }
 
+    static func appKitOptionDigitTextData(
+        characters: String?,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags,
+        keyboardProtocolFlags: Int
+    ) -> Data? {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.option),
+              !modifiers.contains(.control),
+              !modifiers.contains(.command),
+              let ignoredCharacters = charactersIgnoringModifiers,
+              ignoredCharacters.unicodeScalars.count == 1,
+              let ignoredScalar = ignoredCharacters.unicodeScalars.first,
+              ignoredScalar.value >= 0x30,
+              ignoredScalar.value <= 0x39,
+              let characters,
+              !characters.isEmpty,
+              !isAppKitFunctionKeyText(characters),
+              characters.unicodeScalars.allSatisfy({ scalar in
+                  scalar.value >= 0x20 && scalar.value != 0x7F
+              })
+        else {
+            return nil
+        }
+
+        return terminalTextData(characters, keyboardProtocolFlags: keyboardProtocolFlags)
+    }
+
     static func shiftEnterSequence(
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,

@@ -10672,6 +10672,7 @@ private func serviceRecord(
 
 @Test func appKitOptionDigitTextUsesAppKitCharacters() async throws {
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
         modifiers: .option,
@@ -10679,15 +10680,25 @@ private func serviceRecord(
     ) == Data("#".utf8))
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 19,
         characters: "€",
         charactersIgnoringModifiers: "2",
         modifiers: [.option, .shift],
         keyboardProtocolFlags: 0
     ) == Data("€".utf8))
+
+    #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 20,
+        characters: "#",
+        charactersIgnoringModifiers: "£",
+        modifiers: .option,
+        keyboardProtocolFlags: 0
+    ) == Data("#".utf8))
 }
 
 @Test func appKitOptionDigitTextRejectsNonDigitShortcuts() async throws {
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 0,
         characters: "å",
         charactersIgnoringModifiers: "a",
         modifiers: .option,
@@ -10695,6 +10706,7 @@ private func serviceRecord(
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
         modifiers: [.option, .command],
@@ -10702,6 +10714,7 @@ private func serviceRecord(
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
+        keyCode: 20,
         characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
         charactersIgnoringModifiers: "3",
         modifiers: .option,

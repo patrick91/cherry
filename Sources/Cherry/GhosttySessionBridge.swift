@@ -2993,6 +2993,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if let data = TerminalInputEncoder.appKitOptionDigitTextData(
+            keyCode: event.keyCode,
             characters: event.characters,
             charactersIgnoringModifiers: event.charactersIgnoringModifiers,
             modifiers: event.modifierFlags,

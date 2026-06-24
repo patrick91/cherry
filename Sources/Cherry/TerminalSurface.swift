@@ -11,6 +11,18 @@ enum TerminalInputEncoder {
     private static let keypadEnterKeyCode: UInt16 = 76
     private static let tabKeyCode: UInt16 = 48
     private static let backspaceKeyCode: UInt16 = 51
+    private static let appKitTopRowDigitKeyCodes: Set<UInt16> = [
+        18, // 1
+        19, // 2
+        20, // 3
+        21, // 4
+        23, // 5
+        22, // 6
+        26, // 7
+        28, // 8
+        25, // 9
+        29  // 0
+    ]
     private static let appKitLeftArrowKeyCode: UInt16 = 0x7B
     private static let appKitRightArrowKeyCode: UInt16 = 0x7C
     private static let appKitDownArrowKeyCode: UInt16 = 0x7D
@@ -215,6 +227,7 @@ enum TerminalInputEncoder {
     }
 
     static func appKitOptionDigitTextData(
+        keyCode: UInt16,
         characters: String?,
         charactersIgnoringModifiers: String?,
         modifiers: NSEvent.ModifierFlags,
@@ -224,11 +237,7 @@ enum TerminalInputEncoder {
         guard modifiers.contains(.option),
               !modifiers.contains(.control),
               !modifiers.contains(.command),
-              let ignoredCharacters = charactersIgnoringModifiers,
-              ignoredCharacters.unicodeScalars.count == 1,
-              let ignoredScalar = ignoredCharacters.unicodeScalars.first,
-              ignoredScalar.value >= 0x30,
-              ignoredScalar.value <= 0x39,
+              isAppKitTopRowDigitKey(keyCode: keyCode, charactersIgnoringModifiers: charactersIgnoringModifiers),
               let characters,
               !characters.isEmpty,
               !isAppKitFunctionKeyText(characters),
@@ -240,6 +249,24 @@ enum TerminalInputEncoder {
         }
 
         return terminalTextData(characters, keyboardProtocolFlags: keyboardProtocolFlags)
+    }
+
+    private static func isAppKitTopRowDigitKey(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?
+    ) -> Bool {
+        if appKitTopRowDigitKeyCodes.contains(keyCode) {
+            return true
+        }
+
+        guard let ignoredCharacters = charactersIgnoringModifiers,
+              ignoredCharacters.unicodeScalars.count == 1,
+              let ignoredScalar = ignoredCharacters.unicodeScalars.first
+        else {
+            return false
+        }
+
+        return ignoredScalar.value >= 0x30 && ignoredScalar.value <= 0x39
     }
 
     static func shiftEnterSequence(

@@ -1146,6 +1146,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         _ replayLine: TerminalRenderedLine,
         over directLine: TerminalRenderedLine
     ) -> TerminalRenderedLine {
+        // The merge exists to RECOVER lost styling, never to downgrade a correctly styled
+        // direct line. The background/styled-cell heuristics below would otherwise prefer a
+        // re-parsed replay line that merely paints more background cells even when it has no
+        // real foreground color, dropping the direct line's foreground (the "colors lost on
+        // tab switch / resize" regression). Keep whichever side actually carries a foreground
+        // when only one of them does; only fall through to the cell-count tie-breaks when the
+        // foreground signal is equivalent.
+        let replayHasForeground = replayLine.hasRealForeground
+        let directHasForeground = directLine.hasRealForeground
+        if replayHasForeground != directHasForeground {
+            return directHasForeground ? directLine : replayLine
+        }
         if replayLine.paintedBackgroundCellCount != directLine.paintedBackgroundCellCount {
             return replayLine.paintedBackgroundCellCount > directLine.paintedBackgroundCellCount
                 ? replayLine
@@ -1496,20 +1508,74 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         var index = 0
         var didStrip = false
+        // Tracks whether a visible glyph has already been drawn on the current row before
+        // `index`. zsh's PROMPT_EOL_MARK only legitimately appears at the start of a row
+        // (on its own line). When real partial-line output precedes the mark on the same
+        // row — e.g. `printf foo` with no trailing newline, or a mid-line inverse `%` in a
+        // progress bar — collapsing it to `\r\x1b[K` would erase that output (the carriage
+        // return rewinds to column 0 and the erase-to-end clears the row). Leave such
+        // occurrences untouched so legitimate characters are never destroyed.
+        var rowHasPrintableContent = false
         while index < bytes.count {
-            if let markEnd = zshPromptEndOfLineMarkEnd(in: bytes, at: index) {
+            if !rowHasPrintableContent,
+               let markEnd = zshPromptEndOfLineMarkEnd(in: bytes, at: index) {
                 didStrip = true
                 stripped.append(UInt8(ascii: "\r"))
                 stripped.append(contentsOf: [0x1B, UInt8(ascii: "["), UInt8(ascii: "K")])
                 index = markEnd
+                rowHasPrintableContent = false
                 continue
             }
 
-            stripped.append(bytes[index])
+            let byte = bytes[index]
+            if byte == 0x1B {
+                // Copy escape/control sequences verbatim, but do not let their internal
+                // bytes (which are printable ASCII like `[`, `m`, digits) count as drawn
+                // glyphs for the row-start check.
+                let sequenceEnd = escapeSequenceEndIndex(in: bytes, at: index)
+                stripped.append(contentsOf: bytes[index..<sequenceEnd])
+                index = sequenceEnd
+                continue
+            }
+
+            switch byte {
+            case 0x0A, 0x0D:
+                rowHasPrintableContent = false
+            case 0x08:
+                break // backspace moves the cursor but leaves drawn content on the row
+            default:
+                if byte >= 0x20, byte != 0x7F {
+                    rowHasPrintableContent = true
+                }
+            }
+
+            stripped.append(byte)
             index += 1
         }
 
         return didStrip ? Data(stripped) : data
+    }
+
+    /// Returns the index immediately past the escape sequence beginning at `index`
+    /// (where `bytes[index] == 0x1B`). Handles CSI (`ESC [ … final`), string sequences
+    /// (OSC/DCS/PM/APC terminated by BEL or ST) and two-byte escapes. Used to skip over
+    /// non-printing control sequences when scanning for drawn content.
+    nonisolated private static func escapeSequenceEndIndex(in bytes: [UInt8], at index: Int) -> Int {
+        guard index + 1 < bytes.count else { return bytes.count }
+        switch bytes[index + 1] {
+        case UInt8(ascii: "["):
+            if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
+                return finalIndex + 1
+            }
+            return bytes.count
+        case UInt8(ascii: "]"), UInt8(ascii: "P"), UInt8(ascii: "^"), UInt8(ascii: "_"):
+            if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
+                return bounds.endIndex
+            }
+            return bytes.count
+        default:
+            return index + 2
+        }
     }
 
     nonisolated fileprivate static func endsWithIncompleteZshPromptEndOfLineMark(_ data: Data) -> Bool {
@@ -3276,6 +3342,10 @@ private extension TerminalPointerStyle {
 private extension TerminalRenderedLine {
     var hasDefaultStyledText: Bool {
         runs.contains { !$0.text.isEmpty && $0.style == TerminalTextStyle() }
+    }
+
+    var hasRealForeground: Bool {
+        runs.contains { !$0.text.isEmpty && $0.style.foreground != nil }
     }
 
     var styledCellCount: Int {

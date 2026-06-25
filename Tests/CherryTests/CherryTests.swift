@@ -4646,6 +4646,47 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output == ["output\r\n\r\u{1B}[K\u{1B}[0mprompt"])
 }
 
+@Test func ghosttyOutputSinkPreservesPartialLineOutputBeforeZshPromptMark() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(receiveForTesting: { observedData.append($0) })
+
+    // Real zsh output for a command that prints WITHOUT a trailing newline (e.g.
+    // `printf foo`): the partial line "foo" sits on the SAME row as the PROMPT_EOL_MARK.
+    // Collapsing the mark to `\r\x1b[K` would rewind to column 0 and erase the row,
+    // destroying "foo" (the reported ghost/missing-character bug). The mark must be left
+    // intact when real content already occupies the row.
+    let mark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 79) + "\r \r"
+    let input = Data(("foo" + mark + "\r\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J> ").utf8)
+    sink.receive(input)
+    sink.flushForTesting()
+    try await Task.sleep(for: .milliseconds(20))
+    sink.flushForTesting()
+
+    let joined = observedData.values.reduce(into: Data()) { $0.append($1) }
+    // The stream must pass through untouched: the mark is NOT collapsed into `\r\x1b[K`
+    // (which would rewind to column 0 and erase the partial-line "foo" with it).
+    #expect(joined == input)
+    #expect(String(decoding: joined, as: UTF8.self).contains("foo\u{1B}[1m\u{1B}[7m%"))
+}
+
+@Test func ghosttyOutputSinkKeepsMidlineInversePercentContent() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(receiveForTesting: { observedData.append($0) })
+
+    // A progress/status line that legitimately contains an inverse-video '%' mid-row must
+    // not be mistaken for a zsh PROMPT_EOL_MARK and have its leading text erased.
+    sink.receive(Data("Building 50\u{1B}[7m%\u{1B}[0m   \r done".utf8))
+    sink.flushForTesting()
+    try await Task.sleep(for: .milliseconds(20))
+    sink.flushForTesting()
+
+    let joined = observedData.values.reduce(into: Data()) { $0.append($1) }
+    let text = String(decoding: joined, as: UTF8.self)
+    #expect(text.contains("Building 50\u{1B}[7m%"))
+    #expect(!text.contains("\u{1B}[K"))
+}
+
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
     let replay = Data((
         "before" +
@@ -4756,7 +4797,14 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!promptLine.contains("ls"))
 }
 
-@Test func ghosttyReplayOutputClearsStalePromptCellsWhenDroppingZshMark() async throws {
+@Test func ghosttyReplayOutputPreservesContentSharingRowWithZshMark() async throws {
+    // Regression: a zsh PROMPT_EOL_MARK that follows real content on the SAME row must NOT
+    // be collapsed into `\r\x1b[K`. That carriage-return + erase-to-end-of-line rewinds to
+    // column 0 and wipes the content sharing the row — the reported ghost/missing-character
+    // bug (typed input or unterminated command output disappearing). The mark is only
+    // collapsed when it sits alone at the start of a row (see the ...DropsZshPromptEndOfLineMarks
+    // tests); zsh's own width-sized padding wraps the prompt below partial content, so the
+    // content is preserved exactly as a stock terminal would render it.
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 20) +
         "\r \r"
@@ -4772,8 +4820,7 @@ private struct MCPWhoamiPayload: Decodable {
     replayedBuffer.ingest(sanitized)
     let lines = replayedBuffer.snapshot(range: 0..<replayedBuffer.lineCount)
     let promptLine = try #require(lines.last)
-    #expect(promptLine.trimmingCharacters(in: .whitespaces) == "❯")
-    #expect(!promptLine.contains("as"))
+    #expect(promptLine.contains("as"))
 }
 
 @MainActor
@@ -5007,6 +5054,49 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(directoryRun.style.foreground == .palette256(33))
     #expect(statusRun.style.foreground == .rgb(246, 226, 183))
+}
+
+@MainActor
+@Test func ghosttyRenderedReplayKeepsDirectForegroundOverBackgroundOnlyReplayLine() async throws {
+    let directBuffer = StaticStyledTerminalBuffer(
+        lines: [
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(text: "plain text here", style: TerminalTextStyle()),
+            ]),
+            TerminalRenderedLine(runs: [
+                TerminalTextRun(text: "STATUS BAR", style: TerminalTextStyle(foreground: .ansi16(2))),
+            ]),
+        ],
+        cursorState: TerminalCursorState(row: 1, column: 0, shape: .block, isVisible: true)
+    )
+    let session = TerminalSession(
+        title: "Foreground over background",
+        subtitle: "No shell",
+        tint: .systemPurple,
+        buffer: directBuffer,
+        launchShell: false
+    )
+    defer {
+        session.stop()
+    }
+
+    // The raw stream re-parses "STATUS BAR" with a painted background and NO foreground.
+    // The merge must NOT discard the direct green foreground just because the re-parsed
+    // line paints more background cells (the "colors lost on tab switch / resize" bug).
+    session.ingestTestingData(Data((
+        "plain text here\r\n" +
+        "\u{1B}[48;5;236mSTATUS BAR\u{1B}[0m"
+    ).utf8))
+
+    let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(replayData)
+    let replayedLines = replayedBuffer.styledSnapshot(range: 0..<replayedBuffer.lineCount)
+    let statusLine = try #require(replayedLines.first { line in
+        line.runs.contains { $0.text.contains("STATUS BAR") }
+    })
+    let statusRun = try #require(statusLine.runs.first { $0.text.contains("STATUS BAR") })
+    #expect(statusRun.style.foreground == .ansi16(2))
 }
 
 @MainActor

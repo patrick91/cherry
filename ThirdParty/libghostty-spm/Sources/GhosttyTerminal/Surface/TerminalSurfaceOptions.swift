@@ -12,23 +12,34 @@ public struct TerminalSurfaceOptions: Sendable {
     public var fontSize: Float?
     public var workingDirectory: String?
     public var context: TerminalSurfaceContext
+    /// For the `.exec` backend: the command ghostty spawns (word-split like a
+    /// shell). `nil` => ghostty's default shell.
+    public var execCommand: String?
+    /// For the `.exec` backend: environment variables for the spawned child.
+    public var execEnvironment: [String: String]
 
     public init(
         backend: TerminalSessionBackend = .exec,
         fontSize: Float? = nil,
         workingDirectory: String? = nil,
-        context: TerminalSurfaceContext = .window
+        context: TerminalSurfaceContext = .window,
+        execCommand: String? = nil,
+        execEnvironment: [String: String] = [:]
     ) {
         self.backend = backend
         self.fontSize = fontSize
         self.workingDirectory = workingDirectory
         self.context = context
+        self.execCommand = execCommand
+        self.execEnvironment = execEnvironment
     }
 
     func isEquivalent(to other: TerminalSurfaceOptions) -> Bool {
         fontSize == other.fontSize
             && workingDirectory == other.workingDirectory
             && context == other.context
+            && execCommand == other.execCommand
+            && execEnvironment == other.execEnvironment
             && backend.isEquivalent(to: other.backend)
     }
 

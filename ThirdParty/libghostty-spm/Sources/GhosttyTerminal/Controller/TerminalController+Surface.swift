@@ -73,18 +73,32 @@ extension TerminalController {
         workingDirectory: String?,
         platformSetup: (inout ghostty_surface_config_s) -> Void
     ) -> ghostty_surface_t? {
-        guard let workingDirectory else {
-            return buildSurface(
-                app: app,
-                bridge: bridge,
-                configuration: configuration,
-                config: &config,
-                platformSetup: platformSetup
-            )
+        // strdup arena: every C string we hand to ghostty_surface_config_s
+        // (working_directory, command, env keys/values) must stay alive until
+        // ghostty_surface_new returns. `defer` frees them after buildSurface.
+        var allocations: [UnsafeMutablePointer<CChar>] = []
+        func cstr(_ string: String) -> UnsafePointer<CChar> {
+            let pointer = strdup(string)!
+            allocations.append(pointer)
+            return UnsafePointer(pointer)
+        }
+        defer { allocations.forEach { free($0) } }
+
+        if let workingDirectory {
+            config.working_directory = cstr(workingDirectory)
+        }
+        if let command = configuration.execCommand, !command.isEmpty {
+            config.command = cstr(command)
         }
 
-        return workingDirectory.withCString { ptr in
-            config.working_directory = ptr
+        var envVars: [ghostty_env_var_s] = configuration.execEnvironment.map { key, value in
+            ghostty_env_var_s(key: cstr(key), value: cstr(value))
+        }
+        return envVars.withUnsafeMutableBufferPointer { buffer in
+            if let base = buffer.baseAddress, !buffer.isEmpty {
+                config.env_vars = base
+                config.env_var_count = buffer.count
+            }
             return buildSurface(
                 app: app,
                 bridge: bridge,

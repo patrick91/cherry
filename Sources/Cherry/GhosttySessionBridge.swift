@@ -2453,14 +2453,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         for session: TerminalSession,
         inMemorySession: InMemoryTerminalSession
     ) -> TerminalSurfaceOptions {
-        TerminalSurfaceOptions(
-            // Native-PTY mode (CHERRY_NATIVE_PTY): the ghostty surface owns the PTY
-            // (spawns the shell in the cwd) instead of Cherry feeding bytes to an
-            // in-memory session. EXEC means there is no host->surface output path,
-            // so replay is impossible by construction.
+        // Native-PTY mode (CHERRY_NATIVE_PTY): the ghostty surface owns the PTY
+        // (spawns Cherry's resolved shell + env in the cwd) instead of Cherry
+        // feeding bytes to an in-memory session. EXEC means there is no
+        // host->surface output path, so replay is impossible by construction.
+        let native = Self.nativePTYEnabled ? session.nativeExecLaunch : nil
+        return TerminalSurfaceOptions(
             backend: Self.nativePTYEnabled ? .exec : .inMemory(inMemorySession),
             workingDirectory: session.workingDirectory,
-            context: .window
+            context: .window,
+            execCommand: native?.command,
+            execEnvironment: native?.environment ?? [:]
         )
     }
 

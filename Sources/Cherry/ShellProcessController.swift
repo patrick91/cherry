@@ -377,6 +377,77 @@ final class ShellProcessController: @unchecked Sendable {
 
     static let defaultShellName = URL(fileURLWithPath: defaultShellPath).lastPathComponent
 
+    /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
+    /// a libghostty-spawned shell matches the host-managed forkpty launch.
+    ///
+    /// IMPORTANT: this MIRRORS the forkpty child setup below (the `setenv` block
+    /// ~908-953 and the `execv` argv ~956-994). Keep the two in sync — host-managed
+    /// uses the forkpty path; native-PTY uses this. ghostty word-splits `command`
+    /// like a shell, so the common shell-integration path returns `"<shell> -l"`
+    /// and delivers the startup/agent command via `CHERRY_STARTUP_COMMAND`.
+    static func nativeExecLaunch(
+        for configuration: Configuration
+    ) -> (command: String, environment: [String: String]) {
+        let shellPath = configuration.shellPath
+        let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
+
+        let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
+        let inheritedBootstrapZDOTDIR = ProcessInfo.processInfo.environment["CHERRY_BOOTSTRAP_ZDOTDIR"]
+        let originalZDOTDIR: String? = inheritedZDOTDIR == inheritedBootstrapZDOTDIR ? nil : inheritedZDOTDIR
+
+        let extraTerminfoDirs = Self.preferredTerminfo.additionalDirs
+        let inheritedTerminfoDirs = ProcessInfo.processInfo.environment["TERMINFO_DIRS"]
+        let mergedTerminfoDirs: String? = {
+            guard let extraTerminfoDirs, !extraTerminfoDirs.isEmpty else { return nil }
+            guard let inheritedTerminfoDirs, !inheritedTerminfoDirs.isEmpty else { return extraTerminfoDirs }
+            return "\(extraTerminfoDirs):\(inheritedTerminfoDirs)"
+        }()
+
+        var environment = configuration.environment
+        environment["TERM"] = configuration.term
+        if let mergedTerminfoDirs { environment["TERMINFO_DIRS"] = mergedTerminfoDirs }
+        environment["PWD"] = configuration.workingDirectory
+        environment["TERM_PROGRAM"] = "Ghostty"
+        environment["CHERRY_TERM_PROGRAM"] = "Cherry"
+        environment["COLORTERM"] = "truecolor"
+        environment["INSIDE_CHERRY"] = "1"
+        if let projectRoot = configuration.projectRoot, !projectRoot.isEmpty {
+            environment[CherryControl.projectRootEnvironmentKey] = projectRoot
+        }
+        if let processID = configuration.processID, !processID.isEmpty {
+            environment[CherryControl.processIDEnvironmentKey] = processID
+        }
+        if let agentID = configuration.agentID, !agentID.isEmpty {
+            environment[CherryControl.agentIDEnvironmentKey] = agentID
+        }
+
+        let command: String
+        if let shellIntegration {
+            environment["CHERRY_BOOTSTRAP_ZDOTDIR"] = shellIntegration.zdotdir
+            if let startupCommand = configuration.startupCommand, !startupCommand.isEmpty {
+                environment["CHERRY_STARTUP_COMMAND"] = startupCommand
+            }
+            if let originalZDOTDIR, !originalZDOTDIR.isEmpty {
+                environment["CHERRY_ORIGINAL_ZDOTDIR"] = originalZDOTDIR
+            }
+            environment["ZDOTDIR"] = shellIntegration.zdotdir
+            command = "\(shellPath) -l"
+        } else if let startupCommand = configuration.startupCommand, !startupCommand.isEmpty {
+            // No shell integration: a login+interactive shell that execs the
+            // startup command (mirrors the `execv` fallback at ~956-979).
+            command = "\(shellPath) -l -i -c \(singleQuoted("exec \(startupCommand)"))"
+        } else {
+            command = "\(shellPath) -l"
+        }
+
+        return (command, environment)
+    }
+
+    /// POSIX single-quote a token so ghostty's shell-style splitter keeps it whole.
+    private static func singleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     struct TerminfoSelection {
         let term: String
         // Colon-separated dir list to prepend to the child PTY's

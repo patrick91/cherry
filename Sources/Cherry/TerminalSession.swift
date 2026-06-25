@@ -2741,6 +2741,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         return bridge
     }
 
+    /// Shared launch configuration for the host-managed forkpty shell AND the
+    /// native-PTY (ghostty EXEC) shell, so the two stay in parity.
+    private func shellLaunchConfiguration() -> ShellProcessController.Configuration {
+        ShellProcessController.Configuration(
+            shellPath: ShellProcessController.defaultShellPath,
+            workingDirectory: workingDirectory,
+            projectRoot: projectRoot,
+            processID: id.uuidString,
+            agentID: kind == .agent ? id.uuidString : nil,
+            environment: launchEnvironment,
+            term: ShellProcessController.preferredTerminfo.term,
+            initialSize: viewportSize,
+            startupCommand: launchCommand
+        )
+    }
+
+    /// Native-PTY (EXEC) command + environment for the ghostty surface to spawn,
+    /// resolved from the same configuration the host-managed shell uses.
+    var nativeExecLaunch: (command: String?, environment: [String: String]) {
+        let resolved = ShellProcessController.nativeExecLaunch(for: shellLaunchConfiguration())
+        return (resolved.command, resolved.environment)
+    }
+
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
@@ -2770,21 +2793,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         bumpRevision()
 
+        if GhosttySessionBridge.nativePTYEnabled {
+            // Native-PTY: the ghostty surface owns/spawns the PTY (see
+            // GhosttySessionBridge.makeOptions). Do NOT also fork a host shell —
+            // that would be a second shell (and a SECOND agent process for agent
+            // panes). Reach .live so the surface mounts. Input flows through the
+            // surface directly, not the host writer.
+            // KNOWN GAP: no forkpty onExit here, so shell-exit detection waits on
+            // the ghostty childexited action (Stage C6); the session stays .live
+            // until then.
+            shellProcess = nil
+            hostInputWriter.set(nil)
+            childProcessID = nil
+            state = .live
+            bumpRevision()
+            return
+        }
+
         do {
             let processor = processor
             let traceRecorder = traceRecorder
             let process = try ShellProcessController(
-                configuration: .init(
-                    shellPath: ShellProcessController.defaultShellPath,
-                    workingDirectory: workingDirectory,
-                    projectRoot: projectRoot,
-                    processID: id.uuidString,
-                    agentID: kind == .agent ? id.uuidString : nil,
-                    environment: launchEnvironment,
-                    term: ShellProcessController.preferredTerminfo.term,
-                    initialSize: viewportSize,
-                    startupCommand: launchCommand
-                ),
+                configuration: shellLaunchConfiguration(),
                 onData: { data in
                     TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
                     traceRecorder?.recordOutput(data)

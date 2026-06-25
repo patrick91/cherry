@@ -312,11 +312,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// surfaces evicted past the cap fall back to the rebuild-by-replay cold path.
     ///
     /// `nil` disables keep-warm entirely (the old replay-on-every-switch
-    /// behavior). Override at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N` (or `=0`
-    /// to disable), or build the old behavior with `-DCHERRY_REPLAY_ON_SWITCH`
-    /// (`CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app`). The active
-    /// surface is always live; this only bounds how many *inactive* ones stay warm.
+    /// behavior); `unlimitedLiveSurfaceLimit` never evicts (keep every surface
+    /// alive forever, the pure-Ghostty model — memory grows with tab count).
+    /// Override at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N` (`=0` to disable,
+    /// `=unlimited` or a negative value to never evict), or build the old behavior
+    /// with `-DCHERRY_REPLAY_ON_SWITCH` (`CHERRY_KEEP_SURFACES_WARM=0
+    /// Scripts/install-local-app`). The active surface is always live; this only
+    /// bounds how many *inactive* ones stay warm.
     static var liveSurfaceLimit: Int? = resolveInitialLiveSurfaceLimit()
+
+    /// Sentinel for "never evict" — large enough that the eviction loop never
+    /// fires, so every parked surface stays warm.
+    static let unlimitedLiveSurfaceLimit = Int.max
 
     /// Default cap when nothing overrides it. 64 is effectively "keep everything
     /// warm" for realistic tab counts while still bounding a runaway; measured
@@ -324,11 +331,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private static let defaultLiveSurfaceLimit = 64
 
     private static func resolveInitialLiveSurfaceLimit() -> Int? {
-        if let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"],
-           let value = Int(raw.trimmingCharacters(in: .whitespaces)) {
-            // Explicit runtime override: a positive value sets the cap; 0 (or
-            // negative) disables keep-warm and restores replay-on-switch.
-            return value > 0 ? value : nil
+        if let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"] {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces).lowercased()
+            if trimmed == "unlimited" || trimmed == "all" {
+                return unlimitedLiveSurfaceLimit
+            }
+            if let value = Int(trimmed) {
+                // Explicit runtime override: a positive value sets the cap, a
+                // negative value never evicts, 0 disables keep-warm.
+                if value == 0 { return nil }
+                return value < 0 ? unlimitedLiveSurfaceLimit : value
+            }
         }
         #if CHERRY_REPLAY_ON_SWITCH
         return nil

@@ -5929,6 +5929,36 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerNeverEvictsSurfacesWhenUnlimited() async throws {
+    // The pure-Ghostty "keep tabs forever" mode: with the unlimited sentinel, no
+    // surface is ever evicted no matter how many sessions are cycled, so every
+    // bridge stays alive (memory grows with tab count, like Ghostty).
+    GhosttySessionBridge.liveSurfaceLimit = GhosttySessionBridge.unlimitedLiveSurfaceLimit
+    let sessions = (0..<8).map { index in
+        TerminalSession(title: "U\(index)", subtitle: "No shell", tint: .systemGray, launchShell: false)
+    }
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    defer {
+        container.detachActiveSession()
+        sessions.forEach {
+            $0.releaseGhosttyBridge()
+            $0.stop()
+        }
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
+    }
+
+    let firstBridge = sessions[0].ghosttyBridge
+    for session in sessions {
+        container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    }
+
+    // All eight surfaces stay alive — nothing evicted — and the first is reused.
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 8)
+    #expect(sessions[0].ghosttyBridge === firstBridge)
+}
+
+@MainActor
 @Test func ghosttyContainerClearsSidebarSnapshotWhenSwitchingSessions() {
     let first = TerminalSession(
         title: "First",

@@ -307,6 +307,28 @@ Cherry-specific overhead to watch:
 - `GhosttyOutputSink` coalescing helps progress-frame storms, but should not add input latency after host input.
 - Surface detach/reattach should not leak `GhosttySessionBridge` objects or raw output observers.
 
+### Experimental: keep background surfaces warm (`CHERRY_LIVE_SURFACE_LIMIT`)
+
+By default Cherry frees a Ghostty surface when its tab is switched away from and
+rebuilds the screen by replaying bytes (`renderedReplayOutput`) on return. That
+replay round-trip is the source of the styled-replay recovery/merge machinery.
+Set `CHERRY_LIVE_SURFACE_LIMIT=N` to instead keep the N most-recently-used
+*background* surfaces alive and fed (the output observer stays installed), so a
+switch-back is a re-show with no replay — matching how Ghostty and cmux keep a
+live surface per pane. `Scripts/install-local-app` bakes this into the installed
+`.app` by default (no runtime env var needed — it compiles in a generous default
+cap, `bakedInWarmSurfaceLimit`, 64, which a runtime `CHERRY_LIVE_SURFACE_LIMIT`
+still overrides). Build the older replay-on-switch behavior with
+`CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app`. Note the in-code default
+(`swift run`, `swift build`, the test suite) is still replay-on-switch; only
+installed builds default to warm. The active surface is always live; this only bounds how
+many inactive ones stay warm, with the oldest evicted (and fully released) past
+the cap. This trades memory — N extra live surfaces (grid + Metal layer +
+observer, each still parsing hidden output) — for eliminating per-switch replay.
+Use the app-soak harness to measure the per-surface RSS/CPU cost at your real
+tab count before raising N; `last_ghostty_live_bridge_count` and
+`last_ghostty_output_observer_count` in the report show how many stay resident.
+
 ## Tooling
 
 Currently useful without installing anything extra:

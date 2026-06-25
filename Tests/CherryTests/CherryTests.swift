@@ -5796,6 +5796,96 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerKeepsRecentSurfaceAliveUnderLiveSurfaceLimit() async throws {
+    // With the live-surface LRU enabled, switching away from a tab must NOT tear
+    // its surface down. The bridge stays alive and its output observer stays
+    // installed (still fed), so a switch-back is a re-show with no byte replay.
+    GhosttySessionBridge.liveSurfaceLimit = 4
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Second",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    defer {
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+        GhosttySessionBridge.liveSurfaceLimit = nil
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    let firstBridge = first.ghosttyBridge
+    firstBridge.installOutputObserverForTesting()
+    #expect(first.rawOutputObserverCount == 1)
+
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    // Parked, not released: observer still installed, same bridge object, and
+    // both surfaces remain live (no teardown on switch).
+    #expect(first.rawOutputObserverCount == 1)
+    #expect(first.ghosttyBridge === firstBridge)
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 2)
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(first.ghosttyBridge === firstBridge)
+    #expect(first.rawOutputObserverCount == 1)
+    withExtendedLifetime(firstBridge) {}
+}
+
+@MainActor
+@Test func ghosttyContainerEvictsOldestSurfaceBeyondLiveSurfaceLimit() async throws {
+    // The LRU is bounded: with a background cap of 1, parking a second surface
+    // must evict and fully release the oldest one, which then falls back to the
+    // cold replay path (a fresh bridge) on a later switch-back.
+    GhosttySessionBridge.liveSurfaceLimit = 1
+    let a = TerminalSession(title: "A", subtitle: "No shell", tint: .systemBlue, launchShell: false)
+    let b = TerminalSession(title: "B", subtitle: "No shell", tint: .systemGreen, launchShell: false)
+    let c = TerminalSession(title: "C", subtitle: "No shell", tint: .systemOrange, launchShell: false)
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    defer {
+        container.detachActiveSession()
+        a.releaseGhosttyBridge()
+        b.releaseGhosttyBridge()
+        c.releaseGhosttyBridge()
+        a.stop()
+        b.stop()
+        c.stop()
+        GhosttySessionBridge.liveSurfaceLimit = nil
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
+    }
+
+    container.configure(with: a, colorScheme: .dark, allowsAutoFocus: false)
+    let aBridge = a.ghosttyBridge
+    aBridge.installOutputObserverForTesting()
+    #expect(a.rawOutputObserverCount == 1)
+
+    // Park A (count 1 == limit, no eviction yet).
+    container.configure(with: b, colorScheme: .dark, allowsAutoFocus: false)
+    let bBridge = b.ghosttyBridge
+    bBridge.installOutputObserverForTesting()
+    #expect(a.rawOutputObserverCount == 1)
+
+    // Parking B pushes the parked count past the limit and evicts A.
+    container.configure(with: c, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(a.rawOutputObserverCount == 0)
+    #expect(b.rawOutputObserverCount == 1)
+    #expect(a.ghosttyBridge !== aBridge)
+    withExtendedLifetime(bBridge) {}
+}
+
+@MainActor
 @Test func ghosttyContainerClearsSidebarSnapshotWhenSwitchingSessions() {
     let first = TerminalSession(
         title: "First",

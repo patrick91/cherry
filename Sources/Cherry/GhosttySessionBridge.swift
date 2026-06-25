@@ -302,6 +302,86 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     static var detachedSurfaceReleaseDelay: Duration = .milliseconds(750)
     private static let transientStartupShrinkInterval: TimeInterval = 0.9
 
+    /// Optional cap on the number of *background* (parked) Ghostty surfaces kept
+    /// warm across tab switches.
+    ///
+    /// `nil` (the default) reproduces the historical behavior: a surface is torn
+    /// down the moment its tab is switched away from, and rebuilt by replaying
+    /// bytes on return — the path the `renderedReplayOutput` / style-recovery
+    /// machinery exists to serve. When set to N, the N most-recently-used
+    /// background surfaces stay alive *and fed* (the output observer is left
+    /// installed), so switching back is a plain re-show with no rebuild and no
+    /// replay — matching how Ghostty and cmux keep a live surface per pane.
+    /// Opt in at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N`, or bake it into a
+    /// build with `-DCHERRY_KEEP_SURFACES_WARM` (see `bakedInWarmSurfaceLimit`).
+    /// The active surface is always live; this only bounds how many *inactive*
+    /// ones are kept warm.
+    static var liveSurfaceLimit: Int? = resolveInitialLiveSurfaceLimit()
+
+    /// Compile-time default applied when `CHERRY_LIVE_SURFACE_LIMIT` is not set
+    /// in the environment, but only when the build defines
+    /// `CHERRY_KEEP_SURFACES_WARM`. 64 is effectively "keep everything warm" for
+    /// realistic tab counts while still bounding a runaway. Build a baked `.app`
+    /// with `CHERRY_KEEP_SURFACES_WARM=1 Scripts/install-local-app` — no runtime
+    /// flag needed on the target machine.
+    private static let bakedInWarmSurfaceLimit = 64
+
+    private static func resolveInitialLiveSurfaceLimit() -> Int? {
+        if let fromEnvironment = liveSurfaceLimitFromEnvironment() {
+            return fromEnvironment
+        }
+        #if CHERRY_KEEP_SURFACES_WARM
+        return bakedInWarmSurfaceLimit
+        #else
+        return nil
+        #endif
+    }
+
+    private static func liveSurfaceLimitFromEnvironment() -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"],
+              let value = Int(raw.trimmingCharacters(in: .whitespaces)),
+              value > 0
+        else {
+            return nil
+        }
+        return value
+    }
+
+    /// Parked (detached-but-alive) bridges in least-recently-used order. A parked
+    /// bridge is still owned by its session's `ghosttyBridgeStorage`; this list
+    /// governs when that ownership ends — eviction fully releases the surface so a
+    /// later switch-back falls back to the cold replay path.
+    private static var parkedBridges: [GhosttySessionBridge] = []
+
+    private static func notePark(_ bridge: GhosttySessionBridge) {
+        parkedBridges.removeAll { $0 === bridge }
+        parkedBridges.append(bridge)
+        guard let limit = liveSurfaceLimit, limit > 0 else { return }
+        while parkedBridges.count > limit {
+            parkedBridges.removeFirst().releaseFromLiveSurfaceLRU()
+        }
+    }
+
+    private static func noteUnpark(_ bridge: GhosttySessionBridge) {
+        parkedBridges.removeAll { $0 === bridge }
+    }
+
+    static func resetLiveSurfaceLRUForTesting() {
+        parkedBridges.removeAll()
+    }
+
+    private func releaseFromLiveSurfaceLRU() {
+        // Drop the session's ownership of this bridge so a later switch-back
+        // lazily rebuilds a fresh surface (cold path). `releaseGhosttyBridge`
+        // funnels through `releaseResources`, which frees the surface and removes
+        // this bridge from `parkedBridges`.
+        if let session = proxy.session {
+            session.releaseGhosttyBridge()
+        } else {
+            releaseResources()
+        }
+    }
+
     let terminalView: TerminalView
 
     private let proxy: GhosttySessionProxy
@@ -365,6 +445,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func attach(to container: GhosttyTerminalContainerView) {
         guard !isReleased else { return }
         cancelDetachedSurfaceRelease()
+        Self.noteUnpark(self)
         let previousContainer = scrollContainer
         let isAlreadyInstalled = previousContainer === container && terminalView.superview != nil
         TerminalPerformanceMonitor.recordBridgeAttach(reused: isAlreadyInstalled)
@@ -405,7 +486,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         scrollContainer = nil
-        if canPreserveSurface {
+        if Self.liveSurfaceLimit != nil, canPreserveSurface {
+            // Live-surface LRU: keep the surface alive and fed (the output
+            // observer is left installed), so a switch-back is a re-show with no
+            // replay. Release timing is governed by LRU eviction in `notePark`,
+            // not the per-bridge timer.
+            cancelDetachedSurfaceRelease()
+            Self.notePark(self)
+        } else if canPreserveSurface {
             scheduleDetachedSurfaceRelease()
         } else {
             cancelDetachedSurfaceRelease()
@@ -495,6 +583,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         guard !isReleased else { return }
         isReleased = true
         Self.liveBridgeCount -= 1
+        Self.noteUnpark(self)
         cancelDetachedSurfaceRelease()
         pendingFeedActivation = false
         uninstallOutputObserver()
@@ -2490,8 +2579,15 @@ final class GhosttyTerminalContainerView: NSView {
         if activeSession !== session {
             resetSidebarAnimationStateForSurfaceChange()
             if let activeSession {
-                activeSession.detachGhosttyBridge(from: self)
-                activeSession.releaseGhosttyBridge()
+                if GhosttySessionBridge.liveSurfaceLimit != nil {
+                    // Park the outgoing surface in the live-surface LRU instead of
+                    // tearing it down; its bridge stays owned by the session so a
+                    // switch-back re-shows it with no replay.
+                    activeSession.detachGhosttyBridge(from: self, preservingSurface: true)
+                } else {
+                    activeSession.detachGhosttyBridge(from: self)
+                    activeSession.releaseGhosttyBridge()
+                }
             }
             activeSession = session
             session.ghosttyBridge.attach(to: self)

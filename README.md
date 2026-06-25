@@ -37,6 +37,14 @@ You can customize the destination/name if you want a separate dogfood build:
 CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
 ```
 
+Installed builds keep recently-used Ghostty terminal surfaces alive across tab
+switches (no per-switch replay). To build the older replay-on-switch behavior
+instead, opt out:
+
+```bash
+CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app
+```
+
 By default the installer uses ad-hoc signing, which can make macOS privacy
 permissions reset after each rebuild because the code identity changes. To keep
 Desktop/Documents/etc. permissions stable, sign local builds with a persistent

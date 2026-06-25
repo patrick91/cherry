@@ -302,49 +302,39 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     static var detachedSurfaceReleaseDelay: Duration = .milliseconds(750)
     private static let transientStartupShrinkInterval: TimeInterval = 0.9
 
-    /// Optional cap on the number of *background* (parked) Ghostty surfaces kept
-    /// warm across tab switches.
+    /// Cap on the number of *background* (parked) Ghostty surfaces kept warm
+    /// across tab switches.
     ///
-    /// `nil` (the default) reproduces the historical behavior: a surface is torn
-    /// down the moment its tab is switched away from, and rebuilt by replaying
-    /// bytes on return — the path the `renderedReplayOutput` / style-recovery
-    /// machinery exists to serve. When set to N, the N most-recently-used
+    /// Warm by default (`defaultLiveSurfaceLimit`, 64): the most-recently-used
     /// background surfaces stay alive *and fed* (the output observer is left
     /// installed), so switching back is a plain re-show with no rebuild and no
-    /// replay — matching how Ghostty and cmux keep a live surface per pane.
-    /// Opt in at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N`, or bake it into a
-    /// build with `-DCHERRY_KEEP_SURFACES_WARM` (see `bakedInWarmSurfaceLimit`).
-    /// The active surface is always live; this only bounds how many *inactive*
-    /// ones are kept warm.
+    /// replay — matching how Ghostty and cmux keep a live surface per pane. Only
+    /// surfaces evicted past the cap fall back to the rebuild-by-replay cold path.
+    ///
+    /// `nil` disables keep-warm entirely (the old replay-on-every-switch
+    /// behavior). Override at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N` (or `=0`
+    /// to disable), or build the old behavior with `-DCHERRY_REPLAY_ON_SWITCH`
+    /// (`CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app`). The active
+    /// surface is always live; this only bounds how many *inactive* ones stay warm.
     static var liveSurfaceLimit: Int? = resolveInitialLiveSurfaceLimit()
 
-    /// Compile-time default applied when `CHERRY_LIVE_SURFACE_LIMIT` is not set
-    /// in the environment, but only when the build defines
-    /// `CHERRY_KEEP_SURFACES_WARM`. 64 is effectively "keep everything warm" for
-    /// realistic tab counts while still bounding a runaway. Build a baked `.app`
-    /// with `CHERRY_KEEP_SURFACES_WARM=1 Scripts/install-local-app` — no runtime
-    /// flag needed on the target machine.
-    private static let bakedInWarmSurfaceLimit = 64
+    /// Default cap when nothing overrides it. 64 is effectively "keep everything
+    /// warm" for realistic tab counts while still bounding a runaway; measured
+    /// cost is ~3 MiB per light surface, ~8-10 MiB with heavy scrollback.
+    private static let defaultLiveSurfaceLimit = 64
 
     private static func resolveInitialLiveSurfaceLimit() -> Int? {
-        if let fromEnvironment = liveSurfaceLimitFromEnvironment() {
-            return fromEnvironment
+        if let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"],
+           let value = Int(raw.trimmingCharacters(in: .whitespaces)) {
+            // Explicit runtime override: a positive value sets the cap; 0 (or
+            // negative) disables keep-warm and restores replay-on-switch.
+            return value > 0 ? value : nil
         }
-        #if CHERRY_KEEP_SURFACES_WARM
-        return bakedInWarmSurfaceLimit
-        #else
+        #if CHERRY_REPLAY_ON_SWITCH
         return nil
+        #else
+        return defaultLiveSurfaceLimit
         #endif
-    }
-
-    private static func liveSurfaceLimitFromEnvironment() -> Int? {
-        guard let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"],
-              let value = Int(raw.trimmingCharacters(in: .whitespaces)),
-              value > 0
-        else {
-            return nil
-        }
-        return value
     }
 
     /// Parked (detached-but-alive) bridges in least-recently-used order. A parked
@@ -368,6 +358,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     static func resetLiveSurfaceLRUForTesting() {
         parkedBridges.removeAll()
+        liveSurfaceLimit = resolveInitialLiveSurfaceLimit()
     }
 
     private func releaseFromLiveSurfaceLRU() {

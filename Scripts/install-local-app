@@ -16,19 +16,19 @@ ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
 
 cd "$ROOT"
 
-# Live-surface keep-warm: ON by default for installed dogfood builds, so the
-# installed .app keeps recently-used Ghostty surfaces alive across tab switches
-# instead of freeing + replaying them. Opt out (old replay-on-switch behavior)
-# with CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app.
+# Live-surface keep-warm is ON by default (the in-code default keeps
+# recently-used Ghostty surfaces alive across tab switches instead of freeing +
+# replaying them). Opt out (old replay-on-switch behavior) with
+# CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app.
 # (EXTRA_BUILD_ARGS is a plain string, not a bash array, so empty expansion is
 # safe under `set -u` on macOS's stock bash 3.2; these flags contain no spaces.)
 KEEP_WARM="${CHERRY_KEEP_SURFACES_WARM:-1}"
 EXTRA_BUILD_ARGS=""
-if [[ "$KEEP_WARM" != "0" ]]; then
-  EXTRA_BUILD_ARGS="-Xswiftc -DCHERRY_KEEP_SURFACES_WARM"
-  echo "Building WARM (live surfaces kept warm; opt out with CHERRY_KEEP_SURFACES_WARM=0)"
-else
+if [[ "$KEEP_WARM" == "0" ]]; then
+  EXTRA_BUILD_ARGS="-Xswiftc -DCHERRY_REPLAY_ON_SWITCH"
   echo "Building STOCK (replay-on-switch; the old behavior)"
+else
+  echo "Building WARM (live surfaces kept warm; the default)"
 fi
 
 swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS

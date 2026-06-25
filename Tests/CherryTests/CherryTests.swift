@@ -5731,6 +5731,9 @@ private struct MCPWhoamiPayload: Decodable {
         tint: .systemGreen,
         launchShell: false
     )
+    // Covers the opt-out replay-on-switch path (keep-warm disabled): switching
+    // away tears the surface down, so switching back rebuilds a fresh bridge.
+    GhosttySessionBridge.liveSurfaceLimit = nil
     let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
     let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
 
@@ -5740,6 +5743,7 @@ private struct MCPWhoamiPayload: Decodable {
         second.releaseGhosttyBridge()
         first.stop()
         second.stop()
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
     }
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
@@ -5773,6 +5777,9 @@ private struct MCPWhoamiPayload: Decodable {
         tint: .systemGreen,
         launchShell: false
     )
+    // Covers the opt-out replay-on-switch path (keep-warm disabled): the detached
+    // surface is released, dropping its output observer.
+    GhosttySessionBridge.liveSurfaceLimit = nil
     let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
     let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
     defer {
@@ -5781,6 +5788,7 @@ private struct MCPWhoamiPayload: Decodable {
         second.releaseGhosttyBridge()
         first.stop()
         second.stop()
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
     }
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
@@ -5883,6 +5891,41 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(b.rawOutputObserverCount == 1)
     #expect(a.ghosttyBridge !== aBridge)
     withExtendedLifetime(bBridge) {}
+}
+
+@MainActor
+@Test func ghosttyContainerKeepsLiveSurfaceCountBoundedUnderLongChurn() async throws {
+    // The reason the keep-warm path is safe for long-lived workspaces: no matter
+    // how many sessions are cycled through, the number of live surfaces stays
+    // bounded by the cap (+1 active). This is the deterministic guard behind the
+    // "doesn't grow unbounded over hours" soak result — evicted surfaces must be
+    // released, not accumulated.
+    GhosttySessionBridge.liveSurfaceLimit = 2
+    let sessions = (0..<8).map { index in
+        TerminalSession(title: "S\(index)", subtitle: "No shell", tint: .systemGray, launchShell: false)
+    }
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    defer {
+        container.detachActiveSession()
+        sessions.forEach {
+            $0.releaseGhosttyBridge()
+            $0.stop()
+        }
+        GhosttySessionBridge.liveSurfaceLimit = nil
+        GhosttySessionBridge.resetLiveSurfaceLRUForTesting()
+    }
+
+    let firstBridge = sessions[0].ghosttyBridge
+    for session in sessions {
+        container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    }
+
+    // Active + cap(2) parked = 3 live bridges, regardless of how many were cycled.
+    #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 3)
+    // The earliest sessions were evicted and fully released (storage dropped), so
+    // re-accessing rebuilds a fresh bridge — the cold replay path.
+    #expect(sessions[0].ghosttyBridge !== firstBridge)
 }
 
 @MainActor

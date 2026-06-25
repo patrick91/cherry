@@ -2432,12 +2432,33 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return true
     }
 
+    /// Flag for adopting ghostty's native-PTY model: when on, surfaces use the
+    /// EXEC backend (ghostty owns the PTY/Screen) instead of host-managed in-memory
+    /// feeding — so replay is impossible by construction. Enable with
+    /// `CHERRY_NATIVE_PTY=1` or `-DCHERRY_NATIVE_PTY`
+    /// (`CHERRY_NATIVE_PTY=1 Scripts/install-local-app`). Default off.
+    static let nativePTYEnabled: Bool = {
+        if let raw = ProcessInfo.processInfo.environment["CHERRY_NATIVE_PTY"],
+           ["1", "true", "yes", "on"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased()) {
+            return true
+        }
+        #if CHERRY_NATIVE_PTY
+        return true
+        #else
+        return false
+        #endif
+    }()
+
     private static func makeOptions(
         for session: TerminalSession,
         inMemorySession: InMemoryTerminalSession
     ) -> TerminalSurfaceOptions {
         TerminalSurfaceOptions(
-            backend: .inMemory(inMemorySession),
+            // Native-PTY mode (CHERRY_NATIVE_PTY): the ghostty surface owns the PTY
+            // (spawns the shell in the cwd) instead of Cherry feeding bytes to an
+            // in-memory session. EXEC means there is no host->surface output path,
+            // so replay is impossible by construction.
+            backend: Self.nativePTYEnabled ? .exec : .inMemory(inMemorySession),
             workingDirectory: session.workingDirectory,
             context: .window
         )

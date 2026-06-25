@@ -31,6 +31,12 @@ else
   echo "Building WARM (live surfaces kept warm; the default)"
 fi
 
+# Experimental: native-PTY model (ghostty owns the shell). CHERRY_NATIVE_PTY=1.
+if [[ -n "${CHERRY_NATIVE_PTY:-}" && "${CHERRY_NATIVE_PTY}" != "0" ]]; then
+  EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS -Xswiftc -DCHERRY_NATIVE_PTY"
+  echo "Building with CHERRY_NATIVE_PTY (ghostty owns the PTY, experimental)"
+fi
+
 swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS
 swift build -c "$CONFIGURATION" --product CherryMCP
 

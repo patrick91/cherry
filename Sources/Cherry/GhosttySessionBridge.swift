@@ -698,11 +698,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return true
         }
 
-        proxy.session?.resize(
-            columns: Int(gridMetrics.columns),
-            rows: Int(gridMetrics.rows),
-            forceShellResize: true
-        )
+        resizeSessionIfNeededToMountedGrid(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows))
         return true
     }
 
@@ -779,11 +775,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         ) {
             return
         }
-        proxy.session?.resize(
-            columns: Int(gridMetrics.columns),
-            rows: Int(gridMetrics.rows),
-            forceShellResize: true
-        )
+        resizeSessionIfNeededToMountedGrid(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows))
         replayCurrentFrameForMountedGrid(force: true)
     }
 
@@ -1508,6 +1500,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             if let markEnd = zshPromptEndOfLineMarkEnd(in: bytes, at: index) {
                 didStrip = true
                 stripped.append(UInt8(ascii: "\r"))
+                stripped.append(contentsOf: [0x1B, UInt8(ascii: "["), UInt8(ascii: "K")])
                 index = markEnd
                 continue
             }
@@ -1581,7 +1574,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         guard bytes[scan] == UInt8(ascii: "\r") else { return false }
 
         scan += 1
-        guard scan < bytes.count else { return false }
+        guard scan < bytes.count else { return true }
         if bytes[scan] == UInt8(ascii: " ") {
             return scan + 1 == bytes.count
         }
@@ -2149,11 +2142,26 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             "pixels=\(viewport.widthPixels)x\(viewport.heightPixels) " +
             "terminalBounds=\(terminalView.bounds.size)"
         )
-        proxy.session?.resize(
-            columns: Int(viewport.columns),
-            rows: Int(viewport.rows),
-            forceShellResize: true
-        )
+        resizeSessionIfNeededToMountedGrid(columns: Int(viewport.columns), rows: Int(viewport.rows))
+    }
+
+    private func resizeSessionIfNeededToMountedGrid(columns: Int, rows: Int) {
+        guard let session = proxy.session else { return }
+        let currentViewport = session.replayViewportSize
+        guard Self.shouldResizeSession(from: currentViewport, toColumns: columns, rows: rows) else {
+            sidebarResizeLog("skip unchanged shell resize viewport=\(columns)x\(rows)")
+            return
+        }
+
+        session.resize(columns: columns, rows: rows)
+    }
+
+    nonisolated static func shouldResizeSession(
+        from currentViewport: TerminalViewportSize,
+        toColumns columns: Int,
+        rows: Int
+    ) -> Bool {
+        currentViewport.columns != columns || currentViewport.rows != rows
     }
 
     private func shouldIgnoreTransientStartupShrink(columns: Int, rows: Int) -> Bool {

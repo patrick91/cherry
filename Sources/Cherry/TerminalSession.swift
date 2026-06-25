@@ -2290,10 +2290,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.enqueueOutput(replay, launchID: activeLaunchID, responseWriter: { _ in })
     }
 
-    private var shouldParseMetadataForProcessOutput: Bool {
-        kind != .terminal || isAuxiliaryProcessingActive
-    }
-
     private func noteProcessOutputForBackgroundThrottle(bytes: Int) {
         guard kind == .terminal,
               !isAuxiliaryProcessingActive,
@@ -2794,7 +2790,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     traceRecorder?.recordOutput(data)
                     self.renderedReplayCache = nil
                     self.rawOutputStore.append(data)
-                    self.enqueueTerminalMetadata(data, parseMetadata: self.shouldParseMetadataForProcessOutput)
+                    self.enqueueTerminalMetadata(data)
                     self.noteProcessOutputForBackgroundThrottle(bytes: data.count)
                     if !prototypeProcessorDisabledForPerf {
                         processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in

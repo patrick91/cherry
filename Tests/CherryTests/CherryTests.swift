@@ -4597,7 +4597,7 @@ private struct MCPWhoamiPayload: Decodable {
     sink.flushForTesting()
 
     let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
-    #expect(output == ["output\r\n\r\u{1B}[0mprompt"])
+    #expect(output == ["output\r\n\r\u{1B}[K\u{1B}[0mprompt"])
 }
 
 @Test func ghosttyOutputSinkDropsSplitZshPromptEndOfLineMarksBeforeRendering() async throws {
@@ -4620,7 +4620,30 @@ private struct MCPWhoamiPayload: Decodable {
     sink.flushForTesting()
 
     let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
-    #expect(output == ["output\r\n\r\u{1B}[0mprompt"])
+    #expect(output == ["output\r\n\r\u{1B}[K\u{1B}[0mprompt"])
+}
+
+@Test func ghosttyOutputSinkDropsZshPromptEndOfLineMarkSplitAfterReturn() async throws {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(
+        receiveForTesting: { observedData.append($0) },
+        promptMarkCoalescingDelay: .milliseconds(2)
+    )
+    let promptEndMarkPrefix = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 20) +
+        "\r"
+    let promptEndMarkSuffix = " \r"
+
+    sink.receive(Data(("output\r\n" + promptEndMarkPrefix).utf8))
+    sink.flushForTesting()
+    #expect(observedData.values.isEmpty)
+
+    sink.receive(Data((promptEndMarkSuffix + "\u{1B}[0mprompt").utf8))
+    try await Task.sleep(for: .milliseconds(20))
+    sink.flushForTesting()
+
+    let output = observedData.values.map { String(decoding: $0, as: UTF8.self) }
+    #expect(output == ["output\r\n\r\u{1B}[K\u{1B}[0mprompt"])
 }
 
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
@@ -4699,7 +4722,7 @@ private struct MCPWhoamiPayload: Decodable {
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
-    #expect(output == "before\r\n\r\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
+    #expect(output == "before\r\n\r\u{1B}[K\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
 }
 
 @Test func ghosttyReplayOutputKeepsPaletteColoredPercentLines() async throws {
@@ -4731,6 +4754,26 @@ private struct MCPWhoamiPayload: Decodable {
     let promptLine = try #require(lines.last)
     #expect(promptLine == "❯ as")
     #expect(!promptLine.contains("ls"))
+}
+
+@Test func ghosttyReplayOutputClearsStalePromptCellsWhenDroppingZshMark() async throws {
+    let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
+        String(repeating: " ", count: 20) +
+        "\r \r"
+    let replay = Data((
+        "❯ as" +
+        promptEndMark +
+        "\u{1B}[0m❯ "
+    ).utf8)
+
+    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+
+    var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
+    replayedBuffer.ingest(sanitized)
+    let lines = replayedBuffer.snapshot(range: 0..<replayedBuffer.lineCount)
+    let promptLine = try #require(lines.last)
+    #expect(promptLine.trimmingCharacters(in: .whitespaces) == "❯")
+    #expect(!promptLine.contains("as"))
 }
 
 @MainActor
@@ -5356,6 +5399,46 @@ private struct MCPWhoamiPayload: Decodable {
     session.ingestTestingData(Data("\u{1B}]7;kitty-shell-cwd://localhost/tmp/cherry\u{7}".utf8))
     #expect(session.title == "/tmp/cherry")
     #expect(session.workingDirectory == "/tmp/cherry")
+}
+
+@MainActor
+@Test func backgroundTerminalParsesPromptMetadataAfterCommandCompletes() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let session = TerminalSession(
+        title: "Shell 1",
+        subtitle: "zsh login shell",
+        tint: .systemGreen,
+        workingDirectory: directory.path
+    )
+    defer {
+        session.stop()
+    }
+
+    let command = "sleep 0.5"
+    let didLaunch = await waitForCondition(timeout: 2) {
+        session.acceptsInput
+    }
+    #expect(didLaunch)
+
+    session.send(text: command + "\n")
+    let didShowCommandTitle = await waitForCondition(timeout: 2) {
+        session.title == command
+    }
+    #expect(didShowCommandTitle)
+
+    session.setAuxiliaryProcessingActive(false)
+
+    let didClearCommandTitle = await waitForCondition(timeout: 2) {
+        session.title != command
+    }
+    #expect(didClearCommandTitle)
+    #expect(session.title == directory.path)
 }
 
 @MainActor
@@ -7546,7 +7629,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func terminalSettingsLimitGhosttyScrollbackMemory() async throws {
+@Test func terminalSettingsConfigureEmbeddedGhosttyTerminal() async throws {
     let configuration = TerminalSettings.ghosttyConfiguration(
         fontSize: 14,
         cursorBlink: true,
@@ -7554,6 +7637,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     )
 
     #expect(configuration.rendered.contains("scrollback-limit = 4000000"))
+    #expect(configuration.rendered.contains("cursor-style = bar"))
 }
 
 @Test func sidebarThemeSampleContrastsTerminalBackgroundByAppearance() async throws {
@@ -11032,6 +11116,26 @@ private func serviceRecord(
 
     let snapshot = buffer.snapshot(range: 0..<buffer.lineCount)
     #expect(snapshot.last?.contains("abc") == true)
+}
+
+@Test func ghosttyBridgeSkipsUnchangedMountedGridResize() async throws {
+    let viewport = TerminalViewportSize(columns: 110, rows: 83)
+
+    #expect(!GhosttySessionBridge.shouldResizeSession(
+        from: viewport,
+        toColumns: 110,
+        rows: 83
+    ))
+    #expect(GhosttySessionBridge.shouldResizeSession(
+        from: viewport,
+        toColumns: 109,
+        rows: 83
+    ))
+    #expect(GhosttySessionBridge.shouldResizeSession(
+        from: viewport,
+        toColumns: 110,
+        rows: 82
+    ))
 }
 
 private struct StaticStyledTerminalBuffer: TerminalBuffering {

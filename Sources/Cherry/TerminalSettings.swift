@@ -184,7 +184,7 @@ final class TerminalSettings: ObservableObject {
         TerminalConfiguration { builder in
             builder.withFontFamily("Menlo")
             builder.withFontSize(Float(fontSize))
-            builder.withCursorStyle(.block)
+            builder.withCursorStyle(.bar)
             builder.withCursorStyleBlink(cursorBlink)
             builder.withMinimumContrast(minimumContrast)
             builder.withWindowPaddingX(8)

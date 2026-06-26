@@ -102,9 +102,12 @@ These remain under native and want a decision before/at cutover:
   native PTY. Needs an out-of-band channel or a ghostty patch.
 - **foreground_pid / tty_name** absent from this binary → ServiceDetector / sidebar
   program label need an XCFramework rebuild.
-- **Input edge cases** — only printable text + CR/LF + Ctrl-C are translated.
-  Arbitrary control/escape sequences injected via `raw_base64` are sent as text,
-  not synthesized keys.
+- **Input edge cases** — *interactive* keyboard is fully native: the local
+  key-down monitor is gated off under EXEC, so the ghostty surface encodes its own
+  keys (arrows, paste, option-combos, app-cursor-keys, kitty protocol). Only the
+  *programmatic* path (`sendNativeInput`, from MCP/agent `send`) is limited — it
+  translates printable text + CR/LF + Ctrl-C; arbitrary control/escape sequences
+  injected via `raw_base64` are sent as text, not synthesized keys.
 - **Restart-on-exit** (command panes) under EXEC re-mounts the surface; now that
   exit is detected the path runs, but it's only socket-verified for plain exit, not
   visually for the restart redraw.

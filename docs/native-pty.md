@@ -78,6 +78,47 @@ The installed `~/Applications/Cherry.app` is currently the native build
     `outputVersion` advances; `cd` updates the sidebar cwd (PWD action); `exit`
     flips the session to `.exited` with the right code (child-exited action).
 
+- **Resident surfaces — agents/commands run without being displayed** (`45688c6`):
+  the core EXEC tension. A surface *is* its child process, and it was only built when
+  the view entered a window — so an AI-spawned agent in a non-active tab never
+  started until opened. Fix: build EXEC surfaces even while detached (the child runs
+  on ghostty's IO thread; `read_text`/input work with no render/pump — verified a
+  never-displayed terminal runs and executes input), eagerly build the bridge on
+  `startShell`, and never evict/free an EXEC surface while backgrounded (that kills a
+  live process). *This is what unblocked end-to-end agent orchestration.*
+- **Keyboard** (`7599c79`): native gates off Cherry's `handleLocalKeyDown` monitor
+  and instead honors the user's own `~/.config/ghostty/config` — forwarding
+  input-producing keybinds (`text:`/`csi:`/`esc:`, e.g. `shift+enter=text:\n`) and
+  `macos-option-as-alt`. Programmatic input uses `NativeInputTranslator` (byte→key).
+- **OSC 133 / precise script idle** (`41c405c`): shell integration emits OSC 133
+  A/C/D (native-gated env `CHERRY_EMIT_OSC133`) → ghostty `command_finished` →
+  `noteNativeCommandFinished` → a precise command boundary in `waitForProcessIdle`
+  for non-agent sessions.
+
+## Open items (noted, not yet done)
+
+- **Subagents don't nest under their parent** (still broken under native). The
+  orchestrator's children come out as flat top-level agents. The MCP resolves the
+  parent from `CHERRY_PROCESS_ID` (env, verified reaching the native shell) with a
+  PID-inference fallback (`inferredCallerProcessID` matching `process.pid`) — and
+  that fallback is **dead under native** because `childProcessID`/`process.pid` is
+  nil (the surface owns the child; `foreground_pid` is absent from this xcframework).
+  Leading hypothesis: host nesting relied on PID inference, which native can't do.
+  **To pin it:** launch with `CHERRY_DEBUG_MCP=1`, re-run a spawn, and read the
+  `spawned process … parent=<id|nil>` log line (`CherryControlServer:1125`). If
+  `parent=nil`, the MCP-side resolver returned nil → add resolver logging in
+  `CherryMCPToolHandler.parentAgentIDArgument`. Real fix likely needs the agent's
+  child PID (XCFramework rebuild for `foreground_pid`) or the hook system below.
+- **Agent-CLI hook system — deferred** (not needed yet; content/output-based
+  readiness now works because the data layer is live). It's the *robust* upgrade for
+  agent readiness/idle/lineage: a PATH shim injecting Claude/Codex lifecycle hooks
+  (`SessionStart`→ready, `Stop`→idle, `Notification`→needsInput, `SubagentStart`→
+  lineage) that call back over the control socket. Plugs into
+  `waitForDeferredAgentInputReadiness` (readiness) and the parent resolver (lineage).
+  See the research synthesis in memory (`cherry-agent-state-detection`).
+- **Image paste / drag** — pre-existing (never worked); needs ghostty's
+  clipboard-image path. Lower priority.
+
 ## Remaining — the cutover (NEEDS HUMAN REVIEW)
 
 Everything functional is done and socket-verified. What's left is the deliberate,

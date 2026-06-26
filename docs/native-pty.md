@@ -1,7 +1,8 @@
 # Native-PTY migration (eliminating terminal replay)
 
-Status: **in progress on branch `native-pty`**, behind the `CHERRY_NATIVE_PTY` flag.
-`main` and the default (host-managed) path are **untouched**.
+Status: **Stages A–C done on branch `native-pty`**, behind the `CHERRY_NATIVE_PTY`
+flag. `main` and the default (host-managed) path are **untouched**. What remains is
+the human-reviewed cutover: flip the default and delete the replay subsystem.
 
 ## Why
 
@@ -51,55 +52,64 @@ The installed `~/Applications/Cherry.app` is currently the native build
   the host forkpty for native panes (else **two shells per pane, two agents per
   agent pane**) and reaches `.live` so the surface mounts.
   - *Verified via control socket: spawns + selects native sessions, no crash.*
+- **Stage C — chrome + data layer + input** (`c0aa764`, `2235f73`): everything the
+  host path derived from the PTY byte stream is now re-sourced from the surface, so
+  native panes are usable end to end. All flag-gated; host path untouched.
+  - **Chrome from ghostty actions** (`c0aa764`): new wrapper delegates +
+    `handleAction` cases for `GHOSTTY_ACTION_PWD` / `DESKTOP_NOTIFICATION` /
+    `SHOW_CHILD_EXITED` / `SET_TITLE`; `GhosttySessionBridge` forwards (gated on
+    native) into `TerminalSession.ingestNative{Title,WorkingDirectory,Notification,
+    ChildExit}`, which mirror the `ingestTerminalMetadata` cases. Child-exit closes
+    Stage B's exit-detection gap.
+  - **Data layer** (`2235f73`): `TerminalSurface.readText(screen:)` over
+    `ghostty_surface_read_text` + `free_text`. `getProcessRawOutput` and a native
+    line model behind `lineCount`/`snapshot(range:)` (→ search, getTerminalOutput,
+    agent summaries) pull the surface scrollback lazily on read (throttled). A
+    full-screen-hash change probe — driven by a debounced `GHOSTTY_ACTION_RENDER`
+    signal (new `TerminalSurfaceRenderDelegate`) *and* on every read — advances
+    `outputVersion`/`contentVersion`/`lastContentChangeAt` and the agent
+    activity+summary hooks, so `waitForProcessIdle` and agent idle work.
+  - **Input** (`2235f73`): `send(text:)`/`send(data:)`/`sendInterrupt` route to the
+    surface under native (`shellProcess` is nil). Printable runs go through
+    `ghostty_surface_text`; CR/LF and Ctrl-C become real key events
+    (`sendKeyPress`) — a trailing CR via the text path does **not** submit.
+  - *Verified via control socket against the native build:* getProcessRawOutput is
+    live; injected input submits and runs; search finds produced output;
+    `outputVersion` advances; `cd` updates the sidebar cwd (PWD action); `exit`
+    flips the session to `.exited` with the right code (child-exited action).
 
-## Remaining (Stage C — exact plan)
+## Remaining — the cutover (NEEDS HUMAN REVIEW)
 
-The full implementation plan is the workflow synthesis; the key pieces:
+Everything functional is done and socket-verified. What's left is the deliberate,
+human-reviewed cutover — **not started**, waiting on Patrick's visual review on
+real hardware:
 
-### Known consequence to fix: the data layer goes dark
-Under EXEC the forkpty `onData` never fires, so `rawOutputStore`/`outputVersion`
-never advance. Everything reading them — `getProcessRawOutput`,
-`searchProcessOutput`, `waitForProcessIdle`, agent-summaries — is dark for native
-panes until re-sourced (verified: `contentVersion: 0`).
+1. **Flip the default** — make native the default backend (drop the
+   `CHERRY_NATIVE_PTY` opt-in).
+2. **Delete the replay subsystem** — `renderedReplayOutput`, `rawOutputStore`
+   style-recovery merge, the first-mount/resize replay, and the (now-moot)
+   resident-surfaces code on the shelved branch.
 
-### C1–C3, C6 — chrome from ghostty actions (additive)
-Cherry derives title/cwd/notification from PTY bytes today
-(`TerminalSession.metadataEvent` ~798-851). Re-source from ghostty:
-- **Title** — wrapper already forwards `GHOSTTY_ACTION_SET_TITLE` →
-  `TerminalSurfaceTitleDelegate`; `GhosttySessionBridge` just needs to conform and
-  route to `updateSystemTitle` (~`TerminalSession:3040`).
-- **cwd** — add a delegate + `case GHOSTTY_ACTION_PWD` (`pwd.pwd`) → the
-  `.workingDirectory` consumer (~`TerminalSession:3052`).
-- **notification** — `case GHOSTTY_ACTION_DESKTOP_NOTIFICATION` (`title`/`body`) →
-  the `.notification` consumer (~`TerminalSession:3061`).
-- **exit code (closes Stage B's gap)** — `case GHOSTTY_ACTION_SHOW_CHILD_EXITED`
-  (`child_exited.exit_code`) → `finishProcessExit(status:launchID:)`. (Field name
-  in the header is literally `timetime_ms`.)
+## Residual gaps / decisions for review
 
-### C7–C9 — data layer from pull APIs
-- Wrap `ghostty_surface_read_text` (SCREEN) + mandatory `ghostty_surface_free_text`
-  (defer, same surface — leak risk) on `TerminalSurface`.
-- Route `getProcessRawOutput`/search/agent-summary to `readText(.screen)` for
-  native panes (note: rendered text, not raw VT bytes — a semantic change to flag).
-- `waitForProcessIdle`: drive an `outputVersion` bump from a ghostty content-change
-  signal (`GHOSTTY_ACTION_RENDER`, debounced) via `noteNativeOutputChanged()`.
+These remain under native and want a decision before/at cutover:
 
-### Then — flip default + delete (NEEDS HUMAN REVIEW)
-Once the above is solid and visually verified: make native the default, then
-delete the replay/recovery subsystem and the (now-moot) resident-surfaces code.
-
-## Known gaps / decisions for review
-
-- **Chrome stale + MCP/agents dark** for native panes until Stage C lands.
-- **Shell exit not detected** until C6 (session stays `.live`).
-- **`read_text` is rendered text, not raw VT bytes** — a behavior change for
-  byte-exact MCP consumers.
-- **Lost custom OSC 777** (`cherry-command`/`cherry-nix`) — no ghostty action
-  equivalent; needs an out-of-band channel or a ghostty patch. Nix-shell env
-  tracking degrades under native PTY.
-- **foreground_pid/tty_name** absent from this binary → ServiceDetector / sidebar
+- **`read_text` is rendered text, not raw VT bytes** — `getProcessRawOutput` for
+  native panes returns screen text without escape sequences. Fine for human/agent
+  reading; a behavior change for any byte-exact consumer.
+- **Lost custom OSC 777** (`cherry-command` / `cherry-nix`) — no ghostty action
+  equivalent, so resolved-command-line and **nix-shell env tracking degrade** under
+  native PTY. Needs an out-of-band channel or a ghostty patch.
+- **foreground_pid / tty_name** absent from this binary → ServiceDetector / sidebar
   program label need an XCFramework rebuild.
-- **Restart-on-exit** under EXEC re-mounts; behavior unverified.
+- **Input edge cases** — only printable text + CR/LF + Ctrl-C are translated.
+  Arbitrary control/escape sequences injected via `raw_base64` are sent as text,
+  not synthesized keys.
+- **Restart-on-exit** (command panes) under EXEC re-mounts the surface; now that
+  exit is detected the path runs, but it's only socket-verified for plain exit, not
+  visually for the restart redraw.
+- **Title / desktop-notification actions** are wired identically to cwd (verified)
+  but weren't separately socket-asserted.
 
 ## Rules being followed
 Everything flag-gated; default/`main` untouched; verify via control socket since

@@ -451,7 +451,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.controller = controller
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
         proxy.bridge = self
+        if Self.nativePTYEnabled {
+            // Native: the line above creates the EXEC surface eagerly (detached),
+            // before any container assigns a color scheme — so it would render with
+            // ghostty's default theme until first display. Apply the current system
+            // appearance now; the displaying container re-applies the real scheme.
+            activeColorScheme = Self.systemColorScheme()
+            applyTerminalSettings()
+        }
         observeSettingsChanges()
+    }
+
+    private static func systemColorScheme() -> ColorScheme {
+        NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
     }
 
     func attach(to container: GhosttyTerminalContainerView) {

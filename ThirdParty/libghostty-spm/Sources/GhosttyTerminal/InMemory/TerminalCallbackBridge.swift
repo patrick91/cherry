@@ -60,6 +60,16 @@ final class TerminalCallbackBridge {
             (delegate as? any TerminalSurfaceNotificationDelegate)?
                 .terminalDidPostNotification(title: title, body: body)
 
+        case GHOSTTY_ACTION_COMMAND_FINISHED:
+            let finished = action.action.command_finished
+            let exitCode: Int32? = finished.exit_code < 0 ? nil : Int32(finished.exit_code)
+            TerminalDebugLog.log(
+                .lifecycle,
+                "callback action=command_finished exit=\(finished.exit_code) duration=\(finished.duration)"
+            )
+            (delegate as? any TerminalSurfaceCommandFinishedDelegate)?
+                .terminalDidFinishCommand(exitCode: exitCode, durationNanoseconds: finished.duration)
+
         case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
             let childExited = action.action.child_exited
             TerminalDebugLog.log(

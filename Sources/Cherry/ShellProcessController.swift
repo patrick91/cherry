@@ -257,6 +257,15 @@ struct ShellIntegrationBootstrap {
                 return 1
               }
 
+              # OSC 133 semantic-prompt markers, emitted only under native-PTY
+              # (CHERRY_EMIT_OSC133) so the host-managed default byte stream is
+              # unchanged. Ghostty parses these and fires command_finished, giving
+              # precise command-boundary/idle signals for plain scripts.
+              _cherry_osc133() {
+                [[ -n "${CHERRY_EMIT_OSC133-}" ]] || return 0
+                print -n -- "$1"
+              }
+
               _cherry_preexec() {
                 emulate -L zsh
                 local typed_command="$1"
@@ -265,6 +274,7 @@ struct ShellIntegrationBootstrap {
                   _cherry_emit_command_metadata "$expanded_command"
                 fi
                 _cherry_set_title "$typed_command"
+                _cherry_osc133 $'\\e]133;C\\a'
                 if _cherry_is_nix_shell_command "$expanded_command"; then
                   typeset -g CHERRY_NIX_SHELL_METADATA_ACTIVE=1
                   _cherry_emit_nix_shell_metadata enter "$expanded_command"
@@ -284,7 +294,9 @@ struct ShellIntegrationBootstrap {
               }
 
               _cherry_precmd() {
+                local _cherry_last_exit=$?
                 emulate -L zsh
+                _cherry_osc133 $'\\e]133;D;'"$_cherry_last_exit"$'\\a'
                 if [[ -n "${CHERRY_NIX_SHELL_METADATA_ACTIVE-}" ]]; then
                   _cherry_emit_nix_shell_metadata exit
                   unset CHERRY_NIX_SHELL_METADATA_ACTIVE
@@ -304,6 +316,7 @@ struct ShellIntegrationBootstrap {
                 local directory="${PWD/#$HOME/~}"
                 _cherry_set_working_directory
                 _cherry_set_title "$directory"
+                _cherry_osc133 $'\\e]133;A\\a'
               }
 
               autoload -Uz add-zsh-hook
@@ -411,6 +424,10 @@ final class ShellProcessController: @unchecked Sendable {
         environment["CHERRY_TERM_PROGRAM"] = "Cherry"
         environment["COLORTERM"] = "truecolor"
         environment["INSIDE_CHERRY"] = "1"
+        // Native-PTY only: ask the shell integration to emit OSC 133 so ghostty
+        // fires command_finished. The host path leaves this unset (default byte
+        // stream unchanged).
+        environment["CHERRY_EMIT_OSC133"] = "1"
         if let projectRoot = configuration.projectRoot, !projectRoot.isEmpty {
             environment[CherryControl.projectRootEnvironmentKey] = projectRoot
         }

@@ -297,7 +297,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     TerminalSurfaceScrollInputDelegate,
     TerminalSurfaceTitleDelegate, TerminalSurfaceWorkingDirectoryDelegate,
     TerminalSurfaceNotificationDelegate, TerminalSurfaceChildExitDelegate,
-    TerminalSurfaceRenderDelegate,
+    TerminalSurfaceRenderDelegate, TerminalSurfaceCommandFinishedDelegate,
     TerminalSurfaceKeyEquivalentDelegate
 {
     private(set) static var liveBridgeCount = 0
@@ -650,6 +650,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidRequestRender() {
         guard Self.nativePTYEnabled, let session = proxy.session else { return }
         session.noteNativeRenderRequest()
+    }
+
+    func terminalDidFinishCommand(exitCode: Int32?, durationNanoseconds: UInt64) {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.noteNativeCommandFinished(exitCode: exitCode)
     }
 
     /// Routes programmatic input to the surface-owned PTY under native mode (the

@@ -1346,6 +1346,12 @@ final class CherryControlServer: @unchecked Sendable {
                         return result(reason: .idle)
                     }
                 }
+            } else if let commandFinishedAt = session.lastNativeCommandFinishedAt,
+                      commandFinishedAt >= startedAt,
+                      !requireNewOutput || observedNewOutput {
+                // Native OSC 133: a command boundary is a precise "back at prompt"
+                // signal for plain scripts/commands — no quiet-period guessing.
+                return result(reason: .idle)
             } else if ProcessIdleDetector.isQuiet(
                 now: now,
                 lastOutputAt: session.lastOutputAt,

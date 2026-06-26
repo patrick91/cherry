@@ -2102,6 +2102,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
     private var lastNativeContentReadAt: Date?
+    /// OSC 133 command-end signal (native). A precise "back at prompt / command
+    /// done" marker for non-TUI commands; published so idle detection can use it.
+    @Published private(set) var lastNativeCommandFinishedAt: Date?
+    private(set) var lastNativeCommandExitCode: Int32?
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
@@ -3218,6 +3222,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     func ingestNativeChildExit(exitCode: Int32) {
         guard let launchID = activeLaunchID else { return }
         finishProcessExit(status: exitCode, launchID: launchID)
+    }
+
+    /// OSC 133 'D' (shell-integration command end) under native. A precise
+    /// command-boundary signal for plain scripts/commands — far better than a
+    /// quiet-period guess. (Agent TUIs run on the alternate screen and emit no
+    /// per-command markers, so this fires only for primary-screen commands.)
+    func noteNativeCommandFinished(exitCode: Int32?) {
+        guard GhosttySessionBridge.nativePTYEnabled else { return }
+        lastNativeCommandFinishedAt = Date()
+        lastNativeCommandExitCode = exitCode
+        // Capture the command's final output and advance the counters so idle
+        // detection converges on the real boundary, not a heuristic timeout.
+        refreshNativeContentNow()
+        bumpRevision()
     }
 
     // MARK: - Native-PTY content model (search / summary / idle under EXEC)

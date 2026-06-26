@@ -184,3 +184,11 @@ public protocol TerminalSurfaceChildExitDelegate: TerminalSurfaceViewDelegate {
 public protocol TerminalSurfaceRenderDelegate: TerminalSurfaceViewDelegate {
     func terminalDidRequestRender()
 }
+
+@MainActor
+public protocol TerminalSurfaceCommandFinishedDelegate: TerminalSurfaceViewDelegate {
+    /// Fired from OSC 133 'D' (shell-integration command end). `exitCode` is nil
+    /// when the shell reported none. Only fires for primary-screen commands — a
+    /// full-screen TUI on the alternate screen emits no per-command markers.
+    func terminalDidFinishCommand(exitCode: Int32?, durationNanoseconds: UInt64)
+}

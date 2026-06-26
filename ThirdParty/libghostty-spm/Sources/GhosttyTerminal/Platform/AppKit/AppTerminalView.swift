@@ -53,9 +53,10 @@
         }
 
         /// Synthesizes a key press (+release). `keycode` is the AppKit virtual
-        /// keycode. Used for native-PTY Enter/Ctrl-C which the text path can't send.
-        public func sendKeyPress(keycode: UInt32, control: Bool) {
-            surface?.sendKeyPress(keycode: keycode, control: control)
+        /// keycode. Used for native-PTY control/escape input (Enter, arrows, Tab,
+        /// Ctrl-combos) which the text path can't express.
+        public func sendKeyPress(keycode: UInt32, shift: Bool, control: Bool, option: Bool) {
+            surface?.sendKeyPress(keycode: keycode, shift: shift, control: control, option: option)
         }
 
         /// Full scrollback as plain text (nil if unavailable). The native-PTY

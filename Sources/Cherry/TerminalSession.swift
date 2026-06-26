@@ -2480,7 +2480,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
         if GhosttySessionBridge.nativePTYEnabled {
-            ghosttyBridgeStorage?.sendNativeInput(text)
+            ghosttyBridgeStorage?.sendNativeInput(data)
             return
         }
         shellProcess?.write(text)
@@ -2507,7 +2507,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
         }
         if GhosttySessionBridge.nativePTYEnabled {
-            ghosttyBridgeStorage?.sendNativeInput(String(decoding: outboundData, as: UTF8.self))
+            ghosttyBridgeStorage?.sendNativeInput(outboundData)
             return
         }
         shellProcess?.write(outboundData)
@@ -2520,7 +2520,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         processor.discardPendingOutput()
         if GhosttySessionBridge.nativePTYEnabled {
-            ghosttyBridgeStorage?.sendNativeInput("\u{03}")
+            ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
             return
         }
         shellProcess?.writeUrgent(Data([0x03]))

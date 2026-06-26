@@ -43,19 +43,23 @@ public final class TerminalSurface {
     }
 
     /// Synthesizes a key press + release. Used for native-PTY input the text path
-    /// can't express: a trailing CR via `sendText` does not submit, so Enter and
-    /// Ctrl-C must arrive as real key events. `keycode` is the platform virtual
-    /// keycode (AppKit `kVK_*` on macOS).
-    func sendKeyPress(keycode: UInt32, control: Bool) {
+    /// can't express: control/escape sequences (Enter, Ctrl-C, arrows, Tab, …) must
+    /// arrive as real key events so ghostty encodes them for the child's current
+    /// mode. `keycode` is the platform virtual keycode (AppKit `kVK_*` on macOS).
+    func sendKeyPress(keycode: UInt32, shift: Bool, control: Bool, option: Bool) {
         guard let s = surface else {
             TerminalDebugLog.log(.input, "surface keyPress ignored: missing surface")
             return
         }
+        var rawMods: UInt32 = GHOSTTY_MODS_NONE.rawValue
+        if shift { rawMods |= GHOSTTY_MODS_SHIFT.rawValue }
+        if control { rawMods |= GHOSTTY_MODS_CTRL.rawValue }
+        if option { rawMods |= GHOSTTY_MODS_ALT.rawValue }
         var input = ghostty_input_key_s()
         input.keycode = keycode
         input.composing = false
         input.text = nil
-        input.mods = control ? GHOSTTY_MODS_CTRL : GHOSTTY_MODS_NONE
+        input.mods = ghostty_input_mods_e(rawMods)
         input.action = GHOSTTY_ACTION_PRESS
         ghostty_surface_key(s, input)
         input.action = GHOSTTY_ACTION_RELEASE

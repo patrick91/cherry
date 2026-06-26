@@ -95,20 +95,26 @@ The installed `~/Applications/Cherry.app` is currently the native build
   `noteNativeCommandFinished` → a precise command boundary in `waitForProcessIdle`
   for non-agent sessions.
 
+- **Subagent nesting + multi-window routing** (`ec96c5b`, `fe431a5`): root cause —
+  **Codex doesn't propagate `CHERRY_*` into its MCP subprocess** (Claude does), so
+  the orchestrator's MCP can't read `CHERRY_PROCESS_ID`/`CHERRY_PROJECT_ROOT`; host
+  mode survived via process-ancestry PID matching, but `process.pid` was nil under
+  native (no `foreground_pid`). Fix: the native shell **self-reports its PID** to a
+  per-session file (`CHERRY_SHELL_PID_FILE`) which Cherry polls into
+  `childProcessID`, restoring ancestry matching. (1) Subagent parent resolution
+  works (verified: `parent=<uuid>`, children nest). (2) The control server resolves
+  an **unscoped** request's workspace from the connecting MCP's peer PID
+  (`LOCAL_PEERPID`) + ancestry, so agents spawn into the caller's project window
+  even with multiple windows open.
+- **Agent input colors (Codex)** (`fe431a5`): a background-spawned agent's EXEC
+  surface is created before display, and Codex probes **OSC 11** for its input-box
+  background on first paint. The surface must carry the right theme background at
+  creation — and it must come from **Cherry's own appearance**
+  (`TerminalSettings.appearance.preferredColorScheme`), not the system (the app
+  forces its own dark/light). Verified via an OSC 11 probe: f7f7f7 → 212121.
+
 ## Open items (noted, not yet done)
 
-- **Subagents don't nest under their parent** (still broken under native). The
-  orchestrator's children come out as flat top-level agents. The MCP resolves the
-  parent from `CHERRY_PROCESS_ID` (env, verified reaching the native shell) with a
-  PID-inference fallback (`inferredCallerProcessID` matching `process.pid`) — and
-  that fallback is **dead under native** because `childProcessID`/`process.pid` is
-  nil (the surface owns the child; `foreground_pid` is absent from this xcframework).
-  Leading hypothesis: host nesting relied on PID inference, which native can't do.
-  **To pin it:** launch with `CHERRY_DEBUG_MCP=1`, re-run a spawn, and read the
-  `spawned process … parent=<id|nil>` log line (`CherryControlServer:1125`). If
-  `parent=nil`, the MCP-side resolver returned nil → add resolver logging in
-  `CherryMCPToolHandler.parentAgentIDArgument`. Real fix likely needs the agent's
-  child PID (XCFramework rebuild for `foreground_pid`) or the hook system below.
 - **Agent-CLI hook system — deferred** (not needed yet; content/output-based
   readiness now works because the data layer is live). It's the *robust* upgrade for
   agent readiness/idle/lineage: a PATH shim injecting Claude/Codex lifecycle hooks

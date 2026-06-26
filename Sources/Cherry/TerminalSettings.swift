@@ -168,6 +168,61 @@ final class TerminalSettings: ObservableObject {
         )
     }
 
+    /// Keyboard-related lines lifted from the user's own ghostty config so native
+    /// panes match standalone ghostty (their `shift+enter`, `macos-option-as-alt`,
+    /// etc.). Read once. Defaults `macos-option-as-alt = true` if unset so the
+    /// Alt/Meta family works out of the box. Only input-producing keybinds are
+    /// forwarded — app-action keybinds (tabs/splits) are Cherry's job.
+    static let nativeUserKeyboardConfig: [(String, String)] = loadUserGhosttyKeyboardConfig()
+
+    private static func loadUserGhosttyKeyboardConfig() -> [(String, String)] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(".config/ghostty/config"),
+            home.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty/config"),
+        ]
+        let contents = candidates
+            .first(where: { FileManager.default.fileExists(atPath: $0.path) })
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        return parseUserGhosttyKeyboardConfig(contents ?? "")
+    }
+
+    /// Pure parser: keep `macos-option-as-alt` and input-producing `keybind` lines,
+    /// defaulting option-as-alt to `true` when the user didn't set it.
+    nonisolated static func parseUserGhosttyKeyboardConfig(_ contents: String) -> [(String, String)] {
+        var result: [(String, String)] = []
+        var sawOptionAsAlt = false
+        for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            guard !value.isEmpty else { continue }
+            switch key {
+            case "macos-option-as-alt":
+                result.append((key, value))
+                sawOptionAsAlt = true
+            case "keybind" where isInputProducingKeybind(value):
+                result.append((key, value))
+            default:
+                continue
+            }
+        }
+        if !sawOptionAsAlt {
+            result.append(("macos-option-as-alt", "true"))
+        }
+        return result
+    }
+
+    /// A ghostty keybind value is `trigger=action`. Keep only actions that produce
+    /// terminal input (so we don't hijack tab/split/window actions Cherry owns).
+    nonisolated private static func isInputProducingKeybind(_ value: String) -> Bool {
+        guard let eq = value.firstIndex(of: "=") else { return false }
+        let action = value[value.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        return action.hasPrefix("text:") || action.hasPrefix("csi:")
+            || action.hasPrefix("esc:") || action == "ignore"
+    }
+
     func ghosttyConfiguration() -> TerminalConfiguration {
         Self.ghosttyConfiguration(
             fontSize: fontSize,
@@ -191,12 +246,16 @@ final class TerminalSettings: ObservableObject {
             builder.withWindowPaddingY(14)
             builder.withCustom("scrollback-limit", "\(Defaults.ghosttyScrollbackLimitBytes)")
             if GhosttySessionBridge.nativePTYEnabled {
-                // Native-PTY: the ghostty surface owns the keyboard, so it must
-                // handle the inputs the host-managed key monitor used to encode by
-                // hand. Option-as-Alt unlocks the whole Alt/Meta family (alt+delete
-                // = backward-kill-word, alt+←/→ word nav, alt+backspace) instead of
-                // Option composing accented characters.
-                builder.withCustom("macos-option-as-alt", "true")
+                // Native-PTY: the ghostty surface owns the keyboard, so honor the
+                // user's own ghostty keyboard config — the same file standalone
+                // ghostty reads. Cherry's host-managed key monitor (gated off under
+                // native) used to hand-encode shift+enter / option-combos; instead
+                // we forward the user's input-producing keybinds (text:/csi:/esc:)
+                // and macos-option-as-alt to ghostty. App-action keybinds (new_tab,
+                // splits) stay Cherry's responsibility and are skipped.
+                for (key, value) in Self.nativeUserKeyboardConfig {
+                    builder.withCustom(key, value)
+                }
             }
         }
     }

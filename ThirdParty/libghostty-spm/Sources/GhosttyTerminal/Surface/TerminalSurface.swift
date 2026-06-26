@@ -211,6 +211,28 @@ public final class TerminalSurface {
         return (x, y, w, h)
     }
 
+    // MARK: - Text Read
+
+    /// Reads the terminal's text content. When `screen` is true the entire
+    /// scrollback is returned; otherwise only the visible viewport. Returns nil
+    /// if the surface is gone or the read fails. Used by host integrations that
+    /// own no byte stream of their own (e.g. the native-PTY/EXEC backend, where
+    /// the surface — not the host — owns the terminal state).
+    func readText(screen: Bool) -> String? {
+        guard let s = surface else { return nil }
+        let tag: ghostty_point_tag_e = screen ? GHOSTTY_POINT_SCREEN : GHOSTTY_POINT_VIEWPORT
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: 0),
+            bottom_right: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: 0, y: 0),
+            rectangle: false
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(s, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(s, &text) }
+        guard let cStr = text.text, text.text_len > 0 else { return "" }
+        return String(decoding: UnsafeRawBufferPointer(start: cStr, count: Int(text.text_len)), as: UTF8.self)
+    }
+
     // MARK: - Mouse Capture
 
     var isMouseCaptured: Bool {

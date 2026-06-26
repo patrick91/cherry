@@ -38,6 +38,37 @@ final class TerminalCallbackBridge {
                     .terminalDidChangeTitle(title)
             }
 
+        case GHOSTTY_ACTION_PWD:
+            if let cStr = action.action.pwd.pwd {
+                let pwd = String(cString: cStr)
+                TerminalDebugLog.log(
+                    .actions,
+                    "callback action=pwd pwd=\(TerminalDebugLog.describe(pwd))"
+                )
+                (delegate as? any TerminalSurfaceWorkingDirectoryDelegate)?
+                    .terminalDidChangeWorkingDirectory(pwd)
+            }
+
+        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
+            let notification = action.action.desktop_notification
+            let title = notification.title.map { String(cString: $0) }
+            let body = notification.body.map { String(cString: $0) } ?? ""
+            TerminalDebugLog.log(
+                .actions,
+                "callback action=desktop_notification title=\(TerminalDebugLog.describe(title ?? "")) body=\(TerminalDebugLog.describe(body))"
+            )
+            (delegate as? any TerminalSurfaceNotificationDelegate)?
+                .terminalDidPostNotification(title: title, body: body)
+
+        case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
+            let childExited = action.action.child_exited
+            TerminalDebugLog.log(
+                .lifecycle,
+                "callback action=show_child_exited exit_code=\(childExited.exit_code)"
+            )
+            (delegate as? any TerminalSurfaceChildExitDelegate)?
+                .terminalDidExit(exitCode: childExited.exit_code)
+
         case GHOSTTY_ACTION_CELL_SIZE:
             let cellSize = action.action.cell_size
             TerminalDebugLog.log(

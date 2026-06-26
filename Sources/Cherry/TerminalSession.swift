@@ -2708,7 +2708,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
-        rawOutputStore.snapshot(maxBytes: maxBytes)
+        if GhosttySessionBridge.nativePTYEnabled {
+            // Native-PTY: the host owns no byte stream, so the surface IS the
+            // source of truth. Pull its scrollback as text. NOTE: this is
+            // rendered text, not raw VT bytes — a deliberate semantic change for
+            // native panes (no escape sequences, no exact byte fidelity).
+            let text = ghosttyBridgeStorage?.readNativeScreenText() ?? ""
+            let full = Data(text.utf8)
+            if full.count > maxBytes {
+                return (Data(full.suffix(maxBytes)), true)
+            }
+            return (full, false)
+        }
+        return rawOutputStore.snapshot(maxBytes: maxBytes)
     }
 
     func observeRawOutput(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
@@ -3140,6 +3152,50 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastNotification = notification
         hasUnreadNotification = true
         TerminalNotificationCenter.shared.post(notification, for: self)
+    }
+
+    // MARK: - Native-PTY chrome ingestion
+    //
+    // Under the EXEC backend the ghostty surface owns the PTY, so chrome that the
+    // host path derives from PTY bytes (`ingestTerminalMetadata`) instead arrives
+    // as ghostty actions forwarded by `GhosttySessionBridge`. These route those
+    // actions through the same consumers so the sidebar title/cwd/notifications
+    // and shell-exit detection stay live without a host byte stream. They mirror
+    // the matching `case`s in `ingestTerminalMetadata`.
+
+    func ingestNativeTitle(_ nextTitle: String) {
+        if kind == .agent {
+            if recordAgentTitleActivity(nextTitle) { bumpRevision() }
+        } else {
+            guard systemTitle != nextTitle else { return }
+            updateSystemTitle(nextTitle)
+            bumpRevision()
+        }
+    }
+
+    func ingestNativeWorkingDirectory(_ path: String) {
+        var didChange = false
+        if workingDirectory != path {
+            workingDirectory = path
+            didChange = true
+        }
+        if restoreShellTitle(from: path) {
+            didChange = true
+        }
+        if didChange { bumpRevision() }
+    }
+
+    func ingestNativeNotification(title: String?, body: String) {
+        let notification = TerminalNotificationRequest(title: title, body: body, source: .osc777)
+        if handleAgentNotification(notification) == .passThrough {
+            handleTerminalNotification(notification)
+        }
+        bumpRevision()
+    }
+
+    func ingestNativeChildExit(exitCode: Int32) {
+        guard let launchID = activeLaunchID else { return }
+        finishProcessExit(status: exitCode, launchID: launchID)
     }
 
     enum AgentNotificationDisposition {

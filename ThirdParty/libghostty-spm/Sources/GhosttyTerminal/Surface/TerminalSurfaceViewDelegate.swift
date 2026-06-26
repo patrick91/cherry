@@ -164,3 +164,18 @@ public protocol TerminalSurfaceBellDelegate: TerminalSurfaceViewDelegate {
 public protocol TerminalSurfaceCloseDelegate: TerminalSurfaceViewDelegate {
     func terminalDidClose(processAlive: Bool)
 }
+
+@MainActor
+public protocol TerminalSurfaceWorkingDirectoryDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidChangeWorkingDirectory(_ path: String)
+}
+
+@MainActor
+public protocol TerminalSurfaceNotificationDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidPostNotification(title: String?, body: String)
+}
+
+@MainActor
+public protocol TerminalSurfaceChildExitDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidExit(exitCode: UInt32)
+}

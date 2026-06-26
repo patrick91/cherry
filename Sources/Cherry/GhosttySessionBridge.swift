@@ -295,6 +295,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
     TerminalSurfaceLinkHoverDelegate, TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
     TerminalSurfaceScrollInputDelegate,
+    TerminalSurfaceTitleDelegate, TerminalSurfaceWorkingDirectoryDelegate,
+    TerminalSurfaceNotificationDelegate, TerminalSurfaceChildExitDelegate,
     TerminalSurfaceKeyEquivalentDelegate
 {
     private(set) static var liveBridgeCount = 0
@@ -615,6 +617,45 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func terminalDidClose(processAlive _: Bool) {
         proxy.session?.stop()
+    }
+
+    // MARK: - Native-PTY chrome (forwarded ghostty actions)
+    //
+    // Under the EXEC backend the ghostty surface owns the PTY, so the chrome the
+    // host path derives by parsing PTY bytes itself instead arrives as ghostty
+    // actions. Only forward when native is on: in host-managed mode TerminalSession
+    // already parses these from the byte stream, and double-applying would race.
+
+    func terminalDidChangeTitle(_ title: String) {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.ingestNativeTitle(title)
+    }
+
+    func terminalDidChangeWorkingDirectory(_ path: String) {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.ingestNativeWorkingDirectory(path)
+    }
+
+    func terminalDidPostNotification(title: String?, body: String) {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.ingestNativeNotification(title: title, body: body)
+    }
+
+    func terminalDidExit(exitCode: UInt32) {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.ingestNativeChildExit(exitCode: Int32(bitPattern: exitCode))
+    }
+
+    /// Full scrollback text from the surface, for native-PTY data reads (the host
+    /// owns no byte stream under EXEC). nil when the surface is unavailable.
+    func readNativeScreenText() -> String? {
+        terminalView.readScreenText()
+    }
+
+    /// Visible viewport text — cheaper than the full scrollback; used to detect
+    /// content changes under native PTY.
+    func readNativeViewportText() -> String? {
+        terminalView.readViewportText()
     }
 
     func terminalDidRingBell() {

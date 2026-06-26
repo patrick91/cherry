@@ -45,6 +45,18 @@
             surface?.performBindingAction(action) ?? false
         }
 
+        /// Full scrollback as plain text (nil if unavailable). The native-PTY
+        /// backend uses this to source output for hosts that own no byte stream.
+        public func readScreenText() -> String? {
+            surface?.readText(screen: true)
+        }
+
+        /// Visible viewport as plain text (nil if unavailable). Cheaper than
+        /// `readScreenText()`; used for content-change detection.
+        public func readViewportText() -> String? {
+            surface?.readText(screen: false)
+        }
+
         var surface: TerminalSurface? {
             core.surface
         }

@@ -130,6 +130,41 @@
                 enforceMetalLayerScale()
                 onPostRender?()
             }
+
+            registerForDraggedTypes([.fileURL, .png, .tiff, .string])
+        }
+
+        // MARK: - Drag & Drop
+
+        override public func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+            let types: [NSPasteboard.PasteboardType] = [.fileURL, .png, .tiff, .string]
+            return sender.draggingPasteboard.availableType(from: types) != nil ? .copy : []
+        }
+
+        override public func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+            draggingEntered(sender)
+        }
+
+        /// Dropped files insert their (escaped) paths; dropped image bytes are
+        /// written to a temp file and the path inserted — so terminal agents can
+        /// attach them. Mirrors ghostty's apprt drag handling.
+        override public func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+            let pasteboard = sender.draggingPasteboard
+            let text: String
+            if let urls = pasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL], !urls.isEmpty {
+                text = urls.map { TerminalPasteboardImage.escapedForInput($0.path) }.joined(separator: " ")
+            } else if let path = TerminalPasteboardImage.temporaryFilePath(from: pasteboard) {
+                text = TerminalPasteboardImage.escapedForInput(path)
+            } else if let string = pasteboard.string(forType: .string) {
+                text = string
+            } else {
+                return false
+            }
+            surface?.sendText(text + " ")
+            return true
         }
 
         deinit {

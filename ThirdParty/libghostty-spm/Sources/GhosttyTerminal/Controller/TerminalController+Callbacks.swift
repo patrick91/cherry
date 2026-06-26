@@ -93,7 +93,13 @@ private enum TerminalCallbacks {
         #if canImport(UIKit)
             let string = UIPasteboard.general.string
         #elseif canImport(AppKit)
-            let string = NSPasteboard.general.string(forType: .string)
+            var string = NSPasteboard.general.string(forType: .string)
+            // No text but an image on the clipboard (e.g. a screenshot pasted with
+            // Cmd+V): write it to a temp file and paste its path so agents attach it.
+            if string == nil,
+               let path = TerminalPasteboardImage.temporaryFilePath(from: .general) {
+                string = TerminalPasteboardImage.escapedForInput(path)
+            }
         #endif
 
         guard let string else { return false }

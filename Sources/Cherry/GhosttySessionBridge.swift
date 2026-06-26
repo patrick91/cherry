@@ -456,7 +456,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             // be on the controller BEFORE the surface exists — otherwise that first
             // prompt renders with ghostty's default (light) background while later
             // output is correct. The displaying container re-applies the real scheme.
-            activeColorScheme = Self.systemColorScheme()
+            activeColorScheme = Self.resolvedColorScheme()
             applyTerminalSettings()
         }
         terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
@@ -464,8 +464,21 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         observeSettingsChanges()
     }
 
-    private static func systemColorScheme() -> ColorScheme {
-        NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
+    private static func resolvedColorScheme() -> ColorScheme {
+        // Cherry sets its OWN appearance (`.preferredColorScheme(...)`), so honor
+        // that first — a user on Dark with a Light system would otherwise get a
+        // light background baked into a background-spawned agent's surface, which
+        // Codex then probes via OSC 11 for its first input box. Only "follow
+        // system" falls back to the OS setting (read directly; NSApp's appearance
+        // is unreliable while Cherry isn't the active app).
+        if let preferred = TerminalSettings.shared.appearance.preferredColorScheme {
+            return preferred
+        }
+        if let style = UserDefaults.standard.string(forKey: "AppleInterfaceStyle"),
+           style.lowercased().contains("dark") {
+            return .dark
+        }
+        return NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
     }
 
     func attach(to container: GhosttyTerminalContainerView) {

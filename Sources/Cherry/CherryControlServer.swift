@@ -239,6 +239,11 @@ final class CherryControlServer: @unchecked Sendable {
                 return
             }
 
+            // Peer PID of the connecting process (e.g. an agent's MCP server), used
+            // to route unscoped requests to the caller's own workspace when the
+            // agent CLI stripped CHERRY_PROJECT_ROOT from the MCP env.
+            let peerPID = Self.peerProcessID(fileDescriptor: clientFD)
+
             let requestData: Data
             do {
                 requestData = try Self.readRequest(fileDescriptor: clientFD)
@@ -251,7 +256,7 @@ final class CherryControlServer: @unchecked Sendable {
             Task { @MainActor [weak self] in
                 let response: CherryControlResponse
                 if let self {
-                    response = await self.handleRequestData(requestData)
+                    response = await self.handleRequestData(requestData, peerPID: peerPID)
                 } else {
                     response = .init(error: .init(code: "server_unavailable", message: "Cherry control server is unavailable."))
                 }
@@ -263,10 +268,10 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func handleRequestData(_ data: Data) async -> CherryControlResponse {
+    private func handleRequestData(_ data: Data, peerPID: Int32?) async -> CherryControlResponse {
         do {
             let request = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-            return try await handle(request)
+            return try await handle(request, peerPID: peerPID)
         } catch let error as CherryControlError {
             return .init(error: error)
         } catch {
@@ -275,10 +280,18 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func handle(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+    private func handle(_ request: CherryControlRequest, peerPID: Int32?) async throws -> CherryControlResponse {
         if case .scoped(let scopedRequest) = request {
             let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
             return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
+        }
+
+        // An unscoped request: prefer the caller's OWN workspace, resolved from the
+        // connecting process's ancestry, so an MCP whose agent CLI stripped
+        // CHERRY_PROJECT_ROOT still routes to its own project window instead of the
+        // frontmost one. Fall back to the active workspace.
+        if let callerWorkspace = callerWorkspace(peerPID: peerPID) {
+            return try await handleUnscoped(request, workspace: callerWorkspace, isProjectScoped: true)
         }
 
         guard let workspace = workspace ?? workspaceProvider() else {
@@ -286,6 +299,59 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         return try await handleUnscoped(request, workspace: workspace, isProjectScoped: false)
+    }
+
+    /// The workspace whose session process tree contains the connecting peer (the
+    /// agent's MCP server), found by walking the peer's process ancestry and
+    /// matching against each open workspace's session PIDs. nil if no match.
+    @MainActor
+    private func callerWorkspace(peerPID: Int32?) -> TerminalWorkspace? {
+        guard let peerPID else { return nil }
+        let ancestry = Set(Self.processAncestry(of: peerPID))
+        guard !ancestry.isEmpty else { return nil }
+        for projectRoot in openProjectRootsProvider() {
+            guard let workspace = workspaceForProjectRootProvider(projectRoot) else { continue }
+            for session in workspace.sessions {
+                if let pid = session.childProcessID, ancestry.contains(pid) {
+                    return workspace
+                }
+            }
+        }
+        return nil
+    }
+
+    /// `[pid, ppid, …]` up the process tree, via sysctl.
+    private nonisolated static func processAncestry(of pid: Int32, maxDepth: Int = 20) -> [Int32] {
+        var result: [Int32] = [pid]
+        var seen: Set<Int32> = [pid]
+        var current = pid
+        for _ in 0..<maxDepth {
+            guard let parent = parentProcessID(of: current), parent > 1, !seen.contains(parent) else { break }
+            result.append(parent)
+            seen.insert(parent)
+            current = parent
+        }
+        return result
+    }
+
+    private nonisolated static func parentProcessID(of pid: Int32) -> Int32? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        let result = mib.withUnsafeMutableBufferPointer { buffer in
+            sysctl(buffer.baseAddress, u_int(buffer.count), &info, &size, nil, 0)
+        }
+        guard result == 0, size > 0 else { return nil }
+        let ppid = info.kp_eproc.e_ppid
+        return ppid > 0 ? ppid : nil
+    }
+
+    /// PID of the process on the other end of a connected unix-domain socket.
+    private nonisolated static func peerProcessID(fileDescriptor fd: Int32) -> Int32? {
+        var pid: pid_t = 0
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        let result = getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &length)
+        return result == 0 && pid > 0 ? pid : nil
     }
 
     @MainActor

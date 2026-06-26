@@ -113,6 +113,12 @@ The installed `~/Applications/Cherry.app` is currently the native build
   (`TerminalSettings.appearance.preferredColorScheme`), not the system (the app
   forces its own dark/light). Verified via an OSC 11 probe: f7f7f7 → 212121.
 
+- **Image paste + drag** (`eb9abda`): terminals can't carry image bytes, so
+  materialize them as a temp file and insert the path (agents attach it) — added in
+  the wrapper (Cherry's ghostty apprt): the clipboard-read callback pastes an image
+  as a temp-PNG path, and `AppTerminalView` is an `NSDraggingDestination` (dropped
+  files → escaped paths; dropped image bytes → temp file + path). `TerminalPasteboardImage`.
+
 ## Open items (noted, not yet done)
 
 - **Agent-CLI hook system — deferred** (not needed yet; content/output-based

@@ -2732,10 +2732,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
         if GhosttySessionBridge.nativePTYEnabled {
             // Native-PTY: the host owns no byte stream, so the surface IS the
-            // source of truth. Pull its scrollback as text. NOTE: this is
-            // rendered text, not raw VT bytes — a deliberate semantic change for
-            // native panes (no escape sequences, no exact byte fidelity).
-            let text = ghosttyBridgeStorage?.readNativeScreenText() ?? ""
+            // source of truth. NOTE: this is rendered text, not raw VT bytes — a
+            // deliberate semantic change for native panes (no escape sequences, no
+            // exact byte fidelity).
+            let text = readNativeSurfaceText() ?? ""
             let full = Data(text.utf8)
             if full.count > maxBytes {
                 return (Data(full.suffix(maxBytes)), true)
@@ -3228,6 +3228,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     // EXEC there is no host byte stream, so we instead pull the surface's text on a
     // debounced render signal and drive the same counters/hooks from it.
 
+    /// Pulls the surface's text for the native data layer. The SCREEN selection
+    /// returns the active screen — including a TUI's live alternate screen (verified
+    /// against `top`) — plus scrollback for primary-screen shells.
+    private func readNativeSurfaceText() -> String? {
+        ghosttyBridgeStorage?.readNativeScreenText()
+    }
+
     private func contentLineCount() -> Int {
         guard GhosttySessionBridge.nativePTYEnabled else { return processor.lineCount }
         ensureNativeContentFresh()
@@ -3275,14 +3282,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
         guard GhosttySessionBridge.nativePTYEnabled else { return false }
-        guard let screen = ghosttyBridgeStorage?.readNativeScreenText() else { return false }
+        guard let text = readNativeSurfaceText() else { return false }
         lastNativeContentReadAt = Date()
         var hasher = Hasher()
-        hasher.combine(screen)
+        hasher.combine(text)
         let hash = hasher.finalize()
         guard hash != nativeContentHash else { return false }
         nativeContentHash = hash
-        nativeContentLines = screen.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        nativeContentLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
         lastOutputAt = Date()
         if case .launching = state { state = .live }

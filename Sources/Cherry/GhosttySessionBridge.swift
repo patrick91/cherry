@@ -449,16 +449,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             TerminalPerformanceMonitor.recordRenderTick()
         }
         terminalView.controller = controller
-        terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
-        proxy.bridge = self
         if Self.nativePTYEnabled {
-            // Native: the line above creates the EXEC surface eagerly (detached),
-            // before any container assigns a color scheme — so it would render with
-            // ghostty's default theme until first display. Apply the current system
-            // appearance now; the displaying container re-applies the real scheme.
+            // Native eagerly creates the EXEC surface on the next line, which spawns
+            // the child immediately. A background-spawned agent queries the terminal
+            // background (OSC 11) for its very first render, so the theme/scheme must
+            // be on the controller BEFORE the surface exists — otherwise that first
+            // prompt renders with ghostty's default (light) background while later
+            // output is correct. The displaying container re-applies the real scheme.
             activeColorScheme = Self.systemColorScheme()
             applyTerminalSettings()
         }
+        terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
+        proxy.bridge = self
         observeSettingsChanges()
     }
 

@@ -1447,6 +1447,7 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func parentAgentID(from rawValue: String?, workspace: TerminalWorkspace) throws -> UUID? {
+        mcpControlDebugLog("parentAgentID(from:) raw=\(rawValue ?? "nil")")
         guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawValue.isEmpty
         else {

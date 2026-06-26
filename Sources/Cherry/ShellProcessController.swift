@@ -257,6 +257,13 @@ struct ShellIntegrationBootstrap {
                 return 1
               }
 
+              # Native-PTY: report this shell's PID so Cherry can recover the child
+              # PID it can't get from ghostty. Enables process-ancestry parent
+              # resolution for agent CLIs that don't propagate CHERRY_* to their MCP.
+              if [[ -n "${CHERRY_SHELL_PID_FILE-}" ]]; then
+                print -n -- "$$" > "${CHERRY_SHELL_PID_FILE}" 2>/dev/null
+              fi
+
               # OSC 133 semantic-prompt markers, emitted only under native-PTY
               # (CHERRY_EMIT_OSC133) so the host-managed default byte stream is
               # unchanged. Ghostty parses these and fires command_finished, giving
@@ -390,6 +397,14 @@ final class ShellProcessController: @unchecked Sendable {
 
     static let defaultShellName = URL(fileURLWithPath: defaultShellPath).lastPathComponent
 
+    /// Path the native-PTY shell writes its own PID to at startup, so Cherry can
+    /// recover the child PID it can't get from ghostty (no `foreground_pid`).
+    static func shellPIDFilePath(processID: String) -> String {
+        let directory = "/tmp/cherry-\(getuid())/shell-pids"
+        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        return "\(directory)/\(processID).pid"
+    }
+
     /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
     /// a libghostty-spawned shell matches the host-managed forkpty launch.
     ///
@@ -433,6 +448,12 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let processID = configuration.processID, !processID.isEmpty {
             environment[CherryControl.processIDEnvironmentKey] = processID
+            // The shell self-reports its PID here at startup. Under EXEC the host
+            // has no child PID (foreground_pid is absent from this xcframework), so
+            // this restores the process-ancestry parent resolution the host path
+            // relies on — needed because some agent CLIs (Codex) don't propagate
+            // CHERRY_PROCESS_ID into their MCP subprocess.
+            environment["CHERRY_SHELL_PID_FILE"] = Self.shellPIDFilePath(processID: processID)
         }
         if let agentID = configuration.agentID, !agentID.isEmpty {
             environment[CherryControl.agentIDEnvironmentKey] = agentID

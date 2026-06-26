@@ -2849,6 +2849,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             // must run even when they're not the active tab (e.g. an AI-spawned
             // agent the user hasn't opened yet).
             _ = ghosttyBridge
+            // Recover the child PID the shell self-reports (ghostty gives us none),
+            // so process-ancestry parent resolution works for AI-spawned subagents.
+            captureNativeShellPID()
             return
         }
 
@@ -3232,6 +3235,28 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// command-boundary signal for plain scripts/commands — far better than a
     /// quiet-period guess. (Agent TUIs run on the alternate screen and emit no
     /// per-command markers, so this fires only for primary-screen commands.)
+    /// Polls the PID file the native-PTY shell writes at startup and stores it as
+    /// `childProcessID`, so `process.pid` is populated for process-ancestry parent
+    /// resolution (ghostty exposes no child PID). Self-healing: retries until the
+    /// shell integration has written the file.
+    private func captureNativeShellPID() {
+        guard GhosttySessionBridge.nativePTYEnabled else { return }
+        let launchID = activeLaunchID
+        let path = ShellProcessController.shellPIDFilePath(processID: id.uuidString)
+        func poll(_ attempt: Int) {
+            guard activeLaunchID == launchID else { return } // session relaunched/exited
+            if let raw = try? String(contentsOfFile: path, encoding: .utf8),
+               let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+                childProcessID = pid
+                bumpRevision()
+                return
+            }
+            guard attempt < 25 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { poll(attempt + 1) }
+        }
+        poll(0)
+    }
+
     func noteNativeCommandFinished(exitCode: Int32?) {
         guard GhosttySessionBridge.nativePTYEnabled else { return }
         lastNativeCommandFinishedAt = Date()

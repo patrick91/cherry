@@ -3242,6 +3242,13 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func handleLocalKeyDown(_ event: NSEvent) -> Bool {
+        // Native-PTY: the ghostty surface owns the PTY and encodes its own keyboard
+        // input — arrows, paste, option-combos, kitty protocol, app-cursor-keys
+        // mode — exactly like standalone ghostty. This monitor exists only because
+        // the host-managed surface is a pure renderer that doesn't own input; under
+        // EXEC it would double-encode (e.g. arrows would arrive at the shell as
+        // literal escape text via the text path). Let the event fall through.
+        if GhosttySessionBridge.nativePTYEnabled { return false }
         guard event.window === window,
               let activeSession,
               activeSession.acceptsInput,

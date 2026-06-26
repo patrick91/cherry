@@ -47,4 +47,12 @@ public struct TerminalSurfaceOptions: Sendable {
         guard case let .inMemory(session) = backend else { return nil }
         return session
     }
+
+    /// The `.exec` backend spawns and owns a child process, so its surface must be
+    /// created even while the view is detached (the process has to run before the
+    /// session is ever displayed). In-memory surfaces are pure renderers.
+    var isExec: Bool {
+        if case .exec = backend { return true }
+        return false
+    }
 }

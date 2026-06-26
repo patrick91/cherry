@@ -100,7 +100,12 @@ final class TerminalSurfaceCoordinator {
             TerminalDebugLog.log(.lifecycle, "surface rebuild skipped: missing controller")
             return
         }
-        guard isAttached() else {
+        let attached = isAttached()
+        // EXEC surfaces own a child process, so they must be created even while
+        // detached — the process has to run before the session is ever displayed
+        // (e.g. an AI-spawned agent in a non-active tab). In-memory surfaces are
+        // pure renderers and only need to exist while on screen.
+        guard attached || configuration.isExec else {
             TerminalDebugLog.log(.lifecycle, "surface rebuild skipped: view detached")
             return
         }
@@ -129,8 +134,13 @@ final class TerminalSurfaceCoordinator {
         controller.onWakeup = { [weak self] in
             self?.requestImmediateTick()
         }
-        requestImmediateTick()
-        TerminalDebugLog.log(.lifecycle, "surface rebuild succeeded")
+        // A detached EXEC surface has no drawable yet — the child process runs on
+        // ghostty's own IO thread, so skip rendering until the view is attached.
+        // `viewDidMoveToWindow` resumes ticking without rebuilding (surface != nil).
+        if attached {
+            requestImmediateTick()
+        }
+        TerminalDebugLog.log(.lifecycle, "surface rebuild succeeded attached=\(attached)")
         synchronizeMetrics()
     }
 

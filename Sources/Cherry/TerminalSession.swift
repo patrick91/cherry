@@ -2837,14 +2837,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             // that would be a second shell (and a SECOND agent process for agent
             // panes). Reach .live so the surface mounts. Input flows through the
             // surface directly, not the host writer.
-            // KNOWN GAP: no forkpty onExit here, so shell-exit detection waits on
-            // the ghostty childexited action (Stage C6); the session stays .live
-            // until then.
+            // Shell-exit detection arrives via the ghostty childexited action.
             shellProcess = nil
             hostInputWriter.set(nil)
             childProcessID = nil
             state = .live
             bumpRevision()
+            // Eagerly build the bridge so the EXEC surface — and therefore the
+            // child process — spawns now, like the host forkpty does, instead of
+            // lazily on first display. Agents/commands are normal sessions: they
+            // must run even when they're not the active tab (e.g. an AI-spawned
+            // agent the user hasn't opened yet).
+            _ = ghosttyBridge
             return
         }
 

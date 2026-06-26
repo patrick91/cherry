@@ -334,6 +334,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private static let defaultLiveSurfaceLimit = 64
 
     private static func resolveInitialLiveSurfaceLimit() -> Int? {
+        // Native-PTY: every surface owns a live child process, so evicting one
+        // would kill a running agent/command. Keep them all alive.
+        if nativePTYEnabled {
+            return unlimitedLiveSurfaceLimit
+        }
         if let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"] {
             let trimmed = raw.trimmingCharacters(in: .whitespaces).lowercased()
             if trimmed == "unlimited" || trimmed == "all" {
@@ -493,6 +498,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         scrollContainer = nil
+        if Self.nativePTYEnabled {
+            // EXEC surface == live child process. Never free it on detach (that
+            // would kill a running agent/command); keep it parked and alive so a
+            // non-active tab keeps running. Freed only when the session closes.
+            cancelDetachedSurfaceRelease()
+            Self.notePark(self)
+            return
+        }
         if Self.liveSurfaceLimit != nil, canPreserveSurface {
             // Live-surface LRU: keep the surface alive and fed (the output
             // observer is left installed), so a switch-back is a re-show with no

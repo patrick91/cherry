@@ -1,8 +1,9 @@
 # Native-PTY migration (eliminating terminal replay)
 
-Status: **Stages A–C done on branch `native-pty`**, behind the `CHERRY_NATIVE_PTY`
-flag. `main` and the default (host-managed) path are **untouched**. What remains is
-the human-reviewed cutover: flip the default and delete the replay subsystem.
+Status: **native-PTY is now the DEFAULT** (merged to `main`). The legacy
+host-managed (replay) path is still present as an opt-out — `CHERRY_NATIVE_PTY=0`
+or `-DCHERRY_DISABLE_NATIVE_PTY`. The remaining cutover step is deleting the replay
+subsystem once we're confident we won't need the fallback.
 
 ## Why
 

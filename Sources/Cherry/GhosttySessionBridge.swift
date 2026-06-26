@@ -2542,20 +2542,22 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return true
     }
 
-    /// Flag for adopting ghostty's native-PTY model: when on, surfaces use the
-    /// EXEC backend (ghostty owns the PTY/Screen) instead of host-managed in-memory
-    /// feeding — so replay is impossible by construction. Enable with
-    /// `CHERRY_NATIVE_PTY=1` or `-DCHERRY_NATIVE_PTY`
-    /// (`CHERRY_NATIVE_PTY=1 Scripts/install-local-app`). Default off.
+    /// Ghostty's native-PTY model — **the default**. Surfaces use the EXEC backend
+    /// (ghostty owns the PTY/Screen) instead of host-managed in-memory feeding, so
+    /// replay is impossible by construction. Force the legacy host-managed (replay)
+    /// path with `CHERRY_NATIVE_PTY=0` or `-DCHERRY_DISABLE_NATIVE_PTY`.
     static let nativePTYEnabled: Bool = {
-        if let raw = ProcessInfo.processInfo.environment["CHERRY_NATIVE_PTY"],
-           ["1", "true", "yes", "on"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased()) {
-            return true
+        if let raw = ProcessInfo.processInfo.environment["CHERRY_NATIVE_PTY"] {
+            // Explicit override: 0/false/no/off forces the legacy host-managed
+            // (replay) path; anything else keeps native on.
+            return !["0", "false", "no", "off"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased())
         }
-        #if CHERRY_NATIVE_PTY
-        return true
-        #else
+        // Native-PTY is the default: the ghostty surface owns the PTY (no replay).
+        // Build the legacy host-managed path with `-DCHERRY_DISABLE_NATIVE_PTY`.
+        #if CHERRY_DISABLE_NATIVE_PTY
         return false
+        #else
+        return true
         #endif
     }()
 

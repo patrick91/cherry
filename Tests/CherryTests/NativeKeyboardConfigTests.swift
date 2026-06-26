@@ -17,6 +17,7 @@ private func parsed(_ s: String) -> [String] {
     #expect(parsed(config) == [
         "keybind = shift+enter=text:\\n", // input-producing -> kept
         "macos-option-as-alt = left",     // user's value preserved
+        "keybind = shift+tab=csi:Z",      // injected default
     ])
 }
 
@@ -29,13 +30,23 @@ private func parsed(_ s: String) -> [String] {
     // app actions dropped, text: kept, option-as-alt defaulted on
     #expect(parsed(config) == [
         "keybind = ctrl+a=text:\\x01",
+        "keybind = shift+tab=csi:Z",
         "macos-option-as-alt = true",
     ])
 }
 
 @Test func keyboardConfigDefaultsOptionAsAltWhenUnset() {
-    #expect(parsed("") == ["macos-option-as-alt = true"])
-    #expect(parsed("font-size = 14\n# a comment") == ["macos-option-as-alt = true"])
+    #expect(parsed("") == ["keybind = shift+tab=csi:Z", "macos-option-as-alt = true"])
+    #expect(parsed("font-size = 14\n# a comment") == ["keybind = shift+tab=csi:Z", "macos-option-as-alt = true"])
+}
+
+@Test func keyboardConfigDefaultsShiftTabButUserCanOverride() {
+    // Default shift+tab is injected when the user has none.
+    #expect(parsed("keybind = ctrl+a=text:\\x01").contains("keybind = shift+tab=csi:Z"))
+    // A user's own shift+tab binding wins (we don't inject the default).
+    let withUserShiftTab = parsed("keybind = shift+tab=text:custom")
+    #expect(withUserShiftTab.contains("keybind = shift+tab=text:custom"))
+    #expect(!withUserShiftTab.contains("keybind = shift+tab=csi:Z"))
 }
 
 @Test func keyboardConfigIgnoresCommentsAndBlankLines() {
@@ -48,6 +59,7 @@ private func parsed(_ s: String) -> [String] {
     #expect(parsed(config) == [
         "keybind = shift+enter=text:\\n",
         "macos-option-as-alt = right",
+        "keybind = shift+tab=csi:Z",
     ])
 }
 
@@ -60,6 +72,7 @@ private func parsed(_ s: String) -> [String] {
     #expect(parsed(config) == [
         "keybind = f1=csi:11~",
         "keybind = alt+left=esc:b",
+        "keybind = shift+tab=csi:Z",
         "macos-option-as-alt = true",
     ])
 }

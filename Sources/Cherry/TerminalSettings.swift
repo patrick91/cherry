@@ -192,6 +192,7 @@ final class TerminalSettings: ObservableObject {
     nonisolated static func parseUserGhosttyKeyboardConfig(_ contents: String) -> [(String, String)] {
         var result: [(String, String)] = []
         var sawOptionAsAlt = false
+        var userKeybindTriggers: Set<String> = []
         for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
@@ -204,9 +205,18 @@ final class TerminalSettings: ObservableObject {
                 sawOptionAsAlt = true
             case "keybind" where isInputProducingKeybind(value):
                 result.append((key, value))
+                if let eq = value.firstIndex(of: "=") {
+                    userKeybindTriggers.insert(value[..<eq].trimmingCharacters(in: .whitespaces).lowercased())
+                }
             default:
                 continue
             }
+        }
+        // Default keybinds for agent special keys the wrapper's native key handling
+        // encodes wrong (it sends modifiers as modify-other-keys). Force the standard
+        // sequence via ghostty; a user's own binding for the same trigger wins.
+        for (trigger, action) in [("shift+tab", "csi:Z")] where !userKeybindTriggers.contains(trigger) {
+            result.append(("keybind", "\(trigger)=\(action)"))
         }
         if !sawOptionAsAlt {
             result.append(("macos-option-as-alt", "true"))

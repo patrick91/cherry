@@ -85,6 +85,8 @@ final class TerminalCallbackBridge {
         case GHOSTTY_ACTION_RENDER:
             TerminalDebugLog.log(.render, "callback action=render")
             onRenderRequest?()
+            (delegate as? any TerminalSurfaceRenderDelegate)?
+                .terminalDidRequestRender()
 
         case GHOSTTY_ACTION_SCROLLBAR:
             let metrics = TerminalScrollbarMetrics(action.action.scrollbar)

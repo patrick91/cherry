@@ -179,3 +179,8 @@ public protocol TerminalSurfaceNotificationDelegate: TerminalSurfaceViewDelegate
 public protocol TerminalSurfaceChildExitDelegate: TerminalSurfaceViewDelegate {
     func terminalDidExit(exitCode: UInt32)
 }
+
+@MainActor
+public protocol TerminalSurfaceRenderDelegate: TerminalSurfaceViewDelegate {
+    func terminalDidRequestRender()
+}

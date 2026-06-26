@@ -297,6 +297,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     TerminalSurfaceScrollInputDelegate,
     TerminalSurfaceTitleDelegate, TerminalSurfaceWorkingDirectoryDelegate,
     TerminalSurfaceNotificationDelegate, TerminalSurfaceChildExitDelegate,
+    TerminalSurfaceRenderDelegate,
     TerminalSurfaceKeyEquivalentDelegate
 {
     private(set) static var liveBridgeCount = 0
@@ -644,6 +645,49 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidExit(exitCode: UInt32) {
         guard Self.nativePTYEnabled, let session = proxy.session else { return }
         session.ingestNativeChildExit(exitCode: Int32(bitPattern: exitCode))
+    }
+
+    func terminalDidRequestRender() {
+        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        session.noteNativeRenderRequest()
+    }
+
+    /// Routes programmatic input to the surface-owned PTY under native mode (the
+    /// host has no PTY fd to write to). `send(text:)`/`send(data:)` funnel here.
+    ///
+    /// Printable runs go through the surface text path; CR/LF and Ctrl-C become
+    /// real key events, because `ghostty_surface_text` does not submit a trailing
+    /// carriage return (verified). kVK_Return = 36, kVK_ANSI_C = 8.
+    func sendNativeInput(_ text: String) {
+        var pending = ""
+        var previousWasCarriageReturn = false
+        func flush() {
+            guard !pending.isEmpty else { return }
+            terminalView.sendText(pending)
+            pending.removeAll(keepingCapacity: true)
+        }
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x0D: // CR -> Return
+                flush()
+                terminalView.sendKeyPress(keycode: 36, control: false)
+                previousWasCarriageReturn = true
+            case 0x0A: // LF -> Return (collapse CRLF into one submit)
+                if !previousWasCarriageReturn {
+                    flush()
+                    terminalView.sendKeyPress(keycode: 36, control: false)
+                }
+                previousWasCarriageReturn = false
+            case 0x03: // ETX -> Ctrl-C
+                flush()
+                terminalView.sendKeyPress(keycode: 8, control: true)
+                previousWasCarriageReturn = false
+            default:
+                pending.unicodeScalars.append(scalar)
+                previousWasCarriageReturn = false
+            }
+        }
+        flush()
     }
 
     /// Full scrollback text from the surface, for native-PTY data reads (the host

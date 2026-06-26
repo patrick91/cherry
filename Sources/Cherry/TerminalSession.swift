@@ -2092,6 +2092,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     private let rawOutputStore = TerminalRawOutputStore()
     private let metadataParser = TerminalMetadataParser()
     private let metadataOutputLock = NSLock()
+
+    // Native-PTY (EXEC) content model: under EXEC the surface owns the terminal
+    // state, so these mirror what the processor holds in the host path, refreshed
+    // from `ghostty_surface_read_text` on a debounced render signal.
+    private static let nativeContentDebounceInterval: TimeInterval = 0.12
+    private static let nativeContentReadThrottle: TimeInterval = 0.05
+    private var nativeContentLines: [String] = []
+    private var nativeContentHash = 0
+    private var nativeContentRefreshScheduled = false
+    private var lastNativeContentReadAt: Date?
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
@@ -2336,7 +2346,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     var lineCount: Int {
-        processor.lineCount
+        contentLineCount()
     }
 
     var cursorState: TerminalCursorState {
@@ -2394,7 +2404,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func snapshot(range: Range<Int>) -> [String] {
-        processor.snapshot(range: range)
+        contentSnapshot(range: range)
     }
 
     func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
@@ -2469,6 +2479,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
+        if GhosttySessionBridge.nativePTYEnabled {
+            ghosttyBridgeStorage?.sendNativeInput(text)
+            return
+        }
         shellProcess?.write(text)
     }
 
@@ -2492,6 +2506,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
         }
+        if GhosttySessionBridge.nativePTYEnabled {
+            ghosttyBridgeStorage?.sendNativeInput(String(decoding: outboundData, as: UTF8.self))
+            return
+        }
         shellProcess?.write(outboundData)
     }
 
@@ -2501,6 +2519,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             fputs("[send interrupt] shellProcess=\(shellProcess != nil)\n", stderr)
         }
         processor.discardPendingOutput()
+        if GhosttySessionBridge.nativePTYEnabled {
+            ghosttyBridgeStorage?.sendNativeInput("\u{03}")
+            return
+        }
         shellProcess?.writeUrgent(Data([0x03]))
     }
 
@@ -3198,6 +3220,87 @@ final class TerminalSession: ObservableObject, Identifiable {
         finishProcessExit(status: exitCode, launchID: launchID)
     }
 
+    // MARK: - Native-PTY content model (search / summary / idle under EXEC)
+    //
+    // The data layer (getProcessOutput, search, agent summaries, waitForProcessIdle)
+    // reads `lineCount`/`snapshot(range:)` and the `outputVersion`/`contentVersion`
+    // counters, all driven by `handleProcessorDidChange` in the host path. Under
+    // EXEC there is no host byte stream, so we instead pull the surface's text on a
+    // debounced render signal and drive the same counters/hooks from it.
+
+    private func contentLineCount() -> Int {
+        guard GhosttySessionBridge.nativePTYEnabled else { return processor.lineCount }
+        ensureNativeContentFresh()
+        return nativeContentLines.count
+    }
+
+    private func contentSnapshot(range: Range<Int>) -> [String] {
+        guard GhosttySessionBridge.nativePTYEnabled else {
+            return processor.snapshot(range: range)
+        }
+        ensureNativeContentFresh()
+        guard !nativeContentLines.isEmpty else { return [] }
+        let clamped = range.clamped(to: 0..<nativeContentLines.count)
+        return Array(nativeContentLines[clamped])
+    }
+
+    /// Render-signal entry point: schedule a debounced content refresh so the
+    /// output/idle counters advance even when nothing is actively reading.
+    func noteNativeRenderRequest() {
+        guard GhosttySessionBridge.nativePTYEnabled else { return }
+        guard !nativeContentRefreshScheduled else { return }
+        nativeContentRefreshScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.nativeContentDebounceInterval) { [weak self] in
+            guard let self else { return }
+            self.nativeContentRefreshScheduled = false
+            self.refreshNativeContentNow()
+        }
+    }
+
+    /// Re-read the surface scrollback when stale (throttled). Called on every
+    /// data-layer read so search/output are always current, independent of how
+    /// reliably the render signal fires.
+    private func ensureNativeContentFresh() {
+        if let last = lastNativeContentReadAt,
+           Date().timeIntervalSince(last) < Self.nativeContentReadThrottle {
+            return
+        }
+        refreshNativeContentNow()
+    }
+
+    /// Pulls the surface scrollback and, if it changed, rebuilds the native line
+    /// model and advances the same counters/hooks `handleProcessorDidChange` drives
+    /// in the host path. The change probe hashes the full screen text (the viewport
+    /// selection isn't reliably readable), which cursor blink etc. don't alter.
+    @discardableResult
+    private func refreshNativeContentNow() -> Bool {
+        guard GhosttySessionBridge.nativePTYEnabled else { return false }
+        guard let screen = ghosttyBridgeStorage?.readNativeScreenText() else { return false }
+        lastNativeContentReadAt = Date()
+        var hasher = Hasher()
+        hasher.combine(screen)
+        let hash = hasher.finalize()
+        guard hash != nativeContentHash else { return false }
+        nativeContentHash = hash
+        nativeContentLines = screen.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        lastOutputAt = Date()
+        if case .launching = state { state = .live }
+        outputVersion &+= 1
+        lastContentChangeAt = Date()
+        contentVersion &+= 1
+        if kind == .agent {
+            lastSummaryOutputChangeDate = Date()
+            recordAgentActivitySignal()
+            if agentActivityState == .working {
+                scheduleAgentIdleRecheck()
+            }
+            scheduleSummaryIfNeeded()
+        }
+        bumpRevision()
+        return true
+    }
+
     enum AgentNotificationDisposition {
         case passThrough
         case suppress
@@ -3419,10 +3522,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let agentTrailingBlankScanLimit = 600
 
     private func effectiveAgentContentLineCount() -> Int {
-        let lineCount = processor.lineCount
+        let lineCount = contentLineCount()
         guard lineCount > 0 else { return 0 }
         let scanStart = max(0, lineCount - Self.agentTrailingBlankScanLimit)
-        let scanLines = processor.snapshot(range: scanStart..<lineCount)
+        let scanLines = contentSnapshot(range: scanStart..<lineCount)
         var effectiveEnd = lineCount
         var index = scanLines.count - 1
         while index >= 0,
@@ -3438,7 +3541,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard lineCount > 0 else { return false }
         let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = processor.snapshot(range: markerStart..<lineCount)
+        let markerLines = contentSnapshot(range: markerStart..<lineCount)
         return Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName)
     }
 
@@ -3448,7 +3551,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = processor.snapshot(range: markerStart..<lineCount)
+        let markerLines = contentSnapshot(range: markerStart..<lineCount)
         if Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName) {
             return false
         }
@@ -3851,7 +3954,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return .empty }
         let recentStartLine = max(0, lineCount - Self.summaryTailLineLimit)
-        let inputLines = processor.snapshot(range: recentStartLine..<lineCount)
+        let inputLines = contentSnapshot(range: recentStartLine..<lineCount)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let lines = inputLines.filter { !Self.shouldDropSummaryLine($0) }

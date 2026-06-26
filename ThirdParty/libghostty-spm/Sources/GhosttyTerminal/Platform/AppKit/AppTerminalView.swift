@@ -45,6 +45,19 @@
             surface?.performBindingAction(action) ?? false
         }
 
+        /// Sends text as terminal input (→ child stdin) the way committed/typed
+        /// text is. Under the native-PTY backend the host owns no PTY fd, so
+        /// programmatic input must flow through the surface like this.
+        public func sendText(_ text: String) {
+            surface?.sendText(text)
+        }
+
+        /// Synthesizes a key press (+release). `keycode` is the AppKit virtual
+        /// keycode. Used for native-PTY Enter/Ctrl-C which the text path can't send.
+        public func sendKeyPress(keycode: UInt32, control: Bool) {
+            surface?.sendKeyPress(keycode: keycode, control: control)
+        }
+
         /// Full scrollback as plain text (nil if unavailable). The native-PTY
         /// backend uses this to source output for hosts that own no byte stream.
         public func readScreenText() -> String? {

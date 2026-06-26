@@ -190,6 +190,14 @@ final class TerminalSettings: ObservableObject {
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
             builder.withCustom("scrollback-limit", "\(Defaults.ghosttyScrollbackLimitBytes)")
+            if GhosttySessionBridge.nativePTYEnabled {
+                // Native-PTY: the ghostty surface owns the keyboard, so it must
+                // handle the inputs the host-managed key monitor used to encode by
+                // hand. Option-as-Alt unlocks the whole Alt/Meta family (alt+delete
+                // = backward-kill-word, alt+←/→ word nav, alt+backspace) instead of
+                // Option composing accented characters.
+                builder.withCustom("macos-option-as-alt", "true")
+            }
         }
     }
 

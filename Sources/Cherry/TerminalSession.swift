@@ -2353,6 +2353,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         contentLineCount()
     }
 
+    /// Like `lineCount` but never triggers a native content refresh — for hot paths
+    /// like process listings that poll many sessions. The render signal keeps the
+    /// native line model current; this just reads it.
+    var listingLineCount: Int {
+        GhosttySessionBridge.nativePTYEnabled ? nativeContentLines.count : processor.lineCount
+    }
+
     var cursorState: TerminalCursorState {
         processor.cursorState
     }

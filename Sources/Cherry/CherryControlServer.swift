@@ -1100,7 +1100,10 @@ final class CherryControlServer: @unchecked Sendable {
             restartPolicy: session.restartPolicy,
             workingDirectory: session.workingDirectory,
             commandLine: session.kind == .terminal ? nil : session.subtitle,
-            lineCount: session.lineCount,
+            // Cheap, non-refreshing line count: process listings are polled
+            // frequently, and `lineCount` would re-read the surface + run agent
+            // hooks per session, saturating the main actor (list_processes timeouts).
+            lineCount: session.listingLineCount,
             outputVersion: session.outputVersion,
             summary: session.summary,
             selected: workspace.selectedSessionID == session.id,

@@ -153,13 +153,20 @@ final class TerminalSurfaceCoordinator {
         }
 
         let scale = scaleFactor()
-        let size = viewSize()
-        guard size.width > 0, size.height > 0 else {
-            TerminalDebugLog.log(
-                .metrics,
-                "synchronizeMetrics skipped: invalid view size=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height))"
-            )
-            return
+        var size = viewSize()
+        if size.width <= 0 || size.height <= 0 {
+            // A detached EXEC surface still runs a child (e.g. a background agent an
+            // orchestrator reads via read_text) — give it a usable default PTY size
+            // so its TUI isn't tiny/narrow until it's first displayed. In-memory
+            // surfaces are pure renderers and stay skipped while detached.
+            guard configuration.isExec else {
+                TerminalDebugLog.log(
+                    .metrics,
+                    "synchronizeMetrics skipped: invalid view size=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height))"
+                )
+                return
+            }
+            size = (width: 900, height: 600)
         }
 
         let pixelWidth = UInt32((size.width * scale).rounded(.down))

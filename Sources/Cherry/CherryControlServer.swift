@@ -402,7 +402,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .waitForProcessIdle(result))
         case .getProcessPorts(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            return .init(result: .getProcessPorts(try servicesResult(
+            return .init(result: .getProcessPorts(try await servicesResult(
                 workspace: workspace,
                 sessions: [session],
                 includeUnattributed: request.includeUnattributed ?? false
@@ -413,7 +413,7 @@ final class CherryControlServer: @unchecked Sendable {
                 guard let kind else { return true }
                 return session.kind == kind
             }
-            return .init(result: .servicesList(try servicesResult(
+            return .init(result: .servicesList(try await servicesResult(
                 workspace: workspace,
                 sessions: sessions,
                 includeUnattributed: request.includeUnattributed ?? false
@@ -1260,8 +1260,8 @@ final class CherryControlServer: @unchecked Sendable {
         workspace: TerminalWorkspace,
         sessions: [TerminalSession],
         includeUnattributed: Bool
-    ) throws -> ServicesResult {
-        let records = try detectedServices(
+    ) async throws -> ServicesResult {
+        let records = try await detectedServices(
             workspace: workspace,
             sessions: sessions,
             includeUnattributed: includeUnattributed
@@ -1278,7 +1278,7 @@ final class CherryControlServer: @unchecked Sendable {
         workspace: TerminalWorkspace,
         sessions: [TerminalSession],
         includeUnattributed: Bool
-    ) throws -> [ServiceRecord] {
+    ) async throws -> [ServiceRecord] {
         let inspectable = sessions.map { session in
             InspectableProcess(
                 id: session.id.uuidString,
@@ -1289,7 +1289,7 @@ final class CherryControlServer: @unchecked Sendable {
                 agentName: session.agentName
             )
         }
-        return try serviceDetector.detectServices(processes: inspectable, includeUnattributed: includeUnattributed)
+        return try await serviceDetector.detectServices(processes: inspectable, includeUnattributed: includeUnattributed)
     }
 
     @MainActor
@@ -1305,7 +1305,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         var lastCandidates: [ServiceRecord] = []
         repeat {
-            let candidates = try detectedServices(
+            let candidates = try await detectedServices(
                 workspace: workspace,
                 sessions: sessions,
                 includeUnattributed: includeUnattributed

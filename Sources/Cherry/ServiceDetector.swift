@@ -12,25 +12,32 @@ struct InspectableProcess: Equatable {
 }
 
 protocol ServiceDetecting {
-    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) throws -> [ServiceRecord]
+    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord]
 }
 
 struct MacOSServiceDetector: ServiceDetecting {
-    private let processTreeProvider: () -> [Int32: Int32]
-    private let lsofOutputProvider: () throws -> String
+    private let processTreeProvider: @Sendable () -> [Int32: Int32]
+    private let lsofOutputProvider: @Sendable () throws -> String
 
     init(
-        processTreeProvider: @escaping () -> [Int32: Int32] = MacOSServiceDetector.currentProcessTree,
-        lsofOutputProvider: @escaping () throws -> String = MacOSServiceDetector.currentLsofOutput
+        processTreeProvider: @escaping @Sendable () -> [Int32: Int32] = MacOSServiceDetector.currentProcessTree,
+        lsofOutputProvider: @escaping @Sendable () throws -> String = MacOSServiceDetector.currentLsofOutput
     ) {
         self.processTreeProvider = processTreeProvider
         self.lsofOutputProvider = lsofOutputProvider
     }
 
-    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) throws -> [ServiceRecord] {
-        let processTree = processTreeProvider()
+    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord] {
+        // `ps`/`lsof` are blocking subprocesses; run them off the @MainActor control
+        // server (mirrors AgentSummaryRunner) so they can't pin it and starve every
+        // other MCP request — the cause of nested-agent "Transport closed" hangs.
+        let processTreeProvider = self.processTreeProvider
+        let lsofOutputProvider = self.lsofOutputProvider
+        let (processTree, lsofOutput) = try await Task.detached(priority: .utility) {
+            (processTreeProvider(), try lsofOutputProvider())
+        }.value
         let inspectableByPID = processLookup(processes: processes, processTree: processTree)
-        let listeners = Self.parseLsofOutput(try lsofOutputProvider())
+        let listeners = Self.parseLsofOutput(lsofOutput)
 
         return listeners.compactMap { listener in
             guard listener.isLocalOrWildcard else { return nil }
@@ -198,7 +205,7 @@ struct MacOSServiceDetector: ServiceDetecting {
         try runTool(path: "/usr/sbin/lsof", arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcfnPT"])
     }
 
-    private static func runTool(path: String, arguments: [String]) throws -> String {
+    private static func runTool(path: String, arguments: [String], timeout: TimeInterval = 4.0) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -208,10 +215,31 @@ struct MacOSServiceDetector: ServiceDetecting {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
+        let startedAt = Date()
         try process.run()
-        process.waitUntilExit()
 
+        // Bound the wait: if ps/lsof ever hangs (weird network/filesystem state) it
+        // must not block forever even off the main actor. Terminating closes the
+        // pipe, which unblocks the read below.
+        let watchdog = DispatchWorkItem {
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
+        // Read BEFORE waitUntilExit: large output (many listeners) can exceed the
+        // 64KB pipe buffer and deadlock if we wait first. readDataToEndOfFile drains
+        // until EOF (process exit or watchdog kill).
         let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+
+        // Diagnostic: service detection used to run on the main actor; if these ever
+        // get slow under load it explains MCP latency. Now off-actor, but worth a log.
+        let elapsed = Date().timeIntervalSince(startedAt)
+        if elapsed > 0.5 {
+            NSLog("[cherry] service-detect %@ took %.2fs", path, elapsed)
+        }
+
         if process.terminationStatus == 0 {
             return String(decoding: output, as: UTF8.self)
         }

@@ -3311,7 +3311,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard GhosttySessionBridge.nativePTYEnabled else { return }
         guard !nativeContentRefreshScheduled else { return }
         nativeContentRefreshScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.nativeContentDebounceInterval) { [weak self] in
+        // Off-screen sessions (e.g. background agents an orchestrator drives) refresh
+        // less aggressively — their content is still pulled on demand by the data
+        // layer; this just throttles the proactive counter/idle updates.
+        let debounce = ProjectWindowRegistry.shared.isSessionVisible(self)
+            ? Self.nativeContentDebounceInterval
+            : Self.nativeContentDebounceInterval * 4
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounce) { [weak self] in
             guard let self else { return }
             self.nativeContentRefreshScheduled = false
             self.refreshNativeContentNow()

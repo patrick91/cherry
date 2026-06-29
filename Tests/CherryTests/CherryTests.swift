@@ -1309,7 +1309,7 @@ private struct MCPWhoamiPayload: Decodable {
         processTreeProvider: { [200: 100] },
         lsofOutputProvider: { output }
     )
-    let services = try detector.detectServices(
+    let services = try await detector.detectServices(
         processes: [InspectableProcess(
             id: "process-1",
             name: "Web",
@@ -1372,7 +1372,7 @@ private struct MCPWhoamiPayload: Decodable {
     var services: [ServiceRecord] = []
     let deadline = Date(timeIntervalSinceNow: 2)
     repeat {
-        services = (try? detector.detectServices(processes: [process], includeUnattributed: false)) ?? []
+        services = (try? await detector.detectServices(processes: [process], includeUnattributed: false)) ?? []
         if services.contains(where: { $0.port == port && $0.processID == "test-runner" }) {
             break
         }
@@ -10156,7 +10156,7 @@ private final class ControlServerHarness {
 private final class FakeServiceDetector: ServiceDetecting {
     var services: [ServiceRecord] = []
 
-    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) throws -> [ServiceRecord] {
+    func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord] {
         let processIDs = Set(processes.map(\.id))
         return services.filter { service in
             if service.attribution == .unattributed {

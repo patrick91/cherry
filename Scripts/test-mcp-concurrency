@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+Regression test: the MCP control server must stay responsive while service detection
+(ps/lsof) runs.
+
+Background: CherryControlServer is a single @MainActor. Service detection
+(get_process_ports / list_services / wait_for_bound_port) used to spawn ps+lsof
+SYNCHRONOUSLY on that actor, pinning it — so under nested-agent load other MCP requests
+stalled, missed their client timeout, and the stdio transport was torn down
+("Transport closed"). Fixed by running ps/lsof off the actor (Task.detached) + a watchdog.
+
+Proof: hold a wait_for_bound_port on a port that never binds (it loops ps/lsof every
+~150ms for ~3.5s) on one connection, and hammer list_processes on others. They must stay
+fast (a pinned actor would stall them and let far fewer through).
+
+Usage: Scripts/test-mcp-concurrency   (launches an isolated Cherry; native PTY default)
+"""
+import json, os, socket, subprocess, sys, threading, time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+NS = f"mcp-conc-{os.getpid()}"
+SOCK = Path(f"/tmp/cherry-{os.getuid()}") / NS / "control.sock"
+
+def ec(n, p=None): return {n: {"_0": p} if p is not None else {}}
+def sc(r): return ec("scoped", {"projectRoot": str(REPO), "request": r})
+
+def send(req, t=30):
+    """Returns (result, elapsed_seconds). Raises RuntimeError on a control error."""
+    d = json.dumps(req, separators=(",", ":")).encode() + b"\n"
+    start = time.monotonic()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(t); s.connect(str(SOCK)); s.sendall(d); s.shutdown(socket.SHUT_WR)
+        b = bytearray()
+        while True:
+            c = s.recv(65536)
+            if not c: break
+            b.extend(c)
+            if b.endswith(b"\n"): break
+    elapsed = time.monotonic() - start
+    r = json.loads(b.decode())
+    if r.get("error"): raise RuntimeError(r["error"])
+    return r["result"], elapsed
+
+def lp():
+    _, e = send(sc(ec("listProcesses", {})), t=20)
+    return e
+
+env = dict(os.environ)
+env.update({"CHERRY_CONTROL_NAMESPACE": NS, "CHERRY_PERF_PROJECT_ROOTS": str(REPO)})
+proc = subprocess.Popen(["swift", "run", "-c", "release", "Cherry"], cwd=str(REPO),
+                        env=env, stdout=open("/tmp/mcp-conc.log", "w"), stderr=subprocess.STDOUT)
+results = {}
+try:
+    dl = time.monotonic() + 180
+    while time.monotonic() < dl:
+        if proc.poll() is not None: raise RuntimeError("Cherry exited early; see /tmp/mcp-conc.log")
+        if SOCK.exists():
+            try: send(ec("listProjects"), 3); break
+            except Exception: pass
+        time.sleep(0.3)
+    send(ec("openProject", {"projectRoot": str(REPO)}), 30); time.sleep(1.0)
+    for i in range(2):
+        send(sc(ec("spawnProcess", {"kind": "terminal", "title": f"t{i}", "workingDirectory": str(REPO)})), 30)
+    time.sleep(1.5)
+
+    # (1) service detection itself works and returns (doesn't hang)
+    _, sd = send(sc(ec("servicesList", {})), 20)
+    results["services_list_ok"] = (True, f"{sd*1000:.0f}ms")
+
+    # (2) baseline list_processes latency
+    base = sorted(lp() for _ in range(8))
+    results["baseline"] = (True, f"median={base[len(base)//2]*1000:.0f}ms max={base[-1]*1000:.0f}ms")
+
+    # (3) concurrency under SEVERAL looping service-detection calls. One detection is
+    #     fast (~150ms); the discriminator is parallelism — a pinned @MainActor runs
+    #     them serially and saturates, while the fix runs them off-actor in parallel
+    #     and keeps the actor free. So fan out a few holders to amplify the contrast.
+    HOLDERS = 4
+    state = {"done": 0, "err": None}
+    def hold():
+        try:
+            send(sc(ec("waitForBoundPort", {"port": 59999, "timeoutMilliseconds": 3500})), t=20)
+        except RuntimeError as e:
+            state["err"] = str(e)  # expected: port_wait_timed_out
+        finally:
+            state["done"] += 1
+    threads = [threading.Thread(target=hold) for _ in range(HOLDERS)]
+    for th in threads: th.start()
+    time.sleep(0.2)
+
+    conc = []
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and state["done"] < HOLDERS:
+        conc.append(lp())
+    for th in threads: th.join(timeout=20)
+
+    conc_sorted = sorted(conc)
+    conc_max = max(conc)
+    results["concurrent_count"] = (len(conc) >= 100,
+        f"{len(conc)} list_processes during the wait (a pinned actor lets far fewer through)")
+    results["concurrent_latency"] = (conc_max < 0.30,
+        f"median={conc_sorted[len(conc_sorted)//2]*1000:.0f}ms max={conc_max*1000:.0f}ms")
+    results["wait_for_bound_port_returned"] = (state["done"] == HOLDERS, f"{state['done']}/{HOLDERS} err={state['err']}")
+
+    # (4) server still healthy after
+    _, after = send(sc(ec("listProcesses", {})), 10)
+    results["server_alive_after"] = (after < 0.30, f"{after*1000:.0f}ms")
+
+finally:
+    if proc.poll() is None:
+        proc.send_signal(2)
+        try: proc.wait(5)
+        except Exception: proc.kill()
+
+print("\n[mcp-conc] RESULTS:")
+ok = True
+for k, (passed, detail) in results.items():
+    ok = ok and passed
+    print(f"   {'PASS' if passed else 'FAIL'}  {k:28} {detail}")
+print(f"\n[mcp-conc] OVERALL: {'PASS' if ok else 'FAIL'}")
+sys.exit(0 if ok else 1)

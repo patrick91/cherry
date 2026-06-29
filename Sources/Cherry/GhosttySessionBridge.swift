@@ -617,13 +617,22 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         guard !isReleased else { return }
 
         outputSink.discardPending()
-        if terminalView.performBindingAction("clear_screen") {
-            scrollbarMetrics = nil
-            terminalView.performBindingAction("scroll_to_bottom")
-            scrollContainer?.synchronizeScrollState()
+        // ghostty's clear_screen only scrolls the prompt to the top under shell
+        // integration (it leaves scrollback intact — ghostty #970), and ED 3
+        // (CSI 3 J, erase scrollback) is a no-op in this libghostty, so the only way
+        // to actually drop scrollback under native is a full RIS reset. RIS would
+        // wreck a full-screen TUI, so only use it when the program hasn't grabbed the
+        // mouse (a good proxy for "at a plain shell prompt", and it's true for agents
+        // too). RIS also blanks the prompt, so nudge zsh to repaint with Ctrl+L.
+        if Self.nativePTYEnabled, !terminalView.isMouseCaptured,
+           terminalView.performBindingAction("reset") {
+            terminalView.sendKeyPress(keycode: 37, shift: false, control: true, option: false) // Ctrl+L
         } else {
-            reset()
+            _ = terminalView.performBindingAction("clear_screen")
         }
+        scrollbarMetrics = nil
+        terminalView.performBindingAction("scroll_to_bottom")
+        scrollContainer?.synchronizeScrollState()
     }
 
     func releaseResources() {

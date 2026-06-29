@@ -71,6 +71,12 @@
             surface?.readText(screen: false)
         }
 
+        /// True when the running program has grabbed the mouse (a good proxy for a
+        /// full-screen TUI/agent on the alternate screen).
+        public var isMouseCaptured: Bool {
+            surface?.isMouseCaptured ?? false
+        }
+
         var surface: TerminalSurface? {
             core.surface
         }

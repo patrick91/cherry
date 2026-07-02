@@ -814,6 +814,49 @@ private struct MCPWhoamiPayload: Decodable {
     }
 }
 
+@MainActor
+@Test func trafficLightAnimationSurvivesAttachedSheetLayout() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    let sheet = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 360, height: 180),
+        styleMask: [.titled],
+        backing: .buffered,
+        defer: false
+    )
+    sheet.isReleasedWhenClosed = false
+    defer {
+        if sheet.sheetParent != nil {
+            host.window.endSheet(sheet)
+        }
+        sheet.close()
+        host.cleanup()
+    }
+
+    host.window.beginSheet(sheet) { _ in }
+    try await Task.sleep(for: .milliseconds(120))
+    #expect(!host.window.sheets.isEmpty)
+
+    host.chromeState.toggleSidebar()
+    for _ in 0..<5 {
+        try await Task.sleep(for: .milliseconds(45))
+        host.window.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    if sheet.sheetParent != nil {
+        host.window.endSheet(sheet)
+    }
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let frames = try trafficLightFrames(in: host.window)
+    let buttons = try trafficLightButtons(in: host.window)
+    #expect(host.chromeState.isSidebarHidden)
+    #expect(frames.allSatisfy { $0.maxX < 0 }, "sheet animation left lights at \(frames)")
+    #expect(buttons.allSatisfy { $0.isHidden })
+}
+
 // The floating sidebar reveal/dismiss cycle must end with the lights
 // hidden offscreen, matching the collapsed docked sidebar.
 @MainActor

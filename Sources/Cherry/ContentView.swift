@@ -5816,10 +5816,11 @@ final class TrafficLightController {
     private var lastDocked: CGFloat = 0
     private var lastFloating: CGFloat = 0
     private var lastSidebarWidth: CGFloat = 320
+    private var applyScheduled = false
 
     fileprivate func attach(_ view: TrafficLightOverlayView) {
         self.view = view
-        applyCurrent()
+        applyCurrentWhenSafe()
     }
 
     fileprivate func detach(_ view: TrafficLightOverlayView) {
@@ -5831,14 +5832,18 @@ final class TrafficLightController {
         lastDocked = docked
         lastFloating = floating
         lastSidebarWidth = sidebarWidth
-        applyCurrent()
+        applyCurrentWhenSafe()
     }
 
     func update(docked: CGFloat, floating: CGFloat, sidebarWidth: CGFloat) {
         lastDocked = docked
         lastFloating = floating
         lastSidebarWidth = sidebarWidth
-        applyCurrent()
+        applyCurrentWhenSafe()
+    }
+
+    fileprivate func refresh() {
+        applyCurrentWhenSafe()
     }
 
     // Translation matches the sidebar's contents: when the sidebar is fully
@@ -5850,6 +5855,36 @@ final class TrafficLightController {
         let chrome = max(lastDocked, lastFloating)
         let translationX = min(0, chrome - lastSidebarWidth)
         view?.applyButtonTranslation(translationX)
+    }
+
+    private func applyCurrentWhenSafe() {
+        if shouldDeferAppKitMutation {
+            scheduleApplyCurrent()
+        } else {
+            applyCurrent()
+        }
+    }
+
+    private var shouldDeferAppKitMutation: Bool {
+        guard let window = view?.window else { return false }
+        // Sheet dimming captures can force SwiftUI layout while
+        // `ChromeWidthAnimator` is sampling. Moving AppKit titlebar buttons
+        // synchronously from that stack re-enters AttributeGraph.
+        return window.attachedSheet != nil
+            || !window.sheets.isEmpty
+            || window.sheetParent != nil
+    }
+
+    private func scheduleApplyCurrent() {
+        guard !applyScheduled else { return }
+        applyScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.applyScheduled = false
+                self.applyCurrent()
+            }
+        }
     }
 }
 
@@ -5877,7 +5912,7 @@ private struct TrafficLightOverlay: NSViewRepresentable {
 
     func updateNSView(_ nsView: TrafficLightOverlayView, context: Context) {
         nsView.controller = controller
-        nsView.repositionButtons()
+        controller.refresh()
     }
 
     static func dismantleNSView(_ nsView: TrafficLightOverlayView, coordinator: ()) {
@@ -5906,6 +5941,7 @@ private final class TrafficLightOverlayView: NSView {
     private var lastAppliedPlacements: [(origin: NSPoint, isHidden: Bool)] = []
     private var stompRecheckScheduled = false
     private var stompRecheckBudget = 0
+    private var repositionScheduled = false
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -5919,7 +5955,7 @@ private final class TrafficLightOverlayView: NSView {
             registerWindowObservers()
         }
         attachWindowButtonsIfNeeded()
-        applyButtonTranslation(lastTranslationX)
+        scheduleButtonReposition()
         controller?.attach(self)
     }
 
@@ -5993,6 +6029,19 @@ private final class TrafficLightOverlayView: NSView {
     @MainActor
     func repositionButtons() {
         applyButtonTranslation(lastTranslationX)
+    }
+
+    @MainActor
+    private func scheduleButtonReposition() {
+        guard !repositionScheduled else { return }
+        repositionScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.repositionScheduled = false
+                self.repositionButtons()
+            }
+        }
     }
 
     // Place the native traffic-light buttons at their standard top-left

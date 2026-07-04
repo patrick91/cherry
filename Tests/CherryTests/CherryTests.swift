@@ -4473,12 +4473,12 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: false
     )
 
-    session.ingestTestingData(Data((
-        "\u{1B}[?1h" +
-        "\u{1B}[?1000h\u{1B}[?1006h" +
-        "\u{1B}[?2004h" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?1h",
+        "\u{1B}[?1000h\u{1B}[?1006h",
+        "\u{1B}[?2004h",
         "~/repo main\r\n> "
-    ).utf8))
+    ].joined().utf8))
 
     #expect(session.usesApplicationCursorKeys)
     #expect(session.usesBracketedPasteMode)
@@ -4731,20 +4731,20 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
-    let replay = Data((
-        "before" +
-        "\u{1B}]11;?\u{07}" +
-        "\u{1B}]10;?\u{1B}\\" +
-        "\u{1B}[6n" +
-        "\u{1B}[c" +
-        "\u{1B}[>c" +
-        "\u{1B}[?2027$p" +
-        "\u{1B}[?u" +
-        "\u{1B}P+q4D73\u{1B}\\" +
-        "\u{1B}]2;kept title\u{07}" +
-        "\u{1B}[31m" +
+    let replay = Data([
+        "before",
+        "\u{1B}]11;?\u{07}",
+        "\u{1B}]10;?\u{1B}\\",
+        "\u{1B}[6n",
+        "\u{1B}[c",
+        "\u{1B}[>c",
+        "\u{1B}[?2027$p",
+        "\u{1B}[?u",
+        "\u{1B}P+q4D73\u{1B}\\",
+        "\u{1B}]2;kept title\u{07}",
+        "\u{1B}[31m",
         "after"
-    ).utf8)
+    ].joined().utf8)
 
     let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
 
@@ -4752,14 +4752,14 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func ghosttyReplayOutputCollapsesOverwrittenProgressFrames() async throws {
-    let replay = Data((
-        "Building for debugging...\r\n" +
-        "\u{1B}[2K\r[0/3] Write swift-version--58304C5D6DBC2206.txt" +
-        "\u{1B}[2K\r[1/3] Write swift-version--58304C5D6DBC2206.txt" +
-        "\u{1B}[2K\r[1/4] Write swift-version--58304C5D6DBC2206.txt" +
-        "\u{1B}[2K\r[2/4] Emitting module Cherry" +
+    let replay = Data([
+        "Building for debugging...\r\n",
+        "\u{1B}[2K\r[0/3] Write swift-version--58304C5D6DBC2206.txt",
+        "\u{1B}[2K\r[1/3] Write swift-version--58304C5D6DBC2206.txt",
+        "\u{1B}[2K\r[1/4] Write swift-version--58304C5D6DBC2206.txt",
+        "\u{1B}[2K\r[2/4] Emitting module Cherry",
         "\r\nBuild complete\r\n"
-    ).utf8)
+    ].joined().utf8)
 
     let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
@@ -4775,16 +4775,16 @@ private struct MCPWhoamiPayload: Decodable {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 120) +
         "\r \r"
-    let replay = Data((
-        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}" +
-        promptEndMark +
-        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}" +
-        "\u{1B}]2;~/github/strawberry-graphql/strawberry\u{07}" +
-        "\r\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J" +
-        "\u{1B}[1;36m~/github/strawberry-graphql/strawberry\u{1B}[0m " +
-        "\u{1B}[1;35m 2026-06-14-add-support-for-sse\u{1B}[0m\r\n" +
+    let replay = Data([
+        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}",
+        promptEndMark,
+        "\u{1B}]7;kitty-shell-cwd://patbook/Users/patrick/github/strawberry-graphql/strawberry\u{07}",
+        "\u{1B}]2;~/github/strawberry-graphql/strawberry\u{07}",
+        "\r\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J",
+        "\u{1B}[1;36m~/github/strawberry-graphql/strawberry\u{1B}[0m ",
+        "\u{1B}[1;35m 2026-06-14-add-support-for-sse\u{1B}[0m\r\n",
         "\u{1B}[1;32m❯\u{1B}[0m "
-    ).utf8)
+    ].joined().utf8)
 
     let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
@@ -4821,13 +4821,13 @@ private struct MCPWhoamiPayload: Decodable {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 20) +
         "\r \r"
-    let replay = Data((
-        "❯ ls\r\n" +
-        "file\r\n" +
-        promptEndMark +
-        "\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J❯ \u{1B}[K" +
+    let replay = Data([
+        "❯ ls\r\n",
+        "file\r\n",
+        promptEndMark,
+        "\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J❯ \u{1B}[K",
         "a\u{08}as"
-    ).utf8)
+    ].joined().utf8)
 
     let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
 
@@ -4880,20 +4880,20 @@ private struct MCPWhoamiPayload: Decodable {
         session.stop()
     }
 
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[3;3H\u{1B}[1mStarting MCP servers (6/8): mobbin, paper, xcodebuildmcp\u{1B}[0m" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[3;3H\u{1B}[1mStarting MCP servers (6/8): mobbin, paper, xcodebuildmcp\u{1B}[0m",
         "\u{1B}[?2026l"
-    ).utf8))
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "⚠ MCP client for `mobbin` failed to start: MCP startup failed\r\n" +
-        "\r\n" +
-        "› Explain this codebase" +
+    ].joined().utf8))
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "⚠ MCP client for `mobbin` failed to start: MCP startup failed\r\n",
+        "\r\n",
+        "› Explain this codebase",
         "\u{1B}[?2026l"
-    ).utf8))
+    ].joined().utf8))
 
     let rawOutput = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
     let replayOutput = String(decoding: GhosttySessionBridge.renderedReplayOutput(for: session), as: UTF8.self)
@@ -4920,31 +4920,31 @@ private struct MCPWhoamiPayload: Decodable {
     }
     let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
     session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[2;1H\u{1B}[2m╭─────────────────────────────────────────────╮" +
-        "\u{1B}[3;1H│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │" +
-        "\u{1B}[4;1H╰─────────────────────────────────────────────╯" +
-        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m" +
-        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K" +
-        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mImprove documentation in @filename" +
-        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K" +
-        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m" +
-        "\u{1B}[11;3H" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[2;1H\u{1B}[2m╭─────────────────────────────────────────────╮",
+        "\u{1B}[3;1H│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │",
+        "\u{1B}[4;1H╰─────────────────────────────────────────────╯",
+        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m",
+        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K",
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mImprove documentation in @filename",
+        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K",
+        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m",
+        "\u{1B}[11;3H",
         "\u{1B}[?2026l"
-    ).utf8))
-    session.ingestTestingData(Data((
-        "\u{1B}]10;?\u{1B}\\" +
-        "\u{1B}]11;?\u{1B}\\" +
-        "\u{1B}[?2026h" +
-        "\u{1B}[10;2H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
-        "\u{1B}[11;37H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
-        "\u{1B}[12;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
-        "\u{1B}[13;42H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
-        "\u{1B}[0m\u{1B}[?25h\u{1B}[11;3H" +
+    ].joined().utf8))
+    session.ingestTestingData(Data([
+        "\u{1B}]10;?\u{1B}\\",
+        "\u{1B}]11;?\u{1B}\\",
+        "\u{1B}[?2026h",
+        "\u{1B}[10;2H\u{1B}[0m\u{1B}[49m\u{1B}[K",
+        "\u{1B}[11;37H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K",
+        "\u{1B}[12;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K",
+        "\u{1B}[13;42H\u{1B}[0m\u{1B}[49m\u{1B}[K",
+        "\u{1B}[0m\u{1B}[?25h\u{1B}[11;3H",
         "\u{1B}[?2026l"
-    ).utf8))
+    ].joined().utf8))
 
     let directLines = session.snapshot(range: 0..<session.lineCount)
     #expect(directLines.contains { $0.contains("Improve documentation in @filename") })
@@ -4998,13 +4998,13 @@ private struct MCPWhoamiPayload: Decodable {
         session.stop()
     }
 
-    session.ingestTestingData(Data((
-        "\u{1B}[1;32mbold green\u{1B}[0m " +
-        "\u{1B}[2;38;5;203mdim 256\u{1B}[0m " +
-        "\u{1B}[48;2;12;34;56mtrue bg\u{1B}[0m " +
-        "\u{1B}[7minverse\u{1B}[0m " +
+    session.ingestTestingData(Data([
+        "\u{1B}[1;32mbold green\u{1B}[0m ",
+        "\u{1B}[2;38;5;203mdim 256\u{1B}[0m ",
+        "\u{1B}[48;2;12;34;56mtrue bg\u{1B}[0m ",
+        "\u{1B}[7minverse\u{1B}[0m ",
         "\u{1B}[3;4;9mdecorated\u{1B}[0m"
-    ).utf8))
+    ].joined().utf8))
 
     let replayOutput = GhosttySessionBridge.renderedReplayOutput(for: session)
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
@@ -5075,12 +5075,12 @@ private struct MCPWhoamiPayload: Decodable {
         session.stop()
     }
 
-    session.ingestTestingData(Data((
-        "\u{1B}[38;2;94;234;212m~/github/patrick91/cherry\u{1B}[0m  " +
-        "\u{1B}[35mmain\u{1B}[0m\r\n" +
-        "\u{1B}[38;5;33mdrwxr-xr-x  Sources\u{1B}[0m\r\n" +
+    session.ingestTestingData(Data([
+        "\u{1B}[38;2;94;234;212m~/github/patrick91/cherry\u{1B}[0m  ",
+        "\u{1B}[35mmain\u{1B}[0m\r\n",
+        "\u{1B}[38;5;33mdrwxr-xr-x  Sources\u{1B}[0m\r\n",
         "\u{1B}[38;2;246;226;183mgpt-5.5 low\u{1B}[0m"
-    ).utf8))
+    ].joined().utf8))
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
@@ -5155,19 +5155,19 @@ private struct MCPWhoamiPayload: Decodable {
         session.stop()
     }
 
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[1;31mStarting MCP servers\u{1B}[0m" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[1;31mStarting MCP servers\u{1B}[0m",
         "\u{1B}[?2026l"
-    ).utf8))
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[38;5;82mReady\u{1B}[0m\r\n" +
-        "› Prompt" +
+    ].joined().utf8))
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[38;5;82mReady\u{1B}[0m\r\n",
+        "› Prompt",
         "\u{1B}[?2026l"
-    ).utf8))
+    ].joined().utf8))
 
     let rawOutput = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
@@ -5234,13 +5234,13 @@ private struct MCPWhoamiPayload: Decodable {
         session.stop()
     }
 
-    session.ingestTestingData(Data((
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[10;1H\u{1B}[22m\u{1B}[39;48;2;46;45;50m " +
-        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mRun /review on my current changes" +
-        "\u{1B}[12;1H\u{1B}[22m " +
+    session.ingestTestingData(Data([
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[10;1H\u{1B}[22m\u{1B}[39;48;2;46;45;50m ",
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mRun /review on my current changes",
+        "\u{1B}[12;1H\u{1B}[22m ",
         "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 xhigh fast\u{1B}[0m"
-    ).utf8))
+    ].joined().utf8))
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     let replayString = String(decoding: replayData, as: UTF8.self)
@@ -5347,16 +5347,16 @@ private struct MCPWhoamiPayload: Decodable {
     }
     let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
     session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[14;2H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
-        "\u{1B}[15;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
-        "\u{1B}[16;9H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
-        "\u{1B}[17;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K" +
-        "\u{1B}[18;42H\u{1B}[0m\u{1B}[49m\u{1B}[K" +
-        "\u{1B}[16;3H\u{1B}[39;48;2;46;45;50masdasd\u{1B}[39m\u{1B}[49m\u{1B}[0m" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[14;2H\u{1B}[0m\u{1B}[49m\u{1B}[K",
+        "\u{1B}[15;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K",
+        "\u{1B}[16;9H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K",
+        "\u{1B}[17;2H\u{1B}[0m\u{1B}[48;2;46;45;50m\u{1B}[K",
+        "\u{1B}[18;42H\u{1B}[0m\u{1B}[49m\u{1B}[K",
+        "\u{1B}[16;3H\u{1B}[39;48;2;46;45;50masdasd\u{1B}[39m\u{1B}[49m\u{1B}[0m",
         "\u{1B}[0 q\u{1B}[?25h\u{1B}[16;9H\u{1B}[?2026l"
-    ).utf8))
+    ].joined().utf8))
 
     let replayData = GhosttySessionBridge.renderedReplayOutput(for: session)
     var replayedBuffer = PrototypeTerminalBuffer(maxScrollback: nil)
@@ -5390,20 +5390,20 @@ private struct MCPWhoamiPayload: Decodable {
     }
     let viewportSize = TerminalViewportSize(columns: 120, rows: 48)
     session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
-    session.ingestTestingData(Data((
-        "\u{1B}[?2026h" +
-        "\u{1B}[1;1H\u{1B}[J" +
-        "\u{1B}[1;1H\u{1B}[2m╭─────────────────────────────────────────────╮\u{1B}[0m" +
-        "\u{1B}[2;1H\u{1B}[2m│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │\u{1B}[0m" +
-        "\u{1B}[3;1H\u{1B}[2m╰─────────────────────────────────────────────╯\u{1B}[0m" +
-        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m" +
-        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K" +
-        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mWrite tests for @filename" +
-        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K" +
-        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m" +
-        "\u{1B}[11;3H" +
+    session.ingestTestingData(Data([
+        "\u{1B}[?2026h",
+        "\u{1B}[1;1H\u{1B}[J",
+        "\u{1B}[1;1H\u{1B}[2m╭─────────────────────────────────────────────╮\u{1B}[0m",
+        "\u{1B}[2;1H\u{1B}[2m│ >_ \u{1B}[22m\u{1B}[1mOpenAI Codex\u{1B}[22m\u{1B}[2m (v0.142.0)                  │\u{1B}[0m",
+        "\u{1B}[3;1H\u{1B}[2m╰─────────────────────────────────────────────╯\u{1B}[0m",
+        "\u{1B}[8;1H\u{1B}[38;5;3m⚠ Heads up, you have less than 25% of your weekly limit left.\u{1B}[0m",
+        "\u{1B}[10;1H\u{1B}[39;48;2;46;45;50m \u{1B}[K",
+        "\u{1B}[11;1H\u{1B}[1m›\u{1B}[22m \u{1B}[2mWrite tests for @filename",
+        "\u{1B}[12;1H\u{1B}[22m \u{1B}[K",
+        "\u{1B}[13;3H\u{1B}[38;2;246;226;183;49mgpt-5.5 low\u{1B}[2m\u{1B}[39;49m · \u{1B}[22m\u{1B}[38;2;171;223;167;49m~/github/patrick91/cherry\u{1B}[0m",
+        "\u{1B}[11;3H",
         "\u{1B}[?2026l"
-    ).utf8))
+    ].joined().utf8))
 
     let sourceCursor = session.cursorState
     #expect(sourceCursor.row == 10)
@@ -5442,12 +5442,12 @@ private struct MCPWhoamiPayload: Decodable {
 
     session.resize(columns: viewportSize.columns, rows: viewportSize.rows)
     session.ingestTestingData(Data((treeOutput + "\r\n~/repo main\r\n> ").utf8))
-    session.ingestTestingData(Data((
-        String(repeating: "\n", count: viewportSize.rows) +
-        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3" +
-        "\u{1B}[3;1H\u{1B}[J" +
+    session.ingestTestingData(Data([
+        String(repeating: "\n", count: viewportSize.rows),
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3",
+        "\u{1B}[3;1H\u{1B}[J",
         "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K"
-    ).utf8))
+    ].joined().utf8))
 
     let sourceCursor = session.cursorState
     #expect(sourceCursor.row < session.lineCount - 1)
@@ -5462,20 +5462,20 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func ghosttyHostInputDropsTerminalGeneratedQueryResponses() async throws {
-    let input = Data((
-        "keep" +
-        "\u{1B}]10;rgb:eded/ecec/eeee\u{1B}\\" +
-        "\u{1B}]11;rgb:1515/1414/1b1b\u{07}" +
-        "\u{1B}[0n" +
-        "\u{1B}[12;34R" +
-        "\u{1B}[?1;2c" +
-        "\u{1B}[>0;0;0c" +
-        "\u{1B}[?2027;1$y" +
-        "\u{1B}[?0u" +
-        "\u{1B}P1+r4D73=5C455D35323B25703125733B25703225735C303037\u{1B}\\" +
-        "\u{1B}[A" +
+    let input = Data([
+        "keep",
+        "\u{1B}]10;rgb:eded/ecec/eeee\u{1B}\\",
+        "\u{1B}]11;rgb:1515/1414/1b1b\u{07}",
+        "\u{1B}[0n",
+        "\u{1B}[12;34R",
+        "\u{1B}[?1;2c",
+        "\u{1B}[>0;0;0c",
+        "\u{1B}[?2027;1$y",
+        "\u{1B}[?0u",
+        "\u{1B}P1+r4D73=5C455D35323B25703125733B25703225735C303037\u{1B}\\",
+        "\u{1B}[A",
         "tail"
-    ).utf8)
+    ].joined().utf8)
 
     let filtered = GhosttySessionBridge.sanitizeHostInputFromGhostty(input)
 
@@ -10396,21 +10396,22 @@ private func serviceRecord(
     let viewportSize = TerminalViewportSize(columns: 10, rows: 5)
 
     buffer.ingest(Data("abc\r\nxy".utf8), viewportSize: viewportSize)
-    let responses = buffer.ingest(Data((
-        "\u{1B}[5n" +
-        "\u{1B}[6n" +
-        "\u{1B}[?u" +
-        "\u{1B}[c" +
-        "\u{1B}[>c" +
-        "\u{1B}]11;?\u{07}" +
-        "\u{1B}[?69$p" +
-        "\u{1B}[?2026$p" +
-        "\u{1B}[?2027$p" +
-        "\u{1B}[?2031$p" +
+    let startupQueries = [
+        "\u{1B}[5n",
+        "\u{1B}[6n",
+        "\u{1B}[?u",
+        "\u{1B}[c",
+        "\u{1B}[>c",
+        "\u{1B}]11;?\u{07}",
+        "\u{1B}[?69$p",
+        "\u{1B}[?2026$p",
+        "\u{1B}[?2027$p",
+        "\u{1B}[?2031$p",
         "\u{1B}[?2048$p"
-    ).utf8), viewportSize: viewportSize)
+    ].joined()
+    let responses = buffer.ingest(Data(startupQueries.utf8), viewportSize: viewportSize)
 
-    #expect(responses == [
+    let expectedResponses: [Data] = [
         Data("\u{1B}[0n".utf8),
         Data("\u{1B}[2;3R".utf8),
         Data("\u{1B}[?0u".utf8),
@@ -10422,7 +10423,8 @@ private func serviceRecord(
         Data("\u{1B}[?2027;4$y".utf8),
         Data("\u{1B}[?2031;4$y".utf8),
         Data("\u{1B}[?2048;4$y".utf8),
-    ])
+    ]
+    #expect(responses == expectedResponses)
 }
 
 @Test func liveTerminalOutputBufferPreservesPrimaryScrollbackAcrossAlternateScreen() async throws {
@@ -10468,22 +10470,22 @@ private func serviceRecord(
     var buffer = LiveTerminalOutputBuffer(maxScrollback: 200)
     buffer.ingest(Data("~/repo main\r\n> ".utf8), viewportSize: viewport)
 
-    let openAtuin = Data((
-        "\u{1B}[K\r\r\n" +
-        "\u{1B}[?1000h\u{1B}[?1002h\u{1B}[?1003h\u{1B}[?1015h\u{1B}[?1006h\u{1B}[?2004h" +
-        "\u{1B}[>13u" +
+    let openAtuin = Data([
+        "\u{1B}[K\r\r\n",
+        "\u{1B}[?1000h\u{1B}[?1002h\u{1B}[?1003h\u{1B}[?1015h\u{1B}[?1006h\u{1B}[?2004h",
+        "\u{1B}[>13u",
         "\u{1B}[6n"
-    ).utf8)
+    ].joined().utf8)
     let firstProbe = buffer.ingest(openAtuin, viewportSize: viewport)
     #expect(firstProbe == [Data("\u{1B}[3;1R".utf8)])
 
-    buffer.ingest(Data((
-        String(repeating: "\n", count: 40) +
-        "\u{1B}[3;1H\u{1B}[JAtuin v18.15.2" +
-        "\u{1B}[3;1H\u{1B}[J" +
-        "\u{1B}[<1u\u{1B}[?1006l\u{1B}[?1015l\u{1B}[?1003l\u{1B}[?1002l\u{1B}[?1000l\u{1B}[?2004l" +
+    buffer.ingest(Data([
+        String(repeating: "\n", count: 40),
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.15.2",
+        "\u{1B}[3;1H\u{1B}[J",
+        "\u{1B}[<1u\u{1B}[?1006l\u{1B}[?1015l\u{1B}[?1003l\u{1B}[?1002l\u{1B}[?1000l\u{1B}[?2004l",
         "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K\u{1B}[?2004h"
-    ).utf8), viewportSize: viewport)
+    ].joined().utf8), viewportSize: viewport)
 
     let secondProbe = buffer.ingest(openAtuin, viewportSize: viewport)
     #expect(secondProbe == firstProbe)
@@ -10497,12 +10499,12 @@ private func serviceRecord(
         .joined(separator: "\r\n")
 
     buffer.ingest(Data((treeOutput + "\r\n~/repo main\r\n> ").utf8), viewportSize: viewport)
-    buffer.ingest(Data((
-        String(repeating: "\n", count: 8) +
-        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3" +
-        "\u{1B}[3;1H\u{1B}[J" +
+    buffer.ingest(Data([
+        String(repeating: "\n", count: 8),
+        "\u{1B}[3;1H\u{1B}[JAtuin v18.13.3",
+        "\u{1B}[3;1H\u{1B}[J",
         "\u{1B}[A\r\u{1B}[A~/repo main\r\n> \u{1B}[K"
-    ).utf8), viewportSize: viewport)
+    ].joined().utf8), viewportSize: viewport)
 
     let visibleLines = Array(buffer.snapshot(range: max(0, buffer.lineCount - viewport.rows)..<buffer.lineCount))
     let promptIndex = try #require(visibleLines.firstIndex(where: { $0.contains("~/repo main") }))
@@ -10786,29 +10788,32 @@ private func serviceRecord(
 
     let responses = buffer.ingest(Data("\u{1B}]10;?\u{07}\u{1B}]11;?\u{1B}\\".utf8))
 
-    #expect(responses == [
+    let expectedResponses: [Data] = [
         Data("\u{1B}]10;rgb:dbdb/e3e3/ebeb\u{07}".utf8),
         Data("\u{1B}]11;rgb:1212/1111/1717\u{07}".utf8)
-    ])
+    ]
+    #expect(responses == expectedResponses)
 }
 
 @Test func deviceAttributesAndKeyboardProtocolQueriesRespond() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
 
-    let startupProbe =
-        "\u{1B}[?2004h" +
-        "\u{1B}[>7u" +
-        "\u{1B}[?1004h" +
-        "\u{1B}[?u" +
-        "\u{1B}[c" +
+    let startupProbe = [
+        "\u{1B}[?2004h",
+        "\u{1B}[>7u",
+        "\u{1B}[?1004h",
+        "\u{1B}[?u",
+        "\u{1B}[c",
         "\u{1B}[>c"
+    ].joined()
     let responses = buffer.ingest(Data(startupProbe.utf8))
 
-    #expect(responses == [
+    let expectedResponses: [Data] = [
         Data("\u{1B}[?0u".utf8),
         Data("\u{1B}[?1;2c".utf8),
         Data("\u{1B}[>0;0;0c".utf8)
-    ])
+    ]
+    #expect(responses == expectedResponses)
 }
 
 @Test func cursorStateTracksWritesAndMovement() async throws {
@@ -10907,28 +10912,30 @@ private func serviceRecord(
 @Test func decPrivateModeStatusReportsCurrentAndUnsupportedModes() async throws {
     var buffer = PrototypeTerminalBuffer(maxScrollback: nil)
 
-    let responses = buffer.ingest(Data((
-        "\u{1B}[?1h" +
-        "\u{1B}[?25l" +
-        "\u{1B}[?69h" +
-        "\u{1B}[?1004h" +
-        "\u{1B}[?2004h" +
-        "\u{1B}[?1$p" +
-        "\u{1B}[?25$p" +
-        "\u{1B}[?69$p" +
-        "\u{1B}[?1004$p" +
-        "\u{1B}[?2004$p" +
+    let modeQueries = [
+        "\u{1B}[?1h",
+        "\u{1B}[?25l",
+        "\u{1B}[?69h",
+        "\u{1B}[?1004h",
+        "\u{1B}[?2004h",
+        "\u{1B}[?1$p",
+        "\u{1B}[?25$p",
+        "\u{1B}[?69$p",
+        "\u{1B}[?1004$p",
+        "\u{1B}[?2004$p",
         "\u{1B}[?2026$p"
-    ).utf8))
+    ].joined()
+    let responses = buffer.ingest(Data(modeQueries.utf8))
 
-    #expect(responses == [
+    let expectedResponses: [Data] = [
         Data("\u{1B}[?1;1$y".utf8),
         Data("\u{1B}[?25;2$y".utf8),
         Data("\u{1B}[?69;1$y".utf8),
         Data("\u{1B}[?1004;1$y".utf8),
         Data("\u{1B}[?2004;1$y".utf8),
         Data("\u{1B}[?2026;4$y".utf8)
-    ])
+    ]
+    #expect(responses == expectedResponses)
 }
 
 @Test func horizontalMarginCommandDoesNotOverwriteSavedCursor() async throws {

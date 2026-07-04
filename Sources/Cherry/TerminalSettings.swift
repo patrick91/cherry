@@ -129,6 +129,11 @@ final class TerminalSettings: ObservableObject {
         didSet { save(darkTerminalThemeName, forKey: Keys.darkTerminalThemeName) }
     }
 
+    /// Empty string means "Automatic": the first installed editor in catalog order.
+    @Published var defaultEditorID: String {
+        didSet { save(defaultEditorID, forKey: Keys.defaultEditorID, notifyTerminal: false) }
+    }
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -148,6 +153,7 @@ final class TerminalSettings: ObservableObject {
             ?? Defaults.lightTerminalThemeName
         darkTerminalThemeName = defaults.object(forKey: Keys.darkTerminalThemeName) as? String
             ?? Defaults.darkTerminalThemeName
+        defaultEditorID = defaults.object(forKey: Keys.defaultEditorID) as? String ?? Defaults.defaultEditorID
     }
 
     func resetTerminalAppearance() {
@@ -335,6 +341,7 @@ final class TerminalSettings: ObservableObject {
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
+        static let defaultEditorID = ""
     }
 
     private enum Keys {
@@ -347,6 +354,7 @@ final class TerminalSettings: ObservableObject {
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"
+        static let defaultEditorID = "editor.default"
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

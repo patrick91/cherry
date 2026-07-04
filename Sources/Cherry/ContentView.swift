@@ -2533,6 +2533,7 @@ private enum CommandPaletteMode {
     case projects
     case agents
     case agentPresets
+    case editors
 }
 
 enum CommandPaletteCommand: String, CaseIterable, Identifiable {
@@ -2617,6 +2618,8 @@ enum CommandPaletteMatcher {
 
 enum CommandPaletteRootItem: Identifiable, Equatable {
     case command(CommandPaletteCommand)
+    case openInDefaultEditor(InstalledEditor)
+    case otherEditors
     case agent(ResolvedAgentTool)
     case project(CherryProject)
 
@@ -2624,6 +2627,10 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         switch self {
         case .command(let command):
             "command:\(command.id)"
+        case .openInDefaultEditor(let editor):
+            "editor:\(editor.id)"
+        case .otherEditors:
+            "command:openInOtherEditor"
         case .agent(let agent):
             "agent:\(agent.id)"
         case .project(let project):
@@ -2635,6 +2642,8 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         switch self {
         case .command(let command):
             command.icon
+        case .openInDefaultEditor, .otherEditors:
+            "arrow.up.forward.app"
         case .agent:
             "terminal"
         case .project:
@@ -2646,6 +2655,10 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         switch self {
         case .command(let command):
             command.title
+        case .openInDefaultEditor(let editor):
+            "Open in \(editor.displayName)"
+        case .otherEditors:
+            "Open in Other Editor…"
         case .agent(let agent):
             agent.name
         case .project(let project):
@@ -2657,6 +2670,10 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         switch self {
         case .command(let command):
             command.subtitle
+        case .openInDefaultEditor(let editor):
+            "Open project in \(editor.displayName)"
+        case .otherEditors:
+            "Open project in another installed editor"
         case .agent(let agent):
             agent.commandLine
         case .project(let project):
@@ -2667,12 +2684,29 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
     static func filteredItems(
         query: String,
         agents: [ResolvedAgentTool],
-        projects: [CherryProject]
+        projects: [CherryProject],
+        installedEditors: [InstalledEditor] = [],
+        defaultEditorID: String = "",
+        hasOpenProject: Bool = false
     ) -> [CommandPaletteRootItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let commands = CommandPaletteCommand.allCases
             .filter { $0.matches(query) }
             .map(CommandPaletteRootItem.command)
+        var editorItems: [CommandPaletteRootItem] = []
+        if hasOpenProject,
+           let defaultEditor = ExternalEditorDiscovery.resolveDefault(
+               editors: installedEditors,
+               preferredID: defaultEditorID
+           ) {
+            editorItems = [.openInDefaultEditor(defaultEditor), .otherEditors]
+                .filter { item in
+                    CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                        item.title,
+                        item.subtitle
+                    ])
+                }
+        }
         let matchedAgents = agents
             .filter { agent in
                 guard !normalizedQuery.isEmpty else { return true }
@@ -2693,12 +2727,12 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
                 }
                 .map(CommandPaletteRootItem.project)
 
-        return commands + matchedAgents + matchedProjects
+        return commands + editorItems + matchedAgents + matchedProjects
     }
 
     func isCurrent(selectedProjectRoot: String?) -> Bool {
         switch self {
-        case .command, .agent:
+        case .command, .openInDefaultEditor, .otherEditors, .agent:
             false
         case .project(let project):
             project.root == selectedProjectRoot
@@ -2710,6 +2744,7 @@ private struct CommandPaletteOverlay: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var settings: AgentSettings
     @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject private var editorDiscovery = ExternalEditorDiscovery.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let selectedProjectRoot: String?
@@ -2762,6 +2797,8 @@ private struct CommandPaletteOverlay: View {
                                 projectRows
                             } else if mode == .agents {
                                 agentRows
+                            } else if mode == .editors {
+                                editorRows
                             } else {
                                 agentPresetRows
                             }
@@ -2794,6 +2831,7 @@ private struct CommandPaletteOverlay: View {
         .onAppear {
             requestSearchFocus()
             selectedIndex = 0
+            editorDiscovery.refresh()
         }
         .onChange(of: focusRequest) { _, _ in
             requestSearchFocus()
@@ -2843,14 +2881,19 @@ private struct CommandPaletteOverlay: View {
         case .projects: "Project"
         case .agents: "Agent"
         case .agentPresets: "Agent"
+        case .editors: "Editor"
         }
     }
 
     private var filteredRootItems: [CommandPaletteRootItem] {
-        CommandPaletteRootItem.filteredItems(
+        let project = settings.resolvedProject(for: selectedProjectRoot)
+        return CommandPaletteRootItem.filteredItems(
             query: query,
-            agents: settings.resolvedProject(for: selectedProjectRoot).launchableAgents,
-            projects: settings.projects
+            agents: project.launchableAgents,
+            projects: settings.projects,
+            installedEditors: editorDiscovery.installedEditors,
+            defaultEditorID: terminalSettings.defaultEditorID,
+            hasOpenProject: project.validProjectRoot != nil
         )
     }
 
@@ -2888,6 +2931,16 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
+    private var filteredEditors: [InstalledEditor] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return editorDiscovery.installedEditors }
+        return editorDiscovery.installedEditors.filter { editor in
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                editor.displayName
+            ])
+        }
+    }
+
     @ViewBuilder
     private var commandRows: some View {
         if filteredRootItems.isEmpty {
@@ -2896,6 +2949,7 @@ private struct CommandPaletteOverlay: View {
             ForEach(Array(filteredRootItems.enumerated()), id: \.element.id) { index, item in
                 CommandPaletteRow(
                     icon: item.icon,
+                    nsImage: rootItemImage(for: item),
                     title: item.title,
                     subtitle: item.subtitle,
                     isSelected: index == selectedIndex,
@@ -2986,12 +3040,40 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
+    @ViewBuilder
+    private var editorRows: some View {
+        if filteredEditors.isEmpty {
+            CommandPaletteEmptyRow(title: "No editors found")
+        } else {
+            ForEach(Array(filteredEditors.enumerated()), id: \.element.id) { index, editor in
+                CommandPaletteRow(
+                    icon: "arrow.up.forward.app",
+                    nsImage: editorDiscovery.icon(for: editor),
+                    title: editor.displayName,
+                    subtitle: "Open project in \(editor.displayName)",
+                    isSelected: index == selectedIndex,
+                    isCurrent: false
+                ) {
+                    selectedIndex = index
+                    commitSelection()
+                }
+                .id(rowID(for: index))
+            }
+        }
+    }
+
+    private func rootItemImage(for item: CommandPaletteRootItem) -> NSImage? {
+        guard case .openInDefaultEditor(let editor) = item else { return nil }
+        return editorDiscovery.icon(for: editor)
+    }
+
     private var resultCount: Int {
         switch mode {
         case .commands: filteredRootItems.count
         case .projects: max(1, filteredProjects.count)
         case .agents: filteredAgents.count
         case .agentPresets: filteredAgentPresets.count
+        case .editors: filteredEditors.count
         }
     }
 
@@ -3034,6 +3116,7 @@ private struct CommandPaletteOverlay: View {
         case .projects: "projects"
         case .agents: "agents"
         case .agentPresets: "agentPresets"
+        case .editors: "editors"
         }
     }
 
@@ -3090,6 +3173,10 @@ private struct CommandPaletteOverlay: View {
                     terminalSettings.toggleLightDarkAppearance(currentColorScheme: colorScheme)
                     dismiss()
                 }
+            case .openInDefaultEditor(let editor):
+                openInEditor(editor)
+            case .otherEditors:
+                mode = .editors
             case .agent(let agent):
                 launch(agent)
             case .project(let project):
@@ -3111,6 +3198,9 @@ private struct CommandPaletteOverlay: View {
         case .agentPresets:
             guard filteredAgentPresets.indices.contains(selectedIndex) else { return }
             editingAgent = filteredAgentPresets[selectedIndex]
+        case .editors:
+            guard filteredEditors.indices.contains(selectedIndex) else { return }
+            openInEditor(filteredEditors[selectedIndex])
         }
     }
 
@@ -3119,6 +3209,12 @@ private struct CommandPaletteOverlay: View {
         guard let root = project.validProjectRoot else { return }
         chromeState.selectTerminal()
         workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+        dismiss()
+    }
+
+    private func openInEditor(_ editor: InstalledEditor) {
+        guard let root = settings.resolvedProject(for: selectedProjectRoot).validProjectRoot else { return }
+        ExternalEditorLauncher().open(projectRoot: root, with: editor)
         dismiss()
     }
 
@@ -3284,6 +3380,7 @@ private final class CommandPaletteSearchTextField: NSTextField {
 
 private struct CommandPaletteRow: View {
     let icon: String
+    var nsImage: NSImage? = nil
     let title: String
     let subtitle: String
     let isSelected: Bool
@@ -3293,10 +3390,19 @@ private struct CommandPaletteRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 11) {
-                Image(systemName: icon)
-                    .font(.system(size: 15, weight: .semibold))
-                    .frame(width: 22)
-                    .foregroundStyle(isSelected ? .white : .secondary)
+                Group {
+                    if let nsImage {
+                        Image(nsImage: nsImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 18, height: 18)
+                    } else {
+                        Image(systemName: icon)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(isSelected ? .white : .secondary)
+                    }
+                }
+                .frame(width: 22)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct GeneralSettingsPane: View {
     @ObservedObject var settings: TerminalSettings
+    @ObservedObject private var editorDiscovery = ExternalEditorDiscovery.shared
 
     var body: some View {
         SettingsPaneScroll(page: .general) {
@@ -46,6 +47,44 @@ struct GeneralSettingsPane: View {
                     .frame(width: 220)
                 }
             }
+
+            SettingsCard("External Editor") {
+                SettingsRow("Default editor", subtitle: "Used by the ⌘P “Open in …” command.") {
+                    if editorDiscovery.installedEditors.isEmpty {
+                        Text("No editors found")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Default editor", selection: defaultEditorSelection) {
+                            Text("Automatic (\(editorDiscovery.installedEditors[0].displayName))")
+                                .tag("")
+                            ForEach(editorDiscovery.installedEditors) { editor in
+                                Text(editor.displayName)
+                                    .tag(editor.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 190)
+                    }
+                }
+            }
         }
+        .onAppear {
+            editorDiscovery.refresh()
+        }
+    }
+
+    /// Normalizes a stale preference (editor uninstalled since it was chosen)
+    /// back to Automatic instead of leaving the picker blank.
+    private var defaultEditorSelection: Binding<String> {
+        Binding(
+            get: {
+                editorDiscovery.installedEditors.contains { $0.id == settings.defaultEditorID }
+                    ? settings.defaultEditorID
+                    : ""
+            },
+            set: { settings.defaultEditorID = $0 }
+        )
     }
 }

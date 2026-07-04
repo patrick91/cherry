@@ -257,6 +257,11 @@ struct CherryApp: App {
                 }
                 .disabled(focusedChromeState == nil)
 
+                Button(focusedChromeState?.isCommandPalettePlaygroundPresented == true ? "Hide Command Palette Playground" : "Show Command Palette Playground") {
+                    keyWindowChromeState?.toggleCommandPalettePlayground()
+                }
+                .disabled(focusedChromeState == nil)
+
                 Button("New Tab") {
                     keyWindowWorkspace?.addSession()
                 }

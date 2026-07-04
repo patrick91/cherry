@@ -160,6 +160,14 @@ struct ContentView: View {
                 .zIndex(2_120)
             }
 
+            if chromeState.isCommandPalettePlaygroundPresented {
+                CommandPalettePlaygroundOverlay(
+                    chromeState: chromeState,
+                    isPresented: $chromeState.isCommandPalettePlaygroundPresented
+                )
+                .zIndex(2_200)
+            }
+
             if isSidebarHidden {
                 // Passive tracking keeps the edge target alive while the
                 // floating sidebar appears under the cursor, then expands to
@@ -2756,14 +2764,29 @@ private struct CommandPaletteOverlay: View {
     @State private var mode = CommandPaletteMode.commands
     @State private var query = ""
     @State private var selectedIndex = 0
-    @State private var scrollTopIndex = 0
     @State private var editingAgent: AgentToolDefinition?
     @State private var agentError: String?
     @State private var searchFocusRequest = 0
+    @State private var didAppear = false
+
+    @AppStorage(CommandPaletteDesign.usesGlassKey) private var usesGlass = CommandPaletteDesign.defaultUsesGlass
+    @AppStorage(CommandPaletteDesign.cornerRadiusKey) private var cornerRadius = CommandPaletteDesign.defaultCornerRadius
+    @AppStorage(CommandPaletteDesign.panelWidthKey) private var panelWidth = CommandPaletteDesign.defaultPanelWidth
+    @AppStorage(CommandPaletteDesign.scrimOpacityKey) private var scrimOpacity = CommandPaletteDesign.defaultScrimOpacity
+    @AppStorage(CommandPaletteDesign.animatesEntranceKey) private var animatesEntrance = CommandPaletteDesign.defaultAnimatesEntrance
+    @AppStorage(CommandPaletteDesign.usesCompactRowsKey) private var usesCompactRows = CommandPaletteDesign.defaultUsesCompactRows
+    @AppStorage(CommandPaletteDesign.rowHeightKey) private var rowHeight = CommandPaletteDesign.defaultRowHeight
+    @AppStorage(CommandPaletteDesign.selectionStyleKey) private var selectionStyle = CommandPaletteDesign.defaultSelectionStyle
+    @AppStorage(CommandPaletteDesign.usesIconTilesKey) private var usesIconTiles = CommandPaletteDesign.defaultUsesIconTiles
+    @AppStorage(CommandPaletteDesign.highlightsMatchesKey) private var highlightsMatches = CommandPaletteDesign.defaultHighlightsMatches
+    @AppStorage(CommandPaletteDesign.showsSectionHeadersKey) private var showsSectionHeaders = CommandPaletteDesign.defaultShowsSectionHeaders
+    @AppStorage(CommandPaletteDesign.showsKindLabelsKey) private var showsKindLabels = CommandPaletteDesign.defaultShowsKindLabels
+    @AppStorage(CommandPaletteDesign.showsFooterKey) private var showsFooter = CommandPaletteDesign.defaultShowsFooter
 
     var body: some View {
         ZStack(alignment: .top) {
-            Color.black.opacity(0.24)
+            Color.black.opacity(scrimOpacity)
+                .opacity(didAppear ? 1 : 0)
                 .ignoresSafeArea()
                 .onTapGesture {
                     dismiss()
@@ -2791,6 +2814,10 @@ private struct CommandPaletteOverlay: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 4) {
+                            Color.clear
+                                .frame(height: 0)
+                                .id(Self.scrollTopMarkerID)
+
                             if mode == .commands {
                                 commandRows
                             } else if mode == .projects {
@@ -2806,7 +2833,7 @@ private struct CommandPaletteOverlay: View {
                         .padding(7)
                         .frame(maxWidth: .infinity, alignment: .top)
                     }
-                    .frame(maxHeight: 340)
+                    .frame(maxHeight: listMaxHeight)
                     .onChange(of: selectedIndex) { _, _ in
                         scrollSelectionIntoView(proxy)
                     }
@@ -2817,14 +2844,16 @@ private struct CommandPaletteOverlay: View {
                         resetPaletteScroll(proxy)
                     }
                 }
+
+                if showsFooter {
+                    Divider()
+                    footer
+                }
             }
-            .frame(width: 560)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.22), radius: 28, y: 18)
+            .frame(width: CGFloat(panelWidth))
+            .modifier(CommandPaletteSurface(usesGlass: usesGlass, cornerRadius: CGFloat(cornerRadius)))
+            .scaleEffect(didAppear ? 1 : 0.97, anchor: .top)
+            .opacity(didAppear ? 1 : 0)
             .padding(.top, 86)
         }
         .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
@@ -2832,18 +2861,23 @@ private struct CommandPaletteOverlay: View {
             requestSearchFocus()
             selectedIndex = 0
             editorDiscovery.refresh()
+            if animatesEntrance {
+                withAnimation(.snappy(duration: 0.18)) {
+                    didAppear = true
+                }
+            } else {
+                didAppear = true
+            }
         }
         .onChange(of: focusRequest) { _, _ in
             requestSearchFocus()
         }
         .onChange(of: query) { _, _ in
             selectedIndex = 0
-            scrollTopIndex = 0
         }
         .onChange(of: mode) { _, _ in
             query = ""
             selectedIndex = 0
-            scrollTopIndex = 0
             requestSearchFocus()
         }
         .sheet(item: $editingAgent) { agent in
@@ -2883,6 +2917,52 @@ private struct CommandPaletteOverlay: View {
         case .agentPresets: "Agent"
         case .editors: "Editor"
         }
+    }
+
+    private var listMaxHeight: CGFloat {
+        let rows = CGFloat(visibleRowCount)
+        return rows * CGFloat(rowHeight) + (rows - 1) * 4 + 14
+    }
+
+    private var rowStyle: CommandPaletteRowStyle {
+        CommandPaletteRowStyle(
+            height: CGFloat(rowHeight),
+            isCompact: usesCompactRows,
+            selection: CommandPaletteSelectionStyle(rawValue: selectionStyle) ?? .softTint,
+            usesIconTiles: usesIconTiles,
+            cornerRadius: max(4, CGFloat(cornerRadius) - 7)
+        )
+    }
+
+    private func highlightFlags(for title: String) -> [Bool]? {
+        guard highlightsMatches else { return nil }
+        return CommandPaletteMatcher.matchFlags(query: query, in: title)
+    }
+
+    private var footerBreadcrumb: String {
+        switch mode {
+        case .commands: "Commands"
+        case .projects: "Commands › Projects"
+        case .agents: "Commands › Agents"
+        case .agentPresets: "Commands › Add Agent"
+        case .editors: "Commands › Editors"
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            Text(footerBreadcrumb)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            Spacer(minLength: 8)
+
+            CommandPaletteFooterHint(key: "↑↓", label: "Navigate")
+            CommandPaletteFooterHint(key: "↩", label: "Select")
+            CommandPaletteFooterHint(key: "⎋", label: mode == .commands ? "Close" : "Back")
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
     }
 
     private var filteredRootItems: [CommandPaletteRootItem] {
@@ -2945,22 +3025,62 @@ private struct CommandPaletteOverlay: View {
     private var commandRows: some View {
         if filteredRootItems.isEmpty {
             CommandPaletteEmptyRow(title: "No commands")
+        } else if showsSectionHeaders {
+            ForEach(Array(groupedRootItems.enumerated()), id: \.offset) { _, group in
+                CommandPaletteSectionHeader(title: group.title)
+                ForEach(group.rows, id: \.item.id) { row in
+                    rootRow(index: row.offset, item: row.item)
+                }
+            }
         } else {
             ForEach(Array(filteredRootItems.enumerated()), id: \.element.id) { index, item in
-                CommandPaletteRow(
-                    icon: item.icon,
-                    nsImage: rootItemImage(for: item),
-                    title: item.title,
-                    subtitle: item.subtitle,
-                    isSelected: index == selectedIndex,
-                    isCurrent: item.isCurrent(selectedProjectRoot: selectedProjectRoot)
-                ) {
-                    selectedIndex = index
-                    commitSelection()
-                }
-                .id(rowID(for: index))
+                rootRow(index: index, item: item)
             }
         }
+    }
+
+    private struct RootItemGroup {
+        let title: String
+        var rows: [RootItemRow]
+    }
+
+    private struct RootItemRow {
+        let offset: Int
+        let item: CommandPaletteRootItem
+    }
+
+    private var groupedRootItems: [RootItemGroup] {
+        var groups: [RootItemGroup] = []
+        for (offset, item) in filteredRootItems.enumerated() {
+            let row = RootItemRow(offset: offset, item: item)
+            if let lastIndex = groups.indices.last, groups[lastIndex].title == item.sectionTitle {
+                groups[lastIndex].rows.append(row)
+            } else {
+                groups.append(RootItemGroup(title: item.sectionTitle, rows: [row]))
+            }
+        }
+        return groups
+    }
+
+    private func rootRow(index: Int, item: CommandPaletteRootItem) -> some View {
+        CommandPaletteRow(
+            style: rowStyle,
+            icon: item.icon,
+            nsImage: rootItemImage(for: item),
+            tileColor: item.tileColor,
+            title: item.title,
+            matchFlags: highlightFlags(for: item.title),
+            subtitle: item.subtitle,
+            kindLabel: showsKindLabels ? item.kindLabel : nil,
+            isSelected: index == selectedIndex,
+            isCurrent: item.isCurrent(selectedProjectRoot: selectedProjectRoot),
+            onHover: { selectedIndex = index },
+            action: {
+                selectedIndex = index
+                commitSelection()
+            }
+        )
+        .id(rowID(for: index))
     }
 
     @ViewBuilder
@@ -2969,7 +3089,9 @@ private struct CommandPaletteOverlay: View {
             VStack(spacing: 4) {
                 CommandPaletteEmptyRow(title: "No projects")
                 CommandPaletteRow(
+                    style: rowStyle,
                     icon: CommandPaletteCommand.addProject.icon,
+                    tileColor: CommandPaletteCommand.addProject.tileColor,
                     title: CommandPaletteCommand.addProject.title,
                     subtitle: CommandPaletteCommand.addProject.subtitle,
                     isSelected: selectedIndex == 0,
@@ -2981,15 +3103,20 @@ private struct CommandPaletteOverlay: View {
         } else {
             ForEach(Array(filteredProjects.enumerated()), id: \.element.id) { index, project in
                 CommandPaletteRow(
+                    style: rowStyle,
                     icon: "folder.fill",
+                    tileColor: .blue,
                     title: project.name,
+                    matchFlags: highlightFlags(for: project.name),
                     subtitle: project.root,
                     isSelected: index == selectedIndex,
-                    isCurrent: project.root == selectedProjectRoot
-                ) {
-                    selectedIndex = index
-                    commitSelection()
-                }
+                    isCurrent: project.root == selectedProjectRoot,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
                 .id(rowID(for: index))
             }
         }
@@ -3005,15 +3132,20 @@ private struct CommandPaletteOverlay: View {
         } else {
             ForEach(Array(filteredAgents.enumerated()), id: \.element.id) { index, agent in
                 CommandPaletteRow(
+                    style: rowStyle,
                     icon: "terminal",
+                    tileColor: .purple,
                     title: agent.name,
+                    matchFlags: highlightFlags(for: agent.name),
                     subtitle: agent.commandLine,
                     isSelected: index == selectedIndex,
-                    isCurrent: false
-                ) {
-                    selectedIndex = index
-                    commitSelection()
-                }
+                    isCurrent: false,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
                 .id(rowID(for: index))
             }
         }
@@ -3026,15 +3158,20 @@ private struct CommandPaletteOverlay: View {
         } else {
             ForEach(Array(filteredAgentPresets.enumerated()), id: \.element.id) { index, preset in
                 CommandPaletteRow(
+                    style: rowStyle,
                     icon: preset.command.isEmpty ? "plus" : "terminal",
+                    tileColor: .purple,
                     title: preset.name,
+                    matchFlags: highlightFlags(for: preset.name),
                     subtitle: preset.commandLine.isEmpty ? "Custom agent tool" : preset.commandLine,
                     isSelected: index == selectedIndex,
-                    isCurrent: false
-                ) {
-                    selectedIndex = index
-                    commitSelection()
-                }
+                    isCurrent: false,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
                 .id(rowID(for: index))
             }
         }
@@ -3047,16 +3184,21 @@ private struct CommandPaletteOverlay: View {
         } else {
             ForEach(Array(filteredEditors.enumerated()), id: \.element.id) { index, editor in
                 CommandPaletteRow(
+                    style: rowStyle,
                     icon: "arrow.up.forward.app",
                     nsImage: editorDiscovery.icon(for: editor),
+                    tileColor: .teal,
                     title: editor.displayName,
+                    matchFlags: highlightFlags(for: editor.displayName),
                     subtitle: "Open project in \(editor.displayName)",
                     isSelected: index == selectedIndex,
-                    isCurrent: false
-                ) {
-                    selectedIndex = index
-                    commitSelection()
-                }
+                    isCurrent: false,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
                 .id(rowID(for: index))
             }
         }
@@ -3120,37 +3262,31 @@ private struct CommandPaletteOverlay: View {
         }
     }
 
+    private static let scrollTopMarkerID = "palette-scroll-top"
+
     private func scrollSelectionIntoView(_ proxy: ScrollViewProxy, animated: Bool = true) {
         guard resultCount > 0 else { return }
-        let lastPossibleTopIndex = max(0, resultCount - visibleRowCount)
-        let nextTopIndex: Int
-        if selectedIndex < scrollTopIndex {
-            nextTopIndex = selectedIndex
-        } else if selectedIndex >= scrollTopIndex + visibleRowCount {
-            nextTopIndex = selectedIndex - visibleRowCount + 1
-        } else {
-            return
-        }
-
-        scrollTopIndex = min(max(nextTopIndex, 0), lastPossibleTopIndex)
-        scrollToTopIndex(proxy, animated: animated)
-    }
-
-    private func resetPaletteScroll(_ proxy: ScrollViewProxy) {
-        scrollTopIndex = 0
-        scrollToTopIndex(proxy, animated: false)
-    }
-
-    private func scrollToTopIndex(_ proxy: ScrollViewProxy, animated: Bool) {
-        let id = rowID(for: scrollTopIndex)
+        // anchor nil scrolls the minimum needed for full visibility; rows and
+        // section headers have different heights, so index math can't predict
+        // offsets. Index 0 targets the top marker so the leading section
+        // header scrolls back into view too.
+        let isFirst = selectedIndex == 0
+        let id = isFirst ? Self.scrollTopMarkerID : rowID(for: selectedIndex)
+        let anchor: UnitPoint? = isFirst ? .top : nil
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.snappy(duration: 0.12)) {
-                    proxy.scrollTo(id, anchor: .top)
+                    proxy.scrollTo(id, anchor: anchor)
                 }
             } else {
-                proxy.scrollTo(id, anchor: .top)
+                proxy.scrollTo(id, anchor: anchor)
             }
+        }
+    }
+
+    private func resetPaletteScroll(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            proxy.scrollTo(Self.scrollTopMarkerID, anchor: .top)
         }
     }
 
@@ -3378,42 +3514,38 @@ private final class CommandPaletteSearchTextField: NSTextField {
     }
 }
 
+struct CommandPaletteRowStyle {
+    let height: CGFloat
+    let isCompact: Bool
+    let selection: CommandPaletteSelectionStyle
+    let usesIconTiles: Bool
+    let cornerRadius: CGFloat
+}
+
 private struct CommandPaletteRow: View {
+    let style: CommandPaletteRowStyle
     let icon: String
     var nsImage: NSImage? = nil
+    var tileColor: Color = .blue
     let title: String
+    var matchFlags: [Bool]? = nil
     let subtitle: String
+    var kindLabel: String? = nil
     let isSelected: Bool
     let isCurrent: Bool
+    var onHover: (() -> Void)? = nil
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 11) {
-                Group {
-                    if let nsImage {
-                        Image(nsImage: nsImage)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 18, height: 18)
-                    } else {
-                        Image(systemName: icon)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(isSelected ? .white : .secondary)
-                    }
-                }
-                .frame(width: 22)
+            HStack(spacing: 10) {
+                iconView
+                    .frame(width: 24)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(isSelected ? .white : .primary)
-                        .lineLimit(1)
-
-                    Text(subtitle)
-                        .font(.system(size: 12))
-                        .foregroundStyle(isSelected ? .white.opacity(0.72) : .secondary)
-                        .lineLimit(1)
+                if style.isCompact {
+                    compactText
+                } else {
+                    stackedText
                 }
 
                 Spacer(minLength: 10)
@@ -3421,18 +3553,192 @@ private struct CommandPaletteRow: View {
                 if isCurrent {
                     Image(systemName: "checkmark")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(isSelected ? .white : .secondary)
+                        .foregroundStyle(isAccentSelected ? Color.white : Color.secondary)
+                }
+
+                if let kindLabel {
+                    Text(kindLabel)
+                        .font(.system(size: 11))
+                        .foregroundStyle(isAccentSelected ? Color.white.opacity(0.6) : Color.secondary.opacity(0.7))
                 }
             }
             .padding(.horizontal, 10)
-            .frame(height: 50)
+            .frame(height: style.height)
             .background {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isSelected ? Color.accentColor : Color.clear)
+                RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous)
+                    .fill(selectionFill)
             }
-            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .onHover { hovering in
+            if hovering {
+                onHover?()
+            }
+        }
+    }
+
+    private var isAccentSelected: Bool {
+        isSelected && style.selection == .accentFill
+    }
+
+    private var selectionFill: Color {
+        guard isSelected else { return .clear }
+        switch style.selection {
+        case .accentFill: return Color.accentColor
+        case .softTint: return Color.accentColor.opacity(0.18)
+        case .flat: return Color.primary.opacity(0.07)
+        }
+    }
+
+    @ViewBuilder
+    private var iconView: some View {
+        if let nsImage {
+            Image(nsImage: nsImage)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 20, height: 20)
+        } else if style.usesIconTiles {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(tileColor.gradient)
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 24, height: 24)
+        } else {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(isAccentSelected ? Color.white : Color.secondary)
+        }
+    }
+
+    private var compactText: some View {
+        HStack(spacing: 8) {
+            titleText
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            if !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(subtitleColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+
+    private var stackedText: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            titleText
+                .font(.system(size: 14, weight: .semibold))
+                .lineLimit(1)
+
+            Text(subtitle)
+                .font(.system(size: 12))
+                .foregroundStyle(subtitleColor)
+                .lineLimit(1)
+        }
+    }
+
+    private var titleColor: Color {
+        isAccentSelected ? .white : .primary
+    }
+
+    private var subtitleColor: Color {
+        isAccentSelected ? Color.white.opacity(0.72) : Color.secondary
+    }
+
+    private var highlightColor: Color {
+        isAccentSelected ? .white : .accentColor
+    }
+
+    private var titleText: Text {
+        let characters = Array(title)
+        guard let matchFlags,
+              matchFlags.count == characters.count,
+              matchFlags.contains(true)
+        else {
+            return Text(title).foregroundStyle(titleColor)
+        }
+
+        var attributed = AttributedString()
+        for (index, character) in characters.enumerated() {
+            var piece = AttributedString(String(character))
+            if matchFlags[index] {
+                piece.inlinePresentationIntent = .stronglyEmphasized
+                piece.foregroundColor = highlightColor
+            } else {
+                piece.foregroundColor = titleColor
+            }
+            attributed += piece
+        }
+        return Text(attributed)
+    }
+}
+
+private struct CommandPaletteSectionHeader: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct CommandPaletteFooterHint: View {
+    let key: String
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(key)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+                .frame(minWidth: 18)
+                .frame(height: 16)
+                .background {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.primary.opacity(0.07))
+                }
+
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct CommandPaletteSurface: ViewModifier {
+    let usesGlass: Bool
+    let cornerRadius: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if usesGlass {
+            content
+                .clipShape(shape)
+                .glassEffect(.regular, in: shape)
+                .shadow(color: .black.opacity(0.18), radius: 24, y: 14)
+        } else {
+            content
+                .background(.regularMaterial, in: shape)
+                .overlay {
+                    shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.22), radius: 28, y: 18)
+        }
     }
 }
 

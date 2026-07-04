@@ -94,6 +94,16 @@
                     name: NSWindow.didChangeOcclusionStateNotification,
                     object: window
                 )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowDidChangeScreen),
+                    name: NSWindow.didChangeScreenNotification,
+                    object: window
+                )
+                windowDidChangeScreen(Notification(
+                    name: NSWindow.didChangeScreenNotification,
+                    object: window
+                ))
             } else {
                 core.stopDisplayLink()
                 core.setFocus(false)
@@ -115,6 +125,23 @@
 
         @objc internal func windowVisibilityDidChange(_: Notification) {
             updateSurfaceVisibility()
+        }
+
+        @objc internal func windowDidChangeScreen(_: Notification) {
+            guard let window else { return }
+            // Keep ghostty's vsync display link on the display actually showing
+            // the surface, mirroring upstream's SurfaceView.
+            if let screenNumber = window.screen?.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber {
+                surface?.setDisplayID(screenNumber.uint32Value)
+            }
+            // AppKit does not reliably deliver viewDidChangeBackingProperties when
+            // a window lands on a screen with a different scale factor
+            // (ghostty-org/ghostty#2731) — re-run it once the move settles.
+            DispatchQueue.main.async { [weak self] in
+                self?.viewDidChangeBackingProperties()
+            }
         }
 
         private func removeWindowObservers() {
@@ -144,6 +171,11 @@
             NotificationCenter.default.removeObserver(
                 self,
                 name: NSWindow.didChangeOcclusionStateNotification,
+                object: nil
+            )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.didChangeScreenNotification,
                 object: nil
             )
         }
@@ -210,19 +242,33 @@
         internal func updateMetalLayerMetrics() {
             guard bounds.width > 0, bounds.height > 0 else { return }
             let scale = core.scaleFactor()
-            metalLayer?.frame = bounds
-            metalLayer?.contentsScale = scale
-            metalLayer?.drawableSize = CGSize(
-                width: bounds.width * scale,
-                height: bounds.height * scale
-            )
+            // Once a surface exists, ghostty has replaced `layer` with its own
+            // IOSurfaceLayer and `metalLayer` is orphaned — so the scale must be
+            // applied to the *current* backing layer. IOSurfaceLayer discards any
+            // rendered frame whose pixel size != bounds × contentsScale, so a stale
+            // contentsScale after a screen change freezes the old-scale frame on
+            // screen (looks zoomed in/out).
+            guard let backingLayer = layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            backingLayer.contentsScale = scale
+            if let metal = backingLayer as? CAMetalLayer {
+                metal.drawableSize = CGSize(
+                    width: bounds.width * scale,
+                    height: bounds.height * scale
+                )
+            }
+            CATransaction.commit()
         }
 
         internal func enforceMetalLayerScale() {
-            guard let metalLayer else { return }
+            guard let backingLayer = layer else { return }
             let scale = core.scaleFactor()
-            if metalLayer.contentsScale != scale {
-                metalLayer.contentsScale = scale
+            if backingLayer.contentsScale != scale {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                backingLayer.contentsScale = scale
+                CATransaction.commit()
             }
         }
 

@@ -186,6 +186,17 @@ public final class TerminalSurface {
         ghostty_surface_set_content_scale(s, x, y)
     }
 
+    /// Tells ghostty which display is showing the surface so its vsync
+    /// display link tracks that display's refresh rate.
+    func setDisplayID(_ displayID: UInt32) {
+        guard let s = surface else {
+            TerminalDebugLog.log(.metrics, "surface displayID ignored: missing surface")
+            return
+        }
+        TerminalDebugLog.log(.metrics, "surface displayID=\(displayID)")
+        ghostty_surface_set_display_id(s, displayID)
+    }
+
     // MARK: - State
 
     func setFocus(_ focused: Bool) {

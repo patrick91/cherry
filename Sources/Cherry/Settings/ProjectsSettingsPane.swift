@@ -160,6 +160,7 @@ struct ProjectDetailSettingsPane: View {
             ProjectCommandEditor(
                 command: command,
                 projectRoot: project.root,
+                storage: settings.commandStorage(named: editingOriginalName ?? command.name, for: project.root),
                 canDelete: editingOriginalName != nil,
                 errorMessage: commandError,
                 onSave: { updatedCommand, storage in

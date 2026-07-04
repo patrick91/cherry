@@ -745,6 +745,22 @@ final class AgentSettings: ObservableObject {
         projectCommands(for: requestedRoot).filter(\.isLaunchable)
     }
 
+    /// Where the effective definition of a command currently lives. Local
+    /// definitions shadow cherry.toml ones in `projectCommands(for:)`, so a
+    /// name present in both is reported as `.local`.
+    func commandStorage(named name: String, for requestedRoot: String?) -> ProjectCommandStorage {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else { return .local }
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        if (commandsByProject[root] ?? []).contains(where: { $0.normalizedName == normalizedName }) {
+            return .local
+        }
+        if CherryProjectFile.loadCommands(projectRoot: root)
+            .contains(where: { $0.normalizedName == normalizedName }) {
+            return .projectFile
+        }
+        return .local
+    }
+
     func projectFeatures(for requestedRoot: String?) -> ProjectFeatureSettings {
         guard let root = Self.validDirectory(requestedRoot ?? "") else {
             return .disabled
@@ -906,6 +922,19 @@ final class AgentSettings: ObservableObject {
             try setCommands(nextCommands, for: root)
         case .projectFile:
             try CherryProjectFile.upsertCommand(validatedCommand, projectRoot: root, replacing: originalName)
+            // Drop any local definition with the same name: local commands
+            // shadow cherry.toml ones, so leaving a stale copy behind would
+            // make the just-saved shared definition invisible on this machine.
+            var nextCommands = commandsByProject[root] ?? []
+            let normalizedOriginalName = originalName.map(AgentToolDefinition.normalizedName)
+            let previousCount = nextCommands.count
+            nextCommands.removeAll {
+                $0.normalizedName == validatedCommand.normalizedName
+                    || $0.normalizedName == normalizedOriginalName
+            }
+            if nextCommands.count != previousCount {
+                try setCommands(nextCommands, for: root)
+            }
         }
     }
 

@@ -48,9 +48,6 @@ struct ProjectCommandRow: View {
 
 struct ProjectCommandEditor: View {
     @State private var draft: ProjectCommandDraft
-    @State private var isApplyingCommandExtraction = false
-    @AppStorage("ProjectCommandEditor.extractsEnvironmentAssignments")
-    private var extractsEnvironmentAssignments = true
 
     let projectRoot: String
     let canDelete: Bool
@@ -62,13 +59,18 @@ struct ProjectCommandEditor: View {
     init(
         command: ProjectCommandDefinition,
         projectRoot: String,
+        storage: ProjectCommandStorage = .local,
         canDelete: Bool,
         errorMessage: String?,
         onSave: @escaping (ProjectCommandDefinition, ProjectCommandStorage) -> Void,
         onDelete: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
-        _draft = State(initialValue: ProjectCommandDraft(command: command, projectRoot: projectRoot))
+        _draft = State(initialValue: ProjectCommandDraft(
+            command: command,
+            projectRoot: projectRoot,
+            storage: storage
+        ))
         self.projectRoot = projectRoot
         self.canDelete = canDelete
         self.errorMessage = errorMessage
@@ -100,9 +102,20 @@ struct ProjectCommandEditor: View {
                     Text("Command")
                         .foregroundStyle(.secondary)
                     TextField("e.g., npm run dev", text: $draft.commandLine)
-                        .onChange(of: draft.commandLine) { oldValue, newValue in
-                            extractEnvironmentFromCommandIfNeeded(oldValue: oldValue, newValue: newValue)
+
+                    if let extraction = pendingEnvironmentExtraction {
+                        HStack(spacing: 8) {
+                            Text(environmentSuggestionText(for: extraction))
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+
+                            Button("Move to Environment Variables") {
+                                draft.commandLine = extraction.commandLine
+                                draft.mergeEnvironment(extraction.environment)
+                            }
+                            .controlSize(.small)
                         }
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
@@ -124,8 +137,12 @@ struct ProjectCommandEditor: View {
 
                 environmentSection
 
-                Toggle("Auto-start when project starts", isOn: $draft.autoStart)
-                Toggle("Auto-restart if command exits", isOn: $draft.autoRestart)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Behavior")
+                        .foregroundStyle(.secondary)
+                    Toggle("Auto-start when project starts", isOn: $draft.autoStart)
+                    Toggle("Auto-restart if command exits", isOn: $draft.autoRestart)
+                }
             }
             .textFieldStyle(.roundedBorder)
 
@@ -243,30 +260,18 @@ struct ProjectCommandEditor: View {
                     }
                 }
             }
-
-            Toggle("Detect env vars pasted into Command", isOn: $extractsEnvironmentAssignments)
-                .font(.callout)
         }
     }
 
-    private func extractEnvironmentFromCommandIfNeeded(oldValue: String, newValue: String) {
-        guard extractsEnvironmentAssignments,
-              !isApplyingCommandExtraction,
-              isLikelyPaste(oldValue: oldValue, newValue: newValue),
-              let extraction = ProjectCommandEnvironmentExtraction.extractLeadingAssignments(from: newValue)
-        else {
-            return
-        }
-
-        isApplyingCommandExtraction = true
-        draft.commandLine = extraction.commandLine
-        draft.mergeEnvironment(extraction.environment)
-        isApplyingCommandExtraction = false
+    private var pendingEnvironmentExtraction: ProjectCommandEnvironmentExtraction? {
+        ProjectCommandEnvironmentExtraction.extractLeadingAssignments(from: draft.commandLine)
     }
 
-    private func isLikelyPaste(oldValue: String, newValue: String) -> Bool {
-        guard newValue.contains("="), newValue.contains(where: \.isWhitespace) else { return false }
-        return oldValue.isEmpty || newValue.count > oldValue.count + 8
+    private func environmentSuggestionText(for extraction: ProjectCommandEnvironmentExtraction) -> String {
+        let names = extraction.environment.keys.sorted().joined(separator: ", ")
+        return extraction.environment.count == 1
+            ? "\(names) looks like an environment variable."
+            : "\(names) look like environment variables."
     }
 }
 
@@ -309,7 +314,7 @@ private struct ProjectCommandDraft {
     var storage: ProjectCommandStorage
     let projectRoot: String
 
-    init(command: ProjectCommandDefinition, projectRoot: String) {
+    init(command: ProjectCommandDefinition, projectRoot: String, storage: ProjectCommandStorage) {
         name = command.name
         commandLine = command.commandLine
         workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(
@@ -327,7 +332,7 @@ private struct ProjectCommandDraft {
         autoStart = command.autoStart
         autoRestart = command.autoRestart
         enabled = command.enabled
-        storage = .local
+        self.storage = storage
         self.projectRoot = projectRoot
         if name.isEmpty, commandLine.isEmpty, workingDirectory.isEmpty {
             self.workingDirectory = ""

@@ -872,11 +872,11 @@ private struct DetailPaneView: View {
                 NoteDetailView(note: note, noteStore: noteStore)
             } else if features.todosEnabled, chromeState.isTodoPanePresented {
                 TodoPaneView(todoStore: todoStore, chromeState: chromeState)
-            } else if let idleCommand = idleCommandForDetail {
+            } else if let idleCommand = focusedIdleCommand {
                 IdleCommandView(
                     command: idleCommand,
                     onStart: { startIdleCommand(idleCommand) },
-                    onCancel: focusedIdleCommand == nil ? nil : { chromeState.selectTerminal() }
+                    onCancel: { chromeState.selectTerminal() }
                 )
             } else if workspace.selectedSession != nil {
                 TerminalSplitSceneView(workspace: workspace, chromeState: chromeState)
@@ -918,24 +918,6 @@ private struct DetailPaneView: View {
         guard let name = chromeState.focusedIdleCommandName else { return nil }
         return agentSettings.launchableProjectCommands(for: projectRoot)
             .first { $0.name == name }
-    }
-
-    private var idleCommandForDetail: ProjectCommandDefinition? {
-        if let focusedIdleCommand {
-            return focusedIdleCommand
-        }
-
-        guard chromeState.isShowingTerminalContent,
-              let session = workspace.selectedSession,
-              session.kind == .command,
-              !session.isRunningCommand,
-              let commandName = session.commandName
-        else {
-            return nil
-        }
-
-        return agentSettings.launchableProjectCommands(for: projectRoot)
-            .first { $0.name == commandName }
     }
 
     private func startIdleCommand(_ command: ProjectCommandDefinition) {
@@ -4427,11 +4409,11 @@ private struct SidebarCommandSection: View {
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
                         start: { start(command, existingSession: session) },
-                        stop: { stop(command, existingSession: session) },
+                        stop: { stop(session) },
                         restart: { restart(command, existingSession: session) },
                         select: {
-                            if let session, session.isRunningCommand {
-                                chromeState.selectNote(id: nil)
+                            if let session {
+                                chromeState.selectTerminal()
                                 workspace.select(session)
                             } else {
                                 chromeState.focusIdleCommand(name: command.name)
@@ -4452,7 +4434,7 @@ private struct SidebarCommandSection: View {
                         }
 
                         Button("Stop") {
-                            stop(command, existingSession: session)
+                            stop(session)
                         }
                         .disabled(session?.isRunningCommand != true)
 
@@ -4486,6 +4468,7 @@ private struct SidebarCommandSection: View {
             ProjectCommandEditor(
                 command: command,
                 projectRoot: projectRoot ?? "",
+                storage: settings.commandStorage(named: editingOriginalName ?? command.name, for: projectRoot),
                 canDelete: editingOriginalName != nil,
                 errorMessage: commandError,
                 onSave: { updatedCommand, storage in
@@ -4559,9 +4542,11 @@ private struct SidebarCommandSection: View {
         }
     }
 
-    private func stop(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+    // Deliberately selection-neutral: the exited terminal stays visible with
+    // the exit-status bar, and stopping a command you're not looking at
+    // shouldn't steal the detail pane.
+    private func stop(_ existingSession: TerminalSession?) {
         existingSession?.stopManagedCommand()
-        chromeState.focusIdleCommand(name: command.name)
     }
 
     private func remove(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
@@ -4874,16 +4859,24 @@ private struct SidebarCommandRow: View {
 
                 if showShortcutHint, shortcutNumber <= 9 {
                     SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
+                } else if let session {
+                    SidebarCommandRunButton(
+                        session: session,
+                        isSelected: isSelected,
+                        palette: palette,
+                        start: start,
+                        stop: stop
+                    )
                 } else {
-                    Button(action: session?.isRunningCommand == true ? stop : start) {
-                        Image(systemName: session?.isRunningCommand == true ? "stop.fill" : "play.fill")
+                    Button(action: start) {
+                        Image(systemName: "play.fill")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                             .frame(width: 22, height: 22)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(session?.isRunningCommand == true ? "Stop" : "Start")
+                    .help("Start")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -4918,6 +4911,29 @@ private struct SidebarCommandRow: View {
         }
     }
 
+}
+
+// Observes the session directly: run state changes (including a process
+// quitting on its own) must flip the icon without waiting for an unrelated
+// re-render of the sidebar.
+private struct SidebarCommandRunButton: View {
+    @ObservedObject var session: TerminalSession
+    let isSelected: Bool
+    let palette: SidebarPalette
+    let start: () -> Void
+    let stop: () -> Void
+
+    var body: some View {
+        Button(action: session.isRunningCommand ? stop : start) {
+            Image(systemName: session.isRunningCommand ? "stop.fill" : "play.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(session.isRunningCommand ? "Stop" : "Start")
+    }
 }
 
 private extension TerminalSession {
@@ -8748,6 +8764,12 @@ private struct TerminalSceneView: View {
                 )
                 .ignoresSafeArea(.container, edges: .top)
 
+            if session.kind == .command {
+                CommandExitStatusBar(session: session)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 14)
+            }
+
             if isActivePane, chromeState.isTerminalSearchPresented {
                 TerminalSearchOverlay(
                     session: session,
@@ -8810,6 +8832,61 @@ private struct TerminalSceneView: View {
         session.ghosttyBridge.endSearch()
         chromeState.dismissTerminalSearch()
         session.ghosttyBridge.focus(in: NSApp.keyWindow)
+    }
+}
+
+// Floats over an exited command's terminal instead of replacing it, so the
+// final output (usually the reason a dev server died) stays readable.
+// Observes the session directly: nothing above this view in the SwiftUI tree
+// re-renders when a process exits on its own.
+private struct CommandExitStatusBar: View {
+    @ObservedObject var session: TerminalSession
+
+    private struct Status {
+        let text: String
+        let isFailure: Bool
+    }
+
+    private var status: Status? {
+        switch session.state {
+        case .launching, .live:
+            nil
+        case .exited(let code):
+            code == 0
+                ? Status(text: "Command exited", isFailure: false)
+                : Status(text: "Command exited with code \(code)", isFailure: true)
+        case .failed(let message):
+            Status(text: "Launch failed: \(message)", isFailure: true)
+        }
+    }
+
+    var body: some View {
+        if let status {
+            HStack(spacing: 10) {
+                Image(systemName: status.isFailure ? "exclamationmark.triangle.fill" : "stop.circle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(status.isFailure ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+
+                Text(status.text)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Button("Restart") {
+                    session.restartManagedCommandIfNeeded()
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+            .frame(maxWidth: 460)
+        }
     }
 }
 

@@ -9387,6 +9387,99 @@ private func waitForSummaryCallCount(
 }
 
 @MainActor
+@Test func agentSettingsReportsCommandStorageOrigin() async throws {
+    let defaultsName = "CherryTests.CommandStorageOrigin.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
+        for: directory.path,
+        storage: .projectFile
+    )
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "API", command: "uvicorn", arguments: "main:app"),
+        for: directory.path,
+        storage: .local
+    )
+
+    #expect(settings.commandStorage(named: "Web", for: directory.path) == .projectFile)
+    #expect(settings.commandStorage(named: "API", for: directory.path) == .local)
+    #expect(settings.commandStorage(named: "Missing", for: directory.path) == .local)
+
+    // A local definition shadows the cherry.toml one, so it wins.
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev -- --host"),
+        for: directory.path,
+        storage: .local
+    )
+    #expect(settings.commandStorage(named: "Web", for: directory.path) == .local)
+}
+
+@MainActor
+@Test func savingCommandToProjectFileRemovesLocalShadow() async throws {
+    let defaultsName = "CherryTests.CommandLocalShadow.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let settings = AgentSettings(defaults: defaults)
+    settings.addProject(path: directory.path)
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
+        for: directory.path,
+        storage: .local
+    )
+
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev -- --host"),
+        for: directory.path,
+        replacing: "Web",
+        storage: .projectFile
+    )
+
+    // The local copy must not survive to shadow the shared definition.
+    #expect(settings.commandStorage(named: "Web", for: directory.path) == .projectFile)
+    #expect(settings.projectCommands(for: directory.path) == [
+        ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev -- --host")
+    ])
+
+    // Renaming while promoting to cherry.toml also clears the old local name.
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Queue", command: "npm", arguments: "run queue"),
+        for: directory.path,
+        storage: .local
+    )
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Worker", command: "npm", arguments: "run worker"),
+        for: directory.path,
+        replacing: "Queue",
+        storage: .projectFile
+    )
+    #expect(settings.commandStorage(named: "Worker", for: directory.path) == .projectFile)
+    #expect(settings.projectCommands(for: directory.path).map(\.name).sorted() == ["Web", "Worker"])
+}
+
+@MainActor
 @Test func projectFeaturesDefaultDisabledAndLocalOverridesWin() async throws {
     let defaultsName = "CherryTests.ProjectFeatures.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))

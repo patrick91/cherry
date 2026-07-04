@@ -790,6 +790,16 @@ final class AgentSettings: ObservableObject {
         return appearanceOverridesByProject[root] ?? ProjectAppearanceOverrides()
     }
 
+    func projectFileConfiguresFeatures(for requestedRoot: String?) -> Bool {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else { return false }
+        return CherryProjectFile.loadFeatureSettings(projectRoot: root) != nil
+    }
+
+    func projectFileConfiguresAppearance(for requestedRoot: String?) -> Bool {
+        guard let root = Self.validDirectory(requestedRoot ?? "") else { return false }
+        return CherryProjectFile.loadAppearanceSettings(projectRoot: root) != nil
+    }
+
     func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectFeatureStorage) throws {
         guard let root = Self.validDirectory(requestedRoot) else { return }
         switch storage {

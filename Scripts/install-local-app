@@ -54,6 +54,16 @@ mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/Cherry"
 cp "$MCP_HELPER_PATH" "$APP_PATH/Contents/MacOS/CherryMCP"
 
+# SwiftPM resource bundles (Cherry_Cherry.bundle et al.) must ship inside the
+# app: the swiftbuild-generated Bundle.module accessor only searches the app's
+# Resources directory and fatalErrors otherwise. (The old native-build-system
+# accessor fell back to an absolute path into this repo's .build directory,
+# which is why installed apps used to work without them.)
+for RESOURCE_BUNDLE in "$BIN_DIR"/*.bundle; do
+  [[ -e "$RESOURCE_BUNDLE" ]] || continue
+  cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
+done
+
 if [[ -d "$ICON_SOURCE" ]] && xcrun --find actool >/dev/null 2>&1; then
   if xcrun actool "$ICON_SOURCE" \
     --compile "$APP_PATH/Contents/Resources" \

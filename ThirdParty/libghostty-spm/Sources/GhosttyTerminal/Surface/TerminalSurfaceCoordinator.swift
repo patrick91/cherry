@@ -94,6 +94,19 @@ final class TerminalSurfaceCoordinator {
 
     // MARK: - Surface Lifecycle
 
+    /// Rebuild the surface even when `configuration` is unchanged. EXEC
+    /// surfaces own a child process, and relaunching the same command yields
+    /// equivalent options — which the `configuration` setter deliberately
+    /// ignores. Tearing down the old surface closes its PTY, so a
+    /// still-running child is terminated before the new one spawns.
+    func relaunch(with next: TerminalSurfaceOptions) {
+        if next.isEquivalent(to: configuration) {
+            rebuildIfReady()
+        } else {
+            configuration = next
+        }
+    }
+
     func rebuildIfReady(removingBridgeFrom previousController: TerminalController? = nil) {
         tearDownSurface(removingBridgeFrom: previousController ?? controller)
         guard let controller else {

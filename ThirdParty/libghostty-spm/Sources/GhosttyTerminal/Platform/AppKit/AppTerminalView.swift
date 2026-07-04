@@ -40,6 +40,12 @@
             core.freeSurface()
         }
 
+        /// Rebuild the surface even when `configuration` is unchanged, e.g. to
+        /// respawn an exited EXEC child with the same command.
+        public func relaunchSurface(configuration: TerminalSurfaceOptions) {
+            core.relaunch(with: configuration)
+        }
+
         @discardableResult
         public func performBindingAction(_ action: String) -> Bool {
             surface?.performBindingAction(action) ?? false

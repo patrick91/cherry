@@ -705,6 +705,34 @@ final class ShellProcessController: @unchecked Sendable {
         return ProbeProcessResult(exitCode: exitCode, output: output)
     }
 
+    /// Terminate the native-PTY (ghostty EXEC) shell by PID. The host owns no
+    /// PTY fd in that mode, so signal the shell and its process group directly
+    /// with the same HUP → TERM → KILL escalation the forkpty path uses.
+    static func terminateNativeShell(processID: pid_t) {
+        guard processID > 1 else { return }
+        var groupIDs: Set<pid_t> = [processID]
+        let processGroupID = getpgid(processID)
+        if processGroupID > 1 {
+            groupIDs.insert(processGroupID)
+        }
+        groupIDs.remove(getpgrp())
+
+        func signalAll(_ signal: Int32) {
+            for groupID in groupIDs {
+                _ = Darwin.kill(-groupID, signal)
+            }
+            _ = Darwin.kill(processID, signal)
+        }
+
+        signalAll(SIGHUP)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(100)) {
+            signalAll(SIGTERM)
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(700)) {
+            signalAll(SIGKILL)
+        }
+    }
+
     private static func terminateProbeProcess(_ childPID: pid_t) {
         kill(childPID, SIGTERM)
         let terminateDeadline = Date().addingTimeInterval(0.2)

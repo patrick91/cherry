@@ -2081,6 +2081,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var launchCommand: String?
     private var launchEnvironment: [String: String]
     private var restartOnExit: Bool
+    /// True when auto-restart gave up on a crash-looping command (see
+    /// `CommandAutoRestartPolicy`); cleared by a manual restart.
+    @Published private(set) var isAutoRestartPaused = false
+    private var pendingAutoRestart: DispatchWorkItem?
+    private var consecutiveRapidExitCount = 0
     private var systemTitle: String
     private var automaticTitle: String?
     private var pendingResolvedCommandLine: String?
@@ -2578,6 +2583,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func restart() {
+        resetAutoRestartPolicy()
         stop()
         clearScrollback(preservingTerminalState: false)
         startShell()
@@ -2585,6 +2591,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func restartManagedCommandIfNeeded() {
         guard kind == .command else { return }
+        resetAutoRestartPolicy()
 
         switch state {
         case .launching, .live:
@@ -2641,6 +2648,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func stop() {
+        pendingAutoRestart?.cancel()
+        pendingAutoRestart = nil
         let launchID = activeLaunchID
         activeLaunchID = nil
         summaryDebounceTask?.cancel()
@@ -2664,6 +2673,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         updateShellOutputPauseState()
         hostInputWriter.set(nil)
+        if GhosttySessionBridge.nativePTYEnabled, let nativePID = childProcessID {
+            // Native-PTY: ghostty owns the PTY and there is no shellProcess to
+            // terminate, so signal the shell (and its process group) directly —
+            // otherwise Stop leaves the command running invisibly, still
+            // holding its ports.
+            ShellProcessController.terminateNativeShell(processID: nativePID)
+        }
         shellProcess?.terminate()
         shellProcess = nil
     }
@@ -2706,6 +2722,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchCommand = command.commandLine.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         launchEnvironment = command.environment
         restartOnExit = command.autoRestart
+        resetAutoRestartPolicy()
         bumpRevision()
     }
 
@@ -2822,6 +2839,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.beginLaunch(launchID)
         updateShellOutputPauseState()
         state = .launching
+        if isAutoRestartPaused {
+            isAutoRestartPaused = false
+        }
         startedAt = Date()
         exitedAt = nil
         lastOutputAt = nil
@@ -2850,12 +2870,23 @@ final class TerminalSession: ObservableObject, Identifiable {
             childProcessID = nil
             state = .live
             bumpRevision()
-            // Eagerly build the bridge so the EXEC surface — and therefore the
-            // child process — spawns now, like the host forkpty does, instead of
-            // lazily on first display. Agents/commands are normal sessions: they
-            // must run even when they're not the active tab (e.g. an AI-spawned
-            // agent the user hasn't opened yet).
-            _ = ghosttyBridge
+            // Remove the previous run's PID file so captureNativeShellPID can't
+            // resurrect a stale PID before the new shell rewrites it.
+            try? FileManager.default.removeItem(
+                atPath: ShellProcessController.shellPIDFilePath(processID: id.uuidString)
+            )
+            if let bridge = ghosttyBridgeStorage {
+                // Relaunch: merely touching the lazy accessor would return the
+                // existing surface with its exited child and respawn nothing.
+                bridge.relaunchNativeSurface()
+            } else {
+                // Eagerly build the bridge so the EXEC surface — and therefore
+                // the child process — spawns now, like the host forkpty does,
+                // instead of lazily on first display. Agents/commands are normal
+                // sessions: they must run even when they're not the active tab
+                // (e.g. an AI-spawned agent the user hasn't opened yet).
+                _ = ghosttyBridge
+            }
             // Recover the child PID the shell self-reports (ghostty gives us none),
             // so process-ancestry parent resolution works for AI-spawned subagents.
             captureNativeShellPID()
@@ -2909,6 +2940,42 @@ final class TerminalSession: ObservableObject, Identifiable {
         finishProcessExit(status: status, launchID: launchID)
     }
 
+    private func scheduleAutoRestartAfterExit() {
+        let runDuration: TimeInterval? = {
+            guard let startedAt, let exitedAt else { return nil }
+            return exitedAt.timeIntervalSince(startedAt)
+        }()
+        consecutiveRapidExitCount = CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(
+            previous: consecutiveRapidExitCount,
+            runDuration: runDuration
+        )
+        guard let delay = CommandAutoRestartPolicy.restartDelay(
+            consecutiveRapidExits: consecutiveRapidExitCount
+        ) else {
+            isAutoRestartPaused = true
+            return
+        }
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.activeLaunchID == nil, self.shellProcess == nil else { return }
+            self.pendingAutoRestart = nil
+            self.clearScrollback(preservingTerminalState: false)
+            self.startShell()
+        }
+        pendingAutoRestart?.cancel()
+        pendingAutoRestart = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Forget crash-loop history. Called on manual restarts and command edits,
+    /// so a deliberate user action always gets a fresh set of attempts.
+    private func resetAutoRestartPolicy() {
+        consecutiveRapidExitCount = 0
+        if isAutoRestartPaused {
+            isAutoRestartPaused = false
+        }
+    }
+
     private func finishProcessExit(status: Int32, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
 
@@ -2937,11 +3004,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             rawOutputStore.append(hideCursor)
             processor.ingestTestingData(hideCursor)
             if kind == .command, restartOnExit {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                    guard let self, self.shellProcess == nil else { return }
-                    self.clearScrollback(preservingTerminalState: false)
-                    self.startShell()
-                }
+                scheduleAutoRestartAfterExit()
             }
         } else {
             processor.appendPlainLines([

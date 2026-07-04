@@ -665,6 +665,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         inMemorySession.finish(exitCode: exitCode, runtimeMilliseconds: 0)
     }
 
+    /// Respawn the native (EXEC) child in place. ghostty only rebuilds a
+    /// surface when its configuration *changes*, and restarting the same
+    /// command produces an equivalent configuration — so force the rebuild.
+    /// Tearing down the old surface closes its PTY, which also terminates a
+    /// still-running child before the new one spawns.
+    func relaunchNativeSurface() {
+        guard Self.nativePTYEnabled, !isReleased, let session = proxy.session else { return }
+        terminalView.relaunchSurface(
+            configuration: Self.makeOptions(for: session, inMemorySession: inMemorySession)
+        )
+        scrollContainer?.synchronizeScrollState()
+    }
+
     func terminalDidClose(processAlive _: Bool) {
         proxy.session?.stop()
     }

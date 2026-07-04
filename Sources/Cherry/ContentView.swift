@@ -8852,9 +8852,13 @@ private struct CommandExitStatusBar: View {
         case .launching, .live:
             nil
         case .exited(let code):
-            code == 0
-                ? Status(text: "Command exited", isFailure: false)
-                : Status(text: "Command exited with code \(code)", isFailure: true)
+            if session.isAutoRestartPaused {
+                Status(text: "Keeps failing — auto-restart paused", isFailure: true)
+            } else if code == 0 {
+                Status(text: "Command exited", isFailure: false)
+            } else {
+                Status(text: "Command exited with code \(code)", isFailure: true)
+            }
         case .failed(let message):
             Status(text: "Launch failed: \(message)", isFailure: true)
         }

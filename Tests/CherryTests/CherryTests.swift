@@ -9238,6 +9238,29 @@ private func waitForSummaryCallCount(
     #expect(workspace.terminalDisplayItems == [.single(firstSession.id)])
 }
 
+@Test func commandAutoRestartPolicyEscalatesDelaysAndResetsOnHealthyRuns() {
+    // A healthy (or unknown-duration) run clears crash-loop history.
+    #expect(CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(previous: 3, runDuration: 60) == 0)
+    #expect(CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(previous: 3, runDuration: nil) == 0)
+    #expect(CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(previous: 0, runDuration: 0.1) == 1)
+
+    #expect(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: 0) == 0.35)
+    #expect(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: 1) == 1)
+    #expect(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: 2) == 2)
+    #expect(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: 3) == 5)
+    #expect(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: 4) == nil)
+}
+
+@Test func commandAutoRestartPolicyGivesUpAfterConsecutiveRapidExits() {
+    var count = 0
+    var delays: [TimeInterval?] = []
+    for _ in 0..<5 {
+        count = CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(previous: count, runDuration: 0.2)
+        delays.append(CommandAutoRestartPolicy.restartDelay(consecutiveRapidExits: count))
+    }
+    #expect(delays == [1, 2, 5, nil, nil])
+}
+
 @Test func commandEnvironmentExtractionParsesLeadingAssignments() {
     let extraction = ProjectCommandEnvironmentExtraction.extractLeadingAssignments(
         from: #"DEMO_DELAY_MIN_MS=250 DEMO_DELAY_MS=1200 DEMO_LABEL="slow path" uv run fastapi dev"#

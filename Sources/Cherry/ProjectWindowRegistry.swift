@@ -24,6 +24,25 @@ final class ProjectWindowRegistry {
         return !workspaces.isEmpty
     }
 
+    /// Live workspaces across every registered project window.
+    func allWorkspaces() -> [TerminalWorkspace] {
+        pruneStaleWindows()
+        return workspaces.values.compactMap(\.workspace)
+    }
+
+    /// Total sessions running a process across all windows — drives the quit
+    /// confirmation.
+    func runningProcessCount() -> Int {
+        allWorkspaces().reduce(0) { $0 + $1.sessionsWithRunningProcess().count }
+    }
+
+    /// Tear down every workspace's sessions (killing their processes). Used on
+    /// confirmed app quit, where the per-window `windowWillClose` teardown never
+    /// runs — otherwise a SIGHUP-ignoring server would outlive Cherry.
+    func closeAllWorkspaces() {
+        allWorkspaces().forEach { $0.closeAllSessions() }
+    }
+
     var projectRoots: [String] {
         pruneStaleWindows()
         return Array(workspaces.keys)
@@ -855,12 +874,15 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
             return previousWindowShouldClose(sender)
         }
 
-        let runningAgentCount = workspace.runningAgentSessions.count
-        guard runningAgentCount > 0 else {
+        // Confirm for ANY running process (agents, live commands, terminals
+        // executing a foreground program) — not just agents. (Product intent is to
+        // later narrow this back to running agents only.)
+        let runningCount = workspace.sessionsWithRunningProcess().count
+        guard runningCount > 0 else {
             return previousWindowShouldClose(sender)
         }
 
-        presentCloseAlert(for: sender, runningAgentCount: runningAgentCount)
+        presentCloseAlert(for: sender, runningProcessCount: runningCount)
         return false
     }
 
@@ -873,15 +895,15 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         previousDelegate?.windowWillClose?(notification)
     }
 
-    private func presentCloseAlert(for window: NSWindow, runningAgentCount: Int) {
+    private func presentCloseAlert(for window: NSWindow, runningProcessCount: Int) {
         guard !isPresentingCloseAlert else { return }
         isPresentingCloseAlert = true
 
         let alert = NSAlert()
         alert.messageText = "Close window?"
-        alert.informativeText = runningAgentCount == 1
-            ? "This window has a running agent. It will be stopped and removed."
-            : "This window has \(runningAgentCount) running agents. They will be stopped and removed."
+        alert.informativeText = runningProcessCount == 1
+            ? "This window has a running process. It will be stopped."
+            : "This window has \(runningProcessCount) running processes. They will be stopped."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Stop and close")
         alert.addButton(withTitle: "Cancel")

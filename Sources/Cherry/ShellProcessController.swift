@@ -405,6 +405,31 @@ final class ShellProcessController: @unchecked Sendable {
         return "\(directory)/\(processID).pid"
     }
 
+    /// Synchronous best-effort read of the PID the native-PTY shell self-reports
+    /// (the shell integration's `CHERRY_SHELL_PID_FILE` write). Used as the last
+    /// fallback anchor at teardown when the async startup capture hasn't landed —
+    /// e.g. a never-ending command like `tilt up` outran the poll — so Stop still
+    /// has a PID and doesn't leak the whole session.
+    static func readNativeShellPID(processID: String) -> pid_t? {
+        let path = shellPIDFilePath(processID: processID)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let pid = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0
+        else {
+            return nil
+        }
+        return pid
+    }
+
+    /// True if `shellPID` has at least one child process — i.e. the shell is
+    /// running a foreground/background program rather than idling at its prompt.
+    /// The kernel-truth "is a command running" check for a plain terminal pane;
+    /// works under native-PTY where the host holds no PTY fd to `tcgetpgrp`.
+    static func shellHasChildProcess(shellPID: pid_t) -> Bool {
+        guard shellPID > 1 else { return false }
+        return enumerateProcesses().contains { $0.parentPID == shellPID }
+    }
+
     /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
     /// a libghostty-spawned shell matches the host-managed forkpty launch.
     ///
@@ -705,31 +730,119 @@ final class ShellProcessController: @unchecked Sendable {
         return ProbeProcessResult(exitCode: exitCode, output: output)
     }
 
-    /// Terminate the native-PTY (ghostty EXEC) shell by PID. The host owns no
-    /// PTY fd in that mode, so signal the shell and its process group directly
-    /// with the same HUP → TERM → KILL escalation the forkpty path uses.
-    static func terminateNativeShell(processID: pid_t) {
-        guard processID > 1 else { return }
-        var groupIDs: Set<pid_t> = [processID]
-        let processGroupID = getpgid(processID)
-        if processGroupID > 1 {
-            groupIDs.insert(processGroupID)
-        }
-        groupIDs.remove(getpgrp())
+    /// Terminate the entire native-PTY (ghostty EXEC) session anchored at
+    /// `anchorPID` — the shell plus every transitive descendant and everything
+    /// sharing its controlling terminal — with a HUP → TERM → KILL escalation.
+    ///
+    /// ghostty owns the PTY and exposes no child PID, and its two weaker signals
+    /// both miss a self-backgrounding server: `freeSurface` closes the PTY, which
+    /// only SIGHUPs the *foreground* process group (a Go server like `tilt up`
+    /// handles/ignores SIGHUP), and the old shell-only kill hit just the shell's
+    /// process group — which such a server has already left via `setpgid` into its
+    /// own group. Killing the whole session catches it, so agents, terminals, and
+    /// commands tear down uniformly instead of leaking a process that keeps holding
+    /// its ports.
+    static func terminateNativeShellSession(anchorPID: pid_t) {
+        guard anchorPID > 1 else { return }
+        let ownPID = getpid()
+        let ownSessionID = getsid(0)
 
-        func signalAll(_ signal: Int32) {
-            for groupID in groupIDs {
-                _ = Darwin.kill(-groupID, signal)
-            }
-            _ = Darwin.kill(processID, signal)
-        }
+        // Snapshot the session once while the PTY is still intact so a child that
+        // later reparents (to launchd) or loses its tty stays on the kill list.
+        let initialMembers = nativeSessionMembers(
+            anchorPID: anchorPID, excludingPID: ownPID, excludingSessionID: ownSessionID
+        )
+        guard !initialMembers.isEmpty else { return }
 
-        signalAll(SIGHUP)
+        // HUP → TERM → KILL, re-enumerating each stage (unioned with the initial
+        // snapshot) so late-forked children are caught too. Only Sendable values
+        // (pid sets / ids) cross the async boundary.
+        signalNativeSession(
+            base: initialMembers, anchorPID: anchorPID,
+            excludingPID: ownPID, excludingSessionID: ownSessionID, signal: SIGHUP
+        )
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(100)) {
-            signalAll(SIGTERM)
+            signalNativeSession(
+                base: initialMembers, anchorPID: anchorPID,
+                excludingPID: ownPID, excludingSessionID: ownSessionID, signal: SIGTERM
+            )
         }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(700)) {
-            signalAll(SIGKILL)
+            signalNativeSession(
+                base: initialMembers, anchorPID: anchorPID,
+                excludingPID: ownPID, excludingSessionID: ownSessionID, signal: SIGKILL
+            )
+        }
+    }
+
+    private static func signalNativeSession(
+        base: Set<pid_t>, anchorPID: pid_t, excludingPID: pid_t, excludingSessionID: pid_t, signal: Int32
+    ) {
+        let members = base.union(
+            nativeSessionMembers(anchorPID: anchorPID, excludingPID: excludingPID, excludingSessionID: excludingSessionID)
+        )
+        for pid in members {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    /// The anchor's session: the anchor, its transitive descendants, and every
+    /// process on its controlling tty. Never includes `excludingPID` (ourselves)
+    /// or anything in `excludingSessionID` (Cherry's own session) — the EXEC shell
+    /// lives in its own `login`-created session, distinct from the GUI app's, so
+    /// real members are never dropped.
+    private static func nativeSessionMembers(
+        anchorPID: pid_t, excludingPID: pid_t, excludingSessionID: pid_t
+    ) -> Set<pid_t> {
+        let snapshot = enumerateProcesses()
+        guard let anchor = snapshot.first(where: { $0.pid == anchorPID }) else { return [] }
+        var childrenByParent: [pid_t: [pid_t]] = [:]
+        for proc in snapshot {
+            childrenByParent[proc.parentPID, default: []].append(proc.pid)
+        }
+        var members: Set<pid_t> = [anchorPID]
+        var stack: [pid_t] = [anchorPID]
+        while let current = stack.popLast() {
+            for child in childrenByParent[current] ?? [] where members.insert(child).inserted {
+                stack.append(child)
+            }
+        }
+        if anchor.controllingTTY != -1 {
+            for proc in snapshot where proc.controllingTTY == anchor.controllingTTY {
+                members.insert(proc.pid)
+            }
+        }
+        return members.filter { $0 > 1 && $0 != excludingPID && getsid($0) != excludingSessionID }
+    }
+
+    private struct ProcessSnapshotEntry {
+        let pid: pid_t
+        let parentPID: pid_t
+        let controllingTTY: dev_t
+    }
+
+    /// One-shot snapshot of every process (pid, ppid, controlling tty) via
+    /// `sysctl(KERN_PROC_ALL)`. Empty on failure.
+    private static func enumerateProcesses() -> [ProcessSnapshotEntry] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        var byteCount = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &byteCount, nil, 0) == 0, byteCount > 0 else {
+            return []
+        }
+        // Over-allocate: the table can grow between the sizing and fetching calls.
+        let stride = MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: byteCount / stride + 16)
+        var fetchedBytes = procs.count * stride
+        let result = procs.withUnsafeMutableBytes { buffer in
+            sysctl(&mib, u_int(mib.count), buffer.baseAddress, &fetchedBytes, nil, 0)
+        }
+        guard result == 0 else { return [] }
+        return procs.prefix(fetchedBytes / stride).map { info in
+            ProcessSnapshotEntry(
+                pid: info.kp_proc.p_pid,
+                parentPID: info.kp_eproc.e_ppid,
+                controllingTTY: info.kp_eproc.e_tdev
+            )
         }
     }
 

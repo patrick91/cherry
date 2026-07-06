@@ -1063,6 +1063,14 @@ final class TerminalWorkspace: ObservableObject {
         agentSessions.filter(\.isRunning)
     }
 
+    /// Sessions currently running a process across every kind — broader than
+    /// `runningAgentSessions` (adds live commands and terminals executing a
+    /// foreground program). A method, not a computed var: for terminals it probes
+    /// the process table, so it must never be read from a SwiftUI body.
+    func sessionsWithRunningProcess() -> [TerminalSession] {
+        sessions.filter { $0.hasRunningProcess() }
+    }
+
     var rootAgentSessions: [TerminalSession] {
         agentSessions.filter { session in
             guard let parentAgentID = session.parentAgentID else { return true }
@@ -2401,6 +2409,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeLaunchID != nil
     }
 
+    /// Whether closing this session would tear down a live program the user might
+    /// care about — drives the close/quit confirmation. A command or agent pane IS
+    /// its process, so any live one counts. A plain terminal only counts when its
+    /// shell is actually running a child program (not sitting idle at the prompt),
+    /// mirroring how ghostty and other terminals decide whether to confirm.
+    ///
+    /// Product intent is to eventually narrow this back to running agents only; at
+    /// that point the body becomes `kind == .agent && isRunning`.
+    func hasRunningProcess() -> Bool {
+        guard isRunning else { return false }
+        switch kind {
+        case .command, .agent:
+            return true
+        case .terminal:
+            guard let shellPID = childProcessID
+                ?? ShellProcessController.readNativeShellPID(processID: id.uuidString)
+            else {
+                return false
+            }
+            return ShellProcessController.shellHasChildProcess(shellPID: shellPID)
+        }
+    }
+
     var restartPolicy: String? {
         guard kind == .command else { return nil }
         return restartOnExit ? "auto_restart" : "manual"
@@ -2673,12 +2704,19 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         updateShellOutputPauseState()
         hostInputWriter.set(nil)
-        if GhosttySessionBridge.nativePTYEnabled, let nativePID = childProcessID {
+        if GhosttySessionBridge.nativePTYEnabled {
             // Native-PTY: ghostty owns the PTY and there is no shellProcess to
-            // terminate, so signal the shell (and its process group) directly —
-            // otherwise Stop leaves the command running invisibly, still
-            // holding its ports.
-            ShellProcessController.terminateNativeShell(processID: nativePID)
+            // terminate, so signal the shell directly — otherwise Stop leaves the
+            // command running invisibly, still holding its ports. The async startup
+            // capture can miss the PID (a never-ending command like `tilt up`
+            // outruns the poll), so read the PID file one last time synchronously
+            // rather than skip teardown. Kill the WHOLE session: a server that
+            // ignores SIGHUP and moved into its own process group survives both
+            // ghostty's PTY-close SIGHUP and a shell-only kill.
+            if let anchorPID = childProcessID
+                ?? ShellProcessController.readNativeShellPID(processID: id.uuidString) {
+                ShellProcessController.terminateNativeShellSession(anchorPID: anchorPID)
+            }
         }
         shellProcess?.terminate()
         shellProcess = nil
@@ -3312,11 +3350,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func captureNativeShellPID() {
         guard GhosttySessionBridge.nativePTYEnabled else { return }
         let launchID = activeLaunchID
-        let path = ShellProcessController.shellPIDFilePath(processID: id.uuidString)
         func poll(_ attempt: Int) {
             guard activeLaunchID == launchID else { return } // session relaunched/exited
-            if let raw = try? String(contentsOfFile: path, encoding: .utf8),
-               let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+            if let pid = ShellProcessController.readNativeShellPID(processID: id.uuidString) {
                 childProcessID = pid
                 bumpRevision()
                 return

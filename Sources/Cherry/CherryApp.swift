@@ -53,9 +53,18 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         guard !isQuitConfirmed else { return .terminateNow }
 
+        let runningCount = MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.runningProcessCount()
+        }
+        // Nothing running: quit immediately. Idle shells exit on the SIGHUP they
+        // receive when Cherry dies, so there's nothing to confirm — like ghostty.
+        guard runningCount > 0 else { return .terminateNow }
+
         let alert = NSAlert()
         alert.messageText = "Quit Cherry?"
-        alert.informativeText = "Active terminal sessions will be closed."
+        alert.informativeText = runningCount == 1
+            ? "1 running process will be stopped."
+            : "\(runningCount) running processes will be stopped."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
@@ -64,15 +73,27 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         if let window {
             alert.beginSheetModal(for: window) { [weak self] response in
                 guard response == .alertFirstButtonReturn else { return }
-                self?.isQuitConfirmed = true
-                sender.terminate(nil)
+                self?.confirmQuit()
             }
         } else if alert.runModal() == .alertFirstButtonReturn {
-            isQuitConfirmed = true
-            return .terminateNow
+            confirmQuit()
         }
 
         return .terminateCancel
+    }
+
+    /// Tear down every window's running sessions (their processes), then quit once
+    /// the HUP → TERM → KILL escalation has had time to land — app termination
+    /// skips the per-window `windowWillClose` teardown, so without this a
+    /// SIGHUP-ignoring server like `tilt up` would outlive Cherry.
+    private func confirmQuit() {
+        isQuitConfirmed = true
+        MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.closeAllWorkspaces()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(900)) {
+            NSApp.terminate(nil)
+        }
     }
 
     private func scheduleDefaultWindowOpenIfNeeded() {

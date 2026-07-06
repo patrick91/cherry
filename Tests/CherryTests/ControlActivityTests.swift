@@ -196,6 +196,53 @@ struct ControlActivityTests {
         #expect(waited.agentActivityState == "working")
     }
 
+    // Agents with no recognizable composer prompt or working footer (amp, bare REPLs,
+    // unrecognized tools) used to stay pinned to "working" forever once they emitted
+    // any output. The quiet-window recheck now settles them to idle so the sidebar /
+    // menu bar report the truth. See the recheckAgentActivityAfterQuiet fallback.
+    @Test func unrecognizedAgentSettlesToIdleAfterQuietWindow() async throws {
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "customrepl", command: "/bin/cat"))
+        harness.server.start()
+
+        let session = try await harness.spawnAgentSession(named: "customrepl")
+        // Plain output with no prompt glyph, no "esc to interrupt", no title spinner.
+        session.ingestTestingData(Data("building module graph...\n".utf8))
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentActivityEvidenceIsStrong == false)
+
+        // The recheck fires one quiet window (4s) after the last content change; wait
+        // past it with margin, then the weak-evidence fallback should mark it idle.
+        try await Task.sleep(for: .milliseconds(4_600))
+        #expect(session.agentActivityState == .idle)
+        #expect(session.agentActivityEvidenceIsStrong == false)
+    }
+
+    // The quiet-window fallback must not override a genuinely working agent: Claude's
+    // "esc to interrupt" footer persists on screen through the whole turn, so a quiet
+    // stretch (slow tool call, no new output) must stay "working".
+    @Test func persistentWorkingMarkerSurvivesQuietWindow() async throws {
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
+        harness.server.start()
+
+        let session = try await harness.spawnAgentSession(named: "Claude")
+        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(session.agentActivityState == .working)
+
+        // Past the quiet window the marker is still on screen, so it stays working.
+        try await Task.sleep(for: .milliseconds(4_600))
+        #expect(session.agentActivityState == .working)
+    }
+
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
         let continuationTail = Data([0x9F, 0x92, 0x96]) + Data("hello\n".utf8)
         let trimmedContinuation = CherryControlServer.trimmedRawOutputSuffix(continuationTail)

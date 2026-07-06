@@ -2158,6 +2158,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         case summary
         case outputActivity
         case inputSubmit
+        // Idle inferred purely from a quiet content window (no prompt/marker/spinner
+        // to key off) — weak evidence, so fresh output flips straight back to working.
+        case quietWindow
         case promptMarker
         case workingMarker
         case titleSpinner
@@ -3494,7 +3497,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         switch agentActivitySource {
         case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit:
             true
-        case .none, .summary, .outputActivity, .inputSubmit:
+        case .none, .summary, .outputActivity, .inputSubmit, .quietWindow:
             false
         }
     }
@@ -3588,7 +3591,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         switch agentActivitySource {
         case .promptMarker, .notification, .processExit:
             return true
-        case .none, .summary, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner:
+        case .none, .summary, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner, .quietWindow:
             return false
         }
     }
@@ -3663,23 +3666,42 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         guard kind == .agent, agentActivityState == .working else { return }
         guard agentActivitySource != .processExit else { return }
+        // A live working marker or a still-pulsing title spinner outranks quiet.
         guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
 
+        // Prefer a recognized composer prompt — the strongest idle signal. Ignore the
+        // human-input floor so a settled prompt is still found below the last typed line.
         let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return }
-        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
-        let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let scanLines = processor.snapshot(range: scanStart..<lineCount)
-        let promptLines = agentPromptWindowLines(
-            scanStart: scanStart,
-            scanLines: scanLines,
-            applyInputFloor: false
-        )
-        let promptVisible = promptLines.contains { line in
-            Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
-        } || Self.outputContainsAgentInputMarker(scanLines, normalizedAgentName: normalizedAgentName)
-        guard promptVisible else { return }
-        setAgentActivityState(.idle, source: .promptMarker)
+        if lineCount > 0 {
+            let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+            let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+            let scanLines = contentSnapshot(range: scanStart..<lineCount)
+            let promptLines = agentPromptWindowLines(
+                scanStart: scanStart,
+                scanLines: scanLines,
+                applyInputFloor: false
+            )
+            let promptVisible = promptLines.contains { line in
+                Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
+            } || Self.outputContainsAgentInputMarker(scanLines, normalizedAgentName: normalizedAgentName)
+            if promptVisible {
+                setAgentActivityState(.idle, source: .promptMarker)
+                return
+            }
+        }
+
+        // No prompt/working UI to key off (amp, bare REPLs, unrecognized agents): the
+        // turn's strong evidence has gone stale and the content has been quiet for the
+        // recheck window, so settle to idle. Mirrors the content-quiet fallback the MCP
+        // wait_for_process_idle loop already applies, lifted into the live UI state so the
+        // sidebar/menu bar stop showing a permanent "working" spinner for these agents.
+        guard hasBeenContentQuiet(for: Self.agentIdleRecheckQuietInterval) else { return }
+        setAgentActivityState(.idle, source: .quietWindow)
+    }
+
+    private func hasBeenContentQuiet(for interval: TimeInterval) -> Bool {
+        guard let lastContentChangeAt else { return true }
+        return Date().timeIntervalSince(lastContentChangeAt) >= interval
     }
 
     // TUIs that park the cursor on the bottom screen row materialize dozens of

@@ -149,6 +149,7 @@ struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var agentSettings = AgentSettings.shared
+    @StateObject private var menuBarAgents = MenuBarAgentsModel()
     @State private var controlServer: CherryControlServer?
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
@@ -366,6 +367,13 @@ struct CherryApp: App {
                 }
             }
         }
+
+        MenuBarExtra {
+            MenuBarAgentsPanel(model: menuBarAgents)
+        } label: {
+            MenuBarStatusLabel(model: menuBarAgents)
+        }
+        .menuBarExtraStyle(.window)
 
         Settings {
             SettingsView()

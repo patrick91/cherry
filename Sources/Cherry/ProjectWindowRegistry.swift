@@ -43,6 +43,28 @@ final class ProjectWindowRegistry {
         allWorkspaces().forEach { $0.closeAllSessions() }
     }
 
+    /// Live workspaces paired with the project-root key they're registered under —
+    /// the key the reveal/focus helpers expect. Used to aggregate agents across
+    /// every window (e.g. the menu-bar agent list).
+    func workspacesByProjectRoot() -> [(projectRoot: String, workspace: TerminalWorkspace)] {
+        pruneStaleWindows()
+        return workspaces.compactMap { key, weak in
+            weak.workspace.map { (projectRoot: key, workspace: $0) }
+        }
+    }
+
+    /// Bring a specific session to the foreground: focus its project window,
+    /// select the session, and switch that window to the terminal view. Used by
+    /// the menu-bar agent list's click-to-focus.
+    func revealSession(id sessionID: UUID, projectRoot: String) {
+        guard focus(projectRoot: projectRoot),
+              let workspace = workspaces[projectRoot]?.workspace,
+              let session = workspace.sessions.first(where: { $0.id == sessionID })
+        else { return }
+        workspace.select(session)
+        chromeStates[projectRoot]?.chromeState?.selectTerminal()
+    }
+
     var projectRoots: [String] {
         pruneStaleWindows()
         return Array(workspaces.keys)

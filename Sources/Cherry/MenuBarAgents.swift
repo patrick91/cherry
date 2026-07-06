@@ -108,7 +108,10 @@ final class MenuBarAgentsModel: ObservableObject {
             ))
         }
         groups.sort { $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending }
+        apply(groups: groups)
+    }
 
+    private func apply(groups: [MenuBarProjectGroup]) {
         let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items))
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
@@ -185,10 +188,6 @@ struct MenuBarAgentsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
-
-            Divider()
-
             if model.groups.isEmpty {
                 Text("No active agents")
                     .font(.system(size: 13))
@@ -212,35 +211,17 @@ struct MenuBarAgentsPanel: View {
         .frame(width: 300)
     }
 
-    private var header: some View {
-        HStack(spacing: 6) {
-            Text("Agents")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer(minLength: 8)
-            if !summary.isEmpty {
-                Text(summary)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 11)
-        .padding(.bottom, 9)
-    }
-
     private var agentList: some View {
         // The project header is always shown, even for a single project, so it's
         // always clear which window an agent belongs to.
         VStack(alignment: .leading, spacing: 1) {
             ForEach(model.groups) { group in
-                Text(group.projectName)
-                    .font(.system(size: 11, weight: .semibold))
-                    .tracking(0.5)
-                    .textCase(.uppercase)
+                Text(Self.projectTitle(group.projectName))
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 16)
-                    .padding(.top, 9)
-                    .padding(.bottom, 3)
+                    .padding(.top, 12)
+                    .padding(.bottom, 4)
                 ForEach(group.items) { item in
                     MenuBarAgentRow(item: item) { model.reveal(item) }
                 }
@@ -268,18 +249,11 @@ struct MenuBarAgentsPanel: View {
         .padding(.bottom, 6)
     }
 
-    private var summary: String {
-        let items = model.groups.flatMap(\.items)
-        guard !items.isEmpty else { return "" }
-        let permission = items.filter { $0.activity == .permission }.count
-        let working = items.filter { $0.activity == .working }.count
-        if permission > 0 {
-            return permission == 1 ? "1 needs input" : "\(permission) need input"
-        }
-        if working > 0 {
-            return "\(working) working"
-        }
-        return items.count == 1 ? "1 idle" : "\(items.count) idle"
+    // Project folder names are usually lowercase; show them sentence-cased (no
+    // all-caps) so the section header reads like a native grouped menu.
+    private static func projectTitle(_ name: String) -> String {
+        guard let first = name.first else { return name }
+        return first.uppercased() + name.dropFirst()
     }
 }
 
@@ -290,23 +264,25 @@ private struct MenuBarAgentRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 9) {
+            HStack(spacing: 8) {
                 MenuBarAgentGlyph(agentKey: item.agentKey)
-                    .frame(width: 16, height: 16)
+                    .frame(width: 14, height: 14)
                 Text(item.title.isEmpty ? "Agent" : item.title)
                     .font(.system(size: 13))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 8)
-                Circle()
-                    .fill(item.activity.menuBarColor)
-                    .frame(width: 7, height: 7)
-                Text(item.activity.menuBarLabel)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 7) {
+                    Text(item.activity.menuBarLabel)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Circle()
+                        .fill(item.activity.menuBarColor)
+                        .frame(width: 7, height: 7)
+                }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .background(MenuBarRowHighlight(isActive: isHovering))
@@ -332,7 +308,7 @@ private struct MenuBarAgentGlyph: View {
                 .foregroundStyle(Color.primary.opacity(0.85))
         } else {
             Image(systemName: "terminal")
-                .font(.system(size: 12))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
     }
@@ -350,8 +326,11 @@ private struct MenuBarAgentGlyph: View {
     @MainActor private static var cache: [String: NSImage?] = [:]
     @MainActor private static func logo(named name: String) -> NSImage? {
         if let cached = cache[name] { return cached }
-        let image = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "AgentLogos")
-            .flatMap { NSImage(contentsOf: $0) }
+        // `.process` flattens the resource tree, so the SVGs live at the bundle root,
+        // not under AgentLogos/ — try the subdirectory first, then the flattened path.
+        let url = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "AgentLogos")
+            ?? Bundle.module.url(forResource: name, withExtension: "svg")
+        let image = url.flatMap { NSImage(contentsOf: $0) }
         cache[name] = image
         return image
     }

@@ -453,6 +453,41 @@ private struct ProjectWindowView: View {
     }
 }
 
+/// Observes the currently selected session and keeps the AppKit window title in
+/// sync as "<project> — <selected tab>". @ObservedObject so a live title change
+/// (e.g. an agent renaming its tab) updates the window title while the tab stays
+/// selected; the parent re-passes a new `session` when the selection changes.
+private struct WindowTitleBinder: View {
+    let projectName: String
+    @ObservedObject var session: TerminalSession
+
+    var body: some View {
+        WindowTitleWriter(title: windowTitle)
+    }
+
+    private var windowTitle: String {
+        let tab = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return tab.isEmpty ? projectName : "\(projectName) — \(tab)"
+    }
+}
+
+/// Writes a string to the enclosing window's `title`. The titlebar text is hidden
+/// (custom chrome), but the title still drives the Window menu, Mission Control,
+/// and the app switcher. Reactive: a changed `title` re-runs `updateNSView`.
+private struct WindowTitleWriter: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let title = title
+        DispatchQueue.main.async {
+            guard let window = nsView.window, window.title != title else { return }
+            window.title = title
+        }
+    }
+}
+
 private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
@@ -467,6 +502,14 @@ private struct ProjectWorkspaceView: View {
         _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(projectRoot: projectRoot))
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
+    }
+
+    /// Folder name of the project, or "Cherry" for a project-less window.
+    private var projectName: String {
+        workspace.projectRoot
+            .map { URL(fileURLWithPath: $0, isDirectory: true).lastPathComponent }
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "Cherry"
     }
 
     var body: some View {
@@ -489,6 +532,13 @@ private struct ProjectWorkspaceView: View {
             todoStore: todoStore,
             chromeState: chromeState
         ))
+        .background {
+            if let session = workspace.selectedSession {
+                WindowTitleBinder(projectName: projectName, session: session)
+            } else {
+                WindowTitleWriter(title: projectName)
+            }
+        }
         .focusedValue(\.terminalWorkspace, workspace)
         .focusedValue(\.projectWindowChromeState, chromeState)
         .onAppear {

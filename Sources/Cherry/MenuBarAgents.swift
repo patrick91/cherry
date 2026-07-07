@@ -32,17 +32,6 @@ enum MenuBarAggregateState: Equatable {
         }
     }
 
-    // Distinct from the pink brandmark so the badge stays legible on top of it
-    // (a pink "working" dot on the pink icon would vanish).
-    var badgeColor: Color? {
-        switch self {
-        case .none: nil
-        case .idle: Color(nsColor: .systemGreen)
-        case .working: Color(nsColor: .systemBlue)
-        case .attention: Color(nsColor: .systemOrange)
-        case .error: Color(nsColor: .systemRed)
-        }
-    }
 }
 
 struct MenuBarAgentItem: Equatable, Identifiable {
@@ -150,29 +139,37 @@ extension AgentActivityState {
 
 struct MenuBarStatusLabel: View {
     @ObservedObject var model: MenuBarAgentsModel
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            MenuBarBrandIcon()
-            if let color = model.aggregate.badgeColor {
-                Circle()
-                    .fill(color)
-                    .frame(width: 5, height: 5)
-                    .offset(x: 1.5, y: -1.5)
-            }
-        }
-        .frame(width: 20, height: 18, alignment: .center)
-        .accessibilityLabel("Cherry agents")
+        Image(nsImage: Self.icon(paletteColors: Self.paletteColors(for: model.aggregate, dark: colorScheme == .dark)))
+            .accessibilityLabel("Cherry agents")
     }
-}
 
-private struct MenuBarBrandIcon: View {
-    // The Cherry layered-stack motif as a monochrome template glyph. macOS tints it
-    // to the menu-bar foreground — white on dark bars, black on light — so it reads
-    // like the system icons beside it instead of a colored tile.
-    var body: some View {
-        Image(systemName: "square.stack.3d.up.fill")
-            .font(.system(size: 15, weight: .regular))
+    // The state is carried by the glyph itself: idle / no-agents stay monochrome,
+    // working tints just the top layer blue, and needs-input / error tint the whole
+    // glyph orange / red. Every state renders through the same symbol image (mono
+    // states just pass a single glyph color) so the icon never changes size between
+    // states. MenuBarExtra flattens a colored SwiftUI label to a template, so the
+    // image is baked non-template; the glyph color follows the current appearance.
+    private static func paletteColors(for state: MenuBarAggregateState, dark: Bool) -> [NSColor] {
+        let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
+        switch state {
+        case .none, .idle: return [glyph]
+        case .working: return [.systemBlue, glyph]
+        case .attention: return [.systemOrange]
+        case .error: return [.systemRed]
+        }
+    }
+
+    @MainActor
+    private static func icon(paletteColors: [NSColor]) -> NSImage {
+        let base = NSImage(systemSymbolName: "square.stack.3d.up.fill", accessibilityDescription: nil) ?? NSImage()
+        let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: paletteColors))
+        let image = base.withSymbolConfiguration(configuration) ?? base
+        image.isTemplate = false
+        return image
     }
 }
 

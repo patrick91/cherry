@@ -51,6 +51,62 @@ struct MenuBarProjectGroup: Equatable, Identifiable {
 
 // MARK: - Model
 
+/// Drives the working-state breath of the menu-bar glyph: a slow fade of the top
+/// layer between the full glyph color and a dim gray.
+///
+/// Two hard-won constraints shape this:
+/// - It must NOT be a `TimelineView` in the `MenuBarExtra` label: that livelocks
+///   SwiftUI's status-item update loop at launch (requestUpdate → setImage →
+///   requestUpdate never drains) and the app never finishes launching.
+/// - It must NOT publish through `MenuBarAgentsModel`: `CherryApp` holds that model
+///   as `@StateObject`, so every publish re-evaluates the entire App body and the
+///   dropdown panel — at pulse rate that costs ~11% CPU. A separate object observed
+///   only by the status label keeps each tick's invalidation to the tiny label view.
+///
+/// One timer tick per step: quantizing the breath into a fixed alpha table keeps the
+/// tick rate low and gives every frame a stable alpha, so the label can reuse a small
+/// set of cached NSImages instead of baking a fresh symbol image per frame.
+@MainActor
+final class MenuBarPulseModel: ObservableObject {
+    static let shared = MenuBarPulseModel()
+
+    @Published private(set) var alpha: CGFloat = 1.0
+
+    private var timer: Timer?
+    private var step = 0
+    // A 4s breath at 4 ticks/s: every status-item update costs real main-thread time
+    // (label snapshot → setImage → length adjust, ~1% CPU per tick/s), so the rate is
+    // as low as the fade stays smooth. The range tops out at 0.9 so working never
+    // momentarily reads as idle at the peak of the breath.
+    private static let period: TimeInterval = 4.0
+    private static let steps = 16
+    private static let alphas: [CGFloat] = (0..<steps).map {
+        0.65 + 0.25 * sin(CGFloat($0) / CGFloat(steps) * 2 * .pi)
+    }
+
+    func setActive(_ active: Bool) {
+        if active, timer == nil {
+            let timer = Timer(timeInterval: Self.period / Double(Self.steps), repeats: true) { [weak self] timer in
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                MainActor.assumeIsolated {
+                    self.step = (self.step + 1) % Self.steps
+                    self.alpha = Self.alphas[self.step]
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
+        } else if !active, let timer {
+            timer.invalidate()
+            self.timer = nil
+            step = 0
+            alpha = 1.0
+        }
+    }
+}
+
 @MainActor
 final class MenuBarAgentsModel: ObservableObject {
     @Published private(set) var groups: [MenuBarProjectGroup] = []
@@ -104,6 +160,7 @@ final class MenuBarAgentsModel: ObservableObject {
         let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items))
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
+        MenuBarPulseModel.shared.setActive(aggregate == .working)
     }
 
     func reveal(_ item: MenuBarAgentItem) {
@@ -139,24 +196,40 @@ extension AgentActivityState {
 
 struct MenuBarStatusLabel: View {
     @ObservedObject var model: MenuBarAgentsModel
+    @ObservedObject private var pulse = MenuBarPulseModel.shared
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        Image(nsImage: Self.icon(paletteColors: Self.paletteColors(for: model.aggregate, dark: colorScheme == .dark)))
+        Image(nsImage: Self.cachedIcon(for: model.aggregate, dark: colorScheme == .dark, pulseAlpha: pulse.alpha))
             .accessibilityLabel("Cherry agents")
     }
 
+    // Reuse one NSImage per (state, appearance, pulse step): the pulse revisits the
+    // same alpha table every cycle, and handing AppKit the same instance lets its
+    // symbol rasterization cache hit instead of re-rendering a fresh image per frame.
+    @MainActor private static var iconCache: [String: NSImage] = [:]
+
+    @MainActor
+    private static func cachedIcon(for state: MenuBarAggregateState, dark: Bool, pulseAlpha: CGFloat) -> NSImage {
+        let key = "\(state)|\(dark)|\(Int((pulseAlpha * 1000).rounded()))"
+        if let cached = iconCache[key] { return cached }
+        let image = icon(paletteColors: paletteColors(for: state, dark: dark, pulseAlpha: pulseAlpha))
+        iconCache[key] = image
+        return image
+    }
+
     // The state is carried by the glyph itself: idle / no-agents stay monochrome,
-    // working tints just the top layer blue, and needs-input / error tint the whole
-    // glyph orange / red. Every state renders through the same symbol image (mono
-    // states just pass a single glyph color) so the icon never changes size between
-    // states. MenuBarExtra flattens a colored SwiftUI label to a template, so the
-    // image is baked non-template; the glyph color follows the current appearance.
-    private static func paletteColors(for state: MenuBarAggregateState, dark: Bool) -> [NSColor] {
+    // working breathes the top layer between the glyph color and a dim gray, and
+    // needs-input / error tint the whole glyph orange / red. Every state renders
+    // through the same symbol image (mono states just pass a single glyph color) so
+    // the icon never changes size between states. MenuBarExtra flattens a colored
+    // SwiftUI label to a template, so the image is baked non-template; the glyph
+    // color follows the current appearance.
+    private static func paletteColors(for state: MenuBarAggregateState, dark: Bool, pulseAlpha: CGFloat) -> [NSColor] {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         switch state {
         case .none, .idle: return [glyph]
-        case .working: return [.systemBlue, glyph]
+        case .working: return [glyph.withAlphaComponent(pulseAlpha), glyph]
         case .attention: return [.systemOrange]
         case .error: return [.systemRed]
         }

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en" class="antialiased">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cherry</title>
+  <script src="https://unpkg.com/@tailwindcss/browser@4"></script>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: #000;
+      font-family: -apple-system, system-ui, "SF Pro Text", "Helvetica Neue", sans-serif;
+    }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, "Cascadia Code", monospace; }
+    .blink { animation: blink 1.1s steps(1) infinite; }
+    @keyframes blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <!-- ===================== macOS menu bar ===================== -->
+  <div class="flex h-7 items-center gap-x-5 bg-black px-4 text-[13px] text-white/95 select-none">
+    <span class="text-[15px] leading-none"></span>
+    <span class="font-semibold">Cherry</span>
+    <span>File</span>
+    <span>Edit</span>
+    <span>View</span>
+    <span>Prototype</span>
+    <span>Agents</span>
+    <span>Window</span>
+    <span>Help</span>
+  </div>
+
+  <!-- ===================== Window ===================== -->
+  <div class="flex h-[calc(100vh-1.75rem)] overflow-hidden rounded-t-[10px]">
+
+    <!-- ---------- Sidebar ---------- -->
+    <aside class="flex w-[288px] shrink-0 flex-col bg-[#2a1f24] text-white">
+      <!-- Title bar row: traffic lights + project name -->
+      <div class="flex items-center gap-x-2 px-5 pt-5 pb-1">
+        <span class="size-3.5 rounded-full bg-[#ff5f57]"></span>
+        <span class="size-3.5 rounded-full bg-[#febc2e]"></span>
+        <span class="size-3.5 rounded-full bg-[#28c840]"></span>
+        <span class="ml-4 text-[15px] font-semibold tracking-tight text-white">cherry</span>
+      </div>
+
+      <div class="mt-6 px-3">
+        <!-- AGENTS -->
+        <div class="flex items-center gap-x-2 px-2 text-[12px] font-semibold tracking-wide text-[#9c8d88]">
+          <span class="uppercase">Agents</span>
+          <span class="ml-auto tabular-nums">1</span>
+          <span class="text-[15px] leading-none text-[#b3a39d]">+</span>
+          <svg viewBox="0 0 16 16" class="size-3 fill-[#b3a39d]" aria-hidden="true"><path d="M4 6l4 4 4-4z" /></svg>
+        </div>
+
+        <!-- Claude (selected) -->
+        <div class="mt-2 flex items-center gap-x-3 rounded-[10px] bg-[#6b54a3] px-3 py-2.5 ring-1 ring-inset ring-white/10">
+          <svg viewBox="0 0 24 24" class="size-[18px] shrink-0" aria-hidden="true">
+            <g fill="#ffffff">
+              <path transform="rotate(0 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(30 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(60 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(90 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(120 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(150 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(180 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(210 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(240 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(270 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(300 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+              <path transform="rotate(330 12 12)" d="M12 2 L12.8 10.6 L11.2 10.6 Z" />
+            </g>
+          </svg>
+          <div class="min-w-0 flex-1">
+            <p class="text-[14px] font-medium text-white">Claude</p>
+            <p class="mono truncate text-[12px] text-white/70">removed hero and cursor animatio…</p>
+          </div>
+          <span class="mono shrink-0 text-[12px] text-white/80">⌘1</span>
+        </div>
+
+        <!-- TERMINALS -->
+        <div class="mt-6 flex items-center gap-x-2 px-2 text-[12px] font-semibold tracking-wide text-[#9c8d88]">
+          <span class="uppercase">Terminals</span>
+          <span class="ml-auto tabular-nums">1</span>
+        </div>
+
+        <div class="mt-1 flex items-center gap-x-3 rounded-[10px] px-3 py-2.5">
+          <div class="min-w-0 flex-1">
+            <p class="text-[14px] text-white/90">cherry</p>
+            <p class="flex items-center gap-x-1.5 text-[12px] text-[#9c8d88]">
+              <svg viewBox="0 0 16 16" class="size-3.5 shrink-0 fill-[#9c8d88]" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z" /></svg>
+              <span class="mono">patrick91/cherry</span>
+            </p>
+          </div>
+          <span class="mono shrink-0 text-[12px] text-[#9c8d88]">⌘2</span>
+        </div>
+
+        <!-- COMMANDS -->
+        <div class="mt-6 flex items-center gap-x-2 px-2 text-[12px] font-semibold tracking-wide text-[#9c8d88]">
+          <span class="uppercase">Commands</span>
+          <span class="ml-auto tabular-nums">0</span>
+          <span class="text-[15px] leading-none text-[#b3a39d]">+</span>
+        </div>
+        <p class="mt-3 px-2 text-[14px] text-[#6f635f]">No commands</p>
+      </div>
+    </aside>
+
+    <!-- ---------- Main terminal ---------- -->
+    <main class="mono min-w-0 flex-1 overflow-hidden bg-[#181113] pt-6 text-[13px] leading-[1.6] text-[#d4c6b6]">
+
+      <!-- assistant message -->
+      <div class="flex gap-x-2.5 whitespace-pre px-6">
+        <span class="text-[#efe9e3]">●</span>
+        <span class="whitespace-pre"><span class="text-[#e7dccd]">I'll remove the two CSS animations — the floating hero logo (</span><span class="text-[#8fa0e6]">float</span><span class="text-[#e7dccd]">) and the blinking terminal cursor (</span><span class="text-[#8fa0e6]">blink</span><span class="text-[#e7dccd]">).</span></span>
+      </div>
+
+      <!-- tool 1 -->
+      <div class="mt-4 flex gap-x-2.5 px-6">
+        <span class="text-[#46c66a]">●</span>
+        <span><span class="font-semibold text-[#efe9e3]">Update</span><span class="text-[#9c8d88]">(index.html)</span></span>
+      </div>
+      <div class="px-6 pl-12 text-[#9c8d88]">└ Removed 1 line</div>
+
+      <!-- diff block 1 -->
+      <div class="mt-1">
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">55</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">      position: relative;</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">56</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">      transform-style: preserve-3d;</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">57</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">      transform: rotateX(8deg);</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">58</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">      animation: float 7s ease-in-out infinite;</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">58</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">    }</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">59</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">    .cherry-tile { position: absolute; left: 0; right: 0; height: 58%; border-radius: 24%; }</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">60</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">    .cherry-tile-3 {</span></div>
+      </div>
+
+      <!-- tool 2 -->
+      <div class="mt-4 flex gap-x-2.5 px-6">
+        <span class="text-[#46c66a]">●</span>
+        <span><span class="font-semibold text-[#efe9e3]">Update</span><span class="text-[#9c8d88]">(index.html)</span></span>
+      </div>
+      <div class="px-6 pl-12 text-[#9c8d88]">└ Removed 10 lines</div>
+
+      <!-- diff block 2 -->
+      <div class="mt-1">
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">73</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">      box-shadow: 0 22px 34px -16px rgba(120, 20, 50, 0.3), inset 0 2px 0 rgba(255, 255, 255, 0.9), inset 0 -12px 22px -12px rgba(190, 30, 78, 0.25);</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">74</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]">    }</span></div>
+        <div class="flex pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#7e6f66]">75</span><span class="w-[2ch] shrink-0 text-center"> </span><span class="whitespace-pre text-[#c9bba9]"> </span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">76</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">    @keyframes float { 0%, 100% { transform: rotateX(8deg) translateY(0); } 50% { transform: rotateX(8deg) translateY(-14px); } }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">77</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]"> </span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">78</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">    .blink { animation: blink 1.1s steps(1) infinite; }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">79</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">    @keyframes blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">80</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]"> </span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">81</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">    @media (prefers-reduced-motion: reduce) {</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">82</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">      .cherry-stack { animation: none; }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">83</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">      .blink { animation: none; }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">84</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">      html { scroll-behavior: auto; }</span></div>
+        <div class="flex bg-[#3c1419] pl-10 pr-4"><span class="w-[3ch] shrink-0 text-right text-[#d4636f]">85</span><span class="w-[2ch] shrink-0 text-center text-[#d4636f]">-</span><span class="whitespace-pre text-[#e8a9ae]">    }</span></div>
+      </div>
+
+    </main>
+  </div>
+</body>
+</html>

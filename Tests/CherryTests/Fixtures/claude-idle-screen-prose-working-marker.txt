@@ -1,0 +1,83 @@
+      136 -        if ProcessInfo.processInfo.environment["CHERRY_MENUBAR_FAKE"] == "1" {                                                                                                                                                                     
+      137 -            FileHandle.standardError.write(Data("menubar fake refresh\n".utf8))                                                                                                                                                                    
+      138 -            let root = "/tmp/fake-project"                                                                                                                                                                                                         
+      139 -            apply(groups: [MenuBarProjectGroup(                                                                                                                                                                                                    
+      140 -                projectRoot: root,                                                                                                                                                                                                                 
+      141 -                projectName: "fake-project",                                                                                                                                                                                                       
+      142 -                items: [MenuBarAgentItem(                                                                                                                                                                                                          
+      143 -                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,                                                                                                                                                                 
+      144 -                    projectRoot: root,                                                                                                                                                                                                             
+      145 -                    title: "claude",                                                                                                                                                                                                               
+      146 -                    agentKey: "claude",                                                                                                                                                                                                            
+      147 -                    activity: .working                                                                                                                                                                                                             
+      148 -                )]                                                                                                                                                                                                                                 
+      149 -            )])                                                                                                                                                                                                                                    
+      150 -            return                                                                                                                                                                                                                                 
+      151 -        }                                                                                                                                                                                                                                          
+      135          var groups: [MenuBarProjectGroup] = []
+      136          for (root, workspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot() {
+      137              let agents = workspace.runningAgentSessions
+
+⏺ Update(Sources/Cherry/MenuBarAgents.swift)
+  ⎿  Added 1 line, removed 5 lines
+      200      @Environment(\.colorScheme) private var colorScheme
+      201  
+      202      var body: some View {
+      203 -        // TEMP verification scaffold — remove before commit.                                                                                                                                                                                      
+      204 -        if ProcessInfo.processInfo.environment["CHERRY_MENUBAR_FAKE"] == "1" {                                                                                                                                                                     
+      205 -            FileHandle.standardError.write(Data("menubar label render alpha=\(pulse.alpha) aggregate=\(model.aggregate)\n".utf8))                                                                                                                  
+      206 -        }                                                                                                                                                                                                                                          
+      207 -        return Image(nsImage: Self.cachedIcon(for: model.aggregate, dark: colorScheme == .dark, pulseAlpha: pulse.alpha))                                                                                                                          
+      203 +        Image(nsImage: Self.cachedIcon(for: model.aggregate, dark: colorScheme == .dark, pulseAlpha: pulse.alpha))                                                                                                                                 
+      204              .accessibilityLabel("Cherry agents")
+      205      }
+      206  
+
+  Searched for 1 pattern, ran 1 shell command 
+   
+⏺ Final build launches clean. Let me read the final state of the pulse/label code once to make sure it's coherent after all the edits, then update the project memory.
+   
+  Ran 1 shell command 
+   
+⏺ The code is coherent. Now updating the project memory with the hard-won traps from this session:
+   
+  Wrote 2 memories 
+   
+⏺ Done — the blue is gone. The working state is now a gray, slowly breathing top layer, and along the way I found and fixed two real performance traps. CherryDev is running with the change; start any agent and you'll see the top face of the stack gently fade in
+  and out. The changes are on your working tree, uncommitted.
+
+  What it looks like now: while an agent is working, the top layer of the stack breathes between the full glyph color and a soft gray — a 4-second cycle, easing both ways, in both light and dark menu bars. It never quite reaches full brightness, so "working"
+  stays distinguishable from idle even at the peak. Orange (needs input) and red (error) are untouched, since those should pop. I rendered the full cycle offline to check it reads smoothly: …/scratchpad/pulse_strip.png if you want to see the frames.
+
+  Why this took more than swapping a color — two findings worth knowing about:
+
+  1. The obvious implementation (a TimelineView in the MenuBarExtra label) livelocks the app at launch: SwiftUI's status-item update loop (requestUpdate → setImage → requestUpdate) never drains inside applicationDidFinishLaunching, so the app pins a core and
+  never finishes launching. I caught this because the instrumented build froze, and sample showed the whole main thread stuck in that cycle.
+  2. Driving the pulse through MenuBarAgentsModel cost ~11% CPU: since CherryApp holds that model as @StateObject, every alpha publish re-evaluated the entire App body plus the dropdown panel. The pulse now lives in a separate MenuBarPulseModel observed only by
+  the status label, quantized to a fixed 16-step alpha table at 4 ticks/s with the baked NSImages cached per step. Measured result: ~3–5% CPU while an agent is working, 0% otherwise (each status-item image swap inherently costs ~1% per tick/s — that's
+  SwiftUI/AppKit overhead, and the remaining floor).
+   
+  If you'd ever want it fully free, the escape hatch is owning the NSStatusItem directly so Core Animation can run on the button's layer (MenuBarExtra snapshots its label to an image, so live animations can't render there) — but that means replacing the
+  MenuBarExtra popover plumbing, which I don't think ~4% while-working justifies.
+    
+  I've saved all three traps to the project memory so future icon work doesn't rediscover them.
+   
+✻ Churned for 1m 46s
+   
+✻ Claude resuming /loop wakeup (Jul 8 11:38am)
+
+⏺ That wakeup is stale — everything in it was already completed last turn: the CPU measurement from b6a9pzov2 came back at ~3–5% while working (0% idle), the TEMP scaffold is removed from MenuBarAgents.swift, the clean rebuild and final verify launch passed
+  (CherryDev is running), and menu-bar-agents.md now records the TimelineView livelock, the @StateObject app-body re-eval cost, and the stderr-buffering note. The summary is in my previous message. Nothing further to do.
+   
+✻ Brewed for 10s
+
+❯ reply with just: ok                                                                                                                                                                                                                                                
+
+⏺ ok
+
+✻ Baked for 8s
+   
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

@@ -243,6 +243,36 @@ struct ControlActivityTests {
         #expect(session.agentActivityState == .working)
     }
 
+    // Real screen captured live on 2026-07-08: the agent's own FINAL MESSAGE contains
+    // the prose "~3–5% while working (0% idle)", which the old bare "working ("
+    // substring match treated as a working status marker. With that sentence pinned
+    // inside the 32-line tail window of a viewport-height buffer, the session
+    // reported "working" forever despite an idle ❯ composer two rows above the
+    // footer. Markers must come from status chrome, never transcript prose.
+    @Test func agentProseMentioningWorkingDoesNotPinWorkingState() async throws {
+        let fixtureURL = try #require(Bundle.module.url(
+            forResource: "claude-idle-screen-prose-working-marker",
+            withExtension: "txt",
+            subdirectory: "Fixtures"
+        ))
+        let screen = try String(contentsOf: fixtureURL, encoding: .utf8)
+
+        let session = TerminalSession(
+            title: "Claude",
+            subtitle: "claude --dangerously-skip-permissions",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Claude"
+        )
+        session.ingestTestingData(Data(screen.utf8))
+        try await Task.sleep(for: .milliseconds(150))
+
+        // The empty ❯ composer near the bottom is the truth; the prose upstream
+        // must not outrank it.
+        #expect(session.agentActivityState == .idle)
+    }
+
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
         let continuationTail = Data([0x9F, 0x92, 0x96]) + Data("hello\n".utf8)
         let trimmedContinuation = CherryControlServer.trimmedRawOutputSuffix(continuationTail)

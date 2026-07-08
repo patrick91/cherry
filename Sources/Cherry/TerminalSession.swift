@@ -2112,6 +2112,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let nativeContentDebounceInterval: TimeInterval = 0.12
     private static let nativeContentReadThrottle: TimeInterval = 0.05
     private var nativeContentLines: [String] = []
+    private var isRefreshingNativeContent = false
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
     private var lastNativeContentReadAt: Date?
@@ -3444,6 +3445,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
         guard GhosttySessionBridge.nativePTYEnabled else { return false }
+        // recordAgentActivitySignal / summaryTranscript below re-enter this
+        // function through contentSnapshot → ensureNativeContentFresh. Without
+        // this guard, a session whose screen changes faster than one scan pass
+        // (any working agent repaints its spinner every second) recurses
+        // unboundedly and livelocks the main thread.
+        guard !isRefreshingNativeContent else { return false }
+        isRefreshingNativeContent = true
+        defer { isRefreshingNativeContent = false }
         guard let text = readNativeSurfaceText() else { return false }
         lastNativeContentReadAt = Date()
         var hasher = Hasher()
@@ -3512,6 +3521,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard agentActivityState != nextState else { return false }
         guard !agentStateHasDirectEvidence else { return false }
         setAgentActivityState(nextState, source: .summary)
+        if nextState == .working {
+            // A summary verdict is weak evidence. Give the quiet recheck a chance
+            // to overturn it, otherwise a misclassified "working" sticks until the
+            // next content change — which for a finished agent never comes.
+            scheduleAgentIdleRecheck()
+        }
         return true
     }
 
@@ -3666,8 +3681,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         guard kind == .agent, agentActivityState == .working else { return }
         guard agentActivitySource != .processExit else { return }
-        // A live working marker or a still-pulsing title spinner outranks quiet.
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
+        // A live working marker or a still-pulsing title spinner outranks quiet —
+        // but keep rechecking, so evidence that later disappears (marker scrolls
+        // out of the tail window, spinner stops pulsing) cannot pin "working"
+        // forever on a session that never produces another content change.
+        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else {
+            scheduleAgentIdleRecheck()
+            return
+        }
 
         // Prefer a recognized composer prompt — the strongest idle signal. Ignore the
         // human-input floor so a settled prompt is still found below the last typed line.
@@ -3695,7 +3716,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         // recheck window, so settle to idle. Mirrors the content-quiet fallback the MCP
         // wait_for_process_idle loop already applies, lifted into the live UI state so the
         // sidebar/menu bar stop showing a permanent "working" spinner for these agents.
-        guard hasBeenContentQuiet(for: Self.agentIdleRecheckQuietInterval) else { return }
+        guard hasBeenContentQuiet(for: Self.agentIdleRecheckQuietInterval) else {
+            scheduleAgentIdleRecheck()
+            return
+        }
         setAgentActivityState(.idle, source: .quietWindow)
     }
 
@@ -3841,24 +3865,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
-        let output = lines
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .joined(separator: "\n")
+    // Claude Code 2.x and Codex both surface "esc to interrupt" only while a
+    // turn is in flight; older Codex status lines ("Working (Xs · esc to
+    // interrupt)") contained it too. Markers must never trust transcript PROSE:
+    // an agent narrating its own work ("~3–5% while working (0% idle)") pinned
+    // its session to "working" forever, so there is no bare "working (" match,
+    // and Claude's post-turn statuses ("✳ Sautéed for 23s · 1 shell still
+    // running") only count on lines led by a spinner glyph.
+    private static let claudeStatusMarkerPhrases = ["whisking", "still thinking", "shell still running"]
+    private static let claudeSpinnerGlyphs: Set<Character> = ["·", "✢", "✳", "✶", "✻", "✽", "∗", "*"]
 
-        // Claude Code 2.x and Codex both surface "esc to interrupt" only while a
-        // turn is in flight; older Codex builds used "Working (Xs · esc to interrupt)".
-        if output.contains("esc to interrupt") {
-            return true
-        }
-        if output.contains("working (") {
+    private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
+        let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if trimmedLines.contains(where: { $0.lowercased().contains("esc to interrupt") }) {
             return true
         }
 
         guard normalizedAgentName == "claude" else { return false }
-        return output.contains("whisking")
-            || output.contains("still thinking")
-            || output.contains("shell still running")
+        return trimmedLines.contains { line in
+            guard let first = line.first, claudeSpinnerGlyphs.contains(first) else { return false }
+            let lowered = line.lowercased()
+            return claudeStatusMarkerPhrases.contains { lowered.contains($0) }
+        }
     }
 
     private static let agentCompletionPhrases: [String] = [

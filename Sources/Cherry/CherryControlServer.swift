@@ -218,6 +218,10 @@ final class CherryControlServer: @unchecked Sendable {
             if clientFD >= 0 {
                 Self.setCloseOnExec(fileDescriptor: clientFD)
                 Self.configureBlocking(fileDescriptor: clientFD)
+                // A silent client must not pin a pool thread forever (enough of
+                // them starves EVERY later connection), and a client that stops
+                // reading must not block response writes indefinitely.
+                Self.configureSocketTimeouts(fileDescriptor: clientFD, seconds: 10)
                 handleConnection(fileDescriptor: clientFD)
                 continue
             }
@@ -261,8 +265,13 @@ final class CherryControlServer: @unchecked Sendable {
                     response = .init(error: .init(code: "server_unavailable", message: "Cherry control server is unavailable."))
                 }
 
-                Self.writeResponse(response, to: clientFD)
-                close(clientFD)
+                // Write back off the main actor: a client that stopped reading
+                // must never be able to block the main thread on a full socket
+                // buffer.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    Self.writeResponse(response, to: clientFD)
+                    close(clientFD)
+                }
             }
         }
     }
@@ -381,8 +390,8 @@ final class CherryControlServer: @unchecked Sendable {
         case .listProcesses(let request):
             return .init(result: .listProcesses(try listProcesses(workspace: workspace, kind: request.kind)))
         case .getProcessStatus(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: workspace))))
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .getProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             return .init(result: .getProcessOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
@@ -401,9 +410,9 @@ final class CherryControlServer: @unchecked Sendable {
             let result = try await waitForProcessIdle(request, workspace: workspace)
             return .init(result: .waitForProcessIdle(result))
         case .getProcessPorts(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             return .init(result: .getProcessPorts(try await servicesResult(
-                workspace: workspace,
+                workspace: sessionWorkspace,
                 sessions: [session],
                 includeUnattributed: request.includeUnattributed ?? false
             )))
@@ -731,13 +740,13 @@ final class CherryControlServer: @unchecked Sendable {
                 selected: chromeState(for: workspace)?.selectedTodoID == todo.id
             )))
         case .renameTerminal(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
             session.rename(to: request.title)
-            return .init(result: .renameTerminal(summary(for: session, workspace: workspace)))
+            return .init(result: .renameTerminal(summary(for: session, workspace: sessionWorkspace)))
         case .selectTerminal(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            workspace.select(session)
-            chromeState(for: workspace)?.selectTerminal()
+            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
+            sessionWorkspace.select(session)
+            chromeState(for: sessionWorkspace)?.selectTerminal()
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -764,12 +773,12 @@ final class CherryControlServer: @unchecked Sendable {
             session.clearScrollback()
             return .init(result: .clearOutput(.init(terminalID: session.id.uuidString, cleared: true)))
         case .restartTerminal(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
             session.restart()
-            return .init(result: .restartTerminal(summary(for: session, workspace: workspace)))
+            return .init(result: .restartTerminal(summary(for: session, workspace: sessionWorkspace)))
         case .closeTerminal(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            try closeFromControl(session, workspace: workspace, agentClosePolicy: request.agentClosePolicy)
+            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
+            try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeTerminal(.init(terminalID: session.id.uuidString, closed: true)))
         }
     }
@@ -828,9 +837,18 @@ final class CherryControlServer: @unchecked Sendable {
                 todoLink: link(for: todo)
             )
         case .terminal:
-            guard let terminalID = UUID(uuidString: deepLink.targetID),
-                  let linkedWorkspace = workspaceForProjectRoot(projectRoot, fallbackWorkspace: workspace),
-                  let session = linkedWorkspace.session(id: terminalID.uuidString)
+            guard let terminalID = UUID(uuidString: deepLink.targetID) else {
+                return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
+            }
+            // The terminal UUID is the authoritative key: fall back to searching
+            // every open window so a link keeps resolving even when the project
+            // key → workspace mapping misses.
+            let linked = workspaceForProjectRoot(projectRoot, fallbackWorkspace: workspace)
+                .flatMap { linkedWorkspace in
+                    linkedWorkspace.session(id: terminalID.uuidString).map { ($0, linkedWorkspace) }
+                }
+            guard let (session, sessionWorkspace) = linked
+                ?? (try? findSessionWithWorkspace(workspace: workspace, terminalID: terminalID.uuidString))
             else {
                 return missingDeepLinkResult(deepLink, projectRoot: projectRoot, link: normalizedLink)
             }
@@ -844,7 +862,7 @@ final class CherryControlServer: @unchecked Sendable {
                 targetID: deepLink.targetID,
                 found: true,
                 projectRoot: projectRoot,
-                process: processInfo(for: session, workspace: linkedWorkspace),
+                process: processInfo(for: session, workspace: sessionWorkspace),
                 output: output
             )
         }
@@ -1129,10 +1147,20 @@ final class CherryControlServer: @unchecked Sendable {
         processID: String?,
         processName: String?
     ) throws -> TerminalSession {
+        try resolveProcessWithWorkspace(workspace: workspace, processID: processID, processName: processName).session
+    }
+
+    @MainActor
+    private func resolveProcessWithWorkspace(
+        workspace: TerminalWorkspace,
+        processID: String?,
+        processName: String?
+    ) throws -> (session: TerminalSession, workspace: TerminalWorkspace) {
         if let processID = processID?.trimmingCharacters(in: .whitespacesAndNewlines), !processID.isEmpty {
-            let session = try findSession(workspace: workspace, terminalID: processID)
+            let resolved = try findSessionWithWorkspace(workspace: workspace, terminalID: processID)
+            let session = resolved.session
             mcpControlDebugLog("resolved process selector=id:\(processID) session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(self.processName(for: session))")
-            return session
+            return resolved
         }
 
         guard let requestedName = processName?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedName.isEmpty else {
@@ -1151,7 +1179,7 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "ambiguous_process_name", message: "Multiple Cherry processes match name \(requestedName); use process_id.")
         }
         mcpControlDebugLog("resolved process selector=name:\(requestedName) session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(self.processName(for: session))")
-        return session
+        return (session, workspace)
     }
 
     @MainActor
@@ -1351,7 +1379,7 @@ final class CherryControlServer: @unchecked Sendable {
         _ request: WaitForProcessIdleRequest,
         workspace: TerminalWorkspace
     ) async throws -> WaitForProcessIdleResult {
-        let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+        let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
         let timeoutMilliseconds = min(max(request.timeoutMilliseconds ?? 60_000, 1), 300_000)
         let quietMilliseconds = min(max(request.quietMilliseconds ?? 1_000, 0), timeoutMilliseconds)
         let requireNewOutput = request.requireNewOutput ?? true
@@ -1367,7 +1395,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         func result(reason: ProcessIdleWaitReason) -> WaitForProcessIdleResult {
             WaitForProcessIdleResult(
-                process: processInfo(for: session, workspace: workspace),
+                process: processInfo(for: session, workspace: sessionWorkspace),
                 reason: reason,
                 observedNewOutput: observedNewOutput,
                 sinceOutputVersion: sinceOutputVersion,
@@ -1725,10 +1753,29 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func findSession(workspace: TerminalWorkspace, terminalID: String) throws -> TerminalSession {
-        guard let session = workspace.session(id: terminalID) else {
-            throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
+        try findSessionWithWorkspace(workspace: workspace, terminalID: terminalID).session
+    }
+
+    // Terminal UUIDs are globally unique, but a request's scope only selects the
+    // DEFAULT workspace. Orchestrators hold on to process IDs across window
+    // switches, so ID lookups must search every open project window before
+    // failing — otherwise agents in a background window become unreachable the
+    // moment the user focuses a different project.
+    @MainActor
+    private func findSessionWithWorkspace(
+        workspace: TerminalWorkspace,
+        terminalID: String
+    ) throws -> (session: TerminalSession, workspace: TerminalWorkspace) {
+        if let session = workspace.session(id: terminalID) {
+            return (session, workspace)
         }
-        return session
+        for (_, openWorkspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot()
+        where openWorkspace !== workspace {
+            if let session = openWorkspace.session(id: terminalID) {
+                return (session, openWorkspace)
+            }
+        }
+        throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
     }
 
     @MainActor
@@ -2430,6 +2477,12 @@ final class CherryControlServer: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0 else { return }
         _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+    }
+
+    private nonisolated static func configureSocketTimeouts(fileDescriptor fd: Int32, seconds: Int) {
+        var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
     private nonisolated static func setCloseOnExec(fileDescriptor fd: Int32) {

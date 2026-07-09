@@ -51,8 +51,24 @@ struct MenuBarProjectGroup: Equatable, Identifiable {
 
 // MARK: - Model
 
-/// Drives the working-state breath of the menu-bar glyph: a slow fade of the top
-/// layer between the full glyph color and a dim gray.
+struct MenuBarShimmerSettings: Equatable {
+    // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
+    // Stagger 5% ≈ 71 ms). All values are fractions of the shimmer cycle except `duration`.
+    var duration: Double = 2.7 / 1.9   // 1.9× the 2.7 s reference cycle
+    var pulseWidth: Double = 0.4       // each layer's highlight lasts 40% of the cycle
+    var peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
+    var baseAlpha: Double = 0.59       // resting alpha
+    var layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
+
+    var cacheKey: String {
+        [duration, pulseWidth, peakAlpha, baseAlpha, layerStagger]
+            .map { String(Int(($0 * 1_000).rounded())) }
+            .joined(separator: ":")
+    }
+}
+
+/// Drives the working-state shimmer of the menu-bar glyph: small highlight
+/// sweeps across the stack layers.
 ///
 /// Two hard-won constraints shape this:
 /// - It must NOT be a `TimelineView` in the `MenuBarExtra` label: that livelocks
@@ -63,46 +79,67 @@ struct MenuBarProjectGroup: Equatable, Identifiable {
 ///   dropdown panel — at pulse rate that costs ~11% CPU. A separate object observed
 ///   only by the status label keeps each tick's invalidation to the tiny label view.
 ///
-/// One timer tick per step: quantizing the breath into a fixed alpha table keeps the
-/// tick rate low and gives every frame a stable alpha, so the label can reuse a small
-/// set of cached NSImages instead of baking a fresh symbol image per frame.
+/// One timer tick per frame: quantizing the shimmer keeps the tick rate bounded
+/// and gives every frame a stable cache key, so the label can reuse a small set of
+/// NSImages instead of baking a fresh symbol image per timer tick.
 @MainActor
-final class MenuBarPulseModel: ObservableObject {
-    static let shared = MenuBarPulseModel()
+final class MenuBarShimmerModel: ObservableObject {
+    static let shared = MenuBarShimmerModel()
 
-    @Published private(set) var alpha: CGFloat = 1.0
+    @Published private(set) var frame = 0
+    let settings = MenuBarShimmerSettings()
 
     private var timer: Timer?
     private var step = 0
-    // A 4s breath at 4 ticks/s: every status-item update costs real main-thread time
-    // (label snapshot → setImage → length adjust, ~1% CPU per tick/s), so the rate is
-    // as low as the fade stays smooth. The range tops out at 0.9 so working never
-    // momentarily reads as idle at the peak of the breath.
-    private static let period: TimeInterval = 4.0
-    private static let steps = 16
-    private static let alphas: [CGFloat] = (0..<steps).map {
-        0.65 + 0.25 * sin(CGFloat($0) / CGFloat(steps) * 2 * .pi)
+    private var hasWorkingAgents = false
+    // A ~1.4s sweep at ~13 ticks/s: every status-item update costs real main-thread
+    // time (label snapshot → setImage → length adjust), so the shimmer is quantized to
+    // a fixed frame table — a bounded tick rate that still reads as motion, and a
+    // stable per-frame cache key so the label reuses a small set of NSImages.
+    static let frameCount = 18
+
+    func setWorkingAgentsActive(_ active: Bool) {
+        guard hasWorkingAgents != active else { return }
+        hasWorkingAgents = active
+        reconcileTimer(resetFrame: active)
     }
 
-    func setActive(_ active: Bool) {
-        if active, timer == nil {
-            let timer = Timer(timeInterval: Self.period / Double(Self.steps), repeats: true) { [weak self] timer in
-                guard let self else {
-                    timer.invalidate()
-                    return
-                }
-                MainActor.assumeIsolated {
-                    self.step = (self.step + 1) % Self.steps
-                    self.alpha = Self.alphas[self.step]
-                }
+    private func reconcileTimer(resetFrame: Bool) {
+        if hasWorkingAgents {
+            if resetFrame {
+                step = 0
+                frame = 0
             }
-            RunLoop.main.add(timer, forMode: .common)
-            self.timer = timer
-        } else if !active, let timer {
-            timer.invalidate()
-            self.timer = nil
+            if timer == nil {
+                startTimer()
+            }
+        } else {
+            stopTimer(resetFrame: true)
+        }
+    }
+
+    private func startTimer() {
+        let interval = max(0.05, settings.duration / Double(Self.frameCount))
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            MainActor.assumeIsolated {
+                self.step = (self.step + 1) % Self.frameCount
+                self.frame = self.step
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stopTimer(resetFrame: Bool) {
+        timer?.invalidate()
+        timer = nil
+        if resetFrame {
             step = 0
-            alpha = 1.0
+            frame = 0
         }
     }
 }
@@ -160,7 +197,7 @@ final class MenuBarAgentsModel: ObservableObject {
         let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items))
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
-        MenuBarPulseModel.shared.setActive(aggregate == .working)
+        MenuBarShimmerModel.shared.setWorkingAgentsActive(aggregate == .working)
     }
 
     func reveal(_ item: MenuBarAgentItem) {
@@ -196,53 +233,225 @@ extension AgentActivityState {
 
 struct MenuBarStatusLabel: View {
     @ObservedObject var model: MenuBarAgentsModel
-    @ObservedObject private var pulse = MenuBarPulseModel.shared
+    @ObservedObject private var shimmer = MenuBarShimmerModel.shared
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        Image(nsImage: Self.cachedIcon(for: model.aggregate, dark: colorScheme == .dark, pulseAlpha: pulse.alpha))
+        Image(nsImage: Self.cachedIcon(
+            for: model.aggregate,
+            dark: colorScheme == .dark,
+            shimmerFrame: shimmer.frame,
+            settings: shimmer.settings
+        ))
             .accessibilityLabel("Cherry agents")
     }
 
-    // Reuse one NSImage per (state, appearance, pulse step): the pulse revisits the
-    // same alpha table every cycle, and handing AppKit the same instance lets its
+    // Reuse one NSImage per (state, appearance, shimmer frame): the shimmer revisits
+    // the same frame table every cycle, and handing AppKit the same instance lets its
     // symbol rasterization cache hit instead of re-rendering a fresh image per frame.
     @MainActor private static var iconCache: [String: NSImage] = [:]
 
     @MainActor
-    private static func cachedIcon(for state: MenuBarAggregateState, dark: Bool, pulseAlpha: CGFloat) -> NSImage {
-        let key = "\(state)|\(dark)|\(Int((pulseAlpha * 1000).rounded()))"
+    private static func cachedIcon(
+        for state: MenuBarAggregateState,
+        dark: Bool,
+        shimmerFrame: Int,
+        settings: MenuBarShimmerSettings
+    ) -> NSImage {
+        let normalizedFrame = state == .working ? shimmerFrame % MenuBarShimmerModel.frameCount : 0
+        let settingsKey = state == .working ? settings.cacheKey : "static"
+        let key = "\(state)|\(dark)|\(normalizedFrame)|\(settingsKey)"
         if let cached = iconCache[key] { return cached }
-        let image = icon(paletteColors: paletteColors(for: state, dark: dark, pulseAlpha: pulseAlpha))
+        let image: NSImage
+        if state == .working {
+            image = workingIcon(dark: dark, frame: normalizedFrame, settings: settings)
+        } else {
+            image = glyphImage(layerColors: paletteColors(for: state, dark: dark))
+        }
+        if iconCache.count > 240 {
+            iconCache.removeAll(keepingCapacity: true)
+        }
         iconCache[key] = image
         return image
     }
 
+    // The working glyph is drawn from three stacked plate polygons (see `layerPaths`),
+    // so it has three real, independently-tintable layers — top (0), middle (1),
+    // bottom (2). This is why we draw the gem ourselves instead of using
+    // `square.stack.3d.up.fill`, which only exposes two palette layers.
+    private static let stackLayerCount = 3
+
     // The state is carried by the glyph itself: idle / no-agents stay monochrome,
-    // working breathes the top layer between the glyph color and a dim gray, and
-    // needs-input / error tint the whole glyph orange / red. Every state renders
-    // through the same symbol image (mono states just pass a single glyph color) so
-    // the icon never changes size between states. MenuBarExtra flattens a colored
-    // SwiftUI label to a template, so the image is baked non-template; the glyph
-    // color follows the current appearance.
-    private static func paletteColors(for state: MenuBarAggregateState, dark: Bool, pulseAlpha: CGFloat) -> [NSColor] {
+    // working shimmers each plate over a dim base, and needs-input / error tint the
+    // whole gem orange / red. Every state renders through the same three-plate glyph
+    // (mono states pass a single color that fills every plate) so the icon never
+    // changes size between states. MenuBarExtra flattens a colored SwiftUI label to a
+    // template, so the image is baked non-template; the glyph color follows the
+    // current appearance.
+    private static func paletteColors(for state: MenuBarAggregateState, dark: Bool) -> [NSColor] {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         switch state {
         case .none, .idle: return [glyph]
-        case .working: return [glyph.withAlphaComponent(pulseAlpha), glyph]
+        case .working: return [glyph]
         case .attention: return [.systemOrange]
         case .error: return [.systemRed]
         }
     }
 
+    // A highlight sweeps top → bottom through the stack: each layer rides its own
+    // staggered copy of the same rest → peak → rest pulse, so the three planes light
+    // up one after another. Purely a palette-alpha modulation — no per-frame
+    // compositing — which keeps every frame a cheap symbol re-render.
     @MainActor
-    private static func icon(paletteColors: [NSColor]) -> NSImage {
-        let base = NSImage(systemSymbolName: "square.stack.3d.up.fill", accessibilityDescription: nil) ?? NSImage()
-        let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-            .applying(NSImage.SymbolConfiguration(paletteColors: paletteColors))
-        let image = base.withSymbolConfiguration(configuration) ?? base
+    private static func workingIcon(dark: Bool, frame: Int, settings: MenuBarShimmerSettings) -> NSImage {
+        let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
+        let phase = CGFloat(frame) / CGFloat(MenuBarShimmerModel.frameCount)
+        let base = CGFloat(settings.baseAlpha)
+        let peak = CGFloat(settings.peakAlpha)
+        let width = CGFloat(settings.pulseWidth)
+        let stagger = CGFloat(settings.layerStagger)
+
+        let colors: [NSColor] = (0..<stackLayerCount).map { layer in
+            let layerPhase = wrappedPhase(phase - CGFloat(sweepOrder(layer)) * stagger)
+            let pulse = layerPulse(layerPhase, width: width)
+            let alpha = base + (peak - base) * pulse
+            return glyph.withAlphaComponent(min(1, max(0, alpha)))
+        }
+        return glyphImage(layerColors: colors)
+    }
+
+    // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
+    // top → bottom. Return `stackLayerCount - 1 - layer` to reverse it.
+    private static func sweepOrder(_ layer: Int) -> Int {
+        layer
+    }
+
+    // The prototype's `layer-wave` curve as a scalar: 0 at rest, ramps to 1 at 40% of
+    // the pulse window, falls back to 0 by the end of the window, then holds at rest.
+    private static func layerPulse(_ phase: CGFloat, width: CGFloat) -> CGFloat {
+        guard phase > 0, phase < width else { return 0 }
+        let peakAt = width * 0.4
+        let t = phase < peakAt ? phase / peakAt : 1 - (phase - peakAt) / (width - peakAt)
+        return smoothstep(t)
+    }
+
+    // Cubic smoothstep — an ease-in-out that matches the prototype's CSS timing.
+    private static func smoothstep(_ t: CGFloat) -> CGFloat {
+        let x = min(max(t, 0), 1)
+        return x * x * (3 - 2 * x)
+    }
+
+    private static func wrappedPhase(_ phase: CGFloat) -> CGFloat {
+        let wrapped = phase.truncatingRemainder(dividingBy: 1)
+        return wrapped < 0 ? wrapped + 1 : wrapped
+    }
+
+    // The Cherry brandmark's three stacked layers, exported from Figma
+    // (file SVyjAEhWW272P9Ys90L1Ra, node 42:75 — the shorter variant) as an SVG whose
+    // viewBox is the artwork's own bounds (14.66×13.87). Ordered top → bottom: `Top` is
+    // a rounded square tilted into an isometric diamond; `Middle`/`Bottom` are the
+    // chevron "wings". Drawing them ourselves — not an SF symbol — keeps each a real,
+    // independently-tintable shape for the shimmer.
+    private static let middleLayerPath = "M13.7745 6.65273C14.2127 6.87622 14.2127 7.23857 13.7745 7.46205L8.03166 10.3903C7.59342 10.6138 6.88254 10.6138 6.44429 10.3903L0.701486 7.46205C0.263239 7.23856 0.263239 6.87622 0.701486 6.65273L1.0358 6.48175C1.31945 6.33669 1.66922 6.3365 1.95307 6.48125L6.44429 8.77167C6.88254 8.99516 7.59342 8.99516 8.03166 8.77167L12.5222 6.48117C12.8059 6.33646 13.1556 6.33656 13.4392 6.48144L13.7745 6.65273Z"
+    private static let bottomLayerPath = "M13.7745 9.96604C14.2127 10.1895 14.2127 10.5519 13.7745 10.7754L8.03166 13.7036C7.59342 13.9271 6.88254 13.9271 6.44429 13.7036L0.701486 10.7754C0.263239 10.5519 0.263239 10.1895 0.701486 9.96604L1.0358 9.79506C1.31945 9.65 1.66922 9.64981 1.95307 9.79456L6.44429 12.085C6.88254 12.3085 7.59342 12.3085 8.03166 12.085L12.5222 9.79448C12.8059 9.64977 13.1556 9.64987 13.4392 9.79475L13.7745 9.96604Z"
+
+    // Points per source unit. The art is exported at its final menu-bar size, so we
+    // render 1:1 rather than stretching it to fill — that's what lets a "shorter" Figma
+    // variant read shorter. Raise this to scale the whole glyph uniformly.
+    private static let glyphScale: CGFloat = 1
+    private static let glyphPadding: CGFloat = 1
+
+    // Build the three layer shapes in the source viewBox (y-down), ordered top → bottom
+    // to match the incoming `layerColors`.
+    private static func brandmarkLayers() -> [NSBezierPath] {
+        let top = NSBezierPath(
+            roundedRect: NSRect(x: 0, y: 0, width: 8.22825, height: 8.2284),
+            xRadius: 1,
+            yRadius: 1
+        )
+        // Figma's matrix(0.89085 0.454298 -0.89085 0.454298 7.33031 0.000239) tilts the
+        // square into the isometric diamond and positions it.
+        top.transform(using: AffineTransform(m11: 0.89085, m12: 0.454298, m21: -0.89085, m22: 0.454298, tX: 7.33031, tY: 0.000238533))
+        return [top, parseSVGPath(middleLayerPath), parseSVGPath(bottomLayerPath)]
+    }
+
+    // Union bounds of the assembled artwork, in source coordinates (computed once).
+    private static let brandmarkBounds: NSRect = {
+        let layers = brandmarkLayers()
+        return layers.dropFirst().reduce(layers[0].bounds) { $0.union($1.bounds) }
+    }()
+
+    // Draw the brandmark at `glyphScale`, filling each layer with its color
+    // (`layerColors` runs top → bottom; fewer colors than layers repeats the last),
+    // painting bottom → top like the source art. The image is sized to the artwork plus
+    // a little padding and the menu bar centres it; the handler re-runs per scale so it
+    // stays crisp on Retina.
+    @MainActor
+    private static func glyphImage(layerColors: [NSColor]) -> NSImage {
+        let box = brandmarkBounds
+        let size = NSSize(
+            width: box.width * glyphScale + glyphPadding * 2,
+            height: box.height * glyphScale + glyphPadding * 2
+        )
+        // Source (y-down) → image (y-up): scale, flip, drop the box origin, pad.
+        let transform = AffineTransform(
+            m11: glyphScale, m12: 0, m21: 0, m22: -glyphScale,
+            tX: glyphPadding - box.minX * glyphScale,
+            tY: size.height - glyphPadding + box.minY * glyphScale
+        )
+        let image = NSImage(size: size, flipped: false) { _ in
+            let layers = brandmarkLayers()
+            for layer in layers { layer.transform(using: transform) }
+            for index in layers.indices.reversed() {
+                layerColors[min(index, layerColors.count - 1)].setFill()
+                layers[index].fill()
+            }
+            return true
+        }
         image.isTemplate = false
         return image
+    }
+
+    // Minimal parser for the exported layer paths: absolute M / L / C / Z commands,
+    // built in the source's own coordinate space.
+    private static func parseSVGPath(_ definition: String) -> NSBezierPath {
+        var spaced = ""
+        for character in definition {
+            if "MLCZmlcz".contains(character) { spaced += " \(character) " } else { spaced.append(character) }
+        }
+        let tokens = spaced.split(whereSeparator: { $0 == " " || $0 == "," })
+        let path = NSBezierPath()
+        var index = 0
+        var command: Character = "M"
+        func nextValue() -> CGFloat {
+            defer { index += 1 }
+            return index < tokens.count ? CGFloat(Double(tokens[index]) ?? 0) : 0
+        }
+        while index < tokens.count {
+            let start = index
+            if tokens[index].count == 1, let letter = tokens[index].first, "MLCZmlcz".contains(letter) {
+                command = letter
+                index += 1
+            }
+            switch command {
+            case "M", "m":
+                path.move(to: NSPoint(x: nextValue(), y: nextValue()))
+                command = "L"
+            case "L", "l":
+                path.line(to: NSPoint(x: nextValue(), y: nextValue()))
+            case "C", "c":
+                let control1 = NSPoint(x: nextValue(), y: nextValue())
+                let control2 = NSPoint(x: nextValue(), y: nextValue())
+                let end = NSPoint(x: nextValue(), y: nextValue())
+                path.curve(to: end, controlPoint1: control1, controlPoint2: control2)
+            case "Z", "z":
+                path.close()
+            default:
+                break
+            }
+            if index == start { index += 1 }
+        }
+        return path
     }
 }
 

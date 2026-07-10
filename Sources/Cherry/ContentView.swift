@@ -6639,6 +6639,7 @@ private final class TrafficLightOverlayView: NSView {
     private weak var attachedWindow: NSWindow?
     private var lastTranslationX: CGFloat = 0
     private var windowObservers: Set<AnyCancellable> = []
+    private var titleObservation: NSKeyValueObservation?
     private var lastAppliedPlacements: [(origin: NSPoint, isHidden: Bool)] = []
     private var stompRecheckScheduled = false
     private var stompRecheckBudget = 0
@@ -6672,8 +6673,22 @@ private final class TrafficLightOverlayView: NSView {
     @MainActor
     private func registerWindowObservers() {
         windowObservers.removeAll()
+        titleObservation?.invalidate()
+        titleObservation = nil
 
         guard let window else { return }
+
+        // Assigning NSWindow.title synchronously restores the standard buttons
+        // to AppKit's default frames. Observe the title without hopping run
+        // loops so our custom placement is restored before the setter returns
+        // and the default position can be displayed. Going through the
+        // controller preserves the sheet-specific deferral above.
+        titleObservation = window.observe(\.title, options: [.old, .new]) { [weak self] _, change in
+            guard change.oldValue != change.newValue else { return }
+            MainActor.assumeIsolated {
+                self?.controller?.refresh()
+            }
+        }
 
         // Re-apply our translation after AppKit-driven window state changes
         // — these are the moments when the standard buttons can get moved
@@ -6834,6 +6849,9 @@ private final class TrafficLightOverlayView: NSView {
 
     @MainActor
     func restore() {
+        titleObservation?.invalidate()
+        titleObservation = nil
+        windowObservers.removeAll()
         for button in hostedButtons {
             button.layer?.mask = nil
             button.isEnabled = true

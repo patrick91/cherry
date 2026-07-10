@@ -805,6 +805,7 @@ private struct MCPWhoamiPayload: Decodable {
     for toggleIndex in 0..<5 {
         host.chromeState.toggleSidebar()
         try await Task.sleep(for: .milliseconds(55))
+        host.window.title = "Rapid sidebar toggle \(toggleIndex)"
         try expectPickerClear("rapid toggle \(toggleIndex)")
     }
 
@@ -839,8 +840,9 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!host.window.sheets.isEmpty)
 
     host.chromeState.toggleSidebar()
-    for _ in 0..<5 {
+    for sampleIndex in 0..<5 {
         try await Task.sleep(for: .milliseconds(45))
+        host.window.title = "Sheet animation \(sampleIndex)"
         host.window.contentView?.layoutSubtreeIfNeeded()
     }
 
@@ -1107,6 +1109,39 @@ private struct MCPWhoamiPayload: Decodable {
     let recoveredFrames = try trafficLightFrames(in: host.window)
     #expect(recoveredFrames.allSatisfy { $0.maxX < 0 })
     #expect(hiddenButtons.allSatisfy { $0.isHidden })
+}
+
+@MainActor
+@Test func trafficLightsStayPlacedWhenWindowTitleChanges() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    let contentView = try #require(host.window.contentView)
+    let visibleFrames = try trafficLightFrames(in: host.window)
+    let visibleStates = try trafficLightButtons(in: host.window).map(\.isHidden)
+    let closeFrame = try #require(visibleFrames.first)
+    #expect(abs(closeFrame.minX - 18) < 0.5)
+    #expect(abs((closeFrame.minY - contentView.bounds.minY) - 18) < 0.5)
+    #expect(visibleStates.allSatisfy { !$0 })
+
+    host.window.title = "Changed visible title \(UUID())"
+
+    #expect(try trafficLightFrames(in: host.window) == visibleFrames)
+    #expect(try trafficLightButtons(in: host.window).map(\.isHidden) == visibleStates)
+
+    host.chromeState.toggleSidebar()
+    try await Task.sleep(for: .milliseconds(350))
+    host.window.contentView?.layoutSubtreeIfNeeded()
+
+    let hiddenFrames = try trafficLightFrames(in: host.window)
+    let hiddenStates = try trafficLightButtons(in: host.window).map(\.isHidden)
+
+    host.window.title = "Changed hidden title \(UUID())"
+
+    #expect(try trafficLightFrames(in: host.window) == hiddenFrames)
+    #expect(try trafficLightButtons(in: host.window).map(\.isHidden) == hiddenStates)
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {

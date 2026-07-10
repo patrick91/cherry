@@ -8722,6 +8722,49 @@ private func waitForSummaryCallCount(
 }
 
 @MainActor
+@Test func visibleAgentGeneratesInitialTitleAfterSubmittedTurn() async throws {
+    let previousUseAsTitle = AgentSettings.shared.useAgentSummaryAsTitle
+    AgentSettings.shared.useAgentSummaryAsTitle = true
+    defer {
+        AgentSettings.shared.useAgentSummaryAsTitle = previousUseAsTitle
+    }
+
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        },
+        summaryVisibilityProvider: { _ in true }
+    )
+
+    session.noteTestingInput(Data("Improve manually created agent titles\n".utf8))
+    session.ingestTestingData(Data("Reviewing the agent title scheduler\n".utf8))
+
+    try await waitForSummaryCallCount(1, runner: runner)
+    #expect(await runner.transcript(at: 0)?.contains("Reviewing the agent title scheduler") == true)
+
+    await runner.completeCall(
+        at: 0,
+        title: "Manual agent titles",
+        summary: "improving the agent title scheduler"
+    )
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.title == "Manual agent titles")
+    #expect(session.summary == "improving the agent title scheduler")
+}
+
+@MainActor
 @Test func staleInFlightAgentSummaryIsDiscardedAfterNewOutput() async throws {
     let previousUseAsTitle = AgentSettings.shared.useAgentSummaryAsTitle
     AgentSettings.shared.useAgentSummaryAsTitle = true

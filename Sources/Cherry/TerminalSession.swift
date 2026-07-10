@@ -2405,6 +2405,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var automaticTitle: String?
     private var pendingResolvedCommandLine: String?
     private let summaryRunner: AgentSummaryRun
+    private let summaryVisibilityProvider: @MainActor (TerminalSession) -> Bool
 
     @Published private(set) var revision = 0
 
@@ -2525,6 +2526,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                 workingDirectory: workingDirectory,
                 model: model
             )
+        },
+        summaryVisibilityProvider: @escaping @MainActor (TerminalSession) -> Bool = {
+            ProjectWindowRegistry.shared.isSessionVisible($0)
         }
     ) {
         self.title = title
@@ -2543,6 +2547,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
         self.summaryRunner = summaryRunner
+        self.summaryVisibilityProvider = summaryVisibilityProvider
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
@@ -3127,6 +3132,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.ingestTestingData(data)
         bumpRevision()
     }
+
+#if DEBUG
+    func noteTestingInput(_ data: Data) {
+        noteInputBurst(data)
+    }
+#endif
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
         if GhosttySessionBridge.nativePTYEnabled {
@@ -4373,7 +4384,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func scheduleSummaryIfNeeded() {
         guard kind == .agent else { return }
-        guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
+        guard canRunSummaryAtCurrentVisibility else { return }
 
         let settings = AgentSettings.shared
         let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4410,7 +4421,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func startSummary(generation: Int, command: String) {
         guard generation == summaryGeneration, kind == .agent else { return }
-        guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
+        guard canRunSummaryAtCurrentVisibility else { return }
         let transcript = summaryTranscript()
         let transcriptOutputVersion = outputVersion
         guard !transcript.text.isEmpty else {
@@ -4489,6 +4500,18 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
             }
         }
+    }
+
+    private var canRunSummaryAtCurrentVisibility: Bool {
+        guard summaryVisibilityProvider(self) else { return true }
+
+        // Keep recurring summaries in the background, but let a visible,
+        // untitled agent get its first task title after the user submits work.
+        // This is the normal path for agents created from the sidebar, which do
+        // not have an MCP caller supplying an explicit title at creation time.
+        return AgentSettings.shared.useAgentSummaryAsTitle
+            && titleSource == .system
+            && lastHumanInputLine != nil
     }
 
     private func recordSummaryDebug(

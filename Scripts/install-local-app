@@ -131,6 +131,15 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key>
   <string>26.0</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Cherry lets websites request camera access in the embedded project browser.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Cherry lets websites request microphone access in the embedded project browser.</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSSupportsAutomaticTermination</key>

@@ -117,6 +117,7 @@ extension CommandPaletteCommand {
         switch self {
         case .projects, .addProject: .blue
         case .agents, .addAgent: .purple
+        case .browser: .cyan
         case .toggleAppearance: .orange
         }
     }

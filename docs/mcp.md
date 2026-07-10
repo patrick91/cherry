@@ -54,6 +54,37 @@ Use process tools for new automation:
 The older terminal-tab MCP namespace has been removed. Use `process_id` with the
 process tools instead.
 
+## Browser Tools
+
+Each project window has one browser workspace with multiple tabs. Browser tools
+accept the optional `project_root`; tab-specific tools also accept `tab_id` and
+default to the active tab when it is omitted.
+
+- `get_browser_status`, `open_browser`, `close_browser`, `select_browser`
+- `open_browser_tab`, `close_browser_tab`, `select_browser_tab`
+- `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`,
+  `browser_wait`
+- `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`,
+  `browser_press`, `browser_scroll`, `browser_evaluate`
+
+`open_browser` and tab/navigation/action tools can drive the browser in the
+background without changing the visible Cherry pane. Use `select_browser` when
+the browser should be revealed and focused, with `placement` set to
+`split_right` or `standalone`.
+
+Use `browser_wait` instead of a fixed sleep after navigation or an action.
+`browser_snapshot` returns a compact semantic page representation whose
+document-scoped element refs can be passed to the action tools;
+`browser_screenshot` returns the current viewport as PNG image content.
+
+Tabs in a window share a project-scoped WebKit cookie and login session. Tab
+state lasts for the window, while site data persists for that project and is
+isolated from other projects. File pickers and downloads are blocked; camera
+and microphone access still requires WebKit's human permission prompt.
+`browser_evaluate` is disabled by default and
+requires the local, per-project **Allow MCP JavaScript** opt-in; this preference
+is not written to shared project configuration.
+
 ## Process Activity Fields
 
 Process summaries from `list_processes`, `get_process_status`, and the other

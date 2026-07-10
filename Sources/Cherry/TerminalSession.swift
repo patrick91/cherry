@@ -1028,12 +1028,27 @@ struct TerminalSplitGroup: Identifiable, Equatable {
     }
 }
 
+enum WorkspacePaneSelection: Equatable {
+    case process(UUID)
+    case browser
+}
+
+enum WorkspaceBrowserPlacement: Equatable {
+    case closed
+    case standalone
+    case split(hostSessionID: UUID)
+}
+
 @MainActor
 final class TerminalWorkspace: ObservableObject {
     @Published private(set) var sessions: [TerminalSession]
     @Published private(set) var terminalDisplayItems: [TerminalDisplayItem]
     @Published private(set) var terminalSplitGroups: [TerminalSplitGroup] = []
     @Published private(set) var terminalDetailWidth: CGFloat = 0
+    @Published private(set) var browserWorkspace: BrowserWorkspace? = nil
+    @Published private(set) var browserPlacement: WorkspaceBrowserPlacement = .closed
+    @Published private(set) var activePaneSelection: WorkspacePaneSelection
+    @Published private(set) var browserSplitWidthWeights: [Double] = []
     @Published var selectedSessionID: UUID? {
         didSet {
             updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
@@ -1048,6 +1063,7 @@ final class TerminalWorkspace: ObservableObject {
         sessions = [firstSession]
         terminalDisplayItems = [.single(firstSession.id)]
         selectedSessionID = firstSession.id
+        activePaneSelection = .process(firstSession.id)
     }
 
     var selectedSession: TerminalSession? {
@@ -1147,6 +1163,172 @@ final class TerminalWorkspace: ObservableObject {
             terminalSplitGroups[groupIndex].activeSessionID = session.id
         }
         selectedSessionID = session.id
+        activePaneSelection = .process(session.id)
+    }
+
+    var isBrowserOpen: Bool {
+        browserWorkspace != nil && browserPlacement != .closed
+    }
+
+    var isBrowserPaneActive: Bool {
+        activePaneSelection == .browser
+    }
+
+    var isBrowserStandalone: Bool {
+        browserPlacement == .standalone
+    }
+
+    var isStandaloneBrowserSelected: Bool {
+        isBrowserStandalone && isBrowserPaneActive
+    }
+
+    var browserHostSessionID: UUID? {
+        guard case .split(let hostSessionID) = browserPlacement else { return nil }
+        return hostSessionID
+    }
+
+    var browserHostSession: TerminalSession? {
+        browserHostSessionID.flatMap(session(withID:))
+    }
+
+    var hasMultipleActivePanes: Bool {
+        activeProcessPaneSessions.count + (showsBrowserBesideSelectedSession ? 1 : 0) > 1
+    }
+
+    var activeProcessPaneSessions: [TerminalSession] {
+        guard let selectedSession else { return [] }
+        if let group = splitGroup(containing: selectedSession.id) {
+            return group.paneSessionIDs.compactMap(session(withID:))
+        }
+        return [selectedSession]
+    }
+
+    var showsBrowserBesideSelectedSession: Bool {
+        guard case .split(let hostSessionID) = browserPlacement,
+              let selectedSessionID
+        else {
+            return false
+        }
+
+        if hostSessionID == selectedSessionID {
+            return true
+        }
+        guard let hostGroup = splitGroup(containing: hostSessionID) else { return false }
+        return hostGroup.paneSessionIDs.contains(selectedSessionID)
+    }
+
+    func browserIsAttached(to sessionID: UUID) -> Bool {
+        guard case .split(let hostSessionID) = browserPlacement else { return false }
+        if hostSessionID == sessionID {
+            return true
+        }
+        guard let hostGroup = splitGroup(containing: hostSessionID) else { return false }
+        return hostGroup.paneSessionIDs.contains(sessionID)
+    }
+
+    func ensureBrowserWorkspace() -> BrowserWorkspace {
+        if let browserWorkspace {
+            return browserWorkspace
+        }
+        let browserWorkspace = BrowserWorkspace(projectRoot: projectRoot)
+        self.browserWorkspace = browserWorkspace
+        return browserWorkspace
+    }
+
+    @discardableResult
+    func openBrowser(select: Bool = true) -> BrowserWorkspace {
+        let browser = ensureBrowserWorkspace()
+        if browserPlacement == .closed {
+            if select, let selectedSession, canSplitBrowserRight(of: selectedSession) {
+                _ = splitBrowserRight(of: selectedSession, activate: true)
+            } else {
+                browserPlacement = .standalone
+                if select {
+                    activePaneSelection = .browser
+                }
+            }
+        } else if select {
+            selectBrowser()
+        }
+        return browser
+    }
+
+    func canSplitBrowserRight(of session: TerminalSession) -> Bool {
+        let processPaneCount: Int
+        if session.kind == .terminal, let group = splitGroup(containing: session.id) {
+            processPaneCount = group.paneSessionIDs.count
+        } else {
+            processPaneCount = 1
+        }
+        let nextPaneCount = processPaneCount + 1
+        guard nextPaneCount <= Self.maximumSplitPaneCount else { return false }
+        guard nextPaneCount >= Self.maximumSplitPaneCount, terminalDetailWidth > 0 else { return true }
+        return terminalDetailWidth >= CGFloat(nextPaneCount) * Self.minimumSplitPaneWidth
+    }
+
+    @discardableResult
+    func splitBrowserRight(of requestedSession: TerminalSession? = nil, activate: Bool = true) -> Bool {
+        guard let session = requestedSession ?? selectedSession,
+              canSplitBrowserRight(of: session)
+        else {
+            return false
+        }
+
+        _ = ensureBrowserWorkspace()
+        browserPlacement = .split(hostSessionID: session.id)
+        let processPaneCount = session.kind == .terminal
+            ? (splitGroup(containing: session.id)?.paneSessionIDs.count ?? 1)
+            : 1
+        browserSplitWidthWeights = TerminalSplitGroup.balancedWeights(count: processPaneCount + 1)
+        if activate {
+            if let groupIndex = terminalSplitGroups.firstIndex(where: { $0.paneSessionIDs.contains(session.id) }) {
+                terminalSplitGroups[groupIndex].activeSessionID = session.id
+            }
+            selectedSessionID = session.id
+            activePaneSelection = .browser
+        }
+        return true
+    }
+
+    func separateBrowser(select: Bool = true) {
+        guard isBrowserOpen else { return }
+        browserPlacement = .standalone
+        browserSplitWidthWeights = []
+        if select {
+            activePaneSelection = .browser
+        } else if isBrowserPaneActive, let selectedSessionID {
+            activePaneSelection = .process(selectedSessionID)
+        }
+    }
+
+    func selectBrowser() {
+        guard isBrowserOpen else { return }
+        if case .split(let hostSessionID) = browserPlacement,
+           let hostSession = session(withID: hostSessionID) {
+            if let groupIndex = terminalSplitGroups.firstIndex(where: { $0.paneSessionIDs.contains(hostSession.id) }) {
+                terminalSplitGroups[groupIndex].activeSessionID = hostSession.id
+            }
+            selectedSessionID = hostSession.id
+        }
+        activePaneSelection = .browser
+    }
+
+    func closeBrowser() {
+        browserWorkspace = nil
+        browserPlacement = .closed
+        browserSplitWidthWeights = []
+        if let selectedSessionID {
+            activePaneSelection = .process(selectedSessionID)
+        }
+    }
+
+    func setBrowserSplitWidthWeights(_ weights: [Double], paneCount: Int) {
+        guard showsBrowserBesideSelectedSession,
+              let normalizedWeights = Self.normalizedWidthWeights(weights, count: paneCount)
+        else {
+            return
+        }
+        browserSplitWidthWeights = normalizedWeights
     }
 
     private func updateAuxiliaryProcessingForSelection(previousSelectedSessionID: UUID?) {
@@ -1446,9 +1628,12 @@ final class TerminalWorkspace: ObservableObject {
 
     func canAddSplitPane(to sessionID: UUID) -> Bool {
         guard session(withID: sessionID)?.kind == .terminal else { return false }
-        guard let group = splitGroup(containing: sessionID) else { return true }
-        guard group.paneSessionIDs.count < Self.maximumSplitPaneCount else { return false }
-        let nextPaneCount = group.paneSessionIDs.count + 1
+        let browserPaneCount = browserIsAttached(to: sessionID) ? 1 : 0
+        guard let group = splitGroup(containing: sessionID) else {
+            return 1 + browserPaneCount < Self.maximumSplitPaneCount
+        }
+        guard group.paneSessionIDs.count + browserPaneCount < Self.maximumSplitPaneCount else { return false }
+        let nextPaneCount = group.paneSessionIDs.count + browserPaneCount + 1
         guard nextPaneCount >= Self.maximumSplitPaneCount, terminalDetailWidth > 0 else { return true }
         return terminalDetailWidth >= CGFloat(nextPaneCount) * Self.minimumSplitPaneWidth
     }
@@ -1461,7 +1646,8 @@ final class TerminalWorkspace: ObservableObject {
 
     @discardableResult
     func splitDuplicateActiveTerminal() -> TerminalSession? {
-        guard let activeSession = selectedSession,
+        guard !isBrowserPaneActive,
+              let activeSession = selectedSession,
               activeSession.kind == .terminal,
               canAddSplitPane(to: activeSession.id)
         else {
@@ -1503,12 +1689,12 @@ final class TerminalWorkspace: ObservableObject {
 
     @discardableResult
     func focusPreviousPane() -> Bool {
-        focusPane(offset: -1)
+        focusWorkspacePane(offset: -1)
     }
 
     @discardableResult
     func focusNextPane() -> Bool {
-        focusPane(offset: 1)
+        focusWorkspacePane(offset: 1)
     }
 
     func balanceSplitGroup(id groupID: UUID) {
@@ -1519,6 +1705,12 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func balanceActiveSplitGroup() {
+        if showsBrowserBesideSelectedSession {
+            browserSplitWidthWeights = TerminalSplitGroup.balancedWeights(
+                count: activeProcessPaneSessions.count + 1
+            )
+            return
+        }
         guard let selectedSessionID,
               let group = splitGroup(containing: selectedSessionID)
         else {
@@ -1552,6 +1744,7 @@ final class TerminalWorkspace: ObservableObject {
             displayIndex...displayIndex,
             with: group.paneSessionIDs.map { .single($0) }
         )
+        reconcileBrowserSplitWidthWeights()
     }
 
     func separateActiveSplitGroup() {
@@ -1602,6 +1795,9 @@ final class TerminalWorkspace: ObservableObject {
         sessions.removeAll()
         terminalDisplayItems.removeAll()
         terminalSplitGroups.removeAll()
+        browserWorkspace = nil
+        browserPlacement = .closed
+        browserSplitWidthWeights = []
         selectedSessionID = nil
         removedSessions.forEach { session in
             session.releaseGhosttyBridge()
@@ -1615,6 +1811,10 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func closeActivePane() {
+        if isBrowserPaneActive {
+            closeBrowser()
+            return
+        }
         guard let selectedSession else { return }
         close(selectedSession)
     }
@@ -1629,27 +1829,42 @@ final class TerminalWorkspace: ObservableObject {
 
 
     func restartSelectedSession() {
+        guard !isBrowserPaneActive else { return }
         selectedSession?.restart()
     }
 
     func clearSelectedSessionScrollback() {
+        guard !isBrowserPaneActive else { return }
         selectedSession?.clearScrollback()
     }
 
     private func selectSession(offset: Int, visibleCommandNames: [String]?) {
-        let orderedSessions = if let visibleCommandNames {
-            sidebarOrderedSessions(visibleCommandNames: visibleCommandNames)
+        let commandTargets = if let visibleCommandNames {
+            commandSessions(orderedBy: visibleCommandNames)
         } else {
-            sidebarOrderedSessions
+            commandSessions
         }
-        guard !orderedSessions.isEmpty else { return }
+        var targets = visibleAgentSessions().map { WorkspacePaneSelection.process($0.id) }
+        targets += terminalDisplaySessions.map { WorkspacePaneSelection.process($0.id) }
+        if isBrowserStandalone {
+            targets.append(.browser)
+        }
+        targets += commandTargets.map { WorkspacePaneSelection.process($0.id) }
+        guard !targets.isEmpty else { return }
 
-        let currentIndex = selectedSession
-            .flatMap { selectedSession in
-                orderedSessions.firstIndex(where: { $0.id == selectedSession.id })
-            } ?? 0
-        let nextIndex = (currentIndex + offset + orderedSessions.count) % orderedSessions.count
-        select(orderedSessions[nextIndex])
+        let currentSelection: WorkspacePaneSelection? = isStandaloneBrowserSelected
+            ? WorkspacePaneSelection.browser
+            : selectedSessionID.map(WorkspacePaneSelection.process)
+        let currentIndex = currentSelection.flatMap { targets.firstIndex(of: $0) } ?? 0
+        let nextIndex = (currentIndex + offset + targets.count) % targets.count
+        switch targets[nextIndex] {
+        case .process(let sessionID):
+            if let session = session(withID: sessionID) {
+                select(session)
+            }
+        case .browser:
+            selectBrowser()
+        }
     }
 
     func clearUnreadNotificationForSelectedSession() {
@@ -1713,6 +1928,7 @@ final class TerminalWorkspace: ObservableObject {
             terminalSplitGroups[groupIndex].widthWeights = TerminalSplitGroup.balancedWeights(
                 count: terminalSplitGroups[groupIndex].paneSessionIDs.count
             )
+            reconcileBrowserSplitWidthWeights()
             return true
         }
 
@@ -1727,6 +1943,7 @@ final class TerminalWorkspace: ObservableObject {
         )
         terminalSplitGroups.append(group)
         terminalDisplayItems[activeDisplayIndex] = .split(group.id)
+        reconcileBrowserSplitWidthWeights()
         return true
     }
 
@@ -1734,18 +1951,30 @@ final class TerminalWorkspace: ObservableObject {
         terminalDisplayItems.removeAll { $0 == .single(sessionID) }
     }
 
-    private func focusPane(offset: Int) -> Bool {
-        guard let selectedSessionID,
-              let group = splitGroup(containing: selectedSessionID),
-              let currentIndex = group.paneSessionIDs.firstIndex(of: selectedSessionID),
-              group.paneSessionIDs.count > 1
-        else {
-            return false
+    private func focusWorkspacePane(offset: Int) -> Bool {
+        var panes = activeProcessPaneSessions.map { WorkspacePaneSelection.process($0.id) }
+        if showsBrowserBesideSelectedSession {
+            panes.append(.browser)
         }
+        guard panes.count > 1 else { return false }
 
-        let nextIndex = (currentIndex + offset + group.paneSessionIDs.count) % group.paneSessionIDs.count
-        guard let session = session(withID: group.paneSessionIDs[nextIndex]) else { return false }
-        select(session)
+        let currentSelection: WorkspacePaneSelection
+        if isBrowserPaneActive, showsBrowserBesideSelectedSession {
+            currentSelection = .browser
+        } else if let selectedSessionID {
+            currentSelection = .process(selectedSessionID)
+        } else {
+            currentSelection = panes[0]
+        }
+        let currentIndex = panes.firstIndex(of: currentSelection) ?? 0
+        let nextIndex = (currentIndex + offset + panes.count) % panes.count
+        switch panes[nextIndex] {
+        case .process(let sessionID):
+            guard let session = session(withID: sessionID) else { return false }
+            select(session)
+        case .browser:
+            selectBrowser()
+        }
         return true
     }
 
@@ -1772,6 +2001,17 @@ final class TerminalWorkspace: ObservableObject {
         let total = sanitized.reduce(0, +)
         guard total > 0 else { return TerminalSplitGroup.balancedWeights(count: count) }
         return sanitized.map { $0 / total }
+    }
+
+    private func reconcileBrowserSplitWidthWeights() {
+        guard case .split(let hostSessionID) = browserPlacement,
+              session(withID: hostSessionID) != nil
+        else {
+            return
+        }
+        let paneCount = (splitGroup(containing: hostSessionID)?.paneSessionIDs.count ?? 1) + 1
+        guard browserSplitWidthWeights.count != paneCount else { return }
+        browserSplitWidthWeights = TerminalSplitGroup.balancedWeights(count: paneCount)
     }
 
     private func childAgentSessions(parentID: UUID) -> [TerminalSession] {
@@ -1825,10 +2065,37 @@ final class TerminalWorkspace: ObservableObject {
     ) {
         guard !removedIDs.isEmpty, sessions.count > removedIDs.count else { return }
 
+        let browserWasActive = isBrowserPaneActive
+        let browserReplacementHostID: UUID? = {
+            guard case .split(let hostSessionID) = browserPlacement,
+                  removedIDs.contains(hostSessionID)
+            else {
+                return nil
+            }
+            if let group = splitGroup(containing: hostSessionID) {
+                return group.paneSessionIDs.first { !removedIDs.contains($0) }
+            }
+            return nil
+        }()
+
         let removedIndex = sessions.firstIndex { removedIDs.contains($0.id) }
         let removedSessions = sessions.filter { removedIDs.contains($0.id) }
         sessions.removeAll { removedIDs.contains($0.id) }
         removeClosedSessionsFromTerminalDisplay(removedIDs)
+        if case .split(let hostSessionID) = browserPlacement,
+           removedIDs.contains(hostSessionID) {
+            if let browserReplacementHostID,
+               session(withID: browserReplacementHostID) != nil {
+                browserPlacement = .split(hostSessionID: browserReplacementHostID)
+                browserSplitWidthWeights = TerminalSplitGroup.balancedWeights(
+                    count: (splitGroup(containing: browserReplacementHostID)?.paneSessionIDs.count ?? 1) + 1
+                )
+            } else {
+                browserPlacement = .standalone
+                browserSplitWidthWeights = []
+            }
+        }
+        reconcileBrowserSplitWidthWeights()
         removedSessions.forEach { session in
             session.releaseGhosttyBridge()
             session.stop()
@@ -1836,7 +2103,25 @@ final class TerminalWorkspace: ObservableObject {
 
         guard let currentSelectedSessionID = selectedSessionID,
               removedIDs.contains(currentSelectedSessionID)
-        else { return }
+        else {
+            if browserWasActive {
+                activePaneSelection = .browser
+            }
+            return
+        }
+
+        if browserWasActive, isBrowserOpen {
+            if case .split(let hostSessionID) = browserPlacement {
+                selectedSessionID = hostSessionID
+            } else if let replacementSelectionID,
+                      session(withID: replacementSelectionID) != nil {
+                selectedSessionID = replacementSelectionID
+            } else if let remainingSession = sessions.first {
+                selectedSessionID = remainingSession.id
+            }
+            activePaneSelection = .browser
+            return
+        }
 
         if let replacementSelectionID,
            let replacementSession = session(withID: replacementSelectionID) {

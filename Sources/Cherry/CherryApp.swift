@@ -171,6 +171,7 @@ struct CherryApp: App {
 
     private var canSplitFocusedTerminal: Bool {
         guard let workspace = focusedWorkspace,
+              !focusedBrowserIsVisible,
               let session = workspace.selectedSession,
               session.kind == .terminal
         else {
@@ -180,16 +181,22 @@ struct CherryApp: App {
     }
 
     private var focusedWorkspaceHasActiveSplit: Bool {
-        guard let workspace = focusedWorkspace,
-              let selectedSessionID = workspace.selectedSessionID
-        else {
-            return false
-        }
-        return workspace.splitGroup(containing: selectedSessionID) != nil
+        focusedWorkspace?.hasMultipleActivePanes == true
+    }
+
+    private var focusedBrowserIsVisible: Bool {
+        focusedWorkspace?.isBrowserPaneActive == true
+            && focusedChromeState?.isShowingTerminalContent == true
     }
 
     private var closeTabTitle: String {
-        focusedWorkspaceHasActiveSplit ? "Close Pane" : "Close Tab"
+        if focusedBrowserIsVisible {
+            if (focusedWorkspace?.browserWorkspace?.tabs.count ?? 0) > 1 {
+                return "Close Browser Tab"
+            }
+            return "Close Browser"
+        }
+        return focusedWorkspaceHasActiveSplit ? "Close Pane" : "Close Tab"
     }
 
     var body: some Scene {
@@ -233,30 +240,51 @@ struct CherryApp: App {
             CommandGroup(after: .pasteboard) {
                 Divider()
 
+                Button("Open Location…") {
+                    keyWindowWorkspace?.browserWorkspace?.requestAddressFocus()
+                }
+                .keyboardShortcut("l")
+                .disabled(!focusedBrowserIsVisible)
+
+                Button("Reload Page") {
+                    guard let browser = keyWindowWorkspace?.browserWorkspace else { return }
+                    _ = try? browser.reload(tabID: browser.selectedTabID)
+                }
+                .keyboardShortcut("r")
+                .disabled(!focusedBrowserIsVisible)
+
                 Button("Find") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.startSearch()
                 }
                 .keyboardShortcut("f")
-                .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
+                .disabled(
+                    focusedWorkspace?.selectedSession == nil
+                        || focusedChromeState == nil
+                        || focusedBrowserIsVisible
+                )
 
                 Button("Find Next") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: true)
                 }
                 .keyboardShortcut("g")
-                .disabled(focusedWorkspace?.selectedSession == nil)
+                .disabled(focusedWorkspace?.selectedSession == nil || focusedBrowserIsVisible)
 
                 Button("Find Previous") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: false)
                 }
                 .keyboardShortcut("g", modifiers: [.command, .shift])
-                .disabled(focusedWorkspace?.selectedSession == nil)
+                .disabled(focusedWorkspace?.selectedSession == nil || focusedBrowserIsVisible)
 
                 Button("Hide Find Bar") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.endSearch()
                     keyWindowChromeState?.dismissTerminalSearch()
                 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
-                .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
+                .disabled(
+                    focusedWorkspace?.selectedSession == nil
+                        || focusedChromeState == nil
+                        || focusedBrowserIsVisible
+                )
             }
 
             CommandMenu("Prototype") {
@@ -285,7 +313,15 @@ struct CherryApp: App {
                 .disabled(focusedChromeState == nil)
 
                 Button("New Tab") {
-                    keyWindowWorkspace?.addSession()
+                    guard let workspace = keyWindowWorkspace else { return }
+                    if keyWindowChromeState?.isShowingTerminalContent == true,
+                       workspace.isBrowserPaneActive,
+                       let browser = workspace.browserWorkspace {
+                        _ = browser.addTab()
+                        browser.requestAddressFocus()
+                    } else {
+                        workspace.addSession()
+                    }
                 }
                 .keyboardShortcut("t")
                 .disabled(focusedWorkspace == nil)
@@ -296,10 +332,38 @@ struct CherryApp: App {
                 .keyboardShortcut("d")
                 .disabled(!canSplitFocusedTerminal)
 
+                Button("Open Browser Right") {
+                    guard let workspace = keyWindowWorkspace else { return }
+                    keyWindowChromeState?.selectTerminal()
+                    if let session = workspace.selectedSession,
+                       workspace.splitBrowserRight(of: session) {
+                        return
+                    }
+                    _ = workspace.openBrowser()
+                    workspace.separateBrowser()
+                }
+                .disabled(focusedWorkspace == nil)
+
+                Button("Separate Browser") {
+                    keyWindowChromeState?.selectTerminal()
+                    keyWindowWorkspace?.separateBrowser()
+                }
+                .disabled(focusedWorkspace?.isBrowserOpen != true || focusedWorkspace?.isBrowserStandalone == true)
+
                 Button(focusedChromeState?.selectedNoteID == nil ? closeTabTitle : "Close Note") {
                     guard let workspace = keyWindowWorkspace else { return }
                     let chromeState = keyWindowChromeState
                     if chromeState?.closeSelectedNoteIfNeeded() == true {
+                        return
+                    }
+                    if chromeState?.isShowingTerminalContent == true,
+                       workspace.isBrowserPaneActive {
+                        if let browser = workspace.browserWorkspace,
+                           browser.tabs.count > 1 {
+                            _ = browser.closeTab(browser.selectedTabID)
+                        } else {
+                            workspace.closeBrowser()
+                        }
                         return
                     }
                     if workspace.sessions.count > 1 {
@@ -479,6 +543,29 @@ private struct WindowTitleBinder: View {
     }
 }
 
+private struct BrowserWindowTitleBinder: View {
+    let projectName: String
+    @ObservedObject var browser: BrowserWorkspace
+
+    var body: some View {
+        if let tab = browser.selectedTab {
+            BrowserTabWindowTitleBinder(projectName: projectName, tab: tab)
+        } else {
+            WindowTitleWriter(title: "\(projectName) — Browser")
+        }
+    }
+}
+
+private struct BrowserTabWindowTitleBinder: View {
+    let projectName: String
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        let title = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        WindowTitleWriter(title: "\(projectName) — \(title.isEmpty ? "Browser" : title)")
+    }
+}
+
 /// Writes a string to the enclosing window's `title`. The titlebar text is hidden
 /// (custom chrome), but the title still drives the Window menu, Mission Control,
 /// and the app switcher. Reactive: a changed `title` re-runs `updateNSView`.
@@ -541,7 +628,11 @@ private struct ProjectWorkspaceView: View {
             chromeState: chromeState
         ))
         .background {
-            if let session = workspace.selectedSession {
+            if chromeState.isShowingTerminalContent,
+               workspace.isBrowserPaneActive,
+               let browser = workspace.browserWorkspace {
+                BrowserWindowTitleBinder(projectName: projectName, browser: browser)
+            } else if let session = workspace.selectedSession {
                 WindowTitleBinder(projectName: projectName, session: session)
             } else {
                 WindowTitleWriter(title: projectName)

@@ -7354,7 +7354,8 @@ private final class SidebarTabRowState: ObservableObject {
         self.agentIconDescriptor = AgentToolIconDescriptor(
             kind: session.kind,
             agentName: session.agentName,
-            title: session.title
+            title: session.title,
+            commandLine: session.subtitle
         )
         self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
@@ -7430,7 +7431,8 @@ private final class SidebarTabRowState: ObservableObject {
         agentIconDescriptor = AgentToolIconDescriptor(
             kind: session.kind,
             agentName: session.agentName,
-            title: session.title
+            title: session.title,
+            commandLine: session.subtitle
         )
         let nextLabel = Self.label(for: session, pathDisplayMode: pathDisplayMode)
         guard label != nextLabel else { return }
@@ -7441,6 +7443,18 @@ private final class SidebarTabRowState: ObservableObject {
         for session: TerminalSession,
         pathDisplayMode: SidebarTerminalPathDisplayMode
     ) -> SidebarTerminalPathLabel {
+        if session.kind == .agent {
+            return .init(
+                title: SidebarAgentTitleFormatter.title(
+                    title: session.title,
+                    titleSource: session.titleSource,
+                    agentName: session.agentName,
+                    commandLine: session.subtitle
+                ),
+                detail: session.sidebarDetail.nilIfEmpty
+            )
+        }
+
         guard session.kind == .terminal, !session.hasExplicitTitle else {
             return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
         }
@@ -7472,6 +7486,22 @@ private final class SidebarTabRowState: ObservableObject {
         }
 
         return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
+    }
+}
+
+struct SidebarAgentTitleFormatter {
+    static func title(
+        title: String,
+        titleSource: TerminalSession.TitleSource,
+        agentName: String?,
+        commandLine: String
+    ) -> String {
+        guard titleSource == .system,
+              let brand = AgentToolBrand.detect(name: agentName ?? title, commandLine: commandLine)
+        else {
+            return title
+        }
+        return brand.displayName
     }
 }
 
@@ -7524,27 +7554,31 @@ private struct AgentToolIconDescriptor {
 
     @MainActor
     init?(session: TerminalSession) {
-        self.init(kind: session.kind, agentName: session.agentName, title: session.title)
+        self.init(
+            kind: session.kind,
+            agentName: session.agentName,
+            title: session.title,
+            commandLine: session.subtitle
+        )
     }
 
-    init?(kind: TerminalSession.SessionKind, agentName: String?, title: String) {
+    init?(
+        kind: TerminalSession.SessionKind,
+        agentName: String?,
+        title: String,
+        commandLine: String? = nil
+    ) {
         guard kind == .agent else { return nil }
 
-        let displayName = agentName ?? title
-        let name = displayName.lowercased()
-        if name.contains("codex") || name.contains("openai") {
-            self.init(label: "Cx", logoResourceName: "openai")
-        } else if name.contains("claude") || name.contains("anthropic") {
-            self.init(label: "Cl", logoResourceName: "claude")
-        } else if name.contains("gemini") {
-            self.init(label: "Ge", logoResourceName: "gemini")
-        } else if name.contains("amp") {
-            self.init(label: "A", logoResourceName: "amp")
-        } else if name == "pi" || name.contains(" pi ") || name.contains("pi.ai") || name.contains("inflection") {
-            self.init(label: "Pi")
-        } else {
-            return nil
-        }
+        guard let brand = AgentToolBrand.detect(
+            name: agentName ?? title,
+            commandLine: commandLine
+        ) else { return nil }
+
+        self.init(
+            label: brand.fallbackLabel,
+            logoResourceName: brand.logoResourceName
+        )
     }
 }
 

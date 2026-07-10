@@ -40,6 +40,76 @@ struct AgentToolDefinition: Codable, Equatable, Identifiable {
     }
 }
 
+enum AgentToolBrand: String, Equatable {
+    case amp
+    case claude
+    case codex
+    case gemini
+    case openCode = "opencode"
+    case pi
+
+    var displayName: String {
+        switch self {
+        case .amp: "Amp"
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .gemini: "Gemini"
+        case .openCode: "OpenCode"
+        case .pi: "Pi"
+        }
+    }
+
+    var logoResourceName: String? {
+        switch self {
+        case .amp: "amp"
+        case .claude: "claude"
+        case .codex: "openai"
+        case .gemini: "gemini"
+        case .openCode, .pi: nil
+        }
+    }
+
+    var fallbackLabel: String {
+        switch self {
+        case .amp: "A"
+        case .claude: "Cl"
+        case .codex: "Cx"
+        case .gemini: "Ge"
+        case .openCode: "OC"
+        case .pi: "Pi"
+        }
+    }
+
+    static func detect(name: String?, commandLine: String? = nil) -> AgentToolBrand? {
+        for source in [name, commandLine].compactMap({ $0 }) {
+            let tokens = source
+                .lowercased()
+                .split { !$0.isLetter && !$0.isNumber }
+                .map(String.init)
+
+            if tokens.contains("codex") || tokens.contains("openai") {
+                return .codex
+            }
+            if tokens.contains("claude") || tokens.contains("anthropic") {
+                return .claude
+            }
+            if tokens.contains("gemini") {
+                return .gemini
+            }
+            if tokens.contains("opencode") {
+                return .openCode
+            }
+            if tokens.contains("amp") {
+                return .amp
+            }
+            if tokens.contains("pi") || tokens.contains("inflection") {
+                return .pi
+            }
+        }
+        return nil
+    }
+}
+
 struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
     var name: String
     var command: String

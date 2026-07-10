@@ -174,11 +174,16 @@ final class MenuBarAgentsModel: ObservableObject {
             let agents = workspace.runningAgentSessions
             guard !agents.isEmpty else { continue }
             let items = agents.map { session in
-                MenuBarAgentItem(
+                let brand = AgentToolBrand.detect(
+                    name: session.agentName ?? session.title,
+                    commandLine: session.subtitle
+                )
+                return MenuBarAgentItem(
                     id: session.id,
                     projectRoot: root,
                     title: session.title,
-                    agentKey: AgentToolDefinition.normalizedName(session.agentName ?? session.title),
+                    agentKey: brand?.rawValue
+                        ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title),
                     activity: session.agentActivityState
                 )
             }
@@ -593,13 +598,8 @@ private struct MenuBarAgentGlyph: View {
     }
 
     private static func logoResource(for key: String) -> String? {
-        switch key {
-        case "claude": "claude"
-        case "codex", "openai": "openai"
-        case "gemini": "gemini"
-        case "amp": "amp"
-        default: nil
-        }
+        AgentToolBrand(rawValue: key)?.logoResourceName
+            ?? AgentToolBrand.detect(name: key)?.logoResourceName
     }
 
     @MainActor private static var cache: [String: NSImage?] = [:]

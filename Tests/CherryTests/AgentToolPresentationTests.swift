@@ -32,3 +32,36 @@ import Testing
         commandLine: "codex --yolo"
     ) == "Investigate deployment")
 }
+
+@Test func menuBarUsesAppProjectNameVerbatim() {
+    let root = "/tmp/posthog"
+    #expect(MenuBarAgentPresentation.projectName(projectRoot: root) == CherryProject(root: root).name)
+    #expect(MenuBarAgentPresentation.projectName(projectRoot: root) == "posthog")
+}
+
+@Test func menuBarUsesSidebarAgentTitle() {
+    let arguments = (
+        title: "Codex YOLO",
+        titleSource: TerminalSession.TitleSource.system,
+        agentName: Optional("Codex YOLO"),
+        commandLine: "codex --yolo"
+    )
+
+    #expect(MenuBarAgentPresentation.agentTitle(
+        title: arguments.title,
+        titleSource: arguments.titleSource,
+        agentName: arguments.agentName,
+        commandLine: arguments.commandLine
+    ) == SidebarAgentTitleFormatter.title(
+        title: arguments.title,
+        titleSource: arguments.titleSource,
+        agentName: arguments.agentName,
+        commandLine: arguments.commandLine
+    ))
+    #expect(MenuBarAgentPresentation.agentTitle(
+        title: arguments.title,
+        titleSource: arguments.titleSource,
+        agentName: arguments.agentName,
+        commandLine: arguments.commandLine
+    ) == "Codex")
+}

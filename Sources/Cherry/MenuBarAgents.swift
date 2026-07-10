@@ -49,6 +49,27 @@ struct MenuBarProjectGroup: Equatable, Identifiable {
     var id: String { projectRoot }
 }
 
+struct MenuBarAgentPresentation {
+    static func projectName(projectRoot: String) -> String {
+        let name = CherryProject(root: projectRoot).name
+        return name.isEmpty ? "Cherry" : name
+    }
+
+    static func agentTitle(
+        title: String,
+        titleSource: TerminalSession.TitleSource,
+        agentName: String?,
+        commandLine: String
+    ) -> String {
+        SidebarAgentTitleFormatter.title(
+            title: title,
+            titleSource: titleSource,
+            agentName: agentName,
+            commandLine: commandLine
+        )
+    }
+}
+
 // MARK: - Model
 
 struct MenuBarShimmerSettings: Equatable {
@@ -181,16 +202,20 @@ final class MenuBarAgentsModel: ObservableObject {
                 return MenuBarAgentItem(
                     id: session.id,
                     projectRoot: root,
-                    title: session.title,
+                    title: MenuBarAgentPresentation.agentTitle(
+                        title: session.title,
+                        titleSource: session.titleSource,
+                        agentName: session.agentName,
+                        commandLine: session.subtitle
+                    ),
                     agentKey: brand?.rawValue
                         ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title),
                     activity: session.agentActivityState
                 )
             }
-            let name = URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
             groups.append(MenuBarProjectGroup(
                 projectRoot: root,
-                projectName: name.isEmpty ? "Cherry" : name,
+                projectName: MenuBarAgentPresentation.projectName(projectRoot: root),
                 items: items
             ))
         }
@@ -500,7 +525,7 @@ struct MenuBarAgentsPanel: View {
         // always clear which window an agent belongs to.
         VStack(alignment: .leading, spacing: 1) {
             ForEach(model.groups) { group in
-                Text(Self.projectTitle(group.projectName))
+                Text(group.projectName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 16)
@@ -533,12 +558,6 @@ struct MenuBarAgentsPanel: View {
         .padding(.bottom, 6)
     }
 
-    // Project folder names are usually lowercase; show them sentence-cased (no
-    // all-caps) so the section header reads like a native grouped menu.
-    private static func projectTitle(_ name: String) -> String {
-        guard let first = name.first else { return name }
-        return first.uppercased() + name.dropFirst()
-    }
 }
 
 private struct MenuBarAgentRow: View {

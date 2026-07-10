@@ -116,6 +116,28 @@ import Testing
 }
 
 @MainActor
+@Test func separatingActiveSplitBrowserSchedulesHiddenAgentSummaries() throws {
+    let workspace = TerminalWorkspace()
+    workspace.updateTerminalDetailWidth(1_000)
+    defer { workspace.closeAllSessions() }
+
+    let terminal = try #require(workspace.selectedSession)
+    #expect(workspace.splitBrowserRight(of: terminal))
+    #expect(workspace.activePaneSelection == .browser)
+
+    var scheduleCount = 0
+    workspace.hiddenAgentSummarySchedulingObserverForTesting = {
+        scheduleCount += 1
+    }
+
+    workspace.separateBrowser(select: true)
+
+    #expect(workspace.browserPlacement == .standalone)
+    #expect(workspace.activePaneSelection == .browser)
+    #expect(scheduleCount == 1)
+}
+
+@MainActor
 @Test func browserFocusCyclesWithExistingTerminalSplit() throws {
     let workspace = TerminalWorkspace()
     workspace.updateTerminalDetailWidth(1_200)

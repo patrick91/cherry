@@ -2,9 +2,22 @@ import Foundation
 
 struct AgentSummaryRunner {
     struct Result: Equatable {
+        let title: String?
         let summary: String
         let state: AgentActivityState?
         let prompt: String
+
+        init(
+            title: String? = nil,
+            summary: String,
+            state: AgentActivityState?,
+            prompt: String
+        ) {
+            self.title = title
+            self.summary = summary
+            self.state = state
+            self.prompt = prompt
+        }
     }
 
     enum SummaryError: LocalizedError, Equatable {
@@ -69,7 +82,7 @@ func summaryPrompt(for transcript: String) -> String {
     Analyze this AI agent terminal session and respond with ONLY a single-line JSON object.
 
     Example:
-    {"state":"WORKING","summary":"editing summary scheduler tests"}
+    {"state":"WORKING","title":"Summary scheduler","summary":"editing summary scheduler tests"}
 
     State definitions:
     - IDLE: At a prompt waiting for user input
@@ -77,6 +90,11 @@ func summaryPrompt(for transcript: String) -> String {
     - THINKING: Processing or waiting for AI response
     - WORKING: Actively executing commands, editing files, or streaming work with no idle prompt visible
     - ERROR: Encountered an error and stopped
+
+    Rules for title:
+    - Use 2 to 6 words.
+    - Name the stable task or topic with a concise noun phrase.
+    - Do not describe transient activity such as reading, thinking, or waiting.
 
     Rules for summary:
     - Use 3 to 12 words.
@@ -153,10 +171,11 @@ private func runCommand(
     guard !response.summary.isEmpty else {
         throw AgentSummaryRunner.SummaryError.emptyOutput
     }
-    return .init(summary: response.summary, state: response.state, prompt: input)
+    return .init(title: response.title, summary: response.summary, state: response.state, prompt: input)
 }
 
 struct AgentSummaryContent: Equatable {
+    let title: String?
     let summary: String
     let state: AgentActivityState?
 }
@@ -198,6 +217,7 @@ enum AgentActivityState: String, Equatable, Codable {
 
 private struct StructuredSummaryResponse: Decodable {
     let state: String?
+    let title: String?
     let summary: String
 }
 
@@ -215,7 +235,7 @@ func summaryContentFromCommandOutput(_ value: String) -> AgentSummaryContent {
         }
     }
 
-    return AgentSummaryContent(summary: sanitizedSummary(lines.first ?? ""), state: nil)
+    return AgentSummaryContent(title: nil, summary: sanitizedSummary(lines.first ?? ""), state: nil)
 }
 
 func summaryFromCommandOutput(_ value: String) -> String {
@@ -231,9 +251,15 @@ private func structuredSummary(from value: String) -> AgentSummaryContent? {
         return nil
     }
     return AgentSummaryContent(
+        title: sanitizedAgentTitle(response.title),
         summary: sanitizedSummary(response.summary),
         state: AgentActivityState(summaryValue: response.state)
     )
+}
+
+func sanitizedAgentTitle(_ value: String?) -> String? {
+    let title = sanitizedSummary(value ?? "", maxLength: 80)
+    return title.isEmpty ? nil : title
 }
 
 struct SummaryRunnerShellInvocation: Equatable {

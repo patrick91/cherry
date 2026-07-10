@@ -925,8 +925,23 @@ private struct DetailPaneView: View {
             chromeState.selectTodo(id: nil)
         }
         .onChange(of: chromeState.isShowingTerminalContent) { _, isShowingTerminalContent in
-            guard isShowingTerminalContent else { return }
-            workspace.clearUnreadNotificationForSelectedSession()
+            if isShowingTerminalContent {
+                workspace.clearUnreadNotificationForSelectedSession()
+            } else {
+                workspace.scheduleHiddenAgentSummaries()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMiniaturizeNotification)) { notification in
+            guard notification.object as? NSWindow === ProjectWindowRegistry.shared.window(for: chromeState) else {
+                return
+            }
+            workspace.scheduleHiddenAgentSummaries()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { notification in
+            guard notification.object as? NSWindow === ProjectWindowRegistry.shared.window(for: chromeState) else {
+                return
+            }
+            workspace.scheduleHiddenAgentSummaries()
         }
     }
 

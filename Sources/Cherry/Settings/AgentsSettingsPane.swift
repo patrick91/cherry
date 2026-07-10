@@ -158,6 +158,17 @@ private struct SummarySettingsSection: View {
 
             SettingsDivider()
 
+            SummarySettingsRow {
+                Text("Generated titles")
+                Text("Use the generated task title for agents that do not have a manual title.")
+                    .foregroundStyle(.secondary)
+            } control: {
+                Toggle("Generated titles", isOn: $settings.useAgentSummaryAsTitle)
+                    .labelsHidden()
+            }
+
+            SettingsDivider()
+
             VStack(alignment: .leading, spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Command preview")
@@ -264,8 +275,11 @@ private struct SummarySettingsSection: View {
                     workingDirectory: NSHomeDirectory(),
                     model: settings.agentSummaryModel
                 )
+                let resultText = [result.title, result.summary]
+                    .compactMap { $0 }
+                    .joined(separator: " — ")
                 await MainActor.run {
-                    testStatus = .success(result.summary)
+                    testStatus = .success(resultText)
                 }
             } catch {
                 await MainActor.run {

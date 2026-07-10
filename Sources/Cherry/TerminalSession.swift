@@ -1046,8 +1046,18 @@ final class TerminalWorkspace: ObservableObject {
     @Published private(set) var terminalSplitGroups: [TerminalSplitGroup] = []
     @Published private(set) var terminalDetailWidth: CGFloat = 0
     @Published private(set) var browserWorkspace: BrowserWorkspace? = nil
-    @Published private(set) var browserPlacement: WorkspaceBrowserPlacement = .closed
-    @Published private(set) var activePaneSelection: WorkspacePaneSelection
+    @Published private(set) var browserPlacement: WorkspaceBrowserPlacement = .closed {
+        didSet {
+            guard browserPlacement != oldValue else { return }
+            scheduleHiddenAgentSummaries()
+        }
+    }
+    @Published private(set) var activePaneSelection: WorkspacePaneSelection {
+        didSet {
+            guard activePaneSelection != oldValue else { return }
+            scheduleHiddenAgentSummaries()
+        }
+    }
     @Published private(set) var browserSplitWidthWeights: [Double] = []
     @Published var selectedSessionID: UUID? {
         didSet {
@@ -1056,6 +1066,10 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
     let projectRoot: String?
+
+#if DEBUG
+    var hiddenAgentSummarySchedulingObserverForTesting: (() -> Void)?
+#endif
 
     init(projectRoot: String? = nil) {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
@@ -1077,6 +1091,13 @@ final class TerminalWorkspace: ObservableObject {
 
     var runningAgentSessions: [TerminalSession] {
         agentSessions.filter(\.isRunning)
+    }
+
+    func scheduleHiddenAgentSummaries() {
+#if DEBUG
+        hiddenAgentSummarySchedulingObserverForTesting?()
+#endif
+        agentSessions.forEach { $0.scheduleSummaryWhenHiddenIfNeeded() }
     }
 
     /// Sessions currently running a process across every kind — broader than
@@ -1340,6 +1361,7 @@ final class TerminalWorkspace: ObservableObject {
         if let previousSelectedSessionID,
            let previousSession = sessions.first(where: { $0.id == previousSelectedSessionID }) {
             previousSession.setAuxiliaryProcessingActive(false)
+            previousSession.scheduleSummaryWhenHiddenIfNeeded()
         }
 
         selectedSession?.setAuxiliaryProcessingActive(true)
@@ -2659,7 +2681,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// like process listings that poll many sessions. The render signal keeps the
     /// native line model current; this just reads it.
     var listingLineCount: Int {
-        GhosttySessionBridge.nativePTYEnabled ? nativeContentLines.count : processor.lineCount
+        GhosttySessionBridge.nativePTYEnabled && ghosttyBridgeStorage != nil
+            ? nativeContentLines.count
+            : processor.lineCount
     }
 
     var cursorState: TerminalCursorState {
@@ -2938,11 +2962,12 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func applyAutomaticSummary(
         _ nextSummary: String,
+        title nextTitle: String? = nil,
         useAsTitle: Bool,
         agentActivityState nextAgentActivityState: AgentActivityState? = nil
     ) {
         let sanitized = sanitizedSummary(nextSummary).nilIfEmpty
-        let shouldApplyTitle = kind != .agent && useAsTitle && titleSource != .explicit && sanitized != nil
+        let generatedTitle = sanitizedAgentTitle(nextTitle) ?? (kind == .agent ? nil : sanitized)
         var didChange = false
 
         if summary != sanitized {
@@ -2950,11 +2975,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             didChange = true
         }
 
-        if shouldApplyTitle, let sanitized {
-            automaticTitle = sanitized
-            title = sanitized
-            titleSource = .automatic
-            didChange = true
+        if useAsTitle, let generatedTitle {
+            if automaticTitle != generatedTitle,
+               (titleSource != .explicit || kind == .agent) {
+                automaticTitle = generatedTitle
+                didChange = true
+            }
+            if titleSource != .explicit,
+               title != generatedTitle || titleSource != .automatic {
+                title = generatedTitle
+                titleSource = .automatic
+                didChange = true
+            }
         }
 
         if kind == .agent, let nextAgentActivityState {
@@ -2965,6 +2997,18 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         guard didChange else { return }
         bumpRevision()
+    }
+
+    func clearAutomaticSummaryTitle() {
+        automaticTitle = nil
+        guard titleSource == .automatic else { return }
+        title = systemTitle
+        titleSource = .system
+        bumpRevision()
+    }
+
+    func scheduleSummaryWhenHiddenIfNeeded() {
+        scheduleSummaryIfNeeded()
     }
 
     func stop() {
@@ -3156,6 +3200,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
+        resetAutomaticSummaryForNewAgentLaunch()
         resetKeyboardProtocolState()
         outputHoldUntil = nil
         backgroundOutputThrottleTask?.cancel()
@@ -3259,6 +3304,20 @@ final class TerminalSession: ObservableObject, Identifiable {
                 "launch failed: \(error.localizedDescription)"
             ])
             bumpRevision()
+        }
+    }
+
+    private func resetAutomaticSummaryForNewAgentLaunch() {
+        guard kind == .agent else { return }
+        summaryGeneration &+= 1
+        lastSummaryOutputChangeDate = nil
+        lastSummaryInput = nil
+        lastSummaryDate = nil
+        summary = nil
+        automaticTitle = nil
+        if titleSource == .automatic {
+            title = systemTitle
+            titleSource = .system
         }
     }
 
@@ -3678,13 +3737,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentLineCount() -> Int {
-        guard GhosttySessionBridge.nativePTYEnabled else { return processor.lineCount }
+        guard GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil else {
+            return processor.lineCount
+        }
         ensureNativeContentFresh()
         return nativeContentLines.count
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
-        guard GhosttySessionBridge.nativePTYEnabled else {
+        guard GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil else {
             return processor.snapshot(range: range)
         }
         ensureNativeContentFresh()
@@ -4349,6 +4410,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func startSummary(generation: Int, command: String) {
         guard generation == summaryGeneration, kind == .agent else { return }
+        guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
         let transcript = summaryTranscript()
         let transcriptOutputVersion = outputVersion
         guard !transcript.text.isEmpty else {
@@ -4362,7 +4424,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         let settings = AgentSettings.shared
-        let useAsTitle = settings.useAgentSummaryAsTitle
         let summaryModel = settings.agentSummaryModel
         let prompt = summaryPrompt(for: transcript.text)
         let summaryWorkingDirectory = workingDirectory
@@ -4391,12 +4452,14 @@ final class TerminalSession: ObservableObject, Identifiable {
                         command: command,
                         transcript: transcript,
                         prompt: result.prompt,
+                        title: result.title,
                         summary: result.summary,
                         error: nil
                     )
                     self.applyAutomaticSummary(
                         result.summary,
-                        useAsTitle: useAsTitle,
+                        title: result.title,
+                        useAsTitle: AgentSettings.shared.useAgentSummaryAsTitle,
                         agentActivityState: result.state
                     )
                 }
@@ -4432,13 +4495,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         command: String,
         transcript: SummaryTranscript,
         prompt: String,
+        title: String? = nil,
         summary: String?,
         error: String?
     ) {
         AgentSummaryDebugStore.shared.record(.init(
             date: Date(),
             sessionID: id,
-            sessionTitle: title,
+            sessionTitle: self.title,
             command: command,
             workingDirectory: workingDirectory,
             inputLineCount: transcript.inputLineCount,
@@ -4446,6 +4510,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             charactersSent: prompt.count,
             transcript: transcript.text,
             prompt: prompt,
+            title: title,
             summary: summary,
             error: error
         ))

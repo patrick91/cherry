@@ -419,7 +419,7 @@ enum AgentSummaryTool: String, CaseIterable, Identifiable {
     var defaultModel: String {
         switch self {
         case .codex:
-            "gpt-5.3-codex-spark"
+            "gpt-5.6-luna"
         }
     }
 
@@ -427,12 +427,12 @@ enum AgentSummaryTool: String, CaseIterable, Identifiable {
         switch self {
         case .codex:
             [
-                "gpt-5.3-codex-spark",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-                "gpt-5.4",
+                "gpt-5.6-luna",
+                "gpt-5.6-terra",
+                "gpt-5.6-sol",
                 "gpt-5.5",
-                "gpt-5.2"
+                "gpt-5.4-mini",
+                "gpt-5.4"
             ]
         }
     }
@@ -440,7 +440,7 @@ enum AgentSummaryTool: String, CaseIterable, Identifiable {
     var modelFlagDescription: String {
         switch self {
         case .codex:
-            "Passed to the Codex MCP tool via -m"
+            "Passed as the model argument to Codex MCP"
         }
     }
 
@@ -657,6 +657,11 @@ final class AgentSettings: ObservableObject {
     }
     @Published var useAgentSummaryAsTitle: Bool {
         didSet {
+            if !useAgentSummaryAsTitle {
+                for workspace in ProjectWindowRegistry.shared.allWorkspaces() {
+                    workspace.sessions.forEach { $0.clearAutomaticSummaryTitle() }
+                }
+            }
             saveSummarySettings()
         }
     }
@@ -1139,7 +1144,10 @@ final class AgentSettings: ObservableObject {
     private static func loadAgentSummaryModel(from defaults: UserDefaults, tool: AgentSummaryTool) -> String {
         let storedModel = defaults.string(forKey: Keys.agentSummaryModel)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if storedModel.isEmpty || storedModel == "gpt-5-codex" || storedModel == "haiku" {
+        if storedModel.isEmpty
+            || storedModel == "gpt-5-codex"
+            || storedModel == "gpt-5.3-codex-spark"
+            || storedModel == "haiku" {
             return AgentSummaryTool.codex.defaultModel
         }
         return storedModel

@@ -340,6 +340,7 @@ final class ProjectWindowRegistry {
                 workspace.visibleTerminalSessionIDs.contains(session.id)
             } else {
                 workspace.selectedSessionID == session.id
+                    && !workspace.isStandaloneBrowserSelected
             }
             guard isVisibleSession else { continue }
 

@@ -96,7 +96,12 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         guard !summaryContent.summary.isEmpty else {
             throw AgentSummaryRunner.SummaryError.emptyOutput
         }
-        return .init(summary: summaryContent.summary, state: summaryContent.state, prompt: prompt)
+        return .init(
+            title: summaryContent.title,
+            summary: summaryContent.summary,
+            state: summaryContent.state,
+            prompt: prompt
+        )
     }
 
     private func ensureServer() throws {
@@ -316,13 +321,13 @@ func codexMCPSummaryToolArguments(
     return [
         "prompt": prompt,
         "approval-policy": "never",
-        "sandbox": "workspace-write",
+        "sandbox": "read-only",
         "cwd": summaryRunnerWorkingDirectoryURL(
             workingDirectory,
             fallback: FileManager.default.homeDirectoryForCurrentUser
         ).path,
         "model": summaryModel,
-        "base-instructions": "Return only a single-line JSON object with keys state and summary. Do not use tools unless necessary.",
+        "base-instructions": "Return only a single-line JSON object with exactly the keys state, title, and summary. Do not use tools.",
         "config": [
             "model_reasoning_effort": "low"
         ]

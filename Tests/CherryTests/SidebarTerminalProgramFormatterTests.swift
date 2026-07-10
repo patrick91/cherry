@@ -31,6 +31,22 @@ import Testing
     ))
 }
 
+@Test func sidebarTerminalProgramFormatterFindsCommandAfterUvxPackageOptions() async throws {
+    let command = "uvx --from 'fastapi[standard]' --with-editable /Users/patrick/github/fastapilabs/fastapi --with-editable /Users/patrick/github/fastapilabs/fastapi-cloud-cli fastapi deploy"
+
+    #expect(SidebarTerminalProgramFormatter.label(
+        for: command,
+        workingDirectory: "/Users/patrick/github/test-patrick/kenbun-workspace",
+        homeDirectory: "/Users/patrick"
+    ) == SidebarTerminalPathLabel(
+        title: "FastAPI",
+        detail: command,
+        leadingIconResourceName: "fastapi",
+        leadingIconFallback: "Fa",
+        leadingIconRendersAsTemplate: true
+    ))
+}
+
 @Test func sidebarProjectCommandFormatterUsesCommandLineProgramIcon() async throws {
     let command = ProjectCommandDefinition(
         name: "fastapi dev",

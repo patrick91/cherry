@@ -170,7 +170,10 @@ enum SidebarTerminalProgramFormatter {
             return (runner, target)
         case "uvx":
             guard let runner = ProgramCatalog.descriptor(forExecutable: "uvx"),
-                  let target = firstRunnableToken(from: Array(tokens.dropFirst()))
+                  let target = firstRunnableToken(
+                    from: Array(tokens.dropFirst()),
+                    additionalOptionsTakingValue: uvxOptionsTakingValue
+                  )
             else { return nil }
             return (runner, target)
         case "uv":
@@ -199,7 +202,10 @@ enum SidebarTerminalProgramFormatter {
         }
     }
 
-    private static func firstRunnableToken(from tokens: [String]) -> String? {
+    private static func firstRunnableToken(
+        from tokens: [String],
+        additionalOptionsTakingValue: Set<String> = []
+    ) -> String? {
         var index = 0
         while index < tokens.count {
             let token = tokens[index]
@@ -212,7 +218,8 @@ enum SidebarTerminalProgramFormatter {
                 continue
             }
             if token.hasPrefix("-") {
-                if optionTakesValue(token), index + 1 < tokens.count {
+                if optionTakesValue(token, additionalOptions: additionalOptionsTakingValue),
+                   index + 1 < tokens.count {
                     index += 2
                 } else {
                     index += 1
@@ -295,9 +302,12 @@ enum SidebarTerminalProgramFormatter {
         return name.allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
     }
 
-    private static func optionTakesValue(_ option: String) -> Bool {
+    private static func optionTakesValue(
+        _ option: String,
+        additionalOptions: Set<String> = []
+    ) -> Bool {
         guard !option.contains("=") else { return false }
-        return optionsTakingValue.contains(option)
+        return optionsTakingValue.contains(option) || additionalOptions.contains(option)
     }
 
     private static let wrapperCommands: Set<String> = [
@@ -308,6 +318,23 @@ enum SidebarTerminalProgramFormatter {
         "-C", "-E", "-H", "-P", "-S", "-c", "-g", "-h", "-p", "-u",
         "--cache", "--cwd", "--directory", "--package", "--prefix", "--registry",
         "--shell", "--user", "--userconfig"
+    ]
+
+    // uvx accepts package/environment options before the command it eventually
+    // launches. Skip their values so `uvx --from fastapi[standard] fastapi deploy`
+    // is presented as FastAPI rather than as the package spec or uvx itself.
+    private static let uvxOptionsTakingValue: Set<String> = [
+        "-b", "-f", "-i", "-w",
+        "--allow-insecure-host", "--build-constraints", "--cache-dir", "--color",
+        "--config-file", "--config-setting", "--config-settings-package",
+        "--constraints", "--default-index", "--env-file", "--exclude-newer",
+        "--exclude-newer-package", "--extra-index-url", "--find-links", "--fork-strategy",
+        "--from", "--index", "--index-strategy", "--index-url", "--keyring-provider",
+        "--link-mode", "--no-binary-package", "--no-build-isolation-package",
+        "--no-build-package", "--no-sources-package", "--overrides", "--prerelease",
+        "--project", "--python", "--python-platform", "--refresh-package", "--reinstall-package",
+        "--resolution", "--torch-backend", "--upgrade-group", "--upgrade-package",
+        "--with", "--with-editable", "--with-requirements"
     ]
 }
 

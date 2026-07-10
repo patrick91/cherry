@@ -149,6 +149,7 @@ public enum CherryMCPTools {
             properties: [
                 "kind": string("Process kind: terminal, agent, or command."),
                 "name": string("Configured agent or command name. Not used for terminal."),
+                "model": string("Optional model override for supported agent CLIs. Only valid for kind=agent."),
                 "title": string("Optional custom title."),
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
@@ -165,6 +166,7 @@ public enum CherryMCPTools {
             "Create a configured Cherry agent process without selecting it. This is the agent-specific wrapper around spawn_process.",
             properties: [
                 "name": string("Configured agent name."),
+                "model": string("Optional model override for supported agent CLIs."),
                 "title": string("Optional custom title."),
                 "message": string("Optional first message to submit after launch. A final Enter is added automatically when omitted."),
                 "parent_agent_id": string("Optional parent Cherry agent UUID. Defaults to the bound caller agent when available; unbound sessions create top-level agents."),
@@ -654,6 +656,7 @@ public enum CherryMCPTools {
         let request = CherryControlRequest.spawnProcess(.init(
             kind: "agent",
             name: try requiredString("name", in: arguments),
+            model: stringArgument("model", in: arguments),
             title: stringArgument("title", in: arguments),
             workingDirectory: nil,
             text: message,
@@ -933,6 +936,7 @@ public enum CherryMCPTools {
             return .spawnProcess(.init(
                 kind: kind,
                 name: stringArgument("name", in: arguments),
+                model: stringArgument("model", in: arguments),
                 title: stringArgument("title", in: arguments),
                 workingDirectory: stringArgument("working_directory", in: arguments),
                 text: stringArgument("text", in: arguments),

@@ -513,11 +513,13 @@ private struct MCPSendProcessInputPayload: Decodable {
 private struct MCPAgentProcessReference: Decodable {
     let id: String
     let kind: String
+    let commandLine: String?
     let parentAgentID: String?
 
     private enum CodingKeys: String, CodingKey {
         case id
         case kind
+        case commandLine = "command_line"
         case parentAgentID = "parent_agent_id"
     }
 }
@@ -1192,6 +1194,7 @@ private struct MCPWhoamiPayload: Decodable {
     let parentAgentID = UUID().uuidString
     let request = CherryControlRequest.runAgent(.init(
         agentName: "Codex",
+        model: "gpt-5.4-mini",
         title: "Review workflow",
         text: "status\n",
         rawBase64: nil,
@@ -1287,7 +1290,7 @@ private struct MCPWhoamiPayload: Decodable {
         .getProcessPorts(.init(processID: processID, includeUnattributed: true)),
         .servicesList(.init(kind: "command", includeUnattributed: false)),
         .waitForBoundPort(.init(processID: processID, port: 5173, timeoutMilliseconds: 500, probeHTTP: true, path: "/health")),
-        .spawnProcess(.init(kind: "agent", name: "Codex", text: "review status", submit: true, parentAgentID: processID, waitMilliseconds: 100, lineLimit: 20)),
+        .spawnProcess(.init(kind: "agent", name: "Codex", model: "gpt-5.4-mini", text: "review status", submit: true, parentAgentID: processID, waitMilliseconds: 100, lineLimit: 20)),
         .startProcess(.init(processName: "Web", kind: "command", waitMilliseconds: 100, lineLimit: 20)),
         .stopProcess(.init(processID: processID)),
         .restartProcess(.init(processID: processID)),
@@ -1795,6 +1798,74 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerAppliesPerLaunchAgentModelOverride() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(
+        name: "Codex",
+        command: "/bin/echo",
+        arguments: "--yolo"
+    ))
+    harness.server.start()
+
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Codex",
+        model: "gpt-5.4-mini"
+    )))
+
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
+        return
+    }
+
+    #expect(response.error == nil)
+    #expect(result.process.commandLine == "/bin/echo --yolo --model gpt-5.4-mini")
+    #expect(harness.workspace.agentSessions.first?.subtitle == "/bin/echo --yolo --model gpt-5.4-mini")
+}
+
+@MainActor
+@Test func controlServerRejectsUnsupportedAndMisplacedModelOverrides() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Custom", command: "/bin/echo"))
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Amp", command: "amp"))
+    harness.server.start()
+
+    let customResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Custom",
+        model: "some-model"
+    )))
+    #expect(customResponse.error?.code == "unsupported_model_override")
+
+    let ampResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Amp",
+        model: "some-model"
+    )))
+    #expect(ampResponse.error?.code == "unsupported_model_override")
+
+    let terminalResponse = try await harness.send(.spawnProcess(.init(
+        kind: "terminal",
+        model: "some-model"
+    )))
+    #expect(terminalResponse.error?.code == "invalid_process_request")
+
+    let emptyResponse = try await harness.send(.runAgent(.init(
+        agentName: "Custom",
+        model: "  "
+    )))
+    #expect(emptyResponse.error?.code == "invalid_model")
+}
+
+@MainActor
 @Test func controlServerRunAgentSubmitsPlainTextPromptByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -2291,6 +2362,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(properties["parent_agent_id"] != nil)
     #expect(properties["submit"] != nil)
+    #expect(properties["model"] != nil)
     #expect(properties["top_level"] == nil)
 }
 
@@ -2321,6 +2393,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawnRequired = try #require(spawnSchema["required"]?.arrayValue)
 
     #expect(spawnProperties["name"] != nil)
+    #expect(spawnProperties["model"] != nil)
     #expect(spawnProperties["message"] != nil)
     #expect(spawnProperties["bind_session"] != nil)
     #expect(spawnProperties["raw_base64"] == nil)
@@ -2574,6 +2647,38 @@ private struct MCPWhoamiPayload: Decodable {
         }
         return false
     })
+}
+
+@MainActor
+@Test func mcpSpawnAgentForwardsPerLaunchModelOverride() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/echo", arguments: "--yolo"))
+    harness.server.start()
+
+    let result = await CherryMCPTools.call(
+        name: "spawn_agent",
+        arguments: [
+            "name": .string("Codex"),
+            "model": .string("gpt-5.4-mini")
+        ]
+    )
+    let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: result)
+
+    #expect(spawned.process.kind == "agent")
+    #expect(spawned.process.commandLine == "/bin/echo --yolo --model gpt-5.4-mini")
 }
 
 @MainActor
@@ -8564,6 +8669,30 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo", enabled: true),
         AgentToolDefinition(name: "Claude", command: "claude", arguments: "", enabled: true)
     ])
+}
+
+@Test func agentDefinitionsBuildProviderSpecificModelOverridesSafely() {
+    let definitions: [(AgentToolBrand, String)] = [
+        (.codex, "Codex"),
+        (.claude, "Claude"),
+        (.gemini, "Gemini"),
+        (.openCode, "OpenCode"),
+        (.pi, "Pi")
+    ]
+
+    for (brand, name) in definitions {
+        let agent = AgentToolDefinition(name: name, command: name.lowercased(), arguments: "--existing")
+        #expect(
+            agent.overridingModel("provider/model:high", for: brand).arguments
+                == "--existing --model provider/model:high"
+        )
+    }
+
+    let codex = AgentToolDefinition(name: "Codex", command: "codex")
+    #expect(
+        codex.overridingModel("gpt'; touch /tmp/not-run", for: .codex).arguments
+            == "--model 'gpt'\\''; touch /tmp/not-run'"
+    )
 }
 
 @Test func agentDefinitionsRejectDuplicateNames() async throws {

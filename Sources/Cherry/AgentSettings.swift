@@ -80,6 +80,15 @@ enum AgentToolBrand: String, Equatable {
         }
     }
 
+    var modelFlag: String? {
+        switch self {
+        case .codex, .claude, .gemini, .openCode, .pi:
+            "--model"
+        case .amp:
+            nil
+        }
+    }
+
     static func detect(name: String?, commandLine: String? = nil) -> AgentToolBrand? {
         for source in [name, commandLine].compactMap({ $0 }) {
             let tokens = source
@@ -107,6 +116,26 @@ enum AgentToolBrand: String, Equatable {
             }
         }
         return nil
+    }
+}
+
+extension AgentToolDefinition {
+    func overridingModel(_ model: String, for brand: AgentToolBrand) -> AgentToolDefinition {
+        guard let modelFlag = brand.modelFlag else { return self }
+
+        var overridden = self
+        let overrideArguments = "\(modelFlag) \(Self.shellQuoted(model))"
+        overridden.arguments = [arguments, overrideArguments]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return overridden
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        let safeCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.=/:+")
+        guard value.rangeOfCharacter(from: safeCharacters.inverted) != nil else { return value }
+        return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }
 

@@ -338,6 +338,7 @@ public struct WaitForBoundPortRequest: Codable, Equatable, Sendable {
 public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let kind: String
     public let name: String?
+    public let model: String?
     public let title: String?
     public let workingDirectory: String?
     public let text: String?
@@ -350,6 +351,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public init(
         kind: String,
         name: String? = nil,
+        model: String? = nil,
         title: String? = nil,
         workingDirectory: String? = nil,
         text: String? = nil,
@@ -361,6 +363,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     ) {
         self.kind = kind
         self.name = name
+        self.model = model
         self.title = title
         self.workingDirectory = workingDirectory
         self.text = text
@@ -675,6 +678,7 @@ public struct CreateTerminalRequest: Codable, Equatable, Sendable {
 
 public struct RunAgentRequest: Codable, Equatable, Sendable {
     public let agentName: String
+    public let model: String?
     public let title: String?
     public let text: String?
     public let rawBase64: String?
@@ -686,6 +690,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
 
     public init(
         agentName: String,
+        model: String? = nil,
         title: String? = nil,
         text: String? = nil,
         rawBase64: String? = nil,
@@ -696,6 +701,7 @@ public struct RunAgentRequest: Codable, Equatable, Sendable {
         select: Bool? = nil
     ) {
         self.agentName = agentName
+        self.model = model
         self.title = title
         self.text = text
         self.rawBase64 = rawBase64

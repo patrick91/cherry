@@ -142,9 +142,11 @@ original output-quiet behavior.
 
 A typical agent-native flow:
 
-1. `spawn_agent` with the configured agent name. Keep the returned
-   `process.id`; agent sessions are not rebound by default so multi-agent
-   orchestration does not accidentally message the most recently spawned agent.
+1. `spawn_agent` with the configured agent name. Pass `model` to override the
+   configured agent's model for this launch. Codex, Claude, Gemini, OpenCode,
+   and Pi support model overrides; Amp and unrecognized custom agents do not.
+   Keep the returned `process.id`; agent sessions are not rebound by default so
+   multi-agent orchestration does not accidentally message the most recently spawned agent.
    For a single-agent conversation, pass `bind_session: true`.
 2. `send_agent_message` with `process_id` and `message`; no trailing newline is
    required. By default it sends the message and waits for new output plus a

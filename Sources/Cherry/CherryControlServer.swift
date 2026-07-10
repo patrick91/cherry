@@ -553,12 +553,13 @@ final class CherryControlServer: @unchecked Sendable {
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
-            let agent = try findAgent(named: request.agentName)
-            guard agent.isLaunchable else {
-                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
+            let resolvedAgent = try findAgent(named: request.agentName)
+            guard resolvedAgent.isLaunchable else {
+                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
+            let agent = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
             let session = workspace.addAgentSession(
-                agent: agent.definition,
+                agent: agent,
                 projectRoot: projectRoot,
                 title: request.title,
                 parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
@@ -575,8 +576,8 @@ final class CherryControlServer: @unchecked Sendable {
             )
             let sentBytes: Int
             if let initialInput, !initialInput.isEmpty {
-                await waitForAgentInitialInputReadiness(session: session, agent: agent.definition)
-                sentBytes = await sendInitialAgentInput(initialInput, to: session, agent: agent.definition)
+                await waitForAgentInitialInputReadiness(session: session, agent: agent)
+                sentBytes = await sendInitialAgentInput(initialInput, to: session, agent: agent)
             } else {
                 sentBytes = 0
             }
@@ -1230,6 +1231,9 @@ final class CherryControlServer: @unchecked Sendable {
             guard request.name == nil else {
                 throw CherryControlError(code: "invalid_process_request", message: "Terminal processes do not use name; pass title instead.")
             }
+            guard request.model == nil else {
+                throw CherryControlError(code: "invalid_process_request", message: "Model overrides are only valid for agent processes.")
+            }
             session = workspace.addSession(title: request.title, workingDirectory: request.workingDirectory, select: false)
             agent = nil
         case .agent:
@@ -1240,15 +1244,19 @@ final class CherryControlServer: @unchecked Sendable {
             guard resolvedAgent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
+            let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
             session = workspace.addAgentSession(
-                agent: resolvedAgent.definition,
+                agent: agentDefinition,
                 projectRoot: projectRoot,
                 title: request.title,
                 parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
                 select: false
             )
-            agent = resolvedAgent.definition
+            agent = agentDefinition
         case .command:
+            guard request.model == nil else {
+                throw CherryControlError(code: "invalid_process_request", message: "Model overrides are only valid for agent processes.")
+            }
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
@@ -1284,6 +1292,28 @@ final class CherryControlServer: @unchecked Sendable {
             sentBytes = input?.payload.count ?? 0
         }
         return (session, sentBytes)
+    }
+
+    private func agentDefinition(
+        _ agent: AgentToolDefinition,
+        overridingModel requestedModel: String?
+    ) throws -> AgentToolDefinition {
+        guard let requestedModel else { return agent }
+
+        let model = requestedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            throw CherryControlError(code: "invalid_model", message: "Model override cannot be empty.")
+        }
+
+        let brand = AgentToolBrand.detect(name: nil, commandLine: agent.commandLine)
+            ?? AgentToolBrand.detect(name: agent.name)
+        guard let brand, brand.modelFlag != nil else {
+            throw CherryControlError(
+                code: "unsupported_model_override",
+                message: "Agent '\(agent.name)' does not support per-launch model overrides."
+            )
+        }
+        return agent.overridingModel(model, for: brand)
     }
 
     @MainActor

@@ -2448,6 +2448,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastSummaryInput: String?
     private var lastSummaryDate: Date?
     private var lastHumanInputLine: Int?
+    private var humanInputGeneration = 0
     private var agentActivitySource: AgentActivitySource = .none
     private var titleIndicatesAgentWorking = false
     private var lastTitleSpinnerAt: Date?
@@ -2891,6 +2892,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         shellProcess?.writeUrgent(Data([0x03]))
     }
 
+    func noteNativeHostInput(event: NSEvent?) {
+        noteInputOutputBaseline()
+        guard kind == .agent, Self.appKitKeyEventSubmitsAgentTurn(event) else { return }
+        noteHumanInputIfNeeded()
+        setAgentActivityState(.working, source: .inputSubmit)
+        scheduleAgentIdleRecheck()
+    }
+
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
     /// when host input carries ^C, drop output we've already queued
     /// internally so the interrupt takes effect immediately even when a
@@ -3136,6 +3145,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 #if DEBUG
     func noteTestingInput(_ data: Data) {
         noteInputBurst(data)
+    }
+
+    func setLastSummaryDateForTesting(_ date: Date?) {
+        lastSummaryDate = date
     }
 #endif
 
@@ -4326,6 +4339,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         return false
     }
 
+    static func appKitKeyEventSubmitsAgentTurn(_ event: NSEvent?) -> Bool {
+        guard let event, event.type == .keyDown else { return false }
+        guard event.keyCode == 36 || event.keyCode == 76 else { return false }
+
+        let heldModifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        return heldModifiers.isEmpty
+    }
+
     @discardableResult
     private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
         guard kind == .agent else { return false }
@@ -4390,9 +4411,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let command = settings.effectiveAgentSummaryCommand.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let now = Date()
-        if let lastSummaryDate, now.timeIntervalSince(lastSummaryDate) < settings.agentSummaryCadence.interval {
-            return
-        }
+        let cadenceReadyDate = lastSummaryDate?.addingTimeInterval(settings.agentSummaryCadence.interval) ?? now
         guard summaryDebounceTask == nil, summaryTask == nil else { return }
 
         summaryGeneration &+= 1
@@ -4405,7 +4424,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     let latestOutputDate = self.lastSummaryOutputChangeDate ?? scheduledAt
                     let idleReadyDate = latestOutputDate.addingTimeInterval(Self.summaryIdleInterval)
                     let maximumReadyDate = scheduledAt.addingTimeInterval(Self.summaryMaximumIdleWait)
-                    let readyDate = min(idleReadyDate, maximumReadyDate)
+                    let activityReadyDate = min(idleReadyDate, maximumReadyDate)
+                    let readyDate = max(cadenceReadyDate, activityReadyDate)
                     return max(0, readyDate.timeIntervalSinceNow)
                 }
                 if waitSeconds <= 0 { break }
@@ -4424,6 +4444,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard canRunSummaryAtCurrentVisibility else { return }
         let transcript = summaryTranscript()
         let transcriptOutputVersion = outputVersion
+        let transcriptHumanInputGeneration = humanInputGeneration
         guard !transcript.text.isEmpty else {
             recordSummaryDebug(command: command, transcript: transcript, prompt: "", summary: nil, error: "No summarizable terminal output yet.")
             return
@@ -4450,9 +4471,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                         return
                     }
                     let outputChanged = self.outputVersion != transcriptOutputVersion
+                    let submittedTurnChanged = self.humanInputGeneration != transcriptHumanInputGeneration
                     self.summaryTask = nil
-                    guard generation == self.summaryGeneration, !outputChanged else {
-                        if outputChanged {
+                    guard generation == self.summaryGeneration, !submittedTurnChanged else {
+                        if submittedTurnChanged {
                             self.scheduleSummaryIfNeeded()
                         }
                         return
@@ -4471,8 +4493,14 @@ final class TerminalSession: ObservableObject, Identifiable {
                         result.summary,
                         title: result.title,
                         useAsTitle: AgentSettings.shared.useAgentSummaryAsTitle,
-                        agentActivityState: result.state
+                        // The title and summary still describe this submitted
+                        // turn, but activity state is point-in-time data. Do not
+                        // let an older snapshot overwrite fresher output signals.
+                        agentActivityState: outputChanged ? nil : result.state
                     )
+                    if outputChanged {
+                        self.scheduleSummaryIfNeeded()
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -4482,9 +4510,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                         return
                     }
                     let outputChanged = self.outputVersion != transcriptOutputVersion
+                    let submittedTurnChanged = self.humanInputGeneration != transcriptHumanInputGeneration
                     self.summaryTask = nil
-                    guard generation == self.summaryGeneration, !outputChanged else {
-                        if outputChanged {
+                    guard generation == self.summaryGeneration, !submittedTurnChanged else {
+                        if submittedTurnChanged {
                             self.scheduleSummaryIfNeeded()
                         }
                         return
@@ -4497,6 +4526,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                         summary: nil,
                         error: error.localizedDescription
                     )
+                    if outputChanged || self.needsInitialGeneratedTitle {
+                        self.scheduleSummaryIfNeeded()
+                    }
                 }
             }
         }
@@ -4505,11 +4537,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var canRunSummaryAtCurrentVisibility: Bool {
         guard summaryVisibilityProvider(self) else { return true }
 
-        // Keep recurring summaries in the background, but let a visible,
-        // untitled agent get its first task title after the user submits work.
-        // This is the normal path for agents created from the sidebar, which do
-        // not have an MCP caller supplying an explicit title at creation time.
+        // Visible agents still need generated-title refreshes. Avoid summarizing
+        // their startup screen before any work is submitted, and keep explicit
+        // titles entirely user-owned.
         return AgentSettings.shared.useAgentSummaryAsTitle
+            && titleSource != .explicit
+            && (titleSource == .automatic || lastHumanInputLine != nil)
+    }
+
+    private var needsInitialGeneratedTitle: Bool {
+        AgentSettings.shared.useAgentSummaryAsTitle
             && titleSource == .system
             && lastHumanInputLine != nil
     }
@@ -4567,6 +4604,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func noteHumanInputIfNeeded() {
         guard kind == .agent else { return }
         lastHumanInputLine = effectiveAgentContentLineCount()
+        humanInputGeneration &+= 1
     }
 
     private static func shouldDropSummaryLine(_ line: String) -> Bool {

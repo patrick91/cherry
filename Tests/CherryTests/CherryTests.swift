@@ -8876,7 +8876,19 @@ private func waitForSummaryCallCount(
         summaryVisibilityProvider: { _ in true }
     )
 
-    session.noteTestingInput(Data("Improve manually created agent titles\n".utf8))
+    let returnKey = try #require(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: "\r",
+        charactersIgnoringModifiers: "\r",
+        isARepeat: false,
+        keyCode: 36
+    ))
+    session.noteNativeHostInput(event: returnKey)
     session.ingestTestingData(Data("Reviewing the agent title scheduler\n".utf8))
 
     try await waitForSummaryCallCount(1, runner: runner)
@@ -8894,7 +8906,76 @@ private func waitForSummaryCallCount(
 }
 
 @MainActor
-@Test func staleInFlightAgentSummaryIsDiscardedAfterNewOutput() async throws {
+@Test func visibleAgentRefreshesExistingAutomaticTitle() async throws {
+    let previousUseAsTitle = AgentSettings.shared.useAgentSummaryAsTitle
+    AgentSettings.shared.useAgentSummaryAsTitle = true
+    defer {
+        AgentSettings.shared.useAgentSummaryAsTitle = previousUseAsTitle
+    }
+
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Initial task",
+        titleSource: .automatic,
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        },
+        summaryVisibilityProvider: { _ in true }
+    )
+
+    session.ingestTestingData(Data("Implementing the next task\n".utf8))
+
+    try await waitForSummaryCallCount(1, runner: runner)
+    await runner.completeCall(
+        at: 0,
+        title: "Next task",
+        summary: "implementing the next task"
+    )
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.title == "Next task")
+    #expect(session.summary == "implementing the next task")
+}
+
+@MainActor
+@Test func agentSummaryScheduledInsideCadenceWindowRunsWhenCadenceElapses() async throws {
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        }
+    )
+    let cadence = AgentSettings.shared.agentSummaryCadence.interval
+    session.setLastSummaryDateForTesting(Date(timeIntervalSinceNow: -cadence + 0.15))
+
+    session.ingestTestingData(Data("finishing work just inside the cadence window\n".utf8))
+
+    try await waitForSummaryCallCount(1, runner: runner)
+    #expect(await runner.transcript(at: 0)?.contains("finishing work just inside the cadence window") == true)
+    await runner.completeCall(at: 0, summary: "finishing work inside the cadence window")
+}
+
+@MainActor
+@Test func inFlightAgentSummaryAppliesWhileSameTurnProducesOutput() async throws {
     let previousUseAsTitle = AgentSettings.shared.useAgentSummaryAsTitle
     AgentSettings.shared.useAgentSummaryAsTitle = true
     defer {
@@ -8918,10 +8999,55 @@ private func waitForSummaryCallCount(
         }
     )
 
+    session.noteTestingInput(Data("Diagnose MCP startup failures\n".utf8))
+    session.ingestTestingData(Data("diagnosing MCP startup failures\n".utf8))
+    try await waitForSummaryCallCount(1, runner: runner)
+
+    session.ingestTestingData(Data("still checking the same MCP startup failures\n".utf8))
+    await runner.completeCall(
+        at: 0,
+        title: "MCP startup failures",
+        summary: "diagnosing MCP startup failures",
+        state: .idle
+    )
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.title == "MCP startup failures")
+    #expect(session.summary == "diagnosing MCP startup failures")
+    #expect(session.agentActivityState == .working)
+}
+
+@MainActor
+@Test func staleInFlightAgentSummaryIsDiscardedAfterNewSubmittedTurn() async throws {
+    let previousUseAsTitle = AgentSettings.shared.useAgentSummaryAsTitle
+    AgentSettings.shared.useAgentSummaryAsTitle = true
+    defer {
+        AgentSettings.shared.useAgentSummaryAsTitle = previousUseAsTitle
+    }
+
+    let runner = DeferredAgentSummaryRunner()
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Codex",
+        summaryRunner: { transcript, workingDirectory, model in
+            try await runner.run(
+                transcript: transcript,
+                workingDirectory: workingDirectory,
+                model: model
+            )
+        }
+    )
+
+    session.noteTestingInput(Data("Diagnose MCP startup failures\n".utf8))
     session.ingestTestingData(Data("diagnosing MCP startup failures\n".utf8))
     try await waitForSummaryCallCount(1, runner: runner)
     #expect(await runner.transcript(at: 0)?.contains("diagnosing MCP startup failures") == true)
 
+    session.noteTestingInput(Data("Implement the blog backend conversion plan\n".utf8))
     session.ingestTestingData(Data("implementing blog backend conversion plan\n".utf8))
     try await Task.sleep(for: .milliseconds(80))
 
@@ -11765,6 +11891,37 @@ private func serviceRecord(
     #expect(!GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: copy))
     #expect(GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: paste))
     #expect(GhosttySessionBridge.shouldScrollToBottomForHostInput(currentEvent: text))
+}
+
+@MainActor
+@Test func appKitReturnKeyOnlySubmitsAgentTurnWithoutHeldModifiers() async throws {
+    func returnKey(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) throws -> NSEvent {
+        try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: keyCode
+        ))
+    }
+
+    #expect(TerminalSession.appKitKeyEventSubmitsAgentTurn(
+        try returnKey(keyCode: 36, modifiers: [])
+    ))
+    #expect(TerminalSession.appKitKeyEventSubmitsAgentTurn(
+        try returnKey(keyCode: 76, modifiers: [.numericPad, .function])
+    ))
+    #expect(!TerminalSession.appKitKeyEventSubmitsAgentTurn(
+        try returnKey(keyCode: 36, modifiers: .shift)
+    ))
+    #expect(!TerminalSession.appKitKeyEventSubmitsAgentTurn(
+        try returnKey(keyCode: 36, modifiers: .command)
+    ))
 }
 
 @Test func pastedTextNormalizesLineEndings() async throws {

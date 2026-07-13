@@ -815,6 +815,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func terminalWillSendHostInput() {
         noteHostInputForOutputLatency()
+        if Self.nativePTYEnabled {
+            proxy.session?.noteNativeHostInput(event: NSApp.currentEvent)
+        }
         guard Self.shouldScrollToBottomForHostInput(currentEvent: NSApp.currentEvent) else { return }
         scrollToBottomForHostInput()
     }

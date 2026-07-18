@@ -118,7 +118,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     enum SidebarItem {
         case session(TerminalSession)
-        case browser
         case command(ProjectCommandDefinition)
         case todoBoard
         case note(UUID)
@@ -222,15 +221,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             case .toggleSidebar:
                 chromeState?.toggleSidebar()
             case .addSession:
-                if let workspace,
-                   chromeState?.isShowingTerminalContent == true,
-                   workspace.isBrowserPaneActive,
-                   let browser = workspace.browserWorkspace {
-                    _ = browser.addTab()
-                    browser.requestAddressFocus()
-                } else {
-                    workspace?.addSession()
-                }
+                workspace?.addSession()
             case .splitDuplicate:
                 workspace?.splitDuplicateActiveTerminal()
             case .focusPreviousPane:
@@ -249,17 +240,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         private func closeSelectedSessionOrWindow() {
             guard let workspace else { return }
             if chromeState?.closeSelectedNoteIfNeeded() == true {
-                return
-            }
-
-            if chromeState?.isShowingTerminalContent == true,
-               workspace.isBrowserPaneActive {
-                if let browser = workspace.browserWorkspace,
-                   browser.tabs.count > 1 {
-                    _ = browser.closeTab(browser.selectedTabID)
-                } else {
-                    workspace.closeBrowser()
-                }
                 return
             }
 
@@ -292,9 +272,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 collapsedIDs: chromeState?.collapsedAgentGroupIDs ?? []
             ).map { .session($0) }
             items += workspace.terminalDisplaySessions.map { .session($0) }
-            if workspace.isBrowserStandalone {
-                items.append(.browser)
-            }
             items += visibleCommands.map { .command($0) }
             if projectFeatures.todosEnabled {
                 items.append(.todoBoard)
@@ -326,12 +303,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
                     }
                 }
             }
-            if workspace?.isStandaloneBrowserSelected == true {
-                return items.firstIndex {
-                    if case .browser = $0 { return true }
-                    return false
-                }
-            }
             if let selectedID = workspace?.selectedSessionID {
                 return items.firstIndex { item in
                     switch item {
@@ -339,7 +310,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                         return s.id == selectedID
                     case .command(let def):
                         return workspace?.commandSession(named: def.name)?.id == selectedID
-                    case .browser, .todoBoard, .note:
+                    case .todoBoard, .note:
                         return false
                     }
                 }
@@ -353,9 +324,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             case .session(let session):
                 chromeState.selectTerminal()
                 workspace.select(session)
-            case .browser:
-                chromeState.selectTerminal()
-                workspace.selectBrowser()
             case .command(let command):
                 if let session = workspace.commandSession(named: command.name) {
                     chromeState.selectTerminal()

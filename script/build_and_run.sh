@@ -52,15 +52,6 @@ cat >"$INFO_PLIST" <<PLIST
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
-  <key>NSAppTransportSecurity</key>
-  <dict>
-    <key>NSAllowsLocalNetworking</key>
-    <true/>
-  </dict>
-  <key>NSCameraUsageDescription</key>
-  <string>Cherry lets websites request camera access in the embedded project browser.</string>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>Cherry lets websites request microphone access in the embedded project browser.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

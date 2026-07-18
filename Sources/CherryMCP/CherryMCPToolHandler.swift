@@ -247,135 +247,6 @@ public enum CherryMCPTools {
             properties: bulkCommandProperties()
         ),
         tool(
-            "get_browser_status",
-            "Return the singleton project browser, its tabs, placement, visibility, and active tab without changing the Cherry UI.",
-            properties: projectScopedProperties()
-        ),
-        tool(
-            "open_browser",
-            "Create the singleton project browser in the background if needed. This does not reveal or focus the browser pane.",
-            properties: projectScopedProperties([
-                "url": string("Optional URL for the initial browser tab. Defaults to a blank tab.")
-            ])
-        ),
-        tool(
-            "close_browser",
-            "Close the singleton project browser and all of its tabs.",
-            properties: projectScopedProperties()
-        ),
-        tool(
-            "select_browser",
-            "Reveal and focus the singleton project browser. This is the only browser tool that changes the selected Cherry pane.",
-            properties: projectScopedProperties([
-                "placement": stringEnum(
-                    "Browser pane placement: split_right or standalone.",
-                    values: ["split_right", "standalone"]
-                )
-            ]),
-            required: ["placement"]
-        ),
-        tool(
-            "open_browser_tab",
-            "Open and activate a tab in the singleton project browser without revealing or focusing the browser pane.",
-            properties: projectScopedProperties([
-                "url": string("Optional URL for the new tab. Defaults to a blank tab.")
-            ])
-        ),
-        tool(
-            "close_browser_tab",
-            "Close a browser tab without changing the selected Cherry pane.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "select_browser_tab",
-            "Activate a browser tab without revealing or focusing the browser pane.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_navigate",
-            "Navigate a browser tab to a URL without revealing or focusing the browser pane.",
-            properties: browserTabProperties([
-                "url": string("HTTP or HTTPS URL to navigate to.")
-            ]),
-            required: ["url"]
-        ),
-        tool(
-            "browser_back",
-            "Navigate a browser tab back without revealing or focusing the browser pane.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_forward",
-            "Navigate a browser tab forward without revealing or focusing the browser pane.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_reload",
-            "Reload a browser tab without revealing or focusing the browser pane.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_wait",
-            "Wait for the current browser-tab navigation to finish. Prefer this over fixed sleeps after navigation or actions.",
-            properties: browserTabProperties([
-                "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 10000, max 60000.")
-            ])
-        ),
-        tool(
-            "browser_snapshot",
-            "Return page metadata and a compact semantic snapshot with document-scoped element refs.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_screenshot",
-            "Capture the browser tab viewport as PNG image content plus structured tab metadata.",
-            properties: browserTabProperties()
-        ),
-        tool(
-            "browser_click",
-            "Click an element from the latest semantic snapshot without revealing or focusing the browser pane.",
-            properties: browserTabProperties([
-                "element_ref": string("Document-scoped element ref returned by browser_snapshot.")
-            ]),
-            required: ["element_ref"]
-        ),
-        tool(
-            "browser_type",
-            "Type text into an element from the latest semantic snapshot without revealing or focusing the browser pane.",
-            properties: browserTabProperties([
-                "element_ref": string("Document-scoped element ref returned by browser_snapshot."),
-                "text": string("Text to enter."),
-                "clear": boolean("Whether to replace existing text before typing. Defaults to false.")
-            ]),
-            required: ["element_ref", "text"]
-        ),
-        tool(
-            "browser_press",
-            "Dispatch a keyboard key to a browser tab without revealing or focusing the browser pane.",
-            properties: browserTabProperties([
-                "key": string("Key value such as Enter, Escape, ArrowDown, or a single character."),
-                "modifiers": stringArray("Optional modifiers: shift, control, option, or command.")
-            ]),
-            required: ["key"]
-        ),
-        tool(
-            "browser_scroll",
-            "Scroll a browser tab by viewport pixel deltas without revealing or focusing the browser pane.",
-            properties: browserTabProperties([
-                "delta_x": integer("Optional horizontal pixel delta. Defaults to 0."),
-                "delta_y": integer("Optional vertical pixel delta. Defaults to 0.")
-            ])
-        ),
-        tool(
-            "browser_evaluate",
-            "Run page-world JavaScript when the project's local Allow MCP JavaScript setting is enabled. Results must be JSON-compatible or text.",
-            properties: browserTabProperties([
-                "script": string("JavaScript source. Each optional argument key is available as a named JavaScript variable."),
-                "arguments": jsonValue("Optional JSON-compatible arguments passed to the script.")
-            ]),
-            required: ["script"]
-        ),
-        tool(
             "list_agents",
             "List configured Cherry agents available to the active project.",
             properties: [:]
@@ -866,7 +737,7 @@ public enum CherryMCPTools {
         }
     }
 
-    static func controlRequest(
+    private static func controlRequest(
         name: String,
         arguments: [String: Value],
         context: CherryMCPToolContext? = nil
@@ -982,72 +853,6 @@ public enum CherryMCPTools {
             return .stopAllCommands(processBulkCommand(in: arguments))
         case "restart_all_commands":
             return .restartAllCommands(processBulkCommand(in: arguments))
-        case "get_browser_status":
-            return .getBrowserStatus
-        case "open_browser":
-            return .openBrowser(.init(url: stringArgument("url", in: arguments)))
-        case "close_browser":
-            return .closeBrowser
-        case "select_browser":
-            return .selectBrowser(.init(
-                placement: try browserPlacementArgument("placement", in: arguments)
-            ))
-        case "open_browser_tab":
-            return .openBrowserTab(.init(url: stringArgument("url", in: arguments)))
-        case "close_browser_tab":
-            return .closeBrowserTab(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "select_browser_tab":
-            return .selectBrowserTab(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_navigate":
-            return .browserNavigate(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                url: try requiredString("url", in: arguments)
-            ))
-        case "browser_back":
-            return .browserBack(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_forward":
-            return .browserForward(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_reload":
-            return .browserReload(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_wait":
-            return .browserWait(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                timeoutMilliseconds: intArgument("timeout_ms", in: arguments)
-            ))
-        case "browser_snapshot":
-            return .browserSnapshot(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_screenshot":
-            return .browserScreenshot(.init(tabID: stringArgument("tab_id", in: arguments)))
-        case "browser_click":
-            return .browserClick(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                elementRef: try requiredString("element_ref", in: arguments)
-            ))
-        case "browser_type":
-            return .browserType(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                elementRef: try requiredString("element_ref", in: arguments),
-                text: try requiredString("text", in: arguments),
-                clear: boolArgument("clear", in: arguments)
-            ))
-        case "browser_press":
-            return .browserPress(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                key: try requiredString("key", in: arguments),
-                modifiers: try stringArrayArgument("modifiers", in: arguments)
-            ))
-        case "browser_scroll":
-            return .browserScroll(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                deltaX: intArgument("delta_x", in: arguments),
-                deltaY: intArgument("delta_y", in: arguments)
-            ))
-        case "browser_evaluate":
-            return .browserEvaluate(.init(
-                tabID: stringArgument("tab_id", in: arguments),
-                script: try requiredString("script", in: arguments),
-                arguments: try browserJSONValueArgument("arguments", in: arguments)
-            ))
         case "list_agents":
             return .listAgents
         case "list_notes":
@@ -1145,7 +950,7 @@ public enum CherryMCPTools {
         }
     }
 
-    static func toolResult(_ result: CherryControlResult) throws -> CallTool.Result {
+    private static func toolResult(_ result: CherryControlResult) throws -> CallTool.Result {
         switch result {
         case .listProjects(let payload):
             return try encodedResult(payload)
@@ -1196,44 +1001,6 @@ public enum CherryMCPTools {
         case .stopAllCommands(let payload):
             return try encodedResult(payload)
         case .restartAllCommands(let payload):
-            return try encodedResult(payload)
-        case .getBrowserStatus(let payload):
-            return try encodedResult(payload)
-        case .openBrowser(let payload):
-            return try encodedResult(payload)
-        case .closeBrowser(let payload):
-            return try encodedResult(payload)
-        case .selectBrowser(let payload):
-            return try encodedResult(payload)
-        case .openBrowserTab(let payload):
-            return try encodedResult(payload)
-        case .closeBrowserTab(let payload):
-            return try encodedResult(payload)
-        case .selectBrowserTab(let payload):
-            return try encodedResult(payload)
-        case .browserNavigate(let payload):
-            return try encodedResult(payload)
-        case .browserBack(let payload):
-            return try encodedResult(payload)
-        case .browserForward(let payload):
-            return try encodedResult(payload)
-        case .browserReload(let payload):
-            return try encodedResult(payload)
-        case .browserWait(let payload):
-            return try encodedResult(payload)
-        case .browserSnapshot(let payload):
-            return try encodedResult(payload)
-        case .browserScreenshot(let payload):
-            return try screenshotResult(payload)
-        case .browserClick(let payload):
-            return try encodedResult(payload)
-        case .browserType(let payload):
-            return try encodedResult(payload)
-        case .browserPress(let payload):
-            return try encodedResult(payload)
-        case .browserScroll(let payload):
-            return try encodedResult(payload)
-        case .browserEvaluate(let payload):
             return try encodedResult(payload)
         case .listTerminals(let payload):
             return try encodedResult(payload)
@@ -1309,24 +1076,6 @@ public enum CherryMCPTools {
         return CallTool.Result(
             content: [.text(text: json, annotations: nil, _meta: nil)],
             structuredContent: Optional.some(try Value(payload)),
-            isError: false
-        )
-    }
-
-    private static func screenshotResult(_ payload: BrowserScreenshotResult) throws -> CallTool.Result {
-        let metadata = BrowserScreenshotMetadata(
-            tabID: payload.tabID,
-            url: payload.url,
-            title: payload.title,
-            mimeType: payload.mimeType
-        )
-        let json = try jsonString(metadata)
-        return CallTool.Result(
-            content: [
-                .text(text: json, annotations: nil, _meta: nil),
-                .image(data: payload.dataBase64, mimeType: payload.mimeType, annotations: nil, _meta: nil)
-            ],
-            structuredContent: Optional.some(try Value(metadata)),
             isError: false
         )
     }
@@ -1541,60 +1290,6 @@ public enum CherryMCPTools {
         return policy
     }
 
-    private static func browserPlacementArgument(
-        _ key: String,
-        in arguments: [String: Value]
-    ) throws -> BrowserPlacement {
-        let value = try requiredString(key, in: arguments)
-        guard let placement = BrowserPlacement(rawValue: value.lowercased()) else {
-            throw CherryControlError(
-                code: "invalid_browser_placement",
-                message: "Unknown browser placement: \(value)"
-            )
-        }
-        return placement
-    }
-
-    private static func browserJSONValueArgument(
-        _ key: String,
-        in arguments: [String: Value]
-    ) throws -> [String: BrowserJSONValue]? {
-        guard let value = arguments[key] else {
-            return nil
-        }
-        guard let object = value.objectValue else {
-            throw CherryControlError(
-                code: "invalid_argument",
-                message: "\(key) must be a JSON object."
-            )
-        }
-        return try object.mapValues(browserJSONValue)
-    }
-
-    private static func browserJSONValue(_ value: Value) throws -> BrowserJSONValue {
-        switch value {
-        case .null:
-            return .null
-        case .bool(let value):
-            return .bool(value)
-        case .int(let value):
-            return .int(value)
-        case .double(let value):
-            return .double(value)
-        case .string(let value):
-            return .string(value)
-        case .array(let values):
-            return .array(try values.map(browserJSONValue))
-        case .object(let values):
-            return .object(try values.mapValues(browserJSONValue))
-        case .data:
-            throw CherryControlError(
-                code: "invalid_argument",
-                message: "Browser JavaScript arguments cannot contain binary data."
-            )
-        }
-    }
-
     private static func explicitProcessSelector(in arguments: [String: Value]) -> ProcessSelectorRequest {
         ProcessSelectorRequest(
             processID: trimmedArgument("process_id", in: arguments),
@@ -1677,7 +1372,7 @@ public enum CherryMCPTools {
         case "wait_for_process_idle", "send_agent_message":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5
-        case "wait_for_bound_port", "browser_wait":
+        case "wait_for_bound_port":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 10_000, 1), 60_000)
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5
         default:
@@ -1717,22 +1412,6 @@ public enum CherryMCPTools {
         ])
     }
 
-    private static func stringEnum(_ description: String, values: [String]) -> Value {
-        .object([
-            "type": .string("string"),
-            "description": .string(description),
-            "enum": .array(values.map(Value.string))
-        ])
-    }
-
-    private static func jsonValue(_ description: String) -> Value {
-        .object([
-            "type": .string("object"),
-            "description": .string(description),
-            "additionalProperties": .bool(true)
-        ])
-    }
-
     private static func processSelectorProperties(_ extra: [String: Value] = [:]) -> [String: Value] {
         var properties: [String: Value] = [
             "process_id": string("Stable Cherry process UUID. Preferred when known. Defaults to the bound MCP session process when process_name is also omitted."),
@@ -1742,12 +1421,6 @@ public enum CherryMCPTools {
             properties[key] = value
         }
         return properties
-    }
-
-    private static func browserTabProperties(_ extra: [String: Value] = [:]) -> [String: Value] {
-        projectScopedProperties([
-            "tab_id": string("Optional browser tab UUID. Defaults to the active browser tab.")
-        ].merging(extra) { _, replacement in replacement })
     }
 
     private static func idleWaitProperties() -> [String: Value] {
@@ -1788,13 +1461,6 @@ public enum CherryMCPTools {
 
 private struct ErrorPayload: Codable {
     let error: CherryControlError
-}
-
-private struct BrowserScreenshotMetadata: Codable {
-    let tabID: String
-    let url: String?
-    let title: String
-    let mimeType: String
 }
 
 private struct MCPWhoamiPayload: Codable {

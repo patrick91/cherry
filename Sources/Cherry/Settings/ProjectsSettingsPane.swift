@@ -115,26 +115,6 @@ struct ProjectDetailSettingsPane: View {
                     .padding(.vertical, 13)
             }
 
-            SettingsCard("Browser") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Toggle(
-                        "Allow MCP JavaScript",
-                        isOn: Binding(
-                            get: { settings.isBrowserJavaScriptEnabled(for: project.root) },
-                            set: { settings.setBrowserJavaScriptEnabled($0, for: project.root) }
-                        )
-                    )
-                    .toggleStyle(.checkbox)
-
-                    Text("Lets agents run page-world JavaScript in this project's signed-in browser. This trust setting stays local and is never written to cherry.toml.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
-            }
-
             SettingsCard("Appearance") {
                 ProjectAppearanceControls(settings: settings, project: project)
                     .padding(.horizontal, 18)

@@ -729,7 +729,6 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
     @Published private(set) var featureOverridesByProject: [String: ProjectFeatureOverrides] = [:]
     @Published private(set) var appearanceOverridesByProject: [String: ProjectAppearanceOverrides] = [:]
-    @Published private(set) var browserJavaScriptEnabledProjectRoots: Set<String> = []
     @Published var agentSummaryTool: AgentSummaryTool {
         didSet {
             let currentModel = agentSummaryModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -780,9 +779,6 @@ final class AgentSettings: ObservableObject {
         commandsByProject = Self.loadCommandsByProject(from: defaults)
         featureOverridesByProject = Self.loadFeatureOverridesByProject(from: defaults)
         appearanceOverridesByProject = Self.loadAppearanceOverridesByProject(from: defaults)
-        browserJavaScriptEnabledProjectRoots = Set(
-            defaults.stringArray(forKey: Keys.browserJavaScriptEnabledProjectRoots) ?? []
-        )
         let storedSummaryCommand = defaults.string(forKey: Keys.agentSummaryCommand) ?? ""
         let storedSummaryTool = Self.loadAgentSummaryTool(from: defaults, command: storedSummaryCommand)
         agentSummaryCommand = storedSummaryCommand
@@ -912,21 +908,6 @@ final class AgentSettings: ObservableObject {
             return ProjectAppearanceOverrides()
         }
         return appearanceOverridesByProject[root] ?? ProjectAppearanceOverrides()
-    }
-
-    func isBrowserJavaScriptEnabled(for requestedRoot: String?) -> Bool {
-        guard let root = Self.validDirectory(requestedRoot ?? "") else { return false }
-        return browserJavaScriptEnabledProjectRoots.contains(root)
-    }
-
-    func setBrowserJavaScriptEnabled(_ enabled: Bool, for requestedRoot: String) {
-        guard let root = Self.validDirectory(requestedRoot) else { return }
-        if enabled {
-            browserJavaScriptEnabledProjectRoots.insert(root)
-        } else {
-            browserJavaScriptEnabledProjectRoots.remove(root)
-        }
-        defaults.set(Array(browserJavaScriptEnabledProjectRoots).sorted(), forKey: Keys.browserJavaScriptEnabledProjectRoots)
     }
 
     func projectFileConfiguresFeatures(for requestedRoot: String?) -> Bool {
@@ -1346,7 +1327,6 @@ final class AgentSettings: ObservableObject {
         static let commandsByProject = "commands.byProject"
         static let featureOverridesByProject = "features.byProject"
         static let appearanceOverridesByProject = "appearance.byProject"
-        static let browserJavaScriptEnabledProjectRoots = "browser.javascriptEnabledProjectRoots"
         static let agentSummaryTool = "agents.summaryTool"
         static let agentSummaryCadence = "agents.summaryCadence"
         static let agentSummaryModel = "agents.summaryModel"

@@ -886,19 +886,6 @@ private struct DetailPaneView: View {
                     onStart: { startIdleCommand(idleCommand) },
                     onCancel: { chromeState.selectTerminal() }
                 )
-            } else if workspace.isStandaloneBrowserSelected,
-                      let browserWorkspace = workspace.browserWorkspace {
-                BrowserPaneView(
-                    workspace: browserWorkspace,
-                    isActivePane: true,
-                    onActivate: {
-                        chromeState.selectTerminal()
-                        workspace.selectBrowser()
-                    },
-                    onCloseBrowser: {
-                        workspace.closeBrowser()
-                    }
-                )
             } else if workspace.selectedSession != nil {
                 TerminalSplitSceneView(workspace: workspace, chromeState: chromeState)
             } else {
@@ -2577,7 +2564,6 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case addProject
     case agents
     case addAgent
-    case browser
     case toggleAppearance
 
     var id: String { rawValue }
@@ -2588,7 +2574,6 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Add Project"
         case .agents: "Agents"
         case .addAgent: "Add Agent"
-        case .browser: "Browser"
         case .toggleAppearance: "Toggle Light/Dark Mode"
         }
     }
@@ -2599,7 +2584,6 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Create a Cherry project"
         case .agents: "Open a configured agent"
         case .addAgent: "Configure a global agent tool"
-        case .browser: "Open beside the active pane"
         case .toggleAppearance: "Switch app appearance"
         }
     }
@@ -2610,7 +2594,6 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "folder.badge.plus"
         case .agents: "sparkles"
         case .addAgent: "sparkles"
-        case .browser: "globe"
         case .toggleAppearance: "circle.lefthalf.filled"
         }
     }
@@ -3337,16 +3320,6 @@ private struct CommandPaletteOverlay: View {
                     mode = .agents
                 case .addAgent:
                     mode = .agentPresets
-                case .browser:
-                    chromeState.selectTerminal()
-                    if let session = workspace.selectedSession,
-                       workspace.splitBrowserRight(of: session) {
-                        dismiss()
-                        return
-                    }
-                    _ = workspace.openBrowser()
-                    workspace.separateBrowser()
-                    dismiss()
                 case .toggleAppearance:
                     terminalSettings.toggleLightDarkAppearance(currentColorScheme: colorScheme)
                     dismiss()
@@ -4067,28 +4040,13 @@ private struct SidebarTabsView: View {
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
-                    if workspace.isBrowserStandalone,
-                       let browserWorkspace = workspace.browserWorkspace {
-                        SidebarBrowserSection(
-                            browserWorkspace: browserWorkspace,
-                            workspace: workspace,
-                            chromeState: chromeState,
-                            projectRoot: projectRoot,
-                            presentation: presentation,
-                            shortcutNumber: visibleAgentCount + workspace.terminalDisplayItems.count + 1,
-                            showShortcutHint: chromeState.isCommandKeyPressed
-                        )
-                    }
-
                     SidebarCommandSection(
                         settings: agentSettings,
                         workspace: workspace,
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutStartIndex: visibleAgentCount
-                            + workspace.terminalDisplayItems.count
-                            + standaloneBrowserRowCount,
+                        shortcutStartIndex: visibleAgentCount + workspace.terminalDisplayItems.count,
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
 
@@ -4147,7 +4105,6 @@ private struct SidebarTabsView: View {
     private var todoBoardShortcutNumber: Int {
         workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
             + workspace.terminalDisplayItems.count
-            + standaloneBrowserRowCount
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + 1
     }
@@ -4155,13 +4112,8 @@ private struct SidebarTabsView: View {
     private func notesShortcutStartIndex(features: ProjectFeatureSettings) -> Int {
         workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
             + workspace.terminalDisplayItems.count
-            + standaloneBrowserRowCount
             + agentSettings.launchableProjectCommands(for: projectRoot).count
             + (features.todosEnabled ? 1 : 0)
-    }
-
-    private var standaloneBrowserRowCount: Int {
-        workspace.isBrowserStandalone ? 1 : 0
     }
 }
 
@@ -4512,12 +4464,6 @@ private struct SidebarAgentSessionSection: View {
             onToggleDisclosure: showsDisclosure ? {
                 chromeState.toggleAgentGroupCollapsed(session.id)
             } : nil,
-            showsBrowserPane: workspace.browserIsAttached(to: session.id),
-            isBrowserPaneActive: workspace.browserIsAttached(to: session.id) && workspace.isBrowserPaneActive,
-            onSelectBrowser: {
-                chromeState.selectTerminal()
-                workspace.selectBrowser()
-            },
             onSelect: { select(session) }
         )
         .contextMenu {
@@ -4540,21 +4486,6 @@ private struct SidebarAgentSessionSection: View {
 
             Button("Clear Scrollback") {
                 session.clearScrollback()
-            }
-
-            Divider()
-
-            if workspace.browserIsAttached(to: session.id) {
-                Button("Separate Browser") {
-                    chromeState.selectTerminal()
-                    workspace.separateBrowser()
-                }
-            } else {
-                Button("Split Browser Right") {
-                    chromeState.selectTerminal()
-                    _ = workspace.splitBrowserRight(of: session)
-                }
-                .disabled(!workspace.canSplitBrowserRight(of: session))
             }
 
             nixShellContextMenuItems(for: session.nixShellEnvironment)
@@ -4904,10 +4835,6 @@ private struct SidebarCommandSection: View {
                         presentation: presentation,
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
-                        showsBrowserPane: session.map { workspace.browserIsAttached(to: $0.id) } ?? false,
-                        isBrowserPaneActive: session.map {
-                            workspace.browserIsAttached(to: $0.id) && workspace.isBrowserPaneActive
-                        } ?? false,
                         start: { start(command, existingSession: session) },
                         stop: { stop(session) },
                         restart: { restart(command, existingSession: session) },
@@ -4918,10 +4845,6 @@ private struct SidebarCommandSection: View {
                             } else {
                                 chromeState.focusIdleCommand(name: command.name)
                             }
-                        },
-                        selectBrowser: {
-                            chromeState.selectTerminal()
-                            workspace.selectBrowser()
                         }
                     )
                     .contextMenu {
@@ -4952,21 +4875,6 @@ private struct SidebarCommandSection: View {
                             }
 
                             nixShellContextMenuItems(for: session.nixShellEnvironment)
-
-                            Divider()
-
-                            if workspace.browserIsAttached(to: session.id) {
-                                Button("Separate Browser") {
-                                    chromeState.selectTerminal()
-                                    workspace.separateBrowser()
-                                }
-                            } else {
-                                Button("Split Browser Right") {
-                                    chromeState.selectTerminal()
-                                    _ = workspace.splitBrowserRight(of: session)
-                                }
-                                .disabled(!workspace.canSplitBrowserRight(of: session))
-                            }
                         }
 
                         Divider()
@@ -5330,13 +5238,10 @@ private struct SidebarCommandRow: View {
     let presentation: SidebarPresentation
     let shortcutNumber: Int
     let showShortcutHint: Bool
-    let showsBrowserPane: Bool
-    let isBrowserPaneActive: Bool
     let start: () -> Void
     let stop: () -> Void
     let restart: () -> Void
     let select: () -> Void
-    let selectBrowser: () -> Void
 
     @State private var isHovered = false
 
@@ -5378,15 +5283,6 @@ private struct SidebarCommandRow: View {
                 }
 
                 Spacer(minLength: 8)
-
-                if showsBrowserPane {
-                    SidebarBrowserPaneSelector(
-                        isActive: isBrowserPaneActive,
-                        isRowSelected: isSelected,
-                        palette: palette,
-                        action: selectBrowser
-                    )
-                }
 
                 if showShortcutHint, shortcutNumber <= 9 {
                     SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
@@ -5664,12 +5560,6 @@ private struct SidebarSessionSection: View {
                     pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
-                    showsBrowserPane: workspace.browserIsAttached(to: session.id),
-                    isBrowserPaneActive: workspace.browserIsAttached(to: session.id) && workspace.isBrowserPaneActive,
-                    onSelectBrowser: {
-                        chromeState.selectTerminal()
-                        workspace.selectBrowser()
-                    },
                     onSelect: {
                         chromeState.selectTerminal()
                         workspace.select(session)
@@ -5723,122 +5613,10 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        if workspace.browserIsAttached(to: session.id) {
-            Button("Separate Browser") {
-                chromeState.selectTerminal()
-                workspace.separateBrowser()
-            }
-        } else {
-            Button("Split Browser Right") {
-                chromeState.selectTerminal()
-                _ = workspace.splitBrowserRight(of: session)
-            }
-            .disabled(!workspace.canSplitBrowserRight(of: session))
-        }
-
-        Divider()
-
         Button("Close", role: .destructive) {
             workspace.close(session)
         }
         .disabled(workspace.sessions.count <= 1)
-    }
-}
-
-private struct SidebarBrowserSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
-    @ObservedObject var browserWorkspace: BrowserWorkspace
-    @ObservedObject var workspace: TerminalWorkspace
-    @ObservedObject var chromeState: ProjectWindowChromeState
-    let projectRoot: String?
-    let presentation: SidebarPresentation
-    let shortcutNumber: Int
-    let showShortcutHint: Bool
-
-    @State private var isHovered = false
-
-    var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-        let selected = chromeState.isShowingTerminalContent && workspace.isStandaloneBrowserSelected
-
-        VStack(alignment: .leading, spacing: 4) {
-            SidebarSectionHeader(title: "Browser", count: 1, palette: palette)
-
-            Button {
-                chromeState.selectTerminal()
-                workspace.selectBrowser()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "globe")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(selected ? palette.selectedText : palette.rowText)
-                        .frame(width: 20, height: 20)
-
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(browserWorkspace.selectedTab?.title ?? "Browser")
-                            .font(.system(size: 15, weight: .regular))
-                            .foregroundStyle(selected ? palette.selectedText : palette.rowText)
-                            .lineLimit(1)
-
-                        Text("\(browserWorkspace.tabs.count) \(browserWorkspace.tabs.count == 1 ? "tab" : "tabs")")
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle((selected ? palette.selectedText : palette.rowText).opacity(0.56))
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if showShortcutHint, shortcutNumber <= 9 {
-                        SidebarShortcutHint(number: shortcutNumber, isSelected: selected, palette: palette)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(height: 50)
-                .padding(.horizontal, SidebarLayout.rowHorizontalInset)
-                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .background {
-                    if selected {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(palette.selectedFill)
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                            }
-                            .shadow(color: palette.selectedShadow, radius: 9, y: 4)
-                    } else if isHovered {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(palette.hoverFill)
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, -SidebarLayout.rowHorizontalInset)
-            .onHover { isHovered = $0 }
-            .contextMenu {
-                if let session = workspace.selectedSession {
-                    Button("Split Browser Right") {
-                        chromeState.selectTerminal()
-                        _ = workspace.splitBrowserRight(of: session)
-                    }
-                    .disabled(!workspace.canSplitBrowserRight(of: session))
-                }
-
-                Divider()
-
-                Button("Close Browser", role: .destructive) {
-                    workspace.closeBrowser()
-                }
-            }
-        }
     }
 }
 
@@ -5885,18 +5663,6 @@ private struct SidebarSplitTabRow: View {
                         }
                     )
                 }
-
-                if groupContainsBrowser {
-                    SidebarBrowserPaneSelector(
-                        isActive: workspace.isBrowserPaneActive,
-                        isRowSelected: isSelected,
-                        palette: palette,
-                        action: {
-                            chromeState.selectTerminal()
-                            workspace.selectBrowser()
-                        }
-                    )
-                }
             }
 
             if showShortcutHint, shortcutNumber <= 9 {
@@ -5925,28 +5691,8 @@ private struct SidebarSplitTabRow: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Split terminal group")
         .contextMenu {
-            if groupContainsBrowser {
-                Button("Separate Browser") {
-                    chromeState.selectTerminal()
-                    workspace.separateBrowser()
-                }
-
-                Divider()
-            } else if let activeSession {
-                Button("Split Browser Right") {
-                    _ = workspace.splitBrowserRight(of: activeSession)
-                }
-                .disabled(!workspace.canSplitBrowserRight(of: activeSession))
-
-                Divider()
-            }
-
             Button("Balance Panes") {
-                if groupContainsBrowser {
-                    workspace.balanceActiveSplitGroup()
-                } else {
-                    workspace.balanceSplitGroup(id: group.id)
-                }
+                workspace.balanceSplitGroup(id: group.id)
             }
 
             Button("Separate Panes") {
@@ -5977,10 +5723,6 @@ private struct SidebarSplitTabRow: View {
             return false
         }
         return group.paneSessionIDs.contains(selectedSessionID)
-    }
-
-    private var groupContainsBrowser: Bool {
-        group.paneSessionIDs.contains { workspace.browserIsAttached(to: $0) }
     }
 
     private var helpText: String {
@@ -7108,9 +6850,6 @@ private struct SidebarTabRow: View {
     let showsDisclosure: Bool
     let isDisclosureExpanded: Bool
     let onToggleDisclosure: (() -> Void)?
-    let showsBrowserPane: Bool
-    let isBrowserPaneActive: Bool
-    let onSelectBrowser: (() -> Void)?
     let onSelect: () -> Void
 
     @AppStorage(AgentTreeLayout.guideXKey) private var guideX = AgentTreeLayout.defaultGuideX
@@ -7135,9 +6874,6 @@ private struct SidebarTabRow: View {
         showsDisclosure: Bool = false,
         isDisclosureExpanded: Bool = true,
         onToggleDisclosure: (() -> Void)? = nil,
-        showsBrowserPane: Bool = false,
-        isBrowserPaneActive: Bool = false,
-        onSelectBrowser: (() -> Void)? = nil,
         onSelect: @escaping () -> Void
     ) {
         _rowState = StateObject(wrappedValue: SidebarTabRowState(
@@ -7154,9 +6890,6 @@ private struct SidebarTabRow: View {
         self.showsDisclosure = showsDisclosure
         self.isDisclosureExpanded = isDisclosureExpanded
         self.onToggleDisclosure = onToggleDisclosure
-        self.showsBrowserPane = showsBrowserPane
-        self.isBrowserPaneActive = isBrowserPaneActive
-        self.onSelectBrowser = onSelectBrowser
         self.onSelect = onSelect
     }
 
@@ -7259,15 +6992,6 @@ private struct SidebarTabRow: View {
                 .frame(width: 7, height: 7)
                 .opacity(rowState.hasUnreadNotification ? 1 : 0)
 
-            if showsBrowserPane {
-                SidebarBrowserPaneSelector(
-                    isActive: isBrowserPaneActive,
-                    isRowSelected: isSelected,
-                    palette: palette,
-                    action: { onSelectBrowser?() }
-                )
-            }
-
             if showShortcutHint, shortcutNumber <= 9 {
                 SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected, palette: palette)
             }
@@ -7321,34 +7045,6 @@ private struct SidebarTabRow: View {
         usesInlineProgramDetailIcons && rowState.label.detail != nil
     }
 
-}
-
-private struct SidebarBrowserPaneSelector: View {
-    let isActive: Bool
-    let isRowSelected: Bool
-    let palette: SidebarPalette
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "globe")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(iconColor)
-                .frame(width: 24, height: 24)
-                .background {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(isActive ? iconColor.opacity(0.16) : Color.clear)
-                }
-                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .help("Focus Browser")
-        .accessibilityLabel("Focus Browser pane")
-    }
-
-    private var iconColor: Color {
-        (isRowSelected ? palette.selectedText : palette.rowText).opacity(isActive ? 0.95 : 0.55)
-    }
 }
 
 @MainActor
@@ -9175,16 +8871,12 @@ private struct TerminalSplitSceneView: View {
         GeometryReader { geometry in
             let panes = paneSessions
             let group = activeGroup
-            let showsBrowser = workspace.showsBrowserBesideSelectedSession
-            let totalPaneCount = panes.count + (showsBrowser ? 1 : 0)
-            let layoutID = showsBrowser ? workspace.browserWorkspace?.id : group?.id
-            let contentWidth = max(0, geometry.size.width - Self.dividerWidth * CGFloat(max(0, totalPaneCount - 1)))
+            let contentWidth = max(0, geometry.size.width - Self.dividerWidth * CGFloat(max(0, panes.count - 1)))
             let widths = paneWidths(
                 for: group,
-                paneCount: totalPaneCount,
+                paneCount: panes.count,
                 contentWidth: contentWidth,
-                usesBrowserWeights: showsBrowser,
-                overrideWeights: previewWeights(layoutID: layoutID, paneCount: totalPaneCount)
+                overrideWeights: previewWeights(for: group, paneCount: panes.count)
             )
 
             HStack(spacing: 0) {
@@ -9192,27 +8884,24 @@ private struct TerminalSplitSceneView: View {
                     TerminalSceneView(
                         session: session,
                         chromeState: chromeState,
-                        isActivePane: !workspace.isBrowserPaneActive && workspace.selectedSessionID == session.id,
+                        isActivePane: workspace.selectedSessionID == session.id,
                         onActivate: activate
                     )
                     .frame(width: width(at: index, in: widths))
                     .roundedTerminalSplitPane(
-                        isEnabled: totalPaneCount > 1,
+                        isEnabled: panes.count > 1,
                         radius: Self.paneCornerRadius
                     )
 
-                    if index < totalPaneCount - 1 {
+                    if index < panes.count - 1 {
                         TerminalSplitDivider(
                             onDragChanged: { translation in
-                                guard let layoutID else { return }
+                                guard let group else { return }
                                 resizeDivider(
-                                    layoutID: layoutID,
                                     group: group,
-                                    usesBrowserWeights: showsBrowser,
                                     dividerIndex: index,
                                     translation: translation,
-                                    contentWidth: contentWidth,
-                                    paneCount: totalPaneCount
+                                    contentWidth: contentWidth
                                 )
                             },
                             onDragEnded: {
@@ -9221,26 +8910,6 @@ private struct TerminalSplitSceneView: View {
                         )
                         .frame(width: Self.dividerWidth)
                     }
-                }
-
-                if showsBrowser,
-                   let browserWorkspace = workspace.browserWorkspace {
-                    BrowserPaneView(
-                        workspace: browserWorkspace,
-                        isActivePane: workspace.isBrowserPaneActive,
-                        onActivate: {
-                            chromeState.selectTerminal()
-                            workspace.selectBrowser()
-                        },
-                        onCloseBrowser: {
-                            workspace.closeBrowser()
-                        }
-                    )
-                    .frame(width: width(at: panes.count, in: widths))
-                    .roundedTerminalSplitPane(
-                        isEnabled: totalPaneCount > 1,
-                        radius: Self.paneCornerRadius
-                    )
                 }
             }
             .transaction { transaction in
@@ -9285,18 +8954,12 @@ private struct TerminalSplitSceneView: View {
         for group: TerminalSplitGroup?,
         paneCount: Int,
         contentWidth: CGFloat,
-        usesBrowserWeights: Bool,
         overrideWeights: [Double]? = nil
     ) -> [CGFloat] {
         guard paneCount > 0 else { return [] }
         guard paneCount > 1, contentWidth > 0 else { return [max(0, contentWidth)] }
 
-        let weights = effectiveWeights(
-            for: group,
-            paneCount: paneCount,
-            usesBrowserWeights: usesBrowserWeights,
-            overrideWeights: overrideWeights
-        )
+        let weights = effectiveWeights(for: group, paneCount: paneCount, overrideWeights: overrideWeights)
         var widths = weights.map { CGFloat($0) * contentWidth }
         let minimumWidth = contentWidth >= CGFloat(paneCount) * TerminalWorkspace.minimumSplitPaneWidth
             ? TerminalWorkspace.minimumSplitPaneWidth
@@ -9326,38 +8989,34 @@ private struct TerminalSplitSceneView: View {
     }
 
     private func resizeDivider(
-        layoutID: UUID,
-        group: TerminalSplitGroup?,
-        usesBrowserWeights: Bool,
+        group: TerminalSplitGroup,
         dividerIndex: Int,
         translation: CGFloat,
-        contentWidth: CGFloat,
-        paneCount: Int
+        contentWidth: CGFloat
     ) {
         guard contentWidth > 0,
               dividerIndex >= 0,
-              dividerIndex + 1 < paneCount
+              dividerIndex + 1 < group.paneSessionIDs.count
         else {
             return
         }
 
         let dragState: DividerDragState
         if let dividerDragState,
-           dividerDragState.groupID == layoutID,
+           dividerDragState.groupID == group.id,
            dividerDragState.dividerIndex == dividerIndex,
-           dividerDragState.paneCount == paneCount {
+           dividerDragState.paneCount == group.paneSessionIDs.count {
             dragState = dividerDragState
         } else {
             let startWeights = paneWidths(
                 for: group,
-                paneCount: paneCount,
-                contentWidth: contentWidth,
-                usesBrowserWeights: usesBrowserWeights
+                paneCount: group.paneSessionIDs.count,
+                contentWidth: contentWidth
             ).map { Double($0 / contentWidth) }
             dragState = DividerDragState(
-                groupID: layoutID,
+                groupID: group.id,
                 dividerIndex: dividerIndex,
-                paneCount: paneCount,
+                paneCount: group.paneSessionIDs.count,
                 contentWidth: contentWidth,
                 startWeights: startWeights,
                 previewWeights: startWeights
@@ -9383,10 +9042,10 @@ private struct TerminalSplitSceneView: View {
         )
     }
 
-    private func previewWeights(layoutID: UUID?, paneCount: Int) -> [Double]? {
-        guard let layoutID,
+    private func previewWeights(for group: TerminalSplitGroup?, paneCount: Int) -> [Double]? {
+        guard let group,
               let dividerDragState,
-              dividerDragState.groupID == layoutID,
+              dividerDragState.groupID == group.id,
               dividerDragState.paneCount == paneCount,
               dividerDragState.previewWeights.count == paneCount
         else {
@@ -9401,37 +9060,25 @@ private struct TerminalSplitSceneView: View {
         }
 
         guard let dividerDragState,
-              dividerDragState.previewWeights.count == dividerDragState.paneCount
-        else { return }
-
-        if workspace.browserWorkspace?.id == dividerDragState.groupID,
-           workspace.showsBrowserBesideSelectedSession {
-            workspace.setBrowserSplitWidthWeights(
-                dividerDragState.previewWeights,
-                paneCount: dividerDragState.paneCount
-            )
-        } else if workspace.splitGroup(id: dividerDragState.groupID)?.paneSessionIDs.count == dividerDragState.paneCount {
-            workspace.setSplitGroupWidthWeights(
-                id: dividerDragState.groupID,
-                weights: dividerDragState.previewWeights
-            )
+              workspace.splitGroup(id: dividerDragState.groupID)?.paneSessionIDs.count == dividerDragState.paneCount
+        else {
+            return
         }
+
+        workspace.setSplitGroupWidthWeights(
+            id: dividerDragState.groupID,
+            weights: dividerDragState.previewWeights
+        )
     }
 
     private func effectiveWeights(
         for group: TerminalSplitGroup?,
         paneCount: Int,
-        usesBrowserWeights: Bool,
         overrideWeights: [Double]? = nil
     ) -> [Double] {
         if let overrideWeights,
            overrideWeights.count == paneCount {
             return overrideWeights
-        }
-
-        if usesBrowserWeights,
-           workspace.browserSplitWidthWeights.count == paneCount {
-            return workspace.browserSplitWidthWeights
         }
 
         guard let group,

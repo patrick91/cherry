@@ -450,7 +450,17 @@ private struct ProjectWindowView: View {
         }
 
         agentSettings.markProjectOpened(projectRoot)
-        if ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) {
+        let shouldActivateWorktree: Bool
+        switch deepLink.kind {
+        case .terminal:
+            shouldActivateWorktree = true
+        case .note, .todo:
+            shouldActivateWorktree = false
+        }
+        if ProjectWindowRegistry.shared.focus(
+            projectRoot: projectRoot,
+            activateWorktree: shouldActivateWorktree
+        ) {
             if !ProjectWindowRegistry.shared.select(deepLink, projectRoot: projectRoot) {
                 CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
             }
@@ -499,7 +509,7 @@ private struct WindowTitleWriter: NSViewRepresentable {
 private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
-    @StateObject private var workspace: TerminalWorkspace
+    @StateObject private var repository: RepositoryWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
     @StateObject private var todoStore: ProjectTodoStore
@@ -507,21 +517,32 @@ private struct ProjectWorkspaceView: View {
     @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
-        _workspace = StateObject(wrappedValue: TerminalWorkspace(projectRoot: projectRoot))
+        _repository = StateObject(wrappedValue: RepositoryWorkspace(projectRoot: projectRoot))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(projectRoot: projectRoot))
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
     /// Folder name of the project, or "Cherry" for a project-less window.
     private var projectName: String {
-        workspace.projectRoot
-            .map { URL(fileURLWithPath: $0, isDirectory: true).lastPathComponent }
-            .flatMap { $0.isEmpty ? nil : $0 }
-            ?? "Cherry"
+        repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
+    }
+
+    private var workspace: TerminalWorkspace {
+        repository.activeWorkspace
+    }
+
+    private var workspaceTitle: String {
+        guard repository.supportsWorktrees,
+              let worktree = repository.activeWorktree
+        else {
+            return projectName
+        }
+        return "\(projectName) / \(worktree.displayName)"
     }
 
     var body: some View {
         ContentView(
+            repository: repository,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
@@ -534,17 +555,18 @@ private struct ProjectWorkspaceView: View {
             storedSidebarWidth: $storedSidebarWidth
         )
         .background(ProjectWindowBinder(
-            projectRoot: workspace.projectRoot,
+            projectRoot: repository.repositoryRoot,
             workspace: workspace,
+            repository: repository,
             noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState
         ))
         .background {
             if let session = workspace.selectedSession {
-                WindowTitleBinder(projectName: projectName, session: session)
+                WindowTitleBinder(projectName: workspaceTitle, session: session)
             } else {
-                WindowTitleWriter(title: projectName)
+                WindowTitleWriter(title: workspaceTitle)
             }
         }
         .focusedValue(\.terminalWorkspace, workspace)
@@ -559,6 +581,19 @@ private struct ProjectWorkspaceView: View {
             }
             agentSettings.markProjectOpened(workspace.projectRoot)
             autoStartCommandsIfNeeded()
+            openPendingDeepLinks()
+            Task {
+                await repository.refresh()
+            }
+        }
+        .onChange(of: repository.activeWorktreeRoot) { _, _ in
+            ProjectWindowRegistry.shared.activateWindow(
+                projectRoot: repository.repositoryRoot,
+                workspace: repository.activeWorkspace,
+                noteStore: noteStore,
+                todoStore: todoStore,
+                chromeState: chromeState
+            )
             openPendingDeepLinks()
         }
     }
@@ -586,7 +621,12 @@ private struct ProjectWorkspaceView: View {
 
     private func openPendingDeepLinks() {
         guard let projectRoot = workspace.projectRoot else { return }
-        let links = CherryDeepLinkOpenQueue.shared.consume(projectRoot: projectRoot)
+        var links = CherryDeepLinkOpenQueue.shared.consume(projectRoot: projectRoot)
+        if repository.repositoryRoot != projectRoot {
+            links.append(contentsOf: CherryDeepLinkOpenQueue.shared.consume(
+                projectRoot: repository.repositoryRoot
+            ))
+        }
         guard !links.isEmpty else { return }
         DispatchQueue.main.async {
             for link in links {
@@ -599,15 +639,12 @@ private struct ProjectWorkspaceView: View {
 
     @discardableResult
     private func selectDeepLink(_ link: CherryDeepLink) -> Bool {
-        guard let projectRoot = workspace.projectRoot,
-              CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey
-        else {
-            return false
-        }
-
         switch link.kind {
         case .note:
-            guard agentSettings.projectFeatures(for: projectRoot).notesEnabled else {
+            let projectRoot = repository.repositoryRoot
+            guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey,
+                  agentSettings.projectFeatures(for: projectRoot).notesEnabled
+            else {
                 return false
             }
             guard let noteID = UUID(uuidString: link.targetID),
@@ -618,7 +655,10 @@ private struct ProjectWorkspaceView: View {
             chromeState.selectNote(id: noteID)
             return true
         case .todo:
-            guard agentSettings.projectFeatures(for: projectRoot).todosEnabled else {
+            let projectRoot = repository.repositoryRoot
+            guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey,
+                  agentSettings.projectFeatures(for: projectRoot).todosEnabled
+            else {
                 return false
             }
             guard let todoID = UUID(uuidString: link.targetID),
@@ -629,7 +669,9 @@ private struct ProjectWorkspaceView: View {
             chromeState.selectTodo(id: todoID)
             return true
         case .terminal:
-            guard let sessionID = UUID(uuidString: link.targetID),
+            guard let projectRoot = workspace.projectRoot,
+                  CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey,
+                  let sessionID = UUID(uuidString: link.targetID),
                   let session = workspace.sessions.first(where: { $0.id == sessionID })
             else {
                 return false

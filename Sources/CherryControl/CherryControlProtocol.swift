@@ -921,25 +921,89 @@ public struct OpenProjectRequest: Codable, Equatable, Sendable {
     }
 }
 
+public struct WorktreeInfo: Codable, Equatable, Sendable {
+    public let root: String
+    public let branch: String?
+    public let head: String
+    public let main: Bool
+    public let detached: Bool
+    public let locked: Bool
+    public let hidden: Bool
+    public let loaded: Bool
+    public let active: Bool
+
+    public init(
+        root: String,
+        branch: String?,
+        head: String,
+        main: Bool,
+        detached: Bool,
+        locked: Bool,
+        hidden: Bool,
+        loaded: Bool,
+        active: Bool
+    ) {
+        self.root = root
+        self.branch = branch
+        self.head = head
+        self.main = main
+        self.detached = detached
+        self.locked = locked
+        self.hidden = hidden
+        self.loaded = loaded
+        self.active = active
+    }
+}
+
 public struct ProjectInfo: Codable, Equatable, Sendable {
     public let root: String
     public let name: String
     public let active: Bool
     public let open: Bool
     public let features: ProjectFeatureAvailability
+    public let worktrees: [WorktreeInfo]
+    public let activeWorktreeRoot: String?
 
     public init(
         root: String,
         name: String,
         active: Bool,
         open: Bool,
-        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false)
+        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false),
+        worktrees: [WorktreeInfo] = [],
+        activeWorktreeRoot: String? = nil
     ) {
         self.root = root
         self.name = name
         self.active = active
         self.open = open
         self.features = features
+        self.worktrees = worktrees
+        self.activeWorktreeRoot = activeWorktreeRoot
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case root
+        case name
+        case active
+        case open
+        case features
+        case worktrees
+        case activeWorktreeRoot
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        root = try container.decode(String.self, forKey: .root)
+        name = try container.decode(String.self, forKey: .name)
+        active = try container.decode(Bool.self, forKey: .active)
+        open = try container.decode(Bool.self, forKey: .open)
+        features = try container.decodeIfPresent(
+            ProjectFeatureAvailability.self,
+            forKey: .features
+        ) ?? .init(notesEnabled: false, todosEnabled: false)
+        worktrees = try container.decodeIfPresent([WorktreeInfo].self, forKey: .worktrees) ?? []
+        activeWorktreeRoot = try container.decodeIfPresent(String.self, forKey: .activeWorktreeRoot)
     }
 }
 

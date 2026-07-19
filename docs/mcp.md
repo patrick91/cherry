@@ -39,6 +39,16 @@ is running inside a Cherry agent. If there is no bound caller, new agents are
 created at the top level unless `parent_agent_id` explicitly points somewhere
 else.
 
+## Worktree Tools
+
+- `list_projects` includes discovered worktrees, their branch/HEAD state, and
+  whether each checkout is active, loaded, hidden, detached, or locked.
+- `activate_worktree` focuses an existing checkout by absolute
+  `project_root`.
+
+Worktree creation, removal, fetch, and prune are intentionally not exposed to
+MCP. Those lifecycle actions stay in Cherry's confirmation-based UI.
+
 ## Process Tools
 
 Use process tools for new automation:

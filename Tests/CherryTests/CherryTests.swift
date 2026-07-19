@@ -26,6 +26,34 @@ private func runProcessOutput(executable: String, arguments: [String]) throws ->
     return String(decoding: output + errorOutput, as: UTF8.self)
 }
 
+private func runGitForTest(_ arguments: [String]) throws {
+    let outputPipe = Pipe()
+    let errorPipe = Pipe()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["git"] + arguments
+    process.standardOutput = outputPipe
+    process.standardError = errorPipe
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        throw GitWorktreeCommandError(
+            arguments: arguments,
+            exitCode: process.terminationStatus,
+            standardError: String(decoding: error, as: UTF8.self)
+        )
+    }
+}
+
+private func canonicalPathForTest(_ url: URL) throws -> String {
+    guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
+        throw CocoaError(.fileNoSuchFile)
+    }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
 @MainActor
 private func waitForCondition(
     timeout: TimeInterval = 1,
@@ -131,14 +159,31 @@ private struct HostedContentViewWindow {
 }
 
 private struct ContentViewTestHost: View {
+    @StateObject private var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     @State private var storedSidebarWidth = 320.0
 
+    init(
+        workspace: TerminalWorkspace,
+        chromeState: ProjectWindowChromeState,
+        noteStore: ProjectNoteStore,
+        todoStore: ProjectTodoStore
+    ) {
+        _repository = StateObject(wrappedValue: RepositoryWorkspace(
+            projectRoot: workspace.projectRoot ?? FileManager.default.temporaryDirectory.path
+        ))
+        self.workspace = workspace
+        self.chromeState = chromeState
+        self.noteStore = noteStore
+        self.todoStore = todoStore
+    }
+
     var body: some View {
         ContentView(
+            repository: repository,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
@@ -1171,6 +1216,226 @@ private struct MCPWhoamiPayload: Decodable {
     let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
 
     #expect(decoded == request)
+}
+
+@Test func gitWorktreePorcelainParserPreservesLifecycleState() throws {
+    let porcelain = """
+    worktree /tmp/cherry-main\0HEAD 0123456789abcdef\0branch refs/heads/main\0\0worktree /tmp/cherry-feature\0HEAD fedcba9876543210\0branch refs/heads/feature/worktrees\0locked IDE lease\0\0worktree /tmp/cherry-detached\0HEAD aabbccddeeff0011\0detached\0prunable gitdir file points to non-existent location\0\0
+    """
+
+    let worktrees = GitWorktreeService.parseWorktreeList(Data(porcelain.utf8))
+
+    #expect(worktrees.count == 3)
+    #expect(worktrees[0].root == "/tmp/cherry-main")
+    #expect(worktrees[0].branch == "main")
+    #expect(worktrees[0].isMain)
+    #expect(worktrees[1].branch == "feature/worktrees")
+    #expect(worktrees[1].lockReason == "IDE lease")
+    #expect(worktrees[2].isDetached)
+    #expect(worktrees[2].displayName == "@aabbccd")
+    #expect(worktrees[2].pruneReason == "gitdir file points to non-existent location")
+}
+
+@Test func gitBranchReferenceParserOrdersLocalBeforeRemoteAndHidesRemoteHead() {
+    let references = """
+    refs/remotes/origin/feature\0bbbb\0
+    refs/heads/main\0aaaa\0origin/main
+    refs/remotes/origin/HEAD\0aaaa\0
+    refs/heads/feature\0bbbb\0origin/feature
+    """
+
+    let parsed = GitWorktreeService.parseBranchReferences(Data(references.utf8))
+
+    #expect(parsed.map(\.displayName) == ["feature", "main", "origin/feature"])
+    #expect(parsed.map(\.kind) == [.local, .local, .remote])
+    #expect(parsed[0].upstream == "origin/feature")
+}
+
+@MainActor
+@Test func worktreeSwipeStateAnimatesProgrammaticSwitchAndResets() async throws {
+    let state = WorktreeSidebarSwipeState()
+    let activations = BoolRecorder()
+
+    let started = state.animateSwitch(
+        targetRoot: "/tmp/cherry-feature",
+        direction: 1,
+        sidebarWidth: 320,
+        duration: 0.01
+    ) {
+        activations.append(true)
+    }
+
+    #expect(started)
+    #expect(state.targetRoot == "/tmp/cherry-feature")
+    #expect(state.direction == 1)
+    #expect(state.offset == -320)
+    #expect(state.isAnimatingProgrammatically)
+
+    let duplicateStarted = state.animateSwitch(
+        targetRoot: "/tmp/cherry-third",
+        direction: 1,
+        sidebarWidth: 320,
+        duration: 0.01
+    ) {}
+    #expect(!duplicateStarted)
+
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(activations.values == [true])
+    #expect(state.targetRoot == nil)
+    #expect(state.direction == 0)
+    #expect(state.offset == 0)
+    #expect(!state.isAnimatingProgrammatically)
+}
+
+@Test func worktreeSwipeCommitDecisionProjectsFastFlicks() {
+    #expect(WorktreeSwipeCommitDecision.shouldCommit(
+        distance: 24,
+        velocity: 520,
+        threshold: 64
+    ))
+    #expect(!WorktreeSwipeCommitDecision.shouldCommit(
+        distance: 24,
+        velocity: 120,
+        threshold: 64
+    ))
+    #expect(!WorktreeSwipeCommitDecision.shouldCommit(
+        distance: 24,
+        velocity: -900,
+        threshold: 64
+    ))
+    #expect(WorktreeSwipeCommitDecision.shouldCommit(
+        distance: 64,
+        velocity: 0,
+        threshold: 64
+    ))
+}
+
+@Test func worktreeSwipeReleaseDecisionUsesTheLastDirectionAfterReversing() {
+    let fastReversal = WorktreeSwipeReleaseDecision.make(
+        distance: -80,
+        velocity: 900,
+        lastIntentDirection: -1,
+        threshold: 64
+    )
+    #expect(fastReversal == WorktreeSwipeReleaseDecision(
+        direction: -1,
+        shouldCommit: true
+    ))
+
+    let slowReversal = WorktreeSwipeReleaseDecision.make(
+        distance: -80,
+        velocity: 100,
+        lastIntentDirection: -1,
+        threshold: 64
+    )
+    #expect(slowReversal == WorktreeSwipeReleaseDecision(
+        direction: -1,
+        shouldCommit: false
+    ))
+
+    let uninterruptedSwipe = WorktreeSwipeReleaseDecision.make(
+        distance: -70,
+        velocity: -200,
+        lastIntentDirection: 1,
+        threshold: 64
+    )
+    #expect(uninterruptedSwipe == WorktreeSwipeReleaseDecision(
+        direction: 1,
+        shouldCommit: true
+    ))
+}
+
+@Test func worktreeSwipeIdleFallbackIgnoresActiveGesturePhases() {
+    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .began))
+    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .changed))
+    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .ended))
+    #expect(WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: []))
+}
+
+@Test func gitWorktreeServiceDiscoversCreatesAndRemovesACleanWorktree() async throws {
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryWorktreeTests-\(UUID().uuidString)", isDirectory: true)
+    let repositoryRoot = container.appendingPathComponent("repository", isDirectory: true)
+    let worktreeRoot = container
+        .appendingPathComponent("managed", isDirectory: true)
+        .appendingPathComponent("feature", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: container) }
+
+    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
+    let canonicalRepositoryRoot = try canonicalPathForTest(repositoryRoot)
+    try runGitForTest(["-C", repositoryRoot.path, "init", "-b", "main"])
+    try runGitForTest(["-C", repositoryRoot.path, "config", "user.name", "Cherry Tests"])
+    try runGitForTest(["-C", repositoryRoot.path, "config", "user.email", "cherry@example.invalid"])
+    try Data("Cherry\n".utf8).write(to: repositoryRoot.appendingPathComponent("README.md"))
+    try runGitForTest(["-C", repositoryRoot.path, "add", "README.md"])
+    try runGitForTest(["-C", repositoryRoot.path, "commit", "-m", "Initial commit"])
+
+    let service = GitWorktreeService()
+    let initial = try await service.discover(projectRoot: repositoryRoot.path)
+    #expect(initial.primaryRoot == canonicalRepositoryRoot)
+    #expect(initial.worktrees.map(\.branch) == ["main"])
+
+    try await service.create(
+        .newBranch(name: "feature/worktrees", startPoint: "HEAD", destination: worktreeRoot.path),
+        repositoryRoot: repositoryRoot.path
+    )
+    let canonicalWorktreeRoot = try canonicalPathForTest(worktreeRoot)
+    let created = try await service.discover(projectRoot: repositoryRoot.path)
+    #expect(created.worktrees.count == 2)
+    #expect(created.worktrees.first { $0.root == canonicalWorktreeRoot }?.branch == "feature/worktrees")
+    let isDirty = try await service.isDirty(worktreeRoot: worktreeRoot.path)
+    #expect(isDirty == false)
+
+    try await service.remove(worktreeRoot: worktreeRoot.path, repositoryRoot: repositoryRoot.path)
+    let removed = try await service.discover(projectRoot: repositoryRoot.path)
+    #expect(removed.worktrees.map(\.root) == [canonicalRepositoryRoot])
+    #expect(!FileManager.default.fileExists(atPath: worktreeRoot.path))
+}
+
+@Test func projectInfoDecodesPayloadsFromBeforeWorktreeSupport() throws {
+    let payload = Data("""
+    {
+      "root": "/tmp/cherry",
+      "name": "cherry",
+      "active": true,
+      "open": true,
+      "features": {"notesEnabled": true, "todosEnabled": false}
+    }
+    """.utf8)
+
+    let project = try JSONDecoder().decode(ProjectInfo.self, from: payload)
+
+    #expect(project.worktrees.isEmpty)
+    #expect(project.activeWorktreeRoot == nil)
+    #expect(project.features.notesEnabled)
+}
+
+@Test func projectInfoRoundTripsWorktreeMetadata() throws {
+    let project = ProjectInfo(
+        root: "/tmp/cherry",
+        name: "cherry",
+        active: true,
+        open: true,
+        worktrees: [
+            WorktreeInfo(
+                root: "/tmp/cherry-feature",
+                branch: "feature/worktrees",
+                head: "0123456789abcdef",
+                main: false,
+                detached: false,
+                locked: false,
+                hidden: true,
+                loaded: false,
+                active: true
+            )
+        ],
+        activeWorktreeRoot: "/tmp/cherry-feature"
+    )
+
+    let decoded = try JSONDecoder().decode(ProjectInfo.self, from: JSONEncoder().encode(project))
+
+    #expect(decoded == project)
 }
 
 @Test func cherryDeepLinksRoundTrip() throws {
@@ -2372,6 +2637,18 @@ private struct MCPWhoamiPayload: Decodable {
     let properties = try #require(schema["properties"]?.objectValue)
 
     #expect(properties["submit"] != nil)
+}
+
+@Test func mcpWorktreeActivationAdvertisesOnlyAnExistingRoot() throws {
+    let tool = try #require(CherryMCPTools.all.first { $0.name == "activate_worktree" })
+    let schema = try #require(tool.inputSchema.objectValue)
+    let properties = try #require(schema["properties"]?.objectValue)
+    let required = try #require(schema["required"]?.arrayValue)
+
+    #expect(properties["project_root"] != nil)
+    #expect(properties["branch"] == nil)
+    #expect(properties["destination"] == nil)
+    #expect(required.contains(.string("project_root")))
 }
 
 @Test func mcpWaitForProcessIdleAdvertisesOnlyProcessSelectors() throws {
@@ -10075,6 +10352,47 @@ private func waitForSummaryCallCount(
 
     settings.clearLocalProjectFeatureOverrides(for: directory.path)
     #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+}
+
+@MainActor
+@Test func worktreesShareLocalSettingsButLoadCommandsFromTheirActiveCheckout() async throws {
+    let defaultsName = "CherryTests.WorktreeSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer { defaults.removePersistentDomain(forName: defaultsName) }
+
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryWorktreeSettings-\(UUID().uuidString)", isDirectory: true)
+    let repositoryRoot = container.appendingPathComponent("main", isDirectory: true)
+    let worktreeRoot = container.appendingPathComponent("feature", isDirectory: true)
+    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: container) }
+
+    let settings = AgentSettings(defaults: defaults)
+    _ = settings.addProject(path: repositoryRoot.path)
+    settings.registerWorktreeRoots(
+        [repositoryRoot.path, worktreeRoot.path],
+        repositoryRoot: repositoryRoot.path
+    )
+
+    try CherryProjectFile.upsertCommand(
+        ProjectCommandDefinition(name: "Main Config", command: "main-server"),
+        projectRoot: repositoryRoot.path
+    )
+    try CherryProjectFile.upsertCommand(
+        ProjectCommandDefinition(name: "Feature Config", command: "feature-server"),
+        projectRoot: worktreeRoot.path
+    )
+    try settings.upsertCommand(
+        ProjectCommandDefinition(name: "Local Tool", command: "local-tool"),
+        for: worktreeRoot.path,
+        storage: .local
+    )
+
+    #expect(settings.projectCommands(for: repositoryRoot.path).map(\.name).sorted() == ["Local Tool", "Main Config"])
+    #expect(settings.projectCommands(for: worktreeRoot.path).map(\.name).sorted() == ["Feature Config", "Local Tool"])
+    #expect(settings.commandStorage(named: "Local Tool", for: repositoryRoot.path) == .local)
+    #expect(settings.selectedProject(for: worktreeRoot.path)?.root == repositoryRoot.path)
 }
 
 @MainActor

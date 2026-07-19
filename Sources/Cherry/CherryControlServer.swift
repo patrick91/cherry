@@ -95,7 +95,7 @@ final class CherryControlServer: @unchecked Sendable {
             ProjectWindowRegistry.shared.chromeState(for: $0)
         },
         openProjectRootsProvider: @escaping @MainActor () -> [String] = {
-            ProjectWindowRegistry.shared.projectRoots
+            ProjectWindowRegistry.shared.knownProjectRoots
         },
         openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
         socketURL: URL = CherryControl.socketURL,
@@ -982,22 +982,47 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func listProjects(workspace: TerminalWorkspace) -> ListProjectsResult {
         let activeRoot = workspace.projectRoot
+        let activeRepositoryRoot = agentSettings.repositoryRoot(for: activeRoot)
         var roots = agentSettings.projects.map(\.root)
-        if let activeRoot, !roots.contains(activeRoot) {
-            roots.insert(activeRoot, at: 0)
+        if let activeRepositoryRoot, !roots.contains(activeRepositoryRoot) {
+            roots.insert(activeRepositoryRoot, at: 0)
         }
         let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
+        var seenRepositoryRoots = Set<String>()
 
         return ListProjectsResult(
             activeProjectRoot: activeRoot,
-            projects: roots.map { root in
+            projects: roots.compactMap { requestedRoot in
+                let root = agentSettings.repositoryRoot(for: requestedRoot) ?? requestedRoot
                 let standardizedRoot = standardizedProjectRoot(root)
+                guard seenRepositoryRoots.insert(standardizedRoot).inserted else { return nil }
+                let repository = ProjectWindowRegistry.shared.repository(for: root)
+                let worktrees = repository?.supportsWorktrees == true ? repository?.worktrees.map { worktree in
+                    WorktreeInfo(
+                        root: worktree.root,
+                        branch: worktree.branch,
+                        head: worktree.head,
+                        main: worktree.isMain,
+                        detached: worktree.isDetached,
+                        locked: worktree.lockReason != nil,
+                        hidden: repository?.hiddenWorktreeRoots.contains(worktree.root) ?? false,
+                        loaded: repository?.loadedWorktreeRoots.contains(worktree.root) ?? false,
+                        active: repository?.activeWorktreeRoot == worktree.root
+                    )
+                } ?? [] : []
+                let isOpen = openRoots.contains(standardizedRoot)
+                    || worktrees.contains { openRoots.contains(standardizedProjectRoot($0.root)) }
+                let activeWorktreeRoot = repository?.supportsWorktrees == true
+                    ? repository?.activeWorktreeRoot
+                    : nil
                 return ProjectInfo(
                     root: root,
                     name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
-                    active: root == activeRoot,
-                    open: openRoots.contains(standardizedRoot),
-                    features: projectFeatureAvailability(for: root)
+                    active: standardizedRoot == activeRepositoryRoot.map(standardizedProjectRoot),
+                    open: isOpen,
+                    features: projectFeatureAvailability(for: root),
+                    worktrees: worktrees,
+                    activeWorktreeRoot: activeWorktreeRoot
                 )
             }
         )
@@ -1011,6 +1036,7 @@ final class CherryControlServer: @unchecked Sendable {
         let requestedRoot = standardizedProjectRoot(request.projectRoot)
         let candidateRoots = agentSettings.projects.map(\.root)
             + openProjectRootsProvider()
+            + ProjectWindowRegistry.shared.knownProjectRoots
             + [workspace.projectRoot].compactMap { $0 }
         guard let projectRoot = candidateRoots.first(where: { standardizedProjectRoot($0) == requestedRoot }) else {
             throw CherryControlError(

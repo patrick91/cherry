@@ -18,6 +18,7 @@ struct ContentView: View {
 
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
+    @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
@@ -34,6 +35,7 @@ struct ContentView: View {
     @State private var sidebarDismissTask: Task<Void, Never>?
     @State private var trafficLightFinalSyncTask: Task<Void, Never>?
     @State private var floatingSidebarAnimationDepth = 0
+    @StateObject private var worktreeSwipeState = WorktreeSidebarSwipeState()
 
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
@@ -100,8 +102,12 @@ struct ContentView: View {
             // is fully gone.
             TitlebarProjectPicker(
                 settings: AgentSettings.shared,
+                repository: repository,
+                chromeState: chromeState,
+                swipeState: worktreeSwipeState,
                 projectRoot: projectRoot,
                 presentation: isSidebarRevealed ? .floating : .docked,
+                sidebarWidth: sidebarWidth,
                 maximumWidth: titlebarProjectPickerMaximumWidth,
                 openProject: openProject,
                 openSettings: { openSettings() }
@@ -179,6 +185,20 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
                 .ignoresSafeArea(.all, edges: .vertical)
             }
+
+            if repository.supportsWorktrees,
+               !isSidebarHidden || isSidebarRevealed {
+                WorktreeSidebarSwipeMonitor(
+                    repository: repository,
+                    chromeState: chromeState,
+                    swipeState: worktreeSwipeState,
+                    sidebarWidth: sidebarWidth
+                )
+                .frame(width: sidebarWidth + (isSidebarRevealed ? floatingSidebarLeadingInset : 0))
+                .frame(maxHeight: .infinity)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .allowsHitTesting(false)
+            }
         }
         .ignoresSafeArea(.all, edges: .top)
         .background {
@@ -186,11 +206,14 @@ struct ContentView: View {
                 .ignoresSafeArea(.all)
         }
         .background(AppShortcutMonitor(
+            repository: repository,
+            worktreeSwipeState: worktreeSwipeState,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
+            sidebarWidth: sidebarWidth,
             openSettings: { openSettings() }
         ))
         .background(WindowConfigurator())
@@ -369,13 +392,16 @@ struct ContentView: View {
 
     private var dockedSidebar: some View {
         SidebarTabsView(
+            repository: repository,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .docked,
-            openProject: openProject
+            openProject: openProject,
+            swipeState: worktreeSwipeState,
+            sidebarWidth: sidebarWidth
         )
             .frame(width: sidebarWidth)
             .ignoresSafeArea(.all, edges: .top)
@@ -416,13 +442,16 @@ struct ContentView: View {
 
     private var floatingSidebar: some View {
         SidebarTabsView(
+            repository: repository,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .floating,
-            openProject: openProject
+            openProject: openProject,
+            swipeState: worktreeSwipeState,
+            sidebarWidth: sidebarWidth
         )
             .frame(width: sidebarWidth)
             .overlay(alignment: .trailing) {
@@ -4001,6 +4030,88 @@ private func cherryLink(for session: TerminalSession, projectRoot: String?) -> S
 }
 
 private struct SidebarTabsView: View {
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let openProject: (CherryProject) -> Void
+    @ObservedObject var swipeState: WorktreeSidebarSwipeState
+    let sidebarWidth: CGFloat
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                if let targetRoot = swipeState.targetRoot,
+                   let targetWorkspace = repository.workspaceIfLoaded(for: targetRoot) {
+                    SidebarTabsPage(
+                        workspace: targetWorkspace,
+                        chromeState: chromeState,
+                        noteStore: noteStore,
+                        todoStore: todoStore,
+                        projectRoot: targetRoot,
+                        presentation: presentation,
+                        openProject: openProject
+                    )
+                    .id(targetRoot)
+                    .offset(x: targetPageOffset)
+                    .allowsHitTesting(false)
+                }
+
+                SidebarTabsPage(
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    noteStore: noteStore,
+                    todoStore: todoStore,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    openProject: openProject
+                )
+                .id(projectRoot)
+                .offset(x: swipeState.offset)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+
+            if repository.supportsWorktrees {
+                WorktreeSpaceRail(
+                    repository: repository,
+                    chromeState: chromeState,
+                    swipeState: swipeState,
+                    sidebarWidth: sidebarWidth
+                )
+                .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
+                .padding(.trailing, SidebarLayout.trailingInset)
+                .padding(.bottom, 8 + dockedCompensation)
+            }
+        }
+        .background {
+            if presentation == .floating {
+                SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+            }
+        }
+        .overlay(alignment: .top) {
+            SidebarTopChromeShield(projectRoot: projectRoot, presentation: presentation)
+        }
+    }
+
+    private var targetPageOffset: CGFloat {
+        let origin = swipeState.direction > 0 ? sidebarWidth : -sidebarWidth
+        return origin + swipeState.offset
+    }
+
+    private var floatingOuterInset: CGFloat {
+        presentation == .floating ? SidebarLayout.floatingOuterInset : 0
+    }
+
+    private var dockedCompensation: CGFloat {
+        presentation == .docked ? SidebarLayout.floatingOuterInset : 0
+    }
+}
+
+private struct SidebarTabsPage: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject private var agentSettings = AgentSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
@@ -4016,79 +4127,69 @@ private struct SidebarTabsView: View {
         let visibleAgentCount = workspace.visibleAgentSessions(
             collapsedIDs: chromeState.collapsedAgentGroupIDs
         ).count
-        VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    SidebarAgentSessionSection(
-                        settings: agentSettings,
-                        workspace: workspace,
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                SidebarAgentSessionSection(
+                    settings: agentSettings,
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    showShortcutHints: chromeState.isCommandKeyPressed,
+                    openSettings: { openSettings() }
+                )
+
+                SidebarSessionSection(
+                    title: "Terminals",
+                    displayItems: workspace.terminalDisplayItems,
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    shortcutStartIndex: visibleAgentCount,
+                    showShortcutHints: chromeState.isCommandKeyPressed
+                )
+
+                SidebarCommandSection(
+                    settings: agentSettings,
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    shortcutStartIndex: visibleAgentCount + workspace.terminalDisplayItems.count,
+                    showShortcutHints: chromeState.isCommandKeyPressed
+                )
+
+                if features.todosEnabled {
+                    SidebarTodosSection(
+                        todoStore: todoStore,
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        showShortcutHints: chromeState.isCommandKeyPressed,
-                        openSettings: { openSettings() }
+                        shortcutNumber: todoBoardShortcutNumber,
+                        showShortcutHint: chromeState.isCommandKeyPressed
                     )
-
-                    SidebarSessionSection(
-                        title: "Terminals",
-                        displayItems: workspace.terminalDisplayItems,
-                        workspace: workspace,
-                        chromeState: chromeState,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
-                        shortcutStartIndex: visibleAgentCount,
-                        showShortcutHints: chromeState.isCommandKeyPressed
-                    )
-
-                    SidebarCommandSection(
-                        settings: agentSettings,
-                        workspace: workspace,
-                        chromeState: chromeState,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
-                        shortcutStartIndex: visibleAgentCount + workspace.terminalDisplayItems.count,
-                        showShortcutHints: chromeState.isCommandKeyPressed
-                    )
-
-                    if features.todosEnabled {
-                        SidebarTodosSection(
-                            todoStore: todoStore,
-                            chromeState: chromeState,
-                            projectRoot: projectRoot,
-                            presentation: presentation,
-                            shortcutNumber: todoBoardShortcutNumber,
-                            showShortcutHint: chromeState.isCommandKeyPressed
-                        )
-                    }
-
-                    if features.notesEnabled {
-                        SidebarNotesSection(
-                            noteStore: noteStore,
-                            chromeState: chromeState,
-                            projectRoot: projectRoot,
-                            presentation: presentation,
-                            shortcutStartIndex: notesShortcutStartIndex(features: features),
-                            showShortcutHints: chromeState.isCommandKeyPressed
-                        )
-                    }
                 }
-                // Keep the sidebar's text column aligned with the native
-                // traffic-light leading edge in both docked and floating
-                // presentations. Floating mode has an outer wrapper inset,
-                // so the inner leading padding subtracts that amount.
-                .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
-                .padding(.trailing, SidebarLayout.trailingInset)
-                .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + dockedCompensation)
-                .padding(.bottom, 10 + dockedCompensation)
+
+                if features.notesEnabled {
+                    SidebarNotesSection(
+                        noteStore: noteStore,
+                        chromeState: chromeState,
+                        projectRoot: projectRoot,
+                        presentation: presentation,
+                        shortcutStartIndex: notesShortcutStartIndex(features: features),
+                        showShortcutHints: chromeState.isCommandKeyPressed
+                    )
+                }
             }
-        }
-        .background {
-            if presentation == .floating {
-                SidebarBackground(projectRoot: projectRoot, presentation: presentation)
-            }
-        }
-        .overlay(alignment: .top) {
-            SidebarTopChromeShield(projectRoot: projectRoot, presentation: presentation)
+            // Keep the sidebar's text column aligned with the native
+            // traffic-light leading edge in both docked and floating
+            // presentations. Floating mode has an outer wrapper inset,
+            // so the inner leading padding subtracts that amount.
+            .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
+            .padding(.trailing, SidebarLayout.trailingInset)
+            .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + dockedCompensation)
+            .padding(.bottom, 10 + dockedCompensation)
         }
     }
 
@@ -4126,19 +4227,27 @@ private struct TitlebarProjectPicker: View {
     private static let titleSpacing: CGFloat = 6
     private static let horizontalPadding: CGFloat = 8
     private static let verticalPadding: CGFloat = 4
+    private static let worktreeIconWidth: CGFloat = 12
+    private static let worktreeLineSpacing: CGFloat = 4
 
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
 
     @ObservedObject var settings: AgentSettings
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var swipeState: WorktreeSidebarSwipeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let sidebarWidth: CGFloat
     let maximumWidth: CGFloat
     let openProject: (CherryProject) -> Void
     let openSettings: () -> Void
 
     @State private var isHovering = false
     @State private var anchorRef = TitlebarProjectMenuAnchorRef()
+    @State private var isNewWorktreePresented = false
+    @State private var isWorktreeManagerPresented = false
 
     var body: some View {
         let palette = SidebarPalette(
@@ -4162,14 +4271,12 @@ private struct TitlebarProjectPicker: View {
                         .frame(width: Self.accentDiameter, height: Self.accentDiameter)
                 }
 
-                Text(projectTitle)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                titleContent(palette: palette)
             }
             .font(.system(size: Self.fontSize, weight: .semibold))
             .foregroundStyle(palette.rowText)
             .padding(.horizontal, Self.horizontalPadding)
-            .padding(.vertical, Self.verticalPadding)
+            .padding(.vertical, titleVerticalPadding)
             .frame(width: preferredWidth(showsProjectAccent: palette.showsProjectAccent), alignment: .leading)
             .clipped()
             .background {
@@ -4186,11 +4293,66 @@ private struct TitlebarProjectPicker: View {
                 isHovering = hovering
             }
         }
+        .sheet(isPresented: $isNewWorktreePresented) {
+            NewWorktreeSheet(
+                repository: repository,
+                chromeState: chromeState,
+                isPresented: $isNewWorktreePresented
+            )
+        }
+        .sheet(isPresented: $isWorktreeManagerPresented) {
+            WorktreeManagerSheet(
+                repository: repository,
+                chromeState: chromeState,
+                isPresented: $isWorktreeManagerPresented
+            )
+        }
     }
 
     private func presentMenu() {
         let menu = NSMenu()
         var targets: [TitlebarProjectMenuTarget] = []
+
+        if repository.supportsWorktrees {
+            menu.addItem(NSMenuItem.sectionHeader(title: "Worktrees"))
+            for worktree in repository.worktrees {
+                let item = NSMenuItem(title: worktree.displayName, action: nil, keyEquivalent: "")
+                item.state = worktree.root == repository.activeWorktreeRoot ? .on : .off
+                if repository.hiddenWorktreeRoots.contains(worktree.root) {
+                    item.title += " — Hidden"
+                }
+                let target = TitlebarProjectMenuTarget {
+                    _ = repository.activate(
+                        worktreeRoot: worktree.root,
+                        chromeState: chromeState
+                    )
+                }
+                targets.append(target)
+                item.target = target
+                item.action = #selector(TitlebarProjectMenuTarget.invoke)
+                menu.addItem(item)
+            }
+
+            let newWorktreeItem = NSMenuItem(title: "New Worktree...", action: nil, keyEquivalent: "")
+            let newWorktreeTarget = TitlebarProjectMenuTarget {
+                isNewWorktreePresented = true
+            }
+            targets.append(newWorktreeTarget)
+            newWorktreeItem.target = newWorktreeTarget
+            newWorktreeItem.action = #selector(TitlebarProjectMenuTarget.invoke)
+            menu.addItem(newWorktreeItem)
+
+            let manageWorktreesItem = NSMenuItem(title: "Manage Worktrees...", action: nil, keyEquivalent: "")
+            let manageWorktreesTarget = TitlebarProjectMenuTarget {
+                isWorktreeManagerPresented = true
+            }
+            targets.append(manageWorktreesTarget)
+            manageWorktreesItem.target = manageWorktreesTarget
+            manageWorktreesItem.action = #selector(TitlebarProjectMenuTarget.invoke)
+            menu.addItem(manageWorktreesItem)
+
+            menu.addItem(.separator())
+        }
 
         if settings.projects.isEmpty {
             let item = NSMenuItem(title: "No Projects", action: nil, keyEquivalent: "")
@@ -4267,11 +4429,105 @@ private struct TitlebarProjectPicker: View {
     }
 
     private var projectTitle: String {
-        selectedProject?.name ?? "No Project"
+        guard let worktreeName
+        else {
+            return repositoryTitle
+        }
+        return "\(repositoryTitle) / \(worktreeName)"
+    }
+
+    private var repositoryTitle: String {
+        let name = selectedProject?.name ?? repository.repositoryName
+        return name.isEmpty ? "No Project" : name
+    }
+
+    private var worktreeName: String? {
+        activeWorktree?.displayName
+    }
+
+    private var activeWorktree: GitWorktree? {
+        repository.supportsWorktrees ? repository.activeWorktree : nil
+    }
+
+    private var swipeTargetWorktree: GitWorktree? {
+        guard let targetRoot = swipeState.targetRoot else { return nil }
+        return repository.worktrees.first { $0.root == targetRoot }
+    }
+
+    private var worktreeSwipeProgress: CGFloat {
+        guard let target = swipeTargetWorktree,
+              target.root != activeWorktree?.root
+        else { return 0 }
+        return min(1, max(0, abs(swipeState.offset) / max(sidebarWidth, 1)))
+    }
+
+    private var titleVerticalPadding: CGFloat {
+        activeWorktree == nil ? Self.verticalPadding : 1
+    }
+
+    @ViewBuilder
+    private func titleContent(palette: SidebarPalette) -> some View {
+        if let worktree = activeWorktree {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(repositoryTitle)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                ZStack(alignment: .leading) {
+                    worktreeLine(worktree, palette: palette)
+                        .opacity(1 - worktreeSwipeProgress)
+
+                    if let target = swipeTargetWorktree,
+                       target.root != worktree.root {
+                        worktreeLine(target, palette: palette)
+                            .opacity(worktreeSwipeProgress)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text(repositoryTitle)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    private func worktreeLine(
+        _ worktree: GitWorktree,
+        palette: SidebarPalette
+    ) -> some View {
+        HStack(spacing: Self.worktreeLineSpacing) {
+            Image(systemName: worktree.isDetached
+                ? "point.3.connected.trianglepath.dotted"
+                : "rectangle.stack")
+                .font(.system(size: 9, weight: .medium))
+                .frame(width: Self.worktreeIconWidth, height: 11)
+
+            Text(worktree.displayName)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundStyle(palette.rowText.opacity(0.68))
     }
 
     private func preferredWidth(showsProjectAccent: Bool) -> CGFloat {
-        let titleWidth = Self.measuredTitleWidth(projectTitle)
+        let titleWidth: CGFloat
+        if let worktreeName {
+            let targetWidth = swipeTargetWorktree.map {
+                Self.measuredTitleWidth($0.displayName)
+            } ?? 0
+            titleWidth = max(
+                Self.measuredTitleWidth(repositoryTitle),
+                Self.worktreeIconWidth
+                    + Self.worktreeLineSpacing
+                    + max(Self.measuredTitleWidth(worktreeName), targetWidth)
+            )
+        } else {
+            titleWidth = Self.measuredTitleWidth(repositoryTitle)
+        }
         let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))

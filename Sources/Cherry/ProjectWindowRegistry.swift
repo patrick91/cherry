@@ -1,5 +1,6 @@
 import AppKit
 import CherryControl
+import Darwin
 import SwiftUI
 
 @MainActor
@@ -8,6 +9,8 @@ final class ProjectWindowRegistry {
 
     private var windows: [String: WeakWindow] = [:]
     private var workspaces: [String: WeakWorkspace] = [:]
+    private var repositories: [String: WeakRepositoryWorkspace] = [:]
+    private var repositoryRootByWorktreeRoot: [String: String] = [:]
     private var noteStores: [String: WeakNoteStore] = [:]
     private var todoStores: [String: WeakTodoStore] = [:]
     private var chromeStates: [String: WeakChromeState] = [:]
@@ -27,7 +30,14 @@ final class ProjectWindowRegistry {
     /// Live workspaces across every registered project window.
     func allWorkspaces() -> [TerminalWorkspace] {
         pruneStaleWindows()
-        return workspaces.values.compactMap(\.workspace)
+        let repositoryWorkspaces = repositories.values.flatMap {
+            $0.repository?.allLoadedWorkspaces() ?? []
+        }
+        let repositoryWorkspaceIDs = Set(repositoryWorkspaces.map(ObjectIdentifier.init))
+        let legacyWorkspaces = workspaces.values.compactMap(\.workspace).filter {
+            !repositoryWorkspaceIDs.contains(ObjectIdentifier($0))
+        }
+        return repositoryWorkspaces + legacyWorkspaces
     }
 
     /// Total sessions running a process across all windows — drives the quit
@@ -48,8 +58,8 @@ final class ProjectWindowRegistry {
     /// every window (e.g. the menu-bar agent list).
     func workspacesByProjectRoot() -> [(projectRoot: String, workspace: TerminalWorkspace)] {
         pruneStaleWindows()
-        return workspaces.compactMap { key, weak in
-            weak.workspace.map { (projectRoot: key, workspace: $0) }
+        return allWorkspaces().compactMap { workspace in
+            workspace.projectRoot.map { (projectRoot: $0, workspace: workspace) }
         }
     }
 
@@ -57,28 +67,44 @@ final class ProjectWindowRegistry {
     /// select the session, and switch that window to the terminal view. Used by
     /// the menu-bar agent list's click-to-focus.
     func revealSession(id sessionID: UUID, projectRoot: String) {
-        guard focus(projectRoot: projectRoot),
-              let workspace = workspaces[projectRoot]?.workspace,
+        let owningRoot = self.projectRoot(containing: sessionID) ?? projectRoot
+        guard focus(projectRoot: owningRoot),
+              let workspace = workspace(for: owningRoot),
               let session = workspace.sessions.first(where: { $0.id == sessionID })
         else { return }
         workspace.select(session)
-        chromeStates[projectRoot]?.chromeState?.selectTerminal()
+        chromeState(for: owningRoot)?.selectTerminal()
     }
 
     var projectRoots: [String] {
         pruneStaleWindows()
-        return Array(workspaces.keys)
+        return allWorkspaces().compactMap(\.projectRoot)
+    }
+
+    /// Every root that can be focused through an open project window, including
+    /// discovered worktrees whose terminal workspace has not been created yet.
+    var knownProjectRoots: [String] {
+        pruneStaleWindows()
+        let repositoryRoots = repositories.values.flatMap {
+            $0.repository?.worktrees.map(\.root) ?? []
+        }
+        return Array(Set(repositoryRoots + Array(workspaces.keys))).sorted()
+    }
+
+    func canonicalProjectRoot(for projectRoot: String) -> String {
+        repositoryRoot(for: projectRoot)
     }
 
     func hasWindow(for projectRoot: String) -> Bool {
         pruneStaleWindows()
-        return windows[projectRoot]?.window != nil
+        return windows[repositoryRoot(for: projectRoot)]?.window != nil
     }
 
     func projectRoot(forProjectKey projectKey: String) -> String? {
         pruneStaleWindows()
         let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var roots = Array(workspaces.keys)
+        var roots = repositories.values.flatMap { $0.repository?.worktrees.map(\.root) ?? [] }
+        roots.append(contentsOf: workspaces.keys)
         roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
         if let activeProjectRoot {
             roots.append(activeProjectRoot)
@@ -95,6 +121,9 @@ final class ProjectWindowRegistry {
 
     func workspace(for projectRoot: String) -> TerminalWorkspace? {
         pruneStaleWindows()
+        if let repository = repository(for: projectRoot) {
+            return repository.workspaceIfLoaded(for: projectRoot)
+        }
         return workspaces[projectRoot]?.workspace
     }
 
@@ -127,17 +156,17 @@ final class ProjectWindowRegistry {
 
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
-        return noteStores[projectRoot]?.noteStore
+        return noteStores[repositoryRoot(for: projectRoot)]?.noteStore
     }
 
     func todoStore(for projectRoot: String) -> ProjectTodoStore? {
         pruneStaleWindows()
-        return todoStores[projectRoot]?.todoStore
+        return todoStores[repositoryRoot(for: projectRoot)]?.todoStore
     }
 
     func chromeState(for projectRoot: String) -> ProjectWindowChromeState? {
         pruneStaleWindows()
-        return chromeStates[projectRoot]?.chromeState
+        return chromeStates[repositoryRoot(for: projectRoot)]?.chromeState
     }
 
     @discardableResult
@@ -145,12 +174,14 @@ final class ProjectWindowRegistry {
         window: NSWindow,
         projectRoot: String?,
         workspace: TerminalWorkspace,
+        repository: RepositoryWorkspace? = nil,
         noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
     ) -> Bool {
-        guard let projectRoot else { return false }
+        guard let requestedRoot = projectRoot else { return false }
         pruneStaleWindows()
+        let projectRoot = repositoryRoot(for: requestedRoot)
         if let existing = windows[projectRoot]?.window, existing !== window {
             // Another window already owns this project. Refuse to claim the
             // slot so the caller can close this duplicate. SwiftUI's
@@ -162,6 +193,10 @@ final class ProjectWindowRegistry {
         }
         windows[projectRoot] = WeakWindow(window)
         workspaces[projectRoot] = WeakWorkspace(workspace)
+        if let repository {
+            repositories[projectRoot] = WeakRepositoryWorkspace(repository)
+            updateWorktreeMappings(repositoryRoot: projectRoot, repository: repository)
+        }
         if let noteStore {
             noteStores[projectRoot] = WeakNoteStore(noteStore)
         }
@@ -185,13 +220,17 @@ final class ProjectWindowRegistry {
     }
 
     func unregister(window: NSWindow, projectRoot: String?) {
-        guard let projectRoot, windows[projectRoot]?.window === window else { return }
+        guard let requestedRoot = projectRoot else { return }
+        let projectRoot = repositoryRoot(for: requestedRoot)
+        guard windows[projectRoot]?.window === window else { return }
+        repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter { $0.value != projectRoot }
         windows.removeValue(forKey: projectRoot)
         workspaces.removeValue(forKey: projectRoot)
+        repositories.removeValue(forKey: projectRoot)
         noteStores.removeValue(forKey: projectRoot)
         todoStores.removeValue(forKey: projectRoot)
         chromeStates.removeValue(forKey: projectRoot)
-        if activeProjectRoot == projectRoot {
+        if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
             activeProjectRoot = nil
             activeWorkspace = nil
             activeNoteStore = nil
@@ -204,22 +243,39 @@ final class ProjectWindowRegistry {
         }
     }
 
-    func focus(projectRoot: String) -> Bool {
-        guard let window = windows[projectRoot]?.window else {
-            windows.removeValue(forKey: projectRoot)
+    func focus(projectRoot: String, activateWorktree: Bool = true) -> Bool {
+        let repositoryRoot = repositoryRoot(for: projectRoot)
+        guard let window = windows[repositoryRoot]?.window else {
+            windows.removeValue(forKey: repositoryRoot)
             return false
         }
 
-        if let workspace = workspaces[projectRoot]?.workspace {
+        if let repository = repositories[repositoryRoot]?.repository {
+            if activateWorktree, repository.contains(worktreeRoot: projectRoot) {
+                _ = repository.activate(
+                    worktreeRoot: projectRoot,
+                    chromeState: chromeStates[repositoryRoot]?.chromeState
+                )
+            }
+            let workspace = repository.activeWorkspace
+            workspaces[repositoryRoot] = WeakWorkspace(workspace)
+            activate(
+                projectRoot: workspace.projectRoot ?? repositoryRoot,
+                workspace: workspace,
+                noteStore: noteStores[repositoryRoot]?.noteStore,
+                todoStore: todoStores[repositoryRoot]?.todoStore,
+                chromeState: chromeStates[repositoryRoot]?.chromeState
+            )
+        } else if let workspace = workspaces[repositoryRoot]?.workspace {
             activate(
                 projectRoot: projectRoot,
                 workspace: workspace,
-                noteStore: noteStores[projectRoot]?.noteStore,
-                todoStore: todoStores[projectRoot]?.todoStore,
-                chromeState: chromeStates[projectRoot]?.chromeState
+                noteStore: noteStores[repositoryRoot]?.noteStore,
+                todoStore: todoStores[repositoryRoot]?.todoStore,
+                chromeState: chromeStates[repositoryRoot]?.chromeState
             )
         } else {
-            AgentSettings.shared.markProjectOpened(projectRoot)
+            AgentSettings.shared.markProjectOpened(repositoryRoot)
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -228,8 +284,9 @@ final class ProjectWindowRegistry {
 
     @discardableResult
     func select(_ deepLink: CherryDeepLink, projectRoot: String) -> Bool {
+        let repositoryRoot = repositoryRoot(for: projectRoot)
         guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == deepLink.projectKey,
-              let chromeState = chromeStates[projectRoot]?.chromeState
+              let chromeState = chromeStates[repositoryRoot]?.chromeState
         else {
             return false
         }
@@ -240,7 +297,7 @@ final class ProjectWindowRegistry {
                 return false
             }
             guard let noteID = UUID(uuidString: deepLink.targetID),
-                  noteStores[projectRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
+                  noteStores[repositoryRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
             else {
                 return false
             }
@@ -251,7 +308,7 @@ final class ProjectWindowRegistry {
                 return false
             }
             guard let todoID = UUID(uuidString: deepLink.targetID),
-                  todoStores[projectRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
+                  todoStores[repositoryRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
             else {
                 return false
             }
@@ -259,7 +316,8 @@ final class ProjectWindowRegistry {
             return true
         case .terminal:
             guard let sessionID = UUID(uuidString: deepLink.targetID),
-                  let workspace = workspaces[projectRoot]?.workspace,
+                  focus(projectRoot: projectRoot),
+                  let workspace = workspace(for: projectRoot),
                   let session = workspace.sessions.first(where: { $0.id == sessionID })
             else {
                 return false
@@ -272,7 +330,11 @@ final class ProjectWindowRegistry {
 
     func markCurrentActiveProjectOpened() {
         refreshActiveWindow()
-        AgentSettings.shared.markProjectOpened(activeProjectRoot)
+        guard let activeProjectRoot else { return }
+        AgentSettings.shared.markWorktreeOpened(
+            activeProjectRoot,
+            repositoryRoot: repositoryRoot(for: activeProjectRoot)
+        )
     }
 
     func activateWindow(
@@ -293,35 +355,15 @@ final class ProjectWindowRegistry {
     }
 
     func projectRoot(containing sessionID: UUID) -> String? {
-        var staleProjectRoots: [String] = []
-        defer {
-            for projectRoot in staleProjectRoots {
-                windows.removeValue(forKey: projectRoot)
-                workspaces.removeValue(forKey: projectRoot)
-                noteStores.removeValue(forKey: projectRoot)
-                todoStores.removeValue(forKey: projectRoot)
-                chromeStates.removeValue(forKey: projectRoot)
-                if activeProjectRoot == projectRoot {
-                    activeProjectRoot = nil
-                    activeWorkspace = nil
-                    activeNoteStore = nil
-                    activeTodoStore = nil
-                    activeChromeState = nil
-                }
+        pruneStaleWindows()
+        for repository in repositories.values {
+            if let root = repository.repository?.root(containing: sessionID) {
+                return root
             }
         }
-
-        for (projectRoot, workspace) in workspaces {
-            guard let workspace = workspace.workspace else {
-                staleProjectRoots.append(projectRoot)
-                continue
-            }
-            if workspace.sessions.contains(where: { $0.id == sessionID }) {
-                return projectRoot
-            }
-        }
-
-        return nil
+        return workspaces.values.compactMap(\.workspace).first { workspace in
+            workspace.sessions.contains { $0.id == sessionID }
+        }?.projectRoot
     }
 
     func isSessionVisible(_ session: TerminalSession) -> Bool {
@@ -372,35 +414,33 @@ final class ProjectWindowRegistry {
 
     @discardableResult
     func focusSession(sessionID: UUID, projectRoot requestedProjectRoot: String?) -> Bool {
-        let candidates: [(projectRoot: String?, workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState?)]
-        if let requestedProjectRoot, let workspace = workspaces[requestedProjectRoot]?.workspace {
-            candidates = [(requestedProjectRoot, workspace, chromeStates[requestedProjectRoot]?.chromeState)]
-        } else {
-            candidates = workspaces.compactMap { projectRoot, weakWorkspace in
-                weakWorkspace.workspace.map { (projectRoot, $0, chromeStates[projectRoot]?.chromeState) }
+        let candidates: [(projectRoot: String?, workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState?)] =
+            workspacesByProjectRoot().compactMap { candidate in
+                if let requestedProjectRoot,
+                   candidate.projectRoot != requestedProjectRoot,
+                   repositoryRoot(for: candidate.projectRoot) != repositoryRoot(for: requestedProjectRoot) {
+                    return nil
+                }
+                return (
+                    projectRoot: candidate.projectRoot,
+                    workspace: candidate.workspace,
+                    chromeState: chromeState(for: candidate.projectRoot)
+                )
             }
-        }
 
         for candidate in candidates {
             guard let session = candidate.workspace.sessions.first(where: { $0.id == sessionID }) else {
                 continue
             }
 
-            candidate.workspace.select(session)
-            candidate.chromeState?.selectTerminal()
             if let projectRoot = candidate.projectRoot {
-                activate(
-                    projectRoot: projectRoot,
-                    workspace: candidate.workspace,
-                    noteStore: noteStores[projectRoot]?.noteStore,
-                    todoStore: todoStores[projectRoot]?.todoStore,
-                    chromeState: candidate.chromeState
-                )
                 _ = focus(projectRoot: projectRoot)
             } else {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.windows.first?.makeKeyAndOrderFront(nil)
             }
+            candidate.workspace.select(session)
+            candidate.chromeState?.selectTerminal()
             return true
         }
 
@@ -414,12 +454,16 @@ final class ProjectWindowRegistry {
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
     ) {
-        activeProjectRoot = projectRoot
+        let effectiveRoot = workspace.projectRoot ?? projectRoot
+        activeProjectRoot = effectiveRoot
         activeWorkspace = workspace
         activeNoteStore = noteStore
         activeTodoStore = todoStore
         activeChromeState = chromeState
-        AgentSettings.shared.markProjectOpened(projectRoot)
+        AgentSettings.shared.markWorktreeOpened(
+            effectiveRoot,
+            repositoryRoot: repositoryRoot(for: projectRoot)
+        )
 
         if NSApplication.shared.isActive,
            chromeState?.isShowingTerminalContent ?? true {
@@ -435,6 +479,40 @@ final class ProjectWindowRegistry {
         }
 
         activeWorkspace?.clearUnreadNotificationForSelectedSession()
+    }
+
+    func repositoryDidRefresh(_ repository: RepositoryWorkspace) {
+        guard let repositoryRoot = repositories.first(where: {
+            $0.value.repository === repository
+        })?.key else {
+            return
+        }
+        updateWorktreeMappings(repositoryRoot: repositoryRoot, repository: repository)
+    }
+
+    func repositoryDidActivate(_ repository: RepositoryWorkspace) {
+        repositoryDidRefresh(repository)
+        guard let repositoryRoot = repositories.first(where: {
+            $0.value.repository === repository
+        })?.key else {
+            return
+        }
+        let workspace = repository.activeWorkspace
+        workspaces[repositoryRoot] = WeakWorkspace(workspace)
+        if windows[repositoryRoot]?.window?.isKeyWindow == true {
+            activate(
+                projectRoot: repository.activeWorktreeRoot,
+                workspace: workspace,
+                noteStore: noteStores[repositoryRoot]?.noteStore,
+                todoStore: todoStores[repositoryRoot]?.todoStore,
+                chromeState: chromeStates[repositoryRoot]?.chromeState
+            )
+        }
+    }
+
+    func repository(for projectRoot: String) -> RepositoryWorkspace? {
+        pruneStaleWindows()
+        return repositories[repositoryRoot(for: projectRoot)]?.repository
     }
 
     private func refreshActiveWindow() {
@@ -461,17 +539,49 @@ final class ProjectWindowRegistry {
         }?.key
     }
 
+    private func repositoryRoot(for projectRoot: String) -> String {
+        let standardizedRoot = URL(
+            fileURLWithPath: projectRoot,
+            isDirectory: true
+        ).standardizedFileURL.path
+        let normalizedRoot: String
+        if let resolved = standardizedRoot.withCString({ realpath($0, nil) }) {
+            normalizedRoot = String(cString: resolved)
+            free(resolved)
+        } else {
+            normalizedRoot = standardizedRoot
+        }
+        return repositoryRootByWorktreeRoot[normalizedRoot] ?? normalizedRoot
+    }
+
+    private func updateWorktreeMappings(
+        repositoryRoot: String,
+        repository: RepositoryWorkspace
+    ) {
+        repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter {
+            $0.value != repositoryRoot
+        }
+        repositoryRootByWorktreeRoot[repositoryRoot] = repositoryRoot
+        for worktree in repository.worktrees {
+            repositoryRootByWorktreeRoot[worktree.root] = repositoryRoot
+        }
+    }
+
     private func pruneStaleWindows() {
         let staleProjectRoots = windows.compactMap { projectRoot, weakWindow in
             weakWindow.window == nil || workspaces[projectRoot]?.workspace == nil ? projectRoot : nil
         }
         for projectRoot in staleProjectRoots {
+            repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter {
+                $0.value != projectRoot
+            }
             windows.removeValue(forKey: projectRoot)
             workspaces.removeValue(forKey: projectRoot)
+            repositories.removeValue(forKey: projectRoot)
             noteStores.removeValue(forKey: projectRoot)
             todoStores.removeValue(forKey: projectRoot)
             chromeStates.removeValue(forKey: projectRoot)
-            if activeProjectRoot == projectRoot {
+            if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
                 activeProjectRoot = nil
                 activeWorkspace = nil
                 activeNoteStore = nil
@@ -495,6 +605,14 @@ private final class WeakWorkspace {
 
     init(_ workspace: TerminalWorkspace) {
         self.workspace = workspace
+    }
+}
+
+private final class WeakRepositoryWorkspace {
+    weak var repository: RepositoryWorkspace?
+
+    init(_ repository: RepositoryWorkspace) {
+        self.repository = repository
     }
 }
 
@@ -742,6 +860,7 @@ final class ProjectWindowChromeState: ObservableObject {
 struct ProjectWindowBinder: NSViewRepresentable {
     let projectRoot: String?
     let workspace: TerminalWorkspace
+    let repository: RepositoryWorkspace?
     let noteStore: ProjectNoteStore?
     let todoStore: ProjectTodoStore?
     let chromeState: ProjectWindowChromeState?
@@ -750,6 +869,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
         let view = ProjectWindowBinderView()
         view.projectRoot = projectRoot
         view.workspace = workspace
+        view.repository = repository
         view.noteStore = noteStore
         view.todoStore = todoStore
         view.chromeState = chromeState
@@ -760,6 +880,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
         guard let view = nsView as? ProjectWindowBinderView else { return }
         view.projectRoot = projectRoot
         view.workspace = workspace
+        view.repository = repository
         view.noteStore = noteStore
         view.todoStore = todoStore
         view.chromeState = chromeState
@@ -770,6 +891,7 @@ struct ProjectWindowBinder: NSViewRepresentable {
 @MainActor
 private final class ProjectWindowBinderView: NSView {
     weak var workspace: TerminalWorkspace?
+    weak var repository: RepositoryWorkspace?
     weak var noteStore: ProjectNoteStore?
     weak var todoStore: ProjectTodoStore?
     weak var chromeState: ProjectWindowChromeState?
@@ -789,6 +911,7 @@ private final class ProjectWindowBinderView: NSView {
             window: window,
             projectRoot: projectRoot,
             workspace: workspace,
+            repository: repository,
             noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState
@@ -796,7 +919,11 @@ private final class ProjectWindowBinderView: NSView {
         if !claimed {
             // Another window already owns this project. Close this duplicate
             // and bring the existing one forward.
-            workspace.closeAllSessions()
+            if let repository {
+                repository.closeAllSessions()
+            } else {
+                workspace.closeAllSessions()
+            }
             if let projectRoot {
                 _ = ProjectWindowRegistry.shared.focus(projectRoot: projectRoot)
             }
@@ -826,6 +953,7 @@ private final class ProjectWindowBinderView: NSView {
 
         closeDelegate?.projectRoot = projectRoot
         closeDelegate?.workspace = workspace
+        closeDelegate?.repository = repository
     }
 
     private func installObserver() {
@@ -844,7 +972,7 @@ private final class ProjectWindowBinderView: NSView {
                 guard let self, let workspace = self.workspace else { return }
                 ProjectWindowRegistry.shared.activateWindow(
                     projectRoot: self.projectRoot,
-                    workspace: workspace,
+                    workspace: self.repository?.activeWorkspace ?? workspace,
                     noteStore: self.noteStore,
                     todoStore: self.todoStore,
                     chromeState: self.chromeState
@@ -879,6 +1007,7 @@ private final class ProjectWindowBinderView: NSView {
 private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     weak var window: NSWindow?
     weak var workspace: TerminalWorkspace?
+    weak var repository: RepositoryWorkspace?
     weak var previousDelegate: NSWindowDelegate?
     var projectRoot: String?
     private var isCloseConfirmed = false
@@ -899,7 +1028,8 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         // Confirm for ANY running process (agents, live commands, terminals
         // executing a foreground program) — not just agents. (Product intent is to
         // later narrow this back to running agents only.)
-        let runningCount = workspace.sessionsWithRunningProcess().count
+        let runningCount = repository?.runningProcessCount()
+            ?? workspace.sessionsWithRunningProcess().count
         guard runningCount > 0 else {
             return previousWindowShouldClose(sender)
         }
@@ -945,7 +1075,11 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     private func closeWorkspaceIfNeeded() {
         guard !didCloseWorkspace else { return }
         didCloseWorkspace = true
-        workspace?.closeAllSessions()
+        if let repository {
+            repository.closeAllSessions()
+        } else {
+            workspace?.closeAllSessions()
+        }
     }
 
     private func previousWindowShouldClose(_ sender: NSWindow) -> Bool {

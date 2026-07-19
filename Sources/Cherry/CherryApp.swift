@@ -509,6 +509,7 @@ private struct WindowTitleWriter: NSViewRepresentable {
 private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var repository: RepositoryWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
@@ -595,6 +596,15 @@ private struct ProjectWorkspaceView: View {
                 chromeState: chromeState
             )
             openPendingDeepLinks()
+        }
+        .onChange(of: terminalSettings.worktreeSpacesEnabled) { _, isEnabled in
+            if isEnabled {
+                Task {
+                    await repository.refresh()
+                }
+            } else {
+                repository.disableWorktreeSpaces(chromeState: chromeState)
+            }
         }
     }
 

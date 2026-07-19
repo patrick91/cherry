@@ -285,7 +285,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 
     var subtitle: String {
         switch self {
-        case .general: "App chrome, sidebar, and theme behavior"
+        case .general: "App chrome, sidebar, worktrees, and theme behavior"
         case .terminal: "Terminal themes, text, cursor, and contrast"
         case .projects: "Workspaces, local features, and identity colors"
         case .agents: "Agent tools and automatic summaries"

@@ -21,13 +21,8 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
 swift run Cherry
 ```
 
-Worktree spaces are currently opt-in while the UI is being dogfooded:
-
-```bash
-CHERRY_WORKTREE_SPACES=1 swift run Cherry
-```
-
-When enabled, Cherry discovers every Git worktree for a project and keeps them
+Enable worktree spaces in **Cherry > Settings > General**. Cherry then discovers
+every Git worktree for a project and keeps them
 inside one project window. Switch with the worktree rail, an interactive
 horizontal two-finger swipe over the sidebar, or `Cmd-Option-Left/Right`. The
 rail's `+` and `...` buttons create, show/hide, prune, and safely remove clean

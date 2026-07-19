@@ -46,6 +46,13 @@ struct GeneralSettingsPane: View {
                     .pickerStyle(.segmented)
                     .frame(width: 220)
                 }
+
+                SettingsDivider()
+
+                SettingsRow("Worktree spaces", subtitle: "Group Git worktrees into swipeable spaces in one project window.") {
+                    Toggle("Worktree spaces", isOn: $settings.worktreeSpacesEnabled)
+                        .labelsHidden()
+                }
             }
 
             SettingsCard("External Editor") {

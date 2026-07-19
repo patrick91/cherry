@@ -1,15 +1,6 @@
 import Darwin
 import Foundation
 
-enum WorktreeFeatureFlags {
-    static var isEnabled: Bool {
-        let value = ProcessInfo.processInfo.environment["CHERRY_WORKTREE_SPACES"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return value == "1" || value == "true" || value == "yes" || value == "on"
-    }
-}
-
 struct WorktreeRemovalBlockers: Equatable {
     let runningProcessCount: Int
     let isDirty: Bool
@@ -47,7 +38,9 @@ final class RepositoryWorkspace: ObservableObject {
         service: GitWorktreeService = GitWorktreeService()
     ) {
         let root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-        let savedRoot = AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
+        let savedRoot = TerminalSettings.shared.worktreeSpacesEnabled
+            ? AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
+            : root
         let existingRoot = FileManager.default.fileExists(atPath: savedRoot) ? savedRoot : root
         let initialRoot = Self.resolvedPath(existingRoot)
         repositoryRoot = root
@@ -93,7 +86,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     var supportsWorktrees: Bool {
-        WorktreeFeatureFlags.isEnabled && commonDirectory != nil
+        TerminalSettings.shared.worktreeSpacesEnabled && commonDirectory != nil
     }
 
     func workspaceIfLoaded(for root: String) -> TerminalWorkspace? {
@@ -110,7 +103,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func refresh() async {
-        guard WorktreeFeatureFlags.isEnabled else { return }
+        guard TerminalSettings.shared.worktreeSpacesEnabled else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
@@ -162,6 +155,12 @@ final class RepositoryWorkspace: ObservableObject {
             }
             dirtyByRoot = next
         }
+    }
+
+    func disableWorktreeSpaces(chromeState: ProjectWindowChromeState?) {
+        discoveryError = nil
+        guard activeWorktreeRoot != repositoryRoot else { return }
+        _ = activate(worktreeRoot: repositoryRoot, chromeState: chromeState)
     }
 
     @discardableResult

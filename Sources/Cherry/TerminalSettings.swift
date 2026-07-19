@@ -117,6 +117,12 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    @Published var worktreeSpacesEnabled: Bool {
+        didSet {
+            save(worktreeSpacesEnabled, forKey: Keys.worktreeSpacesEnabled, notifyTerminal: false)
+        }
+    }
+
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -147,6 +153,8 @@ final class TerminalSettings: ObservableObject {
             .flatMap(SidebarTerminalPathDisplayMode.init(rawValue:)) ?? Defaults.sidebarTerminalPathDisplayMode
         projectColorDisplayMode = (defaults.object(forKey: Keys.projectColorDisplayMode) as? String)
             .flatMap(ProjectColorDisplayMode.init(rawValue:)) ?? Defaults.projectColorDisplayMode
+        worktreeSpacesEnabled = defaults.object(forKey: Keys.worktreeSpacesEnabled) as? Bool
+            ?? Defaults.worktreeSpacesEnabled
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -314,9 +322,11 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
-    private func save(_ value: Bool, forKey key: String) {
+    private func save(_ value: Bool, forKey key: String, notifyTerminal: Bool = true) {
         defaults.set(value, forKey: key)
-        notifyChanged()
+        if notifyTerminal {
+            notifyChanged()
+        }
     }
 
     private func save(_ value: String, forKey key: String, notifyTerminal: Bool = true) {
@@ -338,6 +348,7 @@ final class TerminalSettings: ObservableObject {
         static let sidebarBackgroundDepth = 0.08
         static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
         static let projectColorDisplayMode = ProjectColorDisplayMode.accent
+        static let worktreeSpacesEnabled = false
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
@@ -351,6 +362,7 @@ final class TerminalSettings: ObservableObject {
         static let sidebarBackgroundDepth = "sidebar.backgroundDepth"
         static let sidebarTerminalPathDisplayMode = "sidebar.terminalPathDisplayMode"
         static let projectColorDisplayMode = "sidebar.projectColorDisplayMode"
+        static let worktreeSpacesEnabled = "features.worktreeSpaces"
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"

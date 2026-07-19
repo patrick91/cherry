@@ -8400,6 +8400,21 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
+@Test func terminalSettingsPersistWorktreeSpacesPreference() async throws {
+    let defaultsName = "CherryTests.WorktreeSpacesSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let settings = TerminalSettings(defaults: defaults)
+    #expect(!settings.worktreeSpacesEnabled)
+
+    settings.worktreeSpacesEnabled = true
+    #expect(TerminalSettings(defaults: defaults).worktreeSpacesEnabled)
+}
+
+@MainActor
 @Test func terminalSettingsConfigureEmbeddedGhosttyTerminal() async throws {
     let configuration = TerminalSettings.ghosttyConfiguration(
         fontSize: 14,

@@ -2757,11 +2757,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 final class GhosttyTerminalContainerView: NSView {
     private static let snapshotFadeDuration: CFTimeInterval = 0.18
 
-    private enum SurfaceTransitionRevealStyle {
-        case crossfade
-        case replace
-    }
-
     private let scrollView = NSScrollView()
     private let documentView = NSView()
     private weak var activeSession: TerminalSession?
@@ -2780,7 +2775,6 @@ final class GhosttyTerminalContainerView: NSView {
     private var surfaceTransitionSnapshotLayer: CALayer?
     private var surfaceTransitionFallbackTask: Task<Void, Never>?
     private var surfaceTransitionGeneration: UInt64 = 0
-    private var surfaceTransitionRevealStyle = SurfaceTransitionRevealStyle.crossfade
     private var activeColorScheme: ColorScheme = .dark
     private var pendingPostAnimationDelta: CGFloat = 0
     private var didApplyEarlyFit = false
@@ -2825,7 +2819,7 @@ final class GhosttyTerminalContainerView: NSView {
         colorScheme: ColorScheme,
         allowsAutoFocus: Bool = true,
         isActivePane: Bool = true,
-        crossfadesSurfaceTransitions: Bool = true,
+        usesWorktreeSurfaceTransition: Bool = false,
         onActivate: (() -> Void)? = nil
     ) {
         TerminalPerformanceMonitor.recordContainerConfigure()
@@ -2838,15 +2832,17 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            // Agent/tab changes and worktree swipes both replace the mounted
-            // Ghostty surface. Keep the outgoing pixels above either path while
-            // the incoming surface fits and its foreground TUI redraws.
-            let transitionGeneration = activeSession.map {
-                let replacesProjectSurface = !crossfadesSurfaceTransitions
-                    || isWorktreeTransition(from: $0, to: session)
-                return beginSurfaceTransitionIfPossible(
-                    revealStyle: replacesProjectSurface ? .replace : .crossfade
-                )
+            // Terminal selection is intentionally immediate. Only worktree
+            // navigation keeps the outgoing pixels briefly while the incoming
+            // surface fits and its foreground TUI redraws.
+            let transitionGeneration: UInt64? = activeSession.flatMap { source -> UInt64? in
+                guard usesWorktreeSurfaceTransition
+                    || isWorktreeTransition(from: source, to: session)
+                else {
+                    cancelSurfaceTransition()
+                    return nil
+                }
+                return beginSurfaceTransitionIfPossible()
             } ?? nil
             resetSidebarAnimationStateForSurfaceChange()
             if let activeSession {
@@ -3144,9 +3140,7 @@ final class GhosttyTerminalContainerView: NSView {
         removeSnapshotLayer(animated: false)
     }
 
-    private func beginSurfaceTransitionIfPossible(
-        revealStyle: SurfaceTransitionRevealStyle
-    ) -> UInt64? {
+    private func beginSurfaceTransitionIfPossible() -> UInt64? {
         guard activeBridge != nil,
               scrollView.frame.width > 0,
               scrollView.frame.height > 0,
@@ -3159,7 +3153,6 @@ final class GhosttyTerminalContainerView: NSView {
         cancelSurfaceTransition()
         surfaceTransitionGeneration &+= 1
         let generation = surfaceTransitionGeneration
-        surfaceTransitionRevealStyle = revealStyle
         surfaceTransitionSnapshotLayer = makeSnapshotLayer(
             contents: cgImage,
             frame: scrollView.frame,
@@ -3168,10 +3161,7 @@ final class GhosttyTerminalContainerView: NSView {
         surfaceTransitionFallbackTask = Task { @MainActor [weak self] in
             // Safety valve for a stopped or otherwise non-rendering surface.
             // Normal transitions complete through the stable-render callback.
-            let fallbackDelay: Duration = revealStyle == .replace
-                ? .milliseconds(240)
-                : .seconds(1)
-            try? await Task.sleep(for: fallbackDelay)
+            try? await Task.sleep(for: .milliseconds(240))
             guard !Task.isCancelled else { return }
             self?.completeSurfaceTransition(generation: generation)
         }
@@ -3185,21 +3175,8 @@ final class GhosttyTerminalContainerView: NSView {
 
         surfaceTransitionFallbackTask?.cancel()
         surfaceTransitionFallbackTask = nil
-
-        if surfaceTransitionRevealStyle == .replace {
-            fadingLayer.removeFromSuperlayer()
-            surfaceTransitionSnapshotLayer = nil
-            surfaceTransitionRevealStyle = .crossfade
-            return
-        }
-
-        animateSnapshotFadeOut(fadingLayer) { [weak self] in
-            fadingLayer.removeFromSuperlayer()
-            if self?.surfaceTransitionSnapshotLayer === fadingLayer {
-                self?.surfaceTransitionSnapshotLayer = nil
-                self?.surfaceTransitionRevealStyle = .crossfade
-            }
-        }
+        fadingLayer.removeFromSuperlayer()
+        surfaceTransitionSnapshotLayer = nil
     }
 
     private func cancelSurfaceTransition() {
@@ -3207,7 +3184,6 @@ final class GhosttyTerminalContainerView: NSView {
         surfaceTransitionFallbackTask = nil
         surfaceTransitionSnapshotLayer?.removeFromSuperlayer()
         surfaceTransitionSnapshotLayer = nil
-        surfaceTransitionRevealStyle = .crossfade
     }
 
     private func isWorktreeTransition(
@@ -3723,15 +3699,6 @@ final class GhosttyTerminalContainerView: NSView {
 
     var hasSurfaceTransitionSnapshotForTesting: Bool {
         surfaceTransitionSnapshotLayer?.superlayer != nil
-    }
-
-    var surfaceTransitionAnimationKeysForTesting: [String] {
-        surfaceTransitionSnapshotLayer?.animationKeys() ?? []
-    }
-
-    var surfaceTransitionCrossfadesForTesting: Bool? {
-        guard surfaceTransitionSnapshotLayer != nil else { return nil }
-        return surfaceTransitionRevealStyle == .crossfade
     }
 
     var activeSessionIDForTesting: UUID? {

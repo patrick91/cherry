@@ -215,7 +215,7 @@ private struct TerminalWorkspaceSwitchTestHost: View {
         TerminalSplitSceneView(
             workspace: selection.workspace,
             chromeState: chromeState,
-            crossfadesSurfaceTransitions: false
+            usesWorktreeSurfaceTransition: true
         )
     }
 }
@@ -6525,7 +6525,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func ghosttySessionSwitchFadesOutgoingSnapshotAfterIncomingRender() async throws {
+@Test func ghosttySessionSwitchIsImmediateWithinAWorktree() {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -6540,16 +6540,9 @@ private struct MCPWhoamiPayload: Decodable {
         projectRoot: "/tmp/cherry-shared-project",
         launchShell: false
     )
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
-        styleMask: [.borderless],
-        backing: .buffered,
-        defer: false
+    let container = GhosttyTerminalContainerView(
+        frame: NSRect(x: 0, y: 0, width: 640, height: 400)
     )
-    window.isReleasedWhenClosed = false
-    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
-    window.contentView = container
-    window.orderFrontRegardless()
 
     defer {
         container.detachActiveSession()
@@ -6557,50 +6550,13 @@ private struct MCPWhoamiPayload: Decodable {
         second.releaseGhosttyBridge()
         first.stop()
         second.stop()
-        window.close()
     }
 
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
-    container.layoutSubtreeIfNeeded()
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
-    #expect(container.hasSurfaceTransitionSnapshotForTesting)
-    #expect(container.surfaceTransitionCrossfadesForTesting == true)
-
-    let scale = window.backingScaleFactor
-    let widthPixels = UInt32((container.bounds.width * scale).rounded(.down))
-    let heightPixels = UInt32((container.bounds.height * scale).rounded(.down))
-    let cellWidthPixels: UInt32 = 8
-    let cellHeightPixels: UInt32 = 16
-    second.ghosttyBridge.terminalDidResize(TerminalGridMetrics(
-        columns: UInt16(widthPixels / cellWidthPixels),
-        rows: UInt16(heightPixels / cellHeightPixels),
-        widthPixels: widthPixels,
-        heightPixels: heightPixels,
-        cellWidthPixels: cellWidthPixels,
-        cellHeightPixels: cellHeightPixels
-    ))
-    second.ghosttyBridge.simulatePostRenderForTesting()
-
-    // A later TUI redraw restarts the quiet period rather than exposing its
-    // intermediate post-resize composition.
-    try await Task.sleep(for: .milliseconds(50))
-    second.ghosttyBridge.simulatePostRenderForTesting()
-    try await Task.sleep(for: .milliseconds(50))
-    #expect(container.hasSurfaceTransitionSnapshotForTesting)
-
-    // Once rendering settles, exactly one compositor animation drives the
-    // outgoing terminal. An implicit `opacity` animation must not compete with
-    // the intentional `fadeOut` curve.
-    #expect(await waitForCondition {
-        container.surfaceTransitionAnimationKeysForTesting.contains("fadeOut")
-    })
-    #expect(!container.surfaceTransitionAnimationKeysForTesting.contains("opacity"))
-
-    // The outgoing terminal then leaves the rendered incoming surface exposed.
-    #expect(await waitForCondition {
-        !container.hasSurfaceTransitionSnapshotForTesting
-    })
+    #expect(!container.hasSurfaceTransitionSnapshotForTesting)
+    #expect(container.activeSessionIDForTesting == second.id)
 }
 
 @MainActor
@@ -6661,7 +6617,6 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(currentContainer === originalContainer)
     #expect(currentContainer.hasSurfaceTransitionSnapshotForTesting)
-    #expect(currentContainer.surfaceTransitionCrossfadesForTesting == false)
     // The target terminal is already transitioning while the sidebar is still
     // in its settle phase; neither waits for the other to finish first.
     #expect(swipeState.targetRoot == "/tmp/cherry-second-worktree")

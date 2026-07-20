@@ -73,7 +73,7 @@ struct ContentView: View {
                     todoStore: todoStore,
                     projectRoot: projectRoot,
                     includeLeadingPadding: isSidebarHidden,
-                    crossfadesSurfaceTransitions: worktreeSwipeState.targetRoot == nil
+                    usesWorktreeSurfaceTransition: worktreeSwipeState.targetRoot != nil
                 )
                     .ignoresSafeArea(.all, edges: .top)
             }
@@ -905,7 +905,7 @@ private struct DetailPaneView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     let projectRoot: String?
     let includeLeadingPadding: Bool
-    let crossfadesSurfaceTransitions: Bool
+    let usesWorktreeSurfaceTransition: Bool
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
@@ -924,7 +924,7 @@ private struct DetailPaneView: View {
                 TerminalSplitSceneView(
                     workspace: workspace,
                     chromeState: chromeState,
-                    crossfadesSurfaceTransitions: crossfadesSurfaceTransitions
+                    usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition
                 )
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
@@ -9148,17 +9148,17 @@ struct TerminalSplitSceneView: View {
 
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let crossfadesSurfaceTransitions: Bool
+    let usesWorktreeSurfaceTransition: Bool
     @State private var dividerDragState: DividerDragState?
 
     init(
         workspace: TerminalWorkspace,
         chromeState: ProjectWindowChromeState,
-        crossfadesSurfaceTransitions: Bool = true
+        usesWorktreeSurfaceTransition: Bool = false
     ) {
         self.workspace = workspace
         self.chromeState = chromeState
-        self.crossfadesSurfaceTransitions = crossfadesSurfaceTransitions
+        self.usesWorktreeSurfaceTransition = usesWorktreeSurfaceTransition
     }
 
     var body: some View {
@@ -9185,7 +9185,7 @@ struct TerminalSplitSceneView: View {
                         session: session,
                         chromeState: chromeState,
                         isActivePane: workspace.selectedSessionID == session.id,
-                        crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
+                        usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
                         onActivate: activate
                     )
                     .frame(width: width(at: index, in: widths))
@@ -9523,7 +9523,7 @@ private struct TerminalSceneView: View {
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
     let isActivePane: Bool
-    let crossfadesSurfaceTransitions: Bool
+    let usesWorktreeSurfaceTransition: Bool
     let onActivate: (UUID) -> Void
     @StateObject private var searchState = TerminalSearchState()
 
@@ -9533,7 +9533,7 @@ private struct TerminalSceneView: View {
                 session: session,
                 chromeState: chromeState,
                 isActivePane: isActivePane,
-                crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
+                usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
                 onActivate: onActivate
             )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -6,9 +6,23 @@ enum WorktreeSwipeTuning {
     static let commitDistanceKey = "worktrees.swipeCommitDistance"
     static let settleDurationKey = "worktrees.swipeSettleDuration"
     static let defaultCommitDistance = 64.0
-    static let defaultSettleDuration = 0.20
+    static let defaultSettleDuration = 0.14
     static let commitDistanceRange = 28.0...100.0
-    static let settleDurationRange = 0.12...0.32
+    static let settleDurationRange = 0.08...0.24
+    private static let minimumSettleDuration = 0.05
+
+    static func resolvedSettleDuration(
+        configuredDuration: Double,
+        currentOffset: CGFloat,
+        finalOffset: CGFloat,
+        sidebarWidth: CGFloat
+    ) -> Double {
+        let maximumDuration = max(0.01, configuredDuration)
+        let minimumDuration = min(maximumDuration, minimumSettleDuration)
+        let remainingDistance = abs(finalOffset - currentOffset)
+        let distanceFraction = min(1, remainingDistance / max(sidebarWidth, 1))
+        return max(minimumDuration, maximumDuration * Double(distanceFraction))
+    }
 }
 
 enum WorktreeSwipeCommitDecision {
@@ -921,10 +935,18 @@ final class WorktreeSidebarSwipeState: ObservableObject {
         }
     }
 
-    func settle(to offset: CGFloat, duration: Double) {
-        withAnimation(.smooth(duration: max(0.01, duration))) {
+    @discardableResult
+    func settle(to offset: CGFloat, duration: Double, sidebarWidth: CGFloat) -> Double {
+        let resolvedDuration = WorktreeSwipeTuning.resolvedSettleDuration(
+            configuredDuration: duration,
+            currentOffset: self.offset,
+            finalOffset: offset,
+            sidebarWidth: sidebarWidth
+        )
+        withAnimation(.smooth(duration: resolvedDuration)) {
             self.offset = offset
         }
+        return resolvedDuration
     }
 
     @discardableResult
@@ -947,12 +969,16 @@ final class WorktreeSidebarSwipeState: ObservableObject {
         )
         // Start the workspace/terminal handoff with the sidebar motion. Waiting
         // until the slide finished made one gesture read as two transitions:
-        // first a sidebar swipe, then a delayed terminal crossfade.
+        // first a sidebar swipe, then a delayed terminal replacement.
         let finalOffset = direction > 0 ? -sidebarWidth : sidebarWidth
-        settle(to: finalOffset, duration: duration)
+        let resolvedDuration = settle(
+            to: finalOffset,
+            duration: duration,
+            sidebarWidth: sidebarWidth
+        )
         activation()
 
-        let delayMilliseconds = Int64((max(0.01, duration) * 1_000).rounded(.up)) + 20
+        let delayMilliseconds = Int64((resolvedDuration * 1_000).rounded(.up)) + 20
         programmaticTransitionTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(delayMilliseconds))
             guard !Task.isCancelled, let self else { return }
@@ -1257,8 +1283,11 @@ struct WorktreeSidebarSwipeMonitor: NSViewRepresentable {
             }
 
             isSettling = true
-            let duration = settleDuration
-            swipeState.settle(to: finalOffset, duration: duration)
+            let duration = swipeState.settle(
+                to: finalOffset,
+                duration: settleDuration,
+                sidebarWidth: sidebarWidth
+            )
             if commit, let targetRoot {
                 _ = repository?.activate(
                     worktreeRoot: targetRoot,

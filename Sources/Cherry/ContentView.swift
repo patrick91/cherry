@@ -72,7 +72,8 @@ struct ContentView: View {
                     noteStore: noteStore,
                     todoStore: todoStore,
                     projectRoot: projectRoot,
-                    includeLeadingPadding: isSidebarHidden
+                    includeLeadingPadding: isSidebarHidden,
+                    crossfadesSurfaceTransitions: worktreeSwipeState.targetRoot == nil
                 )
                     .ignoresSafeArea(.all, edges: .top)
             }
@@ -202,7 +203,10 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.all, edges: .top)
         .background {
-            AppShellBackground(projectRoot: projectRoot)
+            // Worktrees are spaces inside one project, so the window surface
+            // keeps the repository's appearance identity while checkout-local
+            // content changes.
+            AppShellBackground(projectRoot: repository.repositoryRoot)
                 .ignoresSafeArea(.all)
         }
         .background(AppShortcutMonitor(
@@ -901,6 +905,7 @@ private struct DetailPaneView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     let projectRoot: String?
     let includeLeadingPadding: Bool
+    let crossfadesSurfaceTransitions: Bool
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
@@ -916,7 +921,11 @@ private struct DetailPaneView: View {
                     onCancel: { chromeState.selectTerminal() }
                 )
             } else if workspace.selectedSession != nil {
-                TerminalSplitSceneView(workspace: workspace, chromeState: chromeState)
+                TerminalSplitSceneView(
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    crossfadesSurfaceTransitions: crossfadesSurfaceTransitions
+                )
             } else {
                 ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4089,11 +4098,11 @@ private struct SidebarTabsView: View {
         }
         .background {
             if presentation == .floating {
-                SidebarBackground(projectRoot: displayedSourceRoot, presentation: presentation)
+                SidebarBackground(projectRoot: repository.repositoryRoot, presentation: presentation)
             }
         }
         .overlay(alignment: .top) {
-            SidebarTopChromeShield(projectRoot: displayedSourceRoot, presentation: presentation)
+            SidebarTopChromeShield(projectRoot: repository.repositoryRoot, presentation: presentation)
         }
     }
 
@@ -4268,7 +4277,7 @@ private struct TitlebarProjectPicker: View {
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
             sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColor: settings.projectAppearance(for: repository.repositoryRoot).color,
             projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
@@ -9139,7 +9148,18 @@ struct TerminalSplitSceneView: View {
 
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let crossfadesSurfaceTransitions: Bool
     @State private var dividerDragState: DividerDragState?
+
+    init(
+        workspace: TerminalWorkspace,
+        chromeState: ProjectWindowChromeState,
+        crossfadesSurfaceTransitions: Bool = true
+    ) {
+        self.workspace = workspace
+        self.chromeState = chromeState
+        self.crossfadesSurfaceTransitions = crossfadesSurfaceTransitions
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -9165,6 +9185,7 @@ struct TerminalSplitSceneView: View {
                         session: session,
                         chromeState: chromeState,
                         isActivePane: workspace.selectedSessionID == session.id,
+                        crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
                         onActivate: activate
                     )
                     .frame(width: width(at: index, in: widths))
@@ -9502,6 +9523,7 @@ private struct TerminalSceneView: View {
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
     let isActivePane: Bool
+    let crossfadesSurfaceTransitions: Bool
     let onActivate: (UUID) -> Void
     @StateObject private var searchState = TerminalSearchState()
 
@@ -9511,6 +9533,7 @@ private struct TerminalSceneView: View {
                 session: session,
                 chromeState: chromeState,
                 isActivePane: isActivePane,
+                crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
                 onActivate: onActivate
             )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

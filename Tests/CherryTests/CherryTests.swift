@@ -214,7 +214,8 @@ private struct TerminalWorkspaceSwitchTestHost: View {
     var body: some View {
         TerminalSplitSceneView(
             workspace: selection.workspace,
-            chromeState: chromeState
+            chromeState: chromeState,
+            crossfadesSurfaceTransitions: false
         )
     }
 }
@@ -1335,6 +1336,31 @@ private struct MCPWhoamiPayload: Decodable {
         velocity: 0,
         threshold: 64
     ))
+}
+
+@Test func worktreeSwipeSettleDurationTracksRemainingDistance() {
+    let fullDistance = WorktreeSwipeTuning.resolvedSettleDuration(
+        configuredDuration: 0.14,
+        currentOffset: 0,
+        finalOffset: -320,
+        sidebarWidth: 320
+    )
+    let partialDistance = WorktreeSwipeTuning.resolvedSettleDuration(
+        configuredDuration: 0.14,
+        currentOffset: -64,
+        finalOffset: -320,
+        sidebarWidth: 320
+    )
+    let nearlyComplete = WorktreeSwipeTuning.resolvedSettleDuration(
+        configuredDuration: 0.14,
+        currentOffset: -304,
+        finalOffset: -320,
+        sidebarWidth: 320
+    )
+
+    #expect(abs(fullDistance - 0.14) < 0.0001)
+    #expect(abs(partialDistance - 0.112) < 0.0001)
+    #expect(abs(nearlyComplete - 0.05) < 0.0001)
 }
 
 @Test func worktreeSwipeReleaseDecisionUsesTheLastDirectionAfterReversing() {
@@ -6539,6 +6565,7 @@ private struct MCPWhoamiPayload: Decodable {
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
     #expect(container.hasSurfaceTransitionSnapshotForTesting)
+    #expect(container.surfaceTransitionCrossfadesForTesting == true)
 
     let scale = window.backingScaleFactor
     let widthPixels = UInt32((container.bounds.width * scale).rounded(.down))
@@ -6577,7 +6604,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func worktreeWorkspaceSwitchReusesTerminalContainerForSurfaceFade() async throws {
+@Test func worktreeWorkspaceSwitchReusesTerminalContainerWithoutSurfaceFade() async throws {
     let firstWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-first-worktree")
     let secondWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-second-worktree")
     let selection = TerminalWorkspaceSelectionForTesting(workspace: firstWorkspace)
@@ -6634,6 +6661,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(currentContainer === originalContainer)
     #expect(currentContainer.hasSurfaceTransitionSnapshotForTesting)
+    #expect(currentContainer.surfaceTransitionCrossfadesForTesting == false)
     // The target terminal is already transitioning while the sidebar is still
     // in its settle phase; neither waits for the other to finish first.
     #expect(swipeState.targetRoot == "/tmp/cherry-second-worktree")

@@ -636,6 +636,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
     let session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
     let isActivePane: Bool
+    let crossfadesSurfaceTransitions: Bool
     let onActivate: (UUID) -> Void
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
@@ -646,6 +647,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
             colorScheme: context.environment.colorScheme,
             allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
             isActivePane: isActivePane,
+            crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
             onActivate: { onActivate(session.id) }
         )
         containerView.applySidebarAnimationState(
@@ -662,6 +664,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
             colorScheme: context.environment.colorScheme,
             allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
             isActivePane: isActivePane,
+            crossfadesSurfaceTransitions: crossfadesSurfaceTransitions,
             onActivate: { onActivate(session.id) }
         )
         nsView.applySidebarAnimationState(

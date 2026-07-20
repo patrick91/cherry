@@ -175,11 +175,14 @@ struct WorktreeSpaceRail: View {
     }
 
     private func activeProgress(for worktree: GitWorktree) -> CGFloat {
-        let isCurrent = worktree.root == repository.activeWorktreeRoot
+        let currentRoot = swipeState.targetRoot == nil
+            ? repository.activeWorktreeRoot
+            : swipeState.sourceRoot ?? repository.activeWorktreeRoot
+        let isCurrent = worktree.root == currentRoot
         guard let targetRoot = swipeState.targetRoot else {
             return isCurrent ? 1 : 0
         }
-        guard targetRoot != repository.activeWorktreeRoot else {
+        guard targetRoot != currentRoot else {
             return isCurrent ? 1 : 0
         }
 
@@ -895,17 +898,24 @@ private struct WorktreeManagerRow: View {
 @MainActor
 final class WorktreeSidebarSwipeState: ObservableObject {
     @Published private(set) var offset: CGFloat = 0
+    @Published private(set) var sourceRoot: String?
     @Published private(set) var targetRoot: String?
     @Published private(set) var direction = 0
     private(set) var isAnimatingProgrammatically = false
 
     private var programmaticTransitionTask: Task<Void, Never>?
 
-    func update(offset: CGFloat, targetRoot: String, direction: Int) {
+    func update(
+        offset: CGFloat,
+        sourceRoot: String,
+        targetRoot: String,
+        direction: Int
+    ) {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             self.offset = offset
+            self.sourceRoot = self.sourceRoot ?? sourceRoot
             self.targetRoot = targetRoot
             self.direction = direction
         }
@@ -919,6 +929,7 @@ final class WorktreeSidebarSwipeState: ObservableObject {
 
     @discardableResult
     func animateSwitch(
+        sourceRoot: String,
         targetRoot: String,
         direction: Int,
         sidebarWidth: CGFloat,
@@ -928,15 +939,23 @@ final class WorktreeSidebarSwipeState: ObservableObject {
         guard self.targetRoot == nil, direction != 0 else { return false }
 
         isAnimatingProgrammatically = true
-        update(offset: 0, targetRoot: targetRoot, direction: direction)
+        update(
+            offset: 0,
+            sourceRoot: sourceRoot,
+            targetRoot: targetRoot,
+            direction: direction
+        )
+        // Start the workspace/terminal handoff with the sidebar motion. Waiting
+        // until the slide finished made one gesture read as two transitions:
+        // first a sidebar swipe, then a delayed terminal crossfade.
         let finalOffset = direction > 0 ? -sidebarWidth : sidebarWidth
         settle(to: finalOffset, duration: duration)
+        activation()
 
         let delayMilliseconds = Int64((max(0.01, duration) * 1_000).rounded(.up)) + 20
         programmaticTransitionTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(delayMilliseconds))
             guard !Task.isCancelled, let self else { return }
-            activation()
             programmaticTransitionTask = nil
             isAnimatingProgrammatically = false
             clear()
@@ -956,6 +975,7 @@ final class WorktreeSidebarSwipeState: ObservableObject {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             offset = 0
+            sourceRoot = nil
             targetRoot = nil
             direction = 0
         }
@@ -1217,6 +1237,7 @@ struct WorktreeSidebarSwipeMonitor: NSViewRepresentable {
             let offset = min(limit, max(-limit, accumulatedX))
             swipeState.update(
                 offset: offset,
+                sourceRoot: repository.activeWorktreeRoot,
                 targetRoot: target.root,
                 direction: direction
             )
@@ -1238,17 +1259,17 @@ struct WorktreeSidebarSwipeMonitor: NSViewRepresentable {
             isSettling = true
             let duration = settleDuration
             swipeState.settle(to: finalOffset, duration: duration)
+            if commit, let targetRoot {
+                _ = repository?.activate(
+                    worktreeRoot: targetRoot,
+                    chromeState: chromeState
+                )
+            }
             settleTask?.cancel()
             settleTask = Task { @MainActor [weak self, weak swipeState] in
                 let delayMilliseconds = Int64((max(0.01, duration) * 1_000).rounded(.up)) + 20
                 try? await Task.sleep(for: .milliseconds(delayMilliseconds))
                 guard !Task.isCancelled, let self else { return }
-                if commit, let targetRoot {
-                    _ = repository?.activate(
-                        worktreeRoot: targetRoot,
-                        chromeState: chromeState
-                    )
-                }
                 swipeState?.reset()
                 isSettling = false
                 settleTask = nil
@@ -1274,6 +1295,7 @@ struct WorktreeSidebarSwipeMonitor: NSViewRepresentable {
             if swipeState.direction != direction || swipeState.targetRoot != target.root {
                 swipeState.update(
                     offset: swipeState.offset,
+                    sourceRoot: swipeState.sourceRoot ?? repository.activeWorktreeRoot,
                     targetRoot: target.root,
                     direction: direction
                 )

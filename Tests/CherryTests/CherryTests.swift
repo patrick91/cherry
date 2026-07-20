@@ -199,6 +199,27 @@ private struct ContentViewTestHost: View {
 }
 
 @MainActor
+private final class TerminalWorkspaceSelectionForTesting: ObservableObject {
+    @Published var workspace: TerminalWorkspace
+
+    init(workspace: TerminalWorkspace) {
+        self.workspace = workspace
+    }
+}
+
+private struct TerminalWorkspaceSwitchTestHost: View {
+    @ObservedObject var selection: TerminalWorkspaceSelectionForTesting
+    @ObservedObject var chromeState: ProjectWindowChromeState
+
+    var body: some View {
+        TerminalSplitSceneView(
+            workspace: selection.workspace,
+            chromeState: chromeState
+        )
+    }
+}
+
+@MainActor
 private func makeHostedContentViewWindow(
     styleMask: NSWindow.StyleMask = [.borderless]
 ) async throws -> HostedContentViewWindow {
@@ -1257,6 +1278,7 @@ private struct MCPWhoamiPayload: Decodable {
     let activations = BoolRecorder()
 
     let started = state.animateSwitch(
+        sourceRoot: "/tmp/cherry-main",
         targetRoot: "/tmp/cherry-feature",
         direction: 1,
         sidebarWidth: 320,
@@ -1266,12 +1288,15 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     #expect(started)
+    #expect(activations.values == [true])
+    #expect(state.sourceRoot == "/tmp/cherry-main")
     #expect(state.targetRoot == "/tmp/cherry-feature")
     #expect(state.direction == 1)
     #expect(state.offset == -320)
     #expect(state.isAnimatingProgrammatically)
 
     let duplicateStarted = state.animateSwitch(
+        sourceRoot: "/tmp/cherry-main",
         targetRoot: "/tmp/cherry-third",
         direction: 1,
         sidebarWidth: 320,
@@ -1283,6 +1308,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     #expect(activations.values == [true])
     #expect(state.targetRoot == nil)
+    #expect(state.sourceRoot == nil)
     #expect(state.direction == 0)
     #expect(state.offset == 0)
     #expect(!state.isAnimatingProgrammatically)
@@ -6470,6 +6496,148 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!container.isSidebarSyncFrozenForTesting)
     #expect(!container.isSidebarAnimationActiveForTesting)
     #expect(second.ghosttyBridge.terminalView.superview != nil)
+}
+
+@MainActor
+@Test func ghosttySessionSwitchFadesOutgoingSnapshotAfterIncomingRender() async throws {
+    let first = TerminalSession(
+        title: "First",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        projectRoot: "/tmp/cherry-shared-project",
+        launchShell: false
+    )
+    let second = TerminalSession(
+        title: "Second",
+        subtitle: "No shell",
+        tint: .systemGreen,
+        projectRoot: "/tmp/cherry-shared-project",
+        launchShell: false
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let container = GhosttyTerminalContainerView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = container
+    window.orderFrontRegardless()
+
+    defer {
+        container.detachActiveSession()
+        first.releaseGhosttyBridge()
+        second.releaseGhosttyBridge()
+        first.stop()
+        second.stop()
+        window.close()
+    }
+
+    container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
+    container.layoutSubtreeIfNeeded()
+    container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
+
+    #expect(container.hasSurfaceTransitionSnapshotForTesting)
+
+    let scale = window.backingScaleFactor
+    let widthPixels = UInt32((container.bounds.width * scale).rounded(.down))
+    let heightPixels = UInt32((container.bounds.height * scale).rounded(.down))
+    let cellWidthPixels: UInt32 = 8
+    let cellHeightPixels: UInt32 = 16
+    second.ghosttyBridge.terminalDidResize(TerminalGridMetrics(
+        columns: UInt16(widthPixels / cellWidthPixels),
+        rows: UInt16(heightPixels / cellHeightPixels),
+        widthPixels: widthPixels,
+        heightPixels: heightPixels,
+        cellWidthPixels: cellWidthPixels,
+        cellHeightPixels: cellHeightPixels
+    ))
+    second.ghosttyBridge.simulatePostRenderForTesting()
+
+    // A later TUI redraw restarts the quiet period rather than exposing its
+    // intermediate post-resize composition.
+    try await Task.sleep(for: .milliseconds(50))
+    second.ghosttyBridge.simulatePostRenderForTesting()
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(container.hasSurfaceTransitionSnapshotForTesting)
+
+    // Once rendering settles, exactly one compositor animation drives the
+    // outgoing terminal. An implicit `opacity` animation must not compete with
+    // the intentional `fadeOut` curve.
+    #expect(await waitForCondition {
+        container.surfaceTransitionAnimationKeysForTesting.contains("fadeOut")
+    })
+    #expect(!container.surfaceTransitionAnimationKeysForTesting.contains("opacity"))
+
+    // The outgoing terminal then leaves the rendered incoming surface exposed.
+    #expect(await waitForCondition {
+        !container.hasSurfaceTransitionSnapshotForTesting
+    })
+}
+
+@MainActor
+@Test func worktreeWorkspaceSwitchReusesTerminalContainerForSurfaceFade() async throws {
+    let firstWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-first-worktree")
+    let secondWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-second-worktree")
+    let selection = TerminalWorkspaceSelectionForTesting(workspace: firstWorkspace)
+    let swipeState = WorktreeSidebarSwipeState()
+    let chromeState = ProjectWindowChromeState()
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let hostingView = NSHostingView(rootView: TerminalWorkspaceSwitchTestHost(
+        selection: selection,
+        chromeState: chromeState
+    ))
+    hostingView.frame = window.contentView?.bounds ?? .zero
+    window.contentView = hostingView
+    window.orderFrontRegardless()
+
+    defer {
+        swipeState.reset()
+        firstWorkspace.closeAllSessions()
+        secondWorkspace.closeAllSessions()
+        window.close()
+    }
+
+    #expect(await waitForCondition {
+        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView } != nil
+    })
+    let originalContainer = try #require(
+        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView }
+            as? GhosttyTerminalContainerView
+    )
+
+    #expect(swipeState.animateSwitch(
+        sourceRoot: "/tmp/cherry-first-worktree",
+        targetRoot: "/tmp/cherry-second-worktree",
+        direction: 1,
+        sidebarWidth: 320,
+        duration: 0.5
+    ) {
+        selection.workspace = secondWorkspace
+    })
+
+    let secondSessionID = try #require(secondWorkspace.selectedSession?.id)
+    #expect(await waitForCondition {
+        originalContainer.activeSessionIDForTesting == secondSessionID
+    })
+    let currentContainer = try #require(
+        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView }
+            as? GhosttyTerminalContainerView
+    )
+
+    #expect(currentContainer === originalContainer)
+    #expect(currentContainer.hasSurfaceTransitionSnapshotForTesting)
+    // The target terminal is already transitioning while the sidebar is still
+    // in its settle phase; neither waits for the other to finish first.
+    #expect(swipeState.targetRoot == "/tmp/cherry-second-worktree")
+    #expect(swipeState.sourceRoot == "/tmp/cherry-first-worktree")
 }
 
 @MainActor

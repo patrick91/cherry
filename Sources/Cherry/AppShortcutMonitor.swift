@@ -254,6 +254,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
             }
 
             _ = worktreeSwipeState.animateSwitch(
+                sourceRoot: repository.activeWorktreeRoot,
                 targetRoot: target.root,
                 direction: offset,
                 sidebarWidth: sidebarWidth,

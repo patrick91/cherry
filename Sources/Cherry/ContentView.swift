@@ -4061,15 +4061,15 @@ private struct SidebarTabsView: View {
                 }
 
                 SidebarTabsPage(
-                    workspace: workspace,
+                    workspace: displayedSourceWorkspace,
                     chromeState: chromeState,
                     noteStore: noteStore,
                     todoStore: todoStore,
-                    projectRoot: projectRoot,
+                    projectRoot: displayedSourceRoot,
                     presentation: presentation,
                     openProject: openProject
                 )
-                .id(projectRoot)
+                .id(displayedSourceRoot)
                 .offset(x: swipeState.offset)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4089,12 +4089,26 @@ private struct SidebarTabsView: View {
         }
         .background {
             if presentation == .floating {
-                SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+                SidebarBackground(projectRoot: displayedSourceRoot, presentation: presentation)
             }
         }
         .overlay(alignment: .top) {
-            SidebarTopChromeShield(projectRoot: projectRoot, presentation: presentation)
+            SidebarTopChromeShield(projectRoot: displayedSourceRoot, presentation: presentation)
         }
+    }
+
+    private var displayedSourceRoot: String? {
+        guard swipeState.targetRoot != nil else { return projectRoot }
+        return swipeState.sourceRoot ?? projectRoot
+    }
+
+    private var displayedSourceWorkspace: TerminalWorkspace {
+        guard let sourceRoot = displayedSourceRoot,
+              let sourceWorkspace = repository.workspaceIfLoaded(for: sourceRoot)
+        else {
+            return workspace
+        }
+        return sourceWorkspace
     }
 
     private var targetPageOffset: CGFloat {
@@ -4446,7 +4460,11 @@ private struct TitlebarProjectPicker: View {
     }
 
     private var activeWorktree: GitWorktree? {
-        repository.supportsWorktrees ? repository.activeWorktree : nil
+        guard repository.supportsWorktrees else { return nil }
+        let root = swipeState.targetRoot == nil
+            ? repository.activeWorktreeRoot
+            : swipeState.sourceRoot ?? repository.activeWorktreeRoot
+        return repository.worktrees.first { $0.root == root }
     }
 
     private var swipeTargetWorktree: GitWorktree? {
@@ -9115,7 +9133,7 @@ extension NSColor {
     }
 }
 
-private struct TerminalSplitSceneView: View {
+struct TerminalSplitSceneView: View {
     private static let dividerWidth: CGFloat = 5
     private static let paneCornerRadius: CGFloat = 9
 
@@ -9136,7 +9154,13 @@ private struct TerminalSplitSceneView: View {
             )
 
             HStack(spacing: 0) {
-                ForEach(Array(panes.enumerated()), id: \.element.id) { index, session in
+                // A pane is a visual slot. Keying this row by session UUID
+                // destroys its NSViewRepresentable whenever a worktree changes,
+                // so the outgoing Ghostty surface disappears before the shared
+                // container can snapshot and fade it. Keep slot identity stable;
+                // `updateNSView` will hand the replacement session to the same
+                // container and perform the guarded surface transition.
+                ForEach(Array(panes.enumerated()), id: \.offset) { index, session in
                     TerminalSceneView(
                         session: session,
                         chromeState: chromeState,

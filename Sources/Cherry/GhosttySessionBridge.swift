@@ -422,6 +422,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var hoveredLink: String?
     private var isReleased = false
     private var detachedSurfaceReleaseTask: Task<Void, Never>?
+    private var settledRenderHandler: (() -> Void)?
+    private var settledRenderTask: Task<Void, Never>?
+    private var settledRenderGeneration: UInt64 = 0
+    private var hasRenderedSinceSettledRenderRequest = false
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -445,8 +449,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         Self.liveBridgeCount += 1
         terminalView.delegate = self
-        terminalView.onPostRender = {
+        terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
+            self?.handlePostRender()
         }
         terminalView.controller = controller
         if Self.nativePTYEnabled {
@@ -518,6 +523,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased, scrollContainer === container else { return }
+        cancelSettledRenderHandler()
         let canPreserveSurface = preservingSurface
             && container.bounds.width > 0
             && container.bounds.height > 0
@@ -654,6 +660,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.delegate = nil
         terminalView.onPostRender = nil
+        cancelSettledRenderHandler()
         searchState = nil
         searchPresentationHandler = nil
         searchDismissalHandler = nil
@@ -663,6 +670,73 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func finish(exitCode: UInt32) {
         inMemorySession.finish(exitCode: exitCode, runtimeMilliseconds: 0)
+    }
+
+    func performAfterRenderedViewportSettles(_ handler: @escaping () -> Void) {
+        cancelSettledRenderHandler()
+        settledRenderHandler = handler
+    }
+
+    private func handlePostRender() {
+        hasRenderedSinceSettledRenderRequest = true
+        scheduleSettledRenderCompletionIfPossible()
+    }
+
+    private func scheduleSettledRenderCompletionIfPossible() {
+        guard settledRenderHandler != nil,
+              hasRenderedSinceSettledRenderRequest,
+              isMountedViewportReadyForReveal
+        else { return }
+
+        // A fit first paints Ghostty's resized grid, then the foreground TUI
+        // reacts to SIGWINCH and paints its new layout. Debounce render ticks so
+        // the outgoing snapshot is only removed once that short redraw burst has
+        // gone quiet, rather than exposing the intermediate composition.
+        settledRenderTask?.cancel()
+        settledRenderGeneration &+= 1
+        let generation = settledRenderGeneration
+        settledRenderTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled,
+                  let self,
+                  generation == self.settledRenderGeneration,
+                  self.isMountedViewportReadyForReveal,
+                  let handler = self.settledRenderHandler
+            else { return }
+
+            self.settledRenderHandler = nil
+            self.settledRenderTask = nil
+            self.hasRenderedSinceSettledRenderRequest = false
+            handler()
+        }
+    }
+
+    private var isMountedViewportReadyForReveal: Bool {
+        guard let gridMetrics,
+              gridMetrics.columns > 0,
+              gridMetrics.rows > 0
+        else { return false }
+
+        return isViewportConsistentWithMountedSurface(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows),
+            widthPixels: Int(gridMetrics.widthPixels),
+            heightPixels: Int(gridMetrics.heightPixels),
+            cellWidthPixels: Int(gridMetrics.cellWidthPixels),
+            cellHeightPixels: Int(gridMetrics.cellHeightPixels)
+        )
+    }
+
+    private func cancelSettledRenderHandler() {
+        settledRenderGeneration &+= 1
+        settledRenderTask?.cancel()
+        settledRenderTask = nil
+        settledRenderHandler = nil
+        hasRenderedSinceSettledRenderRequest = false
+    }
+
+    func simulatePostRenderForTesting() {
+        handlePostRender()
     }
 
     /// Respawn the native (EXEC) child in place. ghostty only rebuilds a
@@ -759,6 +833,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             "pixels=\(size.widthPixels)x\(size.heightPixels) " +
             "terminalBounds=\(terminalView.bounds.size)"
         )
+        // A resize invalidates any render that was about to reveal this
+        // surface. Require a fresh post-render at the new mounted grid.
+        settledRenderGeneration &+= 1
+        settledRenderTask?.cancel()
+        settledRenderTask = nil
+        hasRenderedSinceSettledRenderRequest = false
         gridMetrics = size
         scrollContainer?.synchronizeScrollState()
         activateOutputFeedWhenSurfaceIsReady()
@@ -767,6 +847,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
         scrollbarMetrics = metrics
         scrollContainer?.synchronizeScrollState()
+        // Scrollbar metrics reposition the document-hosted surface even when
+        // Ghostty does not need another paint. Treat that layout update as part
+        // of the same settling burst before revealing the incoming viewport.
+        scheduleSettledRenderCompletionIfPossible()
     }
 
     func terminalDidChangePointerStyle(_ style: TerminalPointerStyle) {
@@ -2671,6 +2755,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
 @MainActor
 final class GhosttyTerminalContainerView: NSView {
+    private static let snapshotFadeDuration: CFTimeInterval = 0.18
     private let scrollView = NSScrollView()
     private let documentView = NSView()
     private weak var activeSession: TerminalSession?
@@ -2686,6 +2771,9 @@ final class GhosttyTerminalContainerView: NSView {
     private var isSidebarAnimating = false
     private var isSyncFrozen = false
     private var snapshotLayer: CALayer?
+    private var surfaceTransitionSnapshotLayer: CALayer?
+    private var surfaceTransitionFallbackTask: Task<Void, Never>?
+    private var surfaceTransitionGeneration: UInt64 = 0
     private var activeColorScheme: ColorScheme = .dark
     private var pendingPostAnimationDelta: CGFloat = 0
     private var didApplyEarlyFit = false
@@ -2742,6 +2830,12 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
+            // Agent/tab changes and worktree swipes both replace the mounted
+            // Ghostty surface. Keep the outgoing pixels above either path while
+            // the incoming surface fits and its foreground TUI redraws.
+            let transitionGeneration = activeSession == nil
+                ? nil
+                : beginSurfaceTransitionIfPossible()
             resetSidebarAnimationStateForSurfaceChange()
             if let activeSession {
                 if GhosttySessionBridge.liveSurfaceLimit != nil {
@@ -2755,7 +2849,16 @@ final class GhosttyTerminalContainerView: NSView {
                 }
             }
             activeSession = session
-            session.ghosttyBridge.attach(to: self)
+            let bridge = session.ghosttyBridge
+            if let transitionGeneration {
+                bridge.performAfterRenderedViewportSettles { [weak self] in
+                    Task { @MainActor [weak self] in
+                        await Task.yield()
+                        self?.completeSurfaceTransition(generation: transitionGeneration)
+                    }
+                }
+            }
+            bridge.attach(to: self)
             if isActivePane {
                 requestTerminalFocus()
             }
@@ -2881,6 +2984,7 @@ final class GhosttyTerminalContainerView: NSView {
         releasesBridge: Bool = true,
         preservingSurface: Bool = false
     ) {
+        cancelSurfaceTransition()
         guard let session = activeSession else {
             activeBridge = nil
             pendingTerminalFocus = false
@@ -3028,6 +3132,57 @@ final class GhosttyTerminalContainerView: NSView {
         removeSnapshotLayer(animated: false)
     }
 
+    private func beginSurfaceTransitionIfPossible() -> UInt64? {
+        guard activeBridge != nil,
+              scrollView.frame.width > 0,
+              scrollView.frame.height > 0,
+              let cgImage = captureViewBitmap(scrollView, rect: scrollView.bounds)
+        else {
+            cancelSurfaceTransition()
+            return nil
+        }
+
+        cancelSurfaceTransition()
+        surfaceTransitionGeneration &+= 1
+        let generation = surfaceTransitionGeneration
+        surfaceTransitionSnapshotLayer = makeSnapshotLayer(
+            contents: cgImage,
+            frame: scrollView.frame,
+            zPosition: 1_100
+        )
+        surfaceTransitionFallbackTask = Task { @MainActor [weak self] in
+            // Safety valve for a stopped or otherwise non-rendering surface.
+            // Normal transitions complete through the stable-render callback.
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            self?.completeSurfaceTransition(generation: generation)
+        }
+        return generation
+    }
+
+    private func completeSurfaceTransition(generation: UInt64) {
+        guard generation == surfaceTransitionGeneration,
+              let fadingLayer = surfaceTransitionSnapshotLayer
+        else { return }
+
+        surfaceTransitionFallbackTask?.cancel()
+        surfaceTransitionFallbackTask = nil
+
+        animateSnapshotFadeOut(fadingLayer) { [weak self] in
+            fadingLayer.removeFromSuperlayer()
+            if self?.surfaceTransitionSnapshotLayer === fadingLayer {
+                self?.surfaceTransitionSnapshotLayer = nil
+            }
+        }
+    }
+
+    private func cancelSurfaceTransition() {
+        surfaceTransitionFallbackTask?.cancel()
+        surfaceTransitionFallbackTask = nil
+        surfaceTransitionSnapshotLayer?.removeFromSuperlayer()
+        surfaceTransitionSnapshotLayer = nil
+    }
+
     private func applyEarlyFitIfPossible() {
         guard let terminalView = activeBridge?.terminalView,
               pendingPostAnimationDelta != 0 else {
@@ -3085,40 +3240,11 @@ final class GhosttyTerminalContainerView: NSView {
         guard let cgImage else { return }
 
         snapshotLayer?.removeFromSuperlayer()
-
-        wantsLayer = true
-        let layer = CALayer()
-        layer.contents = cgImage
-        // Anchor the captured pixels at the layer's top-left without any
-        // scaling. The live terminal underneath is left-aligned in the
-        // scroll view, so an unscaled top-left snapshot tracks it
-        // pixel-for-pixel — otherwise (e.g. with `.resizeAspectFill`) the
-        // image would scale/crop from the center and snap visibly when the
-        // cross-fade reveals the live content.
-        layer.contentsGravity = .topLeft
-        layer.masksToBounds = true
-        // Ghostty's metal layer renders text on a *clear* background, so the
-        // captured CGImage has alpha holes wherever the terminal background
-        // would normally show. Without a layer background color, those
-        // holes (and the area beyond the image when the layer grows on a
-        // close) reveal the live terminal underneath — and the brief Metal
-        // reconfigure flash from the end-of-animation `fitToSize` is
-        // visible through them. Painting the layer with the active terminal
-        // background color closes every hole so the snapshot is fully
-        // opaque end-to-end.
-        layer.backgroundColor = terminalBackgroundCGColor()
-        layer.frame = captureRect
-        layer.zPosition = 1_000
-        // Disable implicit animations on layout-driven property changes so
-        // the snapshot's frame interpolates with SwiftUI's animation curve
-        // (driven from `layout()`) rather than running on Core Animation's
-        // separate clock and visibly desyncing.
-        layer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
-        if let scale = window?.backingScaleFactor {
-            layer.contentsScale = scale
-        }
-        self.layer?.addSublayer(layer)
-        snapshotLayer = layer
+        snapshotLayer = makeSnapshotLayer(
+            contents: cgImage,
+            frame: captureRect,
+            zPosition: 1_000
+        )
     }
 
     private func refreshSnapshotContentsAfterEarlyFitIfPossible() {
@@ -3154,6 +3280,31 @@ final class GhosttyTerminalContainerView: NSView {
         return resolved.cgColor
     }
 
+    private func makeSnapshotLayer(
+        contents: CGImage,
+        frame: CGRect,
+        zPosition: CGFloat
+    ) -> CALayer {
+        wantsLayer = true
+        let layer = CALayer()
+        layer.contents = contents
+        // Anchor captured terminal pixels at the top-left without scaling so
+        // text stays pixel-aligned while the live Metal surface changes below.
+        layer.contentsGravity = .topLeft
+        layer.masksToBounds = true
+        // Ghostty's Metal layer renders text on a clear background. Filling the
+        // snapshot makes it fully opaque, covering resize/reconfigure flashes.
+        layer.backgroundColor = terminalBackgroundCGColor()
+        layer.frame = frame
+        layer.zPosition = zPosition
+        layer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
+        if let scale = window?.backingScaleFactor {
+            layer.contentsScale = scale
+        }
+        self.layer?.addSublayer(layer)
+        return layer
+    }
+
     private func captureViewBitmap(_ view: NSView, rect: NSRect) -> CGImage? {
         guard rect.width > 0, rect.height > 0,
               let bitmap = view.bitmapImageRepForCachingDisplay(in: rect) else { return nil }
@@ -3168,19 +3319,31 @@ final class GhosttyTerminalContainerView: NSView {
         }
         let fadingLayer = snapshotLayer
 
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = fadingLayer.opacity
-        fade.toValue = 0
-        fade.duration = 0.12
-        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { [weak self] in
+        animateSnapshotFadeOut(fadingLayer) { [weak self] in
             fadingLayer.removeFromSuperlayer()
             if self?.snapshotLayer === fadingLayer {
                 self?.snapshotLayer = nil
             }
         }
+    }
+
+    private func animateSnapshotFadeOut(
+        _ fadingLayer: CALayer,
+        completion: @escaping () -> Void
+    ) {
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fadingLayer.presentation()?.opacity ?? fadingLayer.opacity
+        fade.toValue = 0
+        fade.duration = Self.snapshotFadeDuration
+        fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+
+        CATransaction.begin()
+        // Only the explicit compositor animation should drive opacity. Without
+        // this, assigning the model value also installs Core Animation's default
+        // implicit opacity animation; the two overlapping curves make the short
+        // crossfade appear to step or drop frames.
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock(completion)
         fadingLayer.opacity = 0
         fadingLayer.add(fade, forKey: "fadeOut")
         CATransaction.commit()
@@ -3197,14 +3360,15 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func updateSnapshotLayerFrame() {
-        guard let snapshotLayer else { return }
+        guard snapshotLayer != nil || surfaceTransitionSnapshotLayer != nil else { return }
         // Track the current visible area so the snapshot stays aligned with
         // the underlying scroll view as the container resizes during the
         // animation. Disable implicit layer animations or the snapshot will
         // animate independently from SwiftUI's frame interpolation.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        snapshotLayer.frame = scrollView.frame
+        snapshotLayer?.frame = scrollView.frame
+        surfaceTransitionSnapshotLayer?.frame = scrollView.frame
         CATransaction.commit()
     }
 
@@ -3513,6 +3677,18 @@ final class GhosttyTerminalContainerView: NSView {
 
     var hasSidebarSnapshotForTesting: Bool {
         snapshotLayer?.superlayer != nil
+    }
+
+    var hasSurfaceTransitionSnapshotForTesting: Bool {
+        surfaceTransitionSnapshotLayer?.superlayer != nil
+    }
+
+    var surfaceTransitionAnimationKeysForTesting: [String] {
+        surfaceTransitionSnapshotLayer?.animationKeys() ?? []
+    }
+
+    var activeSessionIDForTesting: UUID? {
+        activeSession?.id
     }
 
     var sidebarSnapshotIdentityForTesting: ObjectIdentifier? {

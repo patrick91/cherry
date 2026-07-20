@@ -1387,6 +1387,19 @@ private struct MCPWhoamiPayload: Decodable {
     let isDirty = try await service.isDirty(worktreeRoot: worktreeRoot.path)
     #expect(isDirty == false)
 
+    try Data("untracked\n".utf8).write(to: worktreeRoot.appendingPathComponent("untracked.txt"))
+    let missingRoot = container.appendingPathComponent("missing", isDirectory: true).path
+    let statuses = await service.dirtyStatuses(worktreeRoots: [
+        canonicalRepositoryRoot,
+        canonicalWorktreeRoot,
+        missingRoot,
+    ])
+    #expect(statuses == [
+        canonicalRepositoryRoot: false,
+        canonicalWorktreeRoot: true,
+    ])
+    try FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent("untracked.txt"))
+
     try await service.remove(worktreeRoot: worktreeRoot.path, repositoryRoot: repositoryRoot.path)
     let removed = try await service.discover(projectRoot: repositoryRoot.path)
     #expect(removed.worktrees.map(\.root) == [canonicalRepositoryRoot])

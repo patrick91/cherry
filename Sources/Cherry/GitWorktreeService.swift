@@ -148,10 +148,25 @@ struct GitWorktreeService: Sendable {
 
     func isDirty(worktreeRoot: String) async throws -> Bool {
         try await Self.perform {
-            let result = try Self.runGit([
-                "-C", worktreeRoot, "status", "--porcelain=v1", "--untracked-files=normal"
-            ])
-            return !result.standardOutput.isEmpty
+            try Self.dirtyStatus(worktreeRoot: worktreeRoot)
+        }
+    }
+
+    func dirtyStatuses(worktreeRoots: [String]) async -> [String: Bool] {
+        do {
+            return try await Self.perform {
+                var statuses: [String: Bool] = [:]
+                for root in worktreeRoots {
+                    do {
+                        statuses[root] = try Self.dirtyStatus(worktreeRoot: root)
+                    } catch {
+                        // A worktree can disappear between discovery and this check.
+                    }
+                }
+                return statuses
+            }
+        } catch {
+            return [:]
         }
     }
 
@@ -418,6 +433,13 @@ struct GitWorktreeService: Sendable {
             )
         }
         return result
+    }
+
+    private static func dirtyStatus(worktreeRoot: String) throws -> Bool {
+        let result = try runGit([
+            "-C", worktreeRoot, "status", "--porcelain=v1", "--untracked-files=normal"
+        ])
+        return !result.standardOutput.isEmpty
     }
 
     private static func decoded(_ data: Data) -> String {

@@ -137,24 +137,9 @@ final class RepositoryWorkspace: ObservableObject {
     func refreshDirtyStatus() async {
         guard supportsWorktrees else { return }
         let roots = worktrees.filter { !$0.isBare && !$0.isPrunable }.map(\.root)
-        await withTaskGroup(of: (String, Bool?).self) { group in
-            for root in roots {
-                group.addTask { [service] in
-                    do {
-                        return (root, try await service.isDirty(worktreeRoot: root))
-                    } catch {
-                        return (root, nil)
-                    }
-                }
-            }
-            var next: [String: Bool] = [:]
-            for await (root, dirty) in group {
-                if let dirty {
-                    next[root] = dirty
-                }
-            }
-            dirtyByRoot = next
-        }
+        // Keep the probes in one background task. A task group here can crash in
+        // Swift's TaskGroup::offer when several Git processes complete together.
+        dirtyByRoot = await service.dirtyStatuses(worktreeRoots: roots)
     }
 
     func disableWorktreeSpaces(chromeState: ProjectWindowChromeState?) {

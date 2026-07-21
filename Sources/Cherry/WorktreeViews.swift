@@ -580,6 +580,91 @@ struct NewWorktreeSheet: View {
     }
 }
 
+struct RenameWorktreeSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @ObservedObject var repository: RepositoryWorkspace
+    let worktree: GitWorktree
+
+    @State private var branchName: String
+    @State private var isRenaming = false
+    @State private var errorMessage: String?
+    @FocusState private var isBranchNameFocused: Bool
+
+    init(repository: RepositoryWorkspace, worktree: GitWorktree) {
+        self.repository = repository
+        self.worktree = worktree
+        _branchName = State(initialValue: worktree.branch ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Rename Worktree")
+                    .font(.title2.weight(.semibold))
+                Text("Rename its checked-out branch. The checkout folder will stay at \(worktree.root).")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            TextField("Branch name", text: $branchName)
+                .focused($isBranchNameFocused)
+                .disabled(isRenaming)
+                .onSubmit(rename)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isRenaming)
+
+                Button(isRenaming ? "Renaming..." : "Rename Worktree") {
+                    rename()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canRename || isRenaming)
+            }
+        }
+        .padding(24)
+        .frame(width: 500)
+        .onAppear {
+            isBranchNameFocused = true
+        }
+    }
+
+    private var requestedName: String {
+        branchName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canRename: Bool {
+        !requestedName.isEmpty && requestedName != worktree.branch
+    }
+
+    private func rename() {
+        guard canRename, !isRenaming else { return }
+        isRenaming = true
+        errorMessage = nil
+        Task {
+            defer { isRenaming = false }
+            do {
+                try await repository.rename(worktree, to: requestedName)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 struct WorktreeManagerSheet: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
@@ -734,6 +819,12 @@ private struct WorktreeManagerRow: View {
 
             Spacer(minLength: 12)
 
+            Button("Rename") {
+                chromeState.presentRenameWorktree(worktree)
+            }
+            .disabled(!repository.canRename(worktree))
+            .help(renameHelp)
+
             if repository.hiddenWorktreeRoots.contains(worktree.root) {
                 Button("Show") {
                     repository.show(worktree)
@@ -793,6 +884,14 @@ private struct WorktreeManagerRow: View {
         }
         if runningProcessCount > 0 { return "Stop foreground processes before removing it." }
         return "Remove the checkout and keep its branch."
+    }
+
+    private var renameHelp: String {
+        if worktree.isMain { return "The primary checkout cannot be renamed." }
+        if worktree.isDetached { return "Attach this worktree to a branch before renaming it." }
+        if worktree.isLocked { return "Unlock this worktree in Git before renaming it." }
+        if worktree.isPrunable { return "Prune the stale Git entry instead." }
+        return "Rename the checked-out branch without moving the checkout folder."
     }
 }
 

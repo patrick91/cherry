@@ -241,6 +241,12 @@ struct ContentView: View {
                 isPresented: $chromeState.isWorktreeManagerPresented
             )
         }
+        .sheet(item: $chromeState.worktreeToRename) { worktree in
+            RenameWorktreeSheet(
+                repository: repository,
+                worktree: worktree
+            )
+        }
         .confirmationDialog(
             "Close Agent Group?",
             isPresented: pendingAgentGroupCloseBinding,
@@ -2616,6 +2622,7 @@ private enum CommandPaletteMode {
     case commands
     case projects
     case worktrees
+    case renameWorktree
     case removeWorktree
     case agents
     case agentPresets
@@ -2627,6 +2634,7 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case addProject
     case worktrees
     case newWorktree
+    case renameWorktree
     case removeWorktree
     case manageWorktrees
     case agents
@@ -2641,6 +2649,7 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Add Project"
         case .worktrees: "Worktrees"
         case .newWorktree: "New Worktree"
+        case .renameWorktree: "Rename Worktree…"
         case .removeWorktree: "Remove Worktree…"
         case .manageWorktrees: "Manage Worktrees"
         case .agents: "Agents"
@@ -2655,6 +2664,7 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "Create a Cherry project"
         case .worktrees: "Switch checkout"
         case .newWorktree: "Create an isolated checkout"
+        case .renameWorktree: "Rename its checked-out branch"
         case .removeWorktree: "Remove a checkout and keep its branch"
         case .manageWorktrees: "Show, hide, or remove checkouts"
         case .agents: "Open a configured agent"
@@ -2669,6 +2679,7 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         case .addProject: "folder.badge.plus"
         case .worktrees: "rectangle.stack"
         case .newWorktree: "rectangle.stack.badge.plus"
+        case .renameWorktree: "pencil"
         case .removeWorktree: "trash"
         case .manageWorktrees: "ellipsis.circle"
         case .agents: "sparkles"
@@ -2683,7 +2694,7 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
 
     var requiresWorktreeSupport: Bool {
         switch self {
-        case .worktrees, .newWorktree, .removeWorktree, .manageWorktrees:
+        case .worktrees, .newWorktree, .renameWorktree, .removeWorktree, .manageWorktrees:
             true
         default:
             false
@@ -2933,6 +2944,8 @@ private struct CommandPaletteOverlay: View {
                                 projectRows
                             } else if mode == .worktrees {
                                 worktreeRows
+                            } else if mode == .renameWorktree {
+                                renameWorktreeRows
                             } else if mode == .removeWorktree {
                                 removeWorktreeRows
                             } else if mode == .agents {
@@ -3049,6 +3062,7 @@ private struct CommandPaletteOverlay: View {
         case .commands: "Command"
         case .projects: "Project"
         case .worktrees: "Worktree"
+        case .renameWorktree: "Worktree to Rename"
         case .removeWorktree: "Worktree to Remove"
         case .agents: "Agent"
         case .agentPresets: "Agent"
@@ -3081,6 +3095,7 @@ private struct CommandPaletteOverlay: View {
         case .commands: "Commands"
         case .projects: "Commands › Projects"
         case .worktrees: "Commands › Worktrees"
+        case .renameWorktree: "Commands › Rename Worktree"
         case .removeWorktree: "Commands › Remove Worktree"
         case .agents: "Commands › Agents"
         case .agentPresets: "Commands › Add Agent"
@@ -3153,8 +3168,21 @@ private struct CommandPaletteOverlay: View {
     }
 
     private var filteredWorktreeActions: [CommandPaletteCommand] {
-        [CommandPaletteCommand.newWorktree, .removeWorktree, .manageWorktrees]
+        [CommandPaletteCommand.newWorktree, .renameWorktree, .removeWorktree, .manageWorktrees]
             .filter { $0.matches(query) }
+    }
+
+    private var filteredRenamableWorktrees: [GitWorktree] {
+        let renamable = repository.worktrees.filter(repository.canRename)
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return renamable }
+        return renamable.filter { worktree in
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                worktree.displayName,
+                worktree.branch ?? "",
+                worktree.root
+            ])
+        }
     }
 
     private var filteredRemovableWorktrees: [GitWorktree] {
@@ -3341,6 +3369,32 @@ private struct CommandPaletteOverlay: View {
     }
 
     @ViewBuilder
+    private var renameWorktreeRows: some View {
+        if filteredRenamableWorktrees.isEmpty {
+            CommandPaletteEmptyRow(title: "No worktrees to rename")
+        } else {
+            ForEach(Array(filteredRenamableWorktrees.enumerated()), id: \.element.id) { index, worktree in
+                CommandPaletteRow(
+                    style: rowStyle,
+                    icon: "pencil",
+                    tileColor: .green,
+                    title: worktree.displayName,
+                    matchFlags: highlightFlags(for: worktree.displayName),
+                    subtitle: worktree.root,
+                    isSelected: index == selectedIndex,
+                    isCurrent: worktree.root == repository.activeWorktreeRoot,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
+                .id(rowID(for: index))
+            }
+        }
+    }
+
+    @ViewBuilder
     private var removeWorktreeRows: some View {
         if let worktreeRemovalError {
             Text(worktreeRemovalError)
@@ -3475,6 +3529,7 @@ private struct CommandPaletteOverlay: View {
         case .commands: filteredRootItems.count
         case .projects: max(1, filteredProjects.count)
         case .worktrees: filteredWorktrees.count + filteredWorktreeActions.count
+        case .renameWorktree: filteredRenamableWorktrees.count
         case .removeWorktree: filteredRemovableWorktrees.count
         case .agents: filteredAgents.count
         case .agentPresets: filteredAgentPresets.count
@@ -3520,6 +3575,7 @@ private struct CommandPaletteOverlay: View {
         case .commands: "commands"
         case .projects: "projects"
         case .worktrees: "worktrees"
+        case .renameWorktree: "renameWorktree"
         case .removeWorktree: "removeWorktree"
         case .agents: "agents"
         case .agentPresets: "agentPresets"
@@ -3570,6 +3626,8 @@ private struct CommandPaletteOverlay: View {
                     mode = .worktrees
                 case .newWorktree:
                     presentNewWorktree()
+                case .renameWorktree:
+                    mode = .renameWorktree
                 case .removeWorktree:
                     mode = .removeWorktree
                 case .manageWorktrees:
@@ -3616,6 +3674,8 @@ private struct CommandPaletteOverlay: View {
             switch filteredWorktreeActions[actionIndex] {
             case .newWorktree:
                 presentNewWorktree()
+            case .renameWorktree:
+                mode = .renameWorktree
             case .removeWorktree:
                 mode = .removeWorktree
             case .manageWorktrees:
@@ -3623,6 +3683,9 @@ private struct CommandPaletteOverlay: View {
             default:
                 break
             }
+        case .renameWorktree:
+            guard filteredRenamableWorktrees.indices.contains(selectedIndex) else { return }
+            presentRenameWorktree(filteredRenamableWorktrees[selectedIndex])
         case .removeWorktree:
             guard !isRemovingWorktree,
                   filteredRemovableWorktrees.indices.contains(selectedIndex)
@@ -3680,6 +3743,11 @@ private struct CommandPaletteOverlay: View {
         DispatchQueue.main.async {
             chromeState.presentNewWorktree()
         }
+    }
+
+    private func presentRenameWorktree(_ worktree: GitWorktree) {
+        isPresented = false
+        chromeState.presentRenameWorktree(worktree)
     }
 
     private func presentWorktreeManager() {

@@ -649,6 +649,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCommandPalettePresented = false
     @Published var isNewWorktreePresented = false
     @Published var isWorktreeManagerPresented = false
+    @Published var worktreeToRename: GitWorktree?
     @Published var isTerminalSearchPresented = false
     @Published var terminalSearchFocusRequest = 0
     @Published var isIconDebugOverlayPresented = false
@@ -743,12 +744,22 @@ final class ProjectWindowChromeState: ObservableObject {
 
     func presentNewWorktree() {
         isWorktreeManagerPresented = false
+        worktreeToRename = nil
         isNewWorktreePresented = true
     }
 
     func presentWorktreeManager() {
         isNewWorktreePresented = false
+        worktreeToRename = nil
         isWorktreeManagerPresented = true
+    }
+
+    func presentRenameWorktree(_ worktree: GitWorktree) {
+        isNewWorktreePresented = false
+        isWorktreeManagerPresented = false
+        DispatchQueue.main.async {
+            self.worktreeToRename = worktree
+        }
     }
 
     func presentTerminalSearch() {

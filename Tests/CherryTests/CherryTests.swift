@@ -1455,6 +1455,14 @@ private struct MCPWhoamiPayload: Decodable {
     let created = try await service.discover(projectRoot: repositoryRoot.path)
     #expect(created.worktrees.count == 2)
     #expect(created.worktrees.first { $0.root == canonicalWorktreeRoot }?.branch == "feature/worktrees")
+
+    try await service.renameBranch(
+        worktreeRoot: worktreeRoot.path,
+        newName: "feature/renamed-worktree"
+    )
+    let renamed = try await service.discover(projectRoot: repositoryRoot.path)
+    #expect(renamed.worktrees.first { $0.root == canonicalWorktreeRoot }?.branch == "feature/renamed-worktree")
+
     let isDirty = try await service.isDirty(worktreeRoot: worktreeRoot.path)
     #expect(isDirty == false)
 
@@ -10047,6 +10055,7 @@ private func waitForSummaryCallCount(
     ).map(\.id)
     #expect(supported.contains("command:worktrees"))
     #expect(supported.contains("command:newWorktree"))
+    #expect(supported.contains("command:renameWorktree"))
     #expect(supported.contains("command:removeWorktree"))
     #expect(supported.contains("command:manageWorktrees"))
 }

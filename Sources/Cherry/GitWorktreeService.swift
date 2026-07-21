@@ -201,6 +201,14 @@ struct GitWorktreeService: Sendable {
         }
     }
 
+    func renameBranch(worktreeRoot: String, newName: String) async throws {
+        try await Self.perform {
+            _ = try Self.runGit([
+                "-C", worktreeRoot, "branch", "-m", newName
+            ])
+        }
+    }
+
     func remove(worktreeRoot: String, repositoryRoot: String) async throws {
         try await Self.perform {
             _ = try Self.runGit([

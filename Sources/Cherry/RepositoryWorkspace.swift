@@ -238,6 +238,30 @@ final class RepositoryWorkspace: ObservableObject {
         _ = activate(worktreeRoot: creation.destination, chromeState: chromeState)
     }
 
+    func canRename(_ worktree: GitWorktree) -> Bool {
+        !worktree.isMain
+            && !worktree.isBare
+            && !worktree.isDetached
+            && !worktree.isLocked
+            && !worktree.isPrunable
+            && worktree.branch != nil
+    }
+
+    func rename(_ worktree: GitWorktree, to requestedName: String) async throws {
+        guard canRename(worktree), let currentName = worktree.branch else {
+            throw GitWorktreeCommandError(
+                arguments: ["branch", "-m", requestedName],
+                exitCode: 1,
+                standardError: "Cherry can only rename linked worktrees on local branches."
+            )
+        }
+        let newName = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard newName != currentName else { return }
+        try await service.validateBranchName(newName, repositoryRoot: repositoryRoot)
+        try await service.renameBranch(worktreeRoot: worktree.root, newName: newName)
+        await refresh()
+    }
+
     func removalBlockers(for worktree: GitWorktree) async -> WorktreeRemovalBlockers {
         let runningProcessCount = workspaces[worktree.root]?.sessionsWithRunningProcess().count ?? 0
         let isDirty: Bool

@@ -1,6 +1,27 @@
 import AppKit
 import SwiftUI
 
+enum NoteEditorStyle {
+    /// Raw monospace source with terminal-palette colors (used by the todo inspector).
+    case terminal
+    /// Document look for notes: proportional type, left-anchored column, syntax
+    /// markers hanging in a leading gutter so text sits flush.
+    case document
+
+    var contentWidth: CGFloat {
+        self == .document ? 716 : 740
+    }
+
+    /// Left gutter that syntax markers hang into so text sits flush.
+    var textGutter: CGFloat {
+        self == .document ? 36 : 0
+    }
+
+    var centersContent: Bool {
+        self == .terminal
+    }
+}
+
 struct MarkdownSourceEditor: NSViewRepresentable {
     @Binding var text: String
     var themeColors: TerminalThemeColors?
@@ -11,6 +32,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     var header: AnyView? = nil
     var bodyFontSize: CGFloat = 13.5
     var useMonospacedFont: Bool = true
+    var style: NoteEditorStyle = .terminal
     var onContentHeightChange: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
@@ -18,7 +40,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             text: $text,
             themeColors: themeColors,
             bodyFontSize: bodyFontSize,
-            useMonospacedFont: useMonospacedFont
+            useMonospacedFont: useMonospacedFont,
+            style: style
         )
     }
 
@@ -30,7 +53,14 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         scrollView.drawsBackground = false
         scrollView.autohidesScrollers = true
 
-        let textView = NSTextView()
+        let textStorage = NSTextStorage()
+        let layoutManager = MarkdownLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+        let textContainer = NSTextContainer(containerSize: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        textContainer.widthTracksTextView = true
+        layoutManager.addTextContainer(textContainer)
+
+        let textView = NSTextView(frame: .zero, textContainer: textContainer)
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -45,7 +75,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.delegate = context.coordinator
-        textView.defaultParagraphStyle = Coordinator.defaultParagraphStyle
+        textView.defaultParagraphStyle = context.coordinator.bodyParagraphStyle
         textView.typingAttributes = context.coordinator.baseAttributes
 
         let documentView = MarkdownDocumentView(textView: textView)
@@ -53,6 +83,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         documentView.minHorizontalInset = minHorizontalInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
+        documentView.centersContent = style.centersContent
         documentView.onContentHeightChange = onContentHeightChange
         documentView.autoresizingMask = .width
         documentView.setHeader(rootView: header)
@@ -73,6 +104,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         documentView.minHorizontalInset = minHorizontalInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
+        documentView.centersContent = style.centersContent
         documentView.onContentHeightChange = onContentHeightChange
         documentView.setHeader(rootView: header)
         documentView.needsLayout = true
@@ -81,6 +113,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         context.coordinator.themeColors = themeColors
         context.coordinator.bodyFontSize = bodyFontSize
         context.coordinator.useMonospacedFont = useMonospacedFont
+        context.coordinator.style = style
+        textView.defaultParagraphStyle = context.coordinator.bodyParagraphStyle
         textView.typingAttributes = context.coordinator.baseAttributes
         context.coordinator.applyInsertionPoint(to: textView)
         context.coordinator.applySelectionColors(to: textView)
@@ -92,25 +126,28 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
         @Binding private var text: String
         weak var textView: NSTextView?
         weak var documentView: MarkdownDocumentView?
         var themeColors: TerminalThemeColors?
         var bodyFontSize: CGFloat
         var useMonospacedFont: Bool
+        var style: NoteEditorStyle
         private var isApplyingText = false
 
         init(
             text: Binding<String>,
             themeColors: TerminalThemeColors?,
             bodyFontSize: CGFloat,
-            useMonospacedFont: Bool
+            useMonospacedFont: Bool,
+            style: NoteEditorStyle
         ) {
             _text = text
             self.themeColors = themeColors
             self.bodyFontSize = bodyFontSize
             self.useMonospacedFont = useMonospacedFont
+            self.style = style
         }
 
         func textDidChange(_ notification: Notification) {
@@ -211,100 +248,117 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             return NSColor(hexRGB: hex)
         }
 
-        static let defaultParagraphStyle: NSParagraphStyle = {
-            let style = NSMutableParagraphStyle()
-            style.lineHeightMultiple = 1.4
-            style.paragraphSpacing = 4
-            return style
-        }()
+        private var gutter: CGFloat { style.textGutter }
 
-        static let headingParagraphStyle: NSParagraphStyle = {
-            let style = NSMutableParagraphStyle()
-            style.lineHeightMultiple = 1.2
-            style.paragraphSpacingBefore = 10
-            style.paragraphSpacing = 6
-            return style
-        }()
+        var bodyParagraphStyle: NSParagraphStyle {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineHeightMultiple = 1.4
+            paragraph.paragraphSpacing = style == .document ? 7 : 4
+            if style == .document {
+                paragraph.firstLineHeadIndent = gutter
+                paragraph.headIndent = gutter
+            }
+            return paragraph
+        }
 
-        static let codeBlockParagraphStyle: NSParagraphStyle = {
-            let style = NSMutableParagraphStyle()
-            style.lineHeightMultiple = 1.25
-            style.paragraphSpacing = 6
-            return style
-        }()
+        private var headingParagraphStyle: NSParagraphStyle {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineHeightMultiple = 1.2
+            paragraph.paragraphSpacingBefore = style == .document ? 14 : 10
+            paragraph.paragraphSpacing = 6
+            if style == .document {
+                paragraph.firstLineHeadIndent = gutter
+                paragraph.headIndent = gutter
+            }
+            return paragraph
+        }
+
+        private var codeBlockParagraphStyle: NSParagraphStyle {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineHeightMultiple = 1.25
+            paragraph.paragraphSpacing = style == .document ? 0 : 6
+            if style == .document {
+                let block = NSTextBlock()
+                block.backgroundColor = foregroundColor.withAlphaComponent(0.05)
+                block.setWidth(gutter, type: .absoluteValueType, for: .padding, edge: .minX)
+                block.setWidth(12, type: .absoluteValueType, for: .padding, edge: .maxX)
+                paragraph.textBlocks = [block]
+            }
+            return paragraph
+        }
 
         var baseAttributes: [NSAttributedString.Key: Any] {
             [
                 .font: bodyFont(weight: .regular),
                 .foregroundColor: foregroundColor,
-                .kern: 0.1,
-                .paragraphStyle: Coordinator.defaultParagraphStyle
+                .kern: style == .terminal ? 0.1 : 0,
+                .paragraphStyle: bodyParagraphStyle
             ]
         }
 
+        private var effectiveBodyFontSize: CGFloat {
+            style == .terminal ? bodyFontSize : 15
+        }
+
         private func bodyFont(weight: NSFont.Weight) -> NSFont {
-            if useMonospacedFont {
-                return NSFont.monospacedSystemFont(ofSize: bodyFontSize, weight: weight)
+            let size = effectiveBodyFontSize
+            if style == .terminal, useMonospacedFont {
+                return NSFont.monospacedSystemFont(ofSize: size, weight: weight)
             }
-            return NSFont.systemFont(ofSize: bodyFontSize, weight: weight)
+            return NSFont.systemFont(ofSize: size, weight: weight)
         }
 
         private func headingFont(size: CGFloat) -> NSFont {
-            if useMonospacedFont {
-                return NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
+            if style == .terminal {
+                if useMonospacedFont {
+                    return NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
+                }
+                return NSFont.systemFont(ofSize: size, weight: .semibold)
             }
-            return NSFont.systemFont(ofSize: size, weight: .semibold)
+            return NSFont.systemFont(ofSize: size, weight: .bold)
+        }
+
+        private func headingSize(forLevel level: Int) -> CGFloat {
+            switch level {
+            case 1: return effectiveBodyFontSize * 1.55
+            case 2: return effectiveBodyFontSize * 1.3
+            case 3: return effectiveBodyFontSize * 1.12
+            default: return effectiveBodyFontSize
+            }
         }
 
         private func codeFont(weight: NSFont.Weight = .regular) -> NSFont {
-            NSFont.monospacedSystemFont(ofSize: bodyFontSize, weight: weight)
+            let size = style == .terminal ? effectiveBodyFontSize : (effectiveBodyFontSize * 0.88).rounded()
+            return NSFont.monospacedSystemFont(ofSize: size, weight: weight)
         }
 
         private func headingAttributes(size: CGFloat, color: NSColor) -> [NSAttributedString.Key: Any] {
             [
                 .font: headingFont(size: size),
                 .foregroundColor: color,
-                .paragraphStyle: Coordinator.headingParagraphStyle
+                .paragraphStyle: headingParagraphStyle
             ]
         }
+
+        private struct Rule {
+            let pattern: String
+            let captureGroup: Int
+            let attributes: [NSAttributedString.Key: Any]
+        }
+
+        private static let boldPattern = #"(\*\*|__)([^\n]+?)(\*\*|__)"#
+        private static let italicPattern = #"(?<!\*)(\*)([^\n*]+?)(\*)(?!\*)"#
+        private static let inlineCodePattern = #"(`)([^`\n]+)(`)"#
+        private static let linkPattern = #"(\[)([^\]\n]+)(\]\([^\)\n]+\))"#
+        private static let headingMarkerPattern = #"(?m)^(#{1,6}[ \t])"#
+        private static let fenceLinePattern = #"(?m)^(`{3}.*)$"#
 
         private func applyPatterns(to storage: NSTextStorage?, text: String) {
             guard let storage else { return }
             let nsText = text as NSString
             let fullRange = NSRange(location: 0, length: nsText.length)
 
-            let headingColor = paletteColor(12) ?? paletteColor(4) ?? .systemPurple
-            let codeColor = paletteColor(11) ?? paletteColor(3) ?? .systemOrange
-            let linkColor = paletteColor(4) ?? paletteColor(12) ?? .linkColor
-            let markerColor = foregroundColor.withAlphaComponent(0.42)
-            let quoteColor = foregroundColor.withAlphaComponent(0.62)
-
-            struct Rule {
-                let pattern: String
-                let captureGroup: Int
-                let attributes: [NSAttributedString.Key: Any]
-            }
-
-            let h1Size = bodyFontSize * 1.55
-            let h2Size = bodyFontSize * 1.32
-            let h3Size = bodyFontSize * 1.15
-            let h4Size = bodyFontSize
-
-            let rules: [Rule] = [
-                Rule(pattern: #"(?m)^#\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h1Size, color: headingColor)),
-                Rule(pattern: #"(?m)^##\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h2Size, color: headingColor)),
-                Rule(pattern: #"(?m)^###\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h3Size, color: headingColor)),
-                Rule(pattern: #"(?m)^#{4,6}\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h4Size, color: headingColor)),
-                Rule(pattern: #"(?m)^>\s?.*$"#, captureGroup: 0, attributes: [.foregroundColor: quoteColor, .obliqueness: 0.12]),
-                Rule(pattern: #"(?m)^\s*([-*+])(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
-                Rule(pattern: #"(?m)^\s*(\d+\.)(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
-                Rule(pattern: #"(?m)^\s*[-*+]\s+(\[[ xX]\])"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
-                Rule(pattern: #"`[^`\n]+`"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont()]),
-                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont(), .paragraphStyle: Coordinator.codeBlockParagraphStyle]),
-                Rule(pattern: #"\[[^\]\n]+\]\([^\)\n]+\)"#, captureGroup: 0, attributes: [.foregroundColor: linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]),
-                Rule(pattern: #"(\*\*|__)[^\n]+?(\*\*|__)"#, captureGroup: 0, attributes: [.font: bodyFont(weight: .semibold)]),
-                Rule(pattern: #"(?<!\*)\*[^\n*]+?\*(?!\*)"#, captureGroup: 0, attributes: [.obliqueness: 0.16])
-            ]
+            let rules = style == .terminal ? terminalRules() : documentRules()
 
             for rule in rules {
                 guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
@@ -314,6 +368,181 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                     storage.addAttributes(rule.attributes, range: range)
                 }
             }
+
+            if style == .document {
+                applyFlushLayout(to: storage, text: text, nsText: nsText)
+            }
+        }
+
+        private func terminalRules() -> [Rule] {
+            let headingColor = paletteColor(12) ?? paletteColor(4) ?? .systemPurple
+            let codeColor = paletteColor(11) ?? paletteColor(3) ?? .systemOrange
+            let linkColor = paletteColor(4) ?? paletteColor(12) ?? .linkColor
+            let markerColor = foregroundColor.withAlphaComponent(0.42)
+            let quoteColor = foregroundColor.withAlphaComponent(0.62)
+
+            let h1Size = bodyFontSize * 1.55
+            let h2Size = bodyFontSize * 1.32
+            let h3Size = bodyFontSize * 1.15
+            let h4Size = bodyFontSize
+
+            return [
+                Rule(pattern: #"(?m)^#\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h1Size, color: headingColor)),
+                Rule(pattern: #"(?m)^##\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h2Size, color: headingColor)),
+                Rule(pattern: #"(?m)^###\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h3Size, color: headingColor)),
+                Rule(pattern: #"(?m)^#{4,6}\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: h4Size, color: headingColor)),
+                Rule(pattern: #"(?m)^>\s?.*$"#, captureGroup: 0, attributes: [.foregroundColor: quoteColor, .obliqueness: 0.12]),
+                Rule(pattern: #"(?m)^\s*([-*+])(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
+                Rule(pattern: #"(?m)^\s*(\d+\.)(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
+                Rule(pattern: #"(?m)^\s*[-*+]\s+(\[[ xX]\])"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
+                Rule(pattern: #"`[^`\n]+`"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont()]),
+                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont(), .paragraphStyle: codeBlockParagraphStyle]),
+                Rule(pattern: #"\[[^\]\n]+\]\([^\)\n]+\)"#, captureGroup: 0, attributes: [.foregroundColor: linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]),
+                Rule(pattern: #"(\*\*|__)[^\n]+?(\*\*|__)"#, captureGroup: 0, attributes: [.font: bodyFont(weight: .semibold)]),
+                Rule(pattern: #"(?<!\*)\*[^\n*]+?\*(?!\*)"#, captureGroup: 0, attributes: [.obliqueness: 0.16])
+            ]
+        }
+
+        private func documentRules() -> [Rule] {
+            let fg = foregroundColor
+            let accent = paletteColor(4) ?? paletteColor(12) ?? .controlAccentColor
+            let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: fg.withAlphaComponent(0.26)]
+            let quoteColor = fg.withAlphaComponent(0.62)
+            let chipColor = fg.withAlphaComponent(0.08)
+            let bulletColor = fg.withAlphaComponent(0.4)
+            let linkAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: accent]
+
+            let fencedBlockAttributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: fg.withAlphaComponent(0.9),
+                .font: codeFont(),
+                .paragraphStyle: codeBlockParagraphStyle
+            ]
+
+            return [
+                Rule(pattern: #"(?m)^#\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: headingSize(forLevel: 1), color: fg)),
+                Rule(pattern: #"(?m)^##\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: headingSize(forLevel: 2), color: fg)),
+                Rule(pattern: #"(?m)^###\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: headingSize(forLevel: 3), color: fg)),
+                Rule(pattern: #"(?m)^#{4,6}\s+.*$"#, captureGroup: 0, attributes: headingAttributes(size: headingSize(forLevel: 4), color: fg)),
+                Rule(pattern: Coordinator.headingMarkerPattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: #"(?m)^>\s?.*$"#, captureGroup: 0, attributes: [.foregroundColor: quoteColor, .obliqueness: 0.12]),
+                Rule(pattern: #"(?m)^\s*([-*+])(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: bulletColor]),
+                Rule(pattern: #"(?m)^\s*(\d+\.)(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: bulletColor]),
+                Rule(pattern: #"(?m)^\s*[-*+]\s+(\[[ xX]\])"#, captureGroup: 1, attributes: [.foregroundColor: bulletColor]),
+                Rule(pattern: Coordinator.boldPattern, captureGroup: 0, attributes: [.font: bodyFont(weight: .semibold)]),
+                Rule(pattern: Coordinator.boldPattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.boldPattern, captureGroup: 3, attributes: markerAttributes),
+                Rule(pattern: Coordinator.italicPattern, captureGroup: 0, attributes: [.obliqueness: 0.16]),
+                Rule(pattern: Coordinator.italicPattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.italicPattern, captureGroup: 3, attributes: markerAttributes),
+                Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 0, attributes: [.foregroundColor: fg, .font: codeFont(), .backgroundColor: chipColor, MarkdownLayoutManager.chipAttribute: true]),
+                Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 3, attributes: markerAttributes),
+                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: fencedBlockAttributes),
+                Rule(pattern: Coordinator.fenceLinePattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 2, attributes: linkAttributes),
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 3, attributes: markerAttributes)
+            ]
+        }
+
+        /// Hangs block prefixes (heading hashes, bullets, quote chevrons) into the left
+        /// gutter so the text column sits flush.
+        private func applyFlushLayout(to storage: NSTextStorage, text: String, nsText: NSString) {
+            let fullRange = NSRange(location: 0, length: nsText.length)
+
+            func hang(prefixRange: NSRange, markerRange: NSRange, font: NSFont, base: NSParagraphStyle) {
+                guard let paragraph = base.mutableCopy() as? NSMutableParagraphStyle else { return }
+                let leadingLength = markerRange.location - prefixRange.location
+                let leading = leadingLength > 0
+                    ? nsText.substring(with: NSRange(location: prefixRange.location, length: leadingLength))
+                    : ""
+                let marker = nsText.substring(with: markerRange)
+                let leadingWidth = leading.isEmpty ? 0 : ceil((leading as NSString).size(withAttributes: [.font: font]).width)
+                let markerWidth = ceil((marker as NSString).size(withAttributes: [.font: font]).width)
+                paragraph.headIndent = gutter + leadingWidth
+                paragraph.firstLineHeadIndent = max(0, gutter + leadingWidth - markerWidth)
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: nsText.paragraphRange(for: markerRange))
+            }
+
+            if let regex = try? NSRegularExpression(pattern: #"(?m)^(#{1,6}[ \t])"#) {
+                for match in regex.matches(in: text, range: fullRange) {
+                    let markerRange = match.range(at: 1)
+                    guard markerRange.location != NSNotFound else { continue }
+                    let level = markerRange.length - 1
+                    hang(
+                        prefixRange: markerRange,
+                        markerRange: markerRange,
+                        font: headingFont(size: headingSize(forLevel: level)),
+                        base: headingParagraphStyle
+                    )
+                }
+            }
+
+            if let regex = try? NSRegularExpression(pattern: #"(?m)^([ \t]*)((?:[-*+]|\d{1,3}\.)[ \t]+)"#) {
+                for match in regex.matches(in: text, range: fullRange) {
+                    let markerRange = match.range(at: 2)
+                    guard markerRange.location != NSNotFound else { continue }
+                    hang(
+                        prefixRange: match.range(at: 0),
+                        markerRange: markerRange,
+                        font: bodyFont(weight: .regular),
+                        base: bodyParagraphStyle
+                    )
+                }
+            }
+
+            if let regex = try? NSRegularExpression(pattern: #"(?m)^(>[ \t]?)"#) {
+                for match in regex.matches(in: text, range: fullRange) {
+                    let markerRange = match.range(at: 1)
+                    guard markerRange.location != NSNotFound else { continue }
+                    hang(
+                        prefixRange: markerRange,
+                        markerRange: markerRange,
+                        font: bodyFont(weight: .regular),
+                        base: bodyParagraphStyle
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Draws inline-code chip backgrounds as rounded rects clamped to the glyphs they
+/// belong to. Stock TextKit extends a background run that starts a wrapped line back
+/// to the line fragment's leading edge, which paints a stray slab left of the text.
+final class MarkdownLayoutManager: NSLayoutManager {
+    static let chipAttribute = NSAttributedString.Key("cherry.inlineCodeChip")
+
+    override func fillBackgroundRectArray(
+        _ rectArray: UnsafePointer<NSRect>,
+        count rectCount: Int,
+        forCharacterRange charRange: NSRange,
+        color: NSColor
+    ) {
+        let isChip = charRange.location < (textStorage?.length ?? 0)
+            && textStorage?.attribute(Self.chipAttribute, at: charRange.location, effectiveRange: nil) != nil
+        guard isChip else {
+            super.fillBackgroundRectArray(rectArray, count: rectCount, forCharacterRange: charRange, color: color)
+            return
+        }
+
+        let glyphRange = self.glyphRange(forCharacterRange: charRange, actualCharacterRange: nil)
+        guard glyphRange.length > 0,
+              let container = textContainer(forGlyphAt: glyphRange.location, effectiveRange: nil)
+        else { return }
+
+        var rects: [NSRect] = []
+        enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, lineGlyphRange, _ in
+            let intersection = NSIntersectionRange(lineGlyphRange, glyphRange)
+            guard intersection.length > 0 else { return }
+            rects.append(self.boundingRect(forGlyphRange: intersection, in: container))
+        }
+        guard !rects.isEmpty else { return }
+
+        color.setFill()
+        for rect in rects {
+            let chipRect = rect.insetBy(dx: -2, dy: 1)
+            NSBezierPath(roundedRect: chipRect, xRadius: 3, yRadius: 3).fill()
         }
     }
 }
@@ -327,6 +556,7 @@ final class MarkdownDocumentView: NSView {
     var minHorizontalInset: CGFloat = 32
     var verticalInset: CGFloat = 24
     var headerSpacing: CGFloat = 24
+    var centersContent: Bool = true
     var onContentHeightChange: ((CGFloat) -> Void)?
 
     override var isFlipped: Bool { true }
@@ -374,8 +604,10 @@ final class MarkdownDocumentView: NSView {
     override func layout() {
         super.layout()
         let availableWidth = bounds.width
-        let horizontal = max(minHorizontalInset, (availableWidth - maxContentWidth) / 2)
-        let contentWidth = max(0, availableWidth - horizontal * 2)
+        let horizontal = centersContent
+            ? max(minHorizontalInset, (availableWidth - maxContentWidth) / 2)
+            : minHorizontalInset
+        let contentWidth = min(maxContentWidth, max(0, availableWidth - horizontal * 2))
 
         var y: CGFloat = verticalInset
 

@@ -1139,6 +1139,7 @@ private struct NoteDetailView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(themeForeground.opacity(0.5))
         }
+        .padding(.leading, NoteEditorStyle.document.textGutter)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -1146,7 +1147,9 @@ private struct NoteDetailView: View {
         MarkdownSourceEditor(
             text: $draftMarkdown,
             themeColors: themeColors,
-            header: AnyView(titleHeader)
+            maxContentWidth: NoteEditorStyle.document.contentWidth,
+            header: AnyView(titleHeader),
+            style: .document
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(themeBackground)

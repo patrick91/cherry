@@ -7,8 +7,6 @@ enum WorktreeSwipeTuning {
     static let settleDurationKey = "worktrees.swipeSettleDuration"
     static let defaultCommitDistance = 64.0
     static let defaultSettleDuration = 0.14
-    static let commitDistanceRange = 28.0...100.0
-    static let settleDurationRange = 0.08...0.24
     private static let minimumSettleDuration = 0.05
 
     static func resolvedSettleDuration(
@@ -95,15 +93,6 @@ struct WorktreeSpaceRail: View {
     @ObservedObject var swipeState: WorktreeSidebarSwipeState
     let sidebarWidth: CGFloat
 
-    @AppStorage(WorktreeSwipeTuning.commitDistanceKey)
-    private var swipeCommitDistance = WorktreeSwipeTuning.defaultCommitDistance
-    @AppStorage(WorktreeSwipeTuning.settleDurationKey)
-    private var swipeSettleDuration = WorktreeSwipeTuning.defaultSettleDuration
-
-    @State private var isNewWorktreePresented = false
-    @State private var isManagerPresented = false
-    @State private var isSwipeTuningPresented = false
-
     var body: some View {
         HStack(spacing: 6) {
             ScrollViewReader { proxy in
@@ -115,7 +104,7 @@ struct WorktreeSpaceRail: View {
                                 repository: repository,
                                 chromeState: chromeState,
                                 activeProgress: activeProgress(for: worktree),
-                                openManager: { isManagerPresented = true }
+                                openManager: chromeState.presentWorktreeManager
                             )
                             .id(worktree.root)
                         }
@@ -130,7 +119,7 @@ struct WorktreeSpaceRail: View {
             }
 
             Button {
-                isNewWorktreePresented = true
+                chromeState.presentNewWorktree()
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 11, weight: .semibold))
@@ -142,7 +131,7 @@ struct WorktreeSpaceRail: View {
             .accessibilityLabel("New Worktree")
 
             Button {
-                isManagerPresented = true
+                chromeState.presentWorktreeManager()
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 11, weight: .semibold))
@@ -152,40 +141,8 @@ struct WorktreeSpaceRail: View {
             .buttonStyle(.plain)
             .help("Manage Worktrees")
             .accessibilityLabel("Manage Worktrees")
-
-            Button {
-                isSwipeTuningPresented.toggle()
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: 24, height: 24)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help("Tune Worktree Swipe")
-            .accessibilityLabel("Tune Worktree Swipe")
-            .popover(isPresented: $isSwipeTuningPresented) {
-                WorktreeSwipeTuningPanel(
-                    commitDistance: $swipeCommitDistance,
-                    settleDuration: $swipeSettleDuration
-                )
-            }
         }
         .frame(height: 30)
-        .sheet(isPresented: $isNewWorktreePresented) {
-            NewWorktreeSheet(
-                repository: repository,
-                chromeState: chromeState,
-                isPresented: $isNewWorktreePresented
-            )
-        }
-        .sheet(isPresented: $isManagerPresented) {
-            WorktreeManagerSheet(
-                repository: repository,
-                chromeState: chromeState,
-                isPresented: $isManagerPresented
-            )
-        }
     }
 
     private func activeProgress(for worktree: GitWorktree) -> CGFloat {
@@ -204,79 +161,6 @@ struct WorktreeSpaceRail: View {
         if isCurrent { return 1 - progress }
         if worktree.root == targetRoot { return progress }
         return 0
-    }
-}
-
-private struct WorktreeSwipeTuningPanel: View {
-    @Binding var commitDistance: Double
-    @Binding var settleDuration: Double
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Swipe Tuning")
-                    .font(.system(size: 13, weight: .semibold))
-
-                Spacer()
-
-                Button("Reset") {
-                    commitDistance = WorktreeSwipeTuning.defaultCommitDistance
-                    settleDuration = WorktreeSwipeTuning.defaultSettleDuration
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-            }
-
-            tuningRow(
-                "Trigger",
-                value: $commitDistance,
-                range: WorktreeSwipeTuning.commitDistanceRange,
-                step: 4,
-                formattedValue: "\(Int(commitDistance.rounded())) pt"
-            )
-
-            tuningRow(
-                "Settle",
-                value: $settleDuration,
-                range: WorktreeSwipeTuning.settleDurationRange,
-                step: 0.02,
-                formattedValue: "\(Int((settleDuration * 1_000).rounded())) ms"
-            )
-
-            Text("Lower trigger distances switch sooner. Fast flicks also project their velocity forward.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(14)
-        .frame(width: 250)
-    }
-
-    private func tuningRow(
-        _ title: String,
-        value: Binding<Double>,
-        range: ClosedRange<Double>,
-        step: Double,
-        formattedValue: String
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(title)
-                    .font(.system(size: 11, weight: .medium))
-
-                Spacer()
-
-                Text(formattedValue)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-
-            Slider(value: value, in: range, step: step) {
-                Text(title)
-            }
-            .labelsHidden()
-        }
     }
 }
 
@@ -776,7 +660,11 @@ struct WorktreeManagerSheet: View {
                 remove(worktree)
             }
         } message: { worktree in
-            Text("Cherry will remove the checkout at \(worktree.root). The branch will be kept.")
+            if worktree.root == repository.activeWorktreeRoot {
+                Text("Cherry will close this worktree's terminals, stop any running processes, and remove the checkout at \(worktree.root). The branch will be kept.")
+            } else {
+                Text("Cherry will remove the checkout at \(worktree.root). The branch will be kept.")
+            }
         }
     }
 
@@ -877,11 +765,7 @@ private struct WorktreeManagerRow: View {
     }
 
     private var canRemove: Bool {
-        !worktree.isMain
-            && !worktree.isLocked
-            && !worktree.isPrunable
-            && repository.dirtyByRoot[worktree.root] == false
-            && runningProcessCount == 0
+        repository.canRemove(worktree)
     }
 
     private var statusLabels: [String] {
@@ -904,6 +788,9 @@ private struct WorktreeManagerRow: View {
         if worktree.isPrunable { return "Prune the stale Git entry instead." }
         if repository.dirtyByRoot[worktree.root] == true { return "Clean modified and untracked files before removing it." }
         if repository.dirtyByRoot[worktree.root] == nil { return "Cherry is still checking this worktree." }
+        if worktree.root == repository.activeWorktreeRoot {
+            return "Remove this checkout and close its terminals. Its branch will be kept."
+        }
         if runningProcessCount > 0 { return "Stop foreground processes before removing it." }
         return "Remove the checkout and keep its branch."
     }

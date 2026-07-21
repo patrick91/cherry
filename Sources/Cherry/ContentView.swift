@@ -135,6 +135,7 @@ struct ContentView: View {
             if chromeState.isCommandPalettePresented {
                 CommandPaletteOverlay(
                     settings: AgentSettings.shared,
+                    repository: repository,
                     workspace: workspace,
                     chromeState: chromeState,
                     selectedProjectRoot: projectRoot,
@@ -226,6 +227,20 @@ struct ContentView: View {
             chromeState: chromeState
         ))
         .frame(minWidth: 320, minHeight: 460)
+        .sheet(isPresented: $chromeState.isNewWorktreePresented) {
+            NewWorktreeSheet(
+                repository: repository,
+                chromeState: chromeState,
+                isPresented: $chromeState.isNewWorktreePresented
+            )
+        }
+        .sheet(isPresented: $chromeState.isWorktreeManagerPresented) {
+            WorktreeManagerSheet(
+                repository: repository,
+                chromeState: chromeState,
+                isPresented: $chromeState.isWorktreeManagerPresented
+            )
+        }
         .confirmationDialog(
             "Close Agent Group?",
             isPresented: pendingAgentGroupCloseBinding,
@@ -927,9 +942,17 @@ private struct DetailPaneView: View {
                     usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition
                 )
             } else {
-                ContentUnavailableView("No Active Session", systemImage: "rectangle.stack")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(nsColor: .windowBackgroundColor))
+                ContentUnavailableView {
+                    Label("No Active Session", systemImage: "rectangle.stack")
+                } description: {
+                    Text("Open a terminal to get started.")
+                } actions: {
+                    Button("New Terminal") {
+                        _ = workspace.addSession()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -2592,6 +2615,8 @@ private struct AppShellBackground: View {
 private enum CommandPaletteMode {
     case commands
     case projects
+    case worktrees
+    case removeWorktree
     case agents
     case agentPresets
     case editors
@@ -2600,6 +2625,10 @@ private enum CommandPaletteMode {
 enum CommandPaletteCommand: String, CaseIterable, Identifiable {
     case projects
     case addProject
+    case worktrees
+    case newWorktree
+    case removeWorktree
+    case manageWorktrees
     case agents
     case addAgent
     case toggleAppearance
@@ -2610,6 +2639,10 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .projects: "Projects"
         case .addProject: "Add Project"
+        case .worktrees: "Worktrees"
+        case .newWorktree: "New Worktree"
+        case .removeWorktree: "Remove Worktree…"
+        case .manageWorktrees: "Manage Worktrees"
         case .agents: "Agents"
         case .addAgent: "Add Agent"
         case .toggleAppearance: "Toggle Light/Dark Mode"
@@ -2620,6 +2653,10 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .projects: "Switch project"
         case .addProject: "Create a Cherry project"
+        case .worktrees: "Switch checkout"
+        case .newWorktree: "Create an isolated checkout"
+        case .removeWorktree: "Remove a checkout and keep its branch"
+        case .manageWorktrees: "Show, hide, or remove checkouts"
         case .agents: "Open a configured agent"
         case .addAgent: "Configure a global agent tool"
         case .toggleAppearance: "Switch app appearance"
@@ -2630,6 +2667,10 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .projects: "folder"
         case .addProject: "folder.badge.plus"
+        case .worktrees: "rectangle.stack"
+        case .newWorktree: "rectangle.stack.badge.plus"
+        case .removeWorktree: "trash"
+        case .manageWorktrees: "ellipsis.circle"
         case .agents: "sparkles"
         case .addAgent: "sparkles"
         case .toggleAppearance: "circle.lefthalf.filled"
@@ -2638,6 +2679,15 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
 
     func matches(_ query: String) -> Bool {
         CommandPaletteMatcher.matches(query: query, fields: [title, subtitle])
+    }
+
+    var requiresWorktreeSupport: Bool {
+        switch self {
+        case .worktrees, .newWorktree, .removeWorktree, .manageWorktrees:
+            true
+        default:
+            false
+        }
     }
 }
 
@@ -2748,10 +2798,12 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         projects: [CherryProject],
         installedEditors: [InstalledEditor] = [],
         defaultEditorID: String = "",
-        hasOpenProject: Bool = false
+        hasOpenProject: Bool = false,
+        supportsWorktrees: Bool = false
     ) -> [CommandPaletteRootItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let commands = CommandPaletteCommand.allCases
+            .filter { !$0.requiresWorktreeSupport || supportsWorktrees }
             .filter { $0.matches(query) }
             .map(CommandPaletteRootItem.command)
         var editorItems: [CommandPaletteRootItem] = []
@@ -2806,6 +2858,7 @@ private struct CommandPaletteOverlay: View {
     @ObservedObject var settings: AgentSettings
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject private var editorDiscovery = ExternalEditorDiscovery.shared
+    @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let selectedProjectRoot: String?
@@ -2819,6 +2872,9 @@ private struct CommandPaletteOverlay: View {
     @State private var selectedIndex = 0
     @State private var editingAgent: AgentToolDefinition?
     @State private var agentError: String?
+    @State private var removalCandidate: GitWorktree?
+    @State private var worktreeRemovalError: String?
+    @State private var isRemovingWorktree = false
     @State private var searchFocusRequest = 0
     @State private var didAppear = false
 
@@ -2875,6 +2931,10 @@ private struct CommandPaletteOverlay: View {
                                 commandRows
                             } else if mode == .projects {
                                 projectRows
+                            } else if mode == .worktrees {
+                                worktreeRows
+                            } else if mode == .removeWorktree {
+                                removeWorktreeRows
                             } else if mode == .agents {
                                 agentRows
                             } else if mode == .editors {
@@ -2960,12 +3020,36 @@ private struct CommandPaletteOverlay: View {
                 }
             )
         }
+        .alert(
+            "Remove Worktree?",
+            isPresented: Binding(
+                get: { removalCandidate != nil },
+                set: { if !$0 { removalCandidate = nil } }
+            ),
+            presenting: removalCandidate
+        ) { worktree in
+            Button("Cancel", role: .cancel) {
+                removalCandidate = nil
+                requestSearchFocus()
+            }
+            Button("Remove Worktree", role: .destructive) {
+                remove(worktree)
+            }
+        } message: { worktree in
+            if worktree.root == repository.activeWorktreeRoot {
+                Text("Cherry will close this worktree's terminals, stop any running processes, and remove the checkout at \(worktree.root). The branch will be kept.")
+            } else {
+                Text("Cherry will remove the checkout at \(worktree.root). The branch will be kept.")
+            }
+        }
     }
 
     private var prompt: String {
         switch mode {
         case .commands: "Command"
         case .projects: "Project"
+        case .worktrees: "Worktree"
+        case .removeWorktree: "Worktree to Remove"
         case .agents: "Agent"
         case .agentPresets: "Agent"
         case .editors: "Editor"
@@ -2996,6 +3080,8 @@ private struct CommandPaletteOverlay: View {
         switch mode {
         case .commands: "Commands"
         case .projects: "Commands › Projects"
+        case .worktrees: "Commands › Worktrees"
+        case .removeWorktree: "Commands › Remove Worktree"
         case .agents: "Commands › Agents"
         case .agentPresets: "Commands › Add Agent"
         case .editors: "Commands › Editors"
@@ -3026,7 +3112,8 @@ private struct CommandPaletteOverlay: View {
             projects: settings.projects,
             installedEditors: editorDiscovery.installedEditors,
             defaultEditorID: terminalSettings.defaultEditorID,
-            hasOpenProject: project.validProjectRoot != nil
+            hasOpenProject: project.validProjectRoot != nil,
+            supportsWorktrees: repository.supportsWorktrees
         )
     }
 
@@ -3049,6 +3136,36 @@ private struct CommandPaletteOverlay: View {
             CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
                 agent.name,
                 agent.commandLine
+            ])
+        }
+    }
+
+    private var filteredWorktrees: [GitWorktree] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return repository.worktrees }
+        return repository.worktrees.filter { worktree in
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                worktree.displayName,
+                worktree.branch ?? "",
+                worktree.root
+            ])
+        }
+    }
+
+    private var filteredWorktreeActions: [CommandPaletteCommand] {
+        [CommandPaletteCommand.newWorktree, .removeWorktree, .manageWorktrees]
+            .filter { $0.matches(query) }
+    }
+
+    private var filteredRemovableWorktrees: [GitWorktree] {
+        let removable = repository.worktrees.filter(repository.canRemove)
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return removable }
+        return removable.filter { worktree in
+            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
+                worktree.displayName,
+                worktree.branch ?? "",
+                worktree.root
             ])
         }
     }
@@ -3176,6 +3293,97 @@ private struct CommandPaletteOverlay: View {
     }
 
     @ViewBuilder
+    private var worktreeRows: some View {
+        if filteredWorktrees.isEmpty && filteredWorktreeActions.isEmpty {
+            CommandPaletteEmptyRow(title: "No worktrees")
+        } else {
+            ForEach(Array(filteredWorktrees.enumerated()), id: \.element.id) { index, worktree in
+                CommandPaletteRow(
+                    style: rowStyle,
+                    icon: worktree.isDetached
+                        ? "point.3.connected.trianglepath.dotted"
+                        : "rectangle.stack",
+                    tileColor: .green,
+                    title: worktree.displayName,
+                    matchFlags: highlightFlags(for: worktree.displayName),
+                    subtitle: worktree.root,
+                    isSelected: index == selectedIndex,
+                    isCurrent: worktree.root == repository.activeWorktreeRoot,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
+                .id(rowID(for: index))
+            }
+
+            ForEach(Array(filteredWorktreeActions.enumerated()), id: \.element.id) { offset, command in
+                let index = filteredWorktrees.count + offset
+                CommandPaletteRow(
+                    style: rowStyle,
+                    icon: command.icon,
+                    tileColor: command.tileColor,
+                    title: command.title,
+                    matchFlags: highlightFlags(for: command.title),
+                    subtitle: command.subtitle,
+                    isSelected: index == selectedIndex,
+                    isCurrent: false,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
+                .id(rowID(for: index))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var removeWorktreeRows: some View {
+        if let worktreeRemovalError {
+            Text(worktreeRemovalError)
+                .font(.callout)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+        }
+
+        if filteredRemovableWorktrees.isEmpty {
+            CommandPaletteEmptyRow(title: "No removable worktrees")
+        } else {
+            ForEach(Array(filteredRemovableWorktrees.enumerated()), id: \.element.id) { index, worktree in
+                CommandPaletteRow(
+                    style: rowStyle,
+                    icon: "trash",
+                    tileColor: .gray,
+                    title: worktree.displayName,
+                    matchFlags: highlightFlags(for: worktree.displayName),
+                    subtitle: removalSubtitle(for: worktree),
+                    isSelected: index == selectedIndex,
+                    isCurrent: worktree.root == repository.activeWorktreeRoot,
+                    onHover: { selectedIndex = index },
+                    action: {
+                        selectedIndex = index
+                        commitSelection()
+                    }
+                )
+                .id(rowID(for: index))
+            }
+        }
+    }
+
+    private func removalSubtitle(for worktree: GitWorktree) -> String {
+        if worktree.root == repository.activeWorktreeRoot {
+            return "Current checkout · Closes its terminals"
+        }
+        return worktree.root
+    }
+
+    @ViewBuilder
     private var agentRows: some View {
         let project = settings.resolvedProject(for: selectedProjectRoot)
         if project.validProjectRoot == nil {
@@ -3266,6 +3474,8 @@ private struct CommandPaletteOverlay: View {
         switch mode {
         case .commands: filteredRootItems.count
         case .projects: max(1, filteredProjects.count)
+        case .worktrees: filteredWorktrees.count + filteredWorktreeActions.count
+        case .removeWorktree: filteredRemovableWorktrees.count
         case .agents: filteredAgents.count
         case .agentPresets: filteredAgentPresets.count
         case .editors: filteredEditors.count
@@ -3309,6 +3519,8 @@ private struct CommandPaletteOverlay: View {
         switch mode {
         case .commands: "commands"
         case .projects: "projects"
+        case .worktrees: "worktrees"
+        case .removeWorktree: "removeWorktree"
         case .agents: "agents"
         case .agentPresets: "agentPresets"
         case .editors: "editors"
@@ -3354,6 +3566,14 @@ private struct CommandPaletteOverlay: View {
                     mode = .projects
                 case .addProject:
                     chooseProjectRoot()
+                case .worktrees:
+                    mode = .worktrees
+                case .newWorktree:
+                    presentNewWorktree()
+                case .removeWorktree:
+                    mode = .removeWorktree
+                case .manageWorktrees:
+                    presentWorktreeManager()
                 case .agents:
                     mode = .agents
                 case .addAgent:
@@ -3381,6 +3601,35 @@ private struct CommandPaletteOverlay: View {
             let project = filteredProjects[selectedIndex]
             dismiss()
             openProject(project)
+        case .worktrees:
+            if filteredWorktrees.indices.contains(selectedIndex) {
+                let worktree = filteredWorktrees[selectedIndex]
+                _ = repository.activate(
+                    worktreeRoot: worktree.root,
+                    chromeState: chromeState
+                )
+                dismiss()
+                return
+            }
+            let actionIndex = selectedIndex - filteredWorktrees.count
+            guard filteredWorktreeActions.indices.contains(actionIndex) else { return }
+            switch filteredWorktreeActions[actionIndex] {
+            case .newWorktree:
+                presentNewWorktree()
+            case .removeWorktree:
+                mode = .removeWorktree
+            case .manageWorktrees:
+                presentWorktreeManager()
+            default:
+                break
+            }
+        case .removeWorktree:
+            guard !isRemovingWorktree,
+                  filteredRemovableWorktrees.indices.contains(selectedIndex)
+            else {
+                return
+            }
+            removalCandidate = filteredRemovableWorktrees[selectedIndex]
         case .agents:
             guard filteredAgents.indices.contains(selectedIndex) else { return }
             launch(filteredAgents[selectedIndex])
@@ -3405,6 +3654,39 @@ private struct CommandPaletteOverlay: View {
         guard let root = settings.resolvedProject(for: selectedProjectRoot).validProjectRoot else { return }
         ExternalEditorLauncher().open(projectRoot: root, with: editor)
         dismiss()
+    }
+
+    private func remove(_ worktree: GitWorktree) {
+        guard !isRemovingWorktree else { return }
+        isRemovingWorktree = true
+        worktreeRemovalError = nil
+        Task {
+            defer {
+                isRemovingWorktree = false
+                removalCandidate = nil
+            }
+            do {
+                try await repository.remove(worktree, chromeState: chromeState)
+                dismiss()
+            } catch {
+                worktreeRemovalError = error.localizedDescription
+                requestSearchFocus()
+            }
+        }
+    }
+
+    private func presentNewWorktree() {
+        isPresented = false
+        DispatchQueue.main.async {
+            chromeState.presentNewWorktree()
+        }
+    }
+
+    private func presentWorktreeManager() {
+        isPresented = false
+        DispatchQueue.main.async {
+            chromeState.presentWorktreeManager()
+        }
     }
 
     private func handleEscape() {

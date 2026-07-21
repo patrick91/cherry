@@ -19,14 +19,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
-            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
             self.scheduleDefaultWindowOpenIfNeeded()
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            if let window = sender.windows.first {
+            if let window = Self.firstProjectCapableWindow {
                 window.makeKeyAndOrderFront(nil)
             } else {
                 let openDefaultProjectWindow = openDefaultProjectWindow
@@ -38,6 +38,13 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         sender.activate(ignoringOtherApps: true)
         return false
+    }
+
+    // The MenuBarExtra's status-item window is always in `NSApp.windows`, so
+    // naive first/visible checks see "a window" on a windowless launch and
+    // never open the default project window. Key-capable filters it out.
+    private static var firstProjectCapableWindow: NSWindow? {
+        NSApp.windows.first { $0.canBecomeKey }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -109,7 +116,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             }
 
             guard !ProjectWindowRegistry.shared.hasRegisteredProjectWindow,
-                  !NSApp.windows.contains(where: \.isVisible)
+                  !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
             else {
                 return
             }

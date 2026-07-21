@@ -116,6 +116,8 @@ extension CommandPaletteCommand {
     var tileColor: Color {
         switch self {
         case .projects, .addProject: .blue
+        case .worktrees, .newWorktree, .manageWorktrees: .green
+        case .removeWorktree: .gray
         case .agents, .addAgent: .purple
         case .toggleAppearance: .orange
         }

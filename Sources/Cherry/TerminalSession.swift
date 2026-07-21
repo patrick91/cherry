@@ -1042,8 +1042,14 @@ final class TerminalWorkspace: ObservableObject {
     }
     let projectRoot: String?
 
-    init(projectRoot: String? = nil) {
+    init(projectRoot: String? = nil, createInitialSession: Bool = true) {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
+        guard createInitialSession else {
+            sessions = []
+            terminalDisplayItems = []
+            selectedSessionID = nil
+            return
+        }
         let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot, projectRoot: self.projectRoot)
         sessions = [firstSession]
         terminalDisplayItems = [.single(firstSession.id)]
@@ -1242,8 +1248,12 @@ final class TerminalWorkspace: ObservableObject {
         displayAsStandalone: Bool = true
     ) -> TerminalSession {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
-        // inherit the selected session's last trusted OSC 7 cwd report.
-        let resolvedWorkingDirectory = workingDirectory ?? selectedSession?.workingDirectory
+        // inherit the selected session's last trusted OSC 7 cwd report. In an
+        // empty workspace (worktree spaces start with no sessions) fall back
+        // to the project root rather than the process home directory.
+        let resolvedWorkingDirectory = workingDirectory
+            ?? selectedSession?.workingDirectory
+            ?? projectRoot
         let session = Self.makeSession(
             index: sessions.count + 1,
             title: title,

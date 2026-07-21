@@ -3141,10 +3141,9 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func beginSurfaceTransitionIfPossible() -> UInt64? {
-        guard activeBridge != nil,
-              scrollView.frame.width > 0,
+        guard scrollView.frame.width > 0,
               scrollView.frame.height > 0,
-              let cgImage = captureViewBitmap(scrollView, rect: scrollView.bounds)
+              let capture = captureTerminalLayerContents()
         else {
             cancelSurfaceTransition()
             return nil
@@ -3154,7 +3153,7 @@ final class GhosttyTerminalContainerView: NSView {
         surfaceTransitionGeneration &+= 1
         let generation = surfaceTransitionGeneration
         surfaceTransitionSnapshotLayer = makeSnapshotLayer(
-            contents: cgImage,
+            capture: capture,
             frame: scrollView.frame,
             zPosition: 1_100
         )
@@ -3245,49 +3244,38 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func captureSnapshotIfPossible() {
-        // Best-effort screenshot of the live terminal area. AppKit's
-        // `cacheDisplay` may not capture every GPU-backed surface; if it
-        // fails we still suppress resize re-fits, the cross-fade just becomes
-        // a no-op.
+        // Best-effort freeze-frame of the live terminal area; if the surface
+        // has never presented we still suppress resize re-fits, the cross-fade
+        // just becomes a no-op.
         guard scrollView.frame.width > 0,
-              scrollView.frame.height > 0 else { return }
-
-        let captureRect = scrollView.frame
-        let cgImage = captureViewBitmap(scrollView, rect: scrollView.bounds)
-
-        guard let cgImage else { return }
+              scrollView.frame.height > 0,
+              let capture = captureTerminalLayerContents()
+        else { return }
 
         snapshotLayer?.removeFromSuperlayer()
         snapshotLayer = makeSnapshotLayer(
-            contents: cgImage,
-            frame: captureRect,
+            capture: capture,
+            frame: scrollView.frame,
             zPosition: 1_000
         )
     }
 
     private func refreshSnapshotContentsAfterEarlyFitIfPossible() {
         guard let snapshotLayer,
-              let terminalView = activeBridge?.terminalView,
-              scrollView.bounds.width > 0,
-              scrollView.bounds.height > 0
+              let contentsLayer = snapshotLayer.sublayers?.first,
+              let capture = captureTerminalLayerContents()
         else {
             return
         }
 
-        let visibleOrigin = scrollView.contentView.bounds.origin
-        let captureSize = NSSize(
-            width: max(scrollView.bounds.width, terminalView.frame.width),
-            height: scrollView.bounds.height
-        )
-        let captureRect = NSRect(origin: visibleOrigin, size: captureSize)
-        guard let cgImage = captureViewBitmap(documentView, rect: captureRect) else { return }
-
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        snapshotLayer.contents = cgImage
-        if let scale = window?.backingScaleFactor {
-            snapshotLayer.contentsScale = scale
-        }
+        contentsLayer.contents = capture.contents
+        contentsLayer.contentsScale = capture.contentsScale
+        contentsLayer.frame = capture.frame.offsetBy(
+            dx: -snapshotLayer.frame.minX,
+            dy: -snapshotLayer.frame.minY
+        )
         CATransaction.commit()
     }
 
@@ -3298,36 +3286,66 @@ final class GhosttyTerminalContainerView: NSView {
         return resolved.cgColor
     }
 
+    private struct TerminalLayerCapture {
+        let contents: Any
+        let contentsScale: CGFloat
+        /// Terminal view rect in container-view coordinates.
+        let frame: NSRect
+    }
+
+    /// Zero-copy grab of the terminal's currently presented IOSurface.
+    /// `cacheDisplay` software-rasterizes the GPU layer through CoreGraphics
+    /// (~250-330ms per capture on a retina window, measured 2026-07);
+    /// referencing the presented surface is O(1). Callers capture before the
+    /// outgoing bridge detaches, and detach hides the surface, so the pixels
+    /// stay stable while the snapshot is on screen.
+    private func captureTerminalLayerContents() -> TerminalLayerCapture? {
+        guard let terminalView = activeBridge?.terminalView,
+              let sourceLayer = terminalView.layer,
+              let contents = sourceLayer.contents
+        else { return nil }
+        return TerminalLayerCapture(
+            contents: contents,
+            contentsScale: sourceLayer.contentsScale,
+            frame: terminalView.convert(terminalView.bounds, to: self)
+        )
+    }
+
     private func makeSnapshotLayer(
-        contents: CGImage,
+        capture: TerminalLayerCapture,
         frame: CGRect,
         zPosition: CGFloat
     ) -> CALayer {
         wantsLayer = true
-        let layer = CALayer()
-        layer.contents = contents
-        // Anchor captured terminal pixels at the top-left without scaling so
-        // text stays pixel-aligned while the live Metal surface changes below.
-        layer.contentsGravity = .topLeft
-        layer.masksToBounds = true
+        let container = CALayer()
         // Ghostty's Metal layer renders text on a clear background. Filling the
         // snapshot makes it fully opaque, covering resize/reconfigure flashes.
-        layer.backgroundColor = terminalBackgroundCGColor()
-        layer.frame = frame
-        layer.zPosition = zPosition
-        layer.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
-        if let scale = window?.backingScaleFactor {
-            layer.contentsScale = scale
-        }
-        self.layer?.addSublayer(layer)
-        return layer
-    }
+        container.backgroundColor = terminalBackgroundCGColor()
+        container.masksToBounds = true
+        container.frame = frame
+        container.zPosition = zPosition
+        container.actions = ["bounds": NSNull(), "position": NSNull(), "frame": NSNull()]
 
-    private func captureViewBitmap(_ view: NSView, rect: NSRect) -> CGImage? {
-        guard rect.width > 0, rect.height > 0,
-              let bitmap = view.bitmapImageRepForCachingDisplay(in: rect) else { return nil }
-        view.cacheDisplay(in: rect, to: bitmap)
-        return bitmap.cgImage
+        // The sublayer frame below is expressed in this view's coordinate
+        // space, which matches the container's CA space only while neither
+        // this view nor its backing layer is flipped.
+        let contentsLayer = CALayer()
+        contentsLayer.contents = capture.contents
+        // Anchor captured terminal pixels at the top-left without scaling so
+        // text stays pixel-aligned while the live Metal surface changes below.
+        contentsLayer.contentsGravity = .topLeft
+        contentsLayer.contentsScale = capture.contentsScale
+        contentsLayer.frame = capture.frame.offsetBy(dx: -frame.minX, dy: -frame.minY)
+        contentsLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "frame": NSNull(),
+            "contents": NSNull(),
+        ]
+        container.addSublayer(contentsLayer)
+
+        self.layer?.addSublayer(container)
+        return container
     }
 
     private func crossfadeOutSnapshotLayer() {

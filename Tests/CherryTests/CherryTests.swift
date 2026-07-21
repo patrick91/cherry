@@ -1258,6 +1258,25 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(worktrees[2].pruneReason == "gitdir file points to non-existent location")
 }
 
+@Test func worktreeRemovalCanCloseRunningProcessesForCurrentCheckout() {
+    let busy = WorktreeRemovalBlockers(
+        runningProcessCount: 2,
+        isDirty: false,
+        lockReason: nil,
+        pruneReason: nil
+    )
+    #expect(!busy.canRemove)
+    #expect(busy.canRemove(closingRunningProcesses: true))
+
+    let dirty = WorktreeRemovalBlockers(
+        runningProcessCount: 2,
+        isDirty: true,
+        lockReason: nil,
+        pruneReason: nil
+    )
+    #expect(!dirty.canRemove(closingRunningProcesses: true))
+}
+
 @Test func gitBranchReferenceParserOrdersLocalBeforeRemoteAndHidesRemoteHead() {
     let references = """
     refs/remotes/origin/feature\0bbbb\0
@@ -10010,6 +10029,26 @@ private func waitForSummaryCallCount(
     #expect(ids.contains("command:projects"))
     #expect(ids.contains("agent:codex"))
     #expect(!ids.contains("project:\(project.root)"))
+}
+
+@Test func commandPaletteOnlyOffersWorktreeCommandsWhenSupported() {
+    let unsupported = CommandPaletteRootItem.filteredItems(
+        query: "worktree",
+        agents: [],
+        projects: []
+    )
+    #expect(unsupported.isEmpty)
+
+    let supported = CommandPaletteRootItem.filteredItems(
+        query: "",
+        agents: [],
+        projects: [],
+        supportsWorktrees: true
+    ).map(\.id)
+    #expect(supported.contains("command:worktrees"))
+    #expect(supported.contains("command:newWorktree"))
+    #expect(supported.contains("command:removeWorktree"))
+    #expect(supported.contains("command:manageWorktrees"))
 }
 
 @MainActor

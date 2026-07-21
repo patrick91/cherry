@@ -647,6 +647,8 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
+    @Published var isNewWorktreePresented = false
+    @Published var isWorktreeManagerPresented = false
     @Published var isTerminalSearchPresented = false
     @Published var terminalSearchFocusRequest = 0
     @Published var isIconDebugOverlayPresented = false
@@ -737,6 +739,16 @@ final class ProjectWindowChromeState: ObservableObject {
     func presentCommandPalette() {
         isCommandPalettePresented = true
         commandPaletteFocusRequest &+= 1
+    }
+
+    func presentNewWorktree() {
+        isWorktreeManagerPresented = false
+        isNewWorktreePresented = true
+    }
+
+    func presentWorktreeManager() {
+        isNewWorktreePresented = false
+        isWorktreeManagerPresented = true
     }
 
     func presentTerminalSearch() {

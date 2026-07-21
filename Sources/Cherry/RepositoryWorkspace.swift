@@ -8,7 +8,11 @@ struct WorktreeRemovalBlockers: Equatable {
     let pruneReason: String?
 
     var canRemove: Bool {
-        runningProcessCount == 0
+        canRemove(closingRunningProcesses: false)
+    }
+
+    func canRemove(closingRunningProcesses: Bool) -> Bool {
+        (closingRunningProcesses || runningProcessCount == 0)
             && !isDirty
             && lockReason == nil
             && pruneReason == nil
@@ -250,6 +254,21 @@ final class RepositoryWorkspace: ObservableObject {
         )
     }
 
+    func canRemove(_ worktree: GitWorktree) -> Bool {
+        guard !worktree.isMain,
+              let isDirty = dirtyByRoot[worktree.root]
+        else {
+            return false
+        }
+        let runningProcessCount = workspaces[worktree.root]?.sessionsWithRunningProcess().count ?? 0
+        return WorktreeRemovalBlockers(
+            runningProcessCount: runningProcessCount,
+            isDirty: isDirty,
+            lockReason: worktree.lockReason,
+            pruneReason: worktree.pruneReason
+        ).canRemove(closingRunningProcesses: worktree.root == activeWorktreeRoot)
+    }
+
     func remove(
         _ worktree: GitWorktree,
         chromeState: ProjectWindowChromeState?
@@ -261,16 +280,20 @@ final class RepositoryWorkspace: ObservableObject {
                 standardError: "The primary checkout cannot be removed from Cherry."
             )
         }
+        let isCurrent = activeWorktreeRoot == worktree.root
         let blockers = await removalBlockers(for: worktree)
-        guard blockers.canRemove else {
+        guard blockers.canRemove(closingRunningProcesses: isCurrent) else {
             throw GitWorktreeCommandError(
                 arguments: ["worktree", "remove", worktree.root],
                 exitCode: 1,
-                standardError: Self.removalBlockerMessage(blockers)
+                standardError: Self.removalBlockerMessage(
+                    blockers,
+                    closingRunningProcesses: isCurrent
+                )
             )
         }
 
-        let wasActive = activeWorktreeRoot == worktree.root
+        let wasActive = isCurrent
         let fallback = visibleWorktrees.first { $0.root != worktree.root }
             ?? worktrees.first { $0.root != worktree.root }
         try await service.remove(worktreeRoot: worktree.root, repositoryRoot: repositoryRoot)
@@ -307,7 +330,11 @@ final class RepositoryWorkspace: ObservableObject {
         if let existing = workspaces[root] {
             return existing
         }
-        let workspace = TerminalWorkspace(projectRoot: root)
+        // Worktree spaces start empty: eagerly spawning a shell here builds a
+        // ghostty surface synchronously (~350ms+ measured), which lands on the
+        // first tick of a swipe gesture via `prepareWorkspace`. The user opens
+        // terminals explicitly; loaded workspaces then stay in memory.
+        let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
         workspaces[root] = workspace
         loadedWorktreeRoots.insert(root)
         ProjectWindowRegistry.shared.repositoryDidRefresh(self)
@@ -340,9 +367,12 @@ final class RepositoryWorkspace: ObservableObject {
         return String(cString: resolved)
     }
 
-    private static func removalBlockerMessage(_ blockers: WorktreeRemovalBlockers) -> String {
+    private static func removalBlockerMessage(
+        _ blockers: WorktreeRemovalBlockers,
+        closingRunningProcesses: Bool
+    ) -> String {
         var reasons: [String] = []
-        if blockers.runningProcessCount > 0 {
+        if blockers.runningProcessCount > 0, !closingRunningProcesses {
             reasons.append("\(blockers.runningProcessCount) foreground process\(blockers.runningProcessCount == 1 ? " is" : "es are") still running")
         }
         if blockers.isDirty {

@@ -3048,15 +3048,11 @@ private struct CommandPaletteOverlay: View {
                 removalCandidate = nil
                 requestSearchFocus()
             }
-            Button("Remove Worktree", role: .destructive) {
+            Button(removalConfirmationButtonTitle(for: worktree), role: .destructive) {
                 remove(worktree)
             }
         } message: { worktree in
-            if worktree.root == repository.activeWorktreeRoot {
-                Text("Cherry will close this worktree's terminals, stop any running processes, and remove the checkout at \(worktree.root). The branch will be kept.")
-            } else {
-                Text("Cherry will remove the checkout at \(worktree.root). The branch will be kept.")
-            }
+            Text(removalConfirmationMessage(for: worktree))
         }
     }
 
@@ -3434,10 +3430,56 @@ private struct CommandPaletteOverlay: View {
     }
 
     private func removalSubtitle(for worktree: GitWorktree) -> String {
+        if worktree.isPrunable {
+            return "Missing checkout · Prunes its stale Git entry"
+        }
+        if repository.dirtyByRoot[worktree.root] == true {
+            return "Modified checkout · Local changes will be discarded"
+        }
+        if worktree.isLocked {
+            return "Locked checkout · Lock will be overridden"
+        }
+        let processCount = repository.workspaceIfLoaded(for: worktree.root)?
+            .sessionsWithRunningProcess().count ?? 0
+        if processCount > 0 {
+            return "\(processCount) running process\(processCount == 1 ? "" : "es") · Will be stopped"
+        }
         if worktree.root == repository.activeWorktreeRoot {
             return "Current checkout · Closes its terminals"
         }
         return worktree.root
+    }
+
+    private func removalConfirmationButtonTitle(for worktree: GitWorktree) -> String {
+        if worktree.isPrunable { return "Prune Entry" }
+        if repository.dirtyByRoot[worktree.root] == true || worktree.isLocked {
+            return "Remove Anyway"
+        }
+        return "Remove Worktree"
+    }
+
+    private func removalConfirmationMessage(for worktree: GitWorktree) -> String {
+        if worktree.isPrunable {
+            return "The checkout at \(worktree.root) is already missing. Cherry will prune its stale Git entry."
+        }
+
+        var details: [String] = []
+        let processCount = repository.workspaceIfLoaded(for: worktree.root)?
+            .sessionsWithRunningProcess().count ?? 0
+        if processCount > 0 {
+            details.append("stop \(processCount) running process\(processCount == 1 ? "" : "es")")
+        }
+        if repository.dirtyByRoot[worktree.root] == true {
+            details.append("permanently discard modified and untracked files")
+        }
+        if worktree.isLocked {
+            details.append("override its Git lock")
+        }
+
+        let consequences = details.isEmpty
+            ? "remove the checkout"
+            : details.joined(separator: ", ") + ", and remove the checkout"
+        return "Cherry will \(consequences) at \(worktree.root). Its branch will be kept."
     }
 
     @ViewBuilder
@@ -3732,7 +3774,7 @@ private struct CommandPaletteOverlay: View {
                 removalCandidate = nil
             }
             do {
-                try await repository.remove(worktree, chromeState: chromeState)
+                try await repository.remove(worktree, force: true, chromeState: chromeState)
                 dismiss()
             } catch {
                 worktreeRemovalError = error.localizedDescription

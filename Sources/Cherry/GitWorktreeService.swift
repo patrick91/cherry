@@ -209,11 +209,20 @@ struct GitWorktreeService: Sendable {
         }
     }
 
-    func remove(worktreeRoot: String, repositoryRoot: String) async throws {
+    func remove(
+        worktreeRoot: String,
+        repositoryRoot: String,
+        force: Bool = false
+    ) async throws {
         try await Self.perform {
-            _ = try Self.runGit([
-                "-C", repositoryRoot, "worktree", "remove", worktreeRoot
-            ])
+            var arguments = ["-C", repositoryRoot, "worktree", "remove"]
+            if force {
+                // Git requires force twice when a worktree is locked. The same
+                // form also covers modified/untracked files.
+                arguments.append(contentsOf: ["--force", "--force"])
+            }
+            arguments.append(worktreeRoot)
+            _ = try Self.runGit(arguments)
         }
     }
 

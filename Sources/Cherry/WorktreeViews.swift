@@ -666,22 +666,42 @@ struct RenameWorktreeSheet: View {
 }
 
 struct WorktreeManagerSheet: View {
+    private enum RemovalRequest: Identifiable {
+        case worktree(GitWorktree)
+        case all
+
+        var id: String {
+            switch self {
+            case .worktree(let worktree): "worktree:\(worktree.id)"
+            case .all: "all"
+            }
+        }
+    }
+
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @Binding var isPresented: Bool
 
-    @State private var removalCandidate: GitWorktree?
+    @State private var removalRequest: RemovalRequest?
     @State private var isRemoving = false
     @State private var errorMessage: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text("Worktrees")
                     .font(.title2.weight(.semibold))
-                Text("Manage isolated checkouts for \(repository.repositoryName).")
+                Text(managerSummary)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.top, 22)
+            .padding(.bottom, 18)
+
+            Divider()
 
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -690,67 +710,208 @@ struct WorktreeManagerSheet: View {
                             worktree: worktree,
                             repository: repository,
                             chromeState: chromeState,
-                            remove: { removalCandidate = worktree }
+                            isPerformingAction: isRemoving,
+                            remove: { removalRequest = .worktree(worktree) }
                         )
                         if worktree.id != repository.worktrees.last?.id {
                             Divider()
+                                .padding(.leading, 58)
                         }
                     }
                 }
             }
-            .frame(height: 340)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(minHeight: 340, idealHeight: 420, maxHeight: 500)
 
             if let errorMessage {
-                Text(errorMessage)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
+                HStack(alignment: .top, spacing: 9) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(errorMessage)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .padding(.horizontal, 18)
+                .padding(.bottom, 12)
             }
 
-            HStack {
-                Button("Refresh") {
+            Divider()
+
+            HStack(spacing: 10) {
+                Button {
                     Task { await repository.refresh() }
+                } label: {
+                    Label(repository.isRefreshing ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise")
                 }
                 .disabled(repository.isRefreshing || isRemoving)
 
-                if repository.worktrees.contains(where: \.isPrunable) {
-                    Button("Prune Stale Entries") {
+                if missingWorktreeCount > 0 {
+                    Button {
                         prune()
+                    } label: {
+                        Label(
+                            "Prune \(missingWorktreeCount) Missing",
+                            systemImage: "trash.slash"
+                        )
                     }
                     .disabled(isRemoving)
                 }
 
                 Spacer()
+
+                if !linkedWorktrees.isEmpty {
+                    Button("Remove All Linked…", role: .destructive) {
+                        removalRequest = .all
+                    }
+                    .disabled(isRemoving)
+                    .help("Remove every linked checkout. The primary project checkout and local branches are kept.")
+                }
+
                 Button("Done") {
                     isPresented = false
                 }
                 .keyboardShortcut(.defaultAction)
             }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
         }
-        .padding(24)
-        .frame(width: 650)
+        .frame(width: 700)
+        .frame(minHeight: 500, idealHeight: 570, maxHeight: 650)
+        .task {
+            await repository.refreshDirtyStatus()
+        }
         .alert(
-            "Remove Worktree?",
+            removalAlertTitle,
             isPresented: Binding(
-                get: { removalCandidate != nil },
-                set: { if !$0 { removalCandidate = nil } }
+                get: { removalRequest != nil },
+                set: { if !$0 { removalRequest = nil } }
             ),
-            presenting: removalCandidate
-        ) { worktree in
+            presenting: removalRequest
+        ) { request in
             Button("Cancel", role: .cancel) {
-                removalCandidate = nil
+                removalRequest = nil
             }
-            Button("Remove Worktree", role: .destructive) {
-                remove(worktree)
+            switch request {
+            case .worktree(let worktree):
+                Button(removalButtonTitle(for: worktree), role: .destructive) {
+                    remove(worktree)
+                }
+            case .all:
+                Button(removeAllButtonTitle, role: .destructive) {
+                    removeAllLinkedWorktrees()
+                }
             }
-        } message: { worktree in
-            if worktree.root == repository.activeWorktreeRoot {
-                Text("Cherry will close this worktree's terminals, stop any running processes, and remove the checkout at \(worktree.root). The branch will be kept.")
-            } else {
-                Text("Cherry will remove the checkout at \(worktree.root). The branch will be kept.")
+        } message: { request in
+            switch request {
+            case .worktree(let worktree):
+                Text(removalMessage(for: worktree))
+            case .all:
+                Text(removeAllMessage)
             }
         }
+    }
+
+    private var linkedWorktrees: [GitWorktree] {
+        repository.worktrees.filter { !$0.isMain }
+    }
+
+    private var missingWorktreeCount: Int {
+        linkedWorktrees.filter(\.isPrunable).count
+    }
+
+    private var primaryWorktreeRoot: String {
+        repository.worktrees.first(where: \.isMain)?.root ?? repository.repositoryRoot
+    }
+
+    private var managerSummary: String {
+        let count = linkedWorktrees.count
+        let noun = count == 1 ? "linked checkout" : "linked checkouts"
+        return "\(count) \(noun) for \(repository.repositoryName). The project checkout stays; linked checkouts and their running processes can be removed."
+    }
+
+    private var removalAlertTitle: String {
+        switch removalRequest {
+        case .worktree(let worktree):
+            worktree.isPrunable ? "Prune Missing Worktree?" : "Remove Worktree?"
+        case .all:
+            "Remove All Linked Worktrees?"
+        case nil:
+            "Remove Worktree?"
+        }
+    }
+
+    private func removalButtonTitle(for worktree: GitWorktree) -> String {
+        if worktree.isPrunable { return "Prune Entry" }
+        if repository.dirtyByRoot[worktree.root] == true || worktree.isLocked {
+            return "Remove Anyway"
+        }
+        return "Remove Worktree"
+    }
+
+    private func removalMessage(for worktree: GitWorktree) -> String {
+        if worktree.isPrunable {
+            return "The checkout at \(worktree.root) is already missing. Cherry will prune its stale Git entry."
+        }
+
+        var details: [String] = []
+        let processCount = repository.workspaceIfLoaded(for: worktree.root)?
+            .sessionsWithRunningProcess().count ?? 0
+        if processCount > 0 {
+            details.append("stop \(processCount) running process\(processCount == 1 ? "" : "es")")
+        }
+        if repository.dirtyByRoot[worktree.root] == true {
+            details.append("permanently discard modified and untracked files")
+        }
+        if worktree.isLocked {
+            details.append("override its Git lock")
+        }
+
+        let consequences = details.isEmpty
+            ? "remove the checkout"
+            : details.joined(separator: ", ") + ", and remove the checkout"
+        return "Cherry will \(consequences) at \(worktree.root). Its branch will be kept."
+    }
+
+    private var removeAllButtonTitle: String {
+        linkedWorktrees.count == 1
+            ? "Remove Linked Worktree"
+            : "Remove \(linkedWorktrees.count) Worktrees"
+    }
+
+    private var removeAllMessage: String {
+        var consequences: [String] = []
+        let processCount = linkedWorktrees.reduce(0) { count, worktree in
+            count + (repository.workspaceIfLoaded(for: worktree.root)?
+                .sessionsWithRunningProcess().count ?? 0)
+        }
+        let modifiedCount = linkedWorktrees.filter {
+            repository.dirtyByRoot[$0.root] == true
+        }.count
+        let lockedCount = linkedWorktrees.filter(\.isLocked).count
+
+        if processCount > 0 {
+            consequences.append("stop \(processCount) running process\(processCount == 1 ? "" : "es")")
+        }
+        if modifiedCount > 0 {
+            consequences.append("permanently discard changes in \(modifiedCount) modified checkout\(modifiedCount == 1 ? "" : "s")")
+        }
+        if lockedCount > 0 {
+            consequences.append("override \(lockedCount) Git lock\(lockedCount == 1 ? "" : "s")")
+        }
+        if missingWorktreeCount > 0 {
+            consequences.append("prune \(missingWorktreeCount) missing entr\(missingWorktreeCount == 1 ? "y" : "ies")")
+        }
+
+        let extra = consequences.isEmpty
+            ? ""
+            : " This will " + consequences.joined(separator: ", ") + "."
+        let target = linkedWorktrees.count == 1
+            ? "the linked checkout"
+            : "all \(linkedWorktrees.count) linked checkouts"
+        return "Cherry will remove \(target).\(extra) The project checkout at \(primaryWorktreeRoot) and local branches will be kept."
     }
 
     private func remove(_ worktree: GitWorktree) {
@@ -759,10 +920,26 @@ struct WorktreeManagerSheet: View {
         Task {
             defer {
                 isRemoving = false
-                removalCandidate = nil
+                removalRequest = nil
             }
             do {
-                try await repository.remove(worktree, chromeState: chromeState)
+                try await repository.remove(worktree, force: true, chromeState: chromeState)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func removeAllLinkedWorktrees() {
+        isRemoving = true
+        errorMessage = nil
+        Task {
+            defer {
+                isRemoving = false
+                removalRequest = nil
+            }
+            do {
+                try await repository.removeAllLinkedWorktrees(chromeState: chromeState)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -784,114 +961,144 @@ struct WorktreeManagerSheet: View {
 }
 
 private struct WorktreeManagerRow: View {
+    private struct Status: Identifiable {
+        let title: String
+        let color: Color
+
+        var id: String { title }
+    }
+
     let worktree: GitWorktree
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
+    let isPerformingAction: Bool
     let remove: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             Image(systemName: worktree.isDetached ? "point.3.connected.trianglepath.dotted" : "rectangle.stack")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 24)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(iconColor)
+                .frame(width: 28)
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 7) {
                     Text(worktree.displayName)
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1)
-                    ForEach(statusLabels, id: \.self) { label in
-                        Text(label)
+                    ForEach(statuses) { status in
+                        Text(status.title)
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 5)
+                            .foregroundStyle(status.color)
+                            .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(Color.primary.opacity(0.07), in: Capsule())
+                            .background(status.color.opacity(0.12), in: Capsule())
                     }
                 }
                 Text(worktree.root)
-                    .font(.system(size: 11))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(worktree.root)
             }
 
-            Spacer(minLength: 12)
+            Spacer(minLength: 18)
 
-            Button("Rename") {
-                chromeState.presentRenameWorktree(worktree)
-            }
-            .disabled(!repository.canRename(worktree))
-            .help(renameHelp)
-
-            if repository.hiddenWorktreeRoots.contains(worktree.root) {
-                Button("Show") {
-                    repository.show(worktree)
+            if worktree.root == repository.activeWorktreeRoot {
+                Label("Current", systemImage: "checkmark.circle.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+            } else if !worktree.isPrunable {
+                Button("Open") {
+                    _ = repository.activate(
+                        worktreeRoot: worktree.root,
+                        chromeState: chromeState
+                    )
                 }
-            } else if !worktree.isMain {
-                Button("Hide") {
-                    repository.hide(worktree, chromeState: chromeState)
+                .disabled(isPerformingAction)
+                .help("Switch to this checkout")
+            }
+
+            if !worktree.isMain {
+                Button(worktree.isPrunable ? "Prune" : "Remove", role: .destructive, action: remove)
+                    .disabled(isPerformingAction)
+                    .help(removalHelp)
+
+                Menu {
+                    Button {
+                        chromeState.presentRenameWorktree(worktree)
+                    } label: {
+                        Label("Rename Branch…", systemImage: "pencil")
+                    }
+                    .disabled(!repository.canRename(worktree))
+
+                    if repository.hiddenWorktreeRoots.contains(worktree.root) {
+                        Button {
+                            repository.show(worktree)
+                        } label: {
+                            Label("Show in Sidebar", systemImage: "eye")
+                        }
+                    } else {
+                        Button {
+                            repository.hide(worktree, chromeState: chromeState)
+                        } label: {
+                            Label("Hide from Sidebar", systemImage: "eye.slash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 26, height: 24)
                 }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(isPerformingAction)
+                .help("Actions for \(worktree.displayName)")
             }
-
-            Button(worktree.root == repository.activeWorktreeRoot ? "Current" : "Open") {
-                _ = repository.activate(
-                    worktreeRoot: worktree.root,
-                    chromeState: chromeState
-                )
-            }
-            .disabled(worktree.root == repository.activeWorktreeRoot || worktree.isPrunable)
-
-            Button("Remove", role: .destructive, action: remove)
-                .disabled(!canRemove)
-                .help(removalHelp)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 13)
     }
 
     private var runningProcessCount: Int {
         repository.workspaceIfLoaded(for: worktree.root)?.sessionsWithRunningProcess().count ?? 0
     }
 
-    private var canRemove: Bool {
-        repository.canRemove(worktree)
+    private var iconColor: Color {
+        if worktree.isPrunable { return .red }
+        if repository.dirtyByRoot[worktree.root] == true { return .orange }
+        if worktree.root == repository.activeWorktreeRoot { return .accentColor }
+        return .secondary
     }
 
-    private var statusLabels: [String] {
-        var result: [String] = []
-        if worktree.isMain { result.append("Primary") }
-        if worktree.root == repository.activeWorktreeRoot { result.append("Current") }
-        if worktree.isDetached { result.append("Detached") }
-        if repository.loadedWorktreeRoots.contains(worktree.root) { result.append("Loaded") }
-        if repository.hiddenWorktreeRoots.contains(worktree.root) { result.append("Hidden") }
-        if repository.dirtyByRoot[worktree.root] == true { result.append("Modified") }
-        if runningProcessCount > 0 { result.append("Busy") }
-        if worktree.isLocked { result.append("Locked") }
-        if worktree.isPrunable { result.append("Missing") }
+    private var statuses: [Status] {
+        var result: [Status] = []
+        if worktree.isMain { result.append(Status(title: "Primary", color: .gray)) }
+        if worktree.isDetached { result.append(Status(title: "Detached", color: .purple)) }
+        if repository.hiddenWorktreeRoots.contains(worktree.root) {
+            result.append(Status(title: "Hidden", color: .gray))
+        }
+        if repository.dirtyByRoot[worktree.root] == true {
+            result.append(Status(title: "Modified", color: .orange))
+        }
+        if runningProcessCount > 0 { result.append(Status(title: "Busy", color: .green)) }
+        if worktree.isLocked { result.append(Status(title: "Locked", color: .orange)) }
+        if worktree.isPrunable { result.append(Status(title: "Missing", color: .red)) }
         return result
     }
 
     private var removalHelp: String {
-        if worktree.isMain { return "The primary checkout cannot be removed." }
-        if worktree.isLocked { return "Unlock this worktree in Git before removing it." }
-        if worktree.isPrunable { return "Prune the stale Git entry instead." }
-        if repository.dirtyByRoot[worktree.root] == true { return "Clean modified and untracked files before removing it." }
-        if repository.dirtyByRoot[worktree.root] == nil { return "Cherry is still checking this worktree." }
-        if worktree.root == repository.activeWorktreeRoot {
-            return "Remove this checkout and close its terminals. Its branch will be kept."
+        if worktree.isPrunable { return "Prune this missing checkout's stale Git entry." }
+        if repository.dirtyByRoot[worktree.root] == true {
+            return "Remove this checkout and permanently discard modified and untracked files."
         }
-        if runningProcessCount > 0 { return "Stop foreground processes before removing it." }
-        return "Remove the checkout and keep its branch."
-    }
-
-    private var renameHelp: String {
-        if worktree.isMain { return "The primary checkout cannot be renamed." }
-        if worktree.isDetached { return "Attach this worktree to a branch before renaming it." }
-        if worktree.isLocked { return "Unlock this worktree in Git before renaming it." }
-        if worktree.isPrunable { return "Prune the stale Git entry instead." }
-        return "Rename the checked-out branch without moving the checkout folder."
+        if worktree.isLocked { return "Remove this checkout and override its Git lock." }
+        if runningProcessCount > 0 {
+            return "Remove this checkout and stop its running processes."
+        }
+        return "Remove this checkout and keep its branch."
     }
 }
 

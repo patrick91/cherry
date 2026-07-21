@@ -531,19 +531,54 @@ final class MarkdownLayoutManager: NSLayoutManager {
               let container = textContainer(forGlyphAt: glyphRange.location, effectiveRange: nil)
         else { return }
 
-        var rects: [NSRect] = []
+        var rects: [(bounds: NSRect, glyphIndex: Int)] = []
         enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, lineGlyphRange, _ in
             let intersection = NSIntersectionRange(lineGlyphRange, glyphRange)
             guard intersection.length > 0 else { return }
-            rects.append(self.boundingRect(forGlyphRange: intersection, in: container))
+            rects.append((
+                bounds: self.boundingRect(forGlyphRange: intersection, in: container),
+                glyphIndex: intersection.location
+            ))
         }
         guard !rects.isEmpty else { return }
 
         color.setFill()
         for rect in rects {
-            let chipRect = rect.insetBy(dx: -2, dy: 1)
+            guard let chipRect = inlineCodeChipRect(
+                forGlyphBounds: rect.bounds,
+                glyphIndex: rect.glyphIndex
+            ) else { continue }
             NSBezierPath(roundedRect: chipRect, xRadius: 3, yRadius: 3).fill()
         }
+    }
+
+    /// TextKit's glyph bounding rect is as tall as the line fragment, including
+    /// paragraph leading. Anchor the chip to the run's baseline and font metrics
+    /// so its background stays centered on the inline code instead.
+    func inlineCodeChipRect(
+        forGlyphBounds glyphBounds: NSRect,
+        glyphIndex: Int
+    ) -> NSRect? {
+        guard let textStorage,
+              glyphIndex < numberOfGlyphs
+        else { return nil }
+
+        let characterIndex = characterIndexForGlyph(at: glyphIndex)
+        guard characterIndex < textStorage.length,
+              let font = textStorage.attribute(.font, at: characterIndex, effectiveRange: nil) as? NSFont
+        else { return nil }
+
+        let lineRect = lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+        let baselineY = lineRect.minY + location(forGlyphAt: glyphIndex).y
+        let horizontalPadding: CGFloat = 2
+        let verticalPadding: CGFloat = 1
+
+        return NSRect(
+            x: glyphBounds.minX - horizontalPadding,
+            y: baselineY - font.ascender - verticalPadding,
+            width: glyphBounds.width + horizontalPadding * 2,
+            height: font.ascender - font.descender + verticalPadding * 2
+        )
     }
 }
 

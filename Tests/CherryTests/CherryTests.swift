@@ -1275,6 +1275,24 @@ private struct MCPWhoamiPayload: Decodable {
         pruneReason: nil
     )
     #expect(!dirty.canRemove(closingRunningProcesses: true))
+    #expect(dirty.canRemove(closingRunningProcesses: true, force: true))
+
+    let locked = WorktreeRemovalBlockers(
+        runningProcessCount: 0,
+        isDirty: false,
+        lockReason: "in use",
+        pruneReason: nil
+    )
+    #expect(!locked.canRemove)
+    #expect(locked.canRemove(closingRunningProcesses: true, force: true))
+
+    let missing = WorktreeRemovalBlockers(
+        runningProcessCount: 0,
+        isDirty: true,
+        lockReason: nil,
+        pruneReason: "checkout is missing"
+    )
+    #expect(!missing.canRemove(closingRunningProcesses: true, force: true))
 }
 
 @Test func gitBranchReferenceParserOrdersLocalBeforeRemoteAndHidesRemoteHead() {
@@ -1477,9 +1495,21 @@ private struct MCPWhoamiPayload: Decodable {
         canonicalRepositoryRoot: false,
         canonicalWorktreeRoot: true,
     ])
-    try FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent("untracked.txt"))
-
-    try await service.remove(worktreeRoot: worktreeRoot.path, repositoryRoot: repositoryRoot.path)
+    try runGitForTest([
+        "-C", repositoryRoot.path,
+        "worktree", "lock", canonicalWorktreeRoot,
+    ])
+    await #expect(throws: GitWorktreeCommandError.self) {
+        try await service.remove(
+            worktreeRoot: worktreeRoot.path,
+            repositoryRoot: repositoryRoot.path
+        )
+    }
+    try await service.remove(
+        worktreeRoot: worktreeRoot.path,
+        repositoryRoot: repositoryRoot.path,
+        force: true
+    )
     let removed = try await service.discover(projectRoot: repositoryRoot.path)
     #expect(removed.worktrees.map(\.root) == [canonicalRepositoryRoot])
     #expect(!FileManager.default.fileExists(atPath: worktreeRoot.path))
@@ -12675,6 +12705,52 @@ private func serviceRecord(
         toColumns: 110,
         rows: 82
     ))
+}
+
+@MainActor
+@Test func markdownInlineCodeChipUsesFontMetricsInsteadOfLineFragmentHeight() {
+    let text = "- `frontend/src/hooks/useAppLogs.ts`"
+    let textStorage = NSTextStorage(string: text)
+    let layoutManager = MarkdownLayoutManager()
+    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
+    layoutManager.addTextContainer(textContainer)
+    textStorage.addLayoutManager(layoutManager)
+
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineHeightMultiple = 1.4
+    paragraph.paragraphSpacing = 7
+    paragraph.firstLineHeadIndent = NoteEditorStyle.document.textGutter
+    paragraph.headIndent = NoteEditorStyle.document.textGutter
+
+    let bodyFont = NSFont.systemFont(ofSize: 15)
+    let codeFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+    textStorage.setAttributes(
+        [.font: bodyFont, .paragraphStyle: paragraph],
+        range: NSRange(location: 0, length: textStorage.length)
+    )
+    let codeRange = (text as NSString).range(of: "`frontend/src/hooks/useAppLogs.ts`")
+    textStorage.addAttribute(.font, value: codeFont, range: codeRange)
+
+    layoutManager.ensureLayout(for: textContainer)
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
+    let glyphBounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+    guard let chipRect = layoutManager.inlineCodeChipRect(
+        forGlyphBounds: glyphBounds,
+        glyphIndex: glyphRange.location
+    ) else {
+        Issue.record("Expected inline-code chip geometry")
+        return
+    }
+
+    let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
+    let baselineY = lineRect.minY + layoutManager.location(forGlyphAt: glyphRange.location).y
+
+    #expect(chipRect.minY > glyphBounds.minY)
+    #expect(chipRect.height < glyphBounds.height)
+    #expect(abs((baselineY - chipRect.minY) - (codeFont.ascender + 1)) < 0.001)
+    #expect(abs((chipRect.maxY - baselineY) - (-codeFont.descender + 1)) < 0.001)
+    #expect(abs(chipRect.minX - (glyphBounds.minX - 2)) < 0.001)
+    #expect(abs(chipRect.maxX - (glyphBounds.maxX + 2)) < 0.001)
 }
 
 private struct StaticStyledTerminalBuffer: TerminalBuffering {

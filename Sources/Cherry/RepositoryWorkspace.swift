@@ -11,10 +11,12 @@ struct WorktreeRemovalBlockers: Equatable {
         canRemove(closingRunningProcesses: false)
     }
 
-    func canRemove(closingRunningProcesses: Bool) -> Bool {
+    func canRemove(
+        closingRunningProcesses: Bool,
+        force: Bool = false
+    ) -> Bool {
         (closingRunningProcesses || runningProcessCount == 0)
-            && !isDirty
-            && lockReason == nil
+            && (force || (!isDirty && lockReason == nil))
             && pruneReason == nil
     }
 }
@@ -279,22 +281,12 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func canRemove(_ worktree: GitWorktree) -> Bool {
-        guard !worktree.isMain,
-              let isDirty = dirtyByRoot[worktree.root]
-        else {
-            return false
-        }
-        let runningProcessCount = workspaces[worktree.root]?.sessionsWithRunningProcess().count ?? 0
-        return WorktreeRemovalBlockers(
-            runningProcessCount: runningProcessCount,
-            isDirty: isDirty,
-            lockReason: worktree.lockReason,
-            pruneReason: worktree.pruneReason
-        ).canRemove(closingRunningProcesses: worktree.root == activeWorktreeRoot)
+        !worktree.isMain
     }
 
     func remove(
         _ worktree: GitWorktree,
+        force: Bool = false,
         chromeState: ProjectWindowChromeState?
     ) async throws {
         guard !worktree.isMain else {
@@ -305,30 +297,95 @@ final class RepositoryWorkspace: ObservableObject {
             )
         }
         let isCurrent = activeWorktreeRoot == worktree.root
-        let blockers = await removalBlockers(for: worktree)
-        guard blockers.canRemove(closingRunningProcesses: isCurrent) else {
-            throw GitWorktreeCommandError(
-                arguments: ["worktree", "remove", worktree.root],
-                exitCode: 1,
-                standardError: Self.removalBlockerMessage(
-                    blockers,
-                    closingRunningProcesses: isCurrent
+        if worktree.isPrunable {
+            guard force else {
+                throw GitWorktreeCommandError(
+                    arguments: ["worktree", "prune"],
+                    exitCode: 1,
+                    standardError: "The checkout is already missing. Prune its stale Git entry instead."
                 )
-            )
+            }
+        } else {
+            let blockers = await removalBlockers(for: worktree)
+            let closesRunningProcesses = isCurrent || force
+            guard blockers.canRemove(
+                closingRunningProcesses: closesRunningProcesses,
+                force: force
+            ) else {
+                throw GitWorktreeCommandError(
+                    arguments: ["worktree", "remove", worktree.root],
+                    exitCode: 1,
+                    standardError: Self.removalBlockerMessage(
+                        blockers,
+                        closingRunningProcesses: closesRunningProcesses
+                    )
+                )
+            }
         }
 
         let wasActive = isCurrent
         let fallback = visibleWorktrees.first { $0.root != worktree.root }
             ?? worktrees.first { $0.root != worktree.root }
-        try await service.remove(worktreeRoot: worktree.root, repositoryRoot: repositoryRoot)
-        workspaces.removeValue(forKey: worktree.root)?.closeAllSessions()
-        loadedWorktreeRoots.remove(worktree.root)
-        hiddenWorktreeRoots.remove(worktree.root)
-        selectionByRoot.removeValue(forKey: worktree.root)
+        let gitRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
+        if worktree.isPrunable {
+            try await service.prune(repositoryRoot: gitRoot)
+        } else {
+            try await service.remove(
+                worktreeRoot: worktree.root,
+                repositoryRoot: gitRoot,
+                force: force
+            )
+        }
+        forgetWorktree(worktree)
         if wasActive, let fallback {
             _ = activate(worktreeRoot: fallback.root, chromeState: chromeState)
         }
         await refresh()
+    }
+
+    func removeAllLinkedWorktrees(
+        chromeState: ProjectWindowChromeState?
+    ) async throws {
+        let targets = worktrees.filter { !$0.isMain }
+        guard !targets.isEmpty else { return }
+        let gitRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
+
+        if targets.contains(where: { $0.root == activeWorktreeRoot }) {
+            _ = activate(worktreeRoot: gitRoot, chromeState: chromeState)
+        }
+
+        var failures: [String] = []
+        for worktree in targets where !worktree.isPrunable {
+            do {
+                try await service.remove(
+                    worktreeRoot: worktree.root,
+                    repositoryRoot: gitRoot,
+                    force: true
+                )
+                forgetWorktree(worktree)
+            } catch {
+                failures.append("\(worktree.displayName): \(error.localizedDescription)")
+            }
+        }
+
+        let staleWorktrees = targets.filter(\.isPrunable)
+        if !staleWorktrees.isEmpty {
+            do {
+                try await service.prune(repositoryRoot: gitRoot)
+                staleWorktrees.forEach(forgetWorktree)
+            } catch {
+                failures.append("Missing entries: \(error.localizedDescription)")
+            }
+        }
+
+        await refresh()
+        guard failures.isEmpty else {
+            throw GitWorktreeCommandError(
+                arguments: ["worktree", "remove", "--force", "--force"],
+                exitCode: 1,
+                standardError: "Some linked worktrees could not be removed:\n" + failures.joined(separator: "\n")
+            )
+        }
     }
 
     func prune() async throws {
@@ -374,6 +431,14 @@ final class RepositoryWorkspace: ObservableObject {
 
     private func persistHiddenWorktrees() {
         AgentSettings.shared.setHiddenWorktreeRoots(hiddenWorktreeRoots, for: repositoryRoot)
+    }
+
+    private func forgetWorktree(_ worktree: GitWorktree) {
+        workspaces.removeValue(forKey: worktree.root)?.closeAllSessions()
+        loadedWorktreeRoots.remove(worktree.root)
+        hiddenWorktreeRoots.remove(worktree.root)
+        selectionByRoot.removeValue(forKey: worktree.root)
+        autoStartedRoots.remove(worktree.root)
     }
 
     private func standardized(_ root: String) -> String {

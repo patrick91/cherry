@@ -1012,6 +1012,8 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .sendProcessInput(let payload):
             return try encodedResult(payload)
+        case .captureAttentionObservation(let payload):
+            return try encodedResult(payload)
         case .startAllCommands(let payload):
             return try encodedResult(payload)
         case .stopAllCommands(let payload):

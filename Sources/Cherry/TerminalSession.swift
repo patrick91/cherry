@@ -2147,6 +2147,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var traceRecorder: TerminalTraceRecorder?
+    private let attentionObservationDirectoryProvider: @MainActor () -> URL?
+    private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
+    private var attentionObservationTask: Task<Void, Never>?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
     private var isOutputPausedForBackgroundThrottle = false
@@ -2162,6 +2165,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastSummaryInput: String?
     private var lastSummaryDate: Date?
     private var lastHumanInputLine: Int?
+    private var lastHumanInputAt: Date?
     private var humanInputGeneration = 0
     private var agentActivitySource: AgentActivitySource = .none
     private var titleIndicatesAgentWorking = false
@@ -2212,6 +2216,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let agentIdleConfirmationEvidenceWindow: TimeInterval = 1.0
     private static let agentIdleConfirmationDelay: TimeInterval = 0.4
     private static let agentIdleRecheckQuietInterval: TimeInterval = 4.0
+    private static let attentionObservationInterval: TimeInterval = 1.0
+    private static let attentionObservationMaximumRows = 200
+    private static let attentionObservationMaximumColumns = 512
     private static let contentFingerprintTailLineLimit = 40
     private static let summaryIdleInterval: TimeInterval = 2
     private static let summaryMaximumIdleWait: TimeInterval = 20
@@ -2244,6 +2251,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         },
         summaryVisibilityProvider: @escaping @MainActor (TerminalSession) -> Bool = {
             ProjectWindowRegistry.shared.isSessionVisible($0)
+        },
+        attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
+            TerminalAttentionObservationRecorder.configuredDirectoryURL
         }
     ) {
         self.title = title
@@ -2263,6 +2273,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.restartOnExit = restartOnExit
         self.summaryRunner = summaryRunner
         self.summaryVisibilityProvider = summaryVisibilityProvider
+        self.attentionObservationDirectoryProvider = attentionObservationDirectoryProvider
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
@@ -2642,6 +2653,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             ghosttyBridgeStorage?.reset()
         }
         lastHumanInputLine = nil
+        lastHumanInputAt = nil
         lastContentFingerprint = nil
         clearUnreadNotification()
         bumpRevision()
@@ -2757,8 +2769,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         nixShellEnvironment = nil
         cancelAgentIdleConfirmation()
         cancelAgentIdleRecheck()
+        attentionObservationTask?.cancel()
+        attentionObservationTask = nil
         resetKeyboardProtocolState()
         lastHumanInputLine = nil
+        lastHumanInputAt = nil
         outputHoldUntil = nil
         pendingResolvedCommandLine = nil
         resolvedCommandLine = nil
@@ -2955,6 +2970,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         startedAt = Date()
         exitedAt = nil
         lastOutputAt = nil
+        lastHumanInputAt = nil
         childProcessID = nil
         exitCode = nil
         nixShellEnvironment = nil
@@ -3136,6 +3152,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 "[shell exited with status \(status)]"
             ])
         }
+        scheduleAttentionObservation(event: .processExited)
         bumpRevision()
     }
 
@@ -3195,6 +3212,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             if agentActivityState == .working {
                 scheduleAgentIdleRecheck()
             }
+            scheduleAttentionObservation(event: .contentChanged)
         }
         if contentChanged {
             scheduleSummaryIfNeeded()
@@ -3225,6 +3243,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 noteHumanInputIfNeeded()
                 setAgentActivityState(.working, source: .inputSubmit)
                 scheduleAgentIdleRecheck()
+                scheduleAttentionObservation(event: .inputSubmitted)
             }
         }
     }
@@ -3558,9 +3577,175 @@ final class TerminalSession: ObservableObject, Identifiable {
                 scheduleAgentIdleRecheck()
             }
             scheduleSummaryIfNeeded()
+            scheduleAttentionObservation(event: .contentChanged)
         }
         bumpRevision()
         return true
+    }
+
+    @discardableResult
+    func captureAttentionObservation(
+        label: TerminalAttentionLabel,
+        scenarioID: String?,
+        checkpoint: String?,
+        harnessVersion: String?,
+        runID: String?
+    ) throws -> (id: UUID, outputURL: URL) {
+        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else {
+            throw TerminalAttentionRecordingError.disabled
+        }
+
+        let observation = makeAttentionObservation(
+            event: .labeledCheckpoint,
+            label: label,
+            scenarioID: scenarioID,
+            checkpoint: checkpoint,
+            harnessVersion: harnessVersion,
+            runID: runID
+        )
+        attentionObservationRecorder.record(observation, synchronously: true)
+        return (observation.id, attentionObservationRecorder.outputURL)
+    }
+
+    private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
+        guard kind == .agent, attentionObservationDirectoryProvider() != nil else { return }
+
+        if event != .contentChanged {
+            recordAttentionObservation(event: event)
+            return
+        }
+
+        guard attentionObservationTask == nil else { return }
+        attentionObservationTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Self.attentionObservationInterval * 1_000)))
+            guard let self, !Task.isCancelled else { return }
+            self.attentionObservationTask = nil
+            self.recordAttentionObservation(event: .contentChanged)
+        }
+    }
+
+    private func recordAttentionObservation(event: TerminalAttentionObservationEvent) {
+        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else { return }
+        let observation = makeAttentionObservation(
+            event: event,
+            label: nil,
+            scenarioID: nil,
+            checkpoint: nil,
+            harnessVersion: nil,
+            runID: nil
+        )
+        attentionObservationRecorder.record(observation)
+    }
+
+    private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {
+        guard let directoryURL = attentionObservationDirectoryProvider() else { return nil }
+        if attentionObservationRecorder == nil {
+            attentionObservationRecorder = TerminalAttentionObservationRecorder(
+                directoryURL: directoryURL,
+                sessionID: id,
+                harness: agentName
+            )
+        }
+        return attentionObservationRecorder
+    }
+
+    private func makeAttentionObservation(
+        event: TerminalAttentionObservationEvent,
+        label: TerminalAttentionLabel?,
+        scenarioID: String?,
+        checkpoint: String?,
+        harnessVersion: String?,
+        runID: String?
+    ) -> TerminalAttentionObservation {
+        let now = Date()
+        let lineCount = contentLineCount()
+        let rowLimit = min(max(viewportSize.rows, 1), Self.attentionObservationMaximumRows)
+        let columnLimit = min(max(viewportSize.columns, 1), Self.attentionObservationMaximumColumns)
+        let gridStart = max(0, lineCount - rowLimit)
+        let grid = contentSnapshot(range: gridStart..<lineCount).map { line in
+            String(line.prefix(columnLimit))
+        }
+        let cursor = cursorState
+
+        return TerminalAttentionObservation(
+            schemaVersion: TerminalAttentionObservation.currentSchemaVersion,
+            id: UUID(),
+            recordedAt: now,
+            event: event,
+            label: label,
+            scenarioID: Self.attentionRecordingMetadata(scenarioID),
+            checkpoint: Self.attentionRecordingMetadata(checkpoint),
+            session: .init(
+                id: id.uuidString,
+                kind: kind.rawValue,
+                harness: Self.attentionRecordingMetadata(agentName),
+                harnessVersion: Self.attentionRecordingMetadata(harnessVersion),
+                runID: Self.attentionRecordingMetadata(runID)
+            ),
+            terminal: .init(
+                columns: viewportSize.columns,
+                rows: viewportSize.rows,
+                usesAlternateScreen: usesAlternateScreen,
+                cursor: .init(
+                    row: max(0, cursor.row - gridStart),
+                    column: cursor.column,
+                    shape: Self.attentionCursorShapeName(cursor.shape),
+                    isVisible: cursor.isVisible
+                ),
+                grid: grid,
+                scrollbackLinesOmitted: gridStart
+            ),
+            timing: .init(
+                millisecondsSinceStarted: Self.milliseconds(since: startedAt, now: now),
+                millisecondsSinceLastOutput: Self.milliseconds(since: lastOutputAt, now: now),
+                millisecondsSinceLastContentChange: Self.milliseconds(since: lastContentChangeAt, now: now),
+                millisecondsSinceLastHumanInput: Self.milliseconds(since: lastHumanInputAt, now: now)
+            ),
+            activity: .init(
+                state: agentActivityState.rawValue,
+                evidence: attentionActivityEvidenceName,
+                hasUnreadNotification: hasUnreadNotification,
+                processState: state.label,
+                exitCode: exitCode
+            ),
+            outputVersion: outputVersion,
+            contentVersion: contentVersion
+        )
+    }
+
+    private var attentionActivityEvidenceName: String {
+        switch agentActivitySource {
+        case .none: "none"
+        case .summary: "summary"
+        case .outputActivity: "output_activity"
+        case .inputSubmit: "input_submit"
+        case .quietWindow: "quiet_window"
+        case .promptMarker: "prompt_marker"
+        case .workingMarker: "working_marker"
+        case .titleSpinner: "title_spinner"
+        case .notification: "notification"
+        case .processExit: "process_exit"
+        }
+    }
+
+    private static func attentionCursorShapeName(_ shape: TerminalCursorShape) -> String {
+        switch shape {
+        case .block: "block"
+        case .bar: "bar"
+        case .underline: "underline"
+        }
+    }
+
+    private static func milliseconds(since date: Date?, now: Date) -> Int? {
+        guard let date else { return nil }
+        return max(0, Int(now.timeIntervalSince(date) * 1_000))
+    }
+
+    private static func attentionRecordingMetadata(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return String(value.prefix(160))
     }
 
     enum AgentNotificationDisposition {
@@ -3572,6 +3757,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         _ notification: TerminalNotificationRequest
     ) -> AgentNotificationDisposition {
         guard kind == .agent else { return .passThrough }
+        defer {
+            scheduleAttentionObservation(event: .notification)
+        }
 
         let body = notification.body
         if Self.notificationBodyIndicatesPermission(body) {
@@ -4068,6 +4256,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         agentActivityState = nextState
         agentActivitySource = source
         guard stateChanged else { return false }
+        scheduleAttentionObservation(event: .activityStateChanged)
         bumpRevision()
         return true
     }
@@ -4318,6 +4507,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func noteHumanInputIfNeeded() {
         guard kind == .agent else { return }
         lastHumanInputLine = effectiveAgentContentLineCount()
+        lastHumanInputAt = Date()
         humanInputGeneration &+= 1
     }
 

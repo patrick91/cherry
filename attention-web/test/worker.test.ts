@@ -1,0 +1,121 @@
+import { SELF, env } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+
+const authorization = { Authorization: "Bearer test-dashboard-token" };
+const bundleID = "32b00665-797d-4800-9030-6171a6d9e9df";
+const observationID = "6594bade-c891-42cb-8cb1-e51c16f1ab95";
+
+const bundle = {
+  bundleSchemaVersion: 1,
+  observationSchemaVersion: 1,
+  bundleID,
+  createdAt: "2026-07-22T12:00:00Z",
+  sourceHost: "test-laptop",
+  files: [],
+  totals: { files: 1, bytes: 800, observations: 1, labeled: 1 },
+};
+
+const observation = {
+  schemaVersion: 1,
+  id: observationID,
+  recordedAt: "2026-07-22T12:00:01Z",
+  event: "labeled_checkpoint",
+  label: "waiting_for_input",
+  scenarioID: "waiting-for-input",
+  checkpoint: "human_verified",
+  session: {
+    id: "4c5d7267-f12c-4e8d-a821-65b9f8bf848c",
+    kind: "agent",
+    harness: "Codex",
+    harnessVersion: "fixture 1.0",
+    runID: "run-1",
+  },
+  terminal: {
+    columns: 100,
+    rows: 32,
+    usesAlternateScreen: false,
+    cursor: { row: 4, column: 2, shape: "block", isVisible: true },
+    grid: ["Choose alpha or beta.", "❯ "],
+    scrollbackLinesOmitted: 4,
+  },
+  timing: {
+    millisecondsSinceStarted: 4_000,
+    millisecondsSinceLastOutput: 120,
+    millisecondsSinceLastContentChange: 120,
+    millisecondsSinceLastHumanInput: 2_000,
+  },
+  activity: {
+    state: "idle",
+    evidence: "quiet_window",
+    hasUnreadNotification: false,
+    processState: "Running",
+  },
+  outputVersion: 4,
+  contentVersion: 3,
+};
+
+async function api(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", authorization.Authorization);
+  if (init.body !== undefined) headers.set("Content-Type", "application/json");
+  return SELF.fetch(`https://attention.test${path}`, { ...init, headers });
+}
+
+beforeEach(async () => {
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM observation_sources"),
+    env.DB.prepare("DELETE FROM observations"),
+    env.DB.prepare("DELETE FROM bundles"),
+  ]);
+});
+
+describe("attention dashboard Worker", () => {
+  it("rejects requests without the dashboard token", async () => {
+    const response = await SELF.fetch("https://attention.test/api/dashboard");
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+  });
+
+  it("stores, deduplicates, lists, and retrieves observations", async () => {
+    const registration = await api("/api/bundles", {
+      method: "POST",
+      body: JSON.stringify(bundle),
+    });
+    expect(registration.status).toBe(201);
+
+    const firstUpload = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+    expect(firstUpload.status).toBe(202);
+    await expect(firstUpload.json()).resolves.toMatchObject({ inserted: 1, duplicates: 0 });
+
+    const duplicateUpload = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+    await expect(duplicateUpload.json()).resolves.toMatchObject({ inserted: 0, duplicates: 1 });
+
+    const dashboard = await api("/api/dashboard?label=waiting_for_input&harness=Codex");
+    expect(dashboard.status).toBe(200);
+    const dashboardText = await dashboard.text();
+    expect(dashboardText).toContain('"kind":"total","name":"all","count":1');
+    expect(dashboardText).toContain('"id":"6594bade-c891-42cb-8cb1-e51c16f1ab95"');
+    expect(dashboardText).toContain('"grid":["Choose alpha or beta.","❯ "]');
+
+    const detail = await api(`/api/observations/${observationID}`);
+    expect(detail.status).toBe(200);
+    await expect(detail.text()).resolves.toContain('"waiting_for_input"');
+  });
+
+  it("rejects invalid labels before writing", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const invalid = { ...observation, id: "5cd5c9dc-2734-4447-837e-e1060831d16c", label: "looks_busy" };
+    const response = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [invalid] }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "unsupported observation label: looks_busy" });
+  });
+});

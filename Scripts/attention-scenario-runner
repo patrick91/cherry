@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Interactively capture labeled terminal-attention observations from Cherry agents.
+
+The runner uses a disposable Git repository already configured in Cherry, starts
+agent harnesses through Cherry's local control socket, sends controlled prompts,
+and asks a human to capture the exact frame where the requested state is visible.
+It intentionally does not use Cherry's current activity heuristic to assign labels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Scenario:
+    key: str
+    label: str
+    prompt: str | None
+    capture_hint: str
+
+
+SCENARIOS = {
+    "approval-required": Scenario(
+        key="approval-required",
+        label="approval_required",
+        prompt=(
+            "Use your shell tool to run this harmless command in the current repository: "
+            "printf 'cherry attention lab\\n' > .cherry-attention-lab-marker. "
+            "Use the tool now rather than merely explaining the command."
+        ),
+        capture_hint="Capture while the harness is visibly asking permission to run the command.",
+    ),
+    "waiting-for-input": Scenario(
+        key="waiting-for-input",
+        label="waiting_for_input",
+        prompt=(
+            "Do not inspect files and do not use tools. Ask me to choose exactly one of alpha or beta, "
+            "then stop and wait for my answer."
+        ),
+        capture_hint="Capture after the agent asks the alpha/beta question and is waiting for you.",
+    ),
+    "ready-for-review": Scenario(
+        key="ready-for-review",
+        label="ready_for_review",
+        prompt=(
+            "Read README.md, give a one-sentence review, and finish your turn. Do not ask me a question "
+            "and do not make any changes."
+        ),
+        capture_hint="Capture after the review is complete and the normal composer is visible again.",
+    ),
+    "no-attention-needed": Scenario(
+        key="no-attention-needed",
+        label="no_attention_needed",
+        prompt=(
+            "Use the shell to run this harmless command and wait for it to finish: "
+            "python3 -c \"import time; [(print(f'lab-step-{i}', flush=True), time.sleep(1)) for i in range(15)]\""
+        ),
+        capture_hint="Capture while the command or agent is actively working and needs no input.",
+    ),
+    "unknown": Scenario(
+        key="unknown",
+        label="unknown",
+        prompt=None,
+        capture_hint=(
+            "Capture the untouched startup, authentication, or empty-composer screen before any task is sent. "
+            "Skip it if the screen clearly belongs to another label."
+        ),
+    ),
+}
+
+
+def enum_case(name: str, payload: dict | None = None) -> dict:
+    return {name: {"_0": payload} if payload is not None else {}}
+
+
+def scoped(project_root: Path, request: dict) -> dict:
+    return enum_case("scoped", {"projectRoot": str(project_root), "request": request})
+
+
+def unwrap(result: dict, name: str) -> dict:
+    try:
+        return result[name]["_0"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(f"Cherry returned an unexpected {name} response: {result}") from error
+
+
+class CherryClient:
+    def __init__(self, socket_path: Path, timeout: float = 30.0):
+        self.socket_path = socket_path
+        self.timeout = timeout
+
+    def send(self, request: dict) -> dict:
+        payload = json.dumps(request, separators=(",", ":")).encode() + b"\n"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(self.timeout)
+            connection.connect(str(self.socket_path))
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            response = bytearray()
+            while True:
+                chunk = connection.recv(65_536)
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if response.endswith(b"\n"):
+                    break
+
+        if not response:
+            raise RuntimeError("Cherry closed the control connection without a response.")
+        decoded = json.loads(response.decode())
+        if decoded.get("error"):
+            error = decoded["error"]
+            raise RuntimeError(f"{error.get('code', 'cherry_error')}: {error.get('message', error)}")
+        return decoded["result"]
+
+
+def discover_socket(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    if value := os.environ.get("CHERRY_CONTROL_SOCKET"):
+        return Path(value).expanduser()
+
+    candidates = sorted(Path(f"/tmp/cherry-{os.getuid()}").glob("*/control.sock"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise RuntimeError("No Cherry control socket found. Start Cherry with attention recording enabled first.")
+    rendered = "\n".join(f"  {candidate}" for candidate in candidates)
+    raise RuntimeError(f"Multiple Cherry instances are running; pass --socket:\n{rendered}")
+
+
+def resolve_lab_repository(project_dir: Path) -> Path:
+    root = project_dir.expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"Lab repository does not exist: {root}")
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        raise RuntimeError(f"Lab project must be a Git repository: {root}")
+    return root
+
+
+def detect_version(agent: dict) -> str | None:
+    try:
+        command = shlex.split(agent["command"])
+    except (KeyError, ValueError):
+        return None
+    if len(command) != 1:
+        return None
+
+    try:
+        result = subprocess.run(
+            [command[0], "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    for line in result.stdout.splitlines():
+        cleaned = "".join(character for character in line if character.isprintable()).strip()
+        if cleaned:
+            return cleaned[:160]
+    return None
+
+
+def rendered_output(client: CherryClient, project_root: Path, process_id: str) -> str:
+    result = client.send(scoped(project_root, enum_case("getProcessOutput", {
+        "processID": process_id,
+        "lineLimit": 40,
+    })))
+    output = unwrap(result, "getProcessOutput")
+    return "\n".join(output.get("lines", []))
+
+
+def capture_interactively(
+    client: CherryClient,
+    project_root: Path,
+    process_id: str,
+    harness: str,
+    harness_version: str | None,
+    scenario: Scenario,
+    run_id: str,
+) -> bool:
+    while True:
+        print("\n" + "=" * 78)
+        print(f"{harness} / {scenario.key} / expected {scenario.label}")
+        print(scenario.capture_hint)
+        print("-" * 78)
+        try:
+            print(rendered_output(client, project_root, process_id))
+        except RuntimeError as error:
+            print(f"Could not refresh output: {error}")
+        print("=" * 78)
+
+        action = input("[c]apture  [r]efresh  [s]kip  [q]uit: ").strip().lower()
+        if action in {"c", "capture"}:
+            result = client.send(scoped(project_root, enum_case("captureAttentionObservation", {
+                "processID": process_id,
+                "label": scenario.label,
+                "scenarioID": scenario.key,
+                "checkpoint": "human_verified",
+                "harnessVersion": harness_version,
+                "runID": run_id,
+            })))
+            captured = unwrap(result, "captureAttentionObservation")
+            print(f"Captured {captured['observationID']} -> {captured['outputPath']}")
+            return True
+        if action in {"s", "skip"}:
+            return True
+        if action in {"q", "quit"}:
+            return False
+
+
+def confirm_harness_ready(
+    client: CherryClient,
+    project_root: Path,
+    process_id: str,
+    harness: str,
+    scenario: Scenario,
+) -> str:
+    while True:
+        print("\n" + "=" * 78)
+        print(f"{harness} / {scenario.key} / startup check")
+        print("Send only when the harness composer is ready. Handle or skip onboarding and update screens first.")
+        print("-" * 78)
+        try:
+            print(rendered_output(client, project_root, process_id))
+        except RuntimeError as error:
+            print(f"Could not refresh output: {error}")
+        print("=" * 78)
+
+        action = input("[Enter] send scenario  [r]efresh  [s]kip  [q]uit: ").strip().lower()
+        if action in {"", "send"}:
+            return "send"
+        if action in {"s", "skip"}:
+            return "skip"
+        if action in {"q", "quit"}:
+            return "quit"
+
+
+def close_process(client: CherryClient, project_root: Path, process_id: str) -> None:
+    try:
+        client.send(scoped(project_root, enum_case("closeProcess", {
+            "processID": process_id,
+            "agentClosePolicy": "close_sub_agents",
+        })))
+    except RuntimeError as error:
+        print(f"Warning: could not close process {process_id}: {error}", file=sys.stderr)
+
+
+def run_scenario(
+    client: CherryClient,
+    project_root: Path,
+    harness: str,
+    harness_version: str | None,
+    scenario: Scenario,
+    run_id: str,
+    initial_wait: float,
+) -> bool:
+    result = client.send(scoped(project_root, enum_case("spawnProcess", {
+        "kind": "agent",
+        "name": harness,
+        "title": f"Attention lab: {scenario.key}",
+        "workingDirectory": str(project_root),
+        "waitMilliseconds": 1000,
+        "lineLimit": 20,
+    })))
+    spawned = unwrap(result, "spawnProcess")
+    process_id = spawned["process"]["id"]
+
+    try:
+        client.send(scoped(project_root, enum_case("selectProcess", {"processID": process_id})))
+        time.sleep(initial_wait)
+        if scenario.prompt is not None:
+            readiness = confirm_harness_ready(client, project_root, process_id, harness, scenario)
+            if readiness == "skip":
+                return True
+            if readiness == "quit":
+                return False
+            client.send(scoped(project_root, enum_case("sendProcessInput", {
+                "processID": process_id,
+                "text": scenario.prompt,
+                "submit": True,
+            })))
+        time.sleep(initial_wait)
+        return capture_interactively(
+            client,
+            project_root,
+            process_id,
+            harness,
+            harness_version,
+            scenario,
+            run_id,
+        )
+    finally:
+        close_process(client, project_root, process_id)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--harness", action="append", required=True, help="Configured Cherry agent name; repeatable.")
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=sorted(SCENARIOS),
+        help="Scenario to run; repeatable. Defaults to all scenarios.",
+    )
+    parser.add_argument("--socket", help="Cherry control socket. Defaults to CHERRY_CONTROL_SOCKET or auto-discovery.")
+    parser.add_argument(
+        "--project-dir",
+        type=Path,
+        required=True,
+        help="Disposable Git repository already configured as a Cherry project.",
+    )
+    parser.add_argument("--initial-wait", type=float, default=1.0, help="Seconds before showing the first capture prompt.")
+    parser.add_argument("--yes", action="store_true", help="Skip the token-usage confirmation.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        socket_path = discover_socket(args.socket)
+        client = CherryClient(socket_path)
+        project_root = resolve_lab_repository(args.project_dir)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"attention-scenario-runner: {error}", file=sys.stderr)
+        return 2
+
+    run_id = str(uuid.uuid4())
+    scenario_keys = args.scenario or list(SCENARIOS)
+
+    print(f"Cherry socket: {socket_path}")
+    print(f"Lab repository: {project_root}")
+    print(f"Run ID: {run_id}")
+    print("This will invoke configured AI harnesses and may consume paid tokens.")
+    print("Captured grids can contain terminal text; use only this disposable repository.")
+    if not args.yes and input("Proceed? [y/N]: ").strip().lower() not in {"y", "yes"}:
+        return 1
+
+    try:
+        client.send(enum_case("openProject", {"projectRoot": str(project_root)}))
+        agents_result = client.send(scoped(project_root, enum_case("listAgents")))
+        agents = unwrap(agents_result, "listAgents").get("agents", [])
+        by_name = {agent["name"].lower(): agent for agent in agents}
+
+        for requested_harness in args.harness:
+            agent = by_name.get(requested_harness.lower())
+            if not agent:
+                available = ", ".join(sorted(item["name"] for item in agents)) or "none"
+                raise RuntimeError(f"Agent '{requested_harness}' is not configured. Available: {available}")
+            if not agent.get("launchable"):
+                raise RuntimeError(f"Agent '{agent['name']}' is configured but not launchable.")
+
+            harness = agent["name"]
+            harness_version = detect_version(agent)
+            print(f"\nHarness: {harness} ({harness_version or 'version unknown'})")
+            command_line = agent.get("commandLine", "").lower()
+            if "--yolo" in command_line or "skip-permissions" in command_line:
+                print(
+                    "Warning: this profile bypasses approvals; approval-required will probably need a safe duplicate profile.",
+                    file=sys.stderr,
+                )
+
+            for scenario_key in scenario_keys:
+                if not run_scenario(
+                    client,
+                    project_root,
+                    harness,
+                    harness_version,
+                    SCENARIOS[scenario_key],
+                    run_id,
+                    max(0.0, args.initial_wait),
+                ):
+                    return 1
+    except (OSError, RuntimeError) as error:
+        print(f"attention-scenario-runner: {error}", file=sys.stderr)
+        return 2
+    print("\nScenario run complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

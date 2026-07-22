@@ -1,4 +1,5 @@
 import CherryControl
+import Darwin
 import Foundation
 import Testing
 @testable import Cherry
@@ -128,6 +129,53 @@ struct ControlActivityTests {
             return
         }
         #expect(alternate.screen == "alternate")
+    }
+
+    @Test func controlCapturesHumanLabeledAttentionCheckpoint() async throws {
+        let recordingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-attention-control-\(UUID().uuidString)", isDirectory: true)
+        let previousRecordingDirectory = ProcessInfo.processInfo.environment[
+            TerminalAttentionObservationRecorder.environmentKey
+        ]
+        setenv(TerminalAttentionObservationRecorder.environmentKey, recordingDirectory.path, 1)
+        defer {
+            if let previousRecordingDirectory {
+                setenv(TerminalAttentionObservationRecorder.environmentKey, previousRecordingDirectory, 1)
+            } else {
+                unsetenv(TerminalAttentionObservationRecorder.environmentKey)
+            }
+            try? FileManager.default.removeItem(at: recordingDirectory)
+        }
+
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Fixture", command: "/bin/cat"))
+        harness.server.start()
+
+        let session = try await harness.spawnAgentSession(named: "Fixture")
+        session.ingestTestingData(Data("Choose alpha or beta\n❯ \n".utf8))
+        try await Task.sleep(for: .milliseconds(150))
+
+        let response = try await harness.send(.captureAttentionObservation(.init(
+            processID: session.id.uuidString,
+            label: "waiting_for_input",
+            scenarioID: "waiting-for-input",
+            checkpoint: "human_verified",
+            harnessVersion: "fixture 1.0",
+            runID: "control-run"
+        )))
+        guard case .captureAttentionObservation(let capture)? = response.result else {
+            Issue.record("Expected captureAttentionObservation result, got \(String(describing: response))")
+            return
+        }
+
+        #expect(capture.processID == session.id.uuidString)
+        #expect(FileManager.default.fileExists(atPath: capture.outputPath))
+        let data = try Data(contentsOf: URL(fileURLWithPath: capture.outputPath))
+        #expect(String(decoding: data, as: UTF8.self).contains("\"label\":\"waiting_for_input\""))
+        #expect(String(decoding: data, as: UTF8.self).contains("\"runID\":\"control-run\""))
     }
 
     @Test func waitForProcessIdleReturnsPermissionImmediately() async throws {

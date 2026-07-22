@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Export and import Cherry attention-study observations without cloud storage."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import uuid
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+BUNDLE_SCHEMA_VERSION = 1
+OBSERVATION_SCHEMA_VERSION = 1
+DEFAULT_SOURCE = Path.home() / "Library/Application Support/Cherry/Attention Study/Recordings"
+DEFAULT_DATASET = Path.home() / "Library/Application Support/Cherry/Attention Study/Dataset"
+
+
+class StudyDataError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1_048_576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def load_observation_records(path: Path) -> list[tuple[str, bytes, dict]]:
+    records: list[tuple[str, bytes, dict]] = []
+    with path.open("rb") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.rstrip(b"\r\n")
+            if not stripped:
+                continue
+            try:
+                observation = json.loads(stripped)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise StudyDataError(f"{path}:{line_number}: invalid JSON: {error}") from error
+            if not isinstance(observation, dict):
+                raise StudyDataError(f"{path}:{line_number}: observation must be an object")
+            if observation.get("schemaVersion") != OBSERVATION_SCHEMA_VERSION:
+                raise StudyDataError(
+                    f"{path}:{line_number}: unsupported observation schema {observation.get('schemaVersion')!r}"
+                )
+            observation_id = observation.get("id")
+            if not isinstance(observation_id, str) or not observation_id:
+                raise StudyDataError(f"{path}:{line_number}: missing observation id")
+            terminal = observation.get("terminal")
+            if not isinstance(terminal, dict) or not isinstance(terminal.get("grid"), list):
+                raise StudyDataError(f"{path}:{line_number}: missing terminal grid")
+            records.append((observation_id, stripped, observation))
+    return records
+
+
+def recording_files(source: Path) -> list[Path]:
+    if not source.is_dir():
+        raise StudyDataError(f"recording directory does not exist: {source}")
+    return sorted(path for path in source.glob("*.jsonl") if path.is_file() and not path.is_symlink())
+
+
+def summarize_records(records: list[tuple[str, bytes, dict]]) -> dict:
+    labels = Counter(
+        observation.get("label")
+        for _, _, observation in records
+        if isinstance(observation.get("label"), str)
+    )
+    sessions = {
+        observation.get("session", {}).get("id")
+        for _, _, observation in records
+        if isinstance(observation.get("session"), dict)
+    }
+    harnesses = {
+        observation.get("session", {}).get("harness")
+        for _, _, observation in records
+        if isinstance(observation.get("session"), dict)
+    }
+    return {
+        "observationCount": len(records),
+        "labeledCount": sum(labels.values()),
+        "labels": dict(sorted(labels.items())),
+        "sessionIDs": sorted(value for value in sessions if isinstance(value, str) and value),
+        "harnesses": sorted(value for value in harnesses if isinstance(value, str) and value),
+    }
+
+
+def status_command(args: argparse.Namespace) -> int:
+    source = args.source.expanduser().resolve()
+    files = recording_files(source)
+    observation_count = 0
+    labeled_count = 0
+    labels: Counter[str] = Counter()
+    total_bytes = 0
+    for path in files:
+        records = load_observation_records(path)
+        summary = summarize_records(records)
+        observation_count += summary["observationCount"]
+        labeled_count += summary["labeledCount"]
+        labels.update(summary["labels"])
+        total_bytes += path.stat().st_size
+
+    print(f"Source: {source}")
+    print(f"Files: {len(files)}")
+    print(f"Observations: {observation_count} ({labeled_count} labeled)")
+    print(f"Bytes: {total_bytes}")
+    if labels:
+        print("Labels: " + ", ".join(f"{label}={count}" for label, count in sorted(labels.items())))
+    return 0
+
+
+def export_command(args: argparse.Namespace) -> int:
+    source = args.source.expanduser().resolve()
+    files = recording_files(source)
+    if not files:
+        raise StudyDataError(f"no JSONL recordings found in {source}")
+
+    bundle_id = str(uuid.uuid4())
+    default_name = f"cherry-attention-study-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    output = (args.output or Path.cwd() / default_name).expanduser().resolve()
+    if output.exists():
+        raise StudyDataError(f"export destination already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    temporary.chmod(0o700)
+    observations_directory = temporary / "observations"
+    private_directory(observations_directory)
+
+    entries = []
+    try:
+        for source_file in files:
+            destination = observations_directory / source_file.name
+            shutil.copyfile(source_file, destination)
+            destination.chmod(0o600)
+            records = load_observation_records(destination)
+            if not records:
+                destination.unlink()
+                continue
+            entries.append({
+                "relativePath": f"observations/{source_file.name}",
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+                **summarize_records(records),
+            })
+
+        if not entries:
+            raise StudyDataError(f"no non-empty JSONL recordings found in {source}")
+
+        manifest = {
+            "bundleSchemaVersion": BUNDLE_SCHEMA_VERSION,
+            "observationSchemaVersion": OBSERVATION_SCHEMA_VERSION,
+            "bundleID": bundle_id,
+            "createdAt": utc_now(),
+            "sourceHost": socket.gethostname(),
+            "files": entries,
+            "totals": {
+                "files": len(entries),
+                "bytes": sum(entry["bytes"] for entry in entries),
+                "observations": sum(entry["observationCount"] for entry in entries),
+                "labeled": sum(entry["labeledCount"] for entry in entries),
+            },
+        }
+        manifest_path = temporary / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        manifest_path.chmod(0o600)
+        os.replace(temporary, output)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    print(f"Exported {manifest['totals']['observations']} observations to {output}")
+    print("Transfer this directory with AirDrop, rsync, scp, or a shared folder.")
+    return 0
+
+
+def safe_bundle_file(bundle: Path, relative_path: str) -> Path:
+    if not isinstance(relative_path, str) or not relative_path.startswith("observations/"):
+        raise StudyDataError(f"invalid bundle path: {relative_path!r}")
+    candidate = (bundle / relative_path).resolve()
+    try:
+        candidate.relative_to(bundle.resolve())
+    except ValueError as error:
+        raise StudyDataError(f"bundle path escapes its root: {relative_path}") from error
+    if not candidate.is_file() or candidate.is_symlink():
+        raise StudyDataError(f"bundle observation file is missing or unsafe: {relative_path}")
+    return candidate
+
+
+def existing_observation_ids(observations_directory: Path) -> set[str]:
+    seen: set[str] = set()
+    for path in sorted(observations_directory.glob("*.jsonl")):
+        for observation_id, _, _ in load_observation_records(path):
+            seen.add(observation_id)
+    return seen
+
+
+def import_command(args: argparse.Namespace) -> int:
+    bundle = args.bundle.expanduser().resolve()
+    destination = args.destination.expanduser().resolve()
+    manifest_path = bundle / "manifest.json"
+    if not bundle.is_dir() or not manifest_path.is_file() or manifest_path.is_symlink():
+        raise StudyDataError(f"not an attention-study bundle: {bundle}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StudyDataError(f"invalid bundle manifest: {error}") from error
+    if manifest.get("bundleSchemaVersion") != BUNDLE_SCHEMA_VERSION:
+        raise StudyDataError(f"unsupported bundle schema: {manifest.get('bundleSchemaVersion')!r}")
+    bundle_id = manifest.get("bundleID")
+    entries = manifest.get("files")
+    if not isinstance(bundle_id, str) or not bundle_id or not isinstance(entries, list):
+        raise StudyDataError("bundle manifest is missing its id or files")
+
+    private_directory(destination)
+    observations_directory = destination / "observations"
+    imports_directory = destination / "imports"
+    private_directory(observations_directory)
+    private_directory(imports_directory)
+    seen_ids = existing_observation_ids(observations_directory)
+
+    validated_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise StudyDataError("bundle file entry must be an object")
+        source_file = safe_bundle_file(bundle, entry.get("relativePath"))
+        expected_sha = entry.get("sha256")
+        actual_sha = sha256_file(source_file)
+        if not isinstance(expected_sha, str) or actual_sha != expected_sha:
+            raise StudyDataError(f"checksum mismatch for {source_file.name}")
+        records = load_observation_records(source_file)
+        if len(records) != entry.get("observationCount"):
+            raise StudyDataError(f"observation count mismatch for {source_file.name}")
+        validated_entries.append((entry, source_file, expected_sha, records))
+
+    imported_observations = 0
+    duplicate_observations = 0
+    stored_files = []
+    for entry, source_file, expected_sha, records in validated_entries:
+        unique_lines = []
+        for observation_id, raw_line, _ in records:
+            if observation_id in seen_ids:
+                duplicate_observations += 1
+                continue
+            seen_ids.add(observation_id)
+            unique_lines.append(raw_line)
+
+        if not unique_lines:
+            continue
+        payload = b"\n".join(unique_lines) + b"\n"
+        stored_sha = sha256_bytes(payload)
+        stored_path = observations_directory / f"{stored_sha}.jsonl"
+        if stored_path.exists() and sha256_file(stored_path) != stored_sha:
+            raise StudyDataError(f"dataset checksum mismatch for {stored_path.name}")
+        if not stored_path.exists():
+            temporary_path = observations_directory / f".{stored_sha}.{uuid.uuid4().hex}.tmp"
+            temporary_path.write_bytes(payload)
+            temporary_path.chmod(0o600)
+            os.replace(temporary_path, stored_path)
+        stored_files.append({
+            "sourcePath": entry["relativePath"],
+            "sourceSHA256": expected_sha,
+            "storedPath": f"observations/{stored_path.name}",
+            "observationCount": len(unique_lines),
+        })
+        imported_observations += len(unique_lines)
+
+    receipt = {
+        "bundleID": bundle_id,
+        "bundleManifestSHA256": sha256_file(manifest_path),
+        "importedAt": utc_now(),
+        "importedObservations": imported_observations,
+        "duplicateObservations": duplicate_observations,
+        "storedFiles": stored_files,
+    }
+    receipt_path = imports_directory / f"{bundle_id}.json"
+    if receipt_path.exists():
+        receipt_path = imports_directory / f"{bundle_id}-{uuid.uuid4().hex[:8]}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    receipt_path.chmod(0o600)
+
+    print(f"Imported {imported_observations} observations into {destination}")
+    print(f"Skipped {duplicate_observations} observations already present")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status = subparsers.add_parser("status", help="Summarize local recordings.")
+    status.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    status.set_defaults(handler=status_command)
+
+    export = subparsers.add_parser("export", help="Create a plain directory bundle for transfer.")
+    export.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    export.add_argument("--output", type=Path)
+    export.set_defaults(handler=export_command)
+
+    import_parser = subparsers.add_parser("import", help="Validate and deduplicate a transferred bundle.")
+    import_parser.add_argument("--bundle", type=Path, required=True)
+    import_parser.add_argument("--destination", type=Path, default=DEFAULT_DATASET)
+    import_parser.set_defaults(handler=import_command)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        return args.handler(args)
+    except (OSError, StudyDataError) as error:
+        print(f"attention-study-data: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

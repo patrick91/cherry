@@ -475,6 +475,34 @@ final class CherryControlServer: @unchecked Sendable {
             )
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
+        case .captureAttentionObservation(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            guard let label = TerminalAttentionLabel(rawValue: request.label) else {
+                throw CherryControlError(
+                    code: "invalid_attention_label",
+                    message: "Unknown terminal attention label: \(request.label)"
+                )
+            }
+            let capture: (id: UUID, outputURL: URL)
+            do {
+                capture = try session.captureAttentionObservation(
+                    label: label,
+                    scenarioID: request.scenarioID,
+                    checkpoint: request.checkpoint,
+                    harnessVersion: request.harnessVersion,
+                    runID: request.runID
+                )
+            } catch TerminalAttentionRecordingError.disabled {
+                throw CherryControlError(
+                    code: "attention_recording_disabled",
+                    message: TerminalAttentionRecordingError.disabled.localizedDescription
+                )
+            }
+            return .init(result: .captureAttentionObservation(.init(
+                processID: session.id.uuidString,
+                observationID: capture.id.uuidString,
+                outputPath: capture.outputURL.path
+            )))
         case .startAllCommands(let request):
             _ = try startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {

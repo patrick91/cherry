@@ -1,0 +1,193 @@
+---
+import "@fontsource-variable/inter";
+import "../styles/global.css";
+---
+
+<!doctype html>
+<html lang="en" class="scheme-only-dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta
+      name="description"
+      content="A private dashboard for inspecting Cherry terminal-attention observations."
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>Cherry Attention Lab</title>
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="Homepage">
+          <span class="brand-mark" aria-hidden="true">C</span>
+          <span>Attention Lab</span>
+        </a>
+        <div class="connection-state" id="connection-state">Locked</div>
+      </header>
+
+      <main class="app" id="app">
+        <section class="login-view" id="login-view" aria-labelledby="login-title">
+          <div class="login-copy">
+            <p class="kicker">Private dataset viewer</p>
+            <h1 id="login-title">See what Cherry captured.</h1>
+            <p>
+              Enter the dashboard token configured in Cloudflare. It stays in this browser tab and
+              is sent only to this Worker.
+            </p>
+          </div>
+          <form class="login-form" id="login-form">
+            <label for="token">Dashboard token</label>
+            <input
+              id="token"
+              name="token"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+            <button class="button button-primary button-large" type="submit">Open dashboard</button>
+            <p class="form-message" id="login-message" aria-live="polite"></p>
+          </form>
+        </section>
+
+        <div class="dashboard" id="dashboard" hidden>
+          <section class="page-intro">
+            <div>
+              <p class="kicker">Terminal attention study</p>
+              <h1>Your capture set.</h1>
+              <p>
+                Inspect imported sessions, classifier labels, and the exact terminal grids stored in
+                D1.
+              </p>
+            </div>
+            <button class="button button-ghost" id="change-token" type="button">Change token</button>
+          </section>
+
+          <section class="stats-section" aria-label="Dataset summary">
+            <div class="stats-grid">
+              <div class="stat">
+                <span>Observations</span>
+                <strong id="stat-observations">0</strong>
+              </div>
+              <div class="stat">
+                <span>Labeled</span>
+                <strong id="stat-labeled">0</strong>
+              </div>
+              <div class="stat">
+                <span>Sessions</span>
+                <strong id="stat-sessions">0</strong>
+              </div>
+              <div class="stat">
+                <span>Bundles</span>
+                <strong id="stat-bundles">0</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="upload-section" aria-labelledby="upload-title">
+            <div class="section-heading">
+              <div>
+                <h2 id="upload-title">Import a bundle.</h2>
+                <p>Select the directory created by <code>attention-study-data export</code>.</p>
+              </div>
+              <span class="privacy-badge">Terminal text included</span>
+            </div>
+            <div class="upload-well">
+              <label class="file-picker" for="bundle-input">Choose bundle directory</label>
+              <input
+                id="bundle-input"
+                name="bundle"
+                type="file"
+                multiple
+              />
+              <div class="upload-copy">
+                <strong id="selected-bundle">No bundle selected</strong>
+                <span id="selected-detail">Manifest and JSONL files remain unchanged locally.</span>
+              </div>
+              <button class="button button-primary" id="upload-button" type="button" disabled>
+                Import observations
+              </button>
+            </div>
+            <p class="upload-status" id="upload-status" aria-live="polite"></p>
+          </section>
+
+          <section class="observations-section" aria-labelledby="observations-title">
+            <div class="section-heading observation-heading">
+              <div>
+                <h2 id="observations-title">Recent observations.</h2>
+                <p>Open a snapshot to inspect its complete stored payload.</p>
+              </div>
+              <div class="filters">
+                <label>
+                  <span>Label</span>
+                  <select id="label-filter" name="label">
+                    <option value="">All labels</option>
+                    <option value="unlabeled">Unlabeled</option>
+                    <option value="approval_required">Approval required</option>
+                    <option value="waiting_for_input">Waiting for input</option>
+                    <option value="ready_for_review">Ready for review</option>
+                    <option value="no_attention_needed">No attention needed</option>
+                    <option value="unknown">Unknown</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Harness</span>
+                  <select id="harness-filter" name="harness">
+                    <option value="">All harnesses</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="observation-grid" id="observation-grid"></div>
+            <p class="empty-state" id="empty-state" hidden>No observations match these filters.</p>
+            <nav class="pagination" aria-label="Observation pages">
+              <button class="button button-ghost" id="previous-page" type="button" disabled>
+                Previous
+              </button>
+              <span id="page-status">Showing 0–0</span>
+              <button class="button button-ghost" id="next-page" type="button" disabled>Next</button>
+            </nav>
+          </section>
+
+          <section class="bundles-section" aria-labelledby="bundles-title">
+            <div class="section-heading">
+              <div>
+                <h2 id="bundles-title">Imported bundles.</h2>
+                <p>Expected and received counts make interrupted uploads visible.</p>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <div class="table-inner">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Imported</th>
+                      <th>Source</th>
+                      <th>Bundle</th>
+                      <th class="number-column">Received</th>
+                    </tr>
+                  </thead>
+                  <tbody id="bundle-rows"></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <dialog class="detail-dialog" id="detail-dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="kicker">Stored observation</p>
+          <h2 id="detail-title">Observation payload.</h2>
+        </div>
+        <button class="button button-ghost" id="close-detail" type="button">Close</button>
+      </div>
+      <pre id="detail-payload"></pre>
+    </dialog>
+
+    <script>
+      import "../scripts/dashboard";
+    </script>
+  </body>
+</html>

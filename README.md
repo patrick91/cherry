@@ -113,6 +113,12 @@ Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
 
 Raw traces can include terminal output and prompt text, so treat them like logs.
 
+For opt-in collection of labeled terminal-grid observations used by the local
+attention-classifier experiment, see
+[docs/attention-classifier.md](docs/attention-classifier.md). The interactive
+scenario runner supports controlled captures across configured agent harnesses,
+and `attention-web/` contains the private Astro/Cloudflare dataset viewer.
+
 ## Performance Stress
 
 Run the opt-in terminal stress suite:

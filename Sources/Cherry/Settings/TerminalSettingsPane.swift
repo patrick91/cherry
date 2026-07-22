@@ -46,6 +46,29 @@ struct TerminalSettingsPane: View {
                 }
             }
 
+            SettingsCard("Attention Study") {
+                SettingsRow(
+                    "Collect agent observations",
+                    subtitle: "Save deduplicated terminal-grid checkpoints locally for the attention-classifier study. Terminal text may contain sensitive data."
+                ) {
+                    Toggle("Collect agent observations", isOn: $settings.attentionStudyEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+
+                SettingsDivider()
+
+                SettingsRow(
+                    "Local recordings",
+                    subtitle: "Stored privately in Application Support. Older sessions are trimmed to 500 MB when collection starts."
+                ) {
+                    Button("Show in Finder") {
+                        revealAttentionStudyRecordings()
+                    }
+                    .settingsGlassButtonStyle()
+                }
+            }
+
             SettingsCard("Color") {
                 SettingsSlider(
                     title: "Minimum contrast",
@@ -88,6 +111,12 @@ struct TerminalSettingsPane: View {
                 }
             }
         }
+    }
+
+    private func revealAttentionStudyRecordings() {
+        let directoryURL = TerminalAttentionStudy.recordingsDirectoryURL()
+        try? TerminalAttentionStudy.prepareDirectoryIfNeeded(directoryURL)
+        NSWorkspace.shared.activateFileViewerSelecting([directoryURL])
     }
 }
 

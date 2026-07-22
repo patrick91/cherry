@@ -124,6 +124,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case renameProcess(RenameProcessRequest)
     case selectProcess(ProcessSelectorRequest)
     case sendProcessInput(SendProcessInputRequest)
+    case captureAttentionObservation(CaptureAttentionObservationRequest)
     case startAllCommands(ProcessBulkCommandRequest)
     case stopAllCommands(ProcessBulkCommandRequest)
     case restartAllCommands(ProcessBulkCommandRequest)
@@ -437,6 +438,34 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
         self.submit = submit
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
+    }
+}
+
+public struct CaptureAttentionObservationRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    public let label: String
+    public let scenarioID: String?
+    public let checkpoint: String?
+    public let harnessVersion: String?
+    public let runID: String?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        label: String,
+        scenarioID: String? = nil,
+        checkpoint: String? = nil,
+        harnessVersion: String? = nil,
+        runID: String? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.label = label
+        self.scenarioID = scenarioID
+        self.checkpoint = checkpoint
+        self.harnessVersion = harnessVersion
+        self.runID = runID
     }
 }
 
@@ -810,6 +839,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case renameProcess(ProcessStatusResult)
     case selectProcess(ProcessStatusResult)
     case sendProcessInput(SendProcessInputResult)
+    case captureAttentionObservation(CaptureAttentionObservationResult)
     case startAllCommands(ListProcessesResult)
     case stopAllCommands(ListProcessesResult)
     case restartAllCommands(ListProcessesResult)
@@ -1428,6 +1458,18 @@ public struct SendProcessInputResult: Codable, Equatable, Sendable {
         self.processID = processID
         self.sentBytes = sentBytes
         self.output = output
+    }
+}
+
+public struct CaptureAttentionObservationResult: Codable, Equatable, Sendable {
+    public let processID: String
+    public let observationID: String
+    public let outputPath: String
+
+    public init(processID: String, observationID: String, outputPath: String) {
+        self.processID = processID
+        self.observationID = observationID
+        self.outputPath = outputPath
     }
 }
 

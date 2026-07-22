@@ -138,6 +138,14 @@ final class ProjectWindowRegistry {
         return workspaces[projectRoot]?.workspace
     }
 
+    /// Repository belonging to the current key window. Used with
+    /// `keyWindowWorkspace` when a menu action needs repository-wide state.
+    var keyWindowRepository: RepositoryWorkspace? {
+        pruneStaleWindows()
+        guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
+        return repositories[projectRoot]?.repository
+    }
+
     /// Chrome state belonging to the current key window. See
     /// `keyWindowWorkspace` for why menu actions resolve through this.
     var keyWindowChromeState: ProjectWindowChromeState? {
@@ -662,7 +670,9 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var selectedTodoTagFilterIDs: Set<String> = []
     @Published var collapsedAgentGroupIDs: Set<UUID> = []
     @Published var pendingAgentCloseSessionID: UUID?
+    @Published var pendingAgentCloseAllowsEmptyWorkspace = false
     @Published var pendingAgentGroupCloseSessionID: UUID?
+    @Published var pendingAgentGroupCloseAllowsEmptyWorkspace = false
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
     // Mirrored from ProjectWorkspaceView's scene-scoped sidebar width so the
@@ -829,11 +839,13 @@ final class ProjectWindowChromeState: ObservableObject {
         }
     }
 
-    func requestAgentGroupClose(sessionID: UUID) {
+    func requestAgentGroupClose(sessionID: UUID, allowEmptyWorkspace: Bool = false) {
+        pendingAgentGroupCloseAllowsEmptyWorkspace = allowEmptyWorkspace
         pendingAgentGroupCloseSessionID = sessionID
     }
 
-    func requestAgentClose(sessionID: UUID) {
+    func requestAgentClose(sessionID: UUID, allowEmptyWorkspace: Bool = false) {
+        pendingAgentCloseAllowsEmptyWorkspace = allowEmptyWorkspace
         pendingAgentCloseSessionID = sessionID
     }
 
@@ -1027,7 +1039,7 @@ private final class ProjectWindowBinderView: NSView {
 }
 
 @MainActor
-private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
+final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     weak var window: NSWindow?
     weak var workspace: TerminalWorkspace?
     weak var repository: RepositoryWorkspace?
@@ -1035,6 +1047,7 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     var projectRoot: String?
     private var isCloseConfirmed = false
     private var isPresentingCloseAlert = false
+    private var shouldCloseAfterSheetEnds = false
     private var didCloseWorkspace = false
 
     init(window: NSWindow) {
@@ -1070,6 +1083,20 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         previousDelegate?.windowWillClose?(notification)
     }
 
+    func windowDidEndSheet(_ notification: Notification) {
+        previousDelegate?.windowDidEndSheet?(notification)
+
+        guard shouldCloseAfterSheetEnds,
+              let window = notification.object as? NSWindow,
+              window === self.window
+        else {
+            return
+        }
+
+        shouldCloseAfterSheetEnds = false
+        window.close()
+    }
+
     private func presentCloseAlert(for window: NSWindow, runningProcessCount: Int) {
         guard !isPresentingCloseAlert else { return }
         isPresentingCloseAlert = true
@@ -1085,13 +1112,28 @@ private final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
 
         alert.beginSheetModal(for: window) { [weak self, weak window] response in
             Task { @MainActor in
-                guard let self else { return }
-                self.isPresentingCloseAlert = false
-                guard response == .alertFirstButtonReturn, let window else { return }
-                self.isCloseConfirmed = true
-                self.closeWorkspaceIfNeeded()
-                window.performClose(nil)
+                guard let self, let window else { return }
+                self.finishCloseAlert(response: response, for: window)
             }
+        }
+    }
+
+    func finishCloseAlert(response: NSApplication.ModalResponse, for window: NSWindow) {
+        isPresentingCloseAlert = false
+        guard response == .alertFirstButtonReturn else { return }
+
+        isCloseConfirmed = true
+        closeWorkspaceIfNeeded()
+
+        // The original traffic-light click already passed through
+        // `windowShouldClose`. Do not simulate another click while AppKit is
+        // still dismissing the confirmation sheet: that can leave the sheet
+        // orphaned over the next key window. Close directly once the sheet has
+        // fully detached instead.
+        if window.attachedSheet == nil {
+            window.close()
+        } else {
+            shouldCloseAfterSheetEnds = true
         }
     }
 

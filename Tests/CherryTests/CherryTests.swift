@@ -6256,6 +6256,62 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func confirmedProjectWindowCloseWaitsForItsSheetAndLeavesOtherWindowsAlone() async {
+    let closingWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    let otherWindow = NSWindow(
+        contentRect: NSRect(x: 40, y: 40, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    let sheet = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 320, height: 160),
+        styleMask: [.titled],
+        backing: .buffered,
+        defer: false
+    )
+    let closeDelegate = ProjectWindowCloseDelegate(window: closingWindow)
+
+    closingWindow.isReleasedWhenClosed = false
+    otherWindow.isReleasedWhenClosed = false
+    sheet.isReleasedWhenClosed = false
+    closingWindow.delegate = closeDelegate
+    otherWindow.orderFrontRegardless()
+    closingWindow.orderFrontRegardless()
+    closingWindow.beginSheet(sheet, completionHandler: nil)
+
+    defer {
+        if sheet.sheetParent === closingWindow {
+            closingWindow.endSheet(sheet)
+        }
+        sheet.close()
+        closingWindow.close()
+        otherWindow.close()
+    }
+
+    #expect(closingWindow.attachedSheet === sheet)
+
+    closeDelegate.finishCloseAlert(response: .alertFirstButtonReturn, for: closingWindow)
+
+    #expect(closingWindow.isVisible)
+    #expect(otherWindow.isVisible)
+    #expect(otherWindow.attachedSheet == nil)
+
+    closingWindow.endSheet(sheet)
+
+    #expect(await waitForCondition {
+        !closingWindow.isVisible
+    })
+    #expect(otherWindow.isVisible)
+    #expect(otherWindow.attachedSheet == nil)
+}
+
+@MainActor
 @Test func workspaceCloseReleasesGhosttyBridge() async throws {
     let workspace = TerminalWorkspace()
     defer {
@@ -10316,6 +10372,94 @@ private func waitForSummaryCallCount(
     #expect(workspace.terminalDisplayItems == [.single(firstSession.id)])
 }
 
+@MainActor
+@Test func appShortcutMonitorCommandWKeepsWindowOpenForSessionsInOtherWorktrees() async throws {
+    let container = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryShortcutWorktreeClose-\(UUID().uuidString)", isDirectory: true)
+    let repositoryRoot = container.appendingPathComponent("repository", isDirectory: true)
+    let worktreeRoot = container.appendingPathComponent("feature", isDirectory: true)
+    let storageDirectory = container.appendingPathComponent("stores", isDirectory: true)
+    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: container) }
+
+    try runGitForTest(["-C", repositoryRoot.path, "init", "-b", "main"])
+    try runGitForTest(["-C", repositoryRoot.path, "config", "user.name", "Cherry Tests"])
+    try runGitForTest(["-C", repositoryRoot.path, "config", "user.email", "cherry@example.invalid"])
+    try Data("Cherry\n".utf8).write(to: repositoryRoot.appendingPathComponent("README.md"))
+    try runGitForTest(["-C", repositoryRoot.path, "add", "README.md"])
+    try runGitForTest(["-C", repositoryRoot.path, "commit", "-m", "Initial commit"])
+
+    let service = GitWorktreeService()
+    try await service.create(
+        .newBranch(name: "feature", startPoint: "HEAD", destination: worktreeRoot.path),
+        repositoryRoot: repositoryRoot.path
+    )
+
+    let settings = TerminalSettings.shared
+    let previousWorktreeSpacesEnabled = settings.worktreeSpacesEnabled
+    settings.worktreeSpacesEnabled = true
+    defer { settings.worktreeSpacesEnabled = previousWorktreeSpacesEnabled }
+
+    let canonicalRepositoryRoot = try canonicalPathForTest(repositoryRoot)
+    let canonicalWorktreeRoot = try canonicalPathForTest(worktreeRoot)
+    let repository = RepositoryWorkspace(projectRoot: canonicalRepositoryRoot)
+    await repository.refresh()
+    _ = repository.activate(worktreeRoot: canonicalRepositoryRoot, chromeState: nil)
+
+    let workspace = repository.activeWorkspace
+    let otherWorkspace = try #require(
+        repository.prepareWorkspace(worktreeRoot: canonicalWorktreeRoot)
+    )
+    let otherSession = otherWorkspace.addSession(title: "Keep Me")
+    let chromeState = ProjectWindowChromeState()
+    let noteStore = ProjectNoteStore(
+        projectRoot: canonicalRepositoryRoot,
+        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
+    )
+    let todoStore = ProjectTodoStore(
+        projectRoot: canonicalRepositoryRoot,
+        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.orderFrontRegardless()
+
+    let coordinator = AppShortcutMonitor.Coordinator(
+        repository: repository,
+        workspace: workspace,
+        chromeState: chromeState,
+        noteStore: noteStore,
+        todoStore: todoStore,
+        projectRoot: canonicalRepositoryRoot,
+        visibleCommandNames: [],
+        visibleCommands: [],
+        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+        openSettings: {}
+    )
+    coordinator.window = window
+
+    defer {
+        _ = coordinator
+        repository.closeAllSessions()
+        window.close()
+    }
+
+    #expect(!SessionCloseCoordinator.shouldCloseWindow(
+        for: workspace,
+        repository: repository
+    ))
+    coordinator.closeSelectedSessionOrWindow()
+
+    #expect(workspace.sessions.isEmpty)
+    #expect(otherWorkspace.sessions.map(\.id) == [otherSession.id])
+    #expect(window.isVisible)
+}
+
 @Test func commandAutoRestartPolicyEscalatesDelaysAndResetsOnHealthyRuns() {
     // A healthy (or unknown-duration) run clears crash-loop history.
     #expect(CommandAutoRestartPolicy.nextConsecutiveRapidExitCount(previous: 3, runDuration: 60) == 0)
@@ -10971,7 +11115,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, createInitialSession: false)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -10980,9 +11124,15 @@ private func waitForSummaryCallCount(
     let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
     let agent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
 
-    SessionCloseCoordinator.close(agent, in: workspace, chromeState: chromeState)
+    SessionCloseCoordinator.close(
+        agent,
+        in: workspace,
+        chromeState: chromeState,
+        allowEmptyWorkspace: true
+    )
 
     #expect(chromeState.pendingAgentCloseSessionID == agent.id)
+    #expect(chromeState.pendingAgentCloseAllowsEmptyWorkspace)
     #expect(workspace.sessions.contains { $0.id == agent.id })
 }
 

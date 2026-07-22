@@ -172,6 +172,10 @@ struct CherryApp: App {
         ProjectWindowRegistry.shared.keyWindowWorkspace ?? focusedWorkspace
     }
 
+    private var keyWindowRepository: RepositoryWorkspace? {
+        ProjectWindowRegistry.shared.keyWindowRepository
+    }
+
     private var keyWindowChromeState: ProjectWindowChromeState? {
         ProjectWindowRegistry.shared.keyWindowChromeState ?? focusedChromeState
     }
@@ -309,9 +313,20 @@ struct CherryApp: App {
                     if chromeState?.closeSelectedNoteIfNeeded() == true {
                         return
                     }
-                    if workspace.sessions.count > 1 {
+                    if !SessionCloseCoordinator.shouldCloseWindow(
+                        for: workspace,
+                        repository: keyWindowRepository
+                    ) {
                         guard let session = workspace.selectedSession else { return }
-                        SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState)
+                        SessionCloseCoordinator.close(
+                            session,
+                            in: workspace,
+                            chromeState: chromeState,
+                            allowEmptyWorkspace: SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(
+                                than: workspace,
+                                repository: keyWindowRepository
+                            )
+                        )
                     } else {
                         NSApp.keyWindow?.performClose(nil)
                     }

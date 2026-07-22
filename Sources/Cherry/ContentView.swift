@@ -255,19 +255,25 @@ struct ContentView: View {
             if let session = pendingAgentGroupCloseSession {
                 if canCloseAgentGroup(session) {
                     Button("Close Parent and Sub-Agents", role: .destructive) {
-                        workspace.closeAgentGroup(session)
+                        workspace.closeAgentGroup(
+                            session,
+                            allowEmptyWorkspace: chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace
+                        )
                         chromeState.pendingAgentGroupCloseSessionID = nil
+                        chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
                     }
                 }
 
                 Button("Close Parent Only") {
                     workspace.closeAgentPromotingChildren(session)
                     chromeState.pendingAgentGroupCloseSessionID = nil
+                    chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
                 }
             }
 
             Button("Cancel", role: .cancel) {
                 chromeState.pendingAgentGroupCloseSessionID = nil
+                chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
             }
         } message: {
             if let session = pendingAgentGroupCloseSession {
@@ -376,6 +382,7 @@ struct ContentView: View {
         } set: { isPresented in
             if !isPresented {
                 chromeState.pendingAgentGroupCloseSessionID = nil
+                chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
             }
         }
     }
@@ -412,7 +419,8 @@ struct ContentView: View {
     }
 
     private func canCloseAgentGroup(_ session: TerminalSession) -> Bool {
-        workspace.sessions.count > workspace.descendantAgentSessions(of: session).count + 1
+        chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace
+            || workspace.sessions.count > workspace.descendantAgentSessions(of: session).count + 1
     }
 
     private var dockedSidebar: some View {
@@ -873,12 +881,17 @@ private final class AgentCloseAlertPresenterView: NSView {
 
         guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else {
             chromeState.pendingAgentCloseSessionID = nil
+            chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
             return
         }
 
         guard session.kind == .agent, session.isRunning else {
-            workspace.close(session)
+            workspace.close(
+                session,
+                allowEmptyWorkspace: chromeState.pendingAgentCloseAllowsEmptyWorkspace
+            )
             chromeState.pendingAgentCloseSessionID = nil
+            chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
             return
         }
 
@@ -897,10 +910,14 @@ private final class AgentCloseAlertPresenterView: NSView {
                     if response == .alertFirstButtonReturn,
                        let workspace,
                        let session = workspace.sessions.first(where: { $0.id == sessionID }) {
-                        workspace.close(session)
+                        workspace.close(
+                            session,
+                            allowEmptyWorkspace: chromeState?.pendingAgentCloseAllowsEmptyWorkspace == true
+                        )
                     }
                     if chromeState?.pendingAgentCloseSessionID == sessionID {
                         chromeState?.pendingAgentCloseSessionID = nil
+                        chromeState?.pendingAgentCloseAllowsEmptyWorkspace = false
                     }
                     self.presentedSessionID = nil
                 }
@@ -908,10 +925,14 @@ private final class AgentCloseAlertPresenterView: NSView {
         } else {
             let response = alert.runModal()
             if response == .alertFirstButtonReturn {
-                workspace.close(session)
+                workspace.close(
+                    session,
+                    allowEmptyWorkspace: chromeState.pendingAgentCloseAllowsEmptyWorkspace
+                )
             }
             if chromeState.pendingAgentCloseSessionID == sessionID {
                 chromeState.pendingAgentCloseSessionID = nil
+                chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
             }
             presentedSessionID = nil
         }

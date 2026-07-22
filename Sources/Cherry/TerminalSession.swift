@@ -1592,19 +1592,20 @@ final class TerminalWorkspace: ObservableObject {
         closeSessions(withIDs: Set(group.paneSessionIDs))
     }
 
-    func close(_ session: TerminalSession) {
+    func close(_ session: TerminalSession, allowEmptyWorkspace: Bool = false) {
         if session.kind == .agent {
             promoteChildAgents(of: session)
         }
         closeSessions(
             withIDs: Set([session.id]),
-            replacementSelectionID: replacementPaneSelection(afterClosing: session.id)
+            replacementSelectionID: replacementPaneSelection(afterClosing: session.id),
+            allowEmptyWorkspace: allowEmptyWorkspace
         )
     }
 
-    func closeAgentGroup(_ session: TerminalSession) {
+    func closeAgentGroup(_ session: TerminalSession, allowEmptyWorkspace: Bool = false) {
         let groupIDs = Set(([session] + descendantAgentSessions(of: session)).map(\.id))
-        closeSessions(withIDs: groupIDs)
+        closeSessions(withIDs: groupIDs, allowEmptyWorkspace: allowEmptyWorkspace)
     }
 
     func closeAgentPromotingChildren(_ session: TerminalSession) {
@@ -1836,9 +1837,14 @@ final class TerminalWorkspace: ObservableObject {
 
     private func closeSessions(
         withIDs removedIDs: Set<UUID>,
-        replacementSelectionID: UUID? = nil
+        replacementSelectionID: UUID? = nil,
+        allowEmptyWorkspace: Bool = false
     ) {
-        guard !removedIDs.isEmpty, sessions.count > removedIDs.count else { return }
+        guard !removedIDs.isEmpty,
+              allowEmptyWorkspace || sessions.count > removedIDs.count
+        else {
+            return
+        }
 
         let removedIndex = sessions.firstIndex { removedIDs.contains($0.id) }
         let removedSessions = sessions.filter { removedIDs.contains($0.id) }

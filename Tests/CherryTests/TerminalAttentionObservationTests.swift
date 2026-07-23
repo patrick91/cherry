@@ -97,6 +97,54 @@ struct TerminalAttentionObservationTests {
         #expect(observations.contains { $0.event == .labeledCheckpoint && $0.label == .noAttentionNeeded })
     }
 
+    @Test func nativeHostSubmissionRecordsInputSubmittedEvent() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-attention-native-input-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Native input fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        let returnKey = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        ))
+        session.noteNativeHostInput(event: returnKey)
+        let capture = try session.captureAttentionObservation(
+            label: .unknown,
+            scenarioID: "native-input-regression",
+            checkpoint: "test_flush",
+            harnessVersion: nil,
+            runID: nil
+        )
+
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let submitted = try #require(observations.first { $0.event == .inputSubmitted })
+        #expect(submitted.label == nil)
+        #expect(submitted.activity.evidence == "input_submit")
+        #expect(submitted.timing.millisecondsSinceLastHumanInput != nil)
+    }
+
     @Test func captureRequestRoundTripsAllDatasetMetadata() throws {
         let request = CherryControlRequest.captureAttentionObservation(.init(
             processID: UUID().uuidString,

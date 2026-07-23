@@ -2623,6 +2623,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         noteHumanInputIfNeeded()
         setAgentActivityState(.working, source: .inputSubmit)
         scheduleAgentIdleRecheck()
+        scheduleAttentionObservation(event: .inputSubmitted)
     }
 
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:

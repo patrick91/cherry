@@ -120,6 +120,7 @@ describe("attention dashboard Worker", () => {
     expect(dashboard.status).toBe(200);
     const dashboardText = await dashboard.text();
     expect(dashboardText).toContain('"kind":"total","name":"all","count":1');
+    expect(dashboardText).toContain('"pagination":{"limit":12,"offset":0,"returned":1,"total":1}');
     expect(dashboardText).toContain('"id":"6594bade-c891-42cb-8cb1-e51c16f1ab95"');
     expect(dashboardText).toContain('"grid":["Choose alpha or beta.","❯ "]');
     expect(dashboardText).toContain('"confidence":0.94');

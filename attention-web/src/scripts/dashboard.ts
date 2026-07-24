@@ -55,15 +55,14 @@ type DashboardResponse = {
   aggregates: Aggregate[];
   bundles: BundleSummary[];
   observations: ObservationSummary[];
-  pagination: { limit: number; offset: number; returned: number };
+  pagination: { limit: number; offset: number; returned: number; total: number };
 };
 
 const tokenKey = "cherry-attention-dashboard-token";
-const pageSize = 12;
+const pageSize = 1;
 let token = sessionStorage.getItem(tokenKey) ?? "";
 let selectedFiles: File[] = [];
 let pageOffset = 0;
-let activeObservationID: string | null = null;
 let detailRequest = 0;
 
 type LabelInformation = {
@@ -227,7 +226,7 @@ function setLabelBadge(badge: HTMLElement, label: string | null): void {
   badge.dataset.label = key;
 }
 
-function updateLabelContext(aggregates: Aggregate[]): void {
+function updateLabelContext(filteredTotal: number): void {
   const key = labelFilter.value || "all";
   const information = key === "all"
     ? {
@@ -238,71 +237,18 @@ function updateLabelContext(aggregates: Aggregate[]): void {
         name: formatIdentifier(key),
         description: "Browse observations with this label.",
       };
-  const total = key === "all"
-    ? count(aggregates, "total", "all")
-    : key === "labeled"
-      ? count(aggregates, "labeled", "all")
-      : count(aggregates, "label", key);
   element("label-context-name").textContent = information.name;
-  element("label-context-count").textContent = `${total.toLocaleString()} stored`;
+  element("label-context-count").textContent = `${filteredTotal.toLocaleString()} stored`;
   element("label-context-description").textContent = information.description;
 }
 
 function renderObservations(observations: ObservationSummary[]): void {
-  const list = element<HTMLElement>("observation-list");
-  const empty = element<HTMLElement>("empty-state");
-  list.replaceChildren();
-  empty.hidden = observations.length > 0;
-
-  for (const observation of observations) {
-    const item = document.createElement("div");
-    item.setAttribute("role", "listitem");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "review-item";
-    button.dataset.observationId = observation.id;
-    button.setAttribute("aria-pressed", String(observation.id === activeObservationID));
-    button.addEventListener("click", () => void selectObservation(observation, true));
-
-    const topLine = document.createElement("span");
-    topLine.className = "review-item-topline";
-    const badge = document.createElement("span");
-    badge.className = "label-badge";
-    setLabelBadge(badge, observation.label);
-    const time = document.createElement("time");
-    time.dateTime = observation.recordedAt;
-    time.textContent = formatDate(observation.recordedAt);
-    topLine.append(badge, time);
-
-    const summary = document.createElement("strong");
-    summary.className = "review-item-summary";
-    summary.textContent = summarizeTerminal(observation.grid);
-
-    const reason = document.createElement("span");
-    reason.className = "review-item-reason";
-    reason.textContent = rationaleText(observation.rationale);
-
-    const metadata = document.createElement("span");
-    metadata.className = "review-item-metadata";
-    metadata.textContent = [
-      observation.harness ?? "Unknown harness",
-      formatIdentifier(observation.event),
-      observation.activityState,
-    ].join(" · ");
-
-    button.append(topLine, summary, reason, metadata);
-    item.append(button);
-    list.append(item);
-  }
-
-  const selected = observations.find((observation) => observation.id === activeObservationID)
-    ?? observations[0];
+  const selected = observations[0];
   if (selected === undefined) {
-    activeObservationID = null;
     element("review-detail-empty").hidden = false;
     element("review-detail-content").hidden = true;
   } else {
-    void selectObservation(selected, false);
+    void selectObservation(selected);
   }
 }
 
@@ -443,17 +389,7 @@ function renderTerminal(
   return true;
 }
 
-async function selectObservation(
-  observation: ObservationSummary,
-  scrollDetail: boolean,
-): Promise<void> {
-  activeObservationID = observation.id;
-  for (const item of document.querySelectorAll<HTMLButtonElement>(".review-item")) {
-    const selected = item.dataset.observationId === observation.id;
-    item.dataset.selected = String(selected);
-    item.setAttribute("aria-pressed", String(selected));
-  }
-
+async function selectObservation(observation: ObservationSummary): Promise<void> {
   const request = ++detailRequest;
   const response = await api(`/api/observations/${encodeURIComponent(observation.id)}`);
   const payload: unknown = await responseJSON<unknown>(response);
@@ -518,10 +454,6 @@ async function selectObservation(
     ? "Foreground, background, and text attributes were retained by Cherry."
     : "This observation was captured without terminal style information.";
   element("detail-payload").textContent = JSON.stringify(payload, null, 2);
-
-  if (scrollDetail && window.matchMedia("(max-width: 799px)").matches) {
-    element("review-detail").scrollIntoView({ behavior: "smooth", block: "start" });
-  }
 }
 
 function renderBundles(bundles: BundleSummary[]): void {
@@ -566,17 +498,18 @@ async function loadDashboard(): Promise<void> {
   element("stat-sessions").textContent = count(data.aggregates, "session", "all").toLocaleString();
   element("stat-bundles").textContent = data.bundles.length.toLocaleString();
   updateHarnesses(data.aggregates);
-  updateLabelContext(data.aggregates);
+  updateLabelContext(data.pagination.total);
   renderObservations(data.observations);
   renderBundles(data.bundles);
   element("dataset-tools-count").textContent =
     `${data.bundles.length.toLocaleString()} ${data.bundles.length === 1 ? "bundle" : "bundles"}`;
 
-  const first = data.pagination.returned > 0 ? data.pagination.offset + 1 : 0;
-  const last = data.pagination.offset + data.pagination.returned;
-  element("page-status").textContent = `Showing ${first.toLocaleString()}–${last.toLocaleString()}`;
+  const current = data.pagination.returned > 0 ? data.pagination.offset + 1 : 0;
+  element("page-status").textContent = current === 0
+    ? "No observations"
+    : `Observation ${current.toLocaleString()} of ${data.pagination.total.toLocaleString()}`;
   previousPage.disabled = pageOffset === 0;
-  nextPage.disabled = data.pagination.returned < data.pagination.limit;
+  nextPage.disabled = current >= data.pagination.total;
 }
 
 function fileMap(files: File[]): Map<string, File> {
@@ -736,11 +669,15 @@ harnessFilter.addEventListener("change", () => {
 });
 previousPage.addEventListener("click", () => {
   pageOffset = Math.max(0, pageOffset - pageSize);
-  void loadDashboard();
+  void loadDashboard().then(() => {
+    element("review-navigation").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
 });
 nextPage.addEventListener("click", () => {
   pageOffset += pageSize;
-  void loadDashboard();
+  void loadDashboard().then(() => {
+    element("review-navigation").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
 });
 if (token.length > 0) {
   void loadDashboard().catch(() => showLogin("Could not connect with the saved token."));

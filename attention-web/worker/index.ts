@@ -144,6 +144,7 @@ async function uploadObservations(request: Request, env: Env, bundleID: string):
 }
 
 type AggregateRow = { kind: string; name: string; count: number };
+type CountRow = { count: number };
 type BundleRow = {
   id: string;
   sourceHost: string | null;
@@ -209,6 +210,7 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
     parameters.push(harness);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const filterParameters = [...parameters];
   parameters.push(limit, offset);
   const limitParameter = parameters.length - 1;
   const offsetParameter = parameters.length;
@@ -248,11 +250,15 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
       ORDER BY recorded_at DESC
       LIMIT ?${limitParameter} OFFSET ?${offsetParameter}`,
   ).bind(...parameters).all<ObservationRow>();
+  const filteredCountQuery = env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM observations ${where}`,
+  ).bind(...filterParameters).first<CountRow>();
 
-  const [aggregates, bundles, observations] = await Promise.all([
+  const [aggregates, bundles, observations, filteredCount] = await Promise.all([
     aggregateQuery,
     bundleQuery,
     observationsQuery,
+    filteredCountQuery,
   ]);
   return json({
     aggregates: aggregates.results,
@@ -262,7 +268,12 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
       grid: storedGrid(observation.gridJSON),
       gridJSON: undefined,
     })),
-    pagination: { limit, offset, returned: observations.results.length },
+    pagination: {
+      limit,
+      offset,
+      returned: observations.results.length,
+      total: filteredCount?.count ?? 0,
+    },
   });
 }
 

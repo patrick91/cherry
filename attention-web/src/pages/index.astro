@@ -87,7 +87,7 @@ import "../styles/global.css";
             <div class="section-heading observation-heading">
               <div>
                 <h2 id="observations-title">Label review.</h2>
-                <p>Select an observation to inspect the decision and its terminal context.</p>
+                <p>Review one observation at a time, with its decision and terminal context.</p>
               </div>
               <div class="filters">
                 <label>
@@ -123,33 +123,26 @@ import "../styles/global.css";
             </div>
 
             <div class="review-workspace">
-              <div class="review-queue">
-                <div class="review-queue-header">
-                  <div>
-                    <h3>Observations</h3>
-                    <p id="queue-description">Newest first.</p>
-                  </div>
-                  <span id="page-status">Showing 0–0</span>
+              <nav class="review-navigation" id="review-navigation" aria-label="Observation navigation">
+                <div>
+                  <span>Review queue</span>
+                  <strong id="page-status" aria-live="polite">No observations</strong>
                 </div>
-                <div class="observation-list" id="observation-list" role="list"></div>
-                <p class="empty-state" id="empty-state" hidden>
-                  No observations match these filters.
-                </p>
-                <nav class="pagination" aria-label="Observation pages">
+                <div class="review-navigation-actions">
                   <button class="button button-ghost" id="previous-page" type="button" disabled>
                     Previous
                   </button>
                   <button class="button button-ghost" id="next-page" type="button" disabled>
                     Next
                   </button>
-                </nav>
-              </div>
+                </div>
+              </nav>
 
               <article class="review-detail" id="review-detail" aria-live="polite">
                 <div class="review-detail-empty" id="review-detail-empty">
                   <p class="kicker">Observation detail</p>
-                  <h3>Select an observation.</h3>
-                  <p>The label explanation, confidence, and terminal snapshot will appear here.</p>
+                  <h3>No observations found.</h3>
+                  <p>Choose another label or harness filter to continue reviewing.</p>
                 </div>
 
                 <div class="review-detail-content" id="review-detail-content" hidden>

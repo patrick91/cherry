@@ -53,10 +53,10 @@ import "../styles/global.css";
           <section class="page-intro">
             <div>
               <p class="kicker">Terminal attention study</p>
-              <h1>Your capture set.</h1>
+              <h1>Review attention labels.</h1>
               <p>
-                Inspect imported sessions, classifier labels, and the exact terminal grids stored in
-                D1.
+                Understand what Cherry thinks needs your attention, why it chose that label, and
+                what was visible in the terminal.
               </p>
             </div>
             <button class="button button-ghost" id="change-token" type="button">Change token</button>
@@ -83,44 +83,18 @@ import "../styles/global.css";
             </div>
           </section>
 
-          <section class="upload-section" aria-labelledby="upload-title">
-            <div class="section-heading">
-              <div>
-                <h2 id="upload-title">Import a bundle.</h2>
-                <p>Select the directory created by <code>attention-study-data export</code>.</p>
-              </div>
-              <span class="privacy-badge">Terminal text included</span>
-            </div>
-            <div class="upload-well">
-              <label class="file-picker" for="bundle-input">Choose bundle directory</label>
-              <input
-                id="bundle-input"
-                name="bundle"
-                type="file"
-                multiple
-              />
-              <div class="upload-copy">
-                <strong id="selected-bundle">No bundle selected</strong>
-                <span id="selected-detail">Manifest and JSONL files remain unchanged locally.</span>
-              </div>
-              <button class="button button-primary" id="upload-button" type="button" disabled>
-                Import observations
-              </button>
-            </div>
-            <p class="upload-status" id="upload-status" aria-live="polite"></p>
-          </section>
-
           <section class="observations-section" aria-labelledby="observations-title">
             <div class="section-heading observation-heading">
               <div>
-                <h2 id="observations-title">Recent observations.</h2>
-                <p>Open a snapshot to inspect its complete stored payload.</p>
+                <h2 id="observations-title">Label review.</h2>
+                <p>Select an observation to inspect the decision and its terminal context.</p>
               </div>
               <div class="filters">
                 <label>
                   <span>Label</span>
                   <select id="label-filter" name="label">
                     <option value="">All labels</option>
+                    <option value="labeled" selected>All provisional labels</option>
                     <option value="unlabeled">Unlabeled</option>
                     <option value="approval_required">Approval required</option>
                     <option value="waiting_for_input">Waiting for input</option>
@@ -137,54 +111,188 @@ import "../styles/global.css";
                 </label>
               </div>
             </div>
-            <div class="observation-grid" id="observation-grid"></div>
-            <p class="empty-state" id="empty-state" hidden>No observations match these filters.</p>
-            <nav class="pagination" aria-label="Observation pages">
-              <button class="button button-ghost" id="previous-page" type="button" disabled>
-                Previous
-              </button>
-              <span id="page-status">Showing 0–0</span>
-              <button class="button button-ghost" id="next-page" type="button" disabled>Next</button>
-            </nav>
+
+            <div class="label-context" id="label-context">
+              <div>
+                <span class="label-context-name" id="label-context-name">All observations</span>
+                <span class="label-context-count" id="label-context-count">0 results</span>
+              </div>
+              <p id="label-context-description">
+                Browse every stored observation, including examples that have not been labeled yet.
+              </p>
+            </div>
+
+            <div class="review-workspace">
+              <div class="review-queue">
+                <div class="review-queue-header">
+                  <div>
+                    <h3>Observations</h3>
+                    <p id="queue-description">Newest first.</p>
+                  </div>
+                  <span id="page-status">Showing 0–0</span>
+                </div>
+                <div class="observation-list" id="observation-list" role="list"></div>
+                <p class="empty-state" id="empty-state" hidden>
+                  No observations match these filters.
+                </p>
+                <nav class="pagination" aria-label="Observation pages">
+                  <button class="button button-ghost" id="previous-page" type="button" disabled>
+                    Previous
+                  </button>
+                  <button class="button button-ghost" id="next-page" type="button" disabled>
+                    Next
+                  </button>
+                </nav>
+              </div>
+
+              <article class="review-detail" id="review-detail" aria-live="polite">
+                <div class="review-detail-empty" id="review-detail-empty">
+                  <p class="kicker">Observation detail</p>
+                  <h3>Select an observation.</h3>
+                  <p>The label explanation, confidence, and terminal snapshot will appear here.</p>
+                </div>
+
+                <div class="review-detail-content" id="review-detail-content" hidden>
+                  <header class="review-detail-header">
+                    <div>
+                      <div class="detail-label-line">
+                        <span class="label-badge" id="detail-label">Unlabeled</span>
+                        <span class="detail-harness" id="detail-harness">Unknown harness</span>
+                      </div>
+                      <h3 id="detail-heading">Observation detail.</h3>
+                      <time id="detail-time"></time>
+                    </div>
+                  </header>
+
+                  <section class="decision-summary" aria-labelledby="decision-title">
+                    <div>
+                      <p class="detail-eyebrow" id="decision-title">Why this label</p>
+                      <p class="decision-rationale" id="detail-rationale">
+                        No labeling rationale was recorded.
+                      </p>
+                      <p class="decision-description" id="detail-label-description"></p>
+                    </div>
+                    <div class="confidence" id="detail-confidence">
+                      <div>
+                        <span>Confidence</span>
+                        <strong id="detail-confidence-value">Not recorded</strong>
+                      </div>
+                      <div
+                        class="confidence-track"
+                        role="progressbar"
+                        aria-label="Label confidence"
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        id="detail-confidence-track"
+                      >
+                        <span id="detail-confidence-bar"></span>
+                      </div>
+                    </div>
+                  </section>
+
+                  <dl class="observation-facts">
+                    <div>
+                      <dt>Event</dt>
+                      <dd id="detail-event">Unknown</dd>
+                    </div>
+                    <div>
+                      <dt>Activity</dt>
+                      <dd id="detail-activity">Unknown</dd>
+                    </div>
+                    <div>
+                      <dt>Evidence</dt>
+                      <dd id="detail-evidence">Unknown</dd>
+                    </div>
+                    <div>
+                      <dt>Session</dt>
+                      <dd id="detail-session">Unknown</dd>
+                    </div>
+                  </dl>
+
+                  <section class="terminal-detail" aria-labelledby="terminal-title">
+                    <div class="terminal-heading">
+                      <div>
+                        <p class="detail-eyebrow">Captured context</p>
+                        <h4 id="terminal-title">Terminal snapshot</h4>
+                      </div>
+                      <span id="terminal-size"></span>
+                    </div>
+                    <pre id="detail-terminal"></pre>
+                  </section>
+
+                  <details class="raw-payload">
+                    <summary>Raw observation JSON</summary>
+                    <pre id="detail-payload"></pre>
+                  </details>
+                </div>
+              </article>
+            </div>
           </section>
 
-          <section class="bundles-section" aria-labelledby="bundles-title">
-            <div class="section-heading">
-              <div>
-                <h2 id="bundles-title">Imported bundles.</h2>
-                <p>Expected and received counts make interrupted uploads visible.</p>
-              </div>
+          <details class="dataset-tools">
+            <summary>
+              <span>
+                <strong>Dataset tools</strong>
+                <span>Import another bundle or inspect import history.</span>
+              </span>
+              <span class="dataset-tools-count" id="dataset-tools-count">0 bundles</span>
+            </summary>
+            <div class="dataset-tools-content">
+              <section class="upload-section" aria-labelledby="upload-title">
+                <div class="section-heading">
+                  <div>
+                    <h2 id="upload-title">Import a bundle.</h2>
+                    <p>Select the directory created by <code>attention-study-data export</code>.</p>
+                  </div>
+                  <span class="privacy-badge">Terminal text included</span>
+                </div>
+                <div class="upload-well">
+                  <label class="file-picker" for="bundle-input">Choose bundle directory</label>
+                  <input
+                    id="bundle-input"
+                    name="bundle"
+                    type="file"
+                    multiple
+                  />
+                  <div class="upload-copy">
+                    <strong id="selected-bundle">No bundle selected</strong>
+                    <span id="selected-detail">Manifest and JSONL files remain unchanged locally.</span>
+                  </div>
+                  <button class="button button-primary" id="upload-button" type="button" disabled>
+                    Import observations
+                  </button>
+                </div>
+                <p class="upload-status" id="upload-status" aria-live="polite"></p>
+              </section>
+
+              <section class="bundles-section" aria-labelledby="bundles-title">
+                <div class="section-heading">
+                  <div>
+                    <h2 id="bundles-title">Imported bundles.</h2>
+                    <p>Expected and received counts make interrupted uploads visible.</p>
+                  </div>
+                </div>
+                <div class="table-scroll">
+                  <div class="table-inner">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Imported</th>
+                          <th>Source</th>
+                          <th>Bundle</th>
+                          <th class="number-column">Received</th>
+                        </tr>
+                      </thead>
+                      <tbody id="bundle-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </section>
             </div>
-            <div class="table-scroll">
-              <div class="table-inner">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Imported</th>
-                      <th>Source</th>
-                      <th>Bundle</th>
-                      <th class="number-column">Received</th>
-                    </tr>
-                  </thead>
-                  <tbody id="bundle-rows"></tbody>
-                </table>
-              </div>
-            </div>
-          </section>
+          </details>
         </div>
       </main>
     </div>
-
-    <dialog class="detail-dialog" id="detail-dialog">
-      <div class="dialog-header">
-        <div>
-          <p class="kicker">Stored observation</p>
-          <h2 id="detail-title">Observation payload.</h2>
-        </div>
-        <button class="button button-ghost" id="close-detail" type="button">Close</button>
-      </div>
-      <pre id="detail-payload"></pre>
-    </dialog>
 
     <script>
       import "../scripts/dashboard";

@@ -50,6 +50,12 @@ const observation = {
     hasUnreadNotification: false,
     processState: "Running",
   },
+  annotation: {
+    schemaVersion: 1,
+    provenance: "human_review",
+    confidence: 0.94,
+    rationale: "explicit_confirmation_request",
+  },
   outputVersion: 4,
   contentVersion: 3,
 };
@@ -102,6 +108,12 @@ describe("attention dashboard Worker", () => {
     expect(dashboardText).toContain('"kind":"total","name":"all","count":1');
     expect(dashboardText).toContain('"id":"6594bade-c891-42cb-8cb1-e51c16f1ab95"');
     expect(dashboardText).toContain('"grid":["Choose alpha or beta.","❯ "]');
+    expect(dashboardText).toContain('"confidence":0.94');
+    expect(dashboardText).toContain('"rationale":"explicit_confirmation_request"');
+
+    const labeledDashboard = await api("/api/dashboard?label=labeled");
+    expect(labeledDashboard.status).toBe(200);
+    await expect(labeledDashboard.text()).resolves.toContain(observationID);
 
     const detail = await api(`/api/observations/${observationID}`);
     expect(detail.status).toBe(200);

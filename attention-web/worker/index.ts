@@ -157,6 +157,9 @@ type ObservationRow = {
   recordedAt: string;
   event: string;
   label: string | null;
+  confidence: number | null;
+  rationale: string | null;
+  provenance: string | null;
   harness: string | null;
   sessionID: string;
   runID: string | null;
@@ -191,7 +194,9 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
 
   const conditions: string[] = [];
   const parameters: (string | number | null)[] = [];
-  if (label === "unlabeled") {
+  if (label === "labeled") {
+    conditions.push("label IS NOT NULL");
+  } else if (label === "unlabeled") {
     conditions.push("label IS NULL");
   } else if (label.length > 0) {
     if (!isAttentionLabel(label)) return json({ error: "invalid label filter" }, 400);
@@ -230,7 +235,11 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
       LIMIT 20`,
   ).all<BundleRow>();
   const observationsQuery = env.DB.prepare(
-    `SELECT id, recorded_at AS recordedAt, event, label, harness,
+    `SELECT id, recorded_at AS recordedAt, event, label,
+            json_extract(payload_json, '$.annotation.confidence') AS confidence,
+            json_extract(payload_json, '$.annotation.rationale') AS rationale,
+            json_extract(payload_json, '$.annotation.provenance') AS provenance,
+            harness,
             session_id AS sessionID, run_id AS runID, scenario_id AS scenarioID,
             checkpoint, columns_count AS columns, rows_count AS rows,
             grid_json AS gridJSON, activity_state AS activityState,

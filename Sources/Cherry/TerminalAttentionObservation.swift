@@ -36,11 +36,44 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
             let isVisible: Bool
         }
 
+        struct Color: Codable, Equatable, Sendable {
+            enum Space: String, Codable, Equatable, Sendable {
+                case ansi16
+                case palette256
+                case rgb
+            }
+
+            let space: Space
+            let components: [Int]
+        }
+
+        struct StyledRun: Codable, Equatable, Sendable {
+            enum Attribute: String, Codable, Equatable, Sendable {
+                case bold
+                case dim
+                case inverse
+                case italic
+                case underline
+                case strikethrough
+            }
+
+            let text: String
+            let foreground: Color?
+            let background: Color?
+            let attributes: [Attribute]
+        }
+
         let columns: Int
         let rows: Int
         let usesAlternateScreen: Bool
         let cursor: Cursor
         let grid: [String]
+        /// Optional styled runs corresponding one-for-one with `grid`.
+        ///
+        /// Older observations and native Ghostty surfaces that only expose
+        /// flattened text omit this field. Keeping `grid` authoritative makes
+        /// the addition backward compatible with schema version 1.
+        let styledGrid: [[StyledRun]]?
         let scrollbackLinesOmitted: Int
     }
 

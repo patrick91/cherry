@@ -36,6 +36,20 @@ const observation = {
     usesAlternateScreen: false,
     cursor: { row: 4, column: 2, shape: "block", isVisible: true },
     grid: ["Choose alpha or beta.", "❯ "],
+    styledGrid: [
+      [{
+        text: "Choose alpha or beta.",
+        foreground: { space: "palette256", components: [82] },
+        background: null,
+        attributes: ["bold"],
+      }],
+      [{
+        text: "❯ ",
+        foreground: { space: "rgb", components: [239, 91, 114] },
+        background: null,
+        attributes: [],
+      }],
+    ],
     scrollbackLinesOmitted: 4,
   },
   timing: {
@@ -117,7 +131,9 @@ describe("attention dashboard Worker", () => {
 
     const detail = await api(`/api/observations/${observationID}`);
     expect(detail.status).toBe(200);
-    await expect(detail.text()).resolves.toContain('"waiting_for_input"');
+    const detailText = await detail.text();
+    expect(detailText).toContain('"waiting_for_input"');
+    expect(detailText).toContain('"space":"palette256","components":[82]');
   });
 
   it("rejects invalid labels before writing", async () => {
@@ -129,5 +145,20 @@ describe("attention dashboard Worker", () => {
     });
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "unsupported observation label: looks_busy" });
+  });
+
+  it("rejects invalid terminal colors before writing", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const invalid = structuredClone(observation);
+    invalid.id = "5cd5c9dc-2734-4447-837e-e1060831d16c";
+    invalid.terminal.styledGrid[0][0].foreground.components = [999];
+    const response = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [invalid] }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "observation.terminal.styledGrid[0][0].foreground.components[0] must be an integer from 0 to 255",
+    });
   });
 });

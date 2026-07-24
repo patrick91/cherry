@@ -46,10 +46,25 @@ CHERRY_ATTENTION_RECORDING_DIR=/tmp/cherry-attention-observations swift run Cher
 ```
 
 Cherry lazily creates one private (`0600`) JSONL file per recorded agent
-session. Each record contains a schema version, terminal viewport text,
-dimensions, cursor state, screen mode, timing signals, output/content counters,
-heuristic evidence, and optional scenario metadata. It does not record submitted
-input separately, working directories, notification bodies, or command lines.
+session. Each record contains a schema version, terminal viewport text and
+optional styled runs, dimensions, cursor state, screen mode, timing signals,
+output/content counters, heuristic evidence, and optional scenario metadata.
+It does not record submitted input separately, working directories,
+notification bodies, or command lines.
+
+Existing schema-1 observations without `terminal.styledGrid` remain valid and
+display as plain text in the dashboard.
+
+Cherry's default native Ghostty PTY currently exposes flattened text only. To
+collect styled runs during an experiment, launch Cherry in its supported
+host-managed mode:
+
+```bash
+CHERRY_NATIVE_PTY=0 swift run Cherry
+```
+
+This mode changes the terminal IO path, so validate your harness workflow
+before using it for a long collection run.
 
 Use a dedicated directory outside the repository. Review every file before
 sharing it; opt-in collection makes no attempt to redact text already visible

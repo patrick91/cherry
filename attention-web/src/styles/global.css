@@ -851,12 +851,19 @@ select:focus {
   gap: 5px;
 }
 
-.terminal-heading > span {
+.terminal-heading > .terminal-capture-meta {
+  display: flex;
   flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
   color: var(--faint);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;
+}
+
+.terminal-capture-meta [data-colored="true"] {
+  color: var(--success);
 }
 
 .terminal-detail pre,
@@ -871,10 +878,31 @@ select:focus {
 }
 
 .terminal-detail pre {
+  --terminal-background: #080a0d;
+  --terminal-foreground: #d9dce3;
   max-height: 30rem;
   padding: 16px;
   border: 1px solid var(--line);
   border-radius: 10px;
+  color: var(--terminal-foreground);
+  background: var(--terminal-background);
+}
+
+.terminal-run {
+  color: var(--run-foreground, var(--terminal-foreground));
+  background: var(--run-background, transparent);
+}
+
+.terminal-run--bold {
+  font-weight: 700;
+}
+
+.terminal-run--dim {
+  opacity: 0.68;
+}
+
+.terminal-run--italic {
+  font-style: italic;
 }
 
 .raw-payload {

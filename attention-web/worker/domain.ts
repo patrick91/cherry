@@ -86,6 +86,70 @@ function isoDate(value: unknown, description: string): string {
   return text;
 }
 
+function validateTerminalColor(value: unknown, description: string): void {
+  const color = objectValue(value, description);
+  const space = requiredString(color.space, `${description}.space`, 32);
+  if (!Array.isArray(color.components)) {
+    throw new ValidationError(`${description}.components must be an array`);
+  }
+  if (space === "ansi16" || space === "palette256") {
+    const maximum = space === "ansi16" ? 15 : 255;
+    if (color.components.length !== 1) {
+      throw new ValidationError(`${description}.components must contain one index`);
+    }
+    integerValue(color.components[0], `${description}.components[0]`, 0, maximum);
+    return;
+  }
+  if (space === "rgb") {
+    if (color.components.length !== 3) {
+      throw new ValidationError(`${description}.components must contain red, green, and blue`);
+    }
+    color.components.forEach((component, index) => {
+      integerValue(component, `${description}.components[${index}]`, 0, 255);
+    });
+    return;
+  }
+  throw new ValidationError(`${description}.space is unsupported`);
+}
+
+function validateStyledGrid(value: unknown, gridLineCount: number): void {
+  if (!Array.isArray(value) || value.length !== gridLineCount) {
+    throw new ValidationError("observation.terminal.styledGrid must correspond to terminal.grid");
+  }
+  const attributes = new Set([
+    "bold", "dim", "inverse", "italic", "underline", "strikethrough",
+  ]);
+  value.forEach((line, lineIndex) => {
+    if (!Array.isArray(line) || line.length > 1_024) {
+      throw new ValidationError(`observation.terminal.styledGrid[${lineIndex}] is invalid`);
+    }
+    let textLength = 0;
+    line.forEach((run, runIndex) => {
+      const description = `observation.terminal.styledGrid[${lineIndex}][${runIndex}]`;
+      const styledRun = objectValue(run, description);
+      const text = requiredString(styledRun.text, `${description}.text`, 1_024);
+      textLength += text.length;
+      if (textLength > 1_024) {
+        throw new ValidationError(`observation.terminal.styledGrid[${lineIndex}] is too long`);
+      }
+      if (!Array.isArray(styledRun.attributes) || styledRun.attributes.length > attributes.size) {
+        throw new ValidationError(`${description}.attributes is invalid`);
+      }
+      for (const attribute of styledRun.attributes) {
+        if (typeof attribute !== "string" || !attributes.has(attribute)) {
+          throw new ValidationError(`${description}.attributes contains an unsupported value`);
+        }
+      }
+      if (styledRun.foreground !== undefined && styledRun.foreground !== null) {
+        validateTerminalColor(styledRun.foreground, `${description}.foreground`);
+      }
+      if (styledRun.background !== undefined && styledRun.background !== null) {
+        validateTerminalColor(styledRun.background, `${description}.background`);
+      }
+    });
+  });
+}
+
 export function parseBundle(value: unknown): BundleRecord {
   const bundle = objectValue(value, "bundle");
   if (bundle.bundleSchemaVersion !== 1 || bundle.observationSchemaVersion !== 1) {
@@ -138,6 +202,9 @@ export function parseObservation(value: unknown): ObservationRecord {
     }
     return line;
   });
+  if (terminal.styledGrid !== undefined && terminal.styledGrid !== null) {
+    validateStyledGrid(terminal.styledGrid, grid.length);
+  }
 
   const payloadJSON = JSON.stringify(observation);
   if (new TextEncoder().encode(payloadJSON).byteLength > maximumObservationBytes) {

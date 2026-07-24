@@ -28,7 +28,9 @@ struct TerminalAttentionObservationTests {
         }
 
         session.resize(columns: 24, rows: 3)
-        session.ingestTestingData(Data("old scrollback\nworking\napproval required\n❯ \n".utf8))
+        session.ingestTestingData(Data(
+            "old scrollback\nworking\n\u{1B}[38;5;82mapproval required\u{1B}[0m\n❯ \n".utf8
+        ))
         try await Task.sleep(for: .milliseconds(150))
 
         let capture = try session.captureAttentionObservation(
@@ -55,6 +57,11 @@ struct TerminalAttentionObservationTests {
         #expect(observation.terminal.rows == 3)
         #expect(observation.terminal.grid.count <= 3)
         #expect(observation.terminal.grid.joined(separator: "\n").contains("approval required"))
+        let styledGrid = try #require(observation.terminal.styledGrid)
+        let approvalRun = try #require(styledGrid.flatMap { $0 }.first {
+            $0.text.contains("approval required")
+        })
+        #expect(approvalRun.foreground == .init(space: .palette256, components: [82]))
         #expect(observation.terminal.scrollbackLinesOmitted > 0)
 
         let attributes = try FileManager.default.attributesOfItem(atPath: capture.outputURL.path)
@@ -95,6 +102,47 @@ struct TerminalAttentionObservationTests {
         let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
         #expect(observations.contains { $0.event == .contentChanged && $0.label == nil })
         #expect(observations.contains { $0.event == .labeledCheckpoint && $0.label == .noAttentionNeeded })
+    }
+
+    @Test func schemaOneObservationWithoutStyledGridStillDecodes() throws {
+        let json = """
+        {
+          "activity": {
+            "evidence": "none",
+            "hasUnreadNotification": false,
+            "processState": "Running",
+            "state": "unknown"
+          },
+          "contentVersion": 1,
+          "event": "content_changed",
+          "id": "6594bade-c891-42cb-8cb1-e51c16f1ab95",
+          "outputVersion": 1,
+          "recordedAt": "2026-07-22T12:00:01Z",
+          "schemaVersion": 1,
+          "session": {
+            "id": "4c5d7267-f12c-4e8d-a821-65b9f8bf848c",
+            "kind": "agent"
+          },
+          "terminal": {
+            "columns": 80,
+            "cursor": {"column": 0, "isVisible": true, "row": 0, "shape": "block"},
+            "grid": ["plain text"],
+            "rows": 24,
+            "scrollbackLinesOmitted": 0,
+            "usesAlternateScreen": false
+          },
+          "timing": {}
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let observation = try decoder.decode(
+            TerminalAttentionObservation.self,
+            from: Data(json.utf8)
+        )
+
+        #expect(observation.terminal.grid == ["plain text"])
+        #expect(observation.terminal.styledGrid == nil)
     }
 
     @Test func nativeHostSubmissionRecordsInputSubmittedEvent() throws {

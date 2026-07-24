@@ -3666,6 +3666,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         let grid = contentSnapshot(range: gridStart..<lineCount).map { line in
             String(line.prefix(columnLimit))
         }
+        let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]?
+        if GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil {
+            // Native EXEC surfaces currently expose only `readText`, so emitting
+            // processor styles here would attach stale or unrelated formatting.
+            styledGrid = nil
+        } else {
+            styledGrid = Self.attentionStyledGrid(
+                styledSnapshot(range: gridStart..<lineCount),
+                columnLimit: columnLimit
+            )
+        }
         let cursor = cursorState
 
         return TerminalAttentionObservation(
@@ -3694,6 +3705,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     isVisible: cursor.isVisible
                 ),
                 grid: grid,
+                styledGrid: styledGrid,
                 scrollbackLinesOmitted: gridStart
             ),
             timing: .init(
@@ -3712,6 +3724,69 @@ final class TerminalSession: ObservableObject, Identifiable {
             outputVersion: outputVersion,
             contentVersion: contentVersion
         )
+    }
+
+    private static func attentionStyledGrid(
+        _ lines: [TerminalRenderedLine],
+        columnLimit: Int
+    ) -> [[TerminalAttentionObservation.TerminalContext.StyledRun]]? {
+        var containsStyle = false
+        let styledLines = lines.map { line in
+            var consumedColumns = 0
+            var output: [TerminalAttentionObservation.TerminalContext.StyledRun] = []
+
+            for run in line.runs where consumedColumns < columnLimit {
+                var text = ""
+                var reachedColumnLimit = false
+                for character in run.text {
+                    let width = TerminalTextRun.cellWidth(for: character)
+                    guard consumedColumns + width <= columnLimit else {
+                        reachedColumnLimit = true
+                        break
+                    }
+                    text.append(character)
+                    consumedColumns += width
+                }
+                if !text.isEmpty {
+                    let style = run.style
+                    if style != TerminalTextStyle() {
+                        containsStyle = true
+                    }
+                    var attributes: [TerminalAttentionObservation.TerminalContext.StyledRun.Attribute] = []
+                    if style.isBold { attributes.append(.bold) }
+                    if style.isDim { attributes.append(.dim) }
+                    if style.isInverse { attributes.append(.inverse) }
+                    if style.isItalic { attributes.append(.italic) }
+                    if style.isUnderline { attributes.append(.underline) }
+                    if style.isStrikethrough { attributes.append(.strikethrough) }
+                    output.append(.init(
+                        text: text,
+                        foreground: attentionColor(style.foreground),
+                        background: attentionColor(style.background),
+                        attributes: attributes
+                    ))
+                }
+                if reachedColumnLimit { break }
+            }
+
+            return output
+        }
+
+        return containsStyle ? styledLines : nil
+    }
+
+    private static func attentionColor(
+        _ color: TerminalANSIColor?
+    ) -> TerminalAttentionObservation.TerminalContext.Color? {
+        guard let color else { return nil }
+        switch color {
+        case let .ansi16(index):
+            return .init(space: .ansi16, components: [index])
+        case let .palette256(index):
+            return .init(space: .palette256, components: [index])
+        case let .rgb(red, green, blue):
+            return .init(space: .rgb, components: [Int(red), Int(green), Int(blue)])
+        }
     }
 
     private var attentionActivityEvidenceName: String {

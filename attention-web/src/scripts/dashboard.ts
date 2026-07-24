@@ -14,6 +14,16 @@ type StudyManifest = {
 };
 
 type Aggregate = { kind: string; name: string; count: number };
+type TerminalColor = {
+  space: "ansi16" | "palette256" | "rgb";
+  components: number[];
+};
+type StyledTerminalRun = {
+  text: string;
+  foreground: TerminalColor | null;
+  background: TerminalColor | null;
+  attributes: string[];
+};
 type ObservationSummary = {
   id: string;
   recordedAt: string;
@@ -306,6 +316,133 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
+function terminalColor(value: unknown): TerminalColor | null {
+  const record = payloadRecord(value);
+  const space = record.space;
+  const components = record.components;
+  if (
+    (space !== "ansi16" && space !== "palette256" && space !== "rgb")
+    || !Array.isArray(components)
+    || !components.every((component) => Number.isInteger(component))
+  ) {
+    return null;
+  }
+  return { space, components: components as number[] };
+}
+
+function styledTerminalGrid(value: unknown, lineCount: number): StyledTerminalRun[][] | null {
+  if (!Array.isArray(value) || value.length !== lineCount) return null;
+  const lines: StyledTerminalRun[][] = [];
+  for (const valueLine of value) {
+    if (!Array.isArray(valueLine)) return null;
+    const line: StyledTerminalRun[] = [];
+    for (const valueRun of valueLine) {
+      const run = payloadRecord(valueRun);
+      if (
+        typeof run.text !== "string"
+        || !Array.isArray(run.attributes)
+        || !run.attributes.every((attribute) => typeof attribute === "string")
+      ) {
+        return null;
+      }
+      line.push({
+        text: run.text,
+        foreground: run.foreground === undefined || run.foreground === null
+          ? null
+          : terminalColor(run.foreground),
+        background: run.background === undefined || run.background === null
+          ? null
+          : terminalColor(run.background),
+        attributes: run.attributes as string[],
+      });
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+const ansi16Colors = [
+  "#000000", "#cd0000", "#00cd00", "#cdcd00",
+  "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+  "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+  "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+];
+
+function byte(value: number): number {
+  return Math.max(0, Math.min(255, value));
+}
+
+function cssTerminalColor(color: TerminalColor | null): string | null {
+  if (color === null) return null;
+  if (color.space === "ansi16") {
+    const index = color.components[0];
+    return typeof index === "number" ? ansi16Colors[index] ?? null : null;
+  }
+  if (color.space === "rgb" && color.components.length === 3) {
+    return `rgb(${color.components.map(byte).join(" ")})`;
+  }
+  const index = color.components[0];
+  if (color.space !== "palette256" || typeof index !== "number" || index < 0 || index > 255) {
+    return null;
+  }
+  if (index < 16) return ansi16Colors[index] ?? null;
+  if (index >= 232) {
+    const level = 8 + ((index - 232) * 10);
+    return `rgb(${level} ${level} ${level})`;
+  }
+  const offset = index - 16;
+  const levels = [0, 95, 135, 175, 215, 255];
+  const red = levels[Math.floor(offset / 36)] ?? 0;
+  const green = levels[Math.floor((offset % 36) / 6)] ?? 0;
+  const blue = levels[offset % 6] ?? 0;
+  return `rgb(${red} ${green} ${blue})`;
+}
+
+function renderTerminal(
+  target: HTMLElement,
+  grid: string[],
+  styledValue: unknown,
+): boolean {
+  const styledGrid = styledTerminalGrid(styledValue, grid.length);
+  if (styledGrid === null) {
+    target.textContent = grid.join("\n").trimEnd() || "(Empty terminal grid.)";
+    return false;
+  }
+
+  const fragment = document.createDocumentFragment();
+  styledGrid.forEach((line, lineIndex) => {
+    for (const run of line) {
+      const span = document.createElement("span");
+      span.className = "terminal-run";
+      span.textContent = run.text;
+
+      let foreground = cssTerminalColor(run.foreground);
+      let background = cssTerminalColor(run.background);
+      const attributes = new Set(run.attributes);
+      if (attributes.has("inverse")) {
+        [foreground, background] = [
+          background ?? "var(--terminal-background)",
+          foreground ?? "var(--terminal-foreground)",
+        ];
+      }
+      if (foreground !== null) span.style.setProperty("--run-foreground", foreground);
+      if (background !== null) span.style.setProperty("--run-background", background);
+      if (attributes.has("bold")) span.classList.add("terminal-run--bold");
+      if (attributes.has("dim")) span.classList.add("terminal-run--dim");
+      if (attributes.has("italic")) span.classList.add("terminal-run--italic");
+      const decorations = [
+        attributes.has("underline") ? "underline" : null,
+        attributes.has("strikethrough") ? "line-through" : null,
+      ].filter((value): value is string => value !== null);
+      if (decorations.length > 0) span.style.textDecorationLine = decorations.join(" ");
+      fragment.append(span);
+    }
+    if (lineIndex < styledGrid.length - 1) fragment.append("\n");
+  });
+  target.replaceChildren(fragment);
+  return true;
+}
+
 async function selectObservation(
   observation: ObservationSummary,
   scrollDetail: boolean,
@@ -369,7 +506,17 @@ async function selectObservation(
   const columns = typeof terminal.columns === "number" ? terminal.columns : observation.columns;
   const rows = typeof terminal.rows === "number" ? terminal.rows : observation.rows;
   element("terminal-size").textContent = `${columns} × ${rows}`;
-  element("detail-terminal").textContent = grid.join("\n").trimEnd() || "(Empty terminal grid.)";
+  const hasColor = renderTerminal(
+    element("detail-terminal"),
+    grid,
+    terminal.styledGrid,
+  );
+  const renderMode = element("terminal-render-mode");
+  renderMode.textContent = hasColor ? "ANSI color" : "Plain text";
+  renderMode.dataset.colored = String(hasColor);
+  renderMode.title = hasColor
+    ? "Foreground, background, and text attributes were retained by Cherry."
+    : "This observation was captured without terminal style information.";
   element("detail-payload").textContent = JSON.stringify(payload, null, 2);
 
   if (scrollDetail && window.matchMedia("(max-width: 799px)").matches) {

@@ -232,6 +232,27 @@ struct TerminalAttentionObservationTests {
         )
     }
 
+    @Test func studyModeDefaultsToStyledTerminalPathUnlessExplicitlyOverridden() {
+        #expect(
+            GhosttySessionBridge.resolveNativePTYEnabled(
+                environment: [:],
+                attentionRecordingEnabled: true
+            ) == false
+        )
+        #expect(
+            GhosttySessionBridge.resolveNativePTYEnabled(
+                environment: ["CHERRY_NATIVE_PTY": "1"],
+                attentionRecordingEnabled: true
+            )
+        )
+        #expect(
+            GhosttySessionBridge.resolveNativePTYEnabled(
+                environment: ["CHERRY_NATIVE_PTY": "off"],
+                attentionRecordingEnabled: false
+            ) == false
+        )
+    }
+
     @Test func studyDirectoryPrunesOldestJSONLFilesToLimit() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("cherry-attention-prune-\(UUID().uuidString)", isDirectory: true)

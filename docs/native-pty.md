@@ -1,9 +1,10 @@
 # Native-PTY migration (eliminating terminal replay)
 
-Status: **native-PTY is now the DEFAULT** (merged to `main`). The legacy
-host-managed (replay) path is still present as an opt-out — `CHERRY_NATIVE_PTY=0`
-or `-DCHERRY_DISABLE_NATIVE_PTY`. The remaining cutover step is deleting the replay
-subsystem once we're confident we won't need the fallback.
+Status: **native-PTY is now the DEFAULT** (merged to `main`), except while
+Attention Study is enabled because styled observation capture currently needs
+the host-managed path. `CHERRY_NATIVE_PTY=0` or `1` explicitly selects either
+path. The remaining cutover step is deleting the replay subsystem once styled
+cells are available from the native path.
 
 ## Why
 

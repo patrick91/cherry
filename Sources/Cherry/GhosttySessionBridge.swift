@@ -2651,15 +2651,26 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return true
     }
 
-    /// Ghostty's native-PTY model — **the default**. Surfaces use the EXEC backend
-    /// (ghostty owns the PTY/Screen) instead of host-managed in-memory feeding, so
-    /// replay is impossible by construction. Force the legacy host-managed (replay)
-    /// path with `CHERRY_NATIVE_PTY=0` or `-DCHERRY_DISABLE_NATIVE_PTY`.
-    static let nativePTYEnabled: Bool = {
-        if let raw = ProcessInfo.processInfo.environment["CHERRY_NATIVE_PTY"] {
+    /// Ghostty's native-PTY model — the default outside Attention Study. Study
+    /// mode uses host-managed in-memory feeding so observations can retain the
+    /// terminal's styled cells. `CHERRY_NATIVE_PTY` always wins when explicitly
+    /// set, providing an escape hatch in either direction.
+    static let nativePTYEnabled = resolveNativePTYEnabled(
+        environment: ProcessInfo.processInfo.environment,
+        attentionRecordingEnabled: TerminalAttentionStudy.configuredDirectoryURL() != nil
+    )
+
+    static func resolveNativePTYEnabled(
+        environment: [String: String],
+        attentionRecordingEnabled: Bool
+    ) -> Bool {
+        if let raw = environment["CHERRY_NATIVE_PTY"] {
             // Explicit override: 0/false/no/off forces the legacy host-managed
             // (replay) path; anything else keeps native on.
             return !["0", "false", "no", "off"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased())
+        }
+        if attentionRecordingEnabled {
+            return false
         }
         // Native-PTY is the default: the ghostty surface owns the PTY (no replay).
         // Build the legacy host-managed path with `-DCHERRY_DISABLE_NATIVE_PTY`.
@@ -2668,7 +2679,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         #else
         return true
         #endif
-    }()
+    }
 
     private static func makeOptions(
         for session: TerminalSession,

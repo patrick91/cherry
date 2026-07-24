@@ -22,8 +22,9 @@ diagnostic evidence, never as training truth.
 ## Week-Long Study Mode
 
 On the laptop, open **Settings → Terminal → Attention Study** and enable
-**Collect agent observations**. The setting applies to active and future agent
-sessions without requiring an app restart.
+**Collect agent observations**, then restart Cherry. Collection begins
+immediately, but the restart selects the color-preserving terminal path for new
+sessions. After that, styled capture is automatic whenever study mode is enabled.
 
 Recordings are stored in:
 
@@ -55,16 +56,16 @@ notification bodies, or command lines.
 Existing schema-1 observations without `terminal.styledGrid` remain valid and
 display as plain text in the dashboard.
 
-Cherry's default native Ghostty PTY currently exposes flattened text only. To
-collect styled runs during an experiment, launch Cherry in its supported
-host-managed mode:
+Cherry's default native Ghostty PTY currently exposes flattened text only, so
+Attention Study automatically selects Cherry's supported host-managed terminal
+path at launch. To select it explicitly during an isolated experiment, use:
 
 ```bash
 CHERRY_NATIVE_PTY=0 swift run Cherry
 ```
 
-This mode changes the terminal IO path, so validate your harness workflow
-before using it for a long collection run.
+Set `CHERRY_NATIVE_PTY=1` to override study mode and use the native path; those
+observations will be plain text until native Ghostty exposes styled cells.
 
 Use a dedicated directory outside the repository. Review every file before
 sharing it; opt-in collection makes no attempt to redact text already visible

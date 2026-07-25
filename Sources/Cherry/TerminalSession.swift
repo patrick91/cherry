@@ -2166,6 +2166,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastSummaryDate: Date?
     private var lastHumanInputLine: Int?
     private var lastHumanInputAt: Date?
+    private var lastHumanKeystrokeAt: Date?
+    private var hasUnsubmittedHumanInput = false
     private var humanInputGeneration = 0
     private var agentActivitySource: AgentActivitySource = .none
     private var titleIndicatesAgentWorking = false
@@ -2194,6 +2196,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         case titleSpinner
         case notification
         case processExit
+    }
+
+    private enum AgentDraftInputEffect: Equatable {
+        case none
+        case inserted
+        case edited
+        case cleared
+        case submitted
     }
 
     private struct RenderedReplayCache {
@@ -2609,6 +2619,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if inputDebugEnabled {
             fputs("[send interrupt] shellProcess=\(shellProcess != nil)\n", stderr)
         }
+        noteAgentDraftCleared()
         processor.discardPendingOutput()
         if GhosttySessionBridge.nativePTYEnabled {
             ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
@@ -2619,11 +2630,8 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func noteNativeHostInput(event: NSEvent?) {
         noteInputOutputBaseline()
-        guard kind == .agent, Self.appKitKeyEventSubmitsAgentTurn(event) else { return }
-        noteHumanInputIfNeeded()
-        setAgentActivityState(.working, source: .inputSubmit)
-        scheduleAgentIdleRecheck()
-        scheduleAttentionObservation(event: .inputSubmitted)
+        guard kind == .agent, let event else { return }
+        applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
     }
 
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
@@ -2775,6 +2783,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         resetKeyboardProtocolState()
         lastHumanInputLine = nil
         lastHumanInputAt = nil
+        lastHumanKeystrokeAt = nil
+        hasUnsubmittedHumanInput = false
         outputHoldUntil = nil
         pendingResolvedCommandLine = nil
         resolvedCommandLine = nil
@@ -2972,6 +2982,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         exitedAt = nil
         lastOutputAt = nil
         lastHumanInputAt = nil
+        lastHumanKeystrokeAt = nil
+        hasUnsubmittedHumanInput = false
         childProcessID = nil
         exitCode = nil
         nixShellEnvironment = nil
@@ -3239,14 +3251,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func noteInputBurst(_ input: Data) {
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
-        if kind == .agent {
-            if Self.agentInputSubmitsTurn(input) {
-                noteHumanInputIfNeeded()
-                setAgentActivityState(.working, source: .inputSubmit)
-                scheduleAgentIdleRecheck()
-                scheduleAttentionObservation(event: .inputSubmitted)
-            }
-        }
+        guard kind == .agent else { return }
+        applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
     }
 
     private func noteInputOutputBaseline() {
@@ -3611,7 +3617,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
         guard kind == .agent, attentionObservationDirectoryProvider() != nil else { return }
 
-        if event != .contentChanged {
+        let isDebounced = event == .contentChanged || event == .inputChanged
+        if !isDebounced {
+            attentionObservationTask?.cancel()
+            attentionObservationTask = nil
             recordAttentionObservation(event: event)
             return
         }
@@ -3621,7 +3630,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             try? await Task.sleep(for: .milliseconds(Int(Self.attentionObservationInterval * 1_000)))
             guard let self, !Task.isCancelled else { return }
             self.attentionObservationTask = nil
-            self.recordAttentionObservation(event: .contentChanged)
+            self.recordAttentionObservation(event: event)
         }
     }
 
@@ -3720,6 +3729,11 @@ final class TerminalSession: ObservableObject, Identifiable {
                 hasUnreadNotification: hasUnreadNotification,
                 processState: state.label,
                 exitCode: exitCode
+            ),
+            interaction: .init(
+                hasUnsubmittedInput: hasUnsubmittedHumanInput,
+                millisecondsSinceLastKeystroke: Self.milliseconds(since: lastHumanKeystrokeAt, now: now),
+                terminalFocused: ghosttyBridgeStorage?.isTerminalFocused ?? false
             ),
             outputVersion: outputVersion,
             contentVersion: contentVersion
@@ -4317,12 +4331,109 @@ final class TerminalSession: ObservableObject, Identifiable {
         return false
     }
 
+    private static let enhancedShiftEnterBytes = Data("\u{1B}[13;2u".utf8)
+
+    private static func agentDraftInputEffect(_ data: Data) -> AgentDraftInputEffect {
+        guard !data.isEmpty else { return .none }
+        if agentInputSubmitsTurn(data) {
+            return .submitted
+        }
+
+        let bytes = Array(data)
+        if bytes.contains(0x03) || bytes.contains(0x15) {
+            return .cleared
+        }
+        if data == enhancedShiftEnterBytes {
+            return .inserted
+        }
+        if bytes.starts(with: bracketedPasteStartBytes),
+           bytes.count > bracketedPasteStartBytes.count + bracketedPasteEndBytes.count,
+           bytes.suffix(bracketedPasteEndBytes.count).elementsEqual(bracketedPasteEndBytes) {
+            return .inserted
+        }
+        if bytes.first == 0x1B {
+            if bytes == [0x1B, 0x7F] || bytes == Array("\u{1B}[3~".utf8) {
+                return .edited
+            }
+            return .none
+        }
+        if bytes.contains(where: { (0x20...0x7E).contains($0) || $0 >= 0x80 }) {
+            return .inserted
+        }
+        if bytes.contains(where: { $0 == 0x08 || $0 == 0x17 || $0 == 0x7F }) {
+            return .edited
+        }
+        return .none
+    }
+
     static func appKitKeyEventSubmitsAgentTurn(_ event: NSEvent?) -> Bool {
         guard let event, event.type == .keyDown else { return false }
         guard event.keyCode == 36 || event.keyCode == 76 else { return false }
 
         let heldModifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
         return heldModifiers.isEmpty
+    }
+
+    private static func appKitDraftInputEffect(_ event: NSEvent) -> AgentDraftInputEffect {
+        guard event.type == .keyDown else { return .none }
+        if appKitKeyEventSubmitsAgentTurn(event) {
+            return .submitted
+        }
+
+        let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        if modifiers.contains(.command) {
+            return event.charactersIgnoringModifiers?.lowercased() == "v" ? .inserted : .none
+        }
+        if event.keyCode == 51 || event.keyCode == 117 {
+            return .edited
+        }
+        if modifiers.contains(.shift), (event.keyCode == 36 || event.keyCode == 76) {
+            return .inserted
+        }
+        if modifiers.contains(.control),
+           let scalar = event.characters?.unicodeScalars.first {
+            switch scalar.value {
+            case 0x03, 0x15:
+                return .cleared
+            case 0x17:
+                return .edited
+            default:
+                return .none
+            }
+        }
+        guard let characters = event.characters, !characters.isEmpty else { return .none }
+        return characters.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) })
+            ? .inserted
+            : .none
+    }
+
+    private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
+        guard kind == .agent, effect != .none else { return }
+        lastHumanKeystrokeAt = Date()
+
+        switch effect {
+        case .none:
+            return
+        case .inserted:
+            hasUnsubmittedHumanInput = true
+            scheduleAttentionObservation(event: .inputChanged)
+        case .edited:
+            scheduleAttentionObservation(event: .inputChanged)
+        case .cleared:
+            hasUnsubmittedHumanInput = false
+            scheduleAttentionObservation(event: .inputChanged)
+        case .submitted:
+            hasUnsubmittedHumanInput = false
+            noteHumanInputIfNeeded()
+            setAgentActivityState(.working, source: .inputSubmit)
+            scheduleAgentIdleRecheck()
+            scheduleAttentionObservation(event: .inputSubmitted)
+        }
+    }
+
+    private func noteAgentDraftCleared() {
+        guard kind == .agent else { return }
+        applyAgentDraftInputEffect(.cleared)
     }
 
     @discardableResult

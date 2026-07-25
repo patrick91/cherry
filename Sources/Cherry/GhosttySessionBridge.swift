@@ -559,6 +559,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         window.makeFirstResponder(terminalView)
     }
 
+    var isTerminalFocused: Bool {
+        guard let window = terminalView.window else { return false }
+        return NSApp.isActive && window.isKeyWindow && window.firstResponder === terminalView
+    }
+
     func applyTerminalSettings(colorScheme: ColorScheme) {
         activeColorScheme = colorScheme
         applyTerminalSettings()

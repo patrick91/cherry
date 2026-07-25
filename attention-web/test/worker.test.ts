@@ -64,6 +64,11 @@ const observation = {
     hasUnreadNotification: false,
     processState: "Running",
   },
+  interaction: {
+    hasUnsubmittedInput: true,
+    millisecondsSinceLastKeystroke: 850,
+    terminalFocused: false,
+  },
   annotation: {
     schemaVersion: 1,
     provenance: "human_review",
@@ -135,6 +140,7 @@ describe("attention dashboard Worker", () => {
     const detailText = await detail.text();
     expect(detailText).toContain('"waiting_for_input"');
     expect(detailText).toContain('"space":"palette256","components":[82]');
+    expect(detailText).toContain('"hasUnsubmittedInput":true');
   });
 
   it("rejects invalid labels before writing", async () => {
@@ -160,6 +166,21 @@ describe("attention dashboard Worker", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
       error: "observation.terminal.styledGrid[0][0].foreground.components[0] must be an integer from 0 to 255",
+    });
+  });
+
+  it("rejects invalid interaction signals before writing", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const invalid = structuredClone(observation);
+    invalid.id = "5cd5c9dc-2734-4447-837e-e1060831d16c";
+    invalid.interaction.hasUnsubmittedInput = "yes" as unknown as boolean;
+    const response = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [invalid] }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "observation.interaction.hasUnsubmittedInput must be a boolean",
     });
   });
 });

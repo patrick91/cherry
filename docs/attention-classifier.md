@@ -49,7 +49,9 @@ CHERRY_ATTENTION_RECORDING_DIR=/tmp/cherry-attention-observations swift run Cher
 Cherry lazily creates one private (`0600`) JSONL file per recorded agent
 session. Each record contains a schema version, terminal viewport text and
 optional styled runs, dimensions, cursor state, screen mode, timing signals,
-output/content counters, heuristic evidence, and optional scenario metadata.
+output/content counters, heuristic evidence, optional scenario metadata, and
+an optional interaction block recording whether input was left unsubmitted,
+time since the last editing keystroke, and whether the terminal was focused.
 It does not record submitted input separately, working directories,
 notification bodies, or command lines.
 

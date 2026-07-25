@@ -1,5 +1,6 @@
 const observationEvents = new Set([
   "content_changed",
+  "input_changed",
   "input_submitted",
   "activity_state_changed",
   "notification",
@@ -74,6 +75,13 @@ function optionalString(value: unknown, description: string, maximumLength = 200
 function integerValue(value: unknown, description: string, minimum: number, maximum: number): number {
   if (!Number.isInteger(value) || typeof value !== "number" || value < minimum || value > maximum) {
     throw new ValidationError(`${description} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return value;
+}
+
+function booleanValue(value: unknown, description: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new ValidationError(`${description} must be a boolean`);
   }
   return value;
 }
@@ -193,6 +201,25 @@ export function parseObservation(value: unknown): ObservationRecord {
   const session = objectValue(observation.session, "observation.session");
   const terminal = objectValue(observation.terminal, "observation.terminal");
   const activity = objectValue(observation.activity, "observation.activity");
+  if (observation.interaction !== undefined && observation.interaction !== null) {
+    const interaction = objectValue(observation.interaction, "observation.interaction");
+    booleanValue(
+      interaction.hasUnsubmittedInput,
+      "observation.interaction.hasUnsubmittedInput",
+    );
+    if (
+      interaction.millisecondsSinceLastKeystroke !== undefined
+      && interaction.millisecondsSinceLastKeystroke !== null
+    ) {
+      integerValue(
+        interaction.millisecondsSinceLastKeystroke,
+        "observation.interaction.millisecondsSinceLastKeystroke",
+        0,
+        2_147_483_647,
+      );
+    }
+    booleanValue(interaction.terminalFocused, "observation.interaction.terminalFocused");
+  }
   if (!Array.isArray(terminal.grid) || terminal.grid.length > 200) {
     throw new ValidationError("observation.terminal.grid must contain at most 200 lines");
   }

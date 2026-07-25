@@ -220,6 +220,15 @@ function rationaleText(value: string | null): string {
   return rationaleDescriptions[value] ?? formatIdentifier(value);
 }
 
+function formatLastEdit(milliseconds: number | null): string {
+  if (milliseconds === null) return "Last edit time was not captured.";
+  if (milliseconds < 1_000) return "Last edit was less than a second before capture.";
+  const seconds = Math.round(milliseconds / 1_000);
+  if (seconds < 60) return `Last edit was ${seconds.toLocaleString()} seconds before capture.`;
+  const minutes = Math.round(seconds / 60);
+  return `Last edit was ${minutes.toLocaleString()} ${minutes === 1 ? "minute" : "minutes"} before capture.`;
+}
+
 function setLabelBadge(badge: HTMLElement, label: string | null): void {
   const key = label ?? "unlabeled";
   badge.textContent = formatLabel(label);
@@ -397,6 +406,7 @@ async function selectObservation(observation: ObservationSummary): Promise<void>
 
   const record = payloadRecord(payload);
   const terminal = payloadRecord(record.terminal);
+  const interaction = payloadRecord(record.interaction);
   const grid = stringArray(terminal.grid);
   const labelKey = observation.label ?? "unlabeled";
   const information = labelInformation[labelKey] ?? {
@@ -420,6 +430,37 @@ async function selectObservation(observation: ObservationSummary): Promise<void>
   element("detail-activity").textContent = formatIdentifier(observation.activityState);
   element("detail-evidence").textContent = formatIdentifier(observation.activityEvidence);
   element("detail-session").textContent = observation.sessionID;
+
+  const hasUnsubmittedInput = typeof interaction.hasUnsubmittedInput === "boolean"
+    ? interaction.hasUnsubmittedInput
+    : null;
+  const millisecondsSinceLastKeystroke =
+    typeof interaction.millisecondsSinceLastKeystroke === "number"
+    && Number.isFinite(interaction.millisecondsSinceLastKeystroke)
+      ? Math.max(0, interaction.millisecondsSinceLastKeystroke)
+      : null;
+  const terminalFocused = typeof interaction.terminalFocused === "boolean"
+    ? interaction.terminalFocused
+    : null;
+  const interactionSummary = element<HTMLElement>("interaction-summary");
+  const hasInteractionData = hasUnsubmittedInput !== null || terminalFocused !== null;
+  interactionSummary.hidden = !hasInteractionData;
+  if (hasInteractionData) {
+    interactionSummary.dataset.draft = String(hasUnsubmittedInput === true);
+    element("detail-interaction-title").textContent = hasUnsubmittedInput
+      ? "Unsubmitted input detected."
+      : "No unsubmitted input detected.";
+    const focusDescription = terminalFocused === null
+      ? "Focus state was not captured."
+      : terminalFocused
+        ? "The terminal was focused."
+        : "The terminal was not focused.";
+    const evidenceDescription = hasUnsubmittedInput
+      ? " Suggested evidence: user composing."
+      : "";
+    element("detail-interaction-description").textContent =
+      `${formatLastEdit(millisecondsSinceLastKeystroke)} ${focusDescription}${evidenceDescription}`;
+  }
 
   const confidence = observation.confidence;
   const percentage = confidence === null

@@ -143,6 +143,7 @@ struct TerminalAttentionObservationTests {
 
         #expect(observation.terminal.grid == ["plain text"])
         #expect(observation.terminal.styledGrid == nil)
+        #expect(observation.interaction == nil)
     }
 
     @Test func nativeHostSubmissionRecordsInputSubmittedEvent() throws {
@@ -164,6 +165,31 @@ struct TerminalAttentionObservationTests {
         defer {
             session.stop()
         }
+
+        let letterKey = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+        session.noteNativeHostInput(event: letterKey)
+        let draftCapture = try session.captureAttentionObservation(
+            label: .noAttentionNeeded,
+            scenarioID: "native-draft-regression",
+            checkpoint: "draft_visible",
+            harnessVersion: nil,
+            runID: nil
+        )
+        let draftObservations = try decodeObservations(Data(contentsOf: draftCapture.outputURL))
+        let draft = try #require(draftObservations.first { $0.id == draftCapture.id })
+        #expect(draft.interaction?.hasUnsubmittedInput == true)
+        #expect(draft.interaction?.millisecondsSinceLastKeystroke != nil)
 
         let returnKey = try #require(NSEvent.keyEvent(
             with: .keyDown,
@@ -190,6 +216,56 @@ struct TerminalAttentionObservationTests {
         let submitted = try #require(observations.first { $0.event == .inputSubmitted })
         #expect(submitted.label == nil)
         #expect(submitted.activity.evidence == "input_submit")
+        #expect(submitted.timing.millisecondsSinceLastHumanInput != nil)
+        #expect(submitted.interaction?.hasUnsubmittedInput == false)
+    }
+
+    @Test func draftInputPersistsUntilSubmissionWithoutRecordingItsTextSeparately() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-attention-draft-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Draft input fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.noteTestingInput(Data("still typing this prompt".utf8))
+        let draftCapture = try session.captureAttentionObservation(
+            label: .noAttentionNeeded,
+            scenarioID: "draft-input",
+            checkpoint: "before_submit",
+            harnessVersion: nil,
+            runID: nil
+        )
+        let draftObservations = try decodeObservations(Data(contentsOf: draftCapture.outputURL))
+        let draft = try #require(draftObservations.first { $0.id == draftCapture.id })
+        let interaction = try #require(draft.interaction)
+        #expect(interaction.hasUnsubmittedInput)
+        #expect(interaction.millisecondsSinceLastKeystroke != nil)
+        #expect(interaction.terminalFocused == false)
+
+        session.noteTestingInput(Data("\r".utf8))
+        let submittedCapture = try session.captureAttentionObservation(
+            label: .unknown,
+            scenarioID: "draft-input",
+            checkpoint: "after_submit",
+            harnessVersion: nil,
+            runID: nil
+        )
+        let submittedObservations = try decodeObservations(Data(contentsOf: submittedCapture.outputURL))
+        let submitted = try #require(submittedObservations.first { $0.id == submittedCapture.id })
+        #expect(submitted.interaction?.hasUnsubmittedInput == false)
         #expect(submitted.timing.millisecondsSinceLastHumanInput != nil)
     }
 

@@ -10,6 +10,7 @@ enum TerminalAttentionLabel: String, Codable, CaseIterable, Equatable, Sendable 
 
 enum TerminalAttentionObservationEvent: String, Codable, Equatable, Sendable {
     case contentChanged = "content_changed"
+    case inputChanged = "input_changed"
     case inputSubmitted = "input_submitted"
     case activityStateChanged = "activity_state_changed"
     case notification
@@ -92,6 +93,12 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
         let exitCode: Int32?
     }
 
+    struct InteractionContext: Codable, Equatable, Sendable {
+        let hasUnsubmittedInput: Bool
+        let millisecondsSinceLastKeystroke: Int?
+        let terminalFocused: Bool
+    }
+
     let schemaVersion: Int
     let id: UUID
     let recordedAt: Date
@@ -103,6 +110,9 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
     let terminal: TerminalContext
     let timing: TimingContext
     let activity: ActivityContext
+    /// Optional so schema-1 observations captured before interaction tracking
+    /// remain decodable and uploadable.
+    let interaction: InteractionContext?
     let outputVersion: Int
     let contentVersion: Int
 }

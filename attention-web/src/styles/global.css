@@ -727,6 +727,39 @@ select:focus {
   width: 0;
 }
 
+.interaction-summary {
+  display: grid;
+  gap: 8px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.interaction-summary[data-draft="true"] {
+  background: rgb(101 214 160 / 7%);
+}
+
+.interaction-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.interaction-title {
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.interaction-summary[data-draft="true"] .interaction-title {
+  color: var(--success);
+}
+
+.interaction-description {
+  max-width: 70ch;
+  font-size: 1rem;
+}
+
 .observation-facts {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -974,6 +1007,17 @@ td {
 }
 
 @container (min-width: 52rem) {
+  .interaction-summary {
+    grid-template-columns: minmax(0, 2fr) minmax(20rem, 3fr);
+    align-items: end;
+    gap: 24px;
+  }
+
+  .interaction-description,
+  .interaction-title {
+    font-size: 0.875rem;
+  }
+
   .decision-summary {
     grid-template-columns: minmax(0, 3fr) minmax(11rem, 2fr);
   }

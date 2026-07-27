@@ -61,8 +61,14 @@ button:disabled {
   opacity: 0.45;
 }
 
+select:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 code,
 pre,
+kbd,
 .kicker,
 .privacy-badge {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -714,6 +720,111 @@ select:focus {
   font-size: 0.875rem;
 }
 
+.human-review {
+  display: grid;
+  gap: 18px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-raised);
+}
+
+.human-review-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.human-review-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.review-status-badge {
+  display: inline-flex;
+  width: fit-content;
+  flex-shrink: 0;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgb(255 255 255 / 5%);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.review-status-badge[data-status="accepted"] {
+  color: var(--success);
+  border-color: rgb(101 214 160 / 24%);
+  background: rgb(101 214 160 / 7%);
+}
+
+.review-status-badge[data-status="corrected"] {
+  color: #f6c873;
+  border-color: rgb(246 200 115 / 22%);
+  background: rgb(246 200 115 / 6%);
+}
+
+.review-status-badge[data-status="skipped"] {
+  color: var(--faint);
+}
+
+.review-form {
+  display: grid;
+  gap: 14px;
+}
+
+.review-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.review-fields label {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.review-fields select {
+  width: 100%;
+}
+
+.review-hint {
+  font-size: 0.875rem;
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.review-actions kbd {
+  margin-left: 8px;
+  padding: 1px 5px;
+  border: 1px solid rgb(255 255 255 / 15%);
+  border-radius: 5px;
+  color: currentcolor;
+  background: rgb(0 0 0 / 15%);
+  font-size: 0.6875rem;
+  font-weight: 500;
+}
+
+.review-message {
+  min-height: 1.5em;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.review-message[data-error="true"] {
+  color: #ff8b9d;
+}
+
 .confidence {
   display: grid;
   min-width: 0;
@@ -1057,6 +1168,12 @@ td {
   }
 }
 
+@container (min-width: 38rem) {
+  .review-fields {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 @media (min-width: 40rem) {
   .site-header {
     padding: 0 28px;
@@ -1096,7 +1213,7 @@ td {
 
   .filters {
     width: auto;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
   }
 
   .table-scroll {

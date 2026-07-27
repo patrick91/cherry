@@ -5,7 +5,9 @@ import {
   maximumRequestBytes,
   parseBundle,
   parseObservationUpload,
+  parseReview,
   type ObservationRecord,
+  type ReviewInput,
 } from "./domain";
 
 const apiHeaders = {
@@ -172,6 +174,17 @@ type ObservationRow = {
   gridJSON: string;
   activityState: string;
   activityEvidence: string;
+  reviewStatus: string | null;
+  reviewLabel: string | null;
+  reviewReason: string | null;
+  reviewedAt: string | null;
+};
+type StoredObservationLabel = { label: string | null; payload: string };
+type ReviewRow = {
+  status: string;
+  label: string | null;
+  reason: string | null;
+  reviewedAt: string;
 };
 
 function storedGrid(value: string): string[] {
@@ -185,6 +198,28 @@ function storedGrid(value: string): string[] {
   return lines;
 }
 
+function normalizedLabel(label: string | null): string | null {
+  if (label === "approval_required" || label === "waiting_for_input" || label === "ready_for_review") {
+    return "attention_needed";
+  }
+  return label;
+}
+
+function normalizedReason(label: string | null, payload: string): string | null {
+  const parsed: unknown = JSON.parse(payload);
+  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+    const annotation = "annotation" in parsed ? parsed.annotation : null;
+    if (typeof annotation === "object" && annotation !== null && !Array.isArray(annotation)) {
+      const reason = "reason" in annotation ? annotation.reason : null;
+      if (typeof reason === "string") return reason;
+    }
+  }
+  if (label === "approval_required") return "waiting_for_approval";
+  if (label === "waiting_for_input") return "waiting_for_input";
+  if (label === "ready_for_review") return "result_ready";
+  return null;
+}
+
 async function dashboard(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const parsedLimit = Number(url.searchParams.get("limit") ?? "12");
@@ -193,29 +228,40 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
   const offset = Number.isInteger(parsedOffset) ? Math.min(Math.max(parsedOffset, 0), 100_000) : 0;
   const label = url.searchParams.get("label")?.trim() ?? "";
   const harness = url.searchParams.get("harness")?.trim() ?? "";
+  const review = url.searchParams.get("review")?.trim() ?? "";
 
   const conditions: string[] = [];
   const parameters: (string | number | null)[] = [];
   if (label === "labeled") {
-    conditions.push("label IS NOT NULL");
+    conditions.push("o.label IS NOT NULL");
   } else if (label === "unlabeled") {
-    conditions.push("label IS NULL");
+    conditions.push("o.label IS NULL");
   } else if (label === "attention_needed") {
     const placeholders = ["attention_needed", "approval_required", "waiting_for_input", "ready_for_review"]
       .map((value) => {
         parameters.push(value);
         return `?${parameters.length}`;
       });
-    conditions.push(`label IN (${placeholders.join(", ")})`);
+    conditions.push(`o.label IN (${placeholders.join(", ")})`);
   } else if (label.length > 0) {
     if (!isAttentionLabel(label)) return json({ error: "invalid label filter" }, 400);
-    conditions.push(`label = ?${parameters.length + 1}`);
+    conditions.push(`o.label = ?${parameters.length + 1}`);
     parameters.push(label);
   }
   if (harness.length > 0) {
     if (harness.length > 160) return json({ error: "invalid harness filter" }, 400);
-    conditions.push(`harness = ?${parameters.length + 1}`);
+    conditions.push(`o.harness = ?${parameters.length + 1}`);
     parameters.push(harness);
+  }
+  if (review === "pending") {
+    conditions.push("o.label IS NOT NULL AND r.observation_id IS NULL");
+  } else if (review === "reviewed") {
+    conditions.push("r.status IN ('accepted', 'corrected')");
+  } else if (review === "accepted" || review === "corrected" || review === "skipped") {
+    conditions.push(`r.status = ?${parameters.length + 1}`);
+    parameters.push(review);
+  } else if (review.length > 0 && review !== "all") {
+    return json({ error: "invalid review filter" }, 400);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const filterParameters = [...parameters];
@@ -246,6 +292,18 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
      UNION ALL
      SELECT 'session', 'all', COUNT(DISTINCT session_id) FROM observations`,
   ).all<AggregateRow>();
+  const reviewAggregateQuery = env.DB.prepare(
+    `SELECT 'review' AS kind, 'pending' AS name, COUNT(*) AS count
+       FROM observations o
+       LEFT JOIN observation_reviews r ON r.observation_id = o.id
+      WHERE o.label IS NOT NULL AND r.observation_id IS NULL
+     UNION ALL
+     SELECT 'review', 'reviewed', COUNT(*)
+       FROM observation_reviews
+      WHERE status IN ('accepted', 'corrected')
+     UNION ALL
+     SELECT 'review', status, COUNT(*) FROM observation_reviews GROUP BY status`,
+  ).all<AggregateRow>();
   const bundleQuery = env.DB.prepare(
     `SELECT b.id, b.source_host AS sourceHost, b.source_created_at AS createdAt,
             b.imported_at AS importedAt, b.expected_observations AS expected,
@@ -257,45 +315,53 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
       LIMIT 20`,
   ).all<BundleRow>();
   const observationsQuery = env.DB.prepare(
-    `SELECT id, recorded_at AS recordedAt, event,
+    `SELECT o.id, o.recorded_at AS recordedAt, o.event,
             CASE
-              WHEN label IN ('approval_required', 'waiting_for_input', 'ready_for_review')
+              WHEN o.label IN ('approval_required', 'waiting_for_input', 'ready_for_review')
                 THEN 'attention_needed'
-              ELSE label
+              ELSE o.label
             END AS label,
             COALESCE(
-              json_extract(payload_json, '$.annotation.reason'),
-              CASE label
+              json_extract(o.payload_json, '$.annotation.reason'),
+              CASE o.label
                 WHEN 'approval_required' THEN 'waiting_for_approval'
                 WHEN 'waiting_for_input' THEN 'waiting_for_input'
                 WHEN 'ready_for_review' THEN 'result_ready'
                 ELSE NULL
               END
             ) AS reason,
-            json_extract(payload_json, '$.annotation.confidence') AS confidence,
-            json_extract(payload_json, '$.annotation.rationale') AS rationale,
-            json_extract(payload_json, '$.annotation.provenance') AS provenance,
-            harness,
-            session_id AS sessionID, run_id AS runID, scenario_id AS scenarioID,
-            checkpoint, columns_count AS columns, rows_count AS rows,
-            grid_json AS gridJSON, activity_state AS activityState,
-            activity_evidence AS activityEvidence
-       FROM observations ${where}
-      ORDER BY recorded_at DESC
+            json_extract(o.payload_json, '$.annotation.confidence') AS confidence,
+            json_extract(o.payload_json, '$.annotation.rationale') AS rationale,
+            json_extract(o.payload_json, '$.annotation.provenance') AS provenance,
+            o.harness,
+            o.session_id AS sessionID, o.run_id AS runID, o.scenario_id AS scenarioID,
+            o.checkpoint, o.columns_count AS columns, o.rows_count AS rows,
+            o.grid_json AS gridJSON, o.activity_state AS activityState,
+            o.activity_evidence AS activityEvidence,
+            r.status AS reviewStatus, r.label AS reviewLabel, r.reason AS reviewReason,
+            r.reviewed_at AS reviewedAt
+       FROM observations o
+       LEFT JOIN observation_reviews r ON r.observation_id = o.id
+       ${where}
+      ORDER BY o.recorded_at DESC
       LIMIT ?${limitParameter} OFFSET ?${offsetParameter}`,
   ).bind(...parameters).all<ObservationRow>();
   const filteredCountQuery = env.DB.prepare(
-    `SELECT COUNT(*) AS count FROM observations ${where}`,
+    `SELECT COUNT(*) AS count
+       FROM observations o
+       LEFT JOIN observation_reviews r ON r.observation_id = o.id
+       ${where}`,
   ).bind(...filterParameters).first<CountRow>();
 
-  const [aggregates, bundles, observations, filteredCount] = await Promise.all([
+  const [aggregates, reviewAggregates, bundles, observations, filteredCount] = await Promise.all([
     aggregateQuery,
+    reviewAggregateQuery,
     bundleQuery,
     observationsQuery,
     filteredCountQuery,
   ]);
   return json({
-    aggregates: aggregates.results,
+    aggregates: [...aggregates.results, ...reviewAggregates.results],
     bundles: bundles.results,
     observations: observations.results.map((observation) => ({
       ...observation,
@@ -320,6 +386,53 @@ async function observationDetail(env: Env, id: string): Promise<Response> {
   return new Response(result.payload, { headers: apiHeaders });
 }
 
+async function reviewObservation(request: Request, env: Env, id: string): Promise<Response> {
+  if (!isUUID(id)) return json({ error: "invalid observation id" }, 400);
+  const input: ReviewInput = parseReview(await requestJSON(request));
+  const stored = await env.DB.prepare(
+    "SELECT label, payload_json AS payload FROM observations WHERE id = ?1",
+  ).bind(id).first<StoredObservationLabel>();
+  if (stored === null) return json({ error: "observation not found" }, 404);
+
+  let status: "accepted" | "corrected" | "skipped";
+  let label: string | null;
+  let reason: string | null;
+  if (input.action === "skip") {
+    status = "skipped";
+    label = null;
+    reason = null;
+  } else if (input.action === "correct") {
+    status = "corrected";
+    label = input.label;
+    reason = input.reason;
+  } else {
+    status = "accepted";
+    label = normalizedLabel(stored.label);
+    reason = normalizedReason(stored.label, stored.payload);
+    if (label === null) return json({ error: "unlabeled observations cannot be accepted" }, 409);
+    if (label === "attention_needed" && reason === null) {
+      return json({ error: "attention labels need a reason before they can be accepted" }, 409);
+    }
+    if (label !== "attention_needed") reason = null;
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO observation_reviews (observation_id, status, label, reason)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(observation_id) DO UPDATE SET
+       status = excluded.status,
+       label = excluded.label,
+       reason = excluded.reason,
+       reviewed_at = CURRENT_TIMESTAMP`,
+  ).bind(id, status, label, reason).run();
+  const review = await env.DB.prepare(
+    `SELECT status, label, reason, reviewed_at AS reviewedAt
+       FROM observation_reviews WHERE observation_id = ?1`,
+  ).bind(id).first<ReviewRow>();
+  if (review === null) throw new Error("review was not stored");
+  return json({ observationID: id, review });
+}
+
 async function routeAPI(request: Request, env: Env): Promise<Response> {
   if (!(await authorized(request, env))) {
     return json({ error: "unauthorized" }, 401);
@@ -339,6 +452,10 @@ async function routeAPI(request: Request, env: Env): Promise<Response> {
   const detailMatch = url.pathname.match(/^\/api\/observations\/([^/]+)$/);
   if (request.method === "GET" && detailMatch !== null) {
     return observationDetail(env, decodeURIComponent(detailMatch[1]));
+  }
+  const reviewMatch = url.pathname.match(/^\/api\/observations\/([^/]+)\/review$/);
+  if (request.method === "PUT" && reviewMatch !== null) {
+    return reviewObservation(request, env, decodeURIComponent(reviewMatch[1]));
   }
   return json({ error: "not found" }, 404);
 }

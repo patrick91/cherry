@@ -69,16 +69,16 @@ import "../styles/global.css";
                 <strong id="stat-observations">0</strong>
               </div>
               <div class="stat">
-                <span>Labeled</span>
+                <span>Provisional</span>
                 <strong id="stat-labeled">0</strong>
               </div>
               <div class="stat">
-                <span>Sessions</span>
-                <strong id="stat-sessions">0</strong>
+                <span>Reviewed</span>
+                <strong id="stat-reviewed">0</strong>
               </div>
               <div class="stat">
-                <span>Bundles</span>
-                <strong id="stat-bundles">0</strong>
+                <span>Remaining</span>
+                <strong id="stat-pending">0</strong>
               </div>
             </div>
           </section>
@@ -90,6 +90,17 @@ import "../styles/global.css";
                 <p>Review one observation at a time, with its decision and terminal context.</p>
               </div>
               <div class="filters">
+                <label>
+                  <span>Review</span>
+                  <select id="review-filter" name="review">
+                    <option value="pending" selected>Pending review</option>
+                    <option value="reviewed">Reviewed</option>
+                    <option value="accepted">Accepted</option>
+                    <option value="corrected">Corrected</option>
+                    <option value="skipped">Skipped</option>
+                    <option value="all">All review states</option>
+                  </select>
+                </label>
                 <label>
                   <span>Label</span>
                   <select id="label-filter" name="label">
@@ -182,6 +193,55 @@ import "../styles/global.css";
                     </div>
                   </section>
 
+                  <section class="human-review" aria-labelledby="human-review-title">
+                    <div class="human-review-heading">
+                      <div>
+                        <p class="detail-eyebrow">Your review</p>
+                        <h4 id="human-review-title">Confirm or correct this example.</h4>
+                      </div>
+                      <span class="review-status-badge" id="review-status-badge" data-status="pending">
+                        Pending
+                      </span>
+                    </div>
+
+                    <form class="review-form" id="review-form">
+                      <div class="review-fields">
+                        <label>
+                          <span>Human label</span>
+                          <select id="review-label" name="review-label">
+                            <option value="attention_needed">Attention needed</option>
+                            <option value="no_attention_needed">No attention needed</option>
+                            <option value="unknown">Unknown</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Reason</span>
+                          <select id="review-reason" name="review-reason">
+                            <option value="result_ready">Result ready</option>
+                            <option value="waiting_for_input">Waiting for input</option>
+                            <option value="waiting_for_approval">Waiting for approval</option>
+                            <option value="blocked_or_error">Blocked or error</option>
+                          </select>
+                        </label>
+                      </div>
+                      <p class="review-hint" id="review-hint">
+                        Accept the provisional suggestion, or choose a correction.
+                      </p>
+                      <div class="review-actions">
+                        <button class="button button-primary" id="accept-review" type="button">
+                          Accept suggestion <kbd>A</kbd>
+                        </button>
+                        <button class="button button-ghost" id="correct-review" type="submit">
+                          Save correction <kbd>C</kbd>
+                        </button>
+                        <button class="button button-ghost" id="skip-review" type="button">
+                          Skip <kbd>S</kbd>
+                        </button>
+                      </div>
+                      <p class="review-message" id="review-message" aria-live="polite"></p>
+                    </form>
+                  </section>
+
                   <section class="interaction-summary" id="interaction-summary" hidden>
                     <div>
                       <p class="detail-eyebrow">User state</p>
@@ -264,7 +324,7 @@ import "../styles/global.css";
                     <strong id="selected-bundle">No bundle selected</strong>
                     <span id="selected-detail">Manifest and JSONL files remain unchanged locally.</span>
                   </div>
-                  <button class="button button-primary" id="upload-button" type="button" disabled>
+                  <button class="button button-ghost" id="upload-button" type="button" disabled>
                     Import observations
                   </button>
                 </div>

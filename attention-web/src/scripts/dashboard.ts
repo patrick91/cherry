@@ -43,6 +43,10 @@ type ObservationSummary = {
   grid: string[];
   activityState: string;
   activityEvidence: string;
+  reviewStatus: "accepted" | "corrected" | "skipped" | null;
+  reviewLabel: "attention_needed" | "no_attention_needed" | "unknown" | null;
+  reviewReason: string | null;
+  reviewedAt: string | null;
 };
 type BundleSummary = {
   id: string;
@@ -58,6 +62,15 @@ type DashboardResponse = {
   observations: ObservationSummary[];
   pagination: { limit: number; offset: number; returned: number; total: number };
 };
+type ReviewResponse = {
+  observationID: string;
+  review: {
+    status: "accepted" | "corrected" | "skipped";
+    label: "attention_needed" | "no_attention_needed" | "unknown" | null;
+    reason: string | null;
+    reviewedAt: string;
+  };
+};
 
 const tokenKey = "cherry-attention-dashboard-token";
 const pageSize = 1;
@@ -65,6 +78,9 @@ let token = sessionStorage.getItem(tokenKey) ?? "";
 let selectedFiles: File[] = [];
 let pageOffset = 0;
 let detailRequest = 0;
+let currentObservation: ObservationSummary | null = null;
+let reviewBusy = false;
+let reviewNotice = "";
 
 type LabelInformation = {
   name: string;
@@ -113,6 +129,33 @@ const reasonInformation: Record<string, LabelInformation> = {
   },
 };
 
+const reviewInformation: Record<string, LabelInformation> = {
+  pending: {
+    name: "Pending review",
+    description: "Provisional examples that have not received a human decision.",
+  },
+  reviewed: {
+    name: "Reviewed",
+    description: "Examples whose provisional label was accepted or corrected.",
+  },
+  accepted: {
+    name: "Accepted",
+    description: "Examples where the provisional label matched the human decision.",
+  },
+  corrected: {
+    name: "Corrected",
+    description: "Examples where the human decision replaced the provisional label.",
+  },
+  skipped: {
+    name: "Skipped",
+    description: "Examples set aside because they need more context or another pass.",
+  },
+  all: {
+    name: "All review states",
+    description: "Every example, regardless of its human-review status.",
+  },
+};
+
 const rationaleDescriptions: Record<string, string> = {
   active_working_indicator: "The terminal showed an active working indicator.",
   ambiguous_post_resume_prompt: "The prompt appeared after a resume, but the next expected action was unclear.",
@@ -145,8 +188,16 @@ const uploadButton = element<HTMLButtonElement>("upload-button");
 const uploadStatus = element<HTMLElement>("upload-status");
 const labelFilter = element<HTMLSelectElement>("label-filter");
 const harnessFilter = element<HTMLSelectElement>("harness-filter");
+const reviewFilter = element<HTMLSelectElement>("review-filter");
 const previousPage = element<HTMLButtonElement>("previous-page");
 const nextPage = element<HTMLButtonElement>("next-page");
+const reviewForm = element<HTMLFormElement>("review-form");
+const reviewLabel = element<HTMLSelectElement>("review-label");
+const reviewReason = element<HTMLSelectElement>("review-reason");
+const acceptReview = element<HTMLButtonElement>("accept-review");
+const correctReview = element<HTMLButtonElement>("correct-review");
+const skipReview = element<HTMLButtonElement>("skip-review");
+const reviewMessage = element<HTMLElement>("review-message");
 
 function showLogin(message = ""): void {
   dashboardView.hidden = true;
@@ -253,7 +304,7 @@ function setLabelBadge(badge: HTMLElement, label: string | null): void {
 
 function updateLabelContext(filteredTotal: number): void {
   const key = labelFilter.value || "all";
-  const information = key === "all"
+  const label = key === "all"
     ? {
         name: "All observations",
         description: "Browse every stored observation, including examples that have not been labeled yet.",
@@ -262,17 +313,21 @@ function updateLabelContext(filteredTotal: number): void {
         name: formatIdentifier(key),
         description: "Browse observations with this label.",
       };
-  element("label-context-name").textContent = information.name;
+  const review = reviewInformation[reviewFilter.value] ?? reviewInformation.all;
+  element("label-context-name").textContent = `${review.name} · ${label.name}`;
   element("label-context-count").textContent = `${filteredTotal.toLocaleString()} stored`;
-  element("label-context-description").textContent = information.description;
+  element("label-context-description").textContent =
+    `${review.description} ${label.description}`;
 }
 
 function renderObservations(observations: ObservationSummary[]): void {
   const selected = observations[0];
   if (selected === undefined) {
+    currentObservation = null;
     element("review-detail-empty").hidden = false;
     element("review-detail-content").hidden = true;
   } else {
+    currentObservation = selected;
     void selectObservation(selected);
   }
 }
@@ -414,6 +469,45 @@ function renderTerminal(
   return true;
 }
 
+function updateReasonControl(): void {
+  reviewReason.disabled = reviewBusy || reviewLabel.value !== "attention_needed";
+}
+
+function setReviewControlsDisabled(disabled: boolean): void {
+  reviewLabel.disabled = disabled;
+  acceptReview.disabled = disabled || currentObservation?.label === null;
+  correctReview.disabled = disabled;
+  skipReview.disabled = disabled;
+  updateReasonControl();
+}
+
+function renderHumanReview(observation: ObservationSummary): void {
+  const status = observation.reviewStatus ?? "pending";
+  const badge = element<HTMLElement>("review-status-badge");
+  badge.dataset.status = status;
+  badge.textContent = formatIdentifier(status);
+
+  const selectedLabel = observation.reviewLabel ?? observation.label ?? "unknown";
+  reviewLabel.value =
+    selectedLabel === "attention_needed"
+    || selectedLabel === "no_attention_needed"
+    || selectedLabel === "unknown"
+      ? selectedLabel
+      : "unknown";
+  const selectedReason = observation.reviewReason ?? observation.reason ?? "result_ready";
+  reviewReason.value = reasonInformation[selectedReason] === undefined ? "result_ready" : selectedReason;
+  reviewBusy = false;
+  setReviewControlsDisabled(false);
+
+  const reviewed = observation.reviewedAt === null ? "" : ` Last saved ${formatDate(observation.reviewedAt)}.`;
+  element("review-hint").textContent = status === "pending"
+    ? "Accept the provisional suggestion, or choose a correction."
+    : `This example is ${formatIdentifier(status).toLowerCase()}.${reviewed} You can replace the decision.`;
+  reviewMessage.textContent = reviewNotice;
+  reviewNotice = "";
+  delete reviewMessage.dataset.error;
+}
+
 async function selectObservation(observation: ObservationSummary): Promise<void> {
   const request = ++detailRequest;
   const response = await api(`/api/observations/${encodeURIComponent(observation.id)}`);
@@ -526,6 +620,7 @@ async function selectObservation(observation: ObservationSummary): Promise<void>
     ? "Foreground, background, and text attributes were retained by Cherry."
     : "This observation was captured without terminal style information.";
   element("detail-payload").textContent = JSON.stringify(payload, null, 2);
+  renderHumanReview(observation);
 }
 
 function renderBundles(bundles: BundleSummary[]): void {
@@ -562,13 +657,19 @@ async function loadDashboard(): Promise<void> {
   const parameters = new URLSearchParams({ limit: String(pageSize), offset: String(pageOffset) });
   if (labelFilter.value) parameters.set("label", labelFilter.value);
   if (harnessFilter.value) parameters.set("harness", harnessFilter.value);
+  if (reviewFilter.value) parameters.set("review", reviewFilter.value);
   const data = await responseJSON<DashboardResponse>(await api(`/api/dashboard?${parameters}`));
+  if (data.pagination.returned === 0 && data.pagination.total > 0 && pageOffset > 0) {
+    pageOffset = Math.max(0, data.pagination.total - 1);
+    await loadDashboard();
+    return;
+  }
   showDashboard();
 
   element("stat-observations").textContent = count(data.aggregates, "total", "all").toLocaleString();
   element("stat-labeled").textContent = count(data.aggregates, "labeled", "all").toLocaleString();
-  element("stat-sessions").textContent = count(data.aggregates, "session", "all").toLocaleString();
-  element("stat-bundles").textContent = data.bundles.length.toLocaleString();
+  element("stat-reviewed").textContent = count(data.aggregates, "review", "reviewed").toLocaleString();
+  element("stat-pending").textContent = count(data.aggregates, "review", "pending").toLocaleString();
   updateHarnesses(data.aggregates);
   updateLabelContext(data.pagination.total);
   renderObservations(data.observations);
@@ -582,6 +683,52 @@ async function loadDashboard(): Promise<void> {
     : `Observation ${current.toLocaleString()} of ${data.pagination.total.toLocaleString()}`;
   previousPage.disabled = pageOffset === 0;
   nextPage.disabled = current >= data.pagination.total;
+}
+
+function reviewFilterContains(status: ReviewResponse["review"]["status"]): boolean {
+  const filter = reviewFilter.value;
+  return filter === "all"
+    || filter === status
+    || (filter === "reviewed" && (status === "accepted" || status === "corrected"));
+}
+
+async function submitReview(action: "accept" | "correct" | "skip"): Promise<void> {
+  if (currentObservation === null || reviewBusy) return;
+  const observationID = currentObservation.id;
+  const body = action === "correct"
+    ? {
+        action,
+        label: reviewLabel.value,
+        reason: reviewLabel.value === "attention_needed" ? reviewReason.value : null,
+      }
+    : { action };
+
+  reviewBusy = true;
+  setReviewControlsDisabled(true);
+  reviewMessage.textContent = "Saving review…";
+  delete reviewMessage.dataset.error;
+  try {
+    const result = await responseJSON<ReviewResponse>(await api(
+      `/api/observations/${encodeURIComponent(observationID)}/review`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ));
+    if (reviewFilterContains(result.review.status)) pageOffset += pageSize;
+    reviewNotice = action === "accept"
+      ? "Suggestion accepted. Next observation loaded."
+      : action === "correct"
+        ? "Correction saved. Next observation loaded."
+        : "Observation skipped. Next observation loaded.";
+    await loadDashboard();
+    if (currentObservation === null) {
+      element("page-status").textContent = "Review saved. Queue complete.";
+      reviewNotice = "";
+    }
+  } catch (error) {
+    reviewBusy = false;
+    setReviewControlsDisabled(false);
+    reviewMessage.dataset.error = "true";
+    reviewMessage.textContent = error instanceof Error ? error.message : "Could not save this review.";
+  }
 }
 
 function fileMap(files: File[]): Map<string, File> {
@@ -735,6 +882,10 @@ labelFilter.addEventListener("change", () => {
   pageOffset = 0;
   void loadDashboard();
 });
+reviewFilter.addEventListener("change", () => {
+  pageOffset = 0;
+  void loadDashboard();
+});
 harnessFilter.addEventListener("change", () => {
   pageOffset = 0;
   void loadDashboard();
@@ -750,6 +901,38 @@ nextPage.addEventListener("click", () => {
   void loadDashboard().then(() => {
     element("review-navigation").scrollIntoView({ behavior: "smooth", block: "start" });
   });
+});
+reviewLabel.addEventListener("change", updateReasonControl);
+reviewForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void submitReview("correct");
+});
+acceptReview.addEventListener("click", () => void submitReview("accept"));
+skipReview.addEventListener("click", () => void submitReview("skip"));
+document.addEventListener("keydown", (event) => {
+  if (
+    currentObservation === null
+    || reviewBusy
+    || event.metaKey
+    || event.ctrlKey
+    || event.altKey
+    || event.shiftKey
+  ) {
+    return;
+  }
+  const target = event.target;
+  if (
+    target instanceof HTMLInputElement
+    || target instanceof HTMLSelectElement
+    || target instanceof HTMLTextAreaElement
+    || target instanceof HTMLButtonElement
+  ) {
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key !== "a" && key !== "c" && key !== "s") return;
+  event.preventDefault();
+  void submitReview(key === "a" ? "accept" : key === "c" ? "correct" : "skip");
 });
 if (token.length > 0) {
   void loadDashboard().catch(() => showLogin("Could not connect with the saved token."));

@@ -26,6 +26,12 @@ const attentionReasons = new Set([
   "blocked_or_error",
 ]);
 
+const humanReviewLabels = new Set([
+  "attention_needed",
+  "no_attention_needed",
+  "unknown",
+]);
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const maximumUploadObservations = 16;
@@ -56,6 +62,22 @@ export type BundleRecord = {
   createdAt: string;
   expectedObservations: number;
 };
+
+export type HumanReviewLabel = "attention_needed" | "no_attention_needed" | "unknown";
+export type AttentionReason =
+  | "result_ready"
+  | "waiting_for_input"
+  | "waiting_for_approval"
+  | "blocked_or_error";
+
+export type ReviewInput =
+  | { action: "accept" }
+  | { action: "skip" }
+  | {
+      action: "correct";
+      label: HumanReviewLabel;
+      reason: AttentionReason | null;
+    };
 
 export class ValidationError extends Error {}
 
@@ -304,6 +326,34 @@ export function parseObservationUpload(value: unknown): ObservationRecord[] {
     throw new ValidationError(`upload contains more than ${maximumUploadObservations} observations`);
   }
   return upload.observations.map(parseObservation);
+}
+
+export function parseReview(value: unknown): ReviewInput {
+  const review = objectValue(value, "review");
+  const action = requiredString(review.action, "review.action", 32);
+  if (action === "accept" || action === "skip") return { action };
+  if (action !== "correct") {
+    throw new ValidationError("review.action must be accept, correct, or skip");
+  }
+
+  const label = requiredString(review.label, "review.label", 64);
+  if (!humanReviewLabels.has(label)) {
+    throw new ValidationError("review.label must be attention_needed, no_attention_needed, or unknown");
+  }
+  const reason = optionalString(review.reason, "review.reason", 64);
+  if (label === "attention_needed") {
+    if (reason === null || !attentionReasons.has(reason)) {
+      throw new ValidationError("review.reason is required for attention_needed");
+    }
+  } else if (reason !== null) {
+    throw new ValidationError("review.reason is only valid for attention_needed");
+  }
+
+  return {
+    action,
+    label: label as HumanReviewLabel,
+    reason: reason as AttentionReason | null,
+  };
 }
 
 export function isAttentionLabel(value: string): boolean {

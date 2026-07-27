@@ -8,6 +8,7 @@
     "check": "astro check && tsc --noEmit -p worker/tsconfig.json && tsc --noEmit -p test/tsconfig.json",
     "dev": "npm run build && wrangler dev",
     "deploy": "npm run build && wrangler deploy",
+    "local": "wrangler d1 migrations apply cherry-attention-lab --local && npm run dev",
     "test": "npm run build && vitest run",
     "types": "wrangler types --include-runtime false"
   },

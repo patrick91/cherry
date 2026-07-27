@@ -89,6 +89,7 @@ async function api(path: string, init: RequestInit = {}): Promise<Response> {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM observation_reviews"),
     env.DB.prepare("DELETE FROM observation_sources"),
     env.DB.prepare("DELETE FROM observations"),
     env.DB.prepare("DELETE FROM bundles"),
@@ -172,6 +173,84 @@ describe("attention dashboard Worker", () => {
     expect(dashboardText).toContain('"kind":"label","name":"attention_needed","count":1');
   });
 
+  it("stores an accepted human review and removes it from the pending queue", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+
+    const pendingBefore = await responseText("/api/dashboard?label=labeled&review=pending");
+    expect(pendingBefore).toContain(`"id":"${observationID}"`);
+    expect(pendingBefore).toContain('"kind":"review","name":"pending","count":1');
+
+    const accepted = await api(`/api/observations/${observationID}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ action: "accept" }),
+    });
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toMatchObject({
+      observationID,
+      review: {
+        status: "accepted",
+        label: "attention_needed",
+        reason: "waiting_for_approval",
+      },
+    });
+
+    const pendingAfter = await responseText("/api/dashboard?label=labeled&review=pending");
+    expect(pendingAfter).not.toContain(`"id":"${observationID}"`);
+    const reviewed = await responseText("/api/dashboard?review=reviewed");
+    expect(reviewed).toContain('"reviewStatus":"accepted"');
+    expect(reviewed).toContain('"reviewLabel":"attention_needed"');
+    expect(reviewed).toContain('"reviewReason":"waiting_for_approval"');
+  });
+
+  it("stores corrections and skipped reviews", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+
+    const corrected = await api(`/api/observations/${observationID}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ action: "correct", label: "no_attention_needed", reason: null }),
+    });
+    expect(corrected.status).toBe(200);
+    await expect(corrected.json()).resolves.toMatchObject({
+      review: { status: "corrected", label: "no_attention_needed", reason: null },
+    });
+
+    const skipped = await api(`/api/observations/${observationID}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ action: "skip" }),
+    });
+    expect(skipped.status).toBe(200);
+    await expect(skipped.json()).resolves.toMatchObject({
+      review: { status: "skipped", label: null, reason: null },
+    });
+    const dashboard = await responseText("/api/dashboard?review=skipped");
+    expect(dashboard).toContain('"reviewStatus":"skipped"');
+  });
+
+  it("validates human review labels and reasons", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+
+    const response = await api(`/api/observations/${observationID}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ action: "correct", label: "attention_needed", reason: null }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "review.reason is required for attention_needed",
+    });
+  });
+
   it("rejects invalid labels before writing", async () => {
     await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
     const invalid = { ...observation, id: "5cd5c9dc-2734-4447-837e-e1060831d16c", label: "looks_busy" };
@@ -228,3 +307,9 @@ describe("attention dashboard Worker", () => {
     });
   });
 });
+
+async function responseText(path: string): Promise<string> {
+  const response = await api(path);
+  expect(response.status).toBe(200);
+  return response.text();
+}

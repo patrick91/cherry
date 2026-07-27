@@ -148,6 +148,13 @@ npx wrangler d1 migrations apply cherry-attention-lab --local
 npm run dev
 ```
 
+For the local review workflow, `npm run local` applies pending D1 migrations
+and starts the dashboard in one command. Import a provisional review bundle,
+then accept, correct, or skip one observation at a time. Human decisions are
+stored separately from the immutable provisional label in the local Wrangler
+D1 state. The dashboard supports `A` to accept, `C` to save a correction, and
+`S` to skip whenever a form control is not focused.
+
 Select the whole exported directory in the browser. Uploads are chunked,
 schema-validated, and de-duplicated by observation UUID. Unlike the local
 import command, the browser uploader does not re-check the manifest's file

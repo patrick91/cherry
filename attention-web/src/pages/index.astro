@@ -96,9 +96,7 @@ import "../styles/global.css";
                     <option value="">All labels</option>
                     <option value="labeled" selected>All provisional labels</option>
                     <option value="unlabeled">Unlabeled</option>
-                    <option value="approval_required">Approval required</option>
-                    <option value="waiting_for_input">Waiting for input</option>
-                    <option value="ready_for_review">Ready for review</option>
+                    <option value="attention_needed">Attention needed</option>
                     <option value="no_attention_needed">No attention needed</option>
                     <option value="unknown">Unknown</option>
                   </select>
@@ -150,6 +148,7 @@ import "../styles/global.css";
                     <div>
                       <div class="detail-label-line">
                         <span class="label-badge" id="detail-label">Unlabeled</span>
+                        <span class="reason-badge" id="detail-reason" hidden></span>
                         <span class="detail-harness" id="detail-harness">Unknown harness</span>
                       </div>
                       <h3 id="detail-heading">Observation detail.</h3>

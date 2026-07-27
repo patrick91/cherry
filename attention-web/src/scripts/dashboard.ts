@@ -29,6 +29,7 @@ type ObservationSummary = {
   recordedAt: string;
   event: string;
   label: string | null;
+  reason: string | null;
   confidence: number | null;
   rationale: string | null;
   provenance: string | null;
@@ -71,17 +72,9 @@ type LabelInformation = {
 };
 
 const labelInformation: Record<string, LabelInformation> = {
-  approval_required: {
-    name: "Approval required",
-    description: "The agent is blocked until you approve or reject an action.",
-  },
-  waiting_for_input: {
-    name: "Waiting for input",
-    description: "The agent asked a question or needs information from you before it can continue.",
-  },
-  ready_for_review: {
-    name: "Ready for review",
-    description: "The agent completed its turn and returned to the prompt. Its result is ready to read.",
+  attention_needed: {
+    name: "Attention needed",
+    description: "The agent needs you to review a result, provide input, approve an action, or resolve a problem.",
   },
   no_attention_needed: {
     name: "No attention needed",
@@ -101,14 +94,37 @@ const labelInformation: Record<string, LabelInformation> = {
   },
 };
 
+const reasonInformation: Record<string, LabelInformation> = {
+  result_ready: {
+    name: "Result ready",
+    description: "The agent completed its turn and returned control to you.",
+  },
+  waiting_for_input: {
+    name: "Waiting for input",
+    description: "The agent is at a prompt and needs information or a new instruction.",
+  },
+  waiting_for_approval: {
+    name: "Waiting for approval",
+    description: "The agent is blocked until you approve or reject an action.",
+  },
+  blocked_or_error: {
+    name: "Blocked or error",
+    description: "The agent stopped because it encountered an interruption or problem.",
+  },
+};
+
 const rationaleDescriptions: Record<string, string> = {
   active_working_indicator: "The terminal showed an active working indicator.",
   ambiguous_post_resume_prompt: "The prompt appeared after a resume, but the next expected action was unclear.",
+  approval_prompt_visible: "The terminal contained an explicit request for approval.",
+  blocked_or_error_visible: "The terminal showed an interruption or error that stopped normal progress.",
   completed_turn_at_prompt: "The agent completed its turn and returned to an idle prompt.",
   explicit_confirmation_request: "The terminal contained an explicit request for confirmation.",
   interrupted_conversation: "The conversation was interrupted before reaching a normal completion.",
   resume_picker_ui: "A session-resume picker was visible and needed a human choice.",
   startup_authentication_error: "The harness reported an authentication problem during startup.",
+  user_composing_at_prompt: "The user had started composing input at an idle prompt.",
+  waiting_at_prompt: "The harness was idle at a prompt and waiting for a user action.",
 };
 
 function element<T extends HTMLElement>(id: string): T {
@@ -413,19 +429,34 @@ async function selectObservation(observation: ObservationSummary): Promise<void>
     name: formatIdentifier(labelKey),
     description: "No plain-language description is available for this label.",
   };
+  const reason = observation.reason === null
+    ? null
+    : reasonInformation[observation.reason] ?? {
+        name: formatIdentifier(observation.reason),
+        description: "No plain-language description is available for this reason.",
+      };
 
   element("review-detail-empty").hidden = true;
   element("review-detail-content").hidden = false;
 
   const detailLabel = element<HTMLElement>("detail-label");
   setLabelBadge(detailLabel, observation.label);
+  const detailReason = element<HTMLElement>("detail-reason");
+  detailReason.hidden = reason === null;
+  if (reason !== null) {
+    detailReason.textContent = reason.name;
+    detailReason.dataset.reason = observation.reason ?? "";
+  } else {
+    detailReason.textContent = "";
+    delete detailReason.dataset.reason;
+  }
   element("detail-harness").textContent = observation.harness ?? "Unknown harness";
   element("detail-heading").textContent = summarizeTerminal(observation.grid);
   const detailTime = element<HTMLTimeElement>("detail-time");
   detailTime.dateTime = observation.recordedAt;
   detailTime.textContent = formatDate(observation.recordedAt);
   element("detail-rationale").textContent = rationaleText(observation.rationale);
-  element("detail-label-description").textContent = information.description;
+  element("detail-label-description").textContent = reason?.description ?? information.description;
   element("detail-event").textContent = formatIdentifier(observation.event);
   element("detail-activity").textContent = formatIdentifier(observation.activityState);
   element("detail-evidence").textContent = formatIdentifier(observation.activityEvidence);

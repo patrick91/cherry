@@ -158,6 +158,7 @@ type ObservationRow = {
   recordedAt: string;
   event: string;
   label: string | null;
+  reason: string | null;
   confidence: number | null;
   rationale: string | null;
   provenance: string | null;
@@ -199,6 +200,13 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
     conditions.push("label IS NOT NULL");
   } else if (label === "unlabeled") {
     conditions.push("label IS NULL");
+  } else if (label === "attention_needed") {
+    const placeholders = ["attention_needed", "approval_required", "waiting_for_input", "ready_for_review"]
+      .map((value) => {
+        parameters.push(value);
+        return `?${parameters.length}`;
+      });
+    conditions.push(`label IN (${placeholders.join(", ")})`);
   } else if (label.length > 0) {
     if (!isAttentionLabel(label)) return json({ error: "invalid label filter" }, 400);
     conditions.push(`label = ?${parameters.length + 1}`);
@@ -220,7 +228,19 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
      UNION ALL
      SELECT 'labeled', 'all', COUNT(*) FROM observations WHERE label IS NOT NULL
      UNION ALL
-     SELECT 'label', COALESCE(label, 'unlabeled'), COUNT(*) FROM observations GROUP BY label
+     SELECT 'label',
+            CASE
+              WHEN label IN ('approval_required', 'waiting_for_input', 'ready_for_review')
+                THEN 'attention_needed'
+              ELSE COALESCE(label, 'unlabeled')
+            END,
+            COUNT(*)
+       FROM observations
+      GROUP BY CASE
+        WHEN label IN ('approval_required', 'waiting_for_input', 'ready_for_review')
+          THEN 'attention_needed'
+        ELSE COALESCE(label, 'unlabeled')
+      END
      UNION ALL
      SELECT 'harness', COALESCE(harness, 'unknown'), COUNT(*) FROM observations GROUP BY harness
      UNION ALL
@@ -237,7 +257,21 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
       LIMIT 20`,
   ).all<BundleRow>();
   const observationsQuery = env.DB.prepare(
-    `SELECT id, recorded_at AS recordedAt, event, label,
+    `SELECT id, recorded_at AS recordedAt, event,
+            CASE
+              WHEN label IN ('approval_required', 'waiting_for_input', 'ready_for_review')
+                THEN 'attention_needed'
+              ELSE label
+            END AS label,
+            COALESCE(
+              json_extract(payload_json, '$.annotation.reason'),
+              CASE label
+                WHEN 'approval_required' THEN 'waiting_for_approval'
+                WHEN 'waiting_for_input' THEN 'waiting_for_input'
+                WHEN 'ready_for_review' THEN 'result_ready'
+                ELSE NULL
+              END
+            ) AS reason,
             json_extract(payload_json, '$.annotation.confidence') AS confidence,
             json_extract(payload_json, '$.annotation.rationale') AS rationale,
             json_extract(payload_json, '$.annotation.provenance') AS provenance,

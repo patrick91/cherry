@@ -20,8 +20,8 @@ const observation = {
   id: observationID,
   recordedAt: "2026-07-22T12:00:01Z",
   event: "labeled_checkpoint",
-  label: "waiting_for_input",
-  scenarioID: "waiting-for-input",
+  label: "attention_needed",
+  scenarioID: "waiting-for-approval",
   checkpoint: "human_verified",
   session: {
     id: "4c5d7267-f12c-4e8d-a821-65b9f8bf848c",
@@ -35,16 +35,16 @@ const observation = {
     rows: 32,
     usesAlternateScreen: false,
     cursor: { row: 4, column: 2, shape: "block", isVisible: true },
-    grid: ["Choose alpha or beta.", "❯ "],
+    grid: ["Allow this command?", "1. Yes  2. No"],
     styledGrid: [
       [{
-        text: "Choose alpha or beta.",
+        text: "Allow this command?",
         foreground: { space: "palette256", components: [82] },
         background: null,
         attributes: ["bold"],
       }],
       [{
-        text: "❯ ",
+        text: "1. Yes  2. No",
         foreground: { space: "rgb", components: [239, 91, 114] },
         background: null,
         attributes: [],
@@ -73,7 +73,8 @@ const observation = {
     schemaVersion: 1,
     provenance: "human_review",
     confidence: 0.94,
-    rationale: "explicit_confirmation_request",
+    rationale: "approval_prompt_visible",
+    reason: "waiting_for_approval",
   },
   outputVersion: 4,
   contentVersion: 3,
@@ -121,15 +122,16 @@ describe("attention dashboard Worker", () => {
     });
     await expect(duplicateUpload.json()).resolves.toMatchObject({ inserted: 0, duplicates: 1 });
 
-    const dashboard = await api("/api/dashboard?label=waiting_for_input&harness=Codex");
+    const dashboard = await api("/api/dashboard?label=attention_needed&harness=Codex");
     expect(dashboard.status).toBe(200);
     const dashboardText = await dashboard.text();
     expect(dashboardText).toContain('"kind":"total","name":"all","count":1');
     expect(dashboardText).toContain('"pagination":{"limit":12,"offset":0,"returned":1,"total":1}');
     expect(dashboardText).toContain('"id":"6594bade-c891-42cb-8cb1-e51c16f1ab95"');
-    expect(dashboardText).toContain('"grid":["Choose alpha or beta.","❯ "]');
+    expect(dashboardText).toContain('"grid":["Allow this command?","1. Yes  2. No"]');
     expect(dashboardText).toContain('"confidence":0.94');
-    expect(dashboardText).toContain('"rationale":"explicit_confirmation_request"');
+    expect(dashboardText).toContain('"rationale":"approval_prompt_visible"');
+    expect(dashboardText).toContain('"reason":"waiting_for_approval"');
 
     const labeledDashboard = await api("/api/dashboard?label=labeled");
     expect(labeledDashboard.status).toBe(200);
@@ -138,9 +140,36 @@ describe("attention dashboard Worker", () => {
     const detail = await api(`/api/observations/${observationID}`);
     expect(detail.status).toBe(200);
     const detailText = await detail.text();
-    expect(detailText).toContain('"waiting_for_input"');
+    expect(detailText).toContain('"attention_needed"');
     expect(detailText).toContain('"space":"palette256","components":[82]');
     expect(detailText).toContain('"hasUnsubmittedInput":true');
+  });
+
+  it("normalizes legacy attention labels into the binary taxonomy", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const legacy = {
+      ...structuredClone(observation),
+      id: "5cd5c9dc-2734-4447-837e-e1060831d16c",
+      label: "ready_for_review",
+      annotation: {
+        schemaVersion: 1,
+        provenance: "human_review",
+        confidence: 0.94,
+        rationale: "completed_turn_at_prompt",
+      },
+    };
+    const upload = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [legacy] }),
+    });
+    expect(upload.status).toBe(202);
+
+    const dashboard = await api("/api/dashboard?label=attention_needed");
+    expect(dashboard.status).toBe(200);
+    const dashboardText = await dashboard.text();
+    expect(dashboardText).toContain('"label":"attention_needed"');
+    expect(dashboardText).toContain('"reason":"result_ready"');
+    expect(dashboardText).toContain('"kind":"label","name":"attention_needed","count":1');
   });
 
   it("rejects invalid labels before writing", async () => {
@@ -181,6 +210,21 @@ describe("attention dashboard Worker", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
       error: "observation.interaction.hasUnsubmittedInput must be a boolean",
+    });
+  });
+
+  it("rejects invalid attention reasons before writing", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const invalid = structuredClone(observation);
+    invalid.id = "5cd5c9dc-2734-4447-837e-e1060831d16c";
+    invalid.annotation.reason = "look_over_here";
+    const response = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [invalid] }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "unsupported observation attention reason: look_over_here",
     });
   });
 });

@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Create a review bundle with provisional labels on useful transition frames."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import socket
+import sys
+import tempfile
+import uuid
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+
+BUNDLE_SCHEMA_VERSION = 1
+OBSERVATION_SCHEMA_VERSION = 1
+
+ATTENTION_NEEDED = "attention_needed"
+NO_ATTENTION_NEEDED = "no_attention_needed"
+
+RESULT_MARKERS = (
+    "worked for",
+    "baked for",
+    "cooked for",
+    "cogitated for",
+    "crunched for",
+    "churned for",
+    "sautéed for",
+    "sauteed for",
+    "brewed for",
+)
+
+APPROVAL_MARKERS = (
+    "do you want to proceed",
+    "would you like to proceed",
+    "waiting for approval",
+    "press enter to approve",
+    "approve this action",
+    "allow this command",
+    "allow command",
+    "allow computer use to use",
+    "run the tool and continue",
+)
+
+BLOCKED_MARKERS = (
+    "conversation interrupted",
+    "task interrupted",
+    "process exited",
+    "fatal error",
+    "panic:",
+)
+
+
+class ProvisionalLabelError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def observation_lines(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                observation = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ProvisionalLabelError(f"{path}:{line_number}: invalid JSON: {error}") from error
+            if not isinstance(observation, dict):
+                raise ProvisionalLabelError(f"{path}:{line_number}: observation must be an object")
+            if observation.get("schemaVersion") != OBSERVATION_SCHEMA_VERSION:
+                raise ProvisionalLabelError(
+                    f"{path}:{line_number}: unsupported observation schema "
+                    f"{observation.get('schemaVersion')!r}"
+                )
+            if not isinstance(observation.get("id"), str):
+                raise ProvisionalLabelError(f"{path}:{line_number}: missing observation id")
+            yield observation
+
+
+def terminal_text(observation: dict[str, Any]) -> str:
+    terminal = observation.get("terminal")
+    if not isinstance(terminal, dict):
+        return ""
+    grid = terminal.get("grid")
+    if not isinstance(grid, list):
+        return ""
+    lines = [line for line in grid if isinstance(line, str)]
+    return "\n".join(lines[-48:]).casefold()
+
+
+def interaction_value(observation: dict[str, Any], key: str) -> bool | None:
+    interaction = observation.get("interaction")
+    if not isinstance(interaction, dict):
+        return None
+    value = interaction.get(key)
+    return value if isinstance(value, bool) else None
+
+
+def activity_state(observation: dict[str, Any]) -> str:
+    activity = observation.get("activity")
+    if not isinstance(activity, dict):
+        return ""
+    value = activity.get("state")
+    return value if isinstance(value, str) else ""
+
+
+def attention_annotation(
+    reason: str,
+    rationale: str,
+    confidence: float,
+) -> tuple[str, dict[str, Any]]:
+    return ATTENTION_NEEDED, {
+        "schemaVersion": 1,
+        "provenance": "codex_transition_review",
+        "confidence": confidence,
+        "rationale": rationale,
+        "reason": reason,
+    }
+
+
+def working_annotation() -> tuple[str, dict[str, Any]]:
+    return NO_ATTENTION_NEEDED, {
+        "schemaVersion": 1,
+        "provenance": "codex_transition_review",
+        "confidence": 0.99,
+        "rationale": "active_working_indicator",
+    }
+
+
+def classify_idle(observation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    text = terminal_text(observation)
+    if interaction_value(observation, "hasUnsubmittedInput") is True:
+        return attention_annotation("waiting_for_input", "user_composing_at_prompt", 0.99)
+    if any(marker in text for marker in APPROVAL_MARKERS):
+        return attention_annotation("waiting_for_approval", "approval_prompt_visible", 0.99)
+    if any(marker in text for marker in BLOCKED_MARKERS):
+        return attention_annotation("blocked_or_error", "blocked_or_error_visible", 0.97)
+    if any(marker in text for marker in RESULT_MARKERS):
+        return attention_annotation("result_ready", "completed_turn_at_prompt", 0.98)
+    return attention_annotation("waiting_for_input", "waiting_at_prompt", 0.94)
+
+
+def classify_notification(observation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    state = activity_state(observation)
+    if state == "idle":
+        return classify_idle(observation)
+
+    text = terminal_text(observation)
+    if interaction_value(observation, "hasUnsubmittedInput") is True:
+        return attention_annotation("waiting_for_input", "user_composing_at_prompt", 0.99)
+    if state == "permission" or any(marker in text for marker in APPROVAL_MARKERS):
+        return attention_annotation("waiting_for_approval", "approval_prompt_visible", 0.99)
+    if any(marker in text for marker in BLOCKED_MARKERS):
+        return attention_annotation("blocked_or_error", "blocked_or_error_visible", 0.97)
+    if any(marker in text for marker in RESULT_MARKERS):
+        # Notification observations can be captured before the harness activity
+        # state changes from working to idle, so the terminal completion marker
+        # is stronger evidence than the stale state.
+        return attention_annotation("result_ready", "completed_turn_at_prompt", 0.98)
+    return working_annotation()
+
+
+def provisional_label(
+    observation: dict[str, Any],
+    next_observation: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]] | None:
+    if observation.get("label") is not None:
+        return None
+
+    event = observation.get("event")
+    state = activity_state(observation)
+
+    if event == "process_exited":
+        return attention_annotation("blocked_or_error", "blocked_or_error_visible", 0.99)
+
+    if event == "input_submitted":
+        return working_annotation()
+
+    if event == "activity_state_changed":
+        return classify_idle(observation) if state == "idle" else working_annotation()
+
+    if event == "notification":
+        return classify_notification(observation)
+
+    if (
+        event == "input_changed"
+        and state == "idle"
+        and interaction_value(observation, "hasUnsubmittedInput") is True
+        and interaction_value(observation, "terminalFocused") is False
+    ):
+        return attention_annotation("waiting_for_input", "user_composing_at_prompt", 0.99)
+
+    if (
+        next_observation is not None
+        and next_observation.get("event") == "input_submitted"
+        and state == "idle"
+        and interaction_value(observation, "hasUnsubmittedInput") is True
+    ):
+        return attention_annotation("waiting_for_input", "user_composing_at_prompt", 0.99)
+
+    return None
+
+
+def write_observations(
+    source: Path,
+    destination: Path,
+) -> tuple[int, Counter[str], Counter[str], set[str], set[str]]:
+    count = 0
+    labels: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    sessions: set[str] = set()
+    harnesses: set[str] = set()
+    iterator = iter(observation_lines(source))
+    current = next(iterator, None)
+
+    with destination.open("w", encoding="utf-8") as output:
+        while current is not None:
+            next_observation = next(iterator, None)
+            provisional = provisional_label(current, next_observation)
+            if provisional is not None:
+                label, annotation = provisional
+                current["label"] = label
+                current["annotation"] = annotation
+                labels[label] += 1
+                reason = annotation.get("reason")
+                if isinstance(reason, str):
+                    reasons[reason] += 1
+
+            session = current.get("session")
+            if isinstance(session, dict):
+                session_id = session.get("id")
+                harness = session.get("harness")
+                if isinstance(session_id, str) and session_id:
+                    sessions.add(session_id)
+                if isinstance(harness, str) and harness:
+                    harnesses.add(harness)
+
+            output.write(json.dumps(current, separators=(",", ":"), sort_keys=True))
+            output.write("\n")
+            count += 1
+            current = next_observation
+
+    os.chmod(destination, 0o600)
+    return count, labels, reasons, sessions, harnesses
+
+
+def build_bundle(args: argparse.Namespace) -> None:
+    sources = [path.expanduser().resolve() for path in args.trace]
+    for source in sources:
+        if not source.is_file() or source.is_symlink() or source.suffix != ".jsonl":
+            raise ProvisionalLabelError(f"not a regular JSONL trace: {source}")
+
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise ProvisionalLabelError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    os.chmod(temporary, 0o700)
+    observations_directory = temporary / "observations"
+    observations_directory.mkdir(mode=0o700)
+
+    entries: list[dict[str, Any]] = []
+    total_labels: Counter[str] = Counter()
+    total_reasons: Counter[str] = Counter()
+    try:
+        for source in sources:
+            destination = observations_directory / source.name
+            count, labels, reasons, sessions, harnesses = write_observations(source, destination)
+            total_labels.update(labels)
+            total_reasons.update(reasons)
+            entries.append({
+                "relativePath": f"observations/{source.name}",
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+                "observationCount": count,
+                "labeledCount": sum(labels.values()),
+                "labels": dict(sorted(labels.items())),
+                "reasons": dict(sorted(reasons.items())),
+                "sessionIDs": sorted(sessions),
+                "harnesses": sorted(harnesses),
+            })
+
+        manifest = {
+            "bundleSchemaVersion": BUNDLE_SCHEMA_VERSION,
+            "observationSchemaVersion": OBSERVATION_SCHEMA_VERSION,
+            "bundleID": str(uuid.uuid4()),
+            "createdAt": utc_now(),
+            "sourceHost": args.source_host or socket.gethostname(),
+            "files": entries,
+            "totals": {
+                "files": len(entries),
+                "bytes": sum(entry["bytes"] for entry in entries),
+                "observations": sum(entry["observationCount"] for entry in entries),
+                "labeled": sum(entry["labeledCount"] for entry in entries),
+            },
+            "provisionalLabels": dict(sorted(total_labels.items())),
+            "provisionalReasons": dict(sorted(total_reasons.items())),
+        }
+        manifest_path = temporary / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(manifest_path, 0o600)
+        os.replace(temporary, output)
+    except Exception:
+        # Leave the private temporary directory in place for diagnosis rather
+        # than risking deletion of a caller-supplied path.
+        raise
+
+    print(f"Created {output}")
+    print(f"Observations: {manifest['totals']['observations']}")
+    print(f"Provisional labels: {manifest['totals']['labeled']}")
+    print("Labels: " + ", ".join(f"{key}={value}" for key, value in sorted(total_labels.items())))
+    print("Reasons: " + ", ".join(f"{key}={value}" for key, value in sorted(total_reasons.items())))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace", type=Path, nargs="+", help="Raw Cherry JSONL trace files.")
+    parser.add_argument("--output", type=Path, required=True, help="New review bundle directory.")
+    parser.add_argument("--source-host", help="Human-readable source machine name for the dashboard.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        build_bundle(parse_args())
+        return 0
+    except (OSError, ProvisionalLabelError) as error:
+        print(f"attention-provisional-labels: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -7,16 +7,26 @@ credentials, and other sensitive text.
 
 ## Labels
 
-The version 1 dataset uses five labels:
+The classifier target is deliberately small:
 
-- `approval_required`: the harness is waiting for a permission or confirmation.
-- `waiting_for_input`: the harness asked a question and cannot continue without an answer.
-- `ready_for_review`: the harness completed a useful turn and returned control to the user.
+- `attention_needed`: the user needs to review a result, provide input, approve an action, or resolve a problem.
 - `no_attention_needed`: the harness is actively working and needs no user action.
-- `unknown`: the screen is ambiguous, out of distribution, or should be handled by abstention.
+- `unknown`: the screen is ambiguous, out of distribution, or should be handled by abstention. This is an abstention/review state rather than a positive model target.
 
-Automatic observations are deliberately unlabeled. Only a human-triggered
-checkpoint receives a label; Cherry's current heuristic state is stored as
+`attention_needed` observations keep one reason as annotation metadata:
+
+- `result_ready`
+- `waiting_for_input`
+- `waiting_for_approval`
+- `blocked_or_error`
+
+Older schema-1 labels (`approval_required`, `waiting_for_input`, and
+`ready_for_review`) remain importable and are normalized to
+`attention_needed` plus the corresponding reason in the dashboard.
+
+Raw automatic observations are deliberately unlabeled. The review-bundle
+sampler can add provisional labels to useful transitions; they become training
+truth only after human review. Cherry's current heuristic state is stored as
 diagnostic evidence, never as training truth.
 
 ## Week-Long Study Mode
@@ -108,6 +118,21 @@ The default Mini dataset lives at:
 Import verifies every checksum and JSONL record. Re-importing the same bundle,
 or an overlapping later export, skips observations already present by UUID.
 Neither export nor import deletes the laptop recordings.
+
+For a dashboard review drop, create a separate bundle that labels only useful
+transition frames while retaining every raw observation:
+
+```bash
+Scripts/attention-provisional-labels \
+  --source-host patrick-laptop \
+  --output ~/Downloads/cherry-attention-review-week-1 \
+  ~/Downloads/202607*.jsonl
+```
+
+The original JSONL files are not changed. The generated bundle labels activity
+transitions, submissions, notifications, process exits, and representative
+unfinished drafts. Adjacent content-change frames remain unlabeled so they do
+not overwhelm the review queue.
 
 ### Private Cloud Dashboard
 

@@ -9,11 +9,21 @@ const observationEvents = new Set([
 ]);
 
 const attentionLabels = new Set([
+  "attention_needed",
+  "no_attention_needed",
+  "unknown",
+  // Legacy schema-1 labels remain uploadable so old bundles can still be
+  // imported. The dashboard normalizes these into attention_needed + reason.
   "approval_required",
   "waiting_for_input",
   "ready_for_review",
-  "no_attention_needed",
-  "unknown",
+]);
+
+const attentionReasons = new Set([
+  "result_ready",
+  "waiting_for_input",
+  "waiting_for_approval",
+  "blocked_or_error",
 ]);
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -82,6 +92,13 @@ function integerValue(value: unknown, description: string, minimum: number, maxi
 function booleanValue(value: unknown, description: string): boolean {
   if (typeof value !== "boolean") {
     throw new ValidationError(`${description} must be a boolean`);
+  }
+  return value;
+}
+
+function numberValue(value: unknown, description: string, minimum: number, maximum: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new ValidationError(`${description} must be a number from ${minimum} to ${maximum}`);
   }
   return value;
 }
@@ -219,6 +236,27 @@ export function parseObservation(value: unknown): ObservationRecord {
       );
     }
     booleanValue(interaction.terminalFocused, "observation.interaction.terminalFocused");
+  }
+  if (observation.annotation !== undefined && observation.annotation !== null) {
+    const annotation = objectValue(observation.annotation, "observation.annotation");
+    if (annotation.schemaVersion !== undefined) {
+      integerValue(annotation.schemaVersion, "observation.annotation.schemaVersion", 1, 1);
+    }
+    if (annotation.confidence !== undefined) {
+      numberValue(annotation.confidence, "observation.annotation.confidence", 0, 1);
+    }
+    if (annotation.provenance !== undefined) {
+      requiredString(annotation.provenance, "observation.annotation.provenance", 160);
+    }
+    if (annotation.rationale !== undefined) {
+      requiredString(annotation.rationale, "observation.annotation.rationale", 160);
+    }
+    if (annotation.reason !== undefined && annotation.reason !== null) {
+      const reason = requiredString(annotation.reason, "observation.annotation.reason", 64);
+      if (!attentionReasons.has(reason)) {
+        throw new ValidationError(`unsupported observation attention reason: ${reason}`);
+      }
+    }
   }
   if (!Array.isArray(terminal.grid) || terminal.grid.length > 200) {
     throw new ValidationError("observation.terminal.grid must contain at most 200 lines");

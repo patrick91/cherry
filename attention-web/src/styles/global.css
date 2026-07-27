@@ -564,6 +564,7 @@ select:focus {
   font-weight: 500;
 }
 
+.label-badge[data-label="attention_needed"],
 .label-badge[data-label="approval_required"] {
   color: #ff9cab;
   background: rgb(239 91 114 / 15%);
@@ -588,6 +589,39 @@ select:focus {
 .label-badge[data-label="unlabeled"] {
   color: var(--muted);
   background: rgb(255 255 255 / 6%);
+}
+
+.reason-badge {
+  display: inline-flex;
+  width: fit-content;
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border: 1px solid rgb(255 255 255 / 9%);
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.reason-badge[data-reason="waiting_for_approval"] {
+  color: #ffb2bf;
+  border-color: rgb(239 91 114 / 24%);
+}
+
+.reason-badge[data-reason="waiting_for_input"] {
+  color: #f6c873;
+  border-color: rgb(246 200 115 / 22%);
+}
+
+.reason-badge[data-reason="result_ready"] {
+  color: #aebcff;
+  border-color: rgb(133 154 255 / 24%);
+}
+
+.reason-badge[data-reason="blocked_or_error"] {
+  color: #ff9cab;
+  border-color: rgb(239 91 114 / 24%);
 }
 
 .review-detail-empty {

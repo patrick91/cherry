@@ -470,7 +470,10 @@ function renderTerminal(
 }
 
 function updateReasonControl(): void {
-  reviewReason.disabled = reviewBusy || reviewLabel.value !== "attention_needed";
+  const needsReason = reviewLabel.value === "attention_needed";
+  if (needsReason && reviewReason.value === "") reviewReason.value = "result_ready";
+  if (!needsReason) reviewReason.value = "";
+  reviewReason.disabled = reviewBusy || !needsReason;
 }
 
 function setReviewControlsDisabled(disabled: boolean): void {
@@ -494,8 +497,12 @@ function renderHumanReview(observation: ObservationSummary): void {
     || selectedLabel === "unknown"
       ? selectedLabel
       : "unknown";
-  const selectedReason = observation.reviewReason ?? observation.reason ?? "result_ready";
-  reviewReason.value = reasonInformation[selectedReason] === undefined ? "result_ready" : selectedReason;
+  const selectedReason = observation.reviewReason ?? observation.reason;
+  reviewReason.value = reviewLabel.value !== "attention_needed"
+    ? ""
+    : selectedReason !== null && reasonInformation[selectedReason] !== undefined
+      ? selectedReason
+      : "result_ready";
   reviewBusy = false;
   setReviewControlsDisabled(false);
 

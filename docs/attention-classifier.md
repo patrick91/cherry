@@ -132,7 +132,10 @@ Scripts/attention-provisional-labels \
 The original JSONL files are not changed. The generated bundle labels activity
 transitions, submissions, notifications, process exits, and representative
 unfinished drafts. Adjacent content-change frames remain unlabeled so they do
-not overwhelm the review queue.
+not overwhelm the review queue. A visible unsubmitted draft is treated as a
+`no_attention_needed` example because the user is already composing. Equivalent
+transition captures within five seconds are collapsed into one review episode,
+keeping the latest snapshot.
 
 ### Private Cloud Dashboard
 

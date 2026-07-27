@@ -177,6 +177,7 @@ type ObservationRow = {
   reviewStatus: string | null;
   reviewLabel: string | null;
   reviewReason: string | null;
+  reviewSource: string | null;
   reviewedAt: string | null;
 };
 type StoredObservationLabel = { label: string | null; payload: string };
@@ -184,6 +185,7 @@ type ReviewRow = {
   status: string;
   label: string | null;
   reason: string | null;
+  source: string;
   reviewedAt: string;
 };
 
@@ -339,6 +341,7 @@ async function dashboard(request: Request, env: Env): Promise<Response> {
             o.grid_json AS gridJSON, o.activity_state AS activityState,
             o.activity_evidence AS activityEvidence,
             r.status AS reviewStatus, r.label AS reviewLabel, r.reason AS reviewReason,
+            r.review_source AS reviewSource,
             r.reviewed_at AS reviewedAt
        FROM observations o
        LEFT JOIN observation_reviews r ON r.observation_id = o.id
@@ -417,16 +420,17 @@ async function reviewObservation(request: Request, env: Env, id: string): Promis
   }
 
   await env.DB.prepare(
-    `INSERT INTO observation_reviews (observation_id, status, label, reason)
-     VALUES (?1, ?2, ?3, ?4)
+    `INSERT INTO observation_reviews (observation_id, status, label, reason, review_source)
+     VALUES (?1, ?2, ?3, ?4, 'human')
      ON CONFLICT(observation_id) DO UPDATE SET
        status = excluded.status,
        label = excluded.label,
        reason = excluded.reason,
+       review_source = excluded.review_source,
        reviewed_at = CURRENT_TIMESTAMP`,
   ).bind(id, status, label, reason).run();
   const review = await env.DB.prepare(
-    `SELECT status, label, reason, reviewed_at AS reviewedAt
+    `SELECT status, label, reason, review_source AS source, reviewed_at AS reviewedAt
        FROM observation_reviews WHERE observation_id = ?1`,
   ).bind(id).first<ReviewRow>();
   if (review === null) throw new Error("review was not stored");

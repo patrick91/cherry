@@ -46,6 +46,7 @@ type ObservationSummary = {
   reviewStatus: "accepted" | "corrected" | "skipped" | null;
   reviewLabel: "attention_needed" | "no_attention_needed" | "unknown" | null;
   reviewReason: string | null;
+  reviewSource: "human" | "assistant_audit" | null;
   reviewedAt: string | null;
 };
 type BundleSummary = {
@@ -507,9 +508,14 @@ function renderHumanReview(observation: ObservationSummary): void {
   setReviewControlsDisabled(false);
 
   const reviewed = observation.reviewedAt === null ? "" : ` Last saved ${formatDate(observation.reviewedAt)}.`;
+  const source = observation.reviewSource === "assistant_audit"
+    ? " Assistant-audited."
+    : observation.reviewSource === "human"
+      ? " Manually reviewed."
+      : "";
   element("review-hint").textContent = status === "pending"
     ? "Accept the provisional suggestion, or choose a correction."
-    : `This example is ${formatIdentifier(status).toLowerCase()}.${reviewed} You can replace the decision.`;
+    : `This example is ${formatIdentifier(status).toLowerCase()}.${source}${reviewed} You can replace the decision.`;
   reviewMessage.textContent = reviewNotice;
   reviewNotice = "";
   delete reviewMessage.dataset.error;

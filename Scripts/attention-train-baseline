@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Train and evaluate a tiny dependency-free attention logistic regressor."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import tempfile
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+MODEL_SCHEMA_VERSION = 1
+BINARY_LABELS = {"attention_needed", "no_attention_needed"}
+POSITIVE_LABEL = "attention_needed"
+RESULT_MARKERS = (
+    "worked for",
+    "baked for",
+    "cooked for",
+    "cogitated for",
+    "crunched for",
+    "churned for",
+    "sautéed for",
+    "sauteed for",
+    "brewed for",
+)
+APPROVAL_MARKERS = (
+    "do you want to proceed",
+    "would you like to proceed",
+    "waiting for approval",
+    "press enter to approve",
+    "approve this action",
+    "allow this command",
+    "allow command",
+    "allow computer use to use",
+    "run the tool and continue",
+)
+BLOCKED_MARKERS = (
+    "conversation interrupted",
+    "task interrupted",
+    "process exited",
+    "fatal error",
+    "panic:",
+)
+
+
+class BaselineError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def object_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def terminal_text(observation: dict[str, Any]) -> str:
+    terminal = object_value(observation.get("terminal"))
+    grid = terminal.get("grid")
+    if not isinstance(grid, list):
+        return ""
+    return "\n".join(line for line in grid[-48:] if isinstance(line, str)).casefold()
+
+
+def add_category(features: dict[str, float], name: str, value: Any) -> None:
+    normalized = str(value) if value is not None else "missing"
+    features[f"category.{name}={normalized}"] = 1.0
+
+
+def add_boolean(features: dict[str, float], name: str, value: Any) -> None:
+    normalized = (
+        "true" if value is True
+        else "false" if value is False
+        else "missing"
+    )
+    features[f"boolean.{name}={normalized}"] = 1.0
+
+
+def add_log_milliseconds(features: dict[str, float], name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        features[f"boolean.{name}.missing=true"] = 1.0
+        return
+    features[f"numeric.{name}"] = math.log1p(float(value))
+    features[f"boolean.{name}.missing=false"] = 1.0
+
+
+def observation_features(record: dict[str, Any]) -> dict[str, float]:
+    observation = object_value(record.get("observation"))
+    activity = object_value(observation.get("activity"))
+    interaction = object_value(observation.get("interaction"))
+    timing = object_value(observation.get("timing"))
+    terminal = object_value(observation.get("terminal"))
+    cursor = object_value(terminal.get("cursor"))
+    text = terminal_text(observation)
+
+    features: dict[str, float] = {}
+    add_category(features, "event", observation.get("event"))
+    add_category(features, "activity.state", activity.get("state"))
+    add_category(features, "activity.evidence", activity.get("evidence"))
+    add_category(features, "activity.processState", activity.get("processState"))
+    add_boolean(features, "activity.hasUnreadNotification", activity.get("hasUnreadNotification"))
+    add_boolean(features, "interaction.hasUnsubmittedInput", interaction.get("hasUnsubmittedInput"))
+    add_boolean(features, "interaction.terminalFocused", interaction.get("terminalFocused"))
+    add_boolean(features, "terminal.usesAlternateScreen", terminal.get("usesAlternateScreen"))
+    add_boolean(features, "terminal.cursorVisible", cursor.get("isVisible"))
+    add_boolean(
+        features,
+        "terminal.scrollbackOmitted",
+        isinstance(terminal.get("scrollbackLinesOmitted"), int)
+        and terminal.get("scrollbackLinesOmitted", 0) > 0,
+    )
+
+    add_log_milliseconds(
+        features,
+        "millisecondsSinceLastKeystroke",
+        interaction.get("millisecondsSinceLastKeystroke"),
+    )
+    for key in (
+        "millisecondsSinceLastContentChange",
+        "millisecondsSinceLastHumanInput",
+        "millisecondsSinceLastOutput",
+        "millisecondsSinceStarted",
+    ):
+        add_log_milliseconds(features, key, timing.get(key))
+
+    marker_values = {
+        "result": any(marker in text for marker in RESULT_MARKERS),
+        "approval": any(marker in text for marker in APPROVAL_MARKERS),
+        "blocked": any(marker in text for marker in BLOCKED_MARKERS),
+        "working": "esc to interrupt" in text or "• working (" in text,
+        "prompt": any(
+            line.lstrip().startswith(("›", "❯"))
+            for line in text.splitlines()
+        ),
+    }
+    for name, value in marker_values.items():
+        add_boolean(features, f"terminal.marker.{name}", value)
+    return features
+
+
+def read_dataset(path: Path) -> list[dict[str, Any]]:
+    manifest_path = path / "manifest.json"
+    dataset_path = path / "dataset.jsonl"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_hash = object_value(manifest.get("datasetFile")).get("sha256")
+    if expected_hash != sha256(dataset_path):
+        raise BaselineError("dataset checksum does not match its manifest")
+
+    records: list[dict[str, Any]] = []
+    with dataset_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise BaselineError(f"dataset line {line_number} is not an object")
+            records.append(value)
+    return records
+
+
+def numeric_statistics(
+    feature_rows: list[dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    names = sorted({
+        name
+        for features in feature_rows
+        for name in features
+        if name.startswith("numeric.")
+    })
+    statistics: dict[str, dict[str, float]] = {}
+    for name in names:
+        values = [features[name] for features in feature_rows if name in features]
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        statistics[name] = {"mean": mean, "scale": max(math.sqrt(variance), 1e-6)}
+    return statistics
+
+
+def feature_names(
+    feature_rows: list[dict[str, float]],
+) -> list[str]:
+    return sorted({name for features in feature_rows for name in features})
+
+
+def vectorize(
+    features: dict[str, float],
+    names: list[str],
+    statistics: dict[str, dict[str, float]],
+) -> list[float]:
+    values: list[float] = []
+    for name in names:
+        if name in statistics:
+            if name not in features:
+                values.append(0.0)
+            else:
+                stats = statistics[name]
+                values.append((features[name] - stats["mean"]) / stats["scale"])
+        else:
+            values.append(features.get(name, 0.0))
+    return values
+
+
+def sigmoid(value: float) -> float:
+    if value >= 0:
+        inverse = math.exp(-value)
+        return 1 / (1 + inverse)
+    exponential = math.exp(value)
+    return exponential / (1 + exponential)
+
+
+def train_logistic(
+    vectors: list[list[float]],
+    targets: list[int],
+    *,
+    epochs: int = 1_500,
+    learning_rate: float = 0.03,
+    l2: float = 0.01,
+) -> tuple[list[float], float, list[float]]:
+    if not vectors or len(set(targets)) < 2:
+        raise BaselineError("training split must contain both binary labels")
+    positive_count = sum(targets)
+    negative_count = len(targets) - positive_count
+    sample_weights = [
+        len(targets) / (2 * (positive_count if target else negative_count))
+        for target in targets
+    ]
+
+    weights = [0.0] * len(vectors[0])
+    positive_rate = positive_count / len(targets)
+    bias = math.log(positive_rate / (1 - positive_rate))
+    first_moment = [0.0] * len(weights)
+    second_moment = [0.0] * len(weights)
+    bias_first_moment = 0.0
+    bias_second_moment = 0.0
+    beta_one = 0.9
+    beta_two = 0.999
+    epsilon = 1e-8
+    losses: list[float] = []
+    total_sample_weight = sum(sample_weights)
+
+    for epoch in range(1, epochs + 1):
+        gradients = [0.0] * len(weights)
+        bias_gradient = 0.0
+        loss = 0.0
+        for vector, target, sample_weight in zip(vectors, targets, sample_weights):
+            probability = sigmoid(bias + sum(
+                weight * value for weight, value in zip(weights, vector)
+            ))
+            error = (probability - target) * sample_weight
+            bias_gradient += error
+            for index, value in enumerate(vector):
+                gradients[index] += error * value
+            clipped = min(max(probability, 1e-12), 1 - 1e-12)
+            loss -= sample_weight * (
+                target * math.log(clipped)
+                + (1 - target) * math.log(1 - clipped)
+            )
+
+        bias_gradient /= total_sample_weight
+        loss /= total_sample_weight
+        for index in range(len(weights)):
+            gradients[index] = gradients[index] / total_sample_weight + l2 * weights[index]
+            loss += 0.5 * l2 * weights[index] ** 2
+            first_moment[index] = (
+                beta_one * first_moment[index]
+                + (1 - beta_one) * gradients[index]
+            )
+            second_moment[index] = (
+                beta_two * second_moment[index]
+                + (1 - beta_two) * gradients[index] ** 2
+            )
+            corrected_first = first_moment[index] / (1 - beta_one ** epoch)
+            corrected_second = second_moment[index] / (1 - beta_two ** epoch)
+            weights[index] -= (
+                learning_rate
+                * corrected_first
+                / (math.sqrt(corrected_second) + epsilon)
+            )
+
+        bias_first_moment = (
+            beta_one * bias_first_moment
+            + (1 - beta_one) * bias_gradient
+        )
+        bias_second_moment = (
+            beta_two * bias_second_moment
+            + (1 - beta_two) * bias_gradient ** 2
+        )
+        bias -= (
+            learning_rate
+            * (bias_first_moment / (1 - beta_one ** epoch))
+            / (math.sqrt(bias_second_moment / (1 - beta_two ** epoch)) + epsilon)
+        )
+        if epoch in {1, epochs // 2, epochs}:
+            losses.append(loss)
+    return weights, bias, losses
+
+
+def probability(vector: list[float], weights: list[float], bias: float) -> float:
+    return sigmoid(bias + sum(
+        weight * value for weight, value in zip(weights, vector)
+    ))
+
+
+def fit_records(
+    records: list[dict[str, Any]],
+) -> tuple[
+    list[str],
+    dict[str, dict[str, float]],
+    list[float],
+    float,
+    list[float],
+]:
+    features = [observation_features(record) for record in records]
+    names = feature_names(features)
+    statistics = numeric_statistics(features)
+    vectors = [vectorize(row, names, statistics) for row in features]
+    targets = [
+        1 if record["target"] == POSITIVE_LABEL else 0
+        for record in records
+    ]
+    weights, bias, losses = train_logistic(vectors, targets)
+    return names, statistics, weights, bias, losses
+
+
+def predict_record(
+    record: dict[str, Any],
+    names: list[str],
+    statistics: dict[str, dict[str, float]],
+    weights: list[float],
+    bias: float,
+    majority_label: str,
+) -> dict[str, Any]:
+    features = observation_features(record)
+    vector = vectorize(features, names, statistics)
+    score = probability(vector, weights, bias)
+    return {
+        "observationID": record["observationID"],
+        "sessionID": record["sessionID"],
+        "split": record["split"],
+        "reviewSource": object_value(record.get("review")).get("source"),
+        "harness": record.get("harness"),
+        "target": record["target"],
+        "probabilityAttentionNeeded": score,
+        "prediction": (
+            POSITIVE_LABEL if score >= 0.5 else "no_attention_needed"
+        ),
+        "majorityPrediction": majority_label,
+    }
+
+
+def classification_metrics(
+    items: list[dict[str, Any]],
+    predictions: dict[str, dict[str, Any]],
+    majority_label: str,
+) -> dict[str, Any] | None:
+    if not items:
+        return None
+    true_positive = false_positive = true_negative = false_negative = 0
+    majority_correct = 0
+    for item in items:
+        target = item["target"]
+        predicted = predictions[item["observationID"]]["prediction"]
+        majority_prediction = predictions[item["observationID"]].get(
+            "majorityPrediction",
+            majority_label,
+        )
+        majority_correct += int(target == majority_prediction)
+        if target == POSITIVE_LABEL and predicted == POSITIVE_LABEL:
+            true_positive += 1
+        elif target != POSITIVE_LABEL and predicted == POSITIVE_LABEL:
+            false_positive += 1
+        elif target != POSITIVE_LABEL and predicted != POSITIVE_LABEL:
+            true_negative += 1
+        else:
+            false_negative += 1
+    positive_recall = (
+        true_positive / (true_positive + false_negative)
+        if true_positive + false_negative else 0.0
+    )
+    negative_recall = (
+        true_negative / (true_negative + false_positive)
+        if true_negative + false_positive else 0.0
+    )
+    precision = (
+        true_positive / (true_positive + false_positive)
+        if true_positive + false_positive else 0.0
+    )
+    return {
+        "count": len(items),
+        "labels": dict(sorted(Counter(item["target"] for item in items).items())),
+        "accuracy": (true_positive + true_negative) / len(items),
+        "balancedAccuracy": (positive_recall + negative_recall) / 2,
+        "precision": precision,
+        "recall": positive_recall,
+        "f1": (
+            2 * precision * positive_recall / (precision + positive_recall)
+            if precision + positive_recall else 0.0
+        ),
+        "majorityBaselineAccuracy": majority_correct / len(items),
+        "confusion": {
+            "truePositive": true_positive,
+            "falsePositive": false_positive,
+            "trueNegative": true_negative,
+            "falseNegative": false_negative,
+        },
+    }
+
+
+def subset(
+    records: list[dict[str, Any]],
+    *,
+    split: str | None = None,
+    source: str | None = None,
+    harness: str | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if record["target"] in BINARY_LABELS
+        and (split is None or record["split"] == split)
+        and (source is None or object_value(record.get("review")).get("source") == source)
+        and (harness is None or record.get("harness") == harness)
+    ]
+
+
+def human_leave_one_session_out(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    human = subset(records, source="human")
+    predictions: dict[str, dict[str, Any]] = {}
+    folds: list[dict[str, Any]] = []
+    for session_id in sorted({record["sessionID"] for record in human}):
+        test = [record for record in human if record["sessionID"] == session_id]
+        train = [
+            record
+            for record in records
+            if record["target"] in BINARY_LABELS
+            and record["sessionID"] != session_id
+        ]
+        if len({record["target"] for record in train}) < 2:
+            continue
+        names, statistics, weights, bias, _ = fit_records(train)
+        majority_label = Counter(
+            record["target"] for record in train
+        ).most_common(1)[0][0]
+        for record in test:
+            predictions[record["observationID"]] = predict_record(
+                record,
+                names,
+                statistics,
+                weights,
+                bias,
+                majority_label,
+            )
+        folds.append({
+            "sessionID": session_id,
+            "trainRecords": len(train),
+            "testHumanRecords": len(test),
+        })
+    evaluated = [
+        record for record in human if record["observationID"] in predictions
+    ]
+    return evaluated, predictions, folds
+
+
+def train_baseline(args: argparse.Namespace) -> Path:
+    dataset = args.dataset.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise BaselineError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    records = read_dataset(dataset)
+    train_records = subset(records, split="train")
+    test_records = subset(records, split="test")
+    if not test_records:
+        raise BaselineError("test split has no binary labels")
+
+    names, statistics, weights, bias, losses = fit_records(train_records)
+    majority_label = Counter(record["target"] for record in train_records).most_common(1)[0][0]
+
+    predictions: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if record["target"] not in BINARY_LABELS:
+            continue
+        predictions[record["observationID"]] = predict_record(
+            record,
+            names,
+            statistics,
+            weights,
+            bias,
+            majority_label,
+        )
+
+    human_cross_validation, cross_validation_predictions, cross_validation_folds = (
+        human_leave_one_session_out(records)
+    )
+
+    evaluation_sets = {
+        "testAll": test_records,
+        "testHuman": subset(records, split="test", source="human"),
+        "testAssistantAudit": subset(
+            records,
+            split="test",
+            source="assistant_audit",
+        ),
+        "trainAllDiagnostic": train_records,
+    }
+    metrics: dict[str, Any] = {
+        "modelSchemaVersion": MODEL_SCHEMA_VERSION,
+        "createdAt": utc_now(),
+        "model": {
+            "type": "binary_logistic_regression",
+            "positiveLabel": POSITIVE_LABEL,
+            "threshold": 0.5,
+            "features": len(names),
+            "parameters": len(names) + 1,
+            "trainingLossCheckpoints": losses,
+        },
+        "dataset": {
+            "records": len(records),
+            "binaryRecords": len(train_records) + len(test_records),
+            "trainSessions": sorted({
+                record["sessionID"] for record in train_records
+            }),
+            "testSessions": sorted({
+                record["sessionID"] for record in test_records
+            }),
+            "reviewSources": dict(sorted(Counter(
+                object_value(record.get("review")).get("source")
+                for record in records
+            ).items())),
+        },
+        "evaluations": {
+            name: classification_metrics(items, predictions, majority_label)
+            for name, items in evaluation_sets.items()
+        },
+        "byHarness": {
+            harness: classification_metrics(
+                subset(records, split="test", harness=harness),
+                predictions,
+                majority_label,
+            )
+            for harness in sorted({
+                str(record.get("harness"))
+                for record in test_records
+            })
+        },
+        "limitations": [
+            "Assistant-audited labels are pseudo-labels, not independent human truth.",
+            "The human-only test set is small; its metrics have high variance.",
+            "The split is by whole session, but all data comes from one user and one collection period.",
+            "Terminal text is reduced to a few marker flags; raw text is not a model input.",
+        ],
+    }
+    metrics["evaluations"]["humanLeaveOneSessionOut"] = classification_metrics(
+        human_cross_validation,
+        cross_validation_predictions,
+        majority_label,
+    )
+    metrics["humanLeaveOneSessionOutFolds"] = cross_validation_folds
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    os.chmod(temporary, 0o700)
+    model = {
+        "modelSchemaVersion": MODEL_SCHEMA_VERSION,
+        "type": "binary_logistic_regression",
+        "positiveLabel": POSITIVE_LABEL,
+        "threshold": 0.5,
+        "bias": bias,
+        "parameters": len(names) + 1,
+        "featureNames": names,
+        "weights": weights,
+        "numericStatistics": statistics,
+        "featurePolicy": {
+            "structuredObservationFieldsOnly": True,
+            "rawTerminalTextIncluded": False,
+            "provisionalLabelIncluded": False,
+            "reviewMetadataIncluded": False,
+        },
+    }
+    model_path = temporary / "model.json"
+    model_path.write_text(json.dumps(model, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    metrics_path = temporary / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(metrics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predictions_path = temporary / "predictions.jsonl"
+    with predictions_path.open("w", encoding="utf-8") as handle:
+        for identifier in sorted(predictions):
+            handle.write(json.dumps(predictions[identifier], separators=(",", ":"), sort_keys=True))
+            handle.write("\n")
+    cross_validation_path = temporary / "human-loso-predictions.jsonl"
+    with cross_validation_path.open("w", encoding="utf-8") as handle:
+        for identifier in sorted(cross_validation_predictions):
+            handle.write(json.dumps(
+                cross_validation_predictions[identifier],
+                separators=(",", ":"),
+                sort_keys=True,
+            ))
+            handle.write("\n")
+    for path in (model_path, metrics_path, predictions_path, cross_validation_path):
+        os.chmod(path, 0o600)
+    os.replace(temporary, output)
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        output = train_baseline(parse_args())
+    except (BaselineError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"attention-train-baseline: {error}", file=os.sys.stderr)
+        return 2
+    print(f"Created {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

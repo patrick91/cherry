@@ -25,9 +25,11 @@ Older schema-1 labels (`approval_required`, `waiting_for_input`, and
 `attention_needed` plus the corresponding reason in the dashboard.
 
 Raw automatic observations are deliberately unlabeled. The review-bundle
-sampler can add provisional labels to useful transitions; they become training
-truth only after human review. Cherry's current heuristic state is stored as
-diagnostic evidence, never as training truth.
+sampler can add provisional labels to useful transitions. Reviews keep their
+provenance as either `human` or `assistant_audit`; assistant-audited decisions
+are useful pseudo-labels, but only human decisions count as independent
+evaluation truth. Cherry's current heuristic state is stored as diagnostic
+evidence, never as a model input.
 
 ## Week-Long Study Mode
 
@@ -153,10 +155,11 @@ npm run dev
 
 For the local review workflow, `npm run local` applies pending D1 migrations
 and starts the dashboard in one command. Import a provisional review bundle,
-then accept, correct, or skip one observation at a time. Human decisions are
-stored separately from the immutable provisional label in the local Wrangler
-D1 state. The dashboard supports `A` to accept, `C` to save a correction, and
-`S` to skip whenever a form control is not focused.
+then accept, correct, or skip one observation at a time. Review decisions and
+their provenance are stored separately from the immutable provisional label in
+the local Wrangler D1 state. Any manual edit becomes a `human` review. The
+dashboard supports `A` to accept, `C` to save a correction, and `S` to skip
+whenever a form control is not focused.
 
 Select the whole exported directory in the browser. Uploads are chunked,
 schema-validated, and de-duplicated by observation UUID. Unlike the local
@@ -166,6 +169,43 @@ treat the deployment as private research infrastructure.
 
 The current private deployment is
 <https://cherry-attention-lab.patrick-arminio.workers.dev>.
+
+## Train the Tiny Baseline
+
+With the local dashboard running, export accepted and corrected reviews and
+train the dependency-free logistic-regression baseline:
+
+```bash
+run_root="$HOME/Library/Application Support/Cherry/Attention Study/Model Runs/my-run"
+
+Scripts/attention-reviewed-dataset \
+  --output "$run_root/dataset"
+
+Scripts/attention-train-baseline \
+  --dataset "$run_root/dataset" \
+  --output "$run_root/model"
+```
+
+The exporter removes provisional labels, annotations, scenario/checkpoint
+names, and session identifiers from the observation payload used for features.
+It creates a deterministic whole-session train/test split and records a SHA-256
+checksum in `manifest.json`. `unknown` reviews remain in the dataset but are
+excluded from binary model fitting.
+
+The model uses activity, event, interaction, timing, cursor, screen-mode, and a
+few terminal-state marker flags. It does not use arbitrary terminal text,
+harness identity, review metadata, or provisional labels. The output contains:
+
+- `model.json`: weights, feature names, scaling statistics, and threshold.
+- `metrics.json`: fixed session-split metrics plus human leave-one-session-out
+  evaluation.
+- `predictions.jsonl`: predictions from the final fixed-split model.
+- `human-loso-predictions.jsonl`: out-of-session predictions for every
+  human-reviewed binary example.
+
+Treat the human leave-one-session-out result as the headline measurement.
+Metrics over `assistant_audit` examples are diagnostic because those labels
+were produced by rules similar to the model inputs.
 
 ## Run Controlled Scenarios
 
@@ -240,5 +280,6 @@ suite. Retrain only if the blind result exposes a real coverage gap.
   screens, errors, ordinary shells, and prose containing misleading keywords.
 - Never commit captured JSONL files to the repository.
 
-The model and Core ML integration should be built only after this capture path
-has produced a representative, trustworthy evaluation set.
+The baseline is suitable for testing the pipeline, not yet for production
+notifications. Expand the human-reviewed, unseen-session and unseen-harness
+evaluation set before integrating it into Cherry or converting it to Core ML.

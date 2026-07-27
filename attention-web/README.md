@@ -24,7 +24,9 @@ uploader:
 ```
 
 The dashboard token is kept in tab-scoped `sessionStorage`; it is not embedded
-in the built site. API routes require `Authorization: Bearer <token>`.
+in the built site. API routes require `Authorization: Bearer <token>`. Reviews
+also retain whether they came from a manual decision or an assistant audit;
+editing any decision in the dashboard marks the replacement as manual.
 
 ## Deploy
 

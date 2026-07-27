@@ -195,6 +195,7 @@ describe("attention dashboard Worker", () => {
         status: "accepted",
         label: "attention_needed",
         reason: "waiting_for_approval",
+        source: "human",
       },
     });
 
@@ -204,6 +205,7 @@ describe("attention dashboard Worker", () => {
     expect(reviewed).toContain('"reviewStatus":"accepted"');
     expect(reviewed).toContain('"reviewLabel":"attention_needed"');
     expect(reviewed).toContain('"reviewReason":"waiting_for_approval"');
+    expect(reviewed).toContain('"reviewSource":"human"');
   });
 
   it("stores corrections and skipped reviews", async () => {
@@ -212,6 +214,11 @@ describe("attention dashboard Worker", () => {
       method: "POST",
       body: JSON.stringify({ observations: [observation] }),
     });
+    await env.DB.prepare(
+      `INSERT INTO observation_reviews
+         (observation_id, status, label, reason, review_source)
+       VALUES (?1, 'accepted', 'attention_needed', 'waiting_for_approval', 'assistant_audit')`,
+    ).bind(observationID).run();
 
     const corrected = await api(`/api/observations/${observationID}/review`, {
       method: "PUT",
@@ -219,7 +226,12 @@ describe("attention dashboard Worker", () => {
     });
     expect(corrected.status).toBe(200);
     await expect(corrected.json()).resolves.toMatchObject({
-      review: { status: "corrected", label: "no_attention_needed", reason: null },
+      review: {
+        status: "corrected",
+        label: "no_attention_needed",
+        reason: null,
+        source: "human",
+      },
     });
 
     const skipped = await api(`/api/observations/${observationID}/review`, {

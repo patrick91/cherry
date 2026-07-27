@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Export reviewed dashboard observations into a leakage-resistant dataset."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from itertools import combinations
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DATASET_SCHEMA_VERSION = 1
+BINARY_LABELS = {"attention_needed", "no_attention_needed"}
+
+
+class DatasetExportError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def read_dashboard_token(path: Path) -> str:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "DASHBOARD_TOKEN":
+            token = value.strip().strip("\"'")
+            if token:
+                return token
+    raise DatasetExportError(f"DASHBOARD_TOKEN is missing from {path}")
+
+
+class DashboardClient:
+    def __init__(self, base_url: str, token: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def get(self, path: str) -> Any:
+        request = urllib.request.Request(
+            self.base_url + path,
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            message = error.read().decode("utf-8", errors="replace")
+            raise DatasetExportError(
+                f"dashboard returned HTTP {error.code} for {path}: {message}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise DatasetExportError(f"could not reach dashboard: {error.reason}") from error
+
+
+def reviewed_summaries(client: DashboardClient) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        query = urllib.parse.urlencode({
+            "review": "reviewed",
+            "label": "labeled",
+            "limit": 50,
+            "offset": offset,
+        })
+        page = client.get(f"/api/dashboard?{query}")
+        if not isinstance(page, dict) or not isinstance(page.get("observations"), list):
+            raise DatasetExportError("dashboard response is missing observations")
+        summaries.extend(page["observations"])
+        pagination = page.get("pagination")
+        if not isinstance(pagination, dict):
+            raise DatasetExportError("dashboard response is missing pagination")
+        total = pagination.get("total")
+        returned = pagination.get("returned")
+        if not isinstance(total, int) or not isinstance(returned, int):
+            raise DatasetExportError("dashboard pagination is invalid")
+        if len(summaries) >= total:
+            return summaries
+        if returned <= 0:
+            raise DatasetExportError("dashboard pagination stopped before all reviews were returned")
+        offset += returned
+
+
+def binary_counts(records: Iterable[dict[str, Any]]) -> Counter[str]:
+    return Counter(
+        record["reviewLabel"]
+        for record in records
+        if record.get("reviewLabel") in BINARY_LABELS
+    )
+
+
+def split_score(
+    records: list[dict[str, Any]],
+    test_sessions: set[str],
+    all_sessions: set[str],
+) -> float:
+    binary = [record for record in records if record.get("reviewLabel") in BINARY_LABELS]
+    test = [record for record in binary if record["sessionID"] in test_sessions]
+    train = [record for record in binary if record["sessionID"] not in test_sessions]
+    if not test or not train:
+        return float("inf")
+
+    total_counts = binary_counts(binary)
+    test_counts = binary_counts(test)
+    train_counts = binary_counts(train)
+    score = abs(len(test) / len(binary) - 0.25) * 6
+    score += abs(len(test_sessions) / len(all_sessions) - 0.25)
+    total_positive_rate = total_counts["attention_needed"] / len(binary)
+    score += abs(test_counts["attention_needed"] / len(test) - total_positive_rate) * 3
+    if len(test_counts) < 2:
+        score += 50
+    if len(train_counts) < 2:
+        score += 50
+
+    human = [record for record in binary if record.get("reviewSource") == "human"]
+    if human:
+        human_test = [record for record in human if record["sessionID"] in test_sessions]
+        human_train = [record for record in human if record["sessionID"] not in test_sessions]
+        score += abs(len(human_test) / len(human) - 0.30) * 4
+        if len(binary_counts(human_test)) < 2:
+            score += 20
+        if len(binary_counts(human_train)) < 2:
+            score += 20
+    return score
+
+
+def choose_test_sessions(records: list[dict[str, Any]]) -> set[str]:
+    sessions = sorted({
+        record["sessionID"]
+        for record in records
+        if record.get("reviewLabel") in BINARY_LABELS
+    })
+    if len(sessions) < 2:
+        raise DatasetExportError("at least two reviewed sessions are required for a session split")
+
+    best_sessions: tuple[str, ...] | None = None
+    best_score = float("inf")
+    all_sessions = set(sessions)
+    if len(sessions) <= 16:
+        for size in range(1, len(sessions)):
+            for candidate in combinations(sessions, size):
+                score = split_score(records, set(candidate), all_sessions)
+                if score < best_score or (
+                    score == best_score
+                    and (best_sessions is None or candidate < best_sessions)
+                ):
+                    best_sessions = candidate
+                    best_score = score
+    else:
+        selected: set[str] = set()
+        while len(selected) < len(sessions) - 1:
+            additions = [
+                (
+                    split_score(records, selected | {session}, all_sessions),
+                    tuple(sorted(selected | {session})),
+                )
+                for session in sessions
+                if session not in selected
+            ]
+            score, candidate = min(additions)
+            if selected and score >= best_score:
+                break
+            selected = set(candidate)
+            best_sessions = candidate
+            best_score = score
+
+        improved = True
+        while improved and best_sessions is not None:
+            improved = False
+            selected = set(best_sessions)
+            neighbors: list[tuple[str, ...]] = []
+            if len(selected) > 1:
+                neighbors.extend(
+                    tuple(sorted(selected - {session}))
+                    for session in sorted(selected)
+                )
+            if len(selected) < len(sessions) - 1:
+                neighbors.extend(
+                    tuple(sorted(selected | {session}))
+                    for session in sessions
+                    if session not in selected
+                )
+            neighbors.extend(
+                tuple(sorted((selected - {removed}) | {added}))
+                for removed in sorted(selected)
+                for added in sessions
+                if added not in selected
+            )
+            for candidate in sorted(set(neighbors)):
+                score = split_score(records, set(candidate), all_sessions)
+                if score < best_score:
+                    best_sessions = candidate
+                    best_score = score
+                    improved = True
+                    break
+    if best_sessions is None or best_score == float("inf"):
+        raise DatasetExportError("could not create a valid session split")
+    return set(best_sessions)
+
+
+def sanitized_observation(payload: dict[str, Any]) -> dict[str, Any]:
+    safe = dict(payload)
+    for key in ("annotation", "checkpoint", "id", "label", "scenarioID"):
+        safe.pop(key, None)
+    session = payload.get("session")
+    if isinstance(session, dict):
+        safe["session"] = {
+            key: session[key]
+            for key in ("harness", "kind")
+            if key in session
+        }
+    return safe
+
+
+def dataset_record(
+    summary: dict[str, Any],
+    payload: dict[str, Any],
+    test_sessions: set[str],
+) -> dict[str, Any]:
+    label = summary.get("reviewLabel")
+    source = summary.get("reviewSource")
+    if label not in BINARY_LABELS | {"unknown"}:
+        raise DatasetExportError(f"review {summary.get('id')} has an invalid label")
+    if source not in {"human", "assistant_audit"}:
+        raise DatasetExportError(f"review {summary.get('id')} has no reviewer provenance")
+    session_id = summary.get("sessionID")
+    if not isinstance(session_id, str) or not session_id:
+        raise DatasetExportError(f"review {summary.get('id')} has no session")
+
+    return {
+        "datasetSchemaVersion": DATASET_SCHEMA_VERSION,
+        "observationID": summary["id"],
+        "recordedAt": summary["recordedAt"],
+        "sessionID": session_id,
+        "harness": summary.get("harness"),
+        "split": "test" if session_id in test_sessions else "train",
+        "target": label,
+        "attentionReason": summary.get("reviewReason"),
+        "review": {
+            "status": summary.get("reviewStatus"),
+            "source": source,
+            "reviewedAt": summary.get("reviewedAt"),
+        },
+        "observation": sanitized_observation(payload),
+    }
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def nested_counts(records: Iterable[dict[str, Any]], *keys: str) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        value: Any = record
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        counts[str(value)] += 1
+    return dict(sorted(counts.items()))
+
+
+def export_dataset(args: argparse.Namespace) -> Path:
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise DatasetExportError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    token = read_dashboard_token(args.token_file.expanduser().resolve())
+    client = DashboardClient(args.url, token)
+    summaries = reviewed_summaries(client)
+    if not summaries:
+        raise DatasetExportError("dashboard has no accepted or corrected reviews")
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        payloads = list(executor.map(
+            lambda summary: client.get(
+                f"/api/observations/{urllib.parse.quote(summary['id'], safe='')}"
+            ),
+            summaries,
+        ))
+    if not all(isinstance(payload, dict) for payload in payloads):
+        raise DatasetExportError("one or more observation payloads are invalid")
+
+    test_sessions = choose_test_sessions(summaries)
+    records = [
+        dataset_record(summary, payload, test_sessions)
+        for summary, payload in zip(summaries, payloads)
+    ]
+    records.sort(key=lambda record: (record["recordedAt"], record["observationID"]))
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    os.chmod(temporary, 0o700)
+    dataset_path = temporary / "dataset.jsonl"
+    with dataset_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True))
+            handle.write("\n")
+    os.chmod(dataset_path, 0o600)
+
+    binary = [record for record in records if record["target"] in BINARY_LABELS]
+    manifest = {
+        "datasetSchemaVersion": DATASET_SCHEMA_VERSION,
+        "createdAt": utc_now(),
+        "sourceURL": args.url,
+        "datasetFile": {
+            "path": dataset_path.name,
+            "sha256": sha256(dataset_path),
+            "records": len(records),
+        },
+        "counts": {
+            "target": nested_counts(records, "target"),
+            "reviewSource": nested_counts(records, "review", "source"),
+            "split": nested_counts(records, "split"),
+            "binarySplit": nested_counts(binary, "split"),
+        },
+        "sessions": {
+            "train": sorted({
+                record["sessionID"] for record in records if record["split"] == "train"
+            }),
+            "test": sorted(test_sessions),
+        },
+        "featurePolicy": {
+            "excludedFromObservation": [
+                "annotation",
+                "checkpoint",
+                "id",
+                "label",
+                "scenarioID",
+                "session.id",
+                "session.runID",
+            ],
+            "note": "Review truth and provisional annotations are metadata, never model inputs.",
+        },
+    }
+    manifest_path = temporary / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(manifest_path, 0o600)
+    os.replace(temporary, output)
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--url", default="http://localhost:8791")
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=Path("attention-web/.dev.vars"),
+        help="Private dotenv file containing DASHBOARD_TOKEN.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        output = export_dataset(parse_args())
+    except (DatasetExportError, OSError, ValueError) as error:
+        print(f"attention-reviewed-dataset: {error}", file=os.sys.stderr)
+        return 2
+    print(f"Created {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

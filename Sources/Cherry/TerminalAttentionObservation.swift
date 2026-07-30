@@ -1,11 +1,61 @@
 import Foundation
 
 enum TerminalAttentionLabel: String, Codable, CaseIterable, Equatable, Sendable {
+    case attentionNeeded = "attention_needed"
     case approvalRequired = "approval_required"
     case waitingForInput = "waiting_for_input"
     case readyForReview = "ready_for_review"
     case noAttentionNeeded = "no_attention_needed"
     case unknown
+}
+
+enum TerminalAttentionReason: String, Codable, CaseIterable, Equatable, Sendable {
+    case resultReady = "result_ready"
+    case waitingForInput = "waiting_for_input"
+    case waitingForApproval = "waiting_for_approval"
+    case blockedOrError = "blocked_or_error"
+}
+
+enum TerminalAttentionCorrection: CaseIterable, Equatable, Sendable {
+    case resultReady
+    case waitingForInput
+    case waitingForApproval
+    case blockedOrError
+    case noAttentionNeeded
+
+    var title: String {
+        switch self {
+        case .resultReady:
+            "Result is ready"
+        case .waitingForInput:
+            "Waiting for my input"
+        case .waitingForApproval:
+            "Waiting for my approval"
+        case .blockedOrError:
+            "Blocked or errored"
+        case .noAttentionNeeded:
+            "No attention needed"
+        }
+    }
+
+    var label: TerminalAttentionLabel {
+        self == .noAttentionNeeded ? .noAttentionNeeded : .attentionNeeded
+    }
+
+    var reason: TerminalAttentionReason? {
+        switch self {
+        case .resultReady:
+            .resultReady
+        case .waitingForInput:
+            .waitingForInput
+        case .waitingForApproval:
+            .waitingForApproval
+        case .blockedOrError:
+            .blockedOrError
+        case .noAttentionNeeded:
+            nil
+        }
+    }
 }
 
 enum TerminalAttentionObservationEvent: String, Codable, Equatable, Sendable {
@@ -20,6 +70,14 @@ enum TerminalAttentionObservationEvent: String, Codable, Equatable, Sendable {
 
 struct TerminalAttentionObservation: Codable, Equatable, Sendable {
     static let currentSchemaVersion = 1
+
+    struct AnnotationContext: Codable, Equatable, Sendable {
+        let schemaVersion: Int
+        let provenance: String
+        let confidence: Double
+        let rationale: String
+        let reason: TerminalAttentionReason?
+    }
 
     struct SessionContext: Codable, Equatable, Sendable {
         let id: String
@@ -104,6 +162,10 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
     let recordedAt: Date
     let event: TerminalAttentionObservationEvent
     let label: TerminalAttentionLabel?
+    /// Optional review metadata. Its absence keeps older schema-1 observations
+    /// decodable, while explicit human checkpoints remain distinguishable from
+    /// automatic or synthetic labels.
+    let annotation: AnnotationContext?
     let scenarioID: String?
     let checkpoint: String?
     let session: SessionContext

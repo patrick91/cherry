@@ -104,6 +104,71 @@ struct TerminalAttentionObservationTests {
         #expect(observations.contains { $0.event == .labeledCheckpoint && $0.label == .noAttentionNeeded })
     }
 
+    @Test func inAppCorrectionRecordsHumanProvenanceAndReason() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-attention-correction-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Correction fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.ingestTestingData(Data("Finished implementing the feature.\n❯ \n".utf8))
+        let capture = try session.captureAttentionCorrection(.resultReady)
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let observation = try #require(observations.first { $0.id == capture.id })
+        let annotation = try #require(observation.annotation)
+
+        #expect(observation.event == .labeledCheckpoint)
+        #expect(observation.label == .attentionNeeded)
+        #expect(observation.scenarioID == "in-app-attention-correction")
+        #expect(observation.checkpoint == "human_corrected")
+        #expect(annotation.schemaVersion == 1)
+        #expect(annotation.provenance == "cherry_in_app_human_correction")
+        #expect(annotation.confidence == 1)
+        #expect(annotation.rationale == "human_corrected_attention_label")
+        #expect(annotation.reason == .resultReady)
+    }
+
+    @Test func noAttentionCorrectionOmitsAttentionReason() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-no-attention-correction-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Correction fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        let capture = try session.captureAttentionCorrection(.noAttentionNeeded)
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let observation = try #require(observations.first { $0.id == capture.id })
+
+        #expect(observation.label == .noAttentionNeeded)
+        #expect(observation.annotation?.reason == nil)
+    }
+
     @Test func schemaOneObservationWithoutStyledGridStillDecodes() throws {
         let json = """
         {
@@ -144,6 +209,7 @@ struct TerminalAttentionObservationTests {
         #expect(observation.terminal.grid == ["plain text"])
         #expect(observation.terminal.styledGrid == nil)
         #expect(observation.interaction == nil)
+        #expect(observation.annotation == nil)
     }
 
     @Test func nativeHostSubmissionRecordsInputSubmittedEvent() throws {

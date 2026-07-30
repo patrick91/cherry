@@ -3605,10 +3605,38 @@ final class TerminalSession: ObservableObject, Identifiable {
         let observation = makeAttentionObservation(
             event: .labeledCheckpoint,
             label: label,
+            annotation: nil,
             scenarioID: scenarioID,
             checkpoint: checkpoint,
             harnessVersion: harnessVersion,
             runID: runID
+        )
+        attentionObservationRecorder.record(observation, synchronously: true)
+        return (observation.id, attentionObservationRecorder.outputURL)
+    }
+
+    @discardableResult
+    func captureAttentionCorrection(
+        _ correction: TerminalAttentionCorrection
+    ) throws -> (id: UUID, outputURL: URL) {
+        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else {
+            throw TerminalAttentionRecordingError.disabled
+        }
+
+        let observation = makeAttentionObservation(
+            event: .labeledCheckpoint,
+            label: correction.label,
+            annotation: .init(
+                schemaVersion: 1,
+                provenance: "cherry_in_app_human_correction",
+                confidence: 1,
+                rationale: "human_corrected_attention_label",
+                reason: correction.reason
+            ),
+            scenarioID: "in-app-attention-correction",
+            checkpoint: "human_corrected",
+            harnessVersion: nil,
+            runID: nil
         )
         attentionObservationRecorder.record(observation, synchronously: true)
         return (observation.id, attentionObservationRecorder.outputURL)
@@ -3639,6 +3667,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let observation = makeAttentionObservation(
             event: event,
             label: nil,
+            annotation: nil,
             scenarioID: nil,
             checkpoint: nil,
             harnessVersion: nil,
@@ -3662,6 +3691,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func makeAttentionObservation(
         event: TerminalAttentionObservationEvent,
         label: TerminalAttentionLabel?,
+        annotation: TerminalAttentionObservation.AnnotationContext?,
         scenarioID: String?,
         checkpoint: String?,
         harnessVersion: String?,
@@ -3694,6 +3724,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             recordedAt: now,
             event: event,
             label: label,
+            annotation: annotation,
             scenarioID: Self.attentionRecordingMetadata(scenarioID),
             checkpoint: Self.attentionRecordingMetadata(checkpoint),
             session: .init(

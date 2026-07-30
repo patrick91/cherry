@@ -161,6 +161,26 @@ the local Wrangler D1 state. Any manual edit becomes a `human` review. The
 dashboard supports `A` to accept, `C` to save a correction, and `S` to skip
 whenever a form control is not focused.
 
+### Correct a Label While Using Cherry
+
+When Attention Study collection is enabled, right-click an agent tab and open
+**Correct Attention Label**. Choose the state that is actually visible:
+
+- Result is ready
+- Waiting for my input
+- Waiting for my approval
+- Blocked or errored
+- No attention needed
+
+For example, if the user is still typing, choose **No attention needed**. Cherry
+writes the current terminal snapshot as a `human_corrected` labeled checkpoint
+with `cherry_in_app_human_correction` provenance. It does not guess the
+replacement label from the current activity indicator.
+
+The correction stays in the normal private JSONL recording. A later provisional
+bundle preserves its label and annotation, and the dashboard presents it for
+review before it enters a training export.
+
 Select the whole exported directory in the browser. Uploads are chunked,
 schema-validated, and de-duplicated by observation UUID. Unlike the local
 import command, the browser uploader does not re-check the manifest's file
@@ -206,6 +226,23 @@ harness identity, review metadata, or provisional labels. The output contains:
 Treat the human leave-one-session-out result as the headline measurement.
 Metrics over `assistant_audit` examples are diagnostic because those labels
 were produced by rules similar to the model inputs.
+
+### Final Reviewed Baseline (30 July 2026)
+
+The completed local review produced 1,110 examples across 32 whole terminal
+sessions: 493 `attention_needed`, 616 `no_attention_needed`, and one retained
+`unknown`. Of these, 34 were directly human-reviewed and 1,076 were
+assistant-audited.
+
+The final dependency-free logistic regressor has 55 parameters. Its fixed
+eight-session test split scored 97.5% balanced accuracy on 279 binary examples.
+The more meaningful human leave-one-session-out evaluation scored 96.7%
+balanced accuracy on 33 examples: 18 true positives, 14 true negatives, one
+false positive, and no false negatives.
+
+This closes the initial collection pass. The result is strong enough to
+prototype integration and collect targeted corrections, but the human sample
+still comes from one user and is too small to call production-ready.
 
 ## Run Controlled Scenarios
 

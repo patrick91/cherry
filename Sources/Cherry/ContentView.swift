@@ -5191,6 +5191,10 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
+            AttentionCorrectionMenu(session: session)
+
+            Divider()
+
             Button("Close", role: .destructive) {
                 close(session)
             }
@@ -6310,6 +6314,12 @@ private struct SidebarSessionSection: View {
 
         nixShellContextMenuItems(for: session.nixShellEnvironment)
 
+        if session.kind == .agent {
+            Divider()
+
+            AttentionCorrectionMenu(session: session)
+        }
+
         Divider()
 
         Button("Close", role: .destructive) {
@@ -6634,7 +6644,11 @@ private struct SidebarSplitPaneIconSelector: View {
 
             nixShellContextMenuItems(for: session.nixShellEnvironment)
 
-            Divider()
+            if session.kind == .agent {
+                Divider()
+
+                AttentionCorrectionMenu(session: session)
+            }
 
             Button("Close Pane", role: .destructive) {
                 workspace.close(session)
@@ -10232,6 +10246,68 @@ private struct RoundedTerminalSplitPaneModifier: ViewModifier {
             content.clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
         } else {
             content
+        }
+    }
+}
+
+private struct AttentionCorrectionMenu: View {
+    let session: TerminalSession
+
+    var body: some View {
+        Menu("Correct Attention Label") {
+            ForEach(
+                [
+                    TerminalAttentionCorrection.resultReady,
+                    .waitingForInput,
+                    .waitingForApproval,
+                    .blockedOrError,
+                ],
+                id: \.title
+            ) { correction in
+                Button(correction.title) {
+                    save(correction)
+                }
+            }
+
+            Divider()
+
+            Button(TerminalAttentionCorrection.noAttentionNeeded.title) {
+                save(.noAttentionNeeded)
+            }
+        }
+    }
+
+    private func save(_ correction: TerminalAttentionCorrection) {
+        do {
+            _ = try session.captureAttentionCorrection(correction)
+            presentResult(
+                title: "Attention correction saved",
+                message: "Recorded “\(correction.title)” with the current terminal snapshot as a human correction."
+            )
+        } catch {
+            presentResult(
+                title: "Couldn’t save attention correction",
+                message: error.localizedDescription,
+                style: .warning
+            )
+        }
+    }
+
+    private func presentResult(
+        title: String,
+        message: String,
+        style: NSAlert.Style = .informational
+    ) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = style
+        alert.addButton(withTitle: "Done")
+
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
         }
     }
 }

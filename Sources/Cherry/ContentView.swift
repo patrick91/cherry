@@ -5191,7 +5191,7 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            AttentionCorrectionMenu(session: session)
+            AttentionToolsMenu(session: session)
 
             Divider()
 
@@ -6317,7 +6317,7 @@ private struct SidebarSessionSection: View {
         if session.kind == .agent {
             Divider()
 
-            AttentionCorrectionMenu(session: session)
+            AttentionToolsMenu(session: session)
         }
 
         Divider()
@@ -6647,7 +6647,7 @@ private struct SidebarSplitPaneIconSelector: View {
             if session.kind == .agent {
                 Divider()
 
-                AttentionCorrectionMenu(session: session)
+                AttentionToolsMenu(session: session)
             }
 
             Button("Close Pane", role: .destructive) {
@@ -7546,6 +7546,24 @@ private struct SidebarAgentPermissionIndicator: View {
     }
 }
 
+private struct SidebarAgentAttentionIndicator: View {
+    let prediction: TerminalAttentionPrediction
+
+    var body: some View {
+        Image(systemName: "exclamationmark.circle.fill")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Color.pink)
+            .frame(width: 14, height: 18)
+            .help(
+                "Model: attention needed " +
+                prediction.attentionProbability.formatted(
+                    .percent.precision(.fractionLength(0))
+                )
+            )
+            .accessibilityLabel("Model predicts attention needed")
+    }
+}
+
 private struct SidebarTabRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
@@ -7694,10 +7712,13 @@ private struct SidebarTabRow: View {
 
             Spacer(minLength: 8)
 
-            if rowState.agentActivityState.showsWorkingIndicator {
-                SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
-            } else if rowState.agentActivityState == .permission {
+            if rowState.agentActivityState == .permission {
                 SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
+            } else if let prediction = rowState.attentionClassifierPrediction,
+                      prediction.needsAttention {
+                SidebarAgentAttentionIndicator(prediction: prediction)
+            } else if rowState.agentActivityState.showsWorkingIndicator {
+                SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 
             Circle()
@@ -7768,6 +7789,7 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var label: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
     @Published private(set) var agentActivityState: AgentActivityState
+    @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
 
     private weak var session: TerminalSession?
@@ -7787,17 +7809,30 @@ private final class SidebarTabRowState: ObservableObject {
         self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
+        self.attentionClassifierPrediction = session.attentionClassifierPrediction
         self.nixShellEnvironment = session.nixShellEnvironment
 
         observe(session)
     }
 
     var helpText: String {
-        guard let nixShellEnvironment else { return label.title }
+        var lines = [label.title]
         if let detail = label.detail, !detail.isEmpty {
-            return "\(label.title)\n\(detail)\n\(nixShellEnvironment.tooltip)"
+            lines.append(detail)
         }
-        return "\(label.title)\n\(nixShellEnvironment.tooltip)"
+        if let prediction = attentionClassifierPrediction {
+            lines.append(
+                "Model: \(prediction.displayName) · " +
+                prediction.attentionProbability.formatted(
+                    .percent.precision(.fractionLength(0))
+                ) +
+                " attention probability"
+            )
+        }
+        if let nixShellEnvironment {
+            lines.append(nixShellEnvironment.tooltip)
+        }
+        return lines.joined(separator: "\n")
     }
 
     func updatePathDisplayMode(_ mode: SidebarTerminalPathDisplayMode) {
@@ -7839,6 +7874,15 @@ private final class SidebarTabRowState: ObservableObject {
             .sink { [weak self] state in
                 Task { @MainActor [weak self] in
                     self?.agentActivityState = state
+                }
+            }
+            .store(in: &cancellables)
+
+        session.$attentionClassifierPrediction
+            .removeDuplicates()
+            .sink { [weak self] prediction in
+                Task { @MainActor [weak self] in
+                    self?.attentionClassifierPrediction = prediction
                 }
             }
             .store(in: &cancellables)
@@ -10250,10 +10294,30 @@ private struct RoundedTerminalSplitPaneModifier: ViewModifier {
     }
 }
 
-private struct AttentionCorrectionMenu: View {
-    let session: TerminalSession
+private struct AttentionToolsMenu: View {
+    @ObservedObject var session: TerminalSession
 
     var body: some View {
+        if let prediction = session.attentionClassifierPrediction {
+            Button(
+                "Model: \(prediction.displayName) (" +
+                prediction.attentionProbability.formatted(
+                    .percent.precision(.fractionLength(0))
+                ) +
+                ")"
+            ) {}
+                .disabled(true)
+
+            Button("Show Attention Debug...") {
+                presentAttentionDebug(prediction)
+            }
+        } else {
+            Button("Model: Waiting for terminal state") {}
+                .disabled(true)
+        }
+
+        Divider()
+
         Menu("Correct Attention Label") {
             ForEach(
                 [
@@ -10274,6 +10338,33 @@ private struct AttentionCorrectionMenu: View {
             Button(TerminalAttentionCorrection.noAttentionNeeded.title) {
                 save(.noAttentionNeeded)
             }
+        }
+    }
+
+    private func presentAttentionDebug(_ prediction: TerminalAttentionPrediction) {
+        let report = prediction.debugReport
+        let alert = NSAlert()
+        alert.messageText = "Attention classifier debug"
+        alert.informativeText = "The model is running locally. Native harness notifications remain unchanged."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Done")
+        alert.addButton(withTitle: "Copy")
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 620, height: 320))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.string = report
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 620, height: 320))
+        scrollView.hasVerticalScroller = true
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(report, forType: .string)
         }
     }
 

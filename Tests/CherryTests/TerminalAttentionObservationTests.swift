@@ -169,6 +169,37 @@ struct TerminalAttentionObservationTests {
         #expect(observation.annotation?.reason == nil)
     }
 
+    @Test func inAppCorrectionRecordsWithoutBulkStudyCollection() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-targeted-correction-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Targeted correction fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { nil },
+            attentionCorrectionDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        let capture = try session.captureAttentionCorrection(.waitingForInput)
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let observation = try #require(observations.first { $0.id == capture.id })
+
+        #expect(capture.outputURL.deletingLastPathComponent() == directory)
+        #expect(observation.label == .attentionNeeded)
+        #expect(observation.annotation?.reason == .waitingForInput)
+        #expect(observation.checkpoint == "human_corrected")
+    }
+
     @Test func schemaOneObservationWithoutStyledGridStillDecodes() throws {
         let json = """
         {

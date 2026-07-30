@@ -31,6 +31,15 @@ enum TerminalAttentionStudy {
             .appendingPathComponent("Recordings", isDirectory: true)
     }
 
+    static func correctionsDirectoryURL(fileManager: FileManager = .default) -> URL {
+        let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        return applicationSupport
+            .appendingPathComponent("Cherry", isDirectory: true)
+            .appendingPathComponent("Attention Study", isDirectory: true)
+            .appendingPathComponent("Corrections", isDirectory: true)
+    }
+
     static func prepareDirectoryIfNeeded(
         _ directoryURL: URL,
         fileManager: FileManager = .default

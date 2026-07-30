@@ -163,8 +163,8 @@ whenever a form control is not focused.
 
 ### Correct a Label While Using Cherry
 
-When Attention Study collection is enabled, right-click an agent tab and open
-**Correct Attention Label**. Choose the state that is actually visible:
+Right-click an agent tab and open **Correct Attention Label**. Choose the state
+that is actually visible:
 
 - Result is ready
 - Waiting for my input
@@ -177,9 +177,11 @@ writes the current terminal snapshot as a `human_corrected` labeled checkpoint
 with `cherry_in_app_human_correction` provenance. It does not guess the
 replacement label from the current activity indicator.
 
-The correction stays in the normal private JSONL recording. A later provisional
-bundle preserves its label and annotation, and the dashboard presents it for
-review before it enters a training export.
+With bulk collection enabled, the correction stays in the normal private JSONL
+recording. With collection disabled, Cherry writes only the clicked snapshot to
+`~/Library/Application Support/Cherry/Attention Study/Corrections`. A later
+provisional bundle preserves its label and annotation, and the dashboard
+presents it for review before it enters a training export.
 
 Select the whole exported directory in the browser. Uploads are chunked,
 schema-validated, and de-duplicated by observation UUID. Unlike the local
@@ -243,6 +245,28 @@ false positive, and no false negatives.
 This closes the initial collection pass. The result is strong enough to
 prototype integration and collect targeted corrections, but the human sample
 still comes from one user and is too small to call production-ready.
+
+### Runtime Test Integration
+
+Cherry embeds the final weights and reproduces the Python feature extractor in
+Swift. The classifier runs locally for every agent session even when bulk study
+collection is disabled, so the standard native Ghostty path remains available.
+No MLX dependency is needed for the 55-parameter logistic regression.
+
+The sidebar uses the model only for its attention state:
+
+- a pink exclamation means the model predicts `attention_needed`;
+- the existing hand remains the native permission indicator;
+- the existing spinner remains the native working indicator when the model does
+  not request attention.
+
+Native harness notifications are unchanged. The classifier does not create
+system notifications during this test phase.
+
+The agent-tab context menu shows the current prediction and probability. Choose
+**Show Attention Debug...** to inspect the input event, native activity
+state/evidence, composition/focus state, and strongest weighted feature
+contributions. The report can be copied for comparison with a correction.
 
 ## Run Controlled Scenarios
 

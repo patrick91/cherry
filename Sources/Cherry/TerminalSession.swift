@@ -2086,6 +2086,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var hasUnreadNotification = false
     @Published private(set) var lastNotification: TerminalNotificationRequest?
     @Published private(set) var agentActivityState: AgentActivityState = .unknown
+    @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
     @Published private(set) var startedAt: Date?
     @Published private(set) var exitedAt: Date?
     @Published private(set) var lastOutputAt: Date?
@@ -2148,7 +2149,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var traceRecorder: TerminalTraceRecorder?
     private let attentionObservationDirectoryProvider: @MainActor () -> URL?
+    private let attentionCorrectionDirectoryProvider: @MainActor () -> URL
     private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
+    private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
     private var attentionObservationTask: Task<Void, Never>?
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
@@ -2264,6 +2267,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         },
         attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
             TerminalAttentionObservationRecorder.configuredDirectoryURL
+        },
+        attentionCorrectionDirectoryProvider: @escaping @MainActor () -> URL = {
+            TerminalAttentionStudy.correctionsDirectoryURL()
         }
     ) {
         self.title = title
@@ -2284,6 +2290,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.summaryRunner = summaryRunner
         self.summaryVisibilityProvider = summaryVisibilityProvider
         self.attentionObservationDirectoryProvider = attentionObservationDirectoryProvider
+        self.attentionCorrectionDirectoryProvider = attentionCorrectionDirectoryProvider
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
@@ -2984,6 +2991,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
+        attentionClassifierPrediction = nil
         childProcessID = nil
         exitCode = nil
         nixShellEnvironment = nil
@@ -3619,7 +3627,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     func captureAttentionCorrection(
         _ correction: TerminalAttentionCorrection
     ) throws -> (id: UUID, outputURL: URL) {
-        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else {
+        guard let attentionObservationRecorder = (
+            ensureAttentionObservationRecorder() ?? ensureAttentionCorrectionRecorder()
+        ) else {
             throw TerminalAttentionRecordingError.disabled
         }
 
@@ -3643,7 +3653,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
-        guard kind == .agent, attentionObservationDirectoryProvider() != nil else { return }
+        guard kind == .agent else { return }
 
         let isDebounced = event == .contentChanged || event == .inputChanged
         if !isDebounced {
@@ -3663,7 +3673,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func recordAttentionObservation(event: TerminalAttentionObservationEvent) {
-        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else { return }
+        let attentionObservationRecorder = ensureAttentionObservationRecorder()
         let observation = makeAttentionObservation(
             event: event,
             label: nil,
@@ -3671,9 +3681,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             scenarioID: nil,
             checkpoint: nil,
             harnessVersion: nil,
-            runID: nil
+            runID: nil,
+            includeStyledGrid: attentionObservationRecorder != nil
         )
-        attentionObservationRecorder.record(observation)
+        attentionClassifierPrediction = TerminalAttentionClassifier.shared.predict(observation)
+        attentionObservationRecorder?.record(observation)
     }
 
     private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {
@@ -3688,6 +3700,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         return attentionObservationRecorder
     }
 
+    private func ensureAttentionCorrectionRecorder() -> TerminalAttentionObservationRecorder? {
+        if attentionCorrectionRecorder == nil {
+            attentionCorrectionRecorder = TerminalAttentionObservationRecorder(
+                directoryURL: attentionCorrectionDirectoryProvider(),
+                sessionID: id,
+                harness: "\(agentName ?? "agent")-correction"
+            )
+        }
+        return attentionCorrectionRecorder
+    }
+
     private func makeAttentionObservation(
         event: TerminalAttentionObservationEvent,
         label: TerminalAttentionLabel?,
@@ -3695,7 +3718,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         scenarioID: String?,
         checkpoint: String?,
         harnessVersion: String?,
-        runID: String?
+        runID: String?,
+        includeStyledGrid: Bool = true
     ) -> TerminalAttentionObservation {
         let now = Date()
         let lineCount = contentLineCount()
@@ -3706,7 +3730,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             String(line.prefix(columnLimit))
         }
         let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]?
-        if GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil {
+        if !includeStyledGrid || (GhosttySessionBridge.nativePTYEnabled && ghosttyBridgeStorage != nil) {
             // Native EXEC surfaces currently expose only `readText`, so emitting
             // processor styles here would attach stale or unrelated formatting.
             styledGrid = nil

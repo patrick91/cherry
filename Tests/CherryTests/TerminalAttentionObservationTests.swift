@@ -139,6 +139,7 @@ struct TerminalAttentionObservationTests {
         #expect(annotation.confidence == 1)
         #expect(annotation.rationale == "human_corrected_attention_label")
         #expect(annotation.reason == .resultReady)
+        #expect(session.currentAttentionScreenTag == .resultReady)
     }
 
     @Test func noAttentionCorrectionOmitsAttentionReason() throws {
@@ -167,6 +168,42 @@ struct TerminalAttentionObservationTests {
 
         #expect(observation.label == .noAttentionNeeded)
         #expect(observation.annotation?.reason == nil)
+        #expect(session.currentAttentionScreenTag == .noAttentionNeeded)
+    }
+
+    @Test func anyTerminalScreenCanBeTaggedWithoutBulkStudyCollection() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-any-screen-tag-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Terminal tag fixture",
+            subtitle: "",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .terminal,
+            attentionObservationDirectoryProvider: { nil },
+            attentionCorrectionDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.ingestTestingData(Data("A regular terminal screen.\n".utf8))
+        let capture = try session.captureAttentionCorrection(.blockedOrError)
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let observation = try #require(observations.first { $0.id == capture.id })
+
+        #expect(observation.session.kind == TerminalSession.SessionKind.terminal.rawValue)
+        #expect(observation.label == .attentionNeeded)
+        #expect(observation.annotation?.reason == .blockedOrError)
+        #expect(session.currentAttentionScreenTag == .blockedOrError)
+
+        session.noteTestingInput(Data("x".utf8))
+
+        #expect(session.currentAttentionScreenTag == nil)
     }
 
     @Test func inAppCorrectionRecordsWithoutBulkStudyCollection() throws {

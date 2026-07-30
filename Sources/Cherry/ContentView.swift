@@ -6314,11 +6314,9 @@ private struct SidebarSessionSection: View {
 
         nixShellContextMenuItems(for: session.nixShellEnvironment)
 
-        if session.kind == .agent {
-            Divider()
+        Divider()
 
-            AttentionToolsMenu(session: session)
-        }
+        AttentionToolsMenu(session: session)
 
         Divider()
 
@@ -6644,11 +6642,9 @@ private struct SidebarSplitPaneIconSelector: View {
 
             nixShellContextMenuItems(for: session.nixShellEnvironment)
 
-            if session.kind == .agent {
-                Divider()
+            Divider()
 
-                AttentionToolsMenu(session: session)
-            }
+            AttentionToolsMenu(session: session)
 
             Button("Close Pane", role: .destructive) {
                 workspace.close(session)
@@ -10298,27 +10294,23 @@ private struct AttentionToolsMenu: View {
     @ObservedObject var session: TerminalSession
 
     var body: some View {
-        if let prediction = session.attentionClassifierPrediction {
-            Button(
-                "Model: \(prediction.displayName) (" +
-                prediction.attentionProbability.formatted(
-                    .percent.precision(.fractionLength(0))
-                ) +
-                ")"
-            ) {}
-                .disabled(true)
+        Button(currentLabelTitle) {}
+            .disabled(true)
 
+        if let prediction = session.attentionClassifierPrediction,
+           session.currentAttentionScreenTag != nil {
+            Button(modelLabelTitle(prediction)) {}
+                .disabled(true)
+        }
+        if let prediction = session.attentionClassifierPrediction {
             Button("Show Attention Debug...") {
                 presentAttentionDebug(prediction)
             }
-        } else {
-            Button("Model: Waiting for terminal state") {}
-                .disabled(true)
         }
 
         Divider()
 
-        Menu("Correct Attention Label") {
+        Menu("Tag Current Screen") {
             ForEach(
                 [
                     TerminalAttentionCorrection.resultReady,
@@ -10328,17 +10320,58 @@ private struct AttentionToolsMenu: View {
                 ],
                 id: \.title
             ) { correction in
-                Button(correction.title) {
+                Button {
                     save(correction)
+                } label: {
+                    if session.currentAttentionScreenTag == correction {
+                        Label(correction.title, systemImage: "checkmark")
+                    } else {
+                        Text(correction.title)
+                    }
                 }
             }
 
             Divider()
 
-            Button(TerminalAttentionCorrection.noAttentionNeeded.title) {
+            Button {
                 save(.noAttentionNeeded)
+            } label: {
+                if session.currentAttentionScreenTag == .noAttentionNeeded {
+                    Label(
+                        TerminalAttentionCorrection.noAttentionNeeded.title,
+                        systemImage: "checkmark"
+                    )
+                } else {
+                    Text(TerminalAttentionCorrection.noAttentionNeeded.title)
+                }
             }
         }
+    }
+
+    private var currentLabelTitle: String {
+        if let tag = session.currentAttentionScreenTag {
+            return "Current label: \(tag.title) (manual)"
+        }
+        if let prediction = session.attentionClassifierPrediction {
+            return (
+                "Current label: \(prediction.displayName) (" +
+                prediction.attentionProbability.formatted(
+                    .percent.precision(.fractionLength(0))
+                ) +
+                ", model)"
+            )
+        }
+        return "Current label: Not tagged"
+    }
+
+    private func modelLabelTitle(_ prediction: TerminalAttentionPrediction) -> String {
+        (
+            "Model inference: \(prediction.displayName) (" +
+            prediction.attentionProbability.formatted(
+                .percent.precision(.fractionLength(0))
+            ) +
+            ")"
+        )
     }
 
     private func presentAttentionDebug(_ prediction: TerminalAttentionPrediction) {
@@ -10372,12 +10405,12 @@ private struct AttentionToolsMenu: View {
         do {
             _ = try session.captureAttentionCorrection(correction)
             presentResult(
-                title: "Attention correction saved",
-                message: "Recorded “\(correction.title)” with the current terminal snapshot as a human correction."
+                title: "Screen tagged",
+                message: "Recorded “\(correction.title)” with the current terminal snapshot."
             )
         } catch {
             presentResult(
-                title: "Couldn’t save attention correction",
+                title: "Couldn’t tag screen",
                 message: error.localizedDescription,
                 style: .warning
             )

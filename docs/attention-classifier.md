@@ -161,9 +161,9 @@ the local Wrangler D1 state. Any manual edit becomes a `human` review. The
 dashboard supports `A` to accept, `C` to save a correction, and `S` to skip
 whenever a form control is not focused.
 
-### Correct a Label While Using Cherry
+### Tag a Screen While Using Cherry
 
-Right-click an agent tab and open **Correct Attention Label**. Choose the state
+Right-click any terminal tab and open **Tag Current Screen**. Choose the state
 that is actually visible:
 
 - Result is ready
@@ -174,8 +174,10 @@ that is actually visible:
 
 For example, if the user is still typing, choose **No attention needed**. Cherry
 writes the current terminal snapshot as a `human_corrected` labeled checkpoint
-with `cherry_in_app_human_correction` provenance. It does not guess the
-replacement label from the current activity indicator.
+with `cherry_in_app_human_correction` provenance. The context menu shows the
+active manual tag as the current label and checkmarks it. The tag clears when
+terminal content or input changes, so it cannot describe a later screen. Agent
+sessions also show the model inference separately.
 
 With bulk collection enabled, the correction stays in the normal private JSONL
 recording. With collection disabled, Cherry writes only the clicked snapshot to

@@ -2087,6 +2087,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var lastNotification: TerminalNotificationRequest?
     @Published private(set) var agentActivityState: AgentActivityState = .unknown
     @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
+    @Published private(set) var currentAttentionScreenTag: TerminalAttentionCorrection?
     @Published private(set) var startedAt: Date?
     @Published private(set) var exitedAt: Date?
     @Published private(set) var lastOutputAt: Date?
@@ -2636,6 +2637,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func noteNativeHostInput(event: NSEvent?) {
+        currentAttentionScreenTag = nil
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
         applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
@@ -2992,6 +2994,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
         attentionClassifierPrediction = nil
+        currentAttentionScreenTag = nil
         childProcessID = nil
         exitCode = nil
         nixShellEnvironment = nil
@@ -3224,6 +3227,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputVersion &+= 1
         let contentChanged = updateContentFingerprint()
         if contentChanged {
+            currentAttentionScreenTag = nil
             lastContentChangeAt = Date()
             contentVersion &+= 1
         }
@@ -3257,6 +3261,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
+        currentAttentionScreenTag = nil
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
@@ -3583,6 +3588,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastOutputAt = Date()
         if case .launching = state { state = .live }
         outputVersion &+= 1
+        currentAttentionScreenTag = nil
         lastContentChangeAt = Date()
         contentVersion &+= 1
         if kind == .agent {
@@ -3649,6 +3655,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             runID: nil
         )
         attentionObservationRecorder.record(observation, synchronously: true)
+        currentAttentionScreenTag = correction
         return (observation.id, attentionObservationRecorder.outputURL)
     }
 
@@ -3705,7 +3712,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             attentionCorrectionRecorder = TerminalAttentionObservationRecorder(
                 directoryURL: attentionCorrectionDirectoryProvider(),
                 sessionID: id,
-                harness: "\(agentName ?? "agent")-correction"
+                harness: "\(agentName ?? kind.rawValue)-correction"
             )
         }
         return attentionCorrectionRecorder

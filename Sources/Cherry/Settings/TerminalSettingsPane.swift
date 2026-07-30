@@ -49,7 +49,7 @@ struct TerminalSettingsPane: View {
             SettingsCard("Attention Study") {
                 SettingsRow(
                     "Collect agent observations",
-                    subtitle: "Save deduplicated terminal-grid checkpoints locally, including terminal colors. Targeted corrections remain available when collection is off. Restart Cherry after enabling. Terminal text may contain sensitive data."
+                    subtitle: "Save deduplicated terminal-grid checkpoints locally, including terminal colors. Manual screen tags remain available when collection is off. Restart Cherry after enabling. Terminal text may contain sensitive data."
                 ) {
                     Toggle("Collect agent observations", isOn: $settings.attentionStudyEnabled)
                         .labelsHidden()

@@ -28,6 +28,14 @@ struct TerminalAttentionClassifierTests {
         #expect(abs(prediction.attentionProbability - 0.9221480208723661) < 1e-12)
         #expect(prediction.needsAttention)
         #expect(prediction.label == .attentionNeeded)
+        #expect(SidebarAgentAttentionPresentation.shouldShow(
+            prediction: prediction,
+            isFocused: false
+        ))
+        #expect(!SidebarAgentAttentionPresentation.shouldShow(
+            prediction: prediction,
+            isFocused: true
+        ))
         #expect(TerminalAttentionClassifier.parameterCount == 55)
         #expect(prediction.debugReport.contains("Native evidence: prompt_marker"))
         #expect(prediction.contributions.first?.name == "boolean.interaction.hasUnsubmittedInput=false")
@@ -55,6 +63,10 @@ struct TerminalAttentionClassifierTests {
         #expect(abs(prediction.attentionProbability - 0.0011094844877164) < 1e-12)
         #expect(!prediction.needsAttention)
         #expect(prediction.label == .noAttentionNeeded)
+        #expect(!SidebarAgentAttentionPresentation.shouldShow(
+            prediction: prediction,
+            isFocused: false
+        ))
     }
 
     @Test func agentSessionRunsClassifierWithoutStudyRecording() async throws {

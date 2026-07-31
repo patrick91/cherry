@@ -7542,6 +7542,15 @@ private struct SidebarAgentPermissionIndicator: View {
     }
 }
 
+enum SidebarAgentAttentionPresentation {
+    static func shouldShow(
+        prediction: TerminalAttentionPrediction?,
+        isFocused: Bool
+    ) -> Bool {
+        !isFocused && prediction?.needsAttention == true
+    }
+}
+
 private struct SidebarAgentAttentionIndicator: View {
     let prediction: TerminalAttentionPrediction
 
@@ -7711,7 +7720,10 @@ private struct SidebarTabRow: View {
             if rowState.agentActivityState == .permission {
                 SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
             } else if let prediction = rowState.attentionClassifierPrediction,
-                      prediction.needsAttention {
+                      SidebarAgentAttentionPresentation.shouldShow(
+                          prediction: prediction,
+                          isFocused: isSelected
+                      ) {
                 SidebarAgentAttentionIndicator(prediction: prediction)
             } else if rowState.agentActivityState.showsWorkingIndicator {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
@@ -10320,32 +10332,22 @@ private struct AttentionToolsMenu: View {
                 ],
                 id: \.title
             ) { correction in
-                Button {
+                Button(menuTitle(for: correction)) {
                     save(correction)
-                } label: {
-                    if session.currentAttentionScreenTag == correction {
-                        Label(correction.title, systemImage: "checkmark")
-                    } else {
-                        Text(correction.title)
-                    }
                 }
             }
 
             Divider()
 
-            Button {
+            Button(menuTitle(for: .noAttentionNeeded)) {
                 save(.noAttentionNeeded)
-            } label: {
-                if session.currentAttentionScreenTag == .noAttentionNeeded {
-                    Label(
-                        TerminalAttentionCorrection.noAttentionNeeded.title,
-                        systemImage: "checkmark"
-                    )
-                } else {
-                    Text(TerminalAttentionCorrection.noAttentionNeeded.title)
-                }
             }
         }
+    }
+
+    private func menuTitle(for correction: TerminalAttentionCorrection) -> String {
+        let checkmark = session.currentAttentionScreenTag == correction ? "✓ " : ""
+        return checkmark + correction.title
     }
 
     private var currentLabelTitle: String {

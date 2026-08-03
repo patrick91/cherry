@@ -1002,6 +1002,9 @@ private struct DetailPaneView: View {
         .onChange(of: chromeState.isShowingTerminalContent) { _, isShowingTerminalContent in
             if isShowingTerminalContent {
                 workspace.clearUnreadNotificationForSelectedSession()
+                if NSApp.isActive {
+                    workspace.acknowledgeAttentionForSelectedSession()
+                }
             } else {
                 workspace.scheduleHiddenAgentSummaries()
             }
@@ -7545,9 +7548,10 @@ private struct SidebarAgentPermissionIndicator: View {
 enum SidebarAgentAttentionPresentation {
     static func shouldShow(
         prediction: TerminalAttentionPrediction?,
+        hasUnacknowledgedAttention: Bool,
         isFocused: Bool
     ) -> Bool {
-        !isFocused && prediction?.needsAttention == true
+        !isFocused && hasUnacknowledgedAttention && prediction?.needsAttention == true
     }
 }
 
@@ -7719,6 +7723,7 @@ private struct SidebarTabRow: View {
             } else if let prediction = rowState.attentionClassifierPrediction,
                       SidebarAgentAttentionPresentation.shouldShow(
                           prediction: prediction,
+                          hasUnacknowledgedAttention: rowState.hasUnacknowledgedAttention,
                           isFocused: isSelected
                       ) {
                 SidebarAgentAttentionIndicator(prediction: prediction)
@@ -7795,6 +7800,7 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var hasUnreadNotification: Bool
     @Published private(set) var agentActivityState: AgentActivityState
     @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
+    @Published private(set) var hasUnacknowledgedAttention: Bool
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
 
     private weak var session: TerminalSession?
@@ -7815,6 +7821,7 @@ private final class SidebarTabRowState: ObservableObject {
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
         self.attentionClassifierPrediction = session.attentionClassifierPrediction
+        self.hasUnacknowledgedAttention = session.hasUnacknowledgedAttention
         self.nixShellEnvironment = session.nixShellEnvironment
 
         observe(session)
@@ -7884,6 +7891,15 @@ private final class SidebarTabRowState: ObservableObject {
             .sink { [weak self] prediction in
                 Task { @MainActor [weak self] in
                     self?.attentionClassifierPrediction = prediction
+                }
+            }
+            .store(in: &cancellables)
+
+        session.$hasUnacknowledgedAttention
+            .removeDuplicates()
+            .sink { [weak self] hasUnacknowledgedAttention in
+                Task { @MainActor [weak self] in
+                    self?.hasUnacknowledgedAttention = hasUnacknowledgedAttention
                 }
             }
             .store(in: &cancellables)
@@ -9995,7 +10011,7 @@ private final class TerminalSplitDividerHandleView: NSView {
 
 private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
-    let session: TerminalSession
+    @ObservedObject var session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
     let isActivePane: Bool
     let usesWorktreeSurfaceTransition: Bool
@@ -10048,6 +10064,7 @@ private struct TerminalSceneView: View {
         }
         .onAppear {
             configureSearchHandlersIfActive()
+            acknowledgeAttentionIfVisible()
         }
         .onChange(of: session.id) { _, _ in
             configureSearchHandlersIfActive()
@@ -10055,7 +10072,14 @@ private struct TerminalSceneView: View {
         .onChange(of: isActivePane) { _, isActivePane in
             if isActivePane {
                 configureSearchHandlersIfActive()
+                acknowledgeAttentionIfVisible()
             }
+        }
+        .onChange(of: session.attentionAlertGeneration) { _, _ in
+            acknowledgeAttentionIfVisible()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            acknowledgeAttentionIfVisible()
         }
     }
 
@@ -10097,6 +10121,11 @@ private struct TerminalSceneView: View {
         chromeState.dismissTerminalSearch()
         session.ghosttyBridge.focus(in: NSApp.keyWindow)
     }
+
+    private func acknowledgeAttentionIfVisible() {
+        guard isActivePane, chromeState.isShowingTerminalContent, NSApp.isActive else { return }
+        session.acknowledgeAttentionAlert()
+    }
 }
 
 // Temporary live instrumentation for tuning the embedded attention model. It
@@ -10120,7 +10149,7 @@ private struct AttentionDebugOverlay: View {
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(prediction.needsAttention ? Color.pink : Color.green)
+                        .fill(debugIndicatorColor(for: prediction))
                         .frame(width: 8, height: 8)
 
                     VStack(alignment: .leading, spacing: 1) {
@@ -10160,6 +10189,7 @@ private struct AttentionDebugOverlay: View {
                             .percent.precision(.fractionLength(1))
                         )
                     )
+                    debugRow("Alert", alertDescription(for: prediction))
                     debugRow(
                         "Native activity",
                         "\(prediction.nativeActivityState) · \(displayEvidence(prediction.activityEvidence))"
@@ -10231,6 +10261,16 @@ private struct AttentionDebugOverlay: View {
 
     private func displayEvidence(_ value: String) -> String {
         value.replacingOccurrences(of: "_", with: " ")
+    }
+
+    private func alertDescription(for prediction: TerminalAttentionPrediction) -> String {
+        guard prediction.needsAttention else { return "none" }
+        return session.hasUnacknowledgedAttention ? "pending" : "acknowledged"
+    }
+
+    private func debugIndicatorColor(for prediction: TerminalAttentionPrediction) -> Color {
+        guard prediction.needsAttention else { return .green }
+        return session.hasUnacknowledgedAttention ? .pink : .secondary
     }
 
     private func tagTitle(for correction: TerminalAttentionCorrection) -> String {

@@ -417,7 +417,7 @@ final class ProjectWindowRegistry {
 
     func handleApplicationDidBecomeActive() {
         refreshActiveWindow()
-        clearUnreadNotificationForActiveVisibleSession()
+        acknowledgeActiveVisibleSession()
     }
 
     @discardableResult
@@ -449,6 +449,7 @@ final class ProjectWindowRegistry {
             }
             candidate.workspace.select(session)
             candidate.chromeState?.selectTerminal()
+            session.acknowledgeAttentionAlert()
             return true
         }
 
@@ -476,10 +477,11 @@ final class ProjectWindowRegistry {
         if NSApplication.shared.isActive,
            chromeState?.isShowingTerminalContent ?? true {
             workspace.clearUnreadNotificationForSelectedSession()
+            workspace.acknowledgeAttentionForSelectedSession()
         }
     }
 
-    private func clearUnreadNotificationForActiveVisibleSession() {
+    private func acknowledgeActiveVisibleSession() {
         guard NSApplication.shared.isActive,
               activeChromeState?.isShowingTerminalContent ?? true
         else {
@@ -487,6 +489,7 @@ final class ProjectWindowRegistry {
         }
 
         activeWorkspace?.clearUnreadNotificationForSelectedSession()
+        activeWorkspace?.acknowledgeAttentionForSelectedSession()
     }
 
     func repositoryDidRefresh(_ repository: RepositoryWorkspace) {

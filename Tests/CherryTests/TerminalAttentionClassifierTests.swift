@@ -31,11 +31,18 @@ struct TerminalAttentionClassifierTests {
         #expect(prediction.confidenceDescription == "92% confidence")
         #expect(SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
+            hasUnacknowledgedAttention: true,
             isFocused: false
         ))
         #expect(!SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
+            hasUnacknowledgedAttention: true,
             isFocused: true
+        ))
+        #expect(!SidebarAgentAttentionPresentation.shouldShow(
+            prediction: prediction,
+            hasUnacknowledgedAttention: false,
+            isFocused: false
         ))
         #expect(TerminalAttentionClassifier.parameterCount == 55)
         #expect(prediction.debugReport.contains("Native evidence: prompt_marker"))
@@ -67,6 +74,7 @@ struct TerminalAttentionClassifierTests {
         #expect(prediction.confidenceDescription == "100% confidence")
         #expect(!SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
+            hasUnacknowledgedAttention: false,
             isFocused: false
         ))
     }
@@ -91,6 +99,38 @@ struct TerminalAttentionClassifierTests {
         let prediction = try #require(session.attentionClassifierPrediction)
         #expect(prediction.needsAttention)
         #expect(prediction.modelID == TerminalAttentionClassifier.modelID)
+    }
+
+    @Test func acknowledgedAlertOnlyRearmsForFreshAgentActivity() async throws {
+        let session = TerminalSession(
+            title: "Acknowledgement fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { nil }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.ingestTestingData(Data("• Baked for 1m\n› \n".utf8))
+        try await Task.sleep(for: .milliseconds(1_250))
+
+        #expect(session.attentionClassifierPrediction?.needsAttention == true)
+        #expect(session.hasUnacknowledgedAttention)
+        let firstGeneration = session.attentionAlertGeneration
+
+        session.acknowledgeAttentionAlert()
+        #expect(!session.hasUnacknowledgedAttention)
+
+        session.ingestTestingData(Data("A second result is ready\n› \n".utf8))
+        try await Task.sleep(for: .milliseconds(1_250))
+
+        #expect(session.attentionClassifierPrediction?.needsAttention == true)
+        #expect(session.attentionAlertGeneration > firstGeneration)
+        #expect(session.hasUnacknowledgedAttention)
     }
 
     private func fixture(

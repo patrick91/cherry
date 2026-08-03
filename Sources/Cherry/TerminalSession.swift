@@ -1677,6 +1677,15 @@ final class TerminalWorkspace: ObservableObject {
         session.clearUnreadNotification()
     }
 
+    func acknowledgeAttentionForSelectedSession() {
+        guard let selectedSessionID,
+              let session = sessions.first(where: { $0.id == selectedSessionID })
+        else {
+            return
+        }
+        session.acknowledgeAttentionAlert()
+    }
+
     private func commandSessions(orderedBy visibleCommandNames: [String]) -> [TerminalSession] {
         let visibleNames = visibleCommandNames.map(AgentToolDefinition.normalizedName)
         return visibleNames.compactMap { visibleName in
@@ -2087,6 +2096,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var lastNotification: TerminalNotificationRequest?
     @Published private(set) var agentActivityState: AgentActivityState = .unknown
     @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
+    @Published private(set) var attentionAlertGeneration = 0
+    @Published private(set) var hasUnacknowledgedAttention = false
     @Published private(set) var currentAttentionScreenTag: TerminalAttentionCorrection?
     @Published private(set) var startedAt: Date?
     @Published private(set) var exitedAt: Date?
@@ -2154,6 +2165,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
     private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
     private var attentionObservationTask: Task<Void, Never>?
+    private var acknowledgedAttentionAlertGeneration = 0
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
     private var isOutputPausedForBackgroundThrottle = false
@@ -2994,6 +3006,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
         attentionClassifierPrediction = nil
+        attentionAlertGeneration = 0
+        acknowledgedAttentionAlertGeneration = 0
+        hasUnacknowledgedAttention = false
         currentAttentionScreenTag = nil
         childProcessID = nil
         exitCode = nil
@@ -3656,7 +3671,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         )
         attentionObservationRecorder.record(observation, synchronously: true)
         currentAttentionScreenTag = correction
+        acknowledgeAttentionAlert()
         return (observation.id, attentionObservationRecorder.outputURL)
+    }
+
+    func acknowledgeAttentionAlert() {
+        guard attentionAlertGeneration > acknowledgedAttentionAlertGeneration else { return }
+        acknowledgedAttentionAlertGeneration = attentionAlertGeneration
+        guard hasUnacknowledgedAttention else { return }
+        hasUnacknowledgedAttention = false
+        bumpRevision()
     }
 
     private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
@@ -3691,7 +3715,21 @@ final class TerminalSession: ObservableObject, Identifiable {
             runID: nil,
             includeStyledGrid: attentionObservationRecorder != nil
         )
-        attentionClassifierPrediction = TerminalAttentionClassifier.shared.predict(observation)
+        let prediction = TerminalAttentionClassifier.shared.predict(observation)
+        attentionClassifierPrediction = prediction
+        if prediction.needsAttention {
+            // Draft edits can cause classifier refreshes, but they are not new
+            // agent activity and must not resurrect an alert the user already
+            // acknowledged. Output, state, notification, submission, and exit
+            // events represent a fresh screen state and receive a generation.
+            if event != .inputChanged {
+                attentionAlertGeneration &+= 1
+            }
+            hasUnacknowledgedAttention =
+                attentionAlertGeneration > acknowledgedAttentionAlertGeneration
+        } else {
+            hasUnacknowledgedAttention = false
+        }
         attentionObservationRecorder?.record(observation)
     }
 

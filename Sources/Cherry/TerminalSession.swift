@@ -4019,6 +4019,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         if renderedOutputShowsAgentInputPrompt() {
             return requestAgentIdleFromRenderedOutput()
         }
+        // Full-screen TUIs repaint the composer after every keystroke. If a new
+        // harness version changes its prompt glyph or layout, that repaint must
+        // not look like agent output while Cherry knows the user still has an
+        // unsubmitted draft. Explicit working markers and title spinners above
+        // continue to win, and submitting the draft clears this flag before
+        // marking the agent working.
+        if hasUnsubmittedHumanInput {
+            cancelAgentIdleConfirmation()
+            return setAgentActivityState(.idle, source: .promptMarker)
+        }
         guard !agentStateResistsOutputActivity else { return false }
         return setAgentActivityState(.working, source: .outputActivity)
     }
@@ -4250,6 +4260,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard !trimmed.isEmpty else { return false }
 
         if isPromptLine(trimmed, prompt: "\u{203A}") ||
+            isPromptLine(trimmed, prompt: "\u{00BB}") ||
             isPromptLine(trimmed, prompt: "\u{276F}") {
             return true
         }
@@ -4773,6 +4784,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             || trimmed.contains("Tip: Try the Codex App")
             || trimmed.hasPrefix("Tip: NEW:")
             || trimmed.hasPrefix("›")
+            || trimmed.hasPrefix("»")
             || trimmed.contains("gpt-5.") && trimmed.contains("· ~/") {
             return true
         }

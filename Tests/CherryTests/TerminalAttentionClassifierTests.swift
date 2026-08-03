@@ -28,6 +28,7 @@ struct TerminalAttentionClassifierTests {
         #expect(abs(prediction.attentionProbability - 0.9221480208723661) < 1e-12)
         #expect(prediction.needsAttention)
         #expect(prediction.label == .attentionNeeded)
+        #expect(prediction.confidenceDescription == "92% confidence")
         #expect(SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
             isFocused: false
@@ -63,6 +64,7 @@ struct TerminalAttentionClassifierTests {
         #expect(abs(prediction.attentionProbability - 0.0011094844877164) < 1e-12)
         #expect(!prediction.needsAttention)
         #expect(prediction.label == .noAttentionNeeded)
+        #expect(prediction.confidenceDescription == "100% confidence")
         #expect(!SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
             isFocused: false

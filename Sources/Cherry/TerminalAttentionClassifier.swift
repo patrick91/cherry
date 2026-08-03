@@ -30,6 +30,12 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
         needsAttention ? attentionProbability : 1 - attentionProbability
     }
 
+    var confidenceDescription: String {
+        confidence.formatted(
+            .percent.precision(.fractionLength(0))
+        ) + " confidence"
+    }
+
     var displayName: String {
         needsAttention ? "Attention needed" : "No attention needed"
     }
@@ -361,7 +367,7 @@ struct TerminalAttentionClassifier: Sendable {
             "working": text.contains("esc to interrupt") || text.contains("• working ("),
             "prompt": lines.contains { line in
                 let trimmed = line.drop(while: \.isWhitespace)
-                return trimmed.hasPrefix("›") || trimmed.hasPrefix("❯")
+                return trimmed.hasPrefix("›") || trimmed.hasPrefix("»") || trimmed.hasPrefix("❯")
             },
         ]
         for (name, value) in markers {

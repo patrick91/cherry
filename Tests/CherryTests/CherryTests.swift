@@ -7862,6 +7862,40 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func unsubmittedAgentInputKeepsUnknownComposerRepaintsIdle() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Codex",
+        subtitle: "codex --yolo",
+        tint: .systemGreen,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Codex",
+        launchCommand: "stty -echo; cat >/dev/null"
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+
+    session.ingestTestingData(Data("MCP startup interrupted\n".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(session.agentActivityState == .working)
+
+    session.noteTestingInput(Data("draft".utf8))
+    session.ingestTestingData(Data("\r\u{1B}[2K? draft".utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func renderedCodexWorkingStatusKeepsAgentWorkingIndicator() async throws {
     let session = TerminalSession(
         title: "Codex",

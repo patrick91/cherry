@@ -70,16 +70,10 @@ notification bodies, or command lines.
 Existing schema-1 observations without `terminal.styledGrid` remain valid and
 display as plain text in the dashboard.
 
-Cherry's default native Ghostty PTY currently exposes flattened text only, so
-Attention Study automatically selects Cherry's supported host-managed terminal
-path at launch. To select it explicitly during an isolated experiment, use:
-
-```bash
-CHERRY_NATIVE_PTY=0 swift run Cherry
-```
-
-Set `CHERRY_NATIVE_PTY=1` to override study mode and use the native path; those
-observations will be plain text until native Ghostty exposes styled cells.
+Cherry's native Ghostty PTY currently exposes flattened text only, so recordings
+from running sessions contain the plain terminal grid without `styledGrid`.
+Shell-less renderer fixtures can still produce styled observations. Existing
+schema-1 observations with or without styled runs remain valid.
 
 Use a dedicated directory outside the repository. Review every file before
 sharing it; opt-in collection makes no attempt to redact text already visible

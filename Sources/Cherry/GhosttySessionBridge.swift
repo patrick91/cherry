@@ -334,11 +334,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private static let defaultLiveSurfaceLimit = 64
 
     private static func resolveInitialLiveSurfaceLimit() -> Int? {
-        // Native-PTY: every surface owns a live child process, so evicting one
-        // would kill a running agent/command. Keep them all alive.
-        if nativePTYEnabled {
-            return unlimitedLiveSurfaceLimit
-        }
         if let raw = ProcessInfo.processInfo.environment["CHERRY_LIVE_SURFACE_LIMIT"] {
             let trimmed = raw.trimmingCharacters(in: .whitespaces).lowercased()
             if trimmed == "unlimited" || trimmed == "all" {
@@ -421,6 +416,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var pointerStyle: TerminalPointerStyle = .text
     private var hoveredLink: String?
     private var isReleased = false
+    private(set) var isNativePTYBacked: Bool
     private var detachedSurfaceReleaseTask: Task<Void, Never>?
     private var settledRenderHandler: (() -> Void)?
     private var settledRenderTask: Task<Void, Never>?
@@ -430,6 +426,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
         let inMemorySession = Self.makeInMemorySession(proxy: proxy)
+        let isNativePTYBacked = session.usesNativePTYBackend
         let terminalConfiguration = TerminalSettings.shared.ghosttyConfiguration()
         let terminalTheme = TerminalSettings.shared.ghosttyTheme()
 
@@ -444,6 +441,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         self.terminalView = TerminalView(frame: .zero)
         self.appliedTerminalConfiguration = terminalConfiguration
         self.appliedTerminalTheme = terminalTheme
+        self.isNativePTYBacked = isNativePTYBacked
 
         super.init()
 
@@ -454,7 +452,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             self?.handlePostRender()
         }
         terminalView.controller = controller
-        if Self.nativePTYEnabled {
+        if isNativePTYBacked {
             // Native eagerly creates the EXEC surface on the next line, which spawns
             // the child immediately. A background-spawned agent queries the terminal
             // background (OSC 11) for its very first render, so the theme/scheme must
@@ -464,7 +462,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             activeColorScheme = Self.resolvedColorScheme()
             applyTerminalSettings()
         }
-        terminalView.configuration = Self.makeOptions(for: session, inMemorySession: inMemorySession)
+        terminalView.configuration = Self.makeOptions(
+            for: session,
+            inMemorySession: inMemorySession,
+            useNativePTY: isNativePTYBacked
+        )
         proxy.bridge = self
         observeSettingsChanges()
     }
@@ -531,12 +533,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         scrollContainer = nil
-        if Self.nativePTYEnabled {
+        if isNativePTYBacked {
             // EXEC surface == live child process. Never free it on detach (that
             // would kill a running agent/command); keep it parked and alive so a
             // non-active tab keeps running. Freed only when the session closes.
             cancelDetachedSurfaceRelease()
-            Self.notePark(self)
             return
         }
         if Self.liveSurfaceLimit != nil, canPreserveSurface {
@@ -615,7 +616,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         outputSink.setSession(nextSession)
 
         if let terminalSession = proxy.session {
-            terminalView.configuration = Self.makeOptions(for: terminalSession, inMemorySession: nextSession)
+            terminalView.configuration = Self.makeOptions(
+                for: terminalSession,
+                inMemorySession: nextSession,
+                useNativePTY: isNativePTYBacked
+            )
         }
         lastReplayedGridSize = nil
         TerminalPerformanceMonitor.recordFitToSize()
@@ -635,7 +640,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         // wreck a full-screen TUI, so only use it when the program hasn't grabbed the
         // mouse (a good proxy for "at a plain shell prompt", and it's true for agents
         // too). RIS also blanks the prompt, so nudge zsh to repaint with Ctrl+L.
-        if Self.nativePTYEnabled, !terminalView.isMouseCaptured,
+        if isNativePTYBacked, !terminalView.isMouseCaptured,
            terminalView.performBindingAction("reset") {
             terminalView.sendKeyPress(keycode: 37, shift: false, control: true, option: false) // Ctrl+L
         } else {
@@ -750,9 +755,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// Tearing down the old surface closes its PTY, which also terminates a
     /// still-running child before the new one spawns.
     func relaunchNativeSurface() {
-        guard Self.nativePTYEnabled, !isReleased, let session = proxy.session else { return }
+        guard !isReleased, let session = proxy.session else { return }
+        isNativePTYBacked = true
         terminalView.relaunchSurface(
-            configuration: Self.makeOptions(for: session, inMemorySession: inMemorySession)
+            configuration: Self.makeOptions(
+                for: session,
+                inMemorySession: inMemorySession,
+                useNativePTY: true
+            )
         )
         scrollContainer?.synchronizeScrollState()
     }
@@ -769,32 +779,32 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     // already parses these from the byte stream, and double-applying would race.
 
     func terminalDidChangeTitle(_ title: String) {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.ingestNativeTitle(title)
     }
 
     func terminalDidChangeWorkingDirectory(_ path: String) {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.ingestNativeWorkingDirectory(path)
     }
 
     func terminalDidPostNotification(title: String?, body: String) {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.ingestNativeNotification(title: title, body: body)
     }
 
     func terminalDidExit(exitCode: UInt32) {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.ingestNativeChildExit(exitCode: Int32(bitPattern: exitCode))
     }
 
     func terminalDidRequestRender() {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.noteNativeRenderRequest()
     }
 
     func terminalDidFinishCommand(exitCode: Int32?, durationNanoseconds: UInt64) {
-        guard Self.nativePTYEnabled, let session = proxy.session else { return }
+        guard isNativePTYBacked, let session = proxy.session else { return }
         session.noteNativeCommandFinished(exitCode: exitCode)
     }
 
@@ -904,7 +914,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func terminalWillSendHostInput() {
         noteHostInputForOutputLatency()
-        if Self.nativePTYEnabled {
+        if isNativePTYBacked {
             proxy.session?.noteNativeHostInput(event: NSApp.currentEvent)
         }
         guard Self.shouldScrollToBottomForHostInput(currentEvent: NSApp.currentEvent) else { return }
@@ -2656,47 +2666,17 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return true
     }
 
-    /// Ghostty's native-PTY model — the default outside Attention Study. Study
-    /// mode uses host-managed in-memory feeding so observations can retain the
-    /// terminal's styled cells. `CHERRY_NATIVE_PTY` always wins when explicitly
-    /// set, providing an escape hatch in either direction.
-    static let nativePTYEnabled = resolveNativePTYEnabled(
-        environment: ProcessInfo.processInfo.environment,
-        attentionRecordingEnabled: TerminalAttentionStudy.configuredDirectoryURL() != nil
-    )
-
-    static func resolveNativePTYEnabled(
-        environment: [String: String],
-        attentionRecordingEnabled: Bool
-    ) -> Bool {
-        if let raw = environment["CHERRY_NATIVE_PTY"] {
-            // Explicit override: 0/false/no/off forces the legacy host-managed
-            // (replay) path; anything else keeps native on.
-            return !["0", "false", "no", "off"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased())
-        }
-        if attentionRecordingEnabled {
-            return false
-        }
-        // Native-PTY is the default: the ghostty surface owns the PTY (no replay).
-        // Build the legacy host-managed path with `-DCHERRY_DISABLE_NATIVE_PTY`.
-        #if CHERRY_DISABLE_NATIVE_PTY
-        return false
-        #else
-        return true
-        #endif
-    }
-
     private static func makeOptions(
         for session: TerminalSession,
-        inMemorySession: InMemoryTerminalSession
+        inMemorySession: InMemoryTerminalSession,
+        useNativePTY: Bool
     ) -> TerminalSurfaceOptions {
-        // Native-PTY mode (CHERRY_NATIVE_PTY): the ghostty surface owns the PTY
-        // (spawns Cherry's resolved shell + env in the cwd) instead of Cherry
-        // feeding bytes to an in-memory session. EXEC means there is no
-        // host->surface output path, so replay is impossible by construction.
-        let native = Self.nativePTYEnabled ? session.nativeExecLaunch : nil
+        // Running Cherry sessions always use EXEC: the Ghostty surface owns the
+        // PTY and spawns Cherry's resolved shell + environment. The in-memory
+        // backend remains only for shell-less previews and renderer tests.
+        let native = useNativePTY ? session.nativeExecLaunch : nil
         return TerminalSurfaceOptions(
-            backend: Self.nativePTYEnabled ? .exec : .inMemory(inMemorySession),
+            backend: useNativePTY ? .exec : .inMemory(inMemorySession),
             workingDirectory: session.workingDirectory,
             context: .window,
             execCommand: native?.command,
@@ -3516,7 +3496,7 @@ final class GhosttyTerminalContainerView: NSView {
         // the host-managed surface is a pure renderer that doesn't own input; under
         // EXEC it would double-encode (e.g. arrows would arrive at the shell as
         // literal escape text via the text path). Let the event fall through.
-        if GhosttySessionBridge.nativePTYEnabled { return false }
+        if activeBridge?.isNativePTYBacked == true { return false }
         guard event.window === window,
               let activeSession,
               activeSession.acceptsInput,

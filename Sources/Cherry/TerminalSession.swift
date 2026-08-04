@@ -1041,16 +1041,27 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
     let projectRoot: String?
+    private let launchBackend: TerminalSessionLaunchBackend
 
-    init(projectRoot: String? = nil, createInitialSession: Bool = true) {
+    init(
+        projectRoot: String? = nil,
+        createInitialSession: Bool = true,
+        launchBackend: TerminalSessionLaunchBackend = .nativePTY
+    ) {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
+        self.launchBackend = launchBackend
         guard createInitialSession else {
             sessions = []
             terminalDisplayItems = []
             selectedSessionID = nil
             return
         }
-        let firstSession = Self.makeSession(index: 1, workingDirectory: self.projectRoot, projectRoot: self.projectRoot)
+        let firstSession = Self.makeSession(
+            index: 1,
+            workingDirectory: self.projectRoot,
+            projectRoot: self.projectRoot,
+            launchBackend: launchBackend
+        )
         sessions = [firstSession]
         terminalDisplayItems = [.single(firstSession.id)]
         selectedSessionID = firstSession.id
@@ -1258,7 +1269,8 @@ final class TerminalWorkspace: ObservableObject {
             index: sessions.count + 1,
             title: title,
             workingDirectory: resolvedWorkingDirectory,
-            projectRoot: projectRoot
+            projectRoot: projectRoot,
+            launchBackend: launchBackend
         )
         sessions.append(session)
         if displayAsStandalone {
@@ -1291,7 +1303,8 @@ final class TerminalWorkspace: ObservableObject {
             agent: agent,
             workingDirectory: projectRoot,
             title: title,
-            parentAgentID: normalizedParentAgentID
+            parentAgentID: normalizedParentAgentID,
+            launchBackend: launchBackend
         )
         sessions.append(session)
         if select {
@@ -1317,7 +1330,8 @@ final class TerminalWorkspace: ObservableObject {
             index: commandSessions.count + 1,
             command: command,
             workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot),
-            projectRoot: projectRoot
+            projectRoot: projectRoot,
+            launchBackend: launchBackend
         )
         sessions.append(session)
         if select {
@@ -1346,7 +1360,8 @@ final class TerminalWorkspace: ObservableObject {
                 agentName: agentName,
                 workingDirectory: workingDirectory,
                 projectRoot: projectRoot,
-                parentAgentID: parentAgentID
+                parentAgentID: parentAgentID,
+                launchBackend: launchBackend
             )
             previewSessions.append(session)
             return session
@@ -1943,7 +1958,8 @@ final class TerminalWorkspace: ObservableObject {
         index: Int,
         title: String? = nil,
         workingDirectory: String? = nil,
-        projectRoot: String? = nil
+        projectRoot: String? = nil,
+        launchBackend: TerminalSessionLaunchBackend
     ) -> TerminalSession {
         let explicitTitle = title?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1954,7 +1970,8 @@ final class TerminalWorkspace: ObservableObject {
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: projectRoot
+            projectRoot: projectRoot,
+            launchBackend: launchBackend
         )
     }
 
@@ -1963,7 +1980,8 @@ final class TerminalWorkspace: ObservableObject {
         agent: AgentToolDefinition,
         workingDirectory: String,
         title requestedTitle: String?,
-        parentAgentID: UUID?
+        parentAgentID: UUID?,
+        launchBackend: TerminalSessionLaunchBackend
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
@@ -1979,7 +1997,8 @@ final class TerminalWorkspace: ObservableObject {
             kind: .agent,
             agentName: agent.name,
             parentAgentID: parentAgentID,
-            launchCommand: agent.commandLine
+            launchCommand: agent.commandLine,
+            launchBackend: launchBackend
         )
     }
 
@@ -1987,7 +2006,8 @@ final class TerminalWorkspace: ObservableObject {
         index: Int,
         command: ProjectCommandDefinition,
         workingDirectory: String,
-        projectRoot: String
+        projectRoot: String,
+        launchBackend: TerminalSessionLaunchBackend
     ) -> TerminalSession {
         TerminalSession(
             title: command.name.isEmpty ? "Command \(index)" : command.name,
@@ -1999,7 +2019,8 @@ final class TerminalWorkspace: ObservableObject {
             commandName: command.name,
             launchCommand: command.commandLine,
             launchEnvironment: command.environment,
-            restartOnExit: command.autoRestart
+            restartOnExit: command.autoRestart,
+            launchBackend: launchBackend
         )
     }
 
@@ -2010,7 +2031,8 @@ final class TerminalWorkspace: ObservableObject {
         agentName: String,
         workingDirectory: String,
         projectRoot: String?,
-        parentAgentID: UUID? = nil
+        parentAgentID: UUID? = nil,
+        launchBackend: TerminalSessionLaunchBackend
     ) -> TerminalSession {
         let session = TerminalSession(
             title: title,
@@ -2021,7 +2043,8 @@ final class TerminalWorkspace: ObservableObject {
             launchShell: false,
             kind: .agent,
             agentName: agentName,
-            parentAgentID: parentAgentID
+            parentAgentID: parentAgentID,
+            launchBackend: launchBackend
         )
         return session
     }
@@ -2047,6 +2070,14 @@ final class TerminalWorkspace: ObservableObject {
         NSColor(calibratedRed: 0.93, green: 0.47, blue: 0.62, alpha: 1),
         NSColor(calibratedRed: 0.70, green: 0.63, blue: 0.97, alpha: 1)
     ]
+}
+
+/// Production sessions use Ghostty's EXEC backend. The host-managed case is an
+/// explicit dependency for deterministic shell/renderer tests; it is not exposed
+/// as an app preference or environment switch.
+enum TerminalSessionLaunchBackend {
+    case nativePTY
+    case hostManaged
 }
 
 @MainActor
@@ -2117,6 +2148,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     let maxScrollback: Int?
     private(set) var launchWorkingDirectory: String
     let kind: SessionKind
+    private let launchBackend: TerminalSessionLaunchBackend
     let agentName: String?
     @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
@@ -2151,6 +2183,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
     private var lastNativeContentReadAt: Date?
+    /// Unit/integration fixtures can inject a deterministic VT stream even when
+    /// the session owns a live native surface. Once injected, data-layer reads use
+    /// the processor snapshot and ignore unrelated shell redraws for that fixture.
+    private var usesInjectedTestingContent = false
     /// OSC 133 command-end signal (native). A precise "back at prompt / command
     /// done" marker for non-TUI commands; published so idle detection can use it.
     @Published private(set) var lastNativeCommandFinishedAt: Date?
@@ -2268,6 +2304,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchCommand: String? = nil,
         launchEnvironment: [String: String] = [:],
         restartOnExit: Bool = false,
+        launchBackend: TerminalSessionLaunchBackend = .nativePTY,
         summaryRunner: @escaping AgentSummaryRun = { transcript, workingDirectory, model in
             try await CodexMCPSummaryRunner.shared.run(
                 transcript: transcript,
@@ -2294,6 +2331,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.projectRoot = projectRoot
         self.maxScrollback = maxScrollback
         self.kind = kind
+        self.launchBackend = launchBackend
         self.agentName = agentName
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
@@ -2442,7 +2480,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// like process listings that poll many sessions. The render signal keeps the
     /// native line model current; this just reads it.
     var listingLineCount: Int {
-        GhosttySessionBridge.nativePTYEnabled && ghosttyBridgeStorage != nil
+        ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
             ? nativeContentLines.count
             : processor.lineCount
     }
@@ -2481,6 +2519,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var isRunning: Bool {
         activeLaunchID != nil
+    }
+
+    var usesNativePTYBackend: Bool {
+        launchBackend == .nativePTY && isRunning
     }
 
     /// Whether closing this session would tear down a live program the user might
@@ -2600,7 +2642,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
-        if GhosttySessionBridge.nativePTYEnabled {
+        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(data)
             return
         }
@@ -2627,7 +2669,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
         }
-        if GhosttySessionBridge.nativePTYEnabled {
+        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(outboundData)
             return
         }
@@ -2641,7 +2683,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         noteAgentDraftCleared()
         processor.discardPendingOutput()
-        if GhosttySessionBridge.nativePTYEnabled {
+        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
             return
         }
@@ -2812,7 +2854,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         updateShellOutputPauseState()
         hostInputWriter.set(nil)
-        if GhosttySessionBridge.nativePTYEnabled {
+        if ghosttyBridgeStorage?.isNativePTYBacked == true {
             // Native-PTY: ghostty owns the PTY and there is no shellProcess to
             // terminate, so signal the shell directly — otherwise Stop leaves the
             // command running invisibly, still holding its ports. The async startup
@@ -2895,6 +2937,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestTestingData(_ data: Data) {
+        usesInjectedTestingContent = true
         renderedReplayCache = nil
         rawOutputStore.append(data)
         lastOutputAt = Date()
@@ -2914,7 +2957,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 #endif
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
-        if GhosttySessionBridge.nativePTYEnabled {
+        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             // Native-PTY: the host owns no byte stream, so the surface IS the
             // source of truth. NOTE: this is rendered text, not raw VT bytes — a
             // deliberate semantic change for native panes (no escape sequences, no
@@ -2959,8 +3002,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         return bridge
     }
 
-    /// Shared launch configuration for the host-managed forkpty shell AND the
-    /// native-PTY (ghostty EXEC) shell, so the two stay in parity.
+    /// Launch configuration for the Ghostty EXEC surface.
     private func shellLaunchConfiguration() -> ShellProcessController.Configuration {
         ShellProcessController.Configuration(
             shellPath: ShellProcessController.defaultShellPath,
@@ -3005,6 +3047,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
+        usesInjectedTestingContent = false
         attentionClassifierPrediction = nil
         attentionAlertGeneration = 0
         acknowledgedAttentionAlertGeneration = 0
@@ -3023,41 +3066,31 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         bumpRevision()
 
-        if GhosttySessionBridge.nativePTYEnabled {
-            // Native-PTY: the ghostty surface owns/spawns the PTY (see
-            // GhosttySessionBridge.makeOptions). Do NOT also fork a host shell —
-            // that would be a second shell (and a SECOND agent process for agent
-            // panes). Reach .live so the surface mounts. Input flows through the
-            // surface directly, not the host writer.
-            // Shell-exit detection arrives via the ghostty childexited action.
+        if launchBackend == .nativePTY {
+            // The Ghostty surface is the sole production PTY owner. Reach `.live`
+            // before constructing it so the bridge selects EXEC, then eagerly
+            // create it: background work must start before its tab is opened.
             shellProcess = nil
             hostInputWriter.set(nil)
             childProcessID = nil
             state = .live
             bumpRevision()
-            // Remove the previous run's PID file so captureNativeShellPID can't
-            // resurrect a stale PID before the new shell rewrites it.
             try? FileManager.default.removeItem(
                 atPath: ShellProcessController.shellPIDFilePath(processID: id.uuidString)
             )
             if let bridge = ghosttyBridgeStorage {
-                // Relaunch: merely touching the lazy accessor would return the
-                // existing surface with its exited child and respawn nothing.
                 bridge.relaunchNativeSurface()
             } else {
-                // Eagerly build the bridge so the EXEC surface — and therefore
-                // the child process — spawns now, like the host forkpty does,
-                // instead of lazily on first display. Agents/commands are normal
-                // sessions: they must run even when they're not the active tab
-                // (e.g. an AI-spawned agent the user hasn't opened yet).
                 _ = ghosttyBridge
             }
-            // Recover the child PID the shell self-reports (ghostty gives us none),
-            // so process-ancestry parent resolution works for AI-spawned subagents.
+            // Ghostty does not expose the child PID in this build. Recover the
+            // PID self-reported by the shell for process-ancestry routing.
             captureNativeShellPID()
             return
         }
 
+        // Deterministic shell/renderer tests use the explicit host-managed
+        // dependency. No app setting or environment variable selects this path.
         do {
             let processor = processor
             let traceRecorder = traceRecorder
@@ -3078,14 +3111,14 @@ final class TerminalSession: ObservableObject, Identifiable {
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {
-                        self?.handleProcessExit(status: status, launchID: launchID)
+                        guard let self, self.activeLaunchID == launchID else { return }
+                        self.finishProcessExit(status: status, launchID: launchID)
                     }
                 }
             )
             shellProcess = process
             hostInputWriter.set(process)
             childProcessID = process.processIdentifier.map { Int32($0) }
-
             state = .live
             bumpRevision()
         } catch {
@@ -3093,9 +3126,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             hostInputWriter.set(nil)
             processor.endLaunch(launchID)
             state = .failed(error.localizedDescription)
-            processor.appendPlainLines([
-                "launch failed: \(error.localizedDescription)"
-            ])
+            processor.appendPlainLines(["launch failed: \(error.localizedDescription)"])
             bumpRevision()
         }
     }
@@ -3112,11 +3143,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             title = systemTitle
             titleSource = .system
         }
-    }
-
-    private func handleProcessExit(status: Int32, launchID: UUID) {
-        guard activeLaunchID == launchID else { return }
-        finishProcessExit(status: status, launchID: launchID)
     }
 
     private func scheduleAutoRestartAfterExit() {
@@ -3488,7 +3514,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// resolution (ghostty exposes no child PID). Self-healing: retries until the
     /// shell integration has written the file.
     private func captureNativeShellPID() {
-        guard GhosttySessionBridge.nativePTYEnabled else { return }
         let launchID = activeLaunchID
         func poll(_ attempt: Int) {
             guard activeLaunchID == launchID else { return } // session relaunched/exited
@@ -3504,7 +3529,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func noteNativeCommandFinished(exitCode: Int32?) {
-        guard GhosttySessionBridge.nativePTYEnabled else { return }
+        guard ghosttyBridgeStorage?.isNativePTYBacked == true else { return }
         lastNativeCommandFinishedAt = Date()
         lastNativeCommandExitCode = exitCode
         // Capture the command's final output and advance the counters so idle
@@ -3529,7 +3554,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentLineCount() -> Int {
-        guard GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil else {
+        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
             return processor.lineCount
         }
         ensureNativeContentFresh()
@@ -3537,7 +3562,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
-        guard GhosttySessionBridge.nativePTYEnabled, ghosttyBridgeStorage != nil else {
+        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
             return processor.snapshot(range: range)
         }
         ensureNativeContentFresh()
@@ -3549,7 +3574,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Render-signal entry point: schedule a debounced content refresh so the
     /// output/idle counters advance even when nothing is actively reading.
     func noteNativeRenderRequest() {
-        guard GhosttySessionBridge.nativePTYEnabled else { return }
+        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return }
         guard !nativeContentRefreshScheduled else { return }
         nativeContentRefreshScheduled = true
         // Off-screen sessions (e.g. background agents an orchestrator drives) refresh
@@ -3582,7 +3607,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// selection isn't reliably readable), which cursor blink etc. don't alter.
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
-        guard GhosttySessionBridge.nativePTYEnabled else { return false }
+        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return false }
         // recordAgentActivitySignal / summaryTranscript below re-enter this
         // function through contentSnapshot → ensureNativeContentFresh. Without
         // this guard, a session whose screen changes faster than one scan pass
@@ -3775,7 +3800,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             String(line.prefix(columnLimit))
         }
         let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]?
-        if !includeStyledGrid || (GhosttySessionBridge.nativePTYEnabled && ghosttyBridgeStorage != nil) {
+        if !includeStyledGrid || (
+            ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
+        ) {
             // Native EXEC surfaces currently expose only `readText`, so emitting
             // processor styles here would attach stale or unrelated formatting.
             styledGrid = nil

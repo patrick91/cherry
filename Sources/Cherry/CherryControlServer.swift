@@ -1470,6 +1470,10 @@ final class CherryControlServer: @unchecked Sendable {
         let sinceOutputVersion = request.sinceOutputVersion
             ?? session.lastInputOutputVersion
             ?? session.outputVersion
+        // Headless native surfaces do not necessarily emit render callbacks, so
+        // pull their text before and during the wait. `lineCount` is the
+        // throttled data-layer refresh point for a single selected process.
+        _ = session.lineCount
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMilliseconds) / 1_000)
         let startedAt = Date()
         var observedNewOutput = ProcessIdleDetector.observedNewOutput(
@@ -1478,7 +1482,8 @@ final class CherryControlServer: @unchecked Sendable {
         )
 
         func result(reason: ProcessIdleWaitReason) -> WaitForProcessIdleResult {
-            WaitForProcessIdleResult(
+            let output = terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
+            return WaitForProcessIdleResult(
                 process: processInfo(for: session, workspace: sessionWorkspace),
                 reason: reason,
                 observedNewOutput: observedNewOutput,
@@ -1486,11 +1491,12 @@ final class CherryControlServer: @unchecked Sendable {
                 outputVersion: session.outputVersion,
                 lastOutputAt: session.lastOutputAt,
                 agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
-                output: terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
+                output: output
             )
         }
 
         while true {
+            _ = session.lineCount
             observedNewOutput = observedNewOutput || ProcessIdleDetector.observedNewOutput(
                 currentOutputVersion: session.outputVersion,
                 sinceOutputVersion: sinceOutputVersion

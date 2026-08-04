@@ -228,7 +228,7 @@ private func makeHostedContentViewWindow(
         .appendingPathComponent("CherrySidebarResize-\(UUID().uuidString)", isDirectory: true)
     let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
     try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
-    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     let chromeState = ProjectWindowChromeState()
     let noteStore = ProjectNoteStore(
         projectRoot: projectDirectory.path,
@@ -2649,8 +2649,8 @@ private struct MCPWhoamiPayload: Decodable {
     _ = settings.addProject(path: projectRootB.path)
     try settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
 
-    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path)
-    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path)
+    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path, launchBackend: .hostManaged)
+    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path, launchBackend: .hostManaged)
     let chromeStateA = ProjectWindowChromeState()
     let chromeStateB = ProjectWindowChromeState()
     let workspaces = [projectRootA.path: workspaceA, projectRootB.path: workspaceB]
@@ -3551,6 +3551,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
+    #expect(await waitForCondition { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPID: parentPID)
 
@@ -3604,6 +3605,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
+    #expect(await waitForCondition { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let unrelatedIntermediatePID = Int32.max
     let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(
@@ -3876,7 +3878,7 @@ private struct MCPWhoamiPayload: Decodable {
     _ = settings.addProject(path: projectRootA.path)
     _ = settings.addProject(path: projectRootB.path)
 
-    let workspace = TerminalWorkspace(projectRoot: projectRootA.path)
+    let workspace = TerminalWorkspace(projectRoot: projectRootA.path, launchBackend: .hostManaged)
     var openProjectRoots = [projectRootA.path]
     var openedProjectRoots: [String] = []
     let server = CherryControlServer(
@@ -3958,8 +3960,8 @@ private struct MCPWhoamiPayload: Decodable {
     try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootA.path, storage: .local)
     try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootB.path, storage: .local)
 
-    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path)
-    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path)
+    let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path, launchBackend: .hostManaged)
+    let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path, launchBackend: .hostManaged)
     let noteStoreA = ProjectNoteStore(projectRoot: projectRootA.path, storageDirectory: notesRoot)
     let noteStoreB = ProjectNoteStore(projectRoot: projectRootB.path, storageDirectory: notesRoot)
     let todoStoreA = ProjectTodoStore(projectRoot: projectRootA.path, storageDirectory: todosRoot)
@@ -6199,7 +6201,7 @@ private struct MCPWhoamiPayload: Decodable {
         TerminalNotificationCenter.shared.isDeliveryEnabled = true
     }
 
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -6313,7 +6315,8 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func workspaceCloseReleasesGhosttyBridge() async throws {
-    let workspace = TerminalWorkspace()
+    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach {
             $0.releaseGhosttyBridge()
@@ -6322,7 +6325,6 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let session = workspace.addSession(title: "Bridge", select: false)
-    let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
     _ = session.ghosttyBridge
     #expect(GhosttySessionBridge.liveBridgeCount == startingBridgeCount + 1)
 
@@ -6674,8 +6676,8 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func worktreeWorkspaceSwitchReusesTerminalContainerWithoutSurfaceFade() async throws {
-    let firstWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-first-worktree")
-    let secondWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-second-worktree")
+    let firstWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-first-worktree", launchBackend: .hostManaged)
+    let secondWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-second-worktree", launchBackend: .hostManaged)
     let selection = TerminalWorkspaceSelectionForTesting(workspace: firstWorkspace)
     let swipeState = WorktreeSidebarSwipeState()
     let chromeState = ProjectWindowChromeState()
@@ -7694,7 +7696,8 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: true,
         kind: .agent,
         agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -7726,7 +7729,8 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: true,
         kind: .agent,
         agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -7747,7 +7751,9 @@ private struct MCPWhoamiPayload: Decodable {
     session.send(text: "Run /review on my current changes\n")
     #expect(session.agentActivityState == .working)
 
-    session.ingestTestingData(Data("Starting review\n".utf8))
+    // The fixture injects output directly rather than receiving the submitted
+    // line back from a host-managed PTY, so advance to the next terminal row.
+    session.ingestTestingData(Data("\nStarting review\n".utf8))
     try await Task.sleep(for: .milliseconds(80))
 
     #expect(session.agentActivityState == .working)
@@ -7795,7 +7801,8 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: true,
         kind: .agent,
         agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -7839,7 +7846,8 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: true,
         kind: .agent,
         agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -7873,7 +7881,8 @@ private struct MCPWhoamiPayload: Decodable {
         launchShell: true,
         kind: .agent,
         agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -8102,7 +8111,8 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         launchShell: true,
         kind: .agent,
         agentName: "Claude",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -8409,7 +8419,8 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         launchShell: true,
         kind: .agent,
         agentName: "Claude",
-        launchCommand: "stty -echo; cat >/dev/null"
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
     )
     defer { session.stop() }
 
@@ -8952,7 +8963,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceCanCreateBackgroundSession() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     let initialSelection = workspace.selectedSessionID
 
     let session = workspace.addSession(title: "Background", select: false)
@@ -8963,7 +8974,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceCanReorderSessions() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -8983,7 +8994,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceSplitDuplicateCreatesDisplayGroup() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -9011,7 +9022,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -9044,7 +9055,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceSplitEnforcesThreePaneLimitAndDetailWidth() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -9065,7 +9076,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceCanMoveSplitDisplayRows() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -9086,7 +9097,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceSplitFocusCloseDissolveAndSeparateActions() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -9134,7 +9145,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -9194,7 +9205,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
 @MainActor
 @Test func workspaceShortcutSelectionTreatsSplitGroupAsOneRow() async throws {
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -9224,7 +9235,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -10262,7 +10273,7 @@ private func waitForSummaryCallCount(
     let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
     try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
 
-    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     let chromeState = ProjectWindowChromeState()
     let noteStore = ProjectNoteStore(
         projectRoot: projectDirectory.path,
@@ -10336,7 +10347,7 @@ private func waitForSummaryCallCount(
     let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
     try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
 
-    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path)
+    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     let chromeState = ProjectWindowChromeState()
     let noteStore = ProjectNoteStore(
@@ -11043,7 +11054,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11080,7 +11091,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11121,7 +11132,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11149,7 +11160,11 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path, createInitialSession: false)
+    let workspace = TerminalWorkspace(
+        projectRoot: directory.path,
+        createInitialSession: false,
+        launchBackend: .hostManaged
+    )
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11179,7 +11194,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     let definition = AgentToolDefinition(name: "Echo", command: "/bin/cat")
     let agent = workspace.addAgentSession(agent: definition, projectRoot: directory.path, select: false)
 
@@ -11201,7 +11216,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11234,7 +11249,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11277,7 +11292,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11319,7 +11334,7 @@ private func waitForSummaryCallCount(
     """.write(to: scriptURL, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     var stubbornPID: pid_t?
     defer {
         workspace.sessions.forEach { $0.stop() }
@@ -11356,7 +11371,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11394,7 +11409,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11428,7 +11443,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11455,7 +11470,7 @@ private func waitForSummaryCallCount(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace(projectRoot: directory.path)
+    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
     defer {
         workspace.sessions.forEach { $0.stop() }
     }
@@ -11569,7 +11584,7 @@ private final class ControlServerHarness {
                 storage: .local
             )
         }
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path)
+        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
         noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
         todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todosRoot)
         chromeState = ProjectWindowChromeState()
@@ -11663,7 +11678,7 @@ private func serviceRecord(
         try? FileManager.default.removeItem(at: directory)
     }
 
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     let selectedSession = workspace.addSession(workingDirectory: directory.path)
 
     let inheritedSession = workspace.addSession()
@@ -11686,7 +11701,7 @@ private func serviceRecord(
         try? FileManager.default.removeItem(at: requestedDirectory)
     }
 
-    let workspace = TerminalWorkspace()
+    let workspace = TerminalWorkspace(launchBackend: .hostManaged)
     _ = workspace.addSession(workingDirectory: selectedDirectory.path)
 
     let explicitSession = workspace.addSession(workingDirectory: requestedDirectory.path)

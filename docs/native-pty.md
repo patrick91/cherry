@@ -1,10 +1,10 @@
 # Native-PTY migration (eliminating terminal replay)
 
-Status: **native-PTY is now the DEFAULT** (merged to `main`), except while
-Attention Study is enabled because styled observation capture currently needs
-the host-managed path. `CHERRY_NATIVE_PTY=0` or `1` explicitly selects either
-path. The remaining cutover step is deleting the replay subsystem once styled
-cells are available from the native path.
+Status: **running sessions always use native PTY**. Ghostty owns the PTY through
+its EXEC backend; Attention Study no longer changes the terminal architecture.
+Shell-less previews and renderer tests retain the in-memory backend. The
+remaining cleanup is deleting replay-only implementation that those tests still
+exercise.
 
 ## Why
 
@@ -32,10 +32,10 @@ model: let the ghostty surface own the PTY (`EXEC` backend), so replay is
 - One genuine gap: `ghostty_surface_foreground_pid`/`tty_name` are absent from this
   binary (needs an XCFramework rebuild) — deferred.
 
-## How to try it
+## How to run it
 
-The installed `~/Applications/Cherry.app` is currently the native build
-(`CHERRY_NATIVE_PTY` baked). Or: `CHERRY_NATIVE_PTY=1 swift run -c release Cherry`.
+Use `swift run -c release Cherry` or `Scripts/install-local-app`. There is no
+native-PTY environment switch; the app has one production terminal path.
 
 **Revert to the stable build:** `git checkout main && Scripts/install-local-app`.
 
@@ -133,17 +133,11 @@ The installed `~/Applications/Cherry.app` is currently the native build
 - **Image paste / drag** — pre-existing (never worked); needs ghostty's
   clipboard-image path. Lower priority.
 
-## Remaining — the cutover (NEEDS HUMAN REVIEW)
+## Remaining cleanup
 
-Everything functional is done and socket-verified. What's left is the deliberate,
-human-reviewed cutover — **not started**, waiting on Patrick's visual review on
-real hardware:
-
-1. **Flip the default** — make native the default backend (drop the
-   `CHERRY_NATIVE_PTY` opt-in).
-2. **Delete the replay subsystem** — `renderedReplayOutput`, `rawOutputStore`
+1. **Delete the replay subsystem** — `renderedReplayOutput`, `rawOutputStore`
    style-recovery merge, the first-mount/resize replay, and the (now-moot)
-   resident-surfaces code on the shelved branch.
+   resident-surfaces code after replacing the remaining renderer-test coverage.
 
 ## Residual gaps / decisions for review
 

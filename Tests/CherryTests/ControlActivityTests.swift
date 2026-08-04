@@ -30,7 +30,7 @@ private final class ControlActivityHarness {
 
         settings = AgentSettings(defaults: defaults)
         _ = settings.addProject(path: projectRoot.path)
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path)
+        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
         server = CherryControlServer(
             workspace: workspace,
             socketURL: socketURL,

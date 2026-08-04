@@ -31,14 +31,7 @@ else
   echo "Building WARM (live surfaces kept warm; the default)"
 fi
 
-# Native-PTY (ghostty owns the PTY; no replay) is the DEFAULT. Build the legacy
-# host-managed (replay) path with CHERRY_NATIVE_PTY=0 Scripts/install-local-app.
-if [[ "${CHERRY_NATIVE_PTY:-}" == "0" ]]; then
-  EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS -Xswiftc -DCHERRY_DISABLE_NATIVE_PTY"
-  echo "Building with host-managed I/O (legacy replay path; native-PTY disabled)"
-else
-  echo "Building with native-PTY (ghostty owns the PTY; the default)"
-fi
+echo "Building with native PTY (Ghostty owns the PTY)"
 
 swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS
 swift build -c "$CONFIGURATION" --product CherryMCP

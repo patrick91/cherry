@@ -277,17 +277,12 @@ final class TerminalSettings: ObservableObject {
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
             builder.withCustom("scrollback-limit", "\(Defaults.ghosttyScrollbackLimitBytes)")
-            if GhosttySessionBridge.nativePTYEnabled {
-                // Native-PTY: the ghostty surface owns the keyboard, so honor the
-                // user's own ghostty keyboard config — the same file standalone
-                // ghostty reads. Cherry's host-managed key monitor (gated off under
-                // native) used to hand-encode shift+enter / option-combos; instead
-                // we forward the user's input-producing keybinds (text:/csi:/esc:)
-                // and macos-option-as-alt to ghostty. App-action keybinds (new_tab,
-                // splits) stay Cherry's responsibility and are skipped.
-                for (key, value) in Self.nativeUserKeyboardConfig {
-                    builder.withCustom(key, value)
-                }
+            // The Ghostty surface owns the keyboard for every running session, so
+            // honor the same input-producing bindings as standalone Ghostty.
+            // App-action bindings (new tabs, splits, and windows) remain Cherry's
+            // responsibility and are intentionally skipped.
+            for (key, value) in Self.nativeUserKeyboardConfig {
+                builder.withCustom(key, value)
             }
         }
     }

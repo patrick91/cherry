@@ -80,11 +80,11 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
 
 struct TerminalAttentionClassifier: Sendable {
     static let shared = TerminalAttentionClassifier()
-    static let modelID = "20260730-final-baseline"
+    static let modelID = "20260803-structured-baseline"
     static var parameterCount: Int { featureNames.count + 1 }
 
     private static let threshold = 0.5
-    private static let bias = -2.5390182062907654
+    private static let bias = -2.1903106646695054
 
     private static let numericStatistics: [String: (mean: Double, scale: Double)] = [
         "numeric.millisecondsSinceLastContentChange": (5.934888450592341, 2.693580642266454),
@@ -113,16 +113,6 @@ struct TerminalAttentionClassifier: Sendable {
         "boolean.millisecondsSinceStarted.missing=false",
         "boolean.terminal.cursorVisible=false",
         "boolean.terminal.cursorVisible=true",
-        "boolean.terminal.marker.approval=false",
-        "boolean.terminal.marker.approval=true",
-        "boolean.terminal.marker.blocked=false",
-        "boolean.terminal.marker.blocked=true",
-        "boolean.terminal.marker.prompt=false",
-        "boolean.terminal.marker.prompt=true",
-        "boolean.terminal.marker.result=false",
-        "boolean.terminal.marker.result=true",
-        "boolean.terminal.marker.working=false",
-        "boolean.terminal.marker.working=true",
         "boolean.terminal.scrollbackOmitted=false",
         "boolean.terminal.scrollbackOmitted=true",
         "boolean.terminal.usesAlternateScreen=false",
@@ -152,97 +142,55 @@ struct TerminalAttentionClassifier: Sendable {
     ]
 
     private static let weights = [
-        0.06093439869162162,
-        -0.06095932064454138,
-        1.7094761757208112,
-        0.04351177689633125,
-        -1.7530142269591826,
-        0.028437287635296,
-        0.04351177689633125,
-        -0.07197542478563514,
-        -0.000025096277250104485,
-        0.10237042797273511,
-        -0.10239515095070821,
-        -0.14262777874574126,
-        0.14260313607767108,
-        0.1455656054627218,
-        -0.14559048830242086,
-        -0.000025096277250104485,
-        0.15171666413562446,
-        -0.15174152005899852,
-        -0.005624226363867248,
-        0.005599138270379968,
-        -0.0024158704221098606,
-        0.0023908222511238525,
-        -0.16831388287935564,
-        0.16828915917626608,
-        -0.18833414876335858,
-        0.18830950829250445,
-        0.35888821714112823,
-        -0.3589137832238593,
-        -0.14694087687639473,
-        0.14691616471360672,
-        0.06569219195164377,
-        -0.0657167424193383,
-        -0.5956464485031974,
-        -0.24159902376458503,
-        0.02040730927707797,
-        1.0148351579778165,
-        0.14335753348940494,
-        -0.36696793815471507,
-        0.025585987378386174,
-        0.02040730927707797,
-        -0.020432340253771827,
-        1.1785987918482834,
-        -1.178630626237267,
-        0.34864097084125134,
-        -0.04143487955973126,
-        -0.14338385607871706,
-        -0.526080733393238,
-        0.34182425776728576,
-        0.02040730927707797,
-        0.07393982752092502,
-        0.24888395091147092,
-        0.767602564573528,
-        -0.22610882523091497,
-        0.069501083519633,
+        0.05158449421651377,
+        -0.05158459147144902,
+        1.7308150476569963,
+        0.0383982392885871,
+        -1.769213394331419,
+        0.024903863632553338,
+        0.0383982392885871,
+        -0.06330221115989249,
+        -0.0000000981382363672938,
+        0.13686689348495934,
+        -0.13686698993160204,
+        -0.12816964079902302,
+        0.1281695449582229,
+        0.14515197808552308,
+        -0.14515207529706356,
+        -0.0000000981382363672938,
+        0.1297411137836451,
+        -0.12974121074151274,
+        -0.13117404738735072,
+        0.1311739513009173,
+        0.03367363810137374,
+        -0.03367373371050227,
+        -0.5730535898936631,
+        -0.24606788808829194,
+        0.018350542297904945,
+        1.0809950549344716,
+        0.1169284110053821,
+        -0.41902304812908336,
+        0.02187039706888814,
+        0.018350542297904945,
+        -0.018350640126010197,
+        1.2162739988012303,
+        -1.2162741544077298,
+        0.3115759374539151,
+        -0.06771490012370816,
+        -0.142297139010288,
+        -0.5121340305280573,
+        0.3922194771586905,
+        0.018350542297904945,
+        0.06706583500698673,
+        0.27460334261075614,
+        0.8111447593731007,
+        -0.20370543554459603,
+        0.15391221724553467,
     ]
 
     private static let featureWeights: [String: Double] = Dictionary(
         uniqueKeysWithValues: zip(featureNames, weights)
     )
-
-    private static let resultMarkers = [
-        "worked for",
-        "baked for",
-        "cooked for",
-        "cogitated for",
-        "crunched for",
-        "churned for",
-        "sautéed for",
-        "sauteed for",
-        "brewed for",
-    ]
-
-    private static let approvalMarkers = [
-        "do you want to proceed",
-        "would you like to proceed",
-        "waiting for approval",
-        "press enter to approve",
-        "approve this action",
-        "allow this command",
-        "allow command",
-        "allow computer use to use",
-        "run the tool and continue",
-    ]
-
-    private static let blockedMarkers = [
-        "conversation interrupted",
-        "task interrupted",
-        "process exited",
-        "fatal error",
-        "panic:",
-    ]
 
     private init() {
         precondition(
@@ -357,22 +305,6 @@ struct TerminalAttentionClassifier: Sendable {
             name: "millisecondsSinceStarted",
             value: observation.timing.millisecondsSinceStarted
         )
-
-        let lines = observation.terminal.grid.suffix(48)
-        let text = lines.joined(separator: "\n").lowercased()
-        let markers = [
-            "result": resultMarkers.contains { text.contains($0) },
-            "approval": approvalMarkers.contains { text.contains($0) },
-            "blocked": blockedMarkers.contains { text.contains($0) },
-            "working": text.contains("esc to interrupt") || text.contains("• working ("),
-            "prompt": lines.contains { line in
-                let trimmed = line.drop(while: \.isWhitespace)
-                return trimmed.hasPrefix("›") || trimmed.hasPrefix("»") || trimmed.hasPrefix("❯")
-            },
-        ]
-        for (name, value) in markers {
-            addBoolean(&features, name: "terminal.marker.\(name)", value: value)
-        }
 
         return features
     }

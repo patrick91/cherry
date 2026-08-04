@@ -216,9 +216,11 @@ It creates a deterministic whole-session train/test split and records a SHA-256
 checksum in `manifest.json`. `unknown` reviews remain in the dataset but are
 excluded from binary model fitting.
 
-The model uses activity, event, interaction, timing, cursor, screen-mode, and a
-few terminal-state marker flags. It does not use arbitrary terminal text,
-harness identity, review metadata, or provisional labels. The output contains:
+The model uses activity, event, interaction, timing, cursor, and screen-mode
+fields. It does not use terminal text, harness identity, review metadata, or
+provisional labels. Terminal phrases remain available only to the provisional
+review sampler, which abstains on user-interrupted turns rather than treating
+them as failures. The output contains:
 
 - `model.json`: weights, feature names, scaling statistics, and threshold.
 - `metrics.json`: fixed session-split metrics plus human leave-one-session-out
@@ -231,15 +233,18 @@ Treat the human leave-one-session-out result as the headline measurement.
 Metrics over `assistant_audit` examples are diagnostic because those labels
 were produced by rules similar to the model inputs.
 
-### Final Reviewed Baseline (30 July 2026)
+### Structured-Only Baseline (3 August 2026)
 
 The completed local review produced 1,110 examples across 32 whole terminal
 sessions: 493 `attention_needed`, 616 `no_attention_needed`, and one retained
 `unknown`. Of these, 34 were directly human-reviewed and 1,076 were
 assistant-audited.
 
-The final dependency-free logistic regressor has 55 parameters. Its fixed
-eight-session test split scored 97.5% balanced accuracy on 279 binary examples.
+The reviewed dataset was retrained without terminal-text marker features after
+those features proved redundant and conflated user interruptions with errors.
+The resulting dependency-free logistic regressor has 45 parameters. Its fixed
+eight-session test split scored 97.1% balanced accuracy on 279 binary examples
+(97.5% overall accuracy), unchanged from the marker-based model.
 The more meaningful human leave-one-session-out evaluation scored 96.7%
 balanced accuracy on 33 examples: 18 true positives, 14 true negatives, one
 false positive, and no false negatives.
@@ -253,7 +258,7 @@ still comes from one user and is too small to call production-ready.
 Cherry embeds the final weights and reproduces the Python feature extractor in
 Swift. The classifier runs locally for every agent session even when bulk study
 collection is disabled, so the standard native Ghostty path remains available.
-No MLX dependency is needed for the 55-parameter logistic regression.
+No MLX dependency is needed for the 45-parameter logistic regression.
 
 The sidebar uses the model only for its attention state:
 

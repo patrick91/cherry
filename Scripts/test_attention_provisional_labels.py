@@ -134,6 +134,23 @@ class ProvisionalLabelTests(unittest.TestCase):
             ["no_attention_needed", "no_attention_needed"],
         )
 
+    def test_user_interruption_is_left_for_human_review(self) -> None:
+        result = self.write([
+            observation(
+                "00000000-0000-4000-8000-000000000008",
+                "2026-08-03T12:00:00Z",
+                "idle",
+                grid=[
+                    "■ Conversation interrupted - tell the model what to do differently.",
+                    "",
+                    "›",
+                ],
+            ),
+        ])
+
+        self.assertNotIn("label", result[0])
+        self.assertNotIn("annotation", result[0])
+
 
 if __name__ == "__main__":
     unittest.main()

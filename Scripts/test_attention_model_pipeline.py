@@ -236,6 +236,10 @@ class AttentionModelPipelineTests(unittest.TestCase):
             )
             model = json.loads((output / "model.json").read_text(encoding="utf-8"))
             self.assertFalse(model["featurePolicy"]["provisionalLabelIncluded"])
+            self.assertFalse(any(
+                "terminal.marker" in name
+                for name in model["featureNames"]
+            ))
             self.assertLess(model["parameters"], 100)
 
 

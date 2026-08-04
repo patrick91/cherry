@@ -25,10 +25,10 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.9221480208723661) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.8981252024920073) < 1e-12)
         #expect(prediction.needsAttention)
         #expect(prediction.label == .attentionNeeded)
-        #expect(prediction.confidenceDescription == "92% confidence")
+        #expect(prediction.confidenceDescription == "90% confidence")
         #expect(SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
             hasUnacknowledgedAttention: true,
@@ -44,9 +44,10 @@ struct TerminalAttentionClassifierTests {
             hasUnacknowledgedAttention: false,
             isFocused: false
         ))
-        #expect(TerminalAttentionClassifier.parameterCount == 55)
+        #expect(TerminalAttentionClassifier.parameterCount == 45)
         #expect(prediction.debugReport.contains("Native evidence: prompt_marker"))
         #expect(prediction.contributions.first?.name == "boolean.interaction.hasUnsubmittedInput=false")
+        #expect(!prediction.contributions.contains { $0.name.contains("terminal.marker") })
     }
 
     @Test func swiftInferenceMatchesPythonBaselineForComposingFixture() {
@@ -68,7 +69,7 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.0011094844877164) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.0018033552447569063) < 1e-12)
         #expect(!prediction.needsAttention)
         #expect(prediction.label == .noAttentionNeeded)
         #expect(prediction.confidenceDescription == "100% confidence")

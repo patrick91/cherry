@@ -50,11 +50,14 @@ APPROVAL_MARKERS = (
 )
 
 BLOCKED_MARKERS = (
-    "conversation interrupted",
-    "task interrupted",
     "process exited",
     "fatal error",
     "panic:",
+)
+
+USER_INTERRUPTION_MARKERS = (
+    "conversation interrupted",
+    "task interrupted",
 )
 
 
@@ -164,10 +167,17 @@ def user_composing_annotation() -> tuple[str, dict[str, Any]]:
     return no_attention_annotation(USER_COMPOSING_RATIONALE)
 
 
-def classify_idle(observation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def classify_idle(
+    observation: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
     text = terminal_text(observation)
     if interaction_value(observation, "hasUnsubmittedInput") is True:
         return user_composing_annotation()
+    if any(marker in text for marker in USER_INTERRUPTION_MARKERS):
+        # An interrupted turn is user-initiated in supported Codex flows. It is
+        # not an agent failure, but a viewport alone cannot establish whether
+        # the user still expects a notification, so leave it for human review.
+        return None
     if any(marker in text for marker in APPROVAL_MARKERS):
         return attention_annotation("waiting_for_approval", "approval_prompt_visible", 0.99)
     if any(marker in text for marker in BLOCKED_MARKERS):
@@ -177,7 +187,9 @@ def classify_idle(observation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return attention_annotation("waiting_for_input", "waiting_at_prompt", 0.94)
 
 
-def classify_notification(observation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def classify_notification(
+    observation: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
     state = activity_state(observation)
     if state == "idle":
         return classify_idle(observation)
@@ -185,6 +197,8 @@ def classify_notification(observation: dict[str, Any]) -> tuple[str, dict[str, A
     text = terminal_text(observation)
     if interaction_value(observation, "hasUnsubmittedInput") is True:
         return user_composing_annotation()
+    if any(marker in text for marker in USER_INTERRUPTION_MARKERS):
+        return None
     if state == "permission" or any(marker in text for marker in APPROVAL_MARKERS):
         return attention_annotation("waiting_for_approval", "approval_prompt_visible", 0.99)
     if any(marker in text for marker in BLOCKED_MARKERS):

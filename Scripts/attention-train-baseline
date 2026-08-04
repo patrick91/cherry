@@ -18,35 +18,6 @@ from typing import Any, Iterable
 MODEL_SCHEMA_VERSION = 1
 BINARY_LABELS = {"attention_needed", "no_attention_needed"}
 POSITIVE_LABEL = "attention_needed"
-RESULT_MARKERS = (
-    "worked for",
-    "baked for",
-    "cooked for",
-    "cogitated for",
-    "crunched for",
-    "churned for",
-    "sautéed for",
-    "sauteed for",
-    "brewed for",
-)
-APPROVAL_MARKERS = (
-    "do you want to proceed",
-    "would you like to proceed",
-    "waiting for approval",
-    "press enter to approve",
-    "approve this action",
-    "allow this command",
-    "allow command",
-    "allow computer use to use",
-    "run the tool and continue",
-)
-BLOCKED_MARKERS = (
-    "conversation interrupted",
-    "task interrupted",
-    "process exited",
-    "fatal error",
-    "panic:",
-)
 
 
 class BaselineError(Exception):
@@ -67,14 +38,6 @@ def sha256(path: Path) -> str:
 
 def object_value(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def terminal_text(observation: dict[str, Any]) -> str:
-    terminal = object_value(observation.get("terminal"))
-    grid = terminal.get("grid")
-    if not isinstance(grid, list):
-        return ""
-    return "\n".join(line for line in grid[-48:] if isinstance(line, str)).casefold()
 
 
 def add_category(features: dict[str, float], name: str, value: Any) -> None:
@@ -106,8 +69,6 @@ def observation_features(record: dict[str, Any]) -> dict[str, float]:
     timing = object_value(observation.get("timing"))
     terminal = object_value(observation.get("terminal"))
     cursor = object_value(terminal.get("cursor"))
-    text = terminal_text(observation)
-
     features: dict[str, float] = {}
     add_category(features, "event", observation.get("event"))
     add_category(features, "activity.state", activity.get("state"))
@@ -138,18 +99,6 @@ def observation_features(record: dict[str, Any]) -> dict[str, float]:
     ):
         add_log_milliseconds(features, key, timing.get(key))
 
-    marker_values = {
-        "result": any(marker in text for marker in RESULT_MARKERS),
-        "approval": any(marker in text for marker in APPROVAL_MARKERS),
-        "blocked": any(marker in text for marker in BLOCKED_MARKERS),
-        "working": "esc to interrupt" in text or "• working (" in text,
-        "prompt": any(
-            line.lstrip().startswith(("›", "❯"))
-            for line in text.splitlines()
-        ),
-    }
-    for name, value in marker_values.items():
-        add_boolean(features, f"terminal.marker.{name}", value)
     return features
 
 
@@ -564,7 +513,7 @@ def train_baseline(args: argparse.Namespace) -> Path:
             "Assistant-audited labels are pseudo-labels, not independent human truth.",
             "The human-only test set is small; its metrics have high variance.",
             "The split is by whole session, but all data comes from one user and one collection period.",
-            "Terminal text is reduced to a few marker flags; raw text is not a model input.",
+            "Terminal text is not a model input; inference uses structured observation fields only.",
         ],
     }
     metrics["evaluations"]["humanLeaveOneSessionOut"] = classification_metrics(

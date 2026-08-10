@@ -69,8 +69,14 @@ def observation_features(record: dict[str, Any]) -> dict[str, float]:
     timing = object_value(observation.get("timing"))
     terminal = object_value(observation.get("terminal"))
     cursor = object_value(terminal.get("cursor"))
+    turn = object_value(observation.get("turn"))
     features: dict[str, float] = {}
-    add_category(features, "event", observation.get("event"))
+    event = observation.get("event")
+    if isinstance(event, str) and event:
+        add_category(features, "event", event)
+    turn_state = turn.get("state")
+    if isinstance(turn_state, str) and turn_state:
+        add_category(features, "turn.state", turn_state)
     add_category(features, "activity.state", activity.get("state"))
     add_category(features, "activity.evidence", activity.get("evidence"))
     add_category(features, "activity.processState", activity.get("processState"))

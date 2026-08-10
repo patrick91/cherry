@@ -165,13 +165,74 @@ class AttentionModelPipelineTests(unittest.TestCase):
                 "kind": "agent",
             },
             "event": "notification",
+            "correction": {
+                "sourceEvent": "content_changed",
+                "modelID": "fixture-model",
+                "modelLabel": "no_attention_needed",
+                "attentionProbability": 0.1,
+                "threshold": 0.5,
+            },
         }
 
         sanitized = EXPORTER.sanitized_observation(payload)
 
         for key in ("id", "label", "annotation", "checkpoint", "scenarioID"):
             self.assertNotIn(key, sanitized)
+        self.assertNotIn("correction", sanitized)
         self.assertEqual(sanitized["session"], {"harness": "Codex", "kind": "agent"})
+
+    def test_sanitizer_restores_runtime_event_for_new_corrections(self) -> None:
+        payload = {
+            "event": "labeled_checkpoint",
+            "correction": {"sourceEvent": "input_changed", "modelID": "fixture"},
+            "session": {"id": "session", "kind": "agent"},
+        }
+
+        sanitized = EXPORTER.sanitized_observation(payload)
+
+        self.assertEqual(sanitized["event"], "input_changed")
+        self.assertNotIn("correction", sanitized)
+
+    def test_sanitizer_omits_unknown_runtime_event_for_legacy_corrections(self) -> None:
+        payload = {
+            "event": "labeled_checkpoint",
+            "session": {"id": "session", "kind": "agent"},
+        }
+
+        sanitized = EXPORTER.sanitized_observation(payload)
+        record = {"observation": sanitized}
+
+        self.assertNotIn("event", sanitized)
+        self.assertFalse(any(
+            feature.startswith("category.event=")
+            for feature in TRAINER.observation_features(record)
+        ))
+
+    def test_latest_human_correction_wins_for_identical_screen(self) -> None:
+        terminal = {"columns": 80, "rows": 24, "grid": ["same screen"]}
+        first_payload = {
+            "id": "first",
+            "session": {"id": "session-one"},
+            "terminal": terminal,
+            "annotation": {"provenance": "cherry_in_app_human_correction"},
+        }
+        latest_payload = {
+            **first_payload,
+            "id": "latest",
+            "correction": {"supersedesObservationID": "first"},
+        }
+        first_summary = summary("first", "session-one", "attention_needed", "human")
+        first_summary["recordedAt"] = "2026-07-27T12:00:00Z"
+        latest_summary = summary("latest", "session-one", "no_attention_needed", "human")
+        latest_summary["recordedAt"] = "2026-07-27T12:00:07Z"
+
+        summaries, payloads = EXPORTER.deduplicate_reviewed_observations(
+            [first_summary, latest_summary],
+            [first_payload, latest_payload],
+        )
+
+        self.assertEqual([value["id"] for value in summaries], ["latest"])
+        self.assertEqual([value["id"] for value in payloads], ["latest"])
 
     def test_feature_extractor_ignores_review_and_provisional_fields(self) -> None:
         record = dataset_record(

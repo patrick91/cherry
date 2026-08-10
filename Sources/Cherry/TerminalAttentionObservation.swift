@@ -62,10 +62,22 @@ enum TerminalAttentionObservationEvent: String, Codable, Equatable, Sendable {
     case contentChanged = "content_changed"
     case inputChanged = "input_changed"
     case inputSubmitted = "input_submitted"
+    case turnInterrupted = "turn_interrupted"
     case activityStateChanged = "activity_state_changed"
     case notification
     case processExited = "process_exited"
     case labeledCheckpoint = "labeled_checkpoint"
+}
+
+enum TerminalAttentionTurnState: String, Codable, Equatable, Sendable {
+    /// Cherry has not observed a submitted turn in this terminal process yet.
+    case notStarted = "not_started"
+    /// A submitted turn is still running.
+    case active
+    /// The agent has yielded control after a submitted turn.
+    case completed
+    /// The user explicitly interrupted the active turn.
+    case userInterrupted = "user_interrupted"
 }
 
 struct TerminalAttentionObservation: Codable, Equatable, Sendable {
@@ -157,6 +169,24 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
         let terminalFocused: Bool
     }
 
+    struct TurnContext: Codable, Equatable, Sendable {
+        let state: TerminalAttentionTurnState
+    }
+
+    /// Metadata captured only for an in-app human correction. Keeping it out of
+    /// `annotation` makes the human target and the source model verdict
+    /// independently available to the dataset exporter.
+    struct CorrectionContext: Codable, Equatable, Sendable {
+        let sourceEvent: TerminalAttentionObservationEvent
+        let modelID: String?
+        let modelLabel: TerminalAttentionLabel?
+        let attentionProbability: Double?
+        let threshold: Double?
+        /// The previous correction for this unchanged screen, if the user
+        /// selected a different (or replacement) label.
+        let supersedesObservationID: UUID?
+    }
+
     let schemaVersion: Int
     let id: UUID
     let recordedAt: Date
@@ -175,6 +205,10 @@ struct TerminalAttentionObservation: Codable, Equatable, Sendable {
     /// Optional so schema-1 observations captured before interaction tracking
     /// remain decodable and uploadable.
     let interaction: InteractionContext?
+    /// Optional so existing schema-1 observations remain decodable.
+    let turn: TurnContext?
+    /// Optional, correction-only source prediction and replacement metadata.
+    let correction: CorrectionContext?
     let outputVersion: Int
     let contentVersion: Int
 }

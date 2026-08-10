@@ -2202,6 +2202,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
     private var attentionObservationTask: Task<Void, Never>?
     private var acknowledgedAttentionAlertGeneration = 0
+    private var currentAttentionScreenTagObservationID: UUID?
+    private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
+    private var agentTurnState: TerminalAttentionTurnState = .notStarted
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
     private var isOutputPausedForBackgroundThrottle = false
@@ -2682,6 +2685,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             fputs("[send interrupt] shellProcess=\(shellProcess != nil)\n", stderr)
         }
         noteAgentDraftCleared()
+        noteAgentTurnInterrupted()
         processor.discardPendingOutput()
         if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
@@ -2691,10 +2695,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func noteNativeHostInput(event: NSEvent?) {
-        currentAttentionScreenTag = nil
+        clearCurrentAttentionScreenTag()
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
         applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
+        if Self.appKitKeyEventInterruptsAgentTurn(event) {
+            noteAgentTurnInterrupted()
+        }
     }
 
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
@@ -2705,6 +2712,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// manage their own interrupt handling.
     private func discardPendingOutputForInterrupt(in outboundData: Data) {
         guard outboundData.contains(0x03) else { return }
+        noteAgentTurnInterrupted()
         processor.discardPendingOutput()
     }
 
@@ -2949,6 +2957,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 #if DEBUG
     func noteTestingInput(_ data: Data) {
         noteInputBurst(data)
+        discardPendingOutputForInterrupt(in: data)
     }
 
     func setLastSummaryDateForTesting(_ date: Date?) {
@@ -3052,7 +3061,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         attentionAlertGeneration = 0
         acknowledgedAttentionAlertGeneration = 0
         hasUnacknowledgedAttention = false
-        currentAttentionScreenTag = nil
+        clearCurrentAttentionScreenTag()
+        latestAttentionObservationEvent = .contentChanged
+        agentTurnState = .notStarted
         childProcessID = nil
         exitCode = nil
         nixShellEnvironment = nil
@@ -3268,7 +3279,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputVersion &+= 1
         let contentChanged = updateContentFingerprint()
         if contentChanged {
-            currentAttentionScreenTag = nil
+            clearCurrentAttentionScreenTag()
             lastContentChangeAt = Date()
             contentVersion &+= 1
         }
@@ -3302,11 +3313,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
-        currentAttentionScreenTag = nil
+        clearCurrentAttentionScreenTag()
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
         applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
+        if input == Data([0x1B]) {
+            noteAgentTurnInterrupted()
+        }
     }
 
     private func noteInputOutputBaseline() {
@@ -3628,7 +3642,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastOutputAt = Date()
         if case .launching = state { state = .live }
         outputVersion &+= 1
-        currentAttentionScreenTag = nil
+        clearCurrentAttentionScreenTag()
         lastContentChangeAt = Date()
         contentVersion &+= 1
         if kind == .agent {
@@ -3679,6 +3693,24 @@ final class TerminalSession: ObservableObject, Identifiable {
             throw TerminalAttentionRecordingError.disabled
         }
 
+        let sourceEvent = latestAttentionObservationEvent
+        let sourceObservation = makeAttentionObservation(
+            event: sourceEvent,
+            label: nil,
+            annotation: nil,
+            scenarioID: nil,
+            checkpoint: nil,
+            harnessVersion: nil,
+            runID: nil,
+            includeStyledGrid: false
+        )
+        let sourcePrediction = kind == .agent
+            ? TerminalAttentionClassifier.shared.predict(sourceObservation)
+            : nil
+        if let sourcePrediction {
+            attentionClassifierPrediction = sourcePrediction
+        }
+
         let observation = makeAttentionObservation(
             event: .labeledCheckpoint,
             label: correction.label,
@@ -3692,10 +3724,19 @@ final class TerminalSession: ObservableObject, Identifiable {
             scenarioID: "in-app-attention-correction",
             checkpoint: "human_corrected",
             harnessVersion: nil,
-            runID: nil
+            runID: nil,
+            correction: .init(
+                sourceEvent: sourceEvent,
+                modelID: sourcePrediction?.modelID,
+                modelLabel: sourcePrediction?.label,
+                attentionProbability: sourcePrediction?.attentionProbability,
+                threshold: sourcePrediction?.threshold,
+                supersedesObservationID: currentAttentionScreenTagObservationID
+            )
         )
         attentionObservationRecorder.record(observation, synchronously: true)
         currentAttentionScreenTag = correction
+        currentAttentionScreenTagObservationID = observation.id
         acknowledgeAttentionAlert()
         return (observation.id, attentionObservationRecorder.outputURL)
     }
@@ -3710,6 +3751,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
         guard kind == .agent else { return }
+        latestAttentionObservationEvent = event
 
         let isDebounced = event == .contentChanged || event == .inputChanged
         if !isDebounced {
@@ -3742,6 +3784,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         )
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
         attentionClassifierPrediction = prediction
+        if agentTurnState == .userInterrupted {
+            // The user is already handling this turn. Preserve interruption and
+            // follow-up screen observations for training without surfacing a
+            // new alert until the user submits another turn.
+            hasUnacknowledgedAttention = false
+            attentionObservationRecorder?.record(observation)
+            return
+        }
         if prediction.needsAttention {
             // Draft edits can cause classifier refreshes, but they are not new
             // agent activity and must not resurrect an alert the user already
@@ -3789,7 +3839,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         checkpoint: String?,
         harnessVersion: String?,
         runID: String?,
-        includeStyledGrid: Bool = true
+        includeStyledGrid: Bool = true,
+        correction: TerminalAttentionObservation.CorrectionContext? = nil
     ) -> TerminalAttentionObservation {
         let now = Date()
         let lineCount = contentLineCount()
@@ -3862,6 +3913,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                 millisecondsSinceLastKeystroke: Self.milliseconds(since: lastHumanKeystrokeAt, now: now),
                 terminalFocused: ghosttyBridgeStorage?.isTerminalFocused ?? false
             ),
+            turn: kind == .agent ? .init(state: agentTurnState) : nil,
+            correction: correction,
             outputVersion: outputVersion,
             contentVersion: contentVersion
         )
@@ -4545,6 +4598,16 @@ final class TerminalSession: ObservableObject, Identifiable {
             : .none
     }
 
+    private static func appKitKeyEventInterruptsAgentTurn(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        if event.keyCode == 53, modifiers.isEmpty {
+            return true
+        }
+        return modifiers == [.control]
+            && event.characters?.unicodeScalars.first?.value == 0x03
+    }
+
     private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
@@ -4563,6 +4626,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         case .submitted:
             hasUnsubmittedHumanInput = false
             noteHumanInputIfNeeded()
+            agentTurnState = .active
             setAgentActivityState(.working, source: .inputSubmit)
             scheduleAgentIdleRecheck()
             scheduleAttentionObservation(event: .inputSubmitted)
@@ -4574,9 +4638,24 @@ final class TerminalSession: ObservableObject, Identifiable {
         applyAgentDraftInputEffect(.cleared)
     }
 
+    private func noteAgentTurnInterrupted() {
+        guard kind == .agent, agentTurnState == .active else { return }
+        agentTurnState = .userInterrupted
+        scheduleAttentionObservation(event: .turnInterrupted)
+    }
+
+    private func clearCurrentAttentionScreenTag() {
+        currentAttentionScreenTag = nil
+        currentAttentionScreenTagObservationID = nil
+    }
+
     @discardableResult
     private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
         guard kind == .agent else { return false }
+        if agentTurnState == .active,
+           nextState == .idle || nextState == .error {
+            agentTurnState = .completed
+        }
         let stateChanged = agentActivityState != nextState
         agentActivityState = nextState
         agentActivitySource = source

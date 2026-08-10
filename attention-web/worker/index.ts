@@ -125,7 +125,28 @@ function observationStatements(env: Env, bundleID: string, observation: Observat
     `INSERT OR IGNORE INTO observation_sources (observation_id, bundle_id)
      SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM observations WHERE id = ?1)`,
   ).bind(observation.id, bundleID);
-  return [insert, source];
+  const humanCorrectionReview = env.DB.prepare(
+    `INSERT OR IGNORE INTO observation_reviews
+       (observation_id, status, label, reason, review_source)
+     SELECT ?1, 'accepted', ?2, ?3, 'human'
+      WHERE ?2 IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM observations
+           WHERE id = ?1
+             AND label = ?2
+             AND json_extract(payload_json, '$.annotation.provenance')
+                   = 'cherry_in_app_human_correction'
+             AND (
+               ?2 = 'no_attention_needed'
+               OR json_extract(payload_json, '$.annotation.reason') = ?3
+             )
+        )`,
+  ).bind(
+    observation.id,
+    observation.humanCorrectionLabel,
+    observation.humanCorrectionReason,
+  );
+  return [insert, source, humanCorrectionReview];
 }
 
 async function uploadObservations(request: Request, env: Env, bundleID: string): Promise<Response> {
@@ -139,7 +160,7 @@ async function uploadObservations(request: Request, env: Env, bundleID: string):
   const statements = observations.flatMap((observation) => observationStatements(env, bundleID, observation));
   const results = await env.DB.batch(statements);
   const inserted = results
-    .filter((_, index) => index % 2 === 0)
+    .filter((_, index) => index % 3 === 0)
     .reduce((total, result) => total + Number(result.meta.changes ?? 0), 0);
 
   return json({ accepted: observations.length, inserted, duplicates: observations.length - inserted }, 202);

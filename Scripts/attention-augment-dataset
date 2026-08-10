@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Add trusted in-app correction bundles to an existing reviewed dataset."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+
+class AugmentError(Exception):
+    pass
+
+
+def load_sibling(name: str) -> Any:
+    path = Path(__file__).with_name(name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    if specification is None:
+        raise AugmentError(f"could not load {path}")
+    module = importlib.util.module_from_spec(specification)
+    loader.exec_module(module)
+    return module
+
+
+EXPORTER = load_sibling("attention-reviewed-dataset")
+STUDY_DATA = load_sibling("attention-study-data")
+
+
+def read_base_dataset(directory: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    manifest_path = directory / "manifest.json"
+    dataset_path = directory / "dataset.jsonl"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise AugmentError(f"invalid base dataset manifest: {error}") from error
+    expected_hash = manifest.get("datasetFile", {}).get("sha256")
+    if expected_hash != EXPORTER.sha256(dataset_path):
+        raise AugmentError("base dataset checksum does not match its manifest")
+
+    records: list[dict[str, Any]] = []
+    with dataset_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise AugmentError(f"base dataset line {line_number} is not an object")
+            records.append(value)
+    return records, manifest
+
+
+def read_correction_bundle(bundle: Path) -> tuple[list[dict[str, Any]], str]:
+    manifest_path = bundle / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise AugmentError(f"invalid correction bundle manifest at {bundle}: {error}") from error
+    if manifest.get("bundleSchemaVersion") != STUDY_DATA.BUNDLE_SCHEMA_VERSION:
+        raise AugmentError(f"unsupported correction bundle schema at {bundle}")
+    bundle_id = manifest.get("bundleID")
+    entries = manifest.get("files")
+    if not isinstance(bundle_id, str) or not isinstance(entries, list):
+        raise AugmentError(f"correction bundle is missing its id or files: {bundle}")
+
+    observations: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise AugmentError(f"invalid correction bundle file entry: {bundle}")
+        source = STUDY_DATA.safe_bundle_file(bundle, entry.get("relativePath"))
+        if STUDY_DATA.sha256_file(source) != entry.get("sha256"):
+            raise AugmentError(f"checksum mismatch for {source.name}")
+        records = STUDY_DATA.load_observation_records(source)
+        if len(records) != entry.get("observationCount"):
+            raise AugmentError(f"observation count mismatch for {source.name}")
+        observations.extend(observation for _, _, observation in records)
+    return observations, bundle_id
+
+
+def correction_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    annotation = payload.get("annotation")
+    session = payload.get("session")
+    label = payload.get("label")
+    identifier = payload.get("id")
+    recorded_at = payload.get("recordedAt")
+    if not isinstance(identifier, str) or not identifier:
+        raise AugmentError("correction is missing its observation id")
+    if not isinstance(recorded_at, str) or not recorded_at:
+        raise AugmentError(f"correction {identifier} is missing its recording time")
+    if not EXPORTER.is_in_app_human_correction(payload):
+        raise AugmentError(f"observation {payload.get('id')} is not an in-app human correction")
+    if label not in EXPORTER.BINARY_LABELS:
+        raise AugmentError(f"correction {payload.get('id')} does not have a binary label")
+    if not isinstance(annotation, dict) or not isinstance(session, dict):
+        raise AugmentError(f"correction {payload.get('id')} is missing annotation or session context")
+    reason = annotation.get("reason")
+    if label == "attention_needed" and not isinstance(reason, str):
+        raise AugmentError(f"attention correction {payload.get('id')} has no reason")
+    session_id = session.get("id")
+    if not isinstance(session_id, str) or not session_id:
+        raise AugmentError(f"correction {payload.get('id')} has no session id")
+    return {
+        "id": identifier,
+        "recordedAt": recorded_at,
+        "sessionID": session_id,
+        "reviewLabel": label,
+        "reviewSource": "human",
+        "reviewReason": reason if label == "attention_needed" else None,
+        "reviewStatus": "accepted",
+        "reviewedAt": payload.get("recordedAt"),
+        "harness": session.get("harness"),
+    }
+
+
+def counts(records: list[dict[str, Any]], *keys: str) -> dict[str, int]:
+    result: Counter[str] = Counter()
+    for record in records:
+        value: Any = record
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        result[str(value)] += 1
+    return dict(sorted(result.items()))
+
+
+def augment(args: argparse.Namespace) -> Path:
+    base_directory = args.dataset.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise AugmentError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    base_records, base_manifest = read_base_dataset(base_directory)
+    payloads: list[dict[str, Any]] = []
+    bundle_ids: list[str] = []
+    for bundle_argument in args.correction_bundle:
+        bundle_payloads, bundle_id = read_correction_bundle(bundle_argument.expanduser().resolve())
+        payloads.extend(bundle_payloads)
+        bundle_ids.append(bundle_id)
+
+    summaries = [correction_summary(payload) for payload in payloads]
+    summaries, payloads = EXPORTER.deduplicate_reviewed_observations(summaries, payloads)
+    base_test_sessions = set(base_manifest.get("sessions", {}).get("test", []))
+    overlapping_test_sessions = sorted({
+        summary["sessionID"] for summary in summaries
+        if summary["sessionID"] in base_test_sessions
+    })
+    if overlapping_test_sessions:
+        raise AugmentError(
+            "correction sessions overlap the frozen test split: "
+            + ", ".join(overlapping_test_sessions)
+        )
+    existing_ids = {str(record.get("observationID")) for record in base_records}
+    correction_records = [
+        EXPORTER.dataset_record(summary, payload, set())
+        for summary, payload in zip(summaries, payloads)
+        if str(summary.get("id")) not in existing_ids
+    ]
+    records = base_records + correction_records
+    records.sort(key=lambda record: (
+        str(record.get("recordedAt", "")),
+        str(record.get("observationID", "")),
+    ))
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    os.chmod(temporary, 0o700)
+    try:
+        dataset_path = temporary / "dataset.jsonl"
+        with dataset_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+        os.chmod(dataset_path, 0o600)
+
+        binary = [record for record in records if record.get("target") in EXPORTER.BINARY_LABELS]
+        base_sessions = base_manifest.get("sessions", {})
+        test_sessions = sorted(set(base_sessions.get("test", [])))
+        train_sessions = sorted({
+            str(record.get("sessionID"))
+            for record in records
+            if record.get("split") == "train" and record.get("sessionID")
+        })
+        manifest = {
+            "datasetSchemaVersion": EXPORTER.DATASET_SCHEMA_VERSION,
+            "createdAt": EXPORTER.utc_now(),
+            "baseDataset": str(base_directory),
+            "correctionBundleIDs": sorted(bundle_ids),
+            "addedCorrections": len(correction_records),
+            "datasetFile": {
+                "path": dataset_path.name,
+                "sha256": EXPORTER.sha256(dataset_path),
+                "records": len(records),
+            },
+            "counts": {
+                "target": counts(records, "target"),
+                "reviewSource": counts(records, "review", "source"),
+                "split": counts(records, "split"),
+                "binarySplit": counts(binary, "split"),
+            },
+            "sessions": {"train": train_sessions, "test": test_sessions},
+            "splitPolicy": "Preserved the base dataset split; new corrections are training-only.",
+            "featurePolicy": {
+                "excludedFromObservation": [
+                    "annotation", "checkpoint", "correction", "id", "label",
+                    "scenarioID", "session.id", "session.runID",
+                ],
+                "note": "Review truth and source prediction metadata are never model inputs.",
+            },
+        }
+        manifest_path = temporary / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        os.replace(temporary, output)
+    except Exception:
+        import shutil
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, required=True, help="Existing reviewed dataset directory.")
+    parser.add_argument(
+        "--correction-bundle",
+        type=Path,
+        action="append",
+        required=True,
+        help="Validated attention correction bundle; repeat to add more than one.",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        output = augment(parse_args())
+    except (AugmentError, OSError, ValueError, STUDY_DATA.StudyDataError) as error:
+        print(f"attention-augment-dataset: {error}", file=os.sys.stderr)
+        return 2
+    print(f"Created {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

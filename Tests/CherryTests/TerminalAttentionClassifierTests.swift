@@ -25,10 +25,10 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.8981252024920073) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.8855168800802705) < 1e-12)
         #expect(prediction.needsAttention)
         #expect(prediction.label == .attentionNeeded)
-        #expect(prediction.confidenceDescription == "90% confidence")
+        #expect(prediction.confidenceDescription == "89% confidence")
         #expect(SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
             hasUnacknowledgedAttention: true,
@@ -69,7 +69,7 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.0018033552447569063) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.0013786096602589131) < 1e-12)
         #expect(!prediction.needsAttention)
         #expect(prediction.label == .noAttentionNeeded)
         #expect(prediction.confidenceDescription == "100% confidence")
@@ -182,6 +182,8 @@ struct TerminalAttentionClassifierTests {
                 millisecondsSinceLastKeystroke: millisecondsSinceLastKeystroke,
                 terminalFocused: terminalFocused
             ),
+            turn: nil,
+            correction: nil,
             outputVersion: 1,
             contentVersion: 1
         )

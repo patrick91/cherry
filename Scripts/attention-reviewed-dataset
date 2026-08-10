@@ -211,10 +211,91 @@ def choose_test_sessions(records: list[dict[str, Any]]) -> set[str]:
     return set(best_sessions)
 
 
+def is_in_app_human_correction(payload: dict[str, Any]) -> bool:
+    annotation = payload.get("annotation")
+    return (
+        isinstance(annotation, dict)
+        and annotation.get("provenance") == "cherry_in_app_human_correction"
+    )
+
+
+def correction_screen_key(payload: dict[str, Any]) -> tuple[str, str] | None:
+    if not is_in_app_human_correction(payload):
+        return None
+    session = payload.get("session")
+    terminal = payload.get("terminal")
+    if not isinstance(session, dict) or not isinstance(terminal, dict):
+        return None
+    session_id = session.get("id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    # Exact visual snapshots within one terminal session represent the same
+    # correction target, even for legacy records that predate explicit
+    # `supersedesObservationID` links.
+    screen = json.dumps(terminal, separators=(",", ":"), sort_keys=True)
+    return session_id, hashlib.sha256(screen.encode("utf-8")).hexdigest()
+
+
+def deduplicate_reviewed_observations(
+    summaries: list[dict[str, Any]],
+    payloads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if len(summaries) != len(payloads):
+        raise DatasetExportError("review summaries and payloads do not correspond")
+
+    superseded_ids = {
+        superseded
+        for payload in payloads
+        if isinstance(payload.get("correction"), dict)
+        for superseded in [payload["correction"].get("supersedesObservationID")]
+        if isinstance(superseded, str) and superseded
+    }
+    candidates = [
+        (summary, payload)
+        for summary, payload in zip(summaries, payloads)
+        if summary.get("id") not in superseded_ids
+    ]
+
+    latest_by_screen: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
+    unkeyed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for summary, payload in candidates:
+        key = correction_screen_key(payload)
+        if key is None:
+            unkeyed.append((summary, payload))
+            continue
+        current = latest_by_screen.get(key)
+        candidate_order = (str(summary.get("recordedAt", "")), str(summary.get("id", "")))
+        current_order = (
+            str(current[0].get("recordedAt", "")),
+            str(current[0].get("id", "")),
+        ) if current else None
+        if current_order is None or candidate_order > current_order:
+            latest_by_screen[key] = (summary, payload)
+
+    retained = unkeyed + list(latest_by_screen.values())
+    retained.sort(key=lambda pair: (
+        str(pair[0].get("recordedAt", "")),
+        str(pair[0].get("id", "")),
+    ))
+    return (
+        [summary for summary, _ in retained],
+        [payload for _, payload in retained],
+    )
+
+
 def sanitized_observation(payload: dict[str, Any]) -> dict[str, Any]:
     safe = dict(payload)
+    correction = safe.pop("correction", None)
     for key in ("annotation", "checkpoint", "id", "label", "scenarioID"):
         safe.pop(key, None)
+    if safe.get("event") == "labeled_checkpoint":
+        source_event = correction.get("sourceEvent") if isinstance(correction, dict) else None
+        if isinstance(source_event, str) and source_event != "labeled_checkpoint":
+            safe["event"] = source_event
+        else:
+            # Legacy manual corrections did not retain their runtime event. Do
+            # not train a synthetic event category that inference never emits.
+            safe.pop("event", None)
     session = payload.get("session")
     if isinstance(session, dict):
         safe["session"] = {
@@ -298,6 +379,8 @@ def export_dataset(args: argparse.Namespace) -> Path:
     if not all(isinstance(payload, dict) for payload in payloads):
         raise DatasetExportError("one or more observation payloads are invalid")
 
+    summaries, payloads = deduplicate_reviewed_observations(summaries, payloads)
+
     test_sessions = choose_test_sessions(summaries)
     records = [
         dataset_record(summary, payload, test_sessions)
@@ -340,6 +423,7 @@ def export_dataset(args: argparse.Namespace) -> Path:
             "excludedFromObservation": [
                 "annotation",
                 "checkpoint",
+                "correction",
                 "id",
                 "label",
                 "scenarioID",

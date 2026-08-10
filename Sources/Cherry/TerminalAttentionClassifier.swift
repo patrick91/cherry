@@ -16,6 +16,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     let activityEvidence: String
     let hasUnsubmittedInput: Bool?
     let terminalFocused: Bool?
+    let turnState: TerminalAttentionTurnState?
     let contributions: [FeatureContribution]
 
     var needsAttention: Bool {
@@ -49,6 +50,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
         )
         let draft = hasUnsubmittedInput.map(String.init) ?? "missing"
         let focused = terminalFocused.map(String.init) ?? "missing"
+        let turn = turnState?.rawValue ?? "missing"
         let strongest = contributions.prefix(12).map { feature in
             let sign = feature.contribution >= 0 ? "+" : ""
             let value = feature.value.formatted(.number.precision(.fractionLength(3)))
@@ -69,6 +71,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
                 "Native evidence: \(activityEvidence)",
                 "Unsubmitted input: \(draft)",
                 "Terminal focused: \(focused)",
+                "Turn state: \(turn)",
                 "",
                 "Strongest feature contributions",
                 "(positive pushes toward attention needed)",
@@ -80,18 +83,18 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
 
 struct TerminalAttentionClassifier: Sendable {
     static let shared = TerminalAttentionClassifier()
-    static let modelID = "20260803-structured-baseline"
+    static let modelID = "20260810-corrections-v1"
     static var parameterCount: Int { featureNames.count + 1 }
 
     private static let threshold = 0.5
-    private static let bias = -2.1903106646695054
+    private static let bias = -2.5780099945038755
 
     private static let numericStatistics: [String: (mean: Double, scale: Double)] = [
-        "numeric.millisecondsSinceLastContentChange": (5.934888450592341, 2.693580642266454),
-        "numeric.millisecondsSinceLastHumanInput": (6.7075317875411615, 5.609627094132668),
-        "numeric.millisecondsSinceLastKeystroke": (6.406990223703139, 5.467575289822395),
-        "numeric.millisecondsSinceLastOutput": (4.701582169231236, 2.4783547622237125),
-        "numeric.millisecondsSinceStarted": (15.023260048715446, 3.0631514048224164),
+        "numeric.millisecondsSinceLastContentChange": (5.856312644987672, 2.7886622763217814),
+        "numeric.millisecondsSinceLastHumanInput": (6.88397010624212, 5.593956020109614),
+        "numeric.millisecondsSinceLastKeystroke": (6.5909711397997235, 5.464571210901379),
+        "numeric.millisecondsSinceLastOutput": (4.66519280626549, 2.564484521474172),
+        "numeric.millisecondsSinceStarted": (14.9968353948742, 3.0450746426384185),
     ]
 
     private static let featureNames = [
@@ -142,50 +145,50 @@ struct TerminalAttentionClassifier: Sendable {
     ]
 
     private static let weights = [
-        0.05158449421651377,
-        -0.05158459147144902,
-        1.7308150476569963,
-        0.0383982392885871,
-        -1.769213394331419,
-        0.024903863632553338,
-        0.0383982392885871,
-        -0.06330221115989249,
-        -0.0000000981382363672938,
-        0.13686689348495934,
-        -0.13686698993160204,
-        -0.12816964079902302,
-        0.1281695449582229,
-        0.14515197808552308,
-        -0.14515207529706356,
-        -0.0000000981382363672938,
-        0.1297411137836451,
-        -0.12974121074151274,
-        -0.13117404738735072,
-        0.1311739513009173,
-        0.03367363810137374,
-        -0.03367373371050227,
-        -0.5730535898936631,
-        -0.24606788808829194,
-        0.018350542297904945,
-        1.0809950549344716,
-        0.1169284110053821,
-        -0.41902304812908336,
-        0.02187039706888814,
-        0.018350542297904945,
-        -0.018350640126010197,
-        1.2162739988012303,
-        -1.2162741544077298,
-        0.3115759374539151,
-        -0.06771490012370816,
-        -0.142297139010288,
-        -0.5121340305280573,
-        0.3922194771586905,
-        0.018350542297904945,
-        0.06706583500698673,
-        0.27460334261075614,
-        0.8111447593731007,
-        -0.20370543554459603,
-        0.15391221724553467,
+        0.04275966180782377,
+        -0.042760783629374674,
+        1.6262219722404558,
+        0.10550043897582519,
+        -1.7317236130220877,
+        0.08270230373956312,
+        0.10550043897582519,
+        -0.18820396393296068,
+        -0.0000011328497544396936,
+        0.18843379840588576,
+        -0.1884349086817755,
+        -0.11778669393603332,
+        0.11778558974889046,
+        0.13545032579602012,
+        -0.13545144796927538,
+        -0.0000011328497544396936,
+        0.1534114058267969,
+        -0.15341252359055,
+        0.2107400525737042,
+        -0.2107411546128735,
+        -0.018653751286902102,
+        0.01865264977141692,
+        -0.504938383718847,
+        -0.06582035103980498,
+        0.03571764060207302,
+        1.0314348889601745,
+        0.12885360105590088,
+        -0.5001094115971237,
+        -0.12513928371116395,
+        0.03571764060207302,
+        -0.03571876827545788,
+        1.196006043060003,
+        -1.196007661646956,
+        0.5949851979934365,
+        -0.03730286847885025,
+        -0.11444063275153649,
+        -0.4385361329040176,
+        0.4389891034872212,
+        0.03571764060207302,
+        0.07126408667905704,
+        0.26038388526027106,
+        0.7255270971260073,
+        -0.3271618372088436,
+        0.17675782780676788,
     ]
 
     private static let featureWeights: [String: Double] = Dictionary(
@@ -236,6 +239,7 @@ struct TerminalAttentionClassifier: Sendable {
             activityEvidence: observation.activity.evidence,
             hasUnsubmittedInput: observation.interaction?.hasUnsubmittedInput,
             terminalFocused: observation.interaction?.terminalFocused,
+            turnState: observation.turn?.state,
             contributions: contributions
         )
     }
@@ -246,6 +250,9 @@ struct TerminalAttentionClassifier: Sendable {
         var features: [String: Double] = [:]
 
         addCategory(&features, name: "event", value: observation.event.rawValue)
+        if let turn = observation.turn {
+            addCategory(&features, name: "turn.state", value: turn.state.rawValue)
+        }
         addCategory(&features, name: "activity.state", value: observation.activity.state)
         addCategory(&features, name: "activity.evidence", value: observation.activity.evidence)
         addCategory(&features, name: "activity.processState", value: observation.activity.processState)

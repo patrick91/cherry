@@ -139,7 +139,107 @@ struct TerminalAttentionObservationTests {
         #expect(annotation.confidence == 1)
         #expect(annotation.rationale == "human_corrected_attention_label")
         #expect(annotation.reason == .resultReady)
+        let correction = try #require(observation.correction)
+        #expect(correction.sourceEvent == .contentChanged)
+        #expect(correction.modelID == TerminalAttentionClassifier.modelID)
+        #expect(correction.modelLabel != nil)
+        #expect(correction.attentionProbability != nil)
+        #expect(correction.threshold == 0.5)
+        #expect(correction.supersedesObservationID == nil)
+        #expect(observation.turn?.state == .notStarted)
         #expect(session.currentAttentionScreenTag == .resultReady)
+    }
+
+    @Test func replacementCorrectionSupersedesPriorTagOnSameScreen() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-replacement-correction-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Replacement correction fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.ingestTestingData(Data("Conversation interrupted\n› \n".utf8))
+        let first = try session.captureAttentionCorrection(.blockedOrError)
+        let replacement = try session.captureAttentionCorrection(.noAttentionNeeded)
+        let observations = try decodeObservations(Data(contentsOf: replacement.outputURL))
+        let observation = try #require(observations.first { $0.id == replacement.id })
+
+        #expect(observation.correction?.supersedesObservationID == first.id)
+        #expect(observation.label == .noAttentionNeeded)
+        #expect(session.currentAttentionScreenTag == .noAttentionNeeded)
+    }
+
+    @Test func observationsCaptureAgentTurnLifecycle() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-turn-lifecycle-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Turn lifecycle fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.noteTestingInput(Data("run this\r".utf8))
+        let activeCapture = try session.captureAttentionObservation(
+            label: .unknown,
+            scenarioID: "turn-lifecycle",
+            checkpoint: "active",
+            harnessVersion: nil,
+            runID: nil
+        )
+        var observations = try decodeObservations(Data(contentsOf: activeCapture.outputURL))
+        #expect(observations.first { $0.id == activeCapture.id }?.turn?.state == .active)
+
+        session.noteTestingInput(Data([0x1B]))
+        let interruptedCapture = try session.captureAttentionObservation(
+            label: .noAttentionNeeded,
+            scenarioID: "turn-lifecycle",
+            checkpoint: "interrupted",
+            harnessVersion: nil,
+            runID: nil
+        )
+        observations = try decodeObservations(Data(contentsOf: interruptedCapture.outputURL))
+        #expect(observations.contains { $0.event == .turnInterrupted && $0.label == nil })
+        #expect(observations.first { $0.id == interruptedCapture.id }?.turn?.state == .userInterrupted)
+
+        session.ingestTestingData(Data("Conversation interrupted\n› \n".utf8))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(!session.hasUnacknowledgedAttention)
+
+        session.noteTestingInput(Data("try again\r".utf8))
+        session.ingestTestingData(Data("Finished\n› \n".utf8))
+        try await Task.sleep(for: .milliseconds(100))
+        let completedCapture = try session.captureAttentionObservation(
+            label: .attentionNeeded,
+            scenarioID: "turn-lifecycle",
+            checkpoint: "completed",
+            harnessVersion: nil,
+            runID: nil
+        )
+        observations = try decodeObservations(Data(contentsOf: completedCapture.outputURL))
+        #expect(observations.first { $0.id == completedCapture.id }?.turn?.state == .completed)
     }
 
     @Test func noAttentionCorrectionOmitsAttentionReason() throws {
@@ -278,6 +378,8 @@ struct TerminalAttentionObservationTests {
         #expect(observation.terminal.styledGrid == nil)
         #expect(observation.interaction == nil)
         #expect(observation.annotation == nil)
+        #expect(observation.turn == nil)
+        #expect(observation.correction == nil)
     }
 
     @Test func nativeHostSubmissionRecordsInputSubmittedEvent() throws {

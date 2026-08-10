@@ -2,6 +2,7 @@ const observationEvents = new Set([
   "content_changed",
   "input_changed",
   "input_submitted",
+  "turn_interrupted",
   "activity_state_changed",
   "notification",
   "process_exited",
@@ -32,6 +33,13 @@ const humanReviewLabels = new Set([
   "unknown",
 ]);
 
+const turnStates = new Set([
+  "not_started",
+  "active",
+  "completed",
+  "user_interrupted",
+]);
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const maximumUploadObservations = 16;
@@ -53,6 +61,8 @@ export type ObservationRecord = {
   gridJSON: string;
   activityState: string;
   activityEvidence: string;
+  humanCorrectionLabel: HumanReviewLabel | null;
+  humanCorrectionReason: AttentionReason | null;
   payloadJSON: string;
 };
 
@@ -259,6 +269,54 @@ export function parseObservation(value: unknown): ObservationRecord {
     }
     booleanValue(interaction.terminalFocused, "observation.interaction.terminalFocused");
   }
+  if (observation.turn !== undefined && observation.turn !== null) {
+    const turn = objectValue(observation.turn, "observation.turn");
+    const state = requiredString(turn.state, "observation.turn.state", 64);
+    if (!turnStates.has(state)) {
+      throw new ValidationError(`unsupported observation turn state: ${state}`);
+    }
+  }
+  if (observation.correction !== undefined && observation.correction !== null) {
+    const correction = objectValue(observation.correction, "observation.correction");
+    const sourceEvent = requiredString(
+      correction.sourceEvent,
+      "observation.correction.sourceEvent",
+      64,
+    );
+    if (!observationEvents.has(sourceEvent) || sourceEvent === "labeled_checkpoint") {
+      throw new ValidationError(`unsupported observation correction source event: ${sourceEvent}`);
+    }
+    optionalString(correction.modelID, "observation.correction.modelID", 160);
+    const modelLabel = optionalString(
+      correction.modelLabel,
+      "observation.correction.modelLabel",
+      64,
+    );
+    if (modelLabel !== null && !humanReviewLabels.has(modelLabel)) {
+      throw new ValidationError(`unsupported observation correction model label: ${modelLabel}`);
+    }
+    if (correction.attentionProbability !== undefined && correction.attentionProbability !== null) {
+      numberValue(
+        correction.attentionProbability,
+        "observation.correction.attentionProbability",
+        0,
+        1,
+      );
+    }
+    if (correction.threshold !== undefined && correction.threshold !== null) {
+      numberValue(correction.threshold, "observation.correction.threshold", 0, 1);
+    }
+    const supersedes = optionalString(
+      correction.supersedesObservationID,
+      "observation.correction.supersedesObservationID",
+      64,
+    );
+    if (supersedes !== null && !uuidPattern.test(supersedes)) {
+      throw new ValidationError("observation.correction.supersedesObservationID must be a UUID");
+    }
+  }
+  let annotationProvenance: string | null = null;
+  let annotationReason: AttentionReason | null = null;
   if (observation.annotation !== undefined && observation.annotation !== null) {
     const annotation = objectValue(observation.annotation, "observation.annotation");
     if (annotation.schemaVersion !== undefined) {
@@ -268,7 +326,11 @@ export function parseObservation(value: unknown): ObservationRecord {
       numberValue(annotation.confidence, "observation.annotation.confidence", 0, 1);
     }
     if (annotation.provenance !== undefined) {
-      requiredString(annotation.provenance, "observation.annotation.provenance", 160);
+      annotationProvenance = requiredString(
+        annotation.provenance,
+        "observation.annotation.provenance",
+        160,
+      );
     }
     if (annotation.rationale !== undefined) {
       requiredString(annotation.rationale, "observation.annotation.rationale", 160);
@@ -278,7 +340,19 @@ export function parseObservation(value: unknown): ObservationRecord {
       if (!attentionReasons.has(reason)) {
         throw new ValidationError(`unsupported observation attention reason: ${reason}`);
       }
+      annotationReason = reason as AttentionReason;
     }
+  }
+  let humanCorrectionLabel: HumanReviewLabel | null = null;
+  if (annotationProvenance === "cherry_in_app_human_correction") {
+    if (label !== "attention_needed" && label !== "no_attention_needed") {
+      throw new ValidationError("in-app human corrections need a binary observation label");
+    }
+    if (label === "attention_needed" && annotationReason === null) {
+      throw new ValidationError("in-app attention corrections need an attention reason");
+    }
+    humanCorrectionLabel = label;
+    if (label === "no_attention_needed") annotationReason = null;
   }
   if (!Array.isArray(terminal.grid) || terminal.grid.length > 200) {
     throw new ValidationError("observation.terminal.grid must contain at most 200 lines");
@@ -313,6 +387,8 @@ export function parseObservation(value: unknown): ObservationRecord {
     gridJSON: JSON.stringify(grid),
     activityState: requiredString(activity.state, "observation.activity.state", 100),
     activityEvidence: requiredString(activity.evidence, "observation.activity.evidence", 100),
+    humanCorrectionLabel,
+    humanCorrectionReason: humanCorrectionLabel === null ? null : annotationReason,
     payloadJSON,
   };
 }

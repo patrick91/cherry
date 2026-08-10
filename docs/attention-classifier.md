@@ -171,13 +171,20 @@ writes the current terminal snapshot as a `human_corrected` labeled checkpoint
 with `cherry_in_app_human_correction` provenance. The context menu shows the
 active manual tag as the current label and checkmarks it. The tag clears when
 terminal content or input changes, so it cannot describe a later screen. Agent
-sessions also show the model inference separately.
+sessions also show the model inference separately. Each correction preserves a
+fresh prediction for that exact screen (source event, model ID, model label,
+probability, and threshold) together with the observed turn lifecycle. Choosing
+another label before the screen changes explicitly supersedes the earlier tag.
+Escape and Control-C during an active turn are recorded as `turn_interrupted`;
+that user action never creates a fresh attention alert by itself.
 
 With bulk collection enabled, the correction stays in the normal private JSONL
 recording. With collection disabled, Cherry writes only the clicked snapshot to
 `~/Library/Application Support/Cherry/Attention Study/Corrections`. A later
 provisional bundle preserves its label and annotation, and the dashboard
-presents it for review before it enters a training export.
+accepts it directly as a human review. Dataset export keeps only the latest
+correction for an identical screen, including legacy corrections that predate
+the explicit supersession link.
 
 Select the whole exported directory in the browser. Uploads are chunked,
 schema-validated, and de-duplicated by observation UUID. Unlike the local
@@ -204,15 +211,30 @@ Scripts/attention-train-baseline \
   --output "$run_root/model"
 ```
 
+To add exported in-app corrections to an existing reviewed dataset while
+preserving its test sessions for a comparable before/after evaluation:
+
+```bash
+Scripts/attention-augment-dataset \
+  --dataset "$existing_run/dataset" \
+  --correction-bundle /path/to/cherry-attention-corrections \
+  --output "$run_root/dataset"
+```
+
+New corrections are training-only. A separately collected future bundle is
+still required for an unbiased evaluation.
+
 The exporter removes provisional labels, annotations, scenario/checkpoint
 names, and session identifiers from the observation payload used for features.
 It creates a deterministic whole-session train/test split and records a SHA-256
 checksum in `manifest.json`. `unknown` reviews remain in the dataset but are
 excluded from binary model fitting.
 
-The model uses activity, event, interaction, timing, cursor, and screen-mode
-fields. It does not use terminal text, harness identity, review metadata, or
-provisional labels. Terminal phrases remain available only to the provisional
+The model uses activity, runtime event, interaction, turn lifecycle, timing,
+cursor, and screen-mode fields. It does not use terminal text, harness identity,
+review metadata, source prediction metadata, or provisional labels. Legacy
+corrections with no captured runtime event omit that feature instead of learning
+the synthetic `labeled_checkpoint` value. Terminal phrases remain available only to the provisional
 review sampler, which abstains on user-interrupted turns rather than treating
 them as failures. The output contains:
 
@@ -246,6 +268,15 @@ false positive, and no false negatives.
 This closes the initial collection pass. The result is strong enough to
 prototype integration and collect targeted corrections, but the human sample
 still comes from one user and is too small to call production-ready.
+
+The `20260810-corrections-v1` update added 30 usable in-app corrections (three
+attention-needed and 27 no-attention-needed) to training while preserving the
+original test sessions. Its fixed-test confusion matrix is unchanged from the
+previous 45-parameter structured model. On the deliberately selected correction
+challenge set, false positives fell from eight to five; all three positive
+corrections still need the newly captured runtime-event and turn context before
+they can be learned reliably. This challenge-set result is diagnostic, not an
+unbiased accuracy estimate.
 
 ### Runtime Test Integration
 

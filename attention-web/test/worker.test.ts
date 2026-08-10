@@ -208,6 +208,56 @@ describe("attention dashboard Worker", () => {
     expect(reviewed).toContain('"reviewSource":"human"');
   });
 
+  it("accepts in-app human corrections without a second review pass", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const correction = structuredClone(observation);
+    correction.annotation.provenance = "cherry_in_app_human_correction";
+    Object.assign(correction, {
+      turn: { state: "completed" },
+      correction: {
+        sourceEvent: "content_changed",
+        modelID: "20260810-corrections-v1",
+        modelLabel: "no_attention_needed",
+        attentionProbability: 0.2,
+        threshold: 0.5,
+        supersedesObservationID: null,
+      },
+    });
+
+    const upload = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [correction] }),
+    });
+    expect(upload.status).toBe(202);
+
+    const pending = await responseText("/api/dashboard?label=labeled&review=pending");
+    expect(pending).not.toContain(`"id":"${observationID}"`);
+    const reviewed = await responseText("/api/dashboard?review=reviewed");
+    expect(reviewed).toContain(`"id":"${observationID}"`);
+    expect(reviewed).toContain('"reviewSource":"human"');
+    expect(reviewed).toContain('"reviewReason":"waiting_for_approval"');
+  });
+
+  it("does not apply correction metadata from a conflicting duplicate id", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [observation] }),
+    });
+    const conflictingCorrection = structuredClone(observation);
+    conflictingCorrection.annotation.provenance = "cherry_in_app_human_correction";
+    const duplicate = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [conflictingCorrection] }),
+    });
+    await expect(duplicate.json()).resolves.toMatchObject({ inserted: 0, duplicates: 1 });
+
+    const pending = await responseText("/api/dashboard?label=labeled&review=pending");
+    expect(pending).toContain(`"id":"${observationID}"`);
+    const reviewed = await responseText("/api/dashboard?review=reviewed");
+    expect(reviewed).not.toContain(`"id":"${observationID}"`);
+  });
+
   it("stores corrections and skipped reviews", async () => {
     await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
     await api(`/api/bundles/${bundleID}/observations`, {

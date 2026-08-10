@@ -12952,6 +12952,44 @@ private func serviceRecord(
     #expect(abs(chipRect.maxX - (glyphBounds.maxX + 2)) < 0.001)
 }
 
+@MainActor
+@Test func markdownCodeBlockUsesAvailableDocumentWidth() {
+    let code = "bootstrap: userId ? { data }"
+    let markdown = "```ts\n\(code)\n```"
+    let textStorage = NSTextStorage()
+    let layoutManager = NSLayoutManager()
+    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
+    layoutManager.addTextContainer(textContainer)
+    textStorage.addLayoutManager(layoutManager)
+    let textView = NSTextView(
+        frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
+        textContainer: textContainer
+    )
+
+    let coordinator = MarkdownSourceEditor.Coordinator(
+        text: .constant(""),
+        themeColors: nil,
+        bodyFontSize: 15,
+        useMonospacedFont: false,
+        style: .document
+    )
+    textView.string = markdown
+    coordinator.applyHighlighting(to: textView)
+
+    layoutManager.ensureLayout(for: textContainer)
+    let codeRange = (markdown as NSString).range(of: code)
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
+    var lineFragmentCount = 0
+    var lineFragmentWidth: CGFloat = 0
+    layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { rect, _, _, _, _ in
+        lineFragmentCount += 1
+        lineFragmentWidth = rect.width
+    }
+
+    #expect(lineFragmentCount == 1)
+    #expect(lineFragmentWidth > 600)
+}
+
 private struct StaticStyledTerminalBuffer: TerminalBuffering {
     var lines: [TerminalRenderedLine]
     var cursorState: TerminalCursorState

@@ -280,6 +280,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             if style == .document {
                 let block = NSTextBlock()
                 block.backgroundColor = foregroundColor.withAlphaComponent(0.05)
+                block.setContentWidth(100, type: .percentageValueType)
                 block.setWidth(gutter, type: .absoluteValueType, for: .padding, edge: .minX)
                 block.setWidth(12, type: .absoluteValueType, for: .padding, edge: .maxX)
                 paragraph.textBlocks = [block]

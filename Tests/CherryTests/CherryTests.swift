@@ -12990,6 +12990,70 @@ private func serviceRecord(
     #expect(lineFragmentWidth > 600)
 }
 
+@MainActor
+@Test func markdownFencedCodeKeepsMarkdownLikeLinesInsideOneBlock() {
+    let markdown = """
+    ```sh
+    #!/bin/sh
+
+    # This is a shell comment, not a heading.
+    > this is code, not a quote
+    1. this is code, not a list
+    echo `literal backticks`
+    ```
+
+    # Actual heading
+    """
+    let textStorage = NSTextStorage()
+    let layoutManager = MarkdownLayoutManager()
+    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
+    layoutManager.addTextContainer(textContainer)
+    textStorage.addLayoutManager(layoutManager)
+    let textView = NSTextView(
+        frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
+        textContainer: textContainer
+    )
+    let coordinator = MarkdownSourceEditor.Coordinator(
+        text: .constant(""),
+        themeColors: nil,
+        bodyFontSize: 15,
+        useMonospacedFont: false,
+        style: .document
+    )
+    textView.string = markdown
+    coordinator.applyHighlighting(to: textView)
+
+    let nsMarkdown = markdown as NSString
+    for line in [
+        "# This is a shell comment, not a heading.",
+        "> this is code, not a quote",
+        "1. this is code, not a list",
+    ] {
+        let range = nsMarkdown.range(of: line)
+        let paragraph = textStorage.attribute(
+            .paragraphStyle,
+            at: range.location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        #expect(paragraph?.textBlocks.isEmpty == false)
+    }
+
+    let inlineCodeRange = nsMarkdown.range(of: "`literal backticks`")
+    #expect(textStorage.attribute(
+        MarkdownLayoutManager.chipAttribute,
+        at: inlineCodeRange.location,
+        effectiveRange: nil
+    ) == nil)
+
+    let headingRange = nsMarkdown.range(of: "# Actual heading")
+    let headingParagraph = textStorage.attribute(
+        .paragraphStyle,
+        at: headingRange.location,
+        effectiveRange: nil
+    ) as? NSParagraphStyle
+    #expect(headingParagraph?.textBlocks.isEmpty == true)
+}
+
 private struct StaticStyledTerminalBuffer: TerminalBuffering {
     var lines: [TerminalRenderedLine]
     var cursorState: TerminalCursorState

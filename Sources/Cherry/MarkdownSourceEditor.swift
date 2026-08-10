@@ -345,6 +345,19 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             let pattern: String
             let captureGroup: Int
             let attributes: [NSAttributedString.Key: Any]
+            let skipsFencedCode: Bool
+
+            init(
+                pattern: String,
+                captureGroup: Int,
+                attributes: [NSAttributedString.Key: Any],
+                skipsFencedCode: Bool = true
+            ) {
+                self.pattern = pattern
+                self.captureGroup = captureGroup
+                self.attributes = attributes
+                self.skipsFencedCode = skipsFencedCode
+            }
         }
 
         private static let boldPattern = #"(\*\*|__)([^\n]+?)(\*\*|__)"#
@@ -353,11 +366,13 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private static let linkPattern = #"(\[)([^\]\n]+)(\]\([^\)\n]+\))"#
         private static let headingMarkerPattern = #"(?m)^(#{1,6}[ \t])"#
         private static let fenceLinePattern = #"(?m)^(`{3}.*)$"#
+        private static let fencedBlockPattern = #"(?m)^```[\s\S]*?^```"#
 
         private func applyPatterns(to storage: NSTextStorage?, text: String) {
             guard let storage else { return }
             let nsText = text as NSString
             let fullRange = NSRange(location: 0, length: nsText.length)
+            let fencedCodeRanges = Self.fencedCodeRanges(in: text, range: fullRange)
 
             let rules = style == .terminal ? terminalRules() : documentRules()
 
@@ -366,13 +381,27 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 for match in regex.matches(in: text, range: fullRange) {
                     let range = match.range(at: rule.captureGroup)
                     guard range.location != NSNotFound else { continue }
+                    if rule.skipsFencedCode,
+                       fencedCodeRanges.contains(where: { NSIntersectionRange($0, range).length > 0 }) {
+                        continue
+                    }
                     storage.addAttributes(rule.attributes, range: range)
                 }
             }
 
             if style == .document {
-                applyFlushLayout(to: storage, text: text, nsText: nsText)
+                applyFlushLayout(
+                    to: storage,
+                    text: text,
+                    nsText: nsText,
+                    fencedCodeRanges: fencedCodeRanges
+                )
             }
+        }
+
+        private static func fencedCodeRanges(in text: String, range: NSRange) -> [NSRange] {
+            guard let regex = try? NSRegularExpression(pattern: fencedBlockPattern) else { return [] }
+            return regex.matches(in: text, range: range).map(\.range)
         }
 
         private func terminalRules() -> [Rule] {
@@ -397,7 +426,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 Rule(pattern: #"(?m)^\s*(\d+\.)(?=\s)"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
                 Rule(pattern: #"(?m)^\s*[-*+]\s+(\[[ xX]\])"#, captureGroup: 1, attributes: [.foregroundColor: markerColor]),
                 Rule(pattern: #"`[^`\n]+`"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont()]),
-                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont(), .paragraphStyle: codeBlockParagraphStyle]),
+                Rule(pattern: Coordinator.fencedBlockPattern, captureGroup: 0, attributes: [.foregroundColor: codeColor, .font: codeFont(), .paragraphStyle: codeBlockParagraphStyle], skipsFencedCode: false),
                 Rule(pattern: #"\[[^\]\n]+\]\([^\)\n]+\)"#, captureGroup: 0, attributes: [.foregroundColor: linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]),
                 Rule(pattern: #"(\*\*|__)[^\n]+?(\*\*|__)"#, captureGroup: 0, attributes: [.font: bodyFont(weight: .semibold)]),
                 Rule(pattern: #"(?<!\*)\*[^\n*]+?\*(?!\*)"#, captureGroup: 0, attributes: [.obliqueness: 0.16])
@@ -438,8 +467,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 0, attributes: [.foregroundColor: fg, .font: codeFont(), .backgroundColor: chipColor, MarkdownLayoutManager.chipAttribute: true]),
                 Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 1, attributes: markerAttributes),
                 Rule(pattern: Coordinator.inlineCodePattern, captureGroup: 3, attributes: markerAttributes),
-                Rule(pattern: #"(?m)^```[\s\S]*?^```"#, captureGroup: 0, attributes: fencedBlockAttributes),
-                Rule(pattern: Coordinator.fenceLinePattern, captureGroup: 1, attributes: markerAttributes),
+                Rule(pattern: Coordinator.fencedBlockPattern, captureGroup: 0, attributes: fencedBlockAttributes, skipsFencedCode: false),
+                Rule(pattern: Coordinator.fenceLinePattern, captureGroup: 1, attributes: markerAttributes, skipsFencedCode: false),
                 Rule(pattern: Coordinator.linkPattern, captureGroup: 2, attributes: linkAttributes),
                 Rule(pattern: Coordinator.linkPattern, captureGroup: 1, attributes: markerAttributes),
                 Rule(pattern: Coordinator.linkPattern, captureGroup: 3, attributes: markerAttributes)
@@ -448,8 +477,17 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         /// Hangs block prefixes (heading hashes, bullets, quote chevrons) into the left
         /// gutter so the text column sits flush.
-        private func applyFlushLayout(to storage: NSTextStorage, text: String, nsText: NSString) {
+        private func applyFlushLayout(
+            to storage: NSTextStorage,
+            text: String,
+            nsText: NSString,
+            fencedCodeRanges: [NSRange]
+        ) {
             let fullRange = NSRange(location: 0, length: nsText.length)
+
+            func isInsideFencedCode(_ range: NSRange) -> Bool {
+                fencedCodeRanges.contains { NSIntersectionRange($0, range).length > 0 }
+            }
 
             func hang(prefixRange: NSRange, markerRange: NSRange, font: NSFont, base: NSParagraphStyle) {
                 guard let paragraph = base.mutableCopy() as? NSMutableParagraphStyle else { return }
@@ -468,7 +506,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             if let regex = try? NSRegularExpression(pattern: #"(?m)^(#{1,6}[ \t])"#) {
                 for match in regex.matches(in: text, range: fullRange) {
                     let markerRange = match.range(at: 1)
-                    guard markerRange.location != NSNotFound else { continue }
+                    guard markerRange.location != NSNotFound,
+                          !isInsideFencedCode(markerRange)
+                    else { continue }
                     let level = markerRange.length - 1
                     hang(
                         prefixRange: markerRange,
@@ -482,7 +522,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             if let regex = try? NSRegularExpression(pattern: #"(?m)^([ \t]*)((?:[-*+]|\d{1,3}\.)[ \t]+)"#) {
                 for match in regex.matches(in: text, range: fullRange) {
                     let markerRange = match.range(at: 2)
-                    guard markerRange.location != NSNotFound else { continue }
+                    guard markerRange.location != NSNotFound,
+                          !isInsideFencedCode(markerRange)
+                    else { continue }
                     hang(
                         prefixRange: match.range(at: 0),
                         markerRange: markerRange,
@@ -495,7 +537,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             if let regex = try? NSRegularExpression(pattern: #"(?m)^(>[ \t]?)"#) {
                 for match in regex.matches(in: text, range: fullRange) {
                     let markerRange = match.range(at: 1)
-                    guard markerRange.location != NSNotFound else { continue }
+                    guard markerRange.location != NSNotFound,
+                          !isInsideFencedCode(markerRange)
+                    else { continue }
                     hang(
                         prefixRange: markerRange,
                         markerRange: markerRange,

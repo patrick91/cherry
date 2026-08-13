@@ -4436,6 +4436,14 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         guard normalizedAgentName == "claude" else { return false }
         return trimmedLines.contains { line in
+            // Claude's task switcher keeps live autonomous work in the footer even
+            // after the main composer reappears. Treat its live elapsed/token meter
+            // as working evidence; completed task rows omit that meter. This stays
+            // scoped to the current tail UI instead of matching stale transcript text
+            // such as "Waiting for 1 background agent to finish" higher on screen.
+            if line.contains("· ↑"), line.lowercased().contains(" tokens") {
+                return true
+            }
             guard let first = line.first, claudeSpinnerGlyphs.contains(first) else { return false }
             let lowered = line.lowercased()
             return claudeStatusMarkerPhrases.contains { lowered.contains($0) }

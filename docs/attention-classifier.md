@@ -278,12 +278,25 @@ corrections still need the newly captured runtime-event and turn context before
 they can be learned reliably. This challenge-set result is diagnostic, not an
 unbiased accuracy estimate.
 
+The `20260813-corrections-v2` update rebuilt from the original frozen dataset
+and the latest cumulative correction export. It contains 34 usable corrections
+(three attention-needed and 31 no-attention-needed), adding four records beyond
+v1 after superseded and duplicate observations are removed. The new records add
+captured `completed` and `not_started` turn-state features, producing a
+47-parameter model. The fixed 279-example test confusion matrix remains exactly
+unchanged at 111 true positives, 161 true negatives, six false negatives, and
+one false positive. The two newest false-positive corrections move in the right
+direction but remain above the 0.5 threshold; weighting the small correction set
+enough to flip them caused held-out regressions, so the embedded model uses the
+conservative unweighted fit. More newly captured positive and negative examples
+are required to move that boundary safely.
+
 ### Runtime Test Integration
 
 Cherry embeds the final weights and reproduces the Python feature extractor in
 Swift. The classifier runs locally for every agent session even when bulk study
 collection is disabled, so the standard native Ghostty path remains available.
-No MLX dependency is needed for the 45-parameter logistic regression.
+No MLX dependency is needed for the 47-parameter logistic regression.
 
 The sidebar uses the model only for its attention state:
 

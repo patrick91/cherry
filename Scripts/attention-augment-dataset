@@ -111,6 +111,7 @@ def correction_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "sessionID": session_id,
         "reviewLabel": label,
         "reviewSource": "human",
+        "reviewProvenance": "cherry_in_app_human_correction",
         "reviewReason": reason if label == "attention_needed" else None,
         "reviewStatus": "accepted",
         "reviewedAt": payload.get("recordedAt"),

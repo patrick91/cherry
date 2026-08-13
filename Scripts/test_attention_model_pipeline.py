@@ -253,6 +253,32 @@ class AttentionModelPipelineTests(unittest.TestCase):
             TRAINER.observation_features(altered),
         )
 
+    def test_dataset_preserves_correction_provenance_as_review_metadata(self) -> None:
+        review = summary(
+            "correction-one",
+            "session-one",
+            "no_attention_needed",
+            "human",
+        )
+        review["reviewProvenance"] = "cherry_in_app_human_correction"
+
+        record = EXPORTER.dataset_record(
+            review,
+            {"event": "content_changed", "session": {"id": "session-one"}},
+            set(),
+        )
+
+        self.assertEqual(
+            record["review"]["provenance"],
+            "cherry_in_app_human_correction",
+        )
+        without_review = json.loads(json.dumps(record))
+        without_review.pop("review")
+        self.assertEqual(
+            TRAINER.observation_features(record),
+            TRAINER.observation_features(without_review),
+        )
+
     def test_end_to_end_training_writes_a_working_model(self) -> None:
         records = [
             dataset_record("train-positive-1", "train-one", "train", "attention_needed", "human"),

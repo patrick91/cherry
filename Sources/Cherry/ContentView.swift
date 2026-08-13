@@ -10043,21 +10043,13 @@ private struct TerminalSceneView: View {
                     .padding(.bottom, 14)
             }
 
-            if isActivePane {
-                VStack(alignment: .trailing, spacing: 10) {
-                    if chromeState.isTerminalSearchPresented {
-                        TerminalSearchOverlay(
-                            session: session,
-                            searchState: searchState,
-                            focusRequest: chromeState.terminalSearchFocusRequest,
-                            onClose: closeSearch
-                        )
-                    }
-
-                    if session.kind == .agent {
-                        AttentionDebugOverlay(session: session)
-                    }
-                }
+            if isActivePane, chromeState.isTerminalSearchPresented {
+                TerminalSearchOverlay(
+                    session: session,
+                    searchState: searchState,
+                    focusRequest: chromeState.terminalSearchFocusRequest,
+                    onClose: closeSearch
+                )
                 .padding(.top, 12)
                 .padding(.trailing, 12)
             }
@@ -10125,157 +10117,6 @@ private struct TerminalSceneView: View {
     private func acknowledgeAttentionIfVisible() {
         guard isActivePane, chromeState.isShowingTerminalContent, NSApp.isActive else { return }
         session.acknowledgeAttentionAlert()
-    }
-}
-
-// Temporary live instrumentation for tuning the embedded attention model. It
-// intentionally sits in the terminal rather than behind a context menu so a
-// tester can compare the model, native activity detector, and current composer
-// state while reproducing a screen.
-private struct AttentionDebugOverlay: View {
-    @ObservedObject var session: TerminalSession
-    @State private var isExpanded = true
-
-    private static let corrections: [TerminalAttentionCorrection] = [
-        .resultReady,
-        .waitingForInput,
-        .waitingForApproval,
-        .blockedOrError,
-        .noAttentionNeeded,
-    ]
-
-    var body: some View {
-        if let prediction = session.attentionClassifierPrediction {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(debugIndicatorColor(for: prediction))
-                        .frame(width: 8, height: 8)
-
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("ATTENTION DEBUG")
-                            .font(.system(size: 9, weight: .bold))
-                            .tracking(0.7)
-                            .foregroundStyle(.secondary)
-
-                        Text("\(prediction.displayName) · \(prediction.confidenceDescription)")
-                            .font(.system(size: 12, weight: .semibold))
-                            .lineLimit(1)
-                    }
-
-                    Spacer(minLength: 8)
-
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            isExpanded.toggle()
-                        }
-                    } label: {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help(isExpanded ? "Collapse Attention Debug" : "Expand Attention Debug")
-                }
-
-                if isExpanded {
-                    Divider()
-
-                    debugRow(
-                        "Attention chance",
-                        prediction.attentionProbability.formatted(
-                            .percent.precision(.fractionLength(1))
-                        )
-                    )
-                    debugRow("Alert", alertDescription(for: prediction))
-                    debugRow(
-                        "Native activity",
-                        "\(prediction.nativeActivityState) · \(displayEvidence(prediction.activityEvidence))"
-                    )
-                    debugRow("Input", prediction.hasUnsubmittedInput == true ? "drafting" : "no draft")
-                    debugRow("Terminal", prediction.terminalFocused == true ? "focused" : "not focused")
-                    debugRow("Event", displayEvidence(prediction.event.rawValue))
-
-                    if let tag = session.currentAttentionScreenTag {
-                        debugRow("Manual tag", tag.title)
-                    }
-
-                    HStack(spacing: 8) {
-                        Menu {
-                            ForEach(Self.corrections, id: \.title) { correction in
-                                Button(tagTitle(for: correction)) {
-                                    AttentionDebugPresenter.save(
-                                        correction,
-                                        for: session,
-                                        confirmsSuccess: false
-                                    )
-                                }
-                            }
-                        } label: {
-                            Label("Tag screen", systemImage: "tag")
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-
-                        Spacer(minLength: 8)
-
-                        Button("Copy") {
-                            AttentionDebugPresenter.copy(prediction.debugReport)
-                        }
-                        .buttonStyle(.borderless)
-
-                        Button("Details…") {
-                            AttentionDebugPresenter.present(prediction)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                }
-            }
-            .padding(11)
-            .frame(width: 306, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.2), radius: 14, y: 6)
-            .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
-        }
-    }
-
-    private func debugRow(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 8)
-            Text(value)
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.trailing)
-                .lineLimit(1)
-        }
-        .font(.system(size: 11, design: .monospaced))
-    }
-
-    private func displayEvidence(_ value: String) -> String {
-        value.replacingOccurrences(of: "_", with: " ")
-    }
-
-    private func alertDescription(for prediction: TerminalAttentionPrediction) -> String {
-        guard prediction.needsAttention else { return "none" }
-        return session.hasUnacknowledgedAttention ? "pending" : "acknowledged"
-    }
-
-    private func debugIndicatorColor(for prediction: TerminalAttentionPrediction) -> Color {
-        guard prediction.needsAttention else { return .green }
-        return session.hasUnacknowledgedAttention ? .pink : .secondary
-    }
-
-    private func tagTitle(for correction: TerminalAttentionCorrection) -> String {
-        let checkmark = session.currentAttentionScreenTag == correction ? "✓ " : ""
-        return checkmark + correction.title
     }
 }
 

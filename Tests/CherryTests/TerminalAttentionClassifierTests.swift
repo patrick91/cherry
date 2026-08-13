@@ -25,10 +25,10 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.8855168800802705) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.8813556985113804) < 1e-12)
         #expect(prediction.needsAttention)
         #expect(prediction.label == .attentionNeeded)
-        #expect(prediction.confidenceDescription == "89% confidence")
+        #expect(prediction.confidenceDescription == "88% confidence")
         #expect(SidebarAgentAttentionPresentation.shouldShow(
             prediction: prediction,
             hasUnacknowledgedAttention: true,
@@ -44,7 +44,7 @@ struct TerminalAttentionClassifierTests {
             hasUnacknowledgedAttention: false,
             isFocused: false
         ))
-        #expect(TerminalAttentionClassifier.parameterCount == 45)
+        #expect(TerminalAttentionClassifier.parameterCount == 47)
         #expect(prediction.debugReport.contains("Native evidence: prompt_marker"))
         #expect(prediction.contributions.first?.name == "boolean.interaction.hasUnsubmittedInput=false")
         #expect(!prediction.contributions.contains { $0.name.contains("terminal.marker") })
@@ -69,7 +69,7 @@ struct TerminalAttentionClassifierTests {
 
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
 
-        #expect(abs(prediction.attentionProbability - 0.0013786096602589131) < 1e-12)
+        #expect(abs(prediction.attentionProbability - 0.0012610420511587517) < 1e-12)
         #expect(!prediction.needsAttention)
         #expect(prediction.label == .noAttentionNeeded)
         #expect(prediction.confidenceDescription == "100% confidence")
@@ -78,6 +78,31 @@ struct TerminalAttentionClassifierTests {
             hasUnacknowledgedAttention: false,
             isFocused: false
         ))
+    }
+
+    @Test func classifierUsesTurnStatesAddedByCorrectionRetraining() {
+        for state in [TerminalAttentionTurnState.completed, .notStarted] {
+            let prediction = TerminalAttentionClassifier.shared.predict(fixture(
+                event: .contentChanged,
+                activityState: "idle",
+                evidence: "prompt_marker",
+                grid: ["› "],
+                hasUnsubmittedInput: false,
+                millisecondsSinceLastKeystroke: 1_000,
+                terminalFocused: false,
+                timing: .init(
+                    millisecondsSinceStarted: 30_000,
+                    millisecondsSinceLastOutput: 1_000,
+                    millisecondsSinceLastContentChange: 1_000,
+                    millisecondsSinceLastHumanInput: 1_000
+                ),
+                turnState: state
+            ))
+
+            #expect(prediction.contributions.contains {
+                $0.name == "category.turn.state=\(state.rawValue)"
+            })
+        }
     }
 
     @Test func agentSessionRunsClassifierWithoutStudyRecording() async throws {
@@ -142,7 +167,8 @@ struct TerminalAttentionClassifierTests {
         hasUnsubmittedInput: Bool,
         millisecondsSinceLastKeystroke: Int,
         terminalFocused: Bool,
-        timing: TerminalAttentionObservation.TimingContext
+        timing: TerminalAttentionObservation.TimingContext,
+        turnState: TerminalAttentionTurnState? = nil
     ) -> TerminalAttentionObservation {
         TerminalAttentionObservation(
             schemaVersion: TerminalAttentionObservation.currentSchemaVersion,
@@ -182,7 +208,7 @@ struct TerminalAttentionClassifierTests {
                 millisecondsSinceLastKeystroke: millisecondsSinceLastKeystroke,
                 terminalFocused: terminalFocused
             ),
-            turn: nil,
+            turn: turnState.map(TerminalAttentionObservation.TurnContext.init(state:)),
             correction: nil,
             outputVersion: 1,
             contentVersion: 1

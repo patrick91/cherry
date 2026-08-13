@@ -8194,6 +8194,75 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
+@Test func claudeLiveTaskFooterKeepsParentWorkingWithoutTrustingStaleTranscript() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Claude",
+        subtitle: "claude --dangerously-skip-permissions",
+        tint: .systemPurple,
+        launchShell: true,
+        kind: .agent,
+        agentName: "Claude",
+        launchCommand: "stty -echo; cat >/dev/null",
+        launchBackend: .hostManaged
+    )
+    defer { session.stop() }
+
+    let deadline = Date(timeIntervalSinceNow: 2)
+    while !session.acceptsInput, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    try #require(session.acceptsInput)
+    session.resize(columns: 171, rows: 66)
+    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
+    session.send(text: "review the pull request\n")
+
+    let transcript = [
+        "❯ review the pull request",
+        "⏺ The review is running and I'll report when it completes.",
+        "✻ Waiting for 1 background agent to finish"
+    ] + Array(repeating: "", count: 38)
+    let composer = [
+        "────────────────────────────",
+        "❯ ",
+        "────────────────────────────",
+        "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage",
+        "",
+        "  ⏺ main",
+        "  ◯ code-review (+2)  /code-review 4402  16m 22s · ↑ 169.2k tokens"
+    ]
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: transcript + composer))
+    // Let the debounced content observation replace the immediate input-submit
+    // prediction so this verifies the classifier sees the corrected native state.
+    try await Task.sleep(for: .milliseconds(1_200))
+
+    #expect(session.agentActivityState == .working)
+    #expect(session.agentActivityState.showsWorkingIndicator)
+    #expect(session.attentionClassifierPrediction?.needsAttention == false)
+    #expect(session.attentionClassifierPrediction?.nativeActivityState == "working")
+    #expect(session.attentionClassifierPrediction?.activityEvidence == "working_marker")
+    #expect(session.attentionClassifierPrediction?.turnState == .active)
+    #expect(session.hasUnacknowledgedAttention == false)
+
+    let settledComposer = [
+        "────────────────────────────",
+        "❯ ",
+        "────────────────────────────",
+        "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage",
+        "",
+        "  ⏺ main",
+        "  ◯ code-review  /code-review 4402"
+    ]
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: transcript + settledComposer))
+    try await Task.sleep(for: .milliseconds(700))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+}
+
+@MainActor
 @Test func brailleSpinnerTitleMarksAgentWorkingAndClearedTitleRestoresIdle() async throws {
     TerminalNotificationCenter.shared.isDeliveryEnabled = false
     defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }

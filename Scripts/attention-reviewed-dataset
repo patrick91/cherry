@@ -321,6 +321,15 @@ def dataset_record(
     if not isinstance(session_id, str) or not session_id:
         raise DatasetExportError(f"review {summary.get('id')} has no session")
 
+    review = {
+        "status": summary.get("reviewStatus"),
+        "source": source,
+        "reviewedAt": summary.get("reviewedAt"),
+    }
+    review_provenance = summary.get("reviewProvenance")
+    if isinstance(review_provenance, str) and review_provenance:
+        review["provenance"] = review_provenance
+
     return {
         "datasetSchemaVersion": DATASET_SCHEMA_VERSION,
         "observationID": summary["id"],
@@ -330,11 +339,7 @@ def dataset_record(
         "split": "test" if session_id in test_sessions else "train",
         "target": label,
         "attentionReason": summary.get("reviewReason"),
-        "review": {
-            "status": summary.get("reviewStatus"),
-            "source": source,
-            "reviewedAt": summary.get("reviewedAt"),
-        },
+        "review": review,
         "observation": sanitized_observation(payload),
     }
 

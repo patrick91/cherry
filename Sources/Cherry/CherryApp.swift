@@ -162,6 +162,10 @@ struct CherryApp: App {
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
+    init() {
+        RemoteViewCrashGuard.installIfNeeded()
+    }
+
     // Menu actions resolve their target from the key window, not the
     // focused values: `@FocusedValue` only updates while SwiftUI owns
     // focus, so with the AppKit terminal view as first responder it can

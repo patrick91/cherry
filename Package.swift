@@ -21,6 +21,13 @@ let package = Package(
             name: "CherryControl"
         ),
         .target(
+            name: "CherryCrashGuard",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+            ]
+        ),
+        .target(
             name: "CherryMCP",
             dependencies: [
                 "CherryControl",
@@ -39,6 +46,7 @@ let package = Package(
             name: "Cherry",
             dependencies: [
                 "CherryControl",
+                "CherryCrashGuard",
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
             ],

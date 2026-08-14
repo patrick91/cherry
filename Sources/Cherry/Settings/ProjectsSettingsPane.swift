@@ -5,6 +5,10 @@ struct ProjectSettingsPane: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject var settings: AgentSettings
 
+    private var orderedProjects: [CherryProject] {
+        SettingsProjectOrdering.byName(settings.projects)
+    }
+
     var body: some View {
         SettingsPaneScroll(page: .projects) {
             SettingsCard("Library") {
@@ -32,7 +36,7 @@ struct ProjectSettingsPane: View {
 
             if !settings.projects.isEmpty {
                 SettingsCard {
-                    ForEach(Array(settings.projects.enumerated()), id: \.element.id) { index, project in
+                    ForEach(Array(orderedProjects.enumerated()), id: \.element.id) { index, project in
                         Button {
                             openProject(project)
                         } label: {
@@ -45,7 +49,7 @@ struct ProjectSettingsPane: View {
                             }
                         }
 
-                        if index < settings.projects.count - 1 {
+                        if index < orderedProjects.count - 1 {
                             SettingsDivider()
                         }
                     }
@@ -71,6 +75,18 @@ struct ProjectSettingsPane: View {
         settings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
         openWindow(value: project.root)
+    }
+}
+
+enum SettingsProjectOrdering {
+    static func byName(_ projects: [CherryProject]) -> [CherryProject] {
+        projects.sorted { left, right in
+            let nameOrder = left.name.localizedStandardCompare(right.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return left.root.localizedStandardCompare(right.root) == .orderedAscending
+        }
     }
 }
 

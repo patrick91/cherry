@@ -257,10 +257,12 @@ private extension CherryProject {
 
     static func filtered(_ projects: [CherryProject], by query: String) -> [CherryProject] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else { return projects }
-        return projects.filter {
-            $0.settingsSearchTokens.localizedCaseInsensitiveContains(trimmedQuery)
-        }
+        let filtered = trimmedQuery.isEmpty
+            ? projects
+            : projects.filter {
+                $0.settingsSearchTokens.localizedCaseInsensitiveContains(trimmedQuery)
+            }
+        return SettingsProjectOrdering.byName(filtered)
     }
 }
 

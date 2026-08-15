@@ -904,6 +904,9 @@ private final class AgentCloseAlertPresenterView: NSView {
         alert.addButton(withTitle: "Cancel")
 
         if let window {
+            // ViewBridge loads lazily, so retry the compatibility hook at the exact
+            // point where AppKit may create an NSRemoteView-backed alert sheet.
+            RemoteViewCrashGuard.installIfNeeded()
             alert.beginSheetModal(for: window) { [weak self, weak workspace, weak chromeState] response in
                 Task { @MainActor in
                     guard let self else { return }

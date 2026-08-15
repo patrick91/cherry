@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import CherryCrashGuard
 @testable import Cherry
 
 @Test func remoteViewCrashGuardIsScopedToMacOS27() {
@@ -23,4 +24,20 @@ import Testing
         minorVersion: 0,
         patchVersion: 0
     )))
+}
+
+@Test func remoteViewCrashGuardMatchesOnlyTheKnownViewBridgeAssertion() {
+    let affected = NSException(
+        name: .internalInconsistencyException,
+        reason: "NSRemoteView containingWindowWillOrderOnScreen: stale containing window",
+        userInfo: nil
+    )
+    let unrelated = NSException(
+        name: .internalInconsistencyException,
+        reason: "Unrelated AppKit invariant",
+        userInfo: nil
+    )
+
+    #expect(CherryShouldSuppressRemoteViewException(affected))
+    #expect(!CherryShouldSuppressRemoteViewException(unrelated))
 }

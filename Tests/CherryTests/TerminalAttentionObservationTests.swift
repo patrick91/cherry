@@ -57,11 +57,7 @@ struct TerminalAttentionObservationTests {
         #expect(observation.terminal.rows == 3)
         #expect(observation.terminal.grid.count <= 3)
         #expect(observation.terminal.grid.joined(separator: "\n").contains("approval required"))
-        let styledGrid = try #require(observation.terminal.styledGrid)
-        let approvalRun = try #require(styledGrid.flatMap { $0 }.first {
-            $0.text.contains("approval required")
-        })
-        #expect(approvalRun.foreground == .init(space: .palette256, components: [82]))
+        #expect(observation.terminal.styledGrid == nil)
         #expect(observation.terminal.scrollbackLinesOmitted > 0)
 
         let attributes = try FileManager.default.attributesOfItem(atPath: capture.outputURL.path)

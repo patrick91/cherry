@@ -2,6 +2,7 @@ import CherryControl
 import Darwin
 import Dispatch
 import Foundation
+import GhosttyTerminal
 
 private let shellTransportDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 
@@ -257,13 +258,6 @@ struct ShellIntegrationBootstrap {
                 return 1
               }
 
-              # Native-PTY: report this shell's PID so Cherry can recover the child
-              # PID it can't get from ghostty. Enables process-ancestry parent
-              # resolution for agent CLIs that don't propagate CHERRY_* to their MCP.
-              if [[ -n "${CHERRY_SHELL_PID_FILE-}" ]]; then
-                print -n -- "$$" > "${CHERRY_SHELL_PID_FILE}" 2>/dev/null
-              fi
-
               # OSC 133 semantic-prompt markers, emitted only under native-PTY
               # (CHERRY_EMIT_OSC133) so the host-managed default byte stream is
               # unchanged. Ghostty parses these and fires command_finished, giving
@@ -397,30 +391,6 @@ final class ShellProcessController: @unchecked Sendable {
 
     static let defaultShellName = URL(fileURLWithPath: defaultShellPath).lastPathComponent
 
-    /// Path the native-PTY shell writes its own PID to at startup, so Cherry can
-    /// recover the child PID it can't get from ghostty (no `foreground_pid`).
-    static func shellPIDFilePath(processID: String) -> String {
-        let directory = "/tmp/cherry-\(getuid())/shell-pids"
-        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        return "\(directory)/\(processID).pid"
-    }
-
-    /// Synchronous best-effort read of the PID the native-PTY shell self-reports
-    /// (the shell integration's `CHERRY_SHELL_PID_FILE` write). Used as the last
-    /// fallback anchor at teardown when the async startup capture hasn't landed —
-    /// e.g. a never-ending command like `tilt up` outran the poll — so Stop still
-    /// has a PID and doesn't leak the whole session.
-    static func readNativeShellPID(processID: String) -> pid_t? {
-        let path = shellPIDFilePath(processID: processID)
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
-              let pid = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-              pid > 0
-        else {
-            return nil
-        }
-        return pid
-    }
-
     /// True if `shellPID` has at least one child process — i.e. the shell is
     /// running a foreground/background program rather than idling at its prompt.
     /// The kernel-truth "is a command running" check for a plain terminal pane;
@@ -473,12 +443,6 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let processID = configuration.processID, !processID.isEmpty {
             environment[CherryControl.processIDEnvironmentKey] = processID
-            // The shell self-reports its PID here at startup. Under EXEC the host
-            // has no child PID (foreground_pid is absent from this xcframework), so
-            // this restores the process-ancestry parent resolution the host path
-            // relies on — needed because some agent CLIs (Codex) don't propagate
-            // CHERRY_PROCESS_ID into their MCP subprocess.
-            environment["CHERRY_SHELL_PID_FILE"] = Self.shellPIDFilePath(processID: processID)
         }
         if let agentID = configuration.agentID, !agentID.isEmpty {
             environment[CherryControl.agentIDEnvironmentKey] = agentID
@@ -519,216 +483,13 @@ final class ShellProcessController: @unchecked Sendable {
         let additionalDirs: String?
     }
 
-    // Cherry's emulator implements the Kitty keyboard protocol, so we want a
-    // TERM that advertises it. TUIs like Claude Code probe terminfo to decide
-    // whether to push enhanced keyboard mode; "xterm-256color" doesn't say
-    // yes, which is why Shift+Enter would otherwise just be a bare \r.
-    static let preferredTerminfo: TerminfoSelection = resolvePreferredTerminfo()
-
-    private static let terminfoCandidates = ["xterm-ghostty", "xterm-kitty"]
-
-    private static func resolvePreferredTerminfo() -> TerminfoSelection {
-        for name in terminfoCandidates where isTerminfoEntryAvailable(name, environment: nil) {
-            return TerminfoSelection(term: name, additionalDirs: nil)
-        }
-
-        // Bundled apps launched from the Dock don't inherit the user's
-        // TERMINFO_DIRS, so re-probe through a login shell to pick it up
-        // (e.g. Nix-installed Ghostty exports its terminfo dir from .zshenv).
-        if let probe = loginShellTerminfoProbe() {
-            return TerminfoSelection(term: probe.name, additionalDirs: probe.terminfoDirs)
-        }
-
-        return TerminfoSelection(term: "xterm-256color", additionalDirs: nil)
-    }
-
-    private static func isTerminfoEntryAvailable(_ name: String, environment: [String: String]?) -> Bool {
-        runProbeProcess(
-            executablePath: "/usr/bin/infocmp",
-            arguments: [name],
-            environment: environment,
-            capturesOutput: false,
-            timeout: 2
-        )?.exitCode == 0
-    }
-
-    private static func loginShellTerminfoProbe() -> (name: String, terminfoDirs: String?)? {
-        let shellPath = defaultShellPath
-        guard FileManager.default.isExecutableFile(atPath: shellPath) else { return nil }
-
-        let probeScript = """
-        printf 'TERMINFO_DIRS=%s\\n' "${TERMINFO_DIRS-}"
-        for candidate in \(terminfoCandidates.joined(separator: " ")); do
-          if /usr/bin/infocmp "$candidate" >/dev/null 2>&1; then
-            printf 'MATCH=%s\\n' "$candidate"
-            exit 0
-          fi
-        done
-        exit 1
-        """
-
-        guard let probeResult = runProbeProcess(
-            executablePath: shellPath,
-            arguments: ["-l", "-c", probeScript],
-            environment: ProcessInfo.processInfo.environment,
-            capturesOutput: true,
-            timeout: 2
-        ), probeResult.exitCode == 0 else { return nil }
-
-        let output = String(data: probeResult.output, encoding: .utf8) ?? ""
-        var matched: String?
-        var terminfoDirs: String?
-        for line in output.split(separator: "\n") {
-            if line.hasPrefix("MATCH=") {
-                matched = String(line.dropFirst("MATCH=".count))
-            } else if line.hasPrefix("TERMINFO_DIRS=") {
-                let value = String(line.dropFirst("TERMINFO_DIRS=".count))
-                terminfoDirs = value.isEmpty ? nil : value
-            }
-        }
-        guard let matched else { return nil }
-        return (matched, terminfoDirs)
-    }
-
-    private struct ProbeProcessResult {
-        let exitCode: Int32
-        let output: Data
-    }
-
-    private static func runProbeProcess(
-        executablePath: String,
-        arguments: [String],
-        environment: [String: String]?,
-        capturesOutput: Bool,
-        timeout: TimeInterval
-    ) -> ProbeProcessResult? {
-        var outputPipe: [Int32] = [-1, -1]
-        if capturesOutput {
-            let pipeResult = outputPipe.withUnsafeMutableBufferPointer { buffer in
-                pipe(buffer.baseAddress!)
-            }
-            guard pipeResult == 0 else { return nil }
-        }
-
-        let nullFileDescriptor = open("/dev/null", O_RDWR)
-        guard nullFileDescriptor >= 0 else {
-            closeIfOpen(outputPipe[0])
-            closeIfOpen(outputPipe[1])
-            return nil
-        }
-
-        var fileActions: posix_spawn_file_actions_t? = nil
-        guard posix_spawn_file_actions_init(&fileActions) == 0 else {
-            closeIfOpen(outputPipe[0])
-            closeIfOpen(outputPipe[1])
-            close(nullFileDescriptor)
-            return nil
-        }
-        defer {
-            posix_spawn_file_actions_destroy(&fileActions)
-        }
-
-        let stdoutTarget = capturesOutput ? outputPipe[1] : nullFileDescriptor
-        guard stdoutTarget >= 0,
-              posix_spawn_file_actions_adddup2(&fileActions, stdoutTarget, STDOUT_FILENO) == 0,
-              posix_spawn_file_actions_adddup2(&fileActions, nullFileDescriptor, STDERR_FILENO) == 0
-        else {
-            closeIfOpen(outputPipe[0])
-            closeIfOpen(outputPipe[1])
-            close(nullFileDescriptor)
-            return nil
-        }
-
-        if capturesOutput {
-            _ = posix_spawn_file_actions_addclose(&fileActions, outputPipe[0])
-            _ = posix_spawn_file_actions_addclose(&fileActions, outputPipe[1])
-        }
-        _ = posix_spawn_file_actions_addclose(&fileActions, nullFileDescriptor)
-
-        let environmentValues = environment ?? ProcessInfo.processInfo.environment
-        let argvValues = [executablePath] + arguments
-        var argv: [UnsafeMutablePointer<CChar>?] = argvValues.map { strdup($0) } + [nil]
-        var envp: [UnsafeMutablePointer<CChar>?] = environmentValues.map { key, value in
-            strdup("\(key)=\(value)")
-        } + [nil]
-        defer {
-            for pointer in argv {
-                free(pointer)
-            }
-            for pointer in envp {
-                free(pointer)
-            }
-        }
-
-        var childPID = pid_t()
-        let spawnResult = executablePath.withCString { executableCString in
-            argv.withUnsafeMutableBufferPointer { argvBuffer in
-                envp.withUnsafeMutableBufferPointer { envBuffer in
-                    posix_spawn(
-                        &childPID,
-                        executableCString,
-                        &fileActions,
-                        nil,
-                        argvBuffer.baseAddress!,
-                        envBuffer.baseAddress!
-                    )
-                }
-            }
-        }
-
-        close(nullFileDescriptor)
-        if capturesOutput {
-            closeIfOpen(outputPipe[1])
-            outputPipe[1] = -1
-        }
-
-        guard spawnResult == 0 else {
-            closeIfOpen(outputPipe[0])
-            return nil
-        }
-
-        let outputFileDescriptor = outputPipe[0]
-        let originalFlags = capturesOutput ? fcntl(outputFileDescriptor, F_GETFL) : -1
-        if originalFlags >= 0 {
-            _ = fcntl(outputFileDescriptor, F_SETFL, originalFlags | O_NONBLOCK)
-        }
-        defer {
-            if originalFlags >= 0 {
-                _ = fcntl(outputFileDescriptor, F_SETFL, originalFlags)
-            }
-            closeIfOpen(outputFileDescriptor)
-        }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        var output = Data()
-        var waitStatus: Int32 = 0
-
-        while true {
-            if capturesOutput {
-                drainAvailableProbeOutput(from: outputFileDescriptor, into: &output)
-            }
-
-            let waitedPID = waitpid(childPID, &waitStatus, WNOHANG)
-            if waitedPID == childPID {
-                break
-            }
-            if waitedPID < 0, errno != EINTR {
-                terminateProbeProcess(childPID)
-                return nil
-            }
-            if Date() >= deadline {
-                terminateProbeProcess(childPID)
-                return nil
-            }
-            usleep(10_000)
-        }
-
-        if capturesOutput {
-            drainAvailableProbeOutput(from: outputFileDescriptor, into: &output)
-        }
-        guard let exitCode = normalExitCode(fromWaitStatus: waitStatus) else { return nil }
-        return ProbeProcessResult(exitCode: exitCode, output: output)
-    }
+    // Ship Ghostty's terminfo entry with the library instead of probing the
+    // developer machine or relying on a login shell's environment. This is the
+    // same entry the embedded renderer implements and works for Dock launches.
+    static let preferredTerminfo = TerminfoSelection(
+        term: "xterm-ghostty",
+        additionalDirs: GhosttyRuntimeResources.terminfoDirectoryURL?.path
+    )
 
     /// Terminate the entire native-PTY (ghostty EXEC) session anchored at
     /// `anchorPID` — the shell plus every transitive descendant and everything
@@ -843,62 +604,6 @@ final class ShellProcessController: @unchecked Sendable {
                 parentPID: info.kp_eproc.e_ppid,
                 controllingTTY: info.kp_eproc.e_tdev
             )
-        }
-    }
-
-    private static func terminateProbeProcess(_ childPID: pid_t) {
-        kill(childPID, SIGTERM)
-        let terminateDeadline = Date().addingTimeInterval(0.2)
-        var status: Int32 = 0
-        while Date() < terminateDeadline {
-            let waitedPID = waitpid(childPID, &status, WNOHANG)
-            if waitedPID == childPID || (waitedPID < 0 && errno == ECHILD) {
-                return
-            }
-            usleep(10_000)
-        }
-        kill(childPID, SIGKILL)
-        _ = waitpid(childPID, &status, 0)
-    }
-
-    private static func normalExitCode(fromWaitStatus status: Int32) -> Int32? {
-        guard status & 0x7f == 0 else { return nil }
-        return (status >> 8) & 0xff
-    }
-
-    private static func closeIfOpen(_ fileDescriptor: Int32) {
-        if fileDescriptor >= 0 {
-            close(fileDescriptor)
-        }
-    }
-
-    private static func drainAvailableProbeOutput(from fd: Int32, into output: inout Data) {
-        let maximumProbeOutputBytes = 64 * 1024
-        var buffer = [UInt8](repeating: 0, count: 4096)
-
-        while true {
-            let byteCount = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
-                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
-                return Darwin.read(fd, baseAddress, rawBuffer.count)
-            }
-
-            if byteCount > 0 {
-                let availableCapacity = max(0, maximumProbeOutputBytes - output.count)
-                if availableCapacity > 0 {
-                    output.append(contentsOf: buffer.prefix(min(byteCount, availableCapacity)))
-                }
-                continue
-            }
-
-            if byteCount == 0 {
-                return
-            }
-
-            let readError = errno
-            if readError == EINTR {
-                continue
-            }
-            return
         }
     }
 

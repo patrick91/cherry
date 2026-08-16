@@ -25,6 +25,20 @@ fi
 XCFRAMEWORK_COMMAND=()
 FOUND_VARIANTS=0
 
+verify_headers() {
+    local header_dir="$1"
+
+    if [ ! -f "$header_dir/libghostty/ghostty.h" ]; then
+        echo "[!] missing header: $header_dir/libghostty/ghostty.h"
+        exit 1
+    fi
+
+    if [ ! -f "$header_dir/libghostty/module.modulemap" ]; then
+        echo "[!] missing module map: $header_dir/libghostty/module.modulemap"
+        exit 1
+    fi
+}
+
 add_library() {
     local variant_dir="$1"
     local library_path="$variant_dir/lib/libghostty.a"
@@ -40,6 +54,7 @@ add_library() {
         exit 1
     fi
 
+    verify_headers "$header_dir"
     XCFRAMEWORK_COMMAND+=("-library" "$library_path" "-headers" "$header_dir")
     FOUND_VARIANTS=$((FOUND_VARIANTS + 1))
 }
@@ -58,10 +73,12 @@ fi
 mkdir -p "$(dirname "$OUTPUT_XCFRAMEWORK")"
 rm -rf "$OUTPUT_XCFRAMEWORK"
 
-echo "[*] creating xcframework: $OUTPUT_XCFRAMEWORK"
+echo "[*] creating static-library xcframework: $OUTPUT_XCFRAMEWORK"
 xcodebuild -create-xcframework \
     -output "$OUTPUT_XCFRAMEWORK" \
     "${XCFRAMEWORK_COMMAND[@]}"
+
+./Script/verify-xcframework.sh "$OUTPUT_XCFRAMEWORK"
 
 if [ -n "$OUTPUT_ZIP" ]; then
     mkdir -p "$(dirname "$OUTPUT_ZIP")"
@@ -71,5 +88,6 @@ if [ -n "$OUTPUT_ZIP" ]; then
         ditto -c -k --sequesterRsrc --keepParent "$(basename "$OUTPUT_XCFRAMEWORK")" "$(basename "$OUTPUT_ZIP")"
     )
     mv "$(dirname "$OUTPUT_XCFRAMEWORK")/$(basename "$OUTPUT_ZIP")" "$OUTPUT_ZIP"
+    ./Script/verify-xcframework.sh "$OUTPUT_ZIP"
     echo "[*] packed xcframework zip: $OUTPUT_ZIP"
 fi

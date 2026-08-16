@@ -18,9 +18,16 @@ format_output() {
 test_build() {
     local scheme="$1"
     local destination="$2"
+    local command=(
+        xcodebuild
+        -scheme "$scheme"
+        -destination "$destination"
+    )
+
+    command+=(build)
 
     echo "[*] build scheme=$scheme destination=$destination"
-    xcodebuild -scheme "$scheme" -destination "$destination" build 2>&1 | format_output
+    "${command[@]}" 2>&1 | format_output
     local exit_code=${PIPESTATUS[0]}
     if [ "$exit_code" -ne 0 ]; then
         echo "[!] failed scheme=$scheme destination=$destination"

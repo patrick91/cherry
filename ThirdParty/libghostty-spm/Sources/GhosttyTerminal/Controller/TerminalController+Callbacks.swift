@@ -104,9 +104,44 @@ private enum TerminalCallbacks {
 
         guard let string else { return false }
         string.withCString { cString in
-            ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, true)
+            ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, false)
         }
         return true
+    }
+
+    static func confirmReadClipboard(
+        userdata: UnsafeMutableRawPointer?,
+        string: UnsafePointer<CChar>?,
+        opaquePtr: UnsafeMutableRawPointer?,
+        request: ghostty_clipboard_request_e
+    ) {
+        guard let userdata, let string, let opaquePtr else { return }
+
+        let bridge = Unmanaged<TerminalCallbackBridge>
+            .fromOpaque(userdata)
+            .takeUnretainedValue()
+        let text = String(cString: string)
+        guard let kind = TerminalClipboardRequestKind(request) else { return }
+        let requestState = UInt(bitPattern: opaquePtr)
+        terminalRunOnMain {
+            guard let surface = bridge.rawSurface,
+                  let opaquePtr = UnsafeMutableRawPointer(bitPattern: requestState)
+            else {
+                return
+            }
+            bridge.handleClipboardConfirmation(contents: text, kind: kind) { allowed in
+                guard bridge.rawSurface == surface else { return }
+                let completedText = allowed ? text : ""
+                completedText.withCString { cString in
+                    ghostty_surface_complete_clipboard_request(
+                        surface,
+                        cString,
+                        opaquePtr,
+                        true
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -154,5 +189,19 @@ func terminalControllerReadClipboardCallback(
         userdata: userdata,
         clipboard: clipboard,
         opaquePtr: opaquePtr
+    )
+}
+
+func terminalControllerConfirmReadClipboardCallback(
+    userdata: UnsafeMutableRawPointer?,
+    string: UnsafePointer<CChar>?,
+    opaquePtr: UnsafeMutableRawPointer?,
+    request: ghostty_clipboard_request_e
+) {
+    TerminalCallbacks.confirmReadClipboard(
+        userdata: userdata,
+        string: string,
+        opaquePtr: opaquePtr,
+        request: request
     )
 }

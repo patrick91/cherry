@@ -275,6 +275,25 @@ public final class TerminalSurface {
         return ghostty_surface_mouse_captured(s)
     }
 
+    // MARK: - Process
+
+    var foregroundPid: pid_t? {
+        guard let s = surface else { return nil }
+        let pid = ghostty_surface_foreground_pid(s)
+        return pid == 0 ? nil : pid_t(pid)
+    }
+
+    var ttyName: String? {
+        guard let s = surface else { return nil }
+        let value = ghostty_surface_tty_name(s)
+        defer { ghostty_string_free(value) }
+        guard let pointer = value.ptr, value.len > 0 else { return nil }
+        return String(
+            decoding: UnsafeRawBufferPointer(start: pointer, count: Int(value.len)),
+            as: UTF8.self
+        )
+    }
+
     // MARK: - Lifecycle
 
     func free() {

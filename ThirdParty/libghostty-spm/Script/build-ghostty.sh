@@ -120,13 +120,26 @@ if [ -z "$LIBRARY_PATH" ]; then
     exit 1
 fi
 
-cp "$LIBRARY_PATH" "$OUTPUT_DIR/lib/libghostty.a"
-cp "$SOURCE_DIR/include/ghostty.h" "$OUTPUT_DIR/include/ghostty.h"
-cat >"$OUTPUT_DIR/include/module.modulemap" <<'EOF'
+# Resolve std::__1::__libcpp_verbose_abort inside the archive: the Apple
+# system libc++ only exports it since iOS 16.3 / macOS 13.3 / tvOS 16.3, and
+# Zig's bundled libc++ headers reference it strongly (no availability markup),
+# which crashes consumers at launch on older OS versions.
+COMPAT_SOURCE="$ROOT_DIR/Script/support/libcxx-verbose-abort-compat.c"
+COMPAT_OBJECT="$LOCAL_CACHE_DIR/libcxx-verbose-abort-compat.o"
+zig cc -target "$ZIG_TARGET" -Os -fno-sanitize=undefined -c "$COMPAT_SOURCE" -o "$COMPAT_OBJECT"
+xcrun libtool -static -no_warning_for_no_symbols \
+    -o "$OUTPUT_DIR/lib/libghostty.a" \
+    "$LIBRARY_PATH" \
+    "$COMPAT_OBJECT"
+echo "[*] appended libc++ verbose abort compatibility object"
+
+mkdir -p "$OUTPUT_DIR/include/libghostty"
+cp "$SOURCE_DIR/include/ghostty.h" "$OUTPUT_DIR/include/libghostty/ghostty.h"
+cat >"$OUTPUT_DIR/include/libghostty/module.modulemap" <<'EOF'
 module libghostty {
     umbrella header "ghostty.h"
     export *
 }
 EOF
 
-echo "[*] built archive: $LIBRARY_PATH"
+echo "[*] built archive: $OUTPUT_DIR/lib/libghostty.a"

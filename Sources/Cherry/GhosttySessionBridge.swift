@@ -294,7 +294,7 @@ enum TerminalSearchArrowDirection {
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
     TerminalSurfaceLinkHoverDelegate, TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
-    TerminalSurfaceScrollInputDelegate,
+    TerminalSurfaceScrollInputDelegate, TerminalSurfaceClipboardConfirmationDelegate,
     TerminalSurfaceTitleDelegate, TerminalSurfaceWorkingDirectoryDelegate,
     TerminalSurfaceNotificationDelegate, TerminalSurfaceChildExitDelegate,
     TerminalSurfaceRenderDelegate, TerminalSurfaceCommandFinishedDelegate,
@@ -771,6 +771,45 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         proxy.session?.stop()
     }
 
+    func terminalDidRequestClipboardConfirmation(
+        _ request: TerminalClipboardConfirmationRequest
+    ) {
+        guard !isReleased, let window = terminalView.window else {
+            request.respond(allow: false)
+            return
+        }
+
+        let alert = NSAlert()
+        switch request.kind {
+        case .paste:
+            alert.messageText = "Paste into Terminal?"
+            alert.informativeText =
+                "Ghostty marked this paste as potentially unsafe. Only paste it if you trust its contents."
+            alert.addButton(withTitle: "Paste")
+        case .osc52Read:
+            alert.messageText = "Allow Clipboard Access?"
+            alert.informativeText = "A program in this terminal wants to read your clipboard."
+            alert.addButton(withTitle: "Allow")
+        case .osc52Write:
+            alert.messageText = "Allow Clipboard Change?"
+            alert.informativeText = "A program in this terminal wants to replace your clipboard."
+            alert.addButton(withTitle: "Allow")
+        }
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            request.respond(allow: response == .alertFirstButtonReturn)
+        }
+    }
+
+    /// Stable process anchor for a Ghostty-owned PTY. The foreground PID changes
+    /// as commands run, while the controlling terminal's session leader remains
+    /// the shell we need for ancestry routing and whole-session teardown.
+    func nativeSessionLeaderPID() -> pid_t? {
+        guard isNativePTYBacked, let ttyName = terminalView.ttyName else { return nil }
+        return TerminalTTYSessionIdentity(ttyName: ttyName)?.sessionLeaderPID
+    }
+
     // MARK: - Native-PTY chrome (forwarded ghostty actions)
     //
     // Under the EXEC backend the ghostty surface owns the PTY, so the chrome the
@@ -1160,8 +1199,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         var byteCount = 0
 
         for (index, line) in snapshot.lines.enumerated() {
-            var chunk = Data()
-            encodeRenderedLine(line, into: &chunk)
+            var chunk = Data(line.utf8)
             if index < snapshot.lines.count - 1 {
                 chunk.append(contentsOf: [0x0D, 0x0A])
             }
@@ -1196,13 +1234,13 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     private struct RenderedReplaySnapshot {
-        let lines: [TerminalRenderedLine]
+        let lines: [String]
         let startLine: Int
     }
 
     private static func renderedReplaySnapshot(
         for session: TerminalSession,
-        maxBytes: Int,
+        maxBytes _: Int,
         maxLines: Int
     ) -> RenderedReplaySnapshot {
         let totalLines = session.lineCount
@@ -1211,350 +1249,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
 
         let startLine = max(0, totalLines - maxLines)
-        let directLines = session.styledSnapshot(range: startLine..<totalLines)
-        guard directLinesNeedStyleRecovery(directLines) else {
-            return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
-        }
-
-        let styledReplayMaxBytes = min(maxBytes, Self.styledReplayFallbackMaxBytes)
-        let rawSnapshot = session.rawOutput(maxBytes: styledReplayMaxBytes)
-        let rawOutput = rawSnapshot.data
-        guard containsSGRStyleSequence(rawOutput) else {
-            return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
-        }
-
-        let styledReplayLineLimit = min(
-            maxLines,
-            max(
-                Self.styledReplayFallbackMinimumLines,
-                session.replayViewportSize.rows * Self.styledReplayFallbackViewportMultiplier
-            )
-        )
-
-        let replayLines = styledReplayLines(
-            from: rawOutput,
-            lineLimit: styledReplayLineLimit,
-            viewportSize: session.replayViewportSize,
-            rawWasTruncated: rawSnapshot.truncated
-        )
-        guard !replayLines.isEmpty else {
-            return RenderedReplaySnapshot(lines: directLines, startLine: startLine)
-        }
-
-        var bestMerge = mergedStyledReplayLines(
-            replayLines,
-            totalLineCount: totalLines,
-            directLines: directLines,
-            directStartLine: startLine
-        )
-        if let queryStart = lastResponseGeneratingQueryStart(in: rawOutput), queryStart > 0 {
-            let prefixReplayLines = styledReplayLines(
-                from: Data(rawOutput.prefix(queryStart)),
-                lineLimit: styledReplayLineLimit,
-                viewportSize: session.replayViewportSize,
-                rawWasTruncated: rawSnapshot.truncated
-            )
-            if !prefixReplayLines.isEmpty {
-                let prefixMerge = mergedStyledReplayLines(
-                    prefixReplayLines,
-                    totalLineCount: totalLines,
-                    directLines: directLines,
-                    directStartLine: startLine
-                )
-                if prefixMerge.isBetter(than: bestMerge) {
-                    bestMerge = prefixMerge
-                }
-            }
-        }
-
         return RenderedReplaySnapshot(
-            lines: bestMerge.lines,
+            lines: session.snapshot(range: startLine..<totalLines),
             startLine: startLine
         )
-    }
-
-    private struct StyledReplayMerge {
-        let lines: [TerminalRenderedLine]
-        let incompatibleLineCount: Int
-        let styledCompatibleLineCount: Int
-        let styledCellCount: Int
-        let paintedBackgroundCellCount: Int
-
-        func isBetter(than other: StyledReplayMerge) -> Bool {
-            if incompatibleLineCount != other.incompatibleLineCount {
-                return incompatibleLineCount < other.incompatibleLineCount
-            }
-            if paintedBackgroundCellCount != other.paintedBackgroundCellCount {
-                return paintedBackgroundCellCount > other.paintedBackgroundCellCount
-            }
-            if styledCellCount != other.styledCellCount {
-                return styledCellCount > other.styledCellCount
-            }
-            return styledCompatibleLineCount > other.styledCompatibleLineCount
-        }
-    }
-
-    private static func styledReplayLines(
-        from rawOutput: Data,
-        lineLimit: Int,
-        viewportSize: TerminalViewportSize,
-        rawWasTruncated: Bool
-    ) -> [TerminalRenderedLine] {
-        var styledReplayBuffer = PrototypeTerminalBuffer(maxScrollback: lineLimit)
-        styledReplayBuffer.resize(to: viewportSize)
-        styledReplayBuffer.ingest(
-            sanitizeReplayOutputForHostManagedTerminal(rawOutput),
-            viewportSize: viewportSize
-        )
-
-        let replayLineCount = styledReplayBuffer.lineCount
-        guard replayLineCount > 0 else { return [] }
-
-        let replayStartLine = max(0, replayLineCount - lineLimit)
-        var replayLines = styledReplayBuffer.styledSnapshot(range: replayStartLine..<replayLineCount)
-        if rawWasTruncated, replayLines.count > 1 {
-            replayLines.removeFirst()
-        }
-        return replayLines
-    }
-
-    private static func mergedStyledReplayLines(
-        _ replayLines: [TerminalRenderedLine],
-        totalLineCount: Int,
-        directLines: [TerminalRenderedLine],
-        directStartLine: Int
-    ) -> StyledReplayMerge {
-        let replayOffset = alignedReplayOffset(
-            replayLines: replayLines,
-            totalLineCount: totalLineCount,
-            directLines: directLines,
-            directStartLine: directStartLine
-        )
-        return mergedStyledReplayLines(
-            replayLines,
-            directLines: directLines,
-            replayOffset: replayOffset
-        )
-    }
-
-    private static func mergedStyledReplayLines(
-        _ replayLines: [TerminalRenderedLine],
-        directLines: [TerminalRenderedLine],
-        replayOffset: Int
-    ) -> StyledReplayMerge {
-        var mergedLines: [TerminalRenderedLine] = []
-        mergedLines.reserveCapacity(directLines.count)
-        var incompatibleLineCount = 0
-        var styledCompatibleLineCount = 0
-        var styledCellCount = 0
-        var paintedBackgroundCellCount = 0
-
-        for (offset, directLine) in directLines.enumerated() {
-            let replayIndex = replayOffset + offset
-            guard replayLines.indices.contains(replayIndex) else {
-                if !normalizedReplayText(directLine.plainText).isEmpty {
-                    incompatibleLineCount += 1
-                }
-                mergedLines.append(directLine)
-                continue
-            }
-
-            let replayLine = replayLines[replayIndex]
-            if canUseStyledReplayLine(replayLine, for: directLine) {
-                let selectedLine = preferredStyledLine(replayLine, over: directLine)
-                if !selectedLine.isPlainDefaultStyled {
-                    styledCompatibleLineCount += 1
-                }
-                if !normalizedReplayText(selectedLine.plainText).isEmpty {
-                    styledCellCount += selectedLine.styledCellCount
-                    paintedBackgroundCellCount += selectedLine.paintedBackgroundCellCount
-                }
-                mergedLines.append(selectedLine)
-            } else {
-                let directText = normalizedReplayText(directLine.plainText)
-                let replayText = normalizedReplayText(replayLine.plainText)
-                if !directText.isEmpty || !replayText.isEmpty {
-                    incompatibleLineCount += 1
-                }
-                mergedLines.append(directLine)
-            }
-        }
-
-        return StyledReplayMerge(
-            lines: mergedLines,
-            incompatibleLineCount: incompatibleLineCount,
-            styledCompatibleLineCount: styledCompatibleLineCount,
-            styledCellCount: styledCellCount,
-            paintedBackgroundCellCount: paintedBackgroundCellCount
-        )
-    }
-
-    private static func alignedReplayOffset(
-        replayLines: [TerminalRenderedLine],
-        totalLineCount: Int,
-        directLines: [TerminalRenderedLine],
-        directStartLine: Int
-    ) -> Int {
-        guard !replayLines.isEmpty, !directLines.isEmpty else { return 0 }
-
-        let expectedReplayStartLine = max(0, totalLineCount - replayLines.count)
-        let expectedOffset = expectedReplayStartLine - directStartLine
-        let minimumOffset = -directLines.count + 1
-        let maximumOffset = replayLines.count - 1
-
-        var replayIndicesByText: [String: [Int]] = [:]
-        for (index, line) in replayLines.enumerated() {
-            let text = normalizedReplayText(line.plainText)
-            guard !text.isEmpty else { continue }
-            replayIndicesByText[text, default: []].append(index)
-        }
-
-        var matchCountsByOffset: [Int: Int] = [:]
-        for (directIndex, directLine) in directLines.enumerated() {
-            let text = normalizedReplayText(directLine.plainText)
-            guard !text.isEmpty, let replayIndices = replayIndicesByText[text] else { continue }
-            for replayIndex in replayIndices {
-                let candidateOffset = replayIndex - directIndex
-                guard candidateOffset >= minimumOffset, candidateOffset <= maximumOffset else { continue }
-                matchCountsByOffset[candidateOffset, default: 0] += 1
-            }
-        }
-
-        var candidateOffsets = Set<Int>()
-        candidateOffsets.insert(min(max(expectedOffset, minimumOffset), maximumOffset))
-        candidateOffsets.insert(min(max(0, minimumOffset), maximumOffset))
-        for offset in matchCountsByOffset
-            .sorted(by: { lhs, rhs in
-                if lhs.value != rhs.value {
-                    return lhs.value > rhs.value
-                }
-                return abs(lhs.key - expectedOffset) < abs(rhs.key - expectedOffset)
-            })
-            .prefix(8)
-            .map(\.key)
-        {
-            candidateOffsets.insert(offset)
-        }
-
-        let sortedCandidateOffsets = candidateOffsets.sorted { lhs, rhs in
-            if abs(lhs - expectedOffset) != abs(rhs - expectedOffset) {
-                return abs(lhs - expectedOffset) < abs(rhs - expectedOffset)
-            }
-            return lhs < rhs
-        }
-        var bestOffset = sortedCandidateOffsets.first ?? expectedOffset
-        var bestMerge = mergedStyledReplayLines(
-            replayLines,
-            directLines: directLines,
-            replayOffset: bestOffset
-        )
-        for offset in sortedCandidateOffsets.dropFirst() {
-            let merge = mergedStyledReplayLines(
-                replayLines,
-                directLines: directLines,
-                replayOffset: offset
-            )
-            if merge.isBetter(than: bestMerge) {
-                bestOffset = offset
-                bestMerge = merge
-            }
-        }
-        return bestOffset
-    }
-
-    private static func canUseStyledReplayLine(
-        _ replayLine: TerminalRenderedLine,
-        for directLine: TerminalRenderedLine
-    ) -> Bool {
-        normalizedReplayText(replayLine.plainText) == normalizedReplayText(directLine.plainText)
-    }
-
-    private static func preferredStyledLine(
-        _ replayLine: TerminalRenderedLine,
-        over directLine: TerminalRenderedLine
-    ) -> TerminalRenderedLine {
-        // The merge exists to RECOVER lost styling, never to downgrade a correctly styled
-        // direct line. The background/styled-cell heuristics below would otherwise prefer a
-        // re-parsed replay line that merely paints more background cells even when it has no
-        // real foreground color, dropping the direct line's foreground (the "colors lost on
-        // tab switch / resize" regression). Keep whichever side actually carries a foreground
-        // when only one of them does; only fall through to the cell-count tie-breaks when the
-        // foreground signal is equivalent.
-        let replayHasForeground = replayLine.hasRealForeground
-        let directHasForeground = directLine.hasRealForeground
-        if replayHasForeground != directHasForeground {
-            return directHasForeground ? directLine : replayLine
-        }
-        if replayLine.paintedBackgroundCellCount != directLine.paintedBackgroundCellCount {
-            return replayLine.paintedBackgroundCellCount > directLine.paintedBackgroundCellCount
-                ? replayLine
-                : directLine
-        }
-        if replayLine.styledCellCount != directLine.styledCellCount {
-            return replayLine.styledCellCount > directLine.styledCellCount
-                ? replayLine
-                : directLine
-        }
-
-        return directLine
-    }
-
-    private static func directLinesNeedStyleRecovery(_ lines: [TerminalRenderedLine]) -> Bool {
-        lines.contains { line in
-            !normalizedReplayText(line.plainText).isEmpty && line.hasDefaultStyledText
-        }
-    }
-
-    private static func normalizedReplayText(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func containsSGRStyleSequence(_ data: Data) -> Bool {
-        let bytes = Array(data)
-        var index = 0
-        while index + 2 < bytes.count {
-            guard bytes[index] == 0x1B, bytes[index + 1] == UInt8(ascii: "[") else {
-                index += 1
-                continue
-            }
-
-            var scan = index + 2
-            while scan < bytes.count, !(0x40...0x7E).contains(bytes[scan]) {
-                scan += 1
-            }
-            guard scan < bytes.count else { return false }
-            if bytes[scan] == UInt8(ascii: "m") {
-                return true
-            }
-            index = scan + 1
-        }
-
-        return false
-    }
-
-    private static func encodeRenderedLine(_ line: TerminalRenderedLine, into output: inout Data) {
-        var currentStyle = TerminalTextStyle()
-        for run in line.runs {
-            let text = replayText(for: run)
-            guard !text.isEmpty else { continue }
-
-            if run.style != currentStyle {
-                appendSGR(for: run.style, to: &output)
-                currentStyle = run.style
-            }
-            output.append(Data(text.utf8))
-        }
-        if currentStyle != TerminalTextStyle() {
-            output.append(Self.ansiResetData)
-        }
-    }
-
-    private static func replayText(for run: TerminalTextRun) -> String {
-        if !run.text.isEmpty {
-            return run.text
-        }
-        guard run.cellWidth > 0, run.style.paintsBackground else { return "" }
-        return String(repeating: " ", count: run.cellWidth)
     }
 
     private static let ansiResetData = Data("\u{1B}[0m".utf8)
@@ -1562,9 +1260,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private static let ansiHomeAndClearData = Data("\u{1B}[H\u{1B}[J".utf8)
     private static let ansiDisableWraparoundData = Data("\u{1B}[?7l".utf8)
     private static let ansiEnableWraparoundData = Data("\u{1B}[?7h".utf8)
-    private static let styledReplayFallbackMaxBytes = 256 * 1024
-    private static let styledReplayFallbackMinimumLines = 200
-    private static let styledReplayFallbackViewportMultiplier = 4
 
     private static func appendCursorRestore(
         for cursor: TerminalCursorState,
@@ -1598,72 +1293,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private static let ansiShowCursorData = Data("\u{1B}[?25h".utf8)
     private static let ansiHideCursorData = Data("\u{1B}[?25l".utf8)
-
-    private static func appendSGR(for style: TerminalTextStyle, to output: inout Data) {
-        var parameters = ["0"]
-
-        if style.isBold {
-            parameters.append("1")
-        }
-        if style.isDim {
-            parameters.append("2")
-        }
-        if style.isItalic {
-            parameters.append("3")
-        }
-        if style.isUnderline {
-            parameters.append("4")
-        }
-        if style.isStrikethrough {
-            parameters.append("9")
-        }
-        if style.isInverse {
-            parameters.append("7")
-        }
-        if let foreground = replayForeground(for: style) {
-            parameters.append(contentsOf: sgrColorParameters(for: foreground, isBackground: false))
-        }
-        if let background = style.background {
-            parameters.append(contentsOf: sgrColorParameters(for: background, isBackground: true))
-        }
-
-        output.append(Data("\u{1B}[\(parameters.joined(separator: ";"))m".utf8))
-    }
-
-    private static func replayForeground(for style: TerminalTextStyle) -> TerminalANSIColor? {
-        if let foreground = style.foreground {
-            return foreground
-        }
-
-        // Cherry answers OSC 10 foreground queries with this color. When an app
-        // relies on that default foreground for styled text, a freshly rebuilt
-        // Ghostty surface can otherwise render it too dark to read.
-        if style.background != nil || style.isDim {
-            return reportedDefaultForegroundColor
-        }
-
-        return nil
-    }
-
-    private static let reportedDefaultForegroundColor = TerminalANSIColor.rgb(219, 227, 235)
-
-    private static func sgrColorParameters(
-        for color: TerminalANSIColor,
-        isBackground: Bool
-    ) -> [String] {
-        switch color {
-        case .ansi16(let value):
-            let normalized = max(0, min(value, 15))
-            if normalized < 8 {
-                return [String((isBackground ? 40 : 30) + normalized)]
-            }
-            return [String((isBackground ? 100 : 90) + normalized - 8)]
-        case .palette256(let value):
-            return [isBackground ? "48" : "38", "5", String(max(0, min(value, 255)))]
-        case let .rgb(red, green, blue):
-            return [isBackground ? "48" : "38", "2", String(red), String(green), String(blue)]
-        }
-    }
 
     func installOutputObserverForTesting() {
         installOutputObserver()
@@ -1771,54 +1400,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
         let promptSanitized = stripZshPromptEndOfLineMarks(querySanitized)
         return collapseOverwrittenProgressFramesForTerminalFeed(promptSanitized)
-    }
-
-    nonisolated private static func lastResponseGeneratingQueryStart(in data: Data) -> Int? {
-        guard !data.isEmpty else { return nil }
-
-        let bytes = Array(data)
-        var lastQueryStart: Int?
-        var index = 0
-        while index < bytes.count {
-            if bytes[index] == 0x1B, index + 1 < bytes.count {
-                switch bytes[index + 1] {
-                case UInt8(ascii: "]"):
-                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<bounds.payloadEnd]
-                        if isResponseGeneratingOSCQuery(payload) {
-                            lastQueryStart = index
-                        }
-                        index = bounds.endIndex
-                        continue
-                    }
-                case UInt8(ascii: "["):
-                    if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<finalIndex]
-                        let finalByte = bytes[finalIndex]
-                        if isResponseGeneratingCSIQuery(payload, finalByte: finalByte) {
-                            lastQueryStart = index
-                        }
-                        index = finalIndex + 1
-                        continue
-                    }
-                case UInt8(ascii: "P"):
-                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<bounds.payloadEnd]
-                        if isResponseGeneratingDCSQuery(payload) {
-                            lastQueryStart = index
-                        }
-                        index = bounds.endIndex
-                        continue
-                    }
-                default:
-                    break
-                }
-            }
-
-            index += 1
-        }
-
-        return lastQueryStart
     }
 
     nonisolated fileprivate static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
@@ -3807,28 +3388,6 @@ private extension TerminalPointerStyle {
             .crosshair
         case .operationNotAllowed:
             .operationNotAllowed
-        }
-    }
-}
-
-private extension TerminalRenderedLine {
-    var hasDefaultStyledText: Bool {
-        runs.contains { !$0.text.isEmpty && $0.style == TerminalTextStyle() }
-    }
-
-    var hasRealForeground: Bool {
-        runs.contains { !$0.text.isEmpty && $0.style.foreground != nil }
-    }
-
-    var styledCellCount: Int {
-        runs.reduce(0) { count, run in
-            run.style == TerminalTextStyle() ? count : count + run.cellWidth
-        }
-    }
-
-    var paintedBackgroundCellCount: Int {
-        runs.reduce(0) { count, run in
-            run.style.paintsBackground ? count + run.cellWidth : count
         }
     }
 }

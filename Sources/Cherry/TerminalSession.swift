@@ -7,8 +7,6 @@ private let activityDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_A
 private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
 private let prototypeProcessorDisabledForPerf =
     ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
-private let fullPrototypeProcessorEnabled =
-    ProcessInfo.processInfo.environment["CHERRY_FULL_PROTOTYPE_PROCESSOR"] == "1"
 
 private final class TerminalTraceRecorder {
     let outputURL: URL
@@ -101,7 +99,7 @@ final class TerminalProcessor: @unchecked Sendable {
         buffer: (any TerminalBuffering)? = nil,
         backpressurePolicy: BackpressurePolicy = .preserveAll
     ) {
-        self.buffer = buffer ?? PrototypeTerminalBuffer(maxScrollback: maxScrollback)
+        self.buffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
         self.backpressurePolicy = backpressurePolicy
     }
 
@@ -154,10 +152,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     func snapshot(range: Range<Int>) -> [String] {
         locked { buffer.snapshot(range: range) }
-    }
-
-    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
-        locked { buffer.styledSnapshot(range: range) }
     }
 
     func lineLength(at row: Int) -> Int {
@@ -2356,9 +2350,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.attentionNotificationHandler = attentionNotificationHandler
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
-        let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
-            ? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
-            : nil)
+        let processorBuffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
         let processorBackpressurePolicy: TerminalProcessor.BackpressurePolicy = kind == .terminal
             ? .dropStalePending(maxPendingBytes: TerminalProcessor.defaultTerminalPendingOutputLimit)
             : .preserveAll
@@ -2552,7 +2544,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             return true
         case .terminal:
             guard let shellPID = childProcessID
-                ?? ShellProcessController.readNativeShellPID(processID: id.uuidString)
+                ?? ghosttyBridgeStorage?.nativeSessionLeaderPID()
             else {
                 return false
             }
@@ -2580,10 +2572,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func snapshot(range: Range<Int>) -> [String] {
         contentSnapshot(range: range)
-    }
-
-    func styledSnapshot(range: Range<Int>) -> [TerminalRenderedLine] {
-        processor.styledSnapshot(range: range)
     }
 
     func cachedRenderedReplayOutput(maxBytes: Int, maxLines: Int) -> Data? {
@@ -2873,15 +2861,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         hostInputWriter.set(nil)
         if ghosttyBridgeStorage?.isNativePTYBacked == true {
             // Native-PTY: ghostty owns the PTY and there is no shellProcess to
-            // terminate, so signal the shell directly — otherwise Stop leaves the
-            // command running invisibly, still holding its ports. The async startup
-            // capture can miss the PID (a never-ending command like `tilt up`
-            // outruns the poll), so read the PID file one last time synchronously
-            // rather than skip teardown. Kill the WHOLE session: a server that
-            // ignores SIGHUP and moved into its own process group survives both
-            // ghostty's PTY-close SIGHUP and a shell-only kill.
+            // terminate, so signal the whole controlling-terminal session. A
+            // server that ignores SIGHUP and moved into its own process group can
+            // otherwise survive both the PTY close and a shell-only kill.
             if let anchorPID = childProcessID
-                ?? ShellProcessController.readNativeShellPID(processID: id.uuidString) {
+                ?? ghosttyBridgeStorage?.nativeSessionLeaderPID() {
                 ShellProcessController.terminateNativeShellSession(anchorPID: anchorPID)
             }
         }
@@ -3096,17 +3080,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             childProcessID = nil
             state = .live
             bumpRevision()
-            try? FileManager.default.removeItem(
-                atPath: ShellProcessController.shellPIDFilePath(processID: id.uuidString)
-            )
             if let bridge = ghosttyBridgeStorage {
                 bridge.relaunchNativeSurface()
             } else {
                 _ = ghosttyBridge
             }
-            // Ghostty does not expose the child PID in this build. Recover the
-            // PID self-reported by the shell for process-ancestry routing.
-            captureNativeShellPID()
+            captureNativeShellIdentity()
             return
         }
 
@@ -3533,15 +3512,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// command-boundary signal for plain scripts/commands — far better than a
     /// quiet-period guess. (Agent TUIs run on the alternate screen and emit no
     /// per-command markers, so this fires only for primary-screen commands.)
-    /// Polls the PID file the native-PTY shell writes at startup and stores it as
-    /// `childProcessID`, so `process.pid` is populated for process-ancestry parent
-    /// resolution (ghostty exposes no child PID). Self-healing: retries until the
-    /// shell integration has written the file.
-    private func captureNativeShellPID() {
+    /// Polls libghostty for the PTY and resolves its stable session leader. This
+    /// populates `process.pid` for process-ancestry routing without modifying the
+    /// user's shell startup or coordinating through a temporary PID file.
+    private func captureNativeShellIdentity() {
         let launchID = activeLaunchID
         func poll(_ attempt: Int) {
             guard activeLaunchID == launchID else { return } // session relaunched/exited
-            if let pid = ShellProcessController.readNativeShellPID(processID: id.uuidString) {
+            if let pid = ghosttyBridgeStorage?.nativeSessionLeaderPID() {
                 childProcessID = pid
                 bumpRevision()
                 return
@@ -3711,8 +3689,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             scenarioID: nil,
             checkpoint: nil,
             harnessVersion: nil,
-            runID: nil,
-            includeStyledGrid: false
+            runID: nil
         )
         let sourcePrediction = kind == .agent
             ? TerminalAttentionClassifier.shared.predict(sourceObservation)
@@ -3790,8 +3767,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             scenarioID: nil,
             checkpoint: nil,
             harnessVersion: nil,
-            runID: nil,
-            includeStyledGrid: attentionObservationRecorder != nil
+            runID: nil
         )
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
         attentionClassifierPrediction = prediction
@@ -3865,7 +3841,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         checkpoint: String?,
         harnessVersion: String?,
         runID: String?,
-        includeStyledGrid: Bool = true,
         correction: TerminalAttentionObservation.CorrectionContext? = nil
     ) -> TerminalAttentionObservation {
         let now = Date()
@@ -3876,19 +3851,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         let grid = contentSnapshot(range: gridStart..<lineCount).map { line in
             String(line.prefix(columnLimit))
         }
-        let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]?
-        if !includeStyledGrid || (
-            ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
-        ) {
-            // Native EXEC surfaces currently expose only `readText`, so emitting
-            // processor styles here would attach stale or unrelated formatting.
-            styledGrid = nil
-        } else {
-            styledGrid = Self.attentionStyledGrid(
-                styledSnapshot(range: gridStart..<lineCount),
-                columnLimit: columnLimit
-            )
-        }
+        // libghostty exposes terminal text but not per-cell styling. Preserve the
+        // optional schema field without maintaining a second terminal parser.
+        let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]? = nil
         let cursor = cursorState
 
         return TerminalAttentionObservation(
@@ -3944,69 +3909,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             outputVersion: outputVersion,
             contentVersion: contentVersion
         )
-    }
-
-    private static func attentionStyledGrid(
-        _ lines: [TerminalRenderedLine],
-        columnLimit: Int
-    ) -> [[TerminalAttentionObservation.TerminalContext.StyledRun]]? {
-        var containsStyle = false
-        let styledLines = lines.map { line in
-            var consumedColumns = 0
-            var output: [TerminalAttentionObservation.TerminalContext.StyledRun] = []
-
-            for run in line.runs where consumedColumns < columnLimit {
-                var text = ""
-                var reachedColumnLimit = false
-                for character in run.text {
-                    let width = TerminalTextRun.cellWidth(for: character)
-                    guard consumedColumns + width <= columnLimit else {
-                        reachedColumnLimit = true
-                        break
-                    }
-                    text.append(character)
-                    consumedColumns += width
-                }
-                if !text.isEmpty {
-                    let style = run.style
-                    if style != TerminalTextStyle() {
-                        containsStyle = true
-                    }
-                    var attributes: [TerminalAttentionObservation.TerminalContext.StyledRun.Attribute] = []
-                    if style.isBold { attributes.append(.bold) }
-                    if style.isDim { attributes.append(.dim) }
-                    if style.isInverse { attributes.append(.inverse) }
-                    if style.isItalic { attributes.append(.italic) }
-                    if style.isUnderline { attributes.append(.underline) }
-                    if style.isStrikethrough { attributes.append(.strikethrough) }
-                    output.append(.init(
-                        text: text,
-                        foreground: attentionColor(style.foreground),
-                        background: attentionColor(style.background),
-                        attributes: attributes
-                    ))
-                }
-                if reachedColumnLimit { break }
-            }
-
-            return output
-        }
-
-        return containsStyle ? styledLines : nil
-    }
-
-    private static func attentionColor(
-        _ color: TerminalANSIColor?
-    ) -> TerminalAttentionObservation.TerminalContext.Color? {
-        guard let color else { return nil }
-        switch color {
-        case let .ansi16(index):
-            return .init(space: .ansi16, components: [index])
-        case let .palette256(index):
-            return .init(space: .palette256, components: [index])
-        case let .rgb(red, green, blue):
-            return .init(space: .rgb, components: [Int(red), Int(green), Int(blue)])
-        }
     }
 
     private var attentionActivityEvidenceName: String {

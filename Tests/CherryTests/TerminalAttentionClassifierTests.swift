@@ -48,6 +48,11 @@ struct TerminalAttentionClassifierTests {
         #expect(prediction.debugReport.contains("Native evidence: prompt_marker"))
         #expect(prediction.contributions.first?.name == "boolean.interaction.hasUnsubmittedInput=false")
         #expect(!prediction.contributions.contains { $0.name.contains("terminal.marker") })
+        #expect(!TerminalAttentionNotificationPolicy.shouldNotify(
+            prediction: prediction,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false
+        ))
     }
 
     @Test func swiftInferenceMatchesPythonBaselineForComposingFixture() {
@@ -105,6 +110,110 @@ struct TerminalAttentionClassifierTests {
         }
     }
 
+    @Test func attentionNotificationGateDeduplicatesAndRearms() {
+        let attention = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .activityStateChanged,
+            activityState: "idle",
+            evidence: "prompt_marker",
+            grid: ["• Result ready", "› "],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 5_000,
+            terminalFocused: false,
+            timing: .init(
+                millisecondsSinceStarted: 60_000,
+                millisecondsSinceLastOutput: 1_000,
+                millisecondsSinceLastContentChange: 1_000,
+                millisecondsSinceLastHumanInput: 5_000
+            ),
+            turnState: .completed
+        ))
+        let composing = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .contentChanged,
+            activityState: "working",
+            evidence: "title_spinner",
+            grid: ["• Working", "› still typing"],
+            hasUnsubmittedInput: true,
+            millisecondsSinceLastKeystroke: 200,
+            terminalFocused: true,
+            timing: .init(
+                millisecondsSinceStarted: 10_000,
+                millisecondsSinceLastOutput: 100,
+                millisecondsSinceLastContentChange: 100,
+                millisecondsSinceLastHumanInput: 200
+            )
+        ))
+        var gate = TerminalAttentionNotificationGate()
+
+        #expect(TerminalAttentionNotificationPolicy.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false
+        ))
+        #expect(!TerminalAttentionNotificationPolicy.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: false,
+            hasUnreadNativeNotification: false
+        ))
+        #expect(!TerminalAttentionNotificationPolicy.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: true
+        ))
+
+        let initialNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(initialNotification)
+        let duplicateNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(!duplicateNotification)
+
+        gate.acknowledge()
+        let draftRefreshNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: false
+        )
+        #expect(!draftRefreshNotification)
+        let rearmedNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(rearmedNotification)
+
+        let composingNotification = gate.shouldNotify(
+            prediction: composing,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: false
+        )
+        #expect(!composingNotification)
+        let nativeDuplicate = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: true,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(!nativeDuplicate)
+        let afterNativeNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(!afterNativeNotification)
+    }
+
     @Test func agentSessionRunsClassifierWithoutStudyRecording() async throws {
         let session = TerminalSession(
             title: "Classifier shadow fixture",
@@ -119,6 +228,8 @@ struct TerminalAttentionClassifierTests {
             session.stop()
         }
 
+        let returnKey = try #require(returnKeyEvent())
+        session.noteNativeHostInput(event: returnKey)
         session.ingestTestingData(Data("• Baked for 1m\n› \n".utf8))
         try await Task.sleep(for: .milliseconds(1_250))
 
@@ -128,6 +239,7 @@ struct TerminalAttentionClassifierTests {
     }
 
     @Test func acknowledgedAlertOnlyRearmsForFreshAgentActivity() async throws {
+        var notificationProbabilities: [Double] = []
         let session = TerminalSession(
             title: "Acknowledgement fixture",
             subtitle: "fixture-agent",
@@ -135,18 +247,29 @@ struct TerminalAttentionClassifierTests {
             launchShell: false,
             kind: .agent,
             agentName: "Fixture",
-            attentionObservationDirectoryProvider: { nil }
+            attentionObservationDirectoryProvider: { nil },
+            attentionNotificationHandler: { prediction, _ in
+                notificationProbabilities.append(prediction.attentionProbability)
+            }
         )
         defer {
             session.stop()
         }
 
+        let returnKey = try #require(returnKeyEvent())
+        session.noteNativeHostInput(event: returnKey)
         session.ingestTestingData(Data("• Baked for 1m\n› \n".utf8))
         try await Task.sleep(for: .milliseconds(1_250))
 
         #expect(session.attentionClassifierPrediction?.needsAttention == true)
         #expect(session.hasUnacknowledgedAttention)
+        #expect(notificationProbabilities.count == 1)
         let firstGeneration = session.attentionAlertGeneration
+
+        session.ingestTestingData(Data("The same result is still ready\n› \n".utf8))
+        try await Task.sleep(for: .milliseconds(1_250))
+
+        #expect(notificationProbabilities.count == 1)
 
         session.acknowledgeAttentionAlert()
         #expect(!session.hasUnacknowledgedAttention)
@@ -157,6 +280,21 @@ struct TerminalAttentionClassifierTests {
         #expect(session.attentionClassifierPrediction?.needsAttention == true)
         #expect(session.attentionAlertGeneration > firstGeneration)
         #expect(session.hasUnacknowledgedAttention)
+    }
+
+    private func returnKeyEvent() -> NSEvent? {
+        NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        )
     }
 
     private func fixture(

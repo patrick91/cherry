@@ -2198,10 +2198,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var traceRecorder: TerminalTraceRecorder?
     private let attentionObservationDirectoryProvider: @MainActor () -> URL?
     private let attentionCorrectionDirectoryProvider: @MainActor () -> URL
+    private let attentionNotificationHandler: @MainActor (TerminalAttentionPrediction, TerminalSession) -> Void
     private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
     private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
     private var attentionObservationTask: Task<Void, Never>?
     private var acknowledgedAttentionAlertGeneration = 0
+    private var attentionNotificationGate = TerminalAttentionNotificationGate()
     private var currentAttentionScreenTagObservationID: UUID?
     private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
     private var agentTurnState: TerminalAttentionTurnState = .notStarted
@@ -2323,6 +2325,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         },
         attentionCorrectionDirectoryProvider: @escaping @MainActor () -> URL = {
             TerminalAttentionStudy.correctionsDirectoryURL()
+        },
+        attentionNotificationHandler: @escaping @MainActor (
+            TerminalAttentionPrediction,
+            TerminalSession
+        ) -> Void = { _, session in
+            TerminalNotificationCenter.shared.postAttention(for: session)
         }
     ) {
         self.title = title
@@ -2345,6 +2353,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.summaryVisibilityProvider = summaryVisibilityProvider
         self.attentionObservationDirectoryProvider = attentionObservationDirectoryProvider
         self.attentionCorrectionDirectoryProvider = attentionCorrectionDirectoryProvider
+        self.attentionNotificationHandler = attentionNotificationHandler
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? (launchShell && !fullPrototypeProcessorEnabled
@@ -3061,6 +3070,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         attentionAlertGeneration = 0
         acknowledgedAttentionAlertGeneration = 0
         hasUnacknowledgedAttention = false
+        attentionNotificationGate = TerminalAttentionNotificationGate()
         clearCurrentAttentionScreenTag()
         latestAttentionObservationEvent = .contentChanged
         agentTurnState = .notStarted
@@ -3744,6 +3754,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func acknowledgeAttentionAlert() {
         guard attentionAlertGeneration > acknowledgedAttentionAlertGeneration else { return }
         acknowledgedAttentionAlertGeneration = attentionAlertGeneration
+        attentionNotificationGate.acknowledge()
         guard hasUnacknowledgedAttention else { return }
         hasUnacknowledgedAttention = false
         bumpRevision()
@@ -3789,6 +3800,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             // follow-up screen observations for training without surfacing a
             // new alert until the user submits another turn.
             hasUnacknowledgedAttention = false
+            attentionNotificationGate.acknowledge()
             attentionObservationRecorder?.record(observation)
             return
         }
@@ -3805,7 +3817,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         } else {
             hasUnacknowledgedAttention = false
         }
+        updateAttentionNotification(for: prediction)
         attentionObservationRecorder?.record(observation)
+    }
+
+    private func updateAttentionNotification(for prediction: TerminalAttentionPrediction) {
+        guard attentionNotificationGate.shouldNotify(
+            prediction: prediction,
+            isTopLevelAgent: kind == .agent && parentAgentID == nil,
+            hasUnreadNativeNotification: hasUnreadNotification,
+            hasUnacknowledgedAttention: hasUnacknowledgedAttention
+        ) else {
+            return
+        }
+
+        attentionNotificationHandler(prediction, self)
     }
 
     private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {

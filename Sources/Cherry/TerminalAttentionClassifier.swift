@@ -81,6 +81,68 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     }
 }
 
+enum TerminalAttentionNotificationPolicy {
+    /// Sidebar attention can remain exploratory at the model's normal threshold,
+    /// while system notifications should be reserved for stronger predictions.
+    static let minimumAttentionProbability = 0.80
+
+    static func shouldNotify(
+        prediction: TerminalAttentionPrediction,
+        isTopLevelAgent: Bool,
+        hasUnreadNativeNotification: Bool
+    ) -> Bool {
+        guard let turnState = prediction.turnState,
+              turnState != .notStarted,
+              turnState != .userInterrupted
+        else {
+            return false
+        }
+
+        return isTopLevelAgent
+            && !hasUnreadNativeNotification
+            && prediction.needsAttention
+            && prediction.attentionProbability >= minimumAttentionProbability
+    }
+}
+
+struct TerminalAttentionNotificationGate {
+    private(set) var isEpisodeActive = false
+
+    mutating func shouldNotify(
+        prediction: TerminalAttentionPrediction,
+        isTopLevelAgent: Bool,
+        hasUnreadNativeNotification: Bool,
+        hasUnacknowledgedAttention: Bool
+    ) -> Bool {
+        guard prediction.needsAttention else {
+            isEpisodeActive = false
+            return false
+        }
+        guard hasUnacknowledgedAttention else { return false }
+        guard !isEpisodeActive else { return false }
+        if hasUnreadNativeNotification {
+            // The native notification owns this attention episode. Keep the
+            // classifier from sending a duplicate after the unread flag clears.
+            isEpisodeActive = true
+            return false
+        }
+        guard TerminalAttentionNotificationPolicy.shouldNotify(
+            prediction: prediction,
+            isTopLevelAgent: isTopLevelAgent,
+            hasUnreadNativeNotification: false
+        ) else {
+            return false
+        }
+
+        isEpisodeActive = true
+        return true
+    }
+
+    mutating func acknowledge() {
+        isEpisodeActive = false
+    }
+}
+
 struct TerminalAttentionClassifier: Sendable {
     static let shared = TerminalAttentionClassifier()
     static let modelID = "20260813-corrections-v2"

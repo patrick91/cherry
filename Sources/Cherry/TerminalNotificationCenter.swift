@@ -37,6 +37,29 @@ final class TerminalNotificationCenter {
     }
 
     func post(_ notification: TerminalNotificationRequest, for session: TerminalSession) {
+        deliver(
+            title: notification.title?.nilIfEmpty ?? session.title,
+            body: notification.body.nilIfEmpty ?? "Terminal bell",
+            identifierPrefix: "cherry-terminal",
+            for: session
+        )
+    }
+
+    func postAttention(for session: TerminalSession) {
+        deliver(
+            title: session.title,
+            body: "This agent may need your attention.",
+            identifierPrefix: "cherry-attention",
+            for: session
+        )
+    }
+
+    private func deliver(
+        title: String,
+        body: String,
+        identifierPrefix: String,
+        for session: TerminalSession
+    ) {
         guard isDeliveryEnabled else { return }
         guard !ProjectWindowRegistry.shared.isSessionVisible(session) else { return }
         guard canUseNativeNotifications else {
@@ -48,8 +71,8 @@ final class TerminalNotificationCenter {
 
         let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id)
         let content = UNMutableNotificationContent()
-        content.title = notification.title?.nilIfEmpty ?? session.title
-        content.body = notification.body.nilIfEmpty ?? "Terminal bell"
+        content.title = title
+        content.body = body
         content.sound = .default
         content.userInfo = [
             "sessionID": session.id.uuidString,
@@ -57,7 +80,7 @@ final class TerminalNotificationCenter {
         ]
 
         let request = UNNotificationRequest(
-            identifier: "cherry-terminal-\(session.id.uuidString)-\(UUID().uuidString)",
+            identifier: "\(identifierPrefix)-\(session.id.uuidString)-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )

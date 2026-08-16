@@ -6099,6 +6099,37 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func ghosttyContainerSkipsUnchangedSessionAndThemeWorkOnRepeatedUpdates() {
+    let session = TerminalSession(
+        title: "Stable",
+        subtitle: "No shell",
+        tint: .systemBlue,
+        launchShell: false
+    )
+    let container = GhosttyTerminalContainerView(
+        frame: NSRect(x: 0, y: 0, width: 640, height: 400)
+    )
+
+    defer {
+        container.detachActiveSession()
+        session.releaseGhosttyBridge()
+        session.stop()
+    }
+
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    let bridge = session.ghosttyBridge
+    let attachCount = bridge.attachCountForTesting
+    let backgroundApplyCount = container.documentBackgroundApplyCountForTesting
+
+    for _ in 0..<10 {
+        container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    }
+
+    #expect(bridge.attachCountForTesting == attachCount)
+    #expect(container.documentBackgroundApplyCountForTesting == backgroundApplyCount)
+}
+
+@MainActor
 @Test func ghosttyContainerEvictsOldestSurfaceBeyondLiveSurfaceLimit() async throws {
     // The LRU is bounded: with a background cap of 1, parking a second surface
     // must evict and fully release the oldest one, which then falls back to the

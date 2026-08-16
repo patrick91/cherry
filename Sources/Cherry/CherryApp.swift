@@ -614,13 +614,10 @@ private struct ProjectWorkspaceView: View {
             }
         }
         .onChange(of: repository.activeWorktreeRoot) { _, _ in
-            ProjectWindowRegistry.shared.activateWindow(
-                projectRoot: repository.repositoryRoot,
-                workspace: repository.activeWorkspace,
-                noteStore: noteStore,
-                todoStore: todoStore,
-                chromeState: chromeState
-            )
+            // RepositoryWorkspace synchronously updates the window registry as
+            // part of activation. Repeating it here acknowledged sessions and
+            // persisted the same root a second time during the first render of
+            // every switch.
             openPendingDeepLinks()
         }
         .onChange(of: terminalSettings.worktreeSpacesEnabled) { _, isEnabled in

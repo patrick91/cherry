@@ -87,6 +87,12 @@ struct TerminalThemeColors: Equatable {
 final class TerminalSettings: ObservableObject {
     static let shared = TerminalSettings()
 
+    /// Changes only when a setting that affects the Ghostty surface changes.
+    /// AppKit containers use this to avoid rebuilding theme colors on unrelated
+    /// SwiftUI updates while still reacting immediately to real terminal-setting
+    /// changes.
+    private(set) var terminalAppearanceRevision: UInt64 = 0
+
     @Published var fontSize: Double {
         didSet { save(fontSize, forKey: Keys.fontSize) }
     }
@@ -340,6 +346,7 @@ final class TerminalSettings: ObservableObject {
     }
 
     private func notifyChanged() {
+        terminalAppearanceRevision &+= 1
         NotificationCenter.default.post(name: .terminalSettingsDidChange, object: self)
     }
 

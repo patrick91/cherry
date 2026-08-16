@@ -78,12 +78,13 @@ struct ContentView: View {
                     .ignoresSafeArea(.all, edges: .top)
             }
 
-            // The floating sidebar is always in the tree so a `(hidden,
-            // revealed) → Cmd+S` transition can fade it out *in place* while
-            // the docked sidebar grows in behind it. If it were gated on
-            // `isSidebarHidden` it would be removed mid-transition and the
-            // user would see the jarring slide-off + slide-in.
-            floatingSidebar
+            // Keep only the sidebar presentation that can currently be seen.
+            // Each sidebar contains the complete sessions/agents/commands/notes
+            // tree; retaining both at steady state doubled the SwiftUI work of a
+            // workspace switch. Transition flags keep both alive only for the
+            // brief handoff where they genuinely overlap.
+            if isSidebarHidden || isSidebarRevealed || floatingSidebarAnimationDepth > 0 {
+                floatingSidebar
                 // Only slide off-screen when the sidebar is BOTH hidden and
                 // not revealed. When transitioning to `shown`, the offset
                 // stays at 0 so the sidebar fades out without sliding.
@@ -94,6 +95,7 @@ struct ContentView: View {
                 )
                 .opacity(isSidebarRevealed ? 1 : 0)
                 .allowsHitTesting(isSidebarRevealed)
+            }
 
             // Project picker, anchored to the window's top-leading corner so
             // it shares coordinate space with the traffic-light overlay
@@ -451,7 +453,11 @@ struct ContentView: View {
     }
 
     private var dockedSidebarSlot: some View {
-        dockedSidebar
+        Group {
+            if !isSidebarHidden || chromeState.isSidebarAnimating {
+                dockedSidebar
+            }
+        }
             // .trailing pins the sidebar's content to the slot's right edge
             // as the slot's width animates from `sidebarWidth → 0`. As the
             // right edge slides left, the contents (and the traffic lights
@@ -4277,7 +4283,7 @@ private final class CommandPaletteKeyMonitorView: NSView {
     }
 }
 
-private enum SidebarPresentation {
+private enum SidebarPresentation: Equatable {
     case docked
     case floating
 }
@@ -4477,7 +4483,7 @@ private struct SidebarTabsView: View {
             ZStack {
                 if let targetRoot = swipeState.targetRoot,
                    let targetWorkspace = repository.workspaceIfLoaded(for: targetRoot) {
-                    SidebarTabsPage(
+                    EquatableSidebarTabsPage(
                         workspace: targetWorkspace,
                         chromeState: chromeState,
                         noteStore: noteStore,
@@ -4486,12 +4492,13 @@ private struct SidebarTabsView: View {
                         presentation: presentation,
                         openProject: openProject
                     )
+                    .equatable()
                     .id(targetRoot)
                     .offset(x: targetPageOffset)
                     .allowsHitTesting(false)
                 }
 
-                SidebarTabsPage(
+                EquatableSidebarTabsPage(
                     workspace: displayedSourceWorkspace,
                     chromeState: chromeState,
                     noteStore: noteStore,
@@ -4500,6 +4507,7 @@ private struct SidebarTabsView: View {
                     presentation: presentation,
                     openProject: openProject
                 )
+                .equatable()
                 .id(displayedSourceRoot)
                 .offset(x: swipeState.offset)
             }
@@ -4553,6 +4561,42 @@ private struct SidebarTabsView: View {
 
     private var dockedCompensation: CGFloat {
         presentation == .docked ? SidebarLayout.floatingOuterInset : 0
+    }
+}
+
+/// Swipe progress changes on every trackpad event. Giving the heavyweight page
+/// an explicit identity boundary lets SwiftUI update its offset without walking
+/// the entire sidebar contents again; the observed models inside the page still
+/// invalidate it normally when their actual data changes.
+@MainActor
+private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let openProject: (CherryProject) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspace === rhs.workspace
+            && lhs.chromeState === rhs.chromeState
+            && lhs.noteStore === rhs.noteStore
+            && lhs.todoStore === rhs.todoStore
+            && lhs.projectRoot == rhs.projectRoot
+            && lhs.presentation == rhs.presentation
+    }
+
+    var body: some View {
+        SidebarTabsPage(
+            workspace: workspace,
+            chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
+            projectRoot: projectRoot,
+            presentation: presentation,
+            openProject: openProject
+        )
     }
 }
 

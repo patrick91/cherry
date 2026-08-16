@@ -174,12 +174,10 @@ private struct WorktreeSpaceMarker: View {
     var body: some View {
         let isActive = worktree.root == repository.activeWorktreeRoot
         Button {
-            withAnimation(.snappy(duration: 0.18)) {
-                _ = repository.activate(
-                    worktreeRoot: worktree.root,
-                    chromeState: chromeState
-                )
-            }
+            _ = repository.activate(
+                worktreeRoot: worktree.root,
+                chromeState: chromeState
+            )
         } label: {
             WorktreeRailIndicator(
                 workspace: repository.workspaceIfLoaded(for: worktree.root),
@@ -300,6 +298,7 @@ private struct WorktreeRailIndicatorShape: View {
         Capsule()
             .fill(indicatorColor)
             .frame(width: 6 + 8 * progress, height: 6)
+            .animation(.snappy(duration: 0.18), value: progress)
     }
 
     private var progress: CGFloat {

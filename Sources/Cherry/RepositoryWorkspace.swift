@@ -431,8 +431,21 @@ final class RepositoryWorkspace: ObservableObject {
 
     private func autoStartCommandsIfNeeded(workspace: TerminalWorkspace, root: String) {
         guard autoStartedRoots.insert(root).inserted else { return }
-        for command in AgentSettings.shared.launchableProjectCommands(for: root) where command.autoStart {
-            workspace.addCommandSession(command: command, projectRoot: root, select: false)
+        // Process/session construction is main-actor work. Let the active-root
+        // publication render first so opening a worktree with several auto-start
+        // commands does not stall the visible workspace handoff.
+        Task { @MainActor [weak self, weak workspace] in
+            await Task.yield()
+            guard let self,
+                  let workspace,
+                  self.workspaces[root] === workspace
+            else {
+                return
+            }
+            for command in AgentSettings.shared.launchableProjectCommands(for: root)
+            where command.autoStart {
+                workspace.addCommandSession(command: command, projectRoot: root, select: false)
+            }
         }
     }
 
@@ -540,11 +553,23 @@ private struct WorktreeSelectionState {
     }
 
     func apply(to chromeState: ProjectWindowChromeState) {
-        chromeState.selectedNoteID = selectedNoteID
-        chromeState.selectedTodoID = selectedTodoID
-        chromeState.isTodoPanePresented = isTodoPanePresented
-        chromeState.selectedTodoTagFilterIDs = selectedTodoTagFilterIDs
-        chromeState.collapsedAgentGroupIDs = collapsedAgentGroupIDs
-        chromeState.focusedIdleCommandName = focusedIdleCommandName
+        if chromeState.selectedNoteID != selectedNoteID {
+            chromeState.selectedNoteID = selectedNoteID
+        }
+        if chromeState.selectedTodoID != selectedTodoID {
+            chromeState.selectedTodoID = selectedTodoID
+        }
+        if chromeState.isTodoPanePresented != isTodoPanePresented {
+            chromeState.isTodoPanePresented = isTodoPanePresented
+        }
+        if chromeState.selectedTodoTagFilterIDs != selectedTodoTagFilterIDs {
+            chromeState.selectedTodoTagFilterIDs = selectedTodoTagFilterIDs
+        }
+        if chromeState.collapsedAgentGroupIDs != collapsedAgentGroupIDs {
+            chromeState.collapsedAgentGroupIDs = collapsedAgentGroupIDs
+        }
+        if chromeState.focusedIdleCommandName != focusedIdleCommandName {
+            chromeState.focusedIdleCommandName = focusedIdleCommandName
+        }
     }
 }

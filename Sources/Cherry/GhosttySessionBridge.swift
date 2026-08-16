@@ -401,6 +401,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var outputObserverID: UUID?
     private var pendingFeedActivation = false
     private var outputFeedActivationRetryCount = 0
+    private(set) var attachCountForTesting = 0
     fileprivate var isPreparingOutputReplay = false
     private var postAttachGeometryRefreshGeneration = 0
     private var attachedAt: Date?
@@ -491,6 +492,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func attach(to container: GhosttyTerminalContainerView) {
         guard !isReleased else { return }
+        attachCountForTesting += 1
         cancelDetachedSurfaceRelease()
         Self.noteUnpark(self)
         let previousContainer = scrollContainer
@@ -568,7 +570,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func applyTerminalSettings(colorScheme: ColorScheme) {
         activeColorScheme = colorScheme
-        applyTerminalSettings()
+        applyTerminalColorSchemeIfNeeded()
     }
 
     func configureSearch(
@@ -2314,19 +2316,21 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             appliedTerminalTheme = nextTheme
         }
 
-        if let activeColorScheme {
-            let nextColorScheme = terminalColorScheme(from: activeColorScheme)
-            if nextColorScheme != appliedTerminalColorScheme {
-                controller.setColorScheme(nextColorScheme)
-                appliedTerminalColorScheme = nextColorScheme
-            }
-        }
+        applyTerminalColorSchemeIfNeeded()
 
         if needsFit {
             TerminalPerformanceMonitor.recordFitToSize()
             terminalView.fitToSize()
         }
         TerminalPerformanceMonitor.recordSettingsApply(reconfigured: needsFit)
+    }
+
+    private func applyTerminalColorSchemeIfNeeded() {
+        guard let activeColorScheme else { return }
+        let nextColorScheme = terminalColorScheme(from: activeColorScheme)
+        guard nextColorScheme != appliedTerminalColorScheme else { return }
+        controller.setColorScheme(nextColorScheme)
+        appliedTerminalColorScheme = nextColorScheme
     }
 
     private func updateTerminalPointerStyle() {
@@ -2365,6 +2369,9 @@ final class GhosttyTerminalContainerView: NSView {
     private var surfaceTransitionFallbackTask: Task<Void, Never>?
     private var surfaceTransitionGeneration: UInt64 = 0
     private var activeColorScheme: ColorScheme = .dark
+    private var appliedDocumentBackgroundScheme: ColorScheme?
+    private var appliedDocumentBackgroundRevision: UInt64?
+    private var documentBackgroundApplyCount = 0
     private var pendingPostAnimationDelta: CGFloat = 0
     private var didApplyEarlyFit = false
     private var shouldSuppressMomentumScrollAfterHostInput = false
@@ -2459,8 +2466,6 @@ final class GhosttyTerminalContainerView: NSView {
             if isActivePane {
                 requestTerminalFocus()
             }
-        } else {
-            session.ghosttyBridge.attach(to: self)
         }
 
         if isActivePane, !wasActivePane {
@@ -2468,7 +2473,7 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         activeColorScheme = colorScheme
-        applyDocumentBackgroundColor(for: colorScheme)
+        applyDocumentBackgroundColorIfNeeded(for: colorScheme)
         session.ghosttyBridge.applyTerminalSettings(colorScheme: colorScheme)
     }
 
@@ -3002,13 +3007,24 @@ final class GhosttyTerminalContainerView: NSView {
     // pre-animation size, any newly exposed area on the right (sidebar
     // closing) reads as terminal background instead of bleeding through to
     // the scene's gradient.
-    private func applyDocumentBackgroundColor(for colorScheme: ColorScheme) {
-        let themeColors = TerminalSettings.shared.ghosttyThemeColors(for: colorScheme)
+    private func applyDocumentBackgroundColorIfNeeded(for colorScheme: ColorScheme) {
+        let settings = TerminalSettings.shared
+        let revision = settings.terminalAppearanceRevision
+        guard appliedDocumentBackgroundScheme != colorScheme
+            || appliedDocumentBackgroundRevision != revision
+        else {
+            return
+        }
+
+        let themeColors = settings.ghosttyThemeColors(for: colorScheme)
         let resolved = NSColor(hexRGB: themeColors.background)
             ?? (colorScheme == .light ? NSColor.white : NSColor.black)
 
         documentView.wantsLayer = true
         documentView.layer?.backgroundColor = resolved.cgColor
+        appliedDocumentBackgroundScheme = colorScheme
+        appliedDocumentBackgroundRevision = revision
+        documentBackgroundApplyCount += 1
     }
 
     private func configureScrollView() {
@@ -3310,6 +3326,10 @@ final class GhosttyTerminalContainerView: NSView {
 
     var activeSessionIDForTesting: UUID? {
         activeSession?.id
+    }
+
+    var documentBackgroundApplyCountForTesting: Int {
+        documentBackgroundApplyCount
     }
 
     var sidebarSnapshotIdentityForTesting: ObjectIdentifier? {

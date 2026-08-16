@@ -2,13 +2,51 @@ import CherryControl
 import CryptoKit
 import Foundation
 
+private final class ProjectNotePersistence: @unchecked Sendable {
+    private let fileURL: URL
+    private let queue = DispatchQueue(label: "Cherry.ProjectNotePersistence", qos: .utility)
+
+    init(fileURL: URL) {
+        self.fileURL = fileURL
+    }
+
+    func saveSynchronously(_ notes: [ProjectNote]) throws {
+        try queue.sync {
+            try Self.write(notes, to: fileURL)
+        }
+    }
+
+    func saveInBackground(_ notes: [ProjectNote]) {
+        let fileURL = fileURL
+        queue.async {
+            try? Self.write(notes, to: fileURL)
+        }
+    }
+
+    func flush() {
+        queue.sync {}
+    }
+
+    private static func write(_ notes: [ProjectNote], to fileURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(notes)
+        try data.write(to: fileURL, options: .atomic)
+    }
+}
+
 @MainActor
 final class ProjectNoteStore: ObservableObject {
     @Published private(set) var notes: [ProjectNote] = []
 
     let projectRoot: String
     private let fileURL: URL
-    private let encoder = JSONEncoder()
+    private let persistence: ProjectNotePersistence
     private let decoder = JSONDecoder()
 
     init(
@@ -16,10 +54,10 @@ final class ProjectNoteStore: ObservableObject {
         storageDirectory: URL = ProjectNoteStore.defaultStorageDirectory()
     ) {
         self.projectRoot = projectRoot
-        fileURL = storageDirectory
+        let fileURL = storageDirectory
             .appendingPathComponent(Self.projectStorageName(projectRoot: projectRoot), isDirectory: false)
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
+        self.fileURL = fileURL
+        persistence = ProjectNotePersistence(fileURL: fileURL)
         decoder.dateDecodingStrategy = .iso8601
         load()
     }
@@ -56,6 +94,20 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     func update(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
+        let note = try mutate(id: id, title: title, markdown: markdown)
+        try save()
+        return note
+    }
+
+    /// Editor autosaves update observable state immediately but keep JSON
+    /// encoding and atomic disk I/O off the main actor.
+    func updateFromEditor(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
+        let note = try mutate(id: id, title: title, markdown: markdown)
+        persistence.saveInBackground(notes)
+        return note
+    }
+
+    private func mutate(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
         guard let index = notes.firstIndex(where: { $0.id == id }) else {
             throw CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
         }
@@ -69,7 +121,6 @@ final class ProjectNoteStore: ObservableObject {
         note.updatedAt = Date()
         notes[index] = note
         sortNotes()
-        try save()
         return note
     }
 
@@ -101,9 +152,11 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     private func save() throws {
-        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try encoder.encode(notes)
-        try data.write(to: fileURL, options: .atomic)
+        try persistence.saveSynchronously(notes)
+    }
+
+    func flushPendingWrites() {
+        persistence.flush()
     }
 
     private func sortNotes() {

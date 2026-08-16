@@ -5,7 +5,15 @@ from pathlib import Path
 import sys
 
 
-SHAPE_KEYS = ("scale", "mode", "duration", "sleep_ms", "tabs_per_window", "windows")
+SHAPE_KEYS = (
+    "scale",
+    "mode",
+    "duration",
+    "sleep_ms",
+    "rate_mib_per_second",
+    "tabs_per_window",
+    "windows",
+)
 
 
 def load_report(path):

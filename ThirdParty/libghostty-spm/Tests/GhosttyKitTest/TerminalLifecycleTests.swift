@@ -120,6 +120,18 @@ struct TerminalLifecycleTests {
         #expect(controller.retainedBridgeCount == 0)
     }
 
+    @Test
+    func detachedSurfaceIsReportedAsOccluded() {
+        #expect(!TerminalSurfaceCoordinator.shouldReportSurfaceVisible(
+            displayRequested: true,
+            attached: false
+        ))
+        #expect(TerminalSurfaceCoordinator.shouldReportSurfaceVisible(
+            displayRequested: true,
+            attached: true
+        ))
+    }
+
     #if canImport(AppKit) && !canImport(UIKit)
         @Test
         func visibleNonKeyWindowCanRenderSurface() {

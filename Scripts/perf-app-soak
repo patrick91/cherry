@@ -25,6 +25,7 @@ SCALES = {
         "frames": 150,
         "progress_frames": 300,
         "sleep_ms": 0,
+        "rate_mib_per_second": 4.0,
         "select_interval": 0.25,
         "sample_interval": 2.0,
     },
@@ -36,6 +37,7 @@ SCALES = {
         "frames": 1_000,
         "progress_frames": 2_000,
         "sleep_ms": 0,
+        "rate_mib_per_second": 2.0,
         "select_interval": 0.5,
         "sample_interval": 5.0,
     },
@@ -47,6 +49,7 @@ SCALES = {
         "frames": 6_000,
         "progress_frames": 10_000,
         "sleep_ms": 0,
+        "rate_mib_per_second": 1.0,
         "select_interval": 1.0,
         "sample_interval": 30.0,
     },
@@ -67,6 +70,11 @@ def parse_args():
     parser.add_argument("--frames", type=int, help="TUI frames per workload cycle.")
     parser.add_argument("--progress-frames", type=int, help="Progress frames per mixed workload cycle.")
     parser.add_argument("--sleep-ms", type=float, help="Delay between TUI frames in each workload.")
+    parser.add_argument(
+        "--rate-mib-per-second",
+        type=float,
+        help="Maximum average output rate for each terminal. Zero runs an unbounded overload test.",
+    )
     parser.add_argument("--select-interval", type=float, help="Seconds between select_process calls.")
     parser.add_argument("--sample-interval", type=float, help="Seconds between Cherry process RSS/CPU samples.")
     parser.add_argument(
@@ -159,7 +167,7 @@ def result_payload(result, case_name):
     return payload.get("_0", payload)
 
 
-def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
+def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms, rate_mib_per_second):
     command = [
         str(WORKLOAD_SCRIPT),
         mode,
@@ -173,6 +181,8 @@ def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
         str(progress_frames),
         "--sleep-ms",
         str(max(0, sleep_ms)),
+        "--rate-mib-per-second",
+        str(max(0, rate_mib_per_second)),
     ]
     return " ".join(shlex.quote(part) for part in command)
 
@@ -311,7 +321,11 @@ def sample_processes(pids):
 
 def wait_for_workload_start(socket_path, project_root, process_id, mode, timeout=5):
     deadline = time.monotonic() + timeout
-    min_lines = 8 if mode == "tui" else 100
+    # Native libghostty text reads retain roughly a viewport of logical lines,
+    # even while the renderer owns much deeper scrollback. Multiple content
+    # versions plus a populated viewport prove the workload is active without
+    # relying on the removed host-side prototype buffer's 100-line count.
+    min_lines = 8
     last_status = None
     while time.monotonic() < deadline:
         status = process_status(socket_path, project_root, process_id)
@@ -323,6 +337,18 @@ def wait_for_workload_start(socket_path, project_root, process_id, mode, timeout
         if output_version > 8 and line_count >= min_lines:
             return status
         time.sleep(0.1)
+
+    try:
+        output = result_payload(send(
+            socket_path,
+            scoped(project_root, enum_case("getProcessOutput", {
+                "processID": process_id,
+                "lineLimit": 8,
+            })),
+        ), "getProcessOutput")
+        print(f"[soak] stalled output={output.get('lines')}")
+    except Exception as error:
+        print(f"[soak] stalled output unavailable: {error}")
 
     raise RuntimeError(
         "Workload did not appear to start for "
@@ -510,6 +536,7 @@ def main():
     frames = setting(args, "frames")
     progress_frames = setting(args, "progress_frames")
     sleep_ms = setting(args, "sleep_ms")
+    rate_mib_per_second = setting(args, "rate_mib_per_second")
     select_interval = setting(args, "select_interval")
     sample_interval = setting(args, "sample_interval")
     socket_path = find_socket(args.socket)
@@ -518,7 +545,15 @@ def main():
 
     project_roots = choose_project_roots(socket_path, args, windows)
 
-    command = shell_command(args.mode, duration, lines, frames, progress_frames, sleep_ms)
+    command = shell_command(
+        args.mode,
+        duration,
+        lines,
+        frames,
+        progress_frames,
+        sleep_ms,
+        rate_mib_per_second,
+    )
     cherry_pids = cherry_pid_for_socket(socket_path)
     start_time = time.monotonic()
     report = {
@@ -529,6 +564,7 @@ def main():
         "mode": args.mode,
         "duration": duration,
         "sleep_ms": sleep_ms,
+        "rate_mib_per_second": rate_mib_per_second,
         "tabs_per_window": tabs,
         "windows": len(project_roots),
         "sample_interval": sample_interval,

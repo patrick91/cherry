@@ -114,6 +114,13 @@ def shape_warnings(cherry, ghostty, cherry_workloads, ghostty_workloads):
     if cherry_sleep_ms is not None and ghostty_sleep_ms is not None:
         if abs(float(cherry_sleep_ms) - float(ghostty_sleep_ms)) > 0.001:
             warnings.append(f"sleep_ms differs: cherry={cherry_sleep_ms!r} ghostty={ghostty_sleep_ms!r}")
+    cherry_rate = cherry.get("rate_mib_per_second")
+    ghostty_rate = ghostty.get("rate_mib_per_second")
+    if cherry_rate is not None and ghostty_rate is not None:
+        if abs(float(cherry_rate) - float(ghostty_rate)) > 0.001:
+            warnings.append(
+                f"rate_mib_per_second differs: cherry={cherry_rate!r} ghostty={ghostty_rate!r}"
+            )
     if cherry_workloads != ghostty_workloads:
         warnings.append(f"workload count differs: cherry={cherry_workloads} ghostty={ghostty_workloads}")
     return warnings
@@ -145,10 +152,12 @@ def main():
         "[compare] "
         f"shape cherry(scale={cherry.get('scale')} mode={cherry.get('mode')} "
         f"duration={cherry.get('duration')} windows={cherry.get('windows')} "
-        f"sleep_ms={cherry.get('sleep_ms')} tabs={cherry.get('tabs_per_window')} workloads={cherry_workloads}) "
+        f"sleep_ms={cherry.get('sleep_ms')} rate_mib_per_second={cherry.get('rate_mib_per_second')} "
+        f"tabs={cherry.get('tabs_per_window')} workloads={cherry_workloads}) "
         f"ghostty(scale={ghostty.get('scale')} mode={ghostty.get('mode')} "
         f"duration={ghostty.get('duration')} windows={ghostty.get('windows')} "
-        f"sleep_ms={ghostty.get('sleep_ms')} workloads={ghostty_workloads})"
+        f"sleep_ms={ghostty.get('sleep_ms')} rate_mib_per_second={ghostty.get('rate_mib_per_second')} "
+        f"workloads={ghostty_workloads})"
     )
     for warning in warnings:
         print(f"[compare] warning: {warning}", file=sys.stderr)

@@ -36,6 +36,7 @@ final class RepositoryWorkspace: ObservableObject {
 
     private let service: GitWorktreeService
     private var workspaces: [String: TerminalWorkspace]
+    private var resolvedPathsByInput: [String: String]
     private var autoStartedRoots: Set<String> = []
     private var selectionByRoot: [String: WorktreeSelectionState] = [:]
 
@@ -55,6 +56,9 @@ final class RepositoryWorkspace: ObservableObject {
 
         let initialWorkspace = TerminalWorkspace(projectRoot: initialRoot)
         workspaces = [initialRoot: initialWorkspace]
+        var initialResolvedPaths = [root: initialRoot]
+        initialResolvedPaths[initialRoot] = initialRoot
+        resolvedPathsByInput = initialResolvedPaths
         loadedWorktreeRoots = [initialRoot]
         hiddenWorktreeRoots = Set(
             AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath)
@@ -117,6 +121,9 @@ final class RepositoryWorkspace: ObservableObject {
             let snapshot = try await service.discover(projectRoot: repositoryRoot)
             commonDirectory = snapshot.commonDirectory
             worktrees = snapshot.worktrees
+            for worktree in snapshot.worktrees {
+                resolvedPathsByInput[worktree.root] = worktree.root
+            }
             discoveryError = nil
             hiddenWorktreeRoots.formIntersection(Set(snapshot.worktrees.map(\.root)))
             persistHiddenWorktrees()
@@ -442,7 +449,19 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     private func standardized(_ root: String) -> String {
-        Self.resolvedPath(root)
+        let standardized = URL(fileURLWithPath: root, isDirectory: true)
+            .standardizedFileURL
+            .path
+        if let resolved = resolvedPathsByInput[standardized] {
+            return resolved
+        }
+        if worktrees.contains(where: { $0.root == standardized }) {
+            resolvedPathsByInput[standardized] = standardized
+            return standardized
+        }
+        let resolved = Self.resolvedPath(standardized)
+        resolvedPathsByInput[standardized] = resolved
+        return resolved
     }
 
     private static func resolvedPath(_ root: String) -> String {

@@ -8,6 +8,26 @@ import time
 
 ESC = "\x1b"
 CSI = f"{ESC}["
+rate_limiter = None
+
+
+class RateLimiter:
+    def __init__(self, mib_per_second):
+        self.bytes_per_second = max(0, mib_per_second) * 1024 * 1024
+        self.started_at = time.monotonic()
+        self.bytes_written = 0
+
+    def add(self, value):
+        if self.bytes_per_second > 0:
+            self.bytes_written += len(value.encode("utf-8"))
+
+    def throttle(self):
+        if self.bytes_per_second <= 0:
+            return
+        target = self.started_at + self.bytes_written / self.bytes_per_second
+        remaining = target - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 def parse_args():
@@ -26,15 +46,25 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=0, help="Minimum seconds to keep emitting output.")
     parser.add_argument("--sleep-ms", type=float, default=0, help="Delay between TUI frames, in milliseconds.")
     parser.add_argument("--progress-frames", type=int, default=1_000, help="Carriage-return progress frames for mixed mode.")
+    parser.add_argument(
+        "--rate-mib-per-second",
+        type=float,
+        default=0,
+        help="Maximum average output rate. Zero keeps the unbounded overload behavior.",
+    )
     return parser.parse_args()
 
 
 def write(value):
     sys.stdout.write(value)
+    if rate_limiter is not None:
+        rate_limiter.add(value)
 
 
 def flush():
     sys.stdout.flush()
+    if rate_limiter is not None:
+        rate_limiter.throttle()
 
 
 def fill(width, seed):
@@ -98,7 +128,9 @@ def emit_for_duration(args):
 
 
 def main():
+    global rate_limiter
     args = parse_args()
+    rate_limiter = RateLimiter(args.rate_mib_per_second)
     write(f"Cherry perf workload pid={os.getpid()} mode={args.mode}\r\n")
     flush()
 

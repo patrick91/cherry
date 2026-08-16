@@ -2015,6 +2015,27 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func projectNoteEditorAutosavePersistsAfterBackgroundFlush() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    let note = try store.create(title: "Draft", markdown: "Before")
+    _ = try store.updateFromEditor(id: note.id, title: "Draft", markdown: "After")
+    store.flushPendingWrites()
+
+    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
+    #expect(reloaded.notes.first?.markdown == "After")
+}
+
+@MainActor
 @Test func projectTodoStorePersistsProjectTodosAndComments() async throws {
     let projectRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

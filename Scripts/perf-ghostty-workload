@@ -20,6 +20,7 @@ SCALES = {
         "frames": 150,
         "progress_frames": 300,
         "sleep_ms": 0,
+        "rate_mib_per_second": 4.0,
         "sample_interval": 2.0,
     },
     "standard": {
@@ -28,6 +29,7 @@ SCALES = {
         "frames": 1_000,
         "progress_frames": 2_000,
         "sleep_ms": 0,
+        "rate_mib_per_second": 2.0,
         "sample_interval": 5.0,
     },
     "soak": {
@@ -36,6 +38,7 @@ SCALES = {
         "frames": 6_000,
         "progress_frames": 10_000,
         "sleep_ms": 0,
+        "rate_mib_per_second": 1.0,
         "sample_interval": 30.0,
     },
 }
@@ -57,6 +60,7 @@ def parse_args():
     parser.add_argument("--frames", type=int, help="TUI frames per workload cycle.")
     parser.add_argument("--progress-frames", type=int, help="Progress frames per mixed workload cycle.")
     parser.add_argument("--sleep-ms", type=float, help="Delay between TUI frames in each workload.")
+    parser.add_argument("--rate-mib-per-second", type=float, help="Maximum average output rate per window.")
     parser.add_argument("--sample-interval", type=float, help="Seconds between RSS/CPU samples.")
     parser.add_argument("--settle-after-complete", type=float, default=1.0)
     parser.add_argument("--keep-open", action="store_true", help="Leave newly launched Ghostty processes running.")
@@ -181,7 +185,7 @@ def summarize_samples(samples):
     }
 
 
-def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
+def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms, rate_mib_per_second):
     command = [
         str(WORKLOAD_SCRIPT),
         mode,
@@ -195,6 +199,8 @@ def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms):
         str(progress_frames),
         "--sleep-ms",
         str(max(0, sleep_ms)),
+        "--rate-mib-per-second",
+        str(max(0, rate_mib_per_second)),
     ]
     return " ".join(shlex.quote(part) for part in command)
 
@@ -235,8 +241,17 @@ def main():
     frames = setting(args, "frames")
     progress_frames = setting(args, "progress_frames")
     sleep_ms = setting(args, "sleep_ms")
+    rate_mib_per_second = setting(args, "rate_mib_per_second")
     sample_interval = setting(args, "sample_interval")
-    command = shell_command(args.mode, duration, lines, frames, progress_frames, sleep_ms)
+    command = shell_command(
+        args.mode,
+        duration,
+        lines,
+        frames,
+        progress_frames,
+        sleep_ms,
+        rate_mib_per_second,
+    )
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -266,6 +281,7 @@ def main():
         "mode": args.mode,
         "duration": duration,
         "sleep_ms": sleep_ms,
+        "rate_mib_per_second": rate_mib_per_second,
         "windows": args.windows,
         "sample_interval": sample_interval,
         "settle_after_complete": args.settle_after_complete,

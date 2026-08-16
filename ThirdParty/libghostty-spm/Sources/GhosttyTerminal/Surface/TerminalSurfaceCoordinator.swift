@@ -143,7 +143,14 @@ final class TerminalSurfaceCoordinator {
 
         bridge.rawSurface = rawSurface
         surface = TerminalSurface(rawSurface)
-        surface?.setOcclusion(isDisplayVisible)
+        // EXEC surfaces are created while detached so their child can start in
+        // a background tab. A detached surface has no drawable and must be
+        // reported as occluded until it is actually installed in a window;
+        // otherwise ghostty treats every background process as visible work.
+        surface?.setOcclusion(Self.shouldReportSurfaceVisible(
+            displayRequested: isDisplayVisible,
+            attached: attached
+        ))
         controller.onWakeup = { [weak self] in
             self?.requestImmediateTick()
         }
@@ -267,6 +274,10 @@ final class TerminalSurfaceCoordinator {
         } else {
             stopDisplayLink()
         }
+    }
+
+    static func shouldReportSurfaceVisible(displayRequested: Bool, attached: Bool) -> Bool {
+        displayRequested && attached
     }
     // MARK: - Frame Rendering
 

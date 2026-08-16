@@ -422,6 +422,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var settledRenderTask: Task<Void, Never>?
     private var settledRenderGeneration: UInt64 = 0
     private var hasRenderedSinceSettledRenderRequest = false
+    private var isScrollbarSynchronizationScheduled = false
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -900,11 +901,22 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
         scrollbarMetrics = metrics
-        scrollContainer?.synchronizeScrollState()
+        scheduleScrollbarSynchronization()
         // Scrollbar metrics reposition the document-hosted surface even when
         // Ghostty does not need another paint. Treat that layout update as part
         // of the same settling burst before revealing the incoming viewport.
         scheduleSettledRenderCompletionIfPossible()
+    }
+
+    private func scheduleScrollbarSynchronization() {
+        guard !isScrollbarSynchronizationScheduled else { return }
+        isScrollbarSynchronizationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isScrollbarSynchronizationScheduled = false
+            guard !self.isReleased else { return }
+            self.scrollContainer?.synchronizeScrollState()
+        }
     }
 
     func terminalDidChangePointerStyle(_ style: TerminalPointerStyle) {

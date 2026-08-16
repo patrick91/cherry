@@ -1220,7 +1220,7 @@ private struct NoteDetailView: View {
         pendingSave?.cancel()
         pendingSave = nil
         guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
-        _ = try? noteStore.update(id: note.id, title: draftTitle, markdown: draftMarkdown)
+        _ = try? noteStore.updateFromEditor(id: note.id, title: draftTitle, markdown: draftMarkdown)
     }
 }
 

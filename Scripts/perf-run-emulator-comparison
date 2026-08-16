@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--frames", type=int)
     parser.add_argument("--progress-frames", type=int)
     parser.add_argument("--sleep-ms", type=float)
+    parser.add_argument("--rate-mib-per-second", type=float)
     parser.add_argument("--sample-interval", type=float)
     parser.add_argument("--select-interval", type=float)
     parser.add_argument(
@@ -221,6 +222,7 @@ def main():
             add_optional(app_command, "--frames", args.frames)
             add_optional(app_command, "--progress-frames", args.progress_frames)
             add_optional(app_command, "--sleep-ms", args.sleep_ms)
+            add_optional(app_command, "--rate-mib-per-second", args.rate_mib_per_second)
             add_optional(app_command, "--sample-interval", args.sample_interval)
             add_optional(app_command, "--select-interval", args.select_interval)
             for root in roots:
@@ -237,6 +239,7 @@ def main():
                 "tabs": args.tabs,
                 "duration": args.duration,
                 "sleep_ms": args.sleep_ms,
+                "rate_mib_per_second": args.rate_mib_per_second,
                 "project_roots_file": str(root_file),
                 "cherry_log": str(cherry_log_path),
                 "cherry_report": str(cherry_report),
@@ -267,6 +270,7 @@ def main():
         add_optional(ghostty_command, "--frames", args.frames)
         add_optional(ghostty_command, "--progress-frames", args.progress_frames)
         add_optional(ghostty_command, "--sleep-ms", args.sleep_ms)
+        add_optional(ghostty_command, "--rate-mib-per-second", args.rate_mib_per_second)
         add_optional(ghostty_command, "--sample-interval", args.sample_interval)
 
         ghostty_output = run_command(ghostty_command)
@@ -293,6 +297,7 @@ def main():
             "tabs": args.tabs,
             "duration": args.duration,
             "sleep_ms": args.sleep_ms,
+            "rate_mib_per_second": args.rate_mib_per_second,
             "project_roots_file": str(root_file),
             "cherry_log": str(cherry_log_path),
             "cherry_report": str(cherry_report),

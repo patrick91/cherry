@@ -391,6 +391,10 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listProcesses(try listProcesses(workspace: workspace, kind: request.kind)))
         case .getProcessStatus(let request):
             let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
+            // A targeted status query is expected to be current. Process lists
+            // deliberately use the cached count, but this path can afford one
+            // throttled native-surface refresh.
+            _ = session.lineCount
             return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .getProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)

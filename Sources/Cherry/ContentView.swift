@@ -4602,7 +4602,9 @@ private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
 
 private struct SidebarTabsPage: View {
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var agentSettings = AgentSettings.shared
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
@@ -4613,9 +4615,19 @@ private struct SidebarTabsPage: View {
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
-        let visibleAgentCount = workspace.visibleAgentSessions(
+        let agentTree = workspace.agentSessionTreeSnapshot()
+        let visibleAgentItems = agentTree.visibleItems(
             collapsedIDs: chromeState.collapsedAgentGroupIDs
-        ).count
+        )
+        let commands = agentSettings.launchableProjectCommands(for: projectRoot)
+        let palette = SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 SidebarAgentSessionSection(
@@ -4624,6 +4636,10 @@ private struct SidebarTabsPage: View {
                     chromeState: chromeState,
                     projectRoot: projectRoot,
                     presentation: presentation,
+                    palette: palette,
+                    agentTree: agentTree,
+                    visibleAgentItems: visibleAgentItems,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     showShortcutHints: chromeState.isCommandKeyPressed,
                     openSettings: { openSettings() }
                 )
@@ -4635,7 +4651,9 @@ private struct SidebarTabsPage: View {
                     chromeState: chromeState,
                     projectRoot: projectRoot,
                     presentation: presentation,
-                    shortcutStartIndex: visibleAgentCount,
+                    palette: palette,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    shortcutStartIndex: visibleAgentItems.count,
                     showShortcutHints: chromeState.isCommandKeyPressed
                 )
 
@@ -4645,7 +4663,9 @@ private struct SidebarTabsPage: View {
                     chromeState: chromeState,
                     projectRoot: projectRoot,
                     presentation: presentation,
-                    shortcutStartIndex: visibleAgentCount + workspace.terminalDisplayItems.count,
+                    palette: palette,
+                    commands: commands,
+                    shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
                     showShortcutHints: chromeState.isCommandKeyPressed
                 )
 
@@ -4655,7 +4675,11 @@ private struct SidebarTabsPage: View {
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutNumber: todoBoardShortcutNumber,
+                        palette: palette,
+                        shortcutNumber: visibleAgentItems.count
+                            + workspace.terminalDisplayItems.count
+                            + commands.count
+                            + 1,
                         showShortcutHint: chromeState.isCommandKeyPressed
                     )
                 }
@@ -4666,7 +4690,11 @@ private struct SidebarTabsPage: View {
                         chromeState: chromeState,
                         projectRoot: projectRoot,
                         presentation: presentation,
-                        shortcutStartIndex: notesShortcutStartIndex(features: features),
+                        palette: palette,
+                        shortcutStartIndex: visibleAgentItems.count
+                            + workspace.terminalDisplayItems.count
+                            + commands.count
+                            + (features.todosEnabled ? 1 : 0),
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
                 }
@@ -4692,19 +4720,6 @@ private struct SidebarTabsPage: View {
         presentation == .docked ? SidebarLayout.floatingOuterInset : 0
     }
 
-    private var todoBoardShortcutNumber: Int {
-        workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
-            + workspace.terminalDisplayItems.count
-            + agentSettings.launchableProjectCommands(for: projectRoot).count
-            + 1
-    }
-
-    private func notesShortcutStartIndex(features: ProjectFeatureSettings) -> Int {
-        workspace.visibleAgentSessions(collapsedIDs: chromeState.collapsedAgentGroupIDs).count
-            + workspace.terminalDisplayItems.count
-            + agentSettings.launchableProjectCommands(for: projectRoot).count
-            + (features.todosEnabled ? 1 : 0)
-    }
 }
 
 private struct TitlebarProjectPicker: View {
@@ -5079,33 +5094,26 @@ extension NSUserInterfaceItemIdentifier {
 }
 
 private struct SidebarAgentSessionSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
     @ObservedObject var settings: AgentSettings
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
+    let agentTree: AgentSessionTreeSnapshot
+    let visibleAgentItems: [AgentSessionTreeItem]
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
     let showShortcutHints: Bool
     let openSettings: () -> Void
 
     var body: some View {
         let project = settings.resolvedProject(for: projectRoot)
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: settings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(
                     title: "Agents",
-                    count: workspace.agentSessions.count + (isIconDebugActive ? SidebarIconDebugFixtures.agentCount : 0),
+                    count: agentTree.sessions.count + (isIconDebugActive ? SidebarIconDebugFixtures.agentCount : 0),
                     palette: palette
                 )
 
@@ -5121,20 +5129,19 @@ private struct SidebarAgentSessionSection: View {
                 SidebarIconDebugAgentPreview(palette: palette)
             }
 
-            if workspace.agentSessions.isEmpty && !isIconDebugActive {
+            if agentTree.sessions.isEmpty && !isIconDebugActive {
                 SidebarEmptyRow(
                     title: "No agents",
                     palette: palette
                 )
             }
 
-            if !workspace.agentSessions.isEmpty {
-                let items = workspace.visibleAgentTreeItems(collapsedIDs: chromeState.collapsedAgentGroupIDs)
-                let shortcutNumbers = Dictionary(uniqueKeysWithValues: items.enumerated().map { index, item in
+            if !agentTree.sessions.isEmpty {
+                let shortcutNumbers = Dictionary(uniqueKeysWithValues: visibleAgentItems.enumerated().map { index, item in
                     (item.session.id, index + 1)
                 })
-                ForEach(workspace.rootAgentSessions) { session in
-                    let children = workspace.childAgentSessions(of: session)
+                ForEach(agentTree.roots) { session in
+                    let children = agentTree.children(of: session)
                     let isCollapsed = chromeState.collapsedAgentGroupIDs.contains(session.id)
                     let isActiveGroup = chromeState.isShowingTerminalContent
                         && (workspace.selectedSessionID == session.id
@@ -5204,7 +5211,7 @@ private struct SidebarAgentSessionSection: View {
             isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
             projectRoot: projectRoot,
             presentation: presentation,
-            pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+            pathDisplayMode: pathDisplayMode,
             shortcutNumber: shortcutNumber,
             showShortcutHint: showShortcutHints,
             nestingDepth: nestingDepth,
@@ -5519,14 +5526,13 @@ private struct AgentTreeTuningPanel: View {
 }
 
 private struct SidebarCommandSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
     @ObservedObject var settings: AgentSettings
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
+    let commands: [ProjectCommandDefinition]
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
@@ -5535,16 +5541,6 @@ private struct SidebarCommandSection: View {
     @State private var commandError: String?
 
     var body: some View {
-        let commands = settings.launchableProjectCommands(for: projectRoot)
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: settings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(
@@ -5586,6 +5582,7 @@ private struct SidebarCommandSection: View {
                         isSelected: chromeState.focusedIdleCommandName == command.name
                             || (chromeState.isShowingTerminalContent && (session.map { workspace.selectedSessionID == $0.id } ?? false)),
                         presentation: presentation,
+                        palette: palette,
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
                         start: { start(command, existingSession: session) },
@@ -5747,27 +5744,15 @@ private struct SidebarCommandSection: View {
 }
 
 private struct SidebarNotesSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(title: "Notes", count: noteStore.notes.count, palette: palette)
@@ -5864,27 +5849,15 @@ private struct SidebarNotesSection: View {
 }
 
 private struct SidebarTodosSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
     @ObservedObject var todoStore: ProjectTodoStore
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
     let shortcutNumber: Int
     let showShortcutHint: Bool
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-
         VStack(alignment: .leading, spacing: 4) {
             SidebarSectionHeader(title: "Todos", count: openTodoCount, palette: palette)
 
@@ -5980,15 +5953,12 @@ private func promptRenameSession(_ session: TerminalSession) {
 }
 
 private struct SidebarCommandRow: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
     let command: ProjectCommandDefinition
     let session: TerminalSession?
     let projectRoot: String?
     let isSelected: Bool
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
     let shortcutNumber: Int
     let showShortcutHint: Bool
     let start: () -> Void
@@ -5999,14 +5969,6 @@ private struct SidebarCommandRow: View {
     @State private var isHovered = false
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
         let label = SidebarProjectCommandFormatter.label(for: command, projectRoot: projectRoot)
 
         Button(action: select) {
@@ -6169,16 +6131,14 @@ private struct SidebarEmptyRow: View {
 }
 
 private struct SidebarSessionSection: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
     let title: String
     let displayItems: [TerminalDisplayItem]
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
     let presentation: SidebarPresentation
+    let palette: SidebarPalette
+    let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
@@ -6186,15 +6146,6 @@ private struct SidebarSessionSection: View {
     @State private var draggedRowOffsetY: CGFloat = 0
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-
         VStack(alignment: .leading, spacing: 4) {
             SidebarSectionHeader(
                 title: title,
@@ -6310,7 +6261,7 @@ private struct SidebarSessionSection: View {
                     isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
                     projectRoot: projectRoot,
                     presentation: presentation,
-                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    pathDisplayMode: pathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
                     onSelect: {
@@ -6330,7 +6281,7 @@ private struct SidebarSessionSection: View {
                     chromeState: chromeState,
                     projectRoot: projectRoot,
                     presentation: presentation,
-                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    pathDisplayMode: pathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
                     palette: palette

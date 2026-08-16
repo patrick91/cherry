@@ -39,6 +39,8 @@ final class RepositoryWorkspace: ObservableObject {
     private var resolvedPathsByInput: [String: String]
     private var autoStartedRoots: Set<String> = []
     private var selectionByRoot: [String: WorktreeSelectionState] = [:]
+    private var pendingAutoStartTask: Task<Void, Never>?
+    private var activeRootPersistenceTask: Task<Void, Never>?
 
     init(
         projectRoot: String,
@@ -179,7 +181,7 @@ final class RepositoryWorkspace: ObservableObject {
         }
         let nextWorkspace = workspace(for: root)
         activeWorktreeRoot = root
-        AgentSettings.shared.markWorktreeOpened(root, repositoryRoot: repositoryRoot)
+        scheduleActiveRootPersistence(root: root)
         if let chromeState {
             (selectionByRoot[root] ?? .terminal).apply(to: chromeState)
         }
@@ -425,20 +427,23 @@ final class RepositoryWorkspace: ObservableObject {
         let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
         workspaces[root] = workspace
         loadedWorktreeRoots.insert(root)
-        ProjectWindowRegistry.shared.repositoryDidRefresh(self)
         return workspace
     }
 
     private func autoStartCommandsIfNeeded(workspace: TerminalWorkspace, root: String) {
-        guard autoStartedRoots.insert(root).inserted else { return }
-        // Process/session construction is main-actor work. Let the active-root
-        // publication render first so opening a worktree with several auto-start
-        // commands does not stall the visible workspace handoff.
-        Task { @MainActor [weak self, weak workspace] in
-            await Task.yield()
+        guard !autoStartedRoots.contains(root) else { return }
+        pendingAutoStartTask?.cancel()
+        // Process/session construction is main-actor work. Wait briefly for rapid
+        // workspace navigation to settle so passing over a workspace does not
+        // launch all of its commands on the switching path.
+        pendingAutoStartTask = Task { @MainActor [weak self, weak workspace] in
+            try? await Task.sleep(for: .milliseconds(150))
             guard let self,
                   let workspace,
-                  self.workspaces[root] === workspace
+                  !Task.isCancelled,
+                  self.activeWorktreeRoot == root,
+                  self.workspaces[root] === workspace,
+                  self.autoStartedRoots.insert(root).inserted
             else {
                 return
             }
@@ -446,6 +451,22 @@ final class RepositoryWorkspace: ObservableObject {
             where command.autoStart {
                 workspace.addCommandSession(command: command, projectRoot: root, select: false)
             }
+            self.pendingAutoStartTask = nil
+        }
+    }
+
+    private func scheduleActiveRootPersistence(root: String) {
+        activeRootPersistenceTask?.cancel()
+        activeRootPersistenceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self,
+                  !Task.isCancelled,
+                  self.activeWorktreeRoot == root
+            else {
+                return
+            }
+            AgentSettings.shared.markWorktreeOpened(root, repositoryRoot: self.repositoryRoot)
+            self.activeRootPersistenceTask = nil
         }
     }
 

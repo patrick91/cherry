@@ -461,7 +461,8 @@ final class ProjectWindowRegistry {
         workspace: TerminalWorkspace,
         noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
-        chromeState: ProjectWindowChromeState?
+        chromeState: ProjectWindowChromeState?,
+        recordsOpening: Bool = true
     ) {
         let effectiveRoot = workspace.projectRoot ?? projectRoot
         activeProjectRoot = effectiveRoot
@@ -469,10 +470,12 @@ final class ProjectWindowRegistry {
         activeNoteStore = noteStore
         activeTodoStore = todoStore
         activeChromeState = chromeState
-        AgentSettings.shared.markWorktreeOpened(
-            effectiveRoot,
-            repositoryRoot: repositoryRoot(for: projectRoot)
-        )
+        if recordsOpening {
+            AgentSettings.shared.markWorktreeOpened(
+                effectiveRoot,
+                repositoryRoot: repositoryRoot(for: projectRoot)
+            )
+        }
 
         if NSApplication.shared.isActive,
            chromeState?.isShowingTerminalContent ?? true {
@@ -502,7 +505,6 @@ final class ProjectWindowRegistry {
     }
 
     func repositoryDidActivate(_ repository: RepositoryWorkspace) {
-        repositoryDidRefresh(repository)
         guard let repositoryRoot = repositories.first(where: {
             $0.value.repository === repository
         })?.key else {
@@ -516,7 +518,8 @@ final class ProjectWindowRegistry {
                 workspace: workspace,
                 noteStore: noteStores[repositoryRoot]?.noteStore,
                 todoStore: todoStores[repositoryRoot]?.todoStore,
-                chromeState: chromeStates[repositoryRoot]?.chromeState
+                chromeState: chromeStates[repositoryRoot]?.chromeState,
+                recordsOpening: false
             )
         }
     }

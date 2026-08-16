@@ -986,6 +986,49 @@ struct AgentSessionTreeItem: Identifiable {
     var id: UUID { session.id }
 }
 
+@MainActor
+struct AgentSessionTreeSnapshot {
+    let sessions: [TerminalSession]
+    let roots: [TerminalSession]
+    private let childrenByParentID: [UUID: [TerminalSession]]
+
+    init(sessions: [TerminalSession]) {
+        let agents = sessions.filter { $0.kind == .agent }
+        let agentIDs = Set(agents.map(\.id))
+        var roots: [TerminalSession] = []
+        var childrenByParentID: [UUID: [TerminalSession]] = [:]
+
+        for session in agents {
+            if let parentID = session.parentAgentID, agentIDs.contains(parentID) {
+                childrenByParentID[parentID, default: []].append(session)
+            } else {
+                roots.append(session)
+            }
+        }
+
+        self.sessions = agents
+        self.roots = roots
+        self.childrenByParentID = childrenByParentID
+    }
+
+    func children(of parent: TerminalSession) -> [TerminalSession] {
+        childrenByParentID[parent.id] ?? []
+    }
+
+    func visibleItems(collapsedIDs: Set<UUID>) -> [AgentSessionTreeItem] {
+        var items: [AgentSessionTreeItem] = []
+        items.reserveCapacity(sessions.count)
+        for root in roots {
+            items.append(AgentSessionTreeItem(session: root, depth: 0))
+            guard !collapsedIDs.contains(root.id) else { continue }
+            items.append(contentsOf: children(of: root).map {
+                AgentSessionTreeItem(session: $0, depth: 1)
+            })
+        }
+        return items
+    }
+}
+
 enum TerminalDisplayItem: Identifiable, Equatable {
     case single(UUID)
     case split(UUID)
@@ -1087,10 +1130,7 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     var rootAgentSessions: [TerminalSession] {
-        agentSessions.filter { session in
-            guard let parentAgentID = session.parentAgentID else { return true }
-            return !agentSessions.contains { $0.id == parentAgentID }
-        }
+        agentSessionTreeSnapshot().roots
     }
 
     var terminalSessions: [TerminalSession] {
@@ -1146,15 +1186,15 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func visibleAgentTreeItems(collapsedIDs: Set<UUID> = []) -> [AgentSessionTreeItem] {
-        var items: [AgentSessionTreeItem] = []
-        for session in rootAgentSessions {
-            appendAgentTreeItems(parent: session, depth: 0, collapsedIDs: collapsedIDs, to: &items)
-        }
-        return items
+        agentSessionTreeSnapshot().visibleItems(collapsedIDs: collapsedIDs)
     }
 
     func visibleAgentSessions(collapsedIDs: Set<UUID> = []) -> [TerminalSession] {
         visibleAgentTreeItems(collapsedIDs: collapsedIDs).map(\.session)
+    }
+
+    func agentSessionTreeSnapshot() -> AgentSessionTreeSnapshot {
+        AgentSessionTreeSnapshot(sessions: sessions)
     }
 
     func select(_ session: TerminalSession) {
@@ -1810,19 +1850,6 @@ final class TerminalWorkspace: ObservableObject {
 
     private func childAgentSessions(parentID: UUID) -> [TerminalSession] {
         agentSessions.filter { $0.parentAgentID == parentID }
-    }
-
-    private func appendAgentTreeItems(
-        parent: TerminalSession,
-        depth: Int,
-        collapsedIDs: Set<UUID>,
-        to items: inout [AgentSessionTreeItem]
-    ) {
-        items.append(AgentSessionTreeItem(session: parent, depth: depth))
-        guard !collapsedIDs.contains(parent.id) else { return }
-        for child in childAgentSessions(parentID: parent.id) {
-            items.append(AgentSessionTreeItem(session: child, depth: 1))
-        }
     }
 
     private func normalizedParentAgentID(_ parentAgentID: UUID?) -> UUID? {

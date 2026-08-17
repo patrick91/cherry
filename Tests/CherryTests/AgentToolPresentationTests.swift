@@ -4,8 +4,13 @@ import Testing
 @Test func agentToolBrandRecognizesNamedProfilesAndCommands() {
     #expect(AgentToolBrand.detect(name: "Codex YOLO") == .codex)
     #expect(AgentToolBrand.detect(name: "Claude with Chrome") == .claude)
+    #expect(AgentToolBrand.detect(name: "Pi") == .pi)
     #expect(AgentToolBrand.detect(name: "YOLO", commandLine: "/opt/homebrew/bin/codex --yolo") == .codex)
     #expect(AgentToolBrand.detect(name: "Example") == nil)
+}
+
+@Test func piBrandUsesOfficialLogoResource() {
+    #expect(AgentToolBrand.pi.logoResourceName == "pi")
 }
 
 @Test func defaultSidebarAgentTitleUsesCanonicalBrandName() {

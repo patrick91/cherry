@@ -65,7 +65,8 @@ enum AgentToolBrand: String, Equatable {
         case .claude: "claude"
         case .codex: "openai"
         case .gemini: "gemini"
-        case .openCode, .pi: nil
+        case .pi: "pi"
+        case .openCode: nil
         }
     }
 

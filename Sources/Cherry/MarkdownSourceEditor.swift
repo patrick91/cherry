@@ -9,16 +9,22 @@ enum NoteEditorStyle {
     case document
 
     var contentWidth: CGFloat {
-        self == .document ? 716 : 740
+        self == .document ? 880 : 740
     }
 
-    /// Minimum inset from the pane edge to the marker gutter.
+    /// Minimum inset from the pane edge to the marker gutter. The text edge sits at
+    /// `horizontalInset + textGutter`, which is what the eye reads as the left margin.
     var horizontalInset: CGFloat {
-        self == .document ? 12 : 32
+        self == .document ? 6 : 32
+    }
+
+    /// Right margin on narrow panes; matches the visible left text margin.
+    var trailingInset: CGFloat {
+        self == .document ? horizontalInset + textGutter : 32
     }
 
     var verticalInset: CGFloat {
-        self == .document ? 14 : 24
+        self == .document ? 26 : 24
     }
 
     var headerSpacing: CGFloat {
@@ -40,6 +46,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     var themeColors: TerminalThemeColors?
     var maxContentWidth: CGFloat = 740
     var minHorizontalInset: CGFloat = 32
+    /// Right-edge inset when the pane is narrower than the content width; nil mirrors the left.
+    var trailingInset: CGFloat? = nil
     var verticalInset: CGFloat = 24
     var headerSpacing: CGFloat = 24
     var header: AnyView? = nil
@@ -99,6 +107,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         let documentView = MarkdownDocumentView(textView: textView)
         documentView.maxContentWidth = maxContentWidth
         documentView.minHorizontalInset = minHorizontalInset
+        documentView.trailingInset = trailingInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
         documentView.centersContent = style.centersContent
@@ -120,6 +129,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         guard let documentView = scrollView.documentView as? MarkdownDocumentView else { return }
         documentView.maxContentWidth = maxContentWidth
         documentView.minHorizontalInset = minHorizontalInset
+        documentView.trailingInset = trailingInset
         documentView.verticalInset = verticalInset
         documentView.headerSpacing = headerSpacing
         documentView.centersContent = style.centersContent
@@ -759,6 +769,7 @@ final class MarkdownDocumentView: NSView {
 
     var maxContentWidth: CGFloat = 740
     var minHorizontalInset: CGFloat = 32
+    var trailingInset: CGFloat?
     var verticalInset: CGFloat = 24
     var headerSpacing: CGFloat = 24
     var centersContent: Bool = true
@@ -812,7 +823,8 @@ final class MarkdownDocumentView: NSView {
         let horizontal = centersContent
             ? max(minHorizontalInset, (availableWidth - maxContentWidth) / 2)
             : minHorizontalInset
-        let contentWidth = min(maxContentWidth, max(0, availableWidth - horizontal * 2))
+        let trailing = centersContent ? horizontal : (trailingInset ?? horizontal)
+        let contentWidth = min(maxContentWidth, max(0, availableWidth - horizontal - trailing))
 
         var y: CGFloat = verticalInset
 

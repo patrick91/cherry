@@ -1183,6 +1183,7 @@ private struct NoteDetailView: View {
             themeColors: themeColors,
             maxContentWidth: NoteEditorStyle.document.contentWidth,
             minHorizontalInset: NoteEditorStyle.document.horizontalInset,
+            trailingInset: NoteEditorStyle.document.trailingInset,
             verticalInset: NoteEditorStyle.document.verticalInset,
             headerSpacing: NoteEditorStyle.document.headerSpacing,
             header: AnyView(titleHeader),

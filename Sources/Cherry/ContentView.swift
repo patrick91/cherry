@@ -1157,7 +1157,8 @@ private struct NoteDetailView: View {
     }
 
     private var themeForeground: Color {
-        Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
+        let foreground = NSColor(hexRGB: themeColors.foreground) ?? .labelColor
+        return Color(nsColor: foreground.boostedForReading(against: NSColor(hexRGB: themeColors.background)))
     }
 
     private var titleHeader: some View {
@@ -1181,6 +1182,9 @@ private struct NoteDetailView: View {
             text: $draftMarkdown,
             themeColors: themeColors,
             maxContentWidth: NoteEditorStyle.document.contentWidth,
+            minHorizontalInset: NoteEditorStyle.document.horizontalInset,
+            verticalInset: NoteEditorStyle.document.verticalInset,
+            headerSpacing: NoteEditorStyle.document.headerSpacing,
             header: AnyView(titleHeader),
             style: .document
         )

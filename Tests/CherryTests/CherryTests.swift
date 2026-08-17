@@ -12288,6 +12288,58 @@ private func serviceRecord(
     #expect(headingParagraph?.textBlocks.isEmpty == true)
 }
 
+@MainActor
+@Test func markdownLinksAreClickableButDestinationsStayEditable() {
+    let markdown = """
+    - [Sentry](https://sentry.io/issues/1/) · see https://example.com/docs, or (https://example.com/wrapped).
+    - [anchor](#local) and [file](./notes.md)
+    ```
+    https://not-a-link.example
+    ```
+    """
+    let textStorage = NSTextStorage()
+    let layoutManager = MarkdownLayoutManager()
+    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
+    layoutManager.addTextContainer(textContainer)
+    textStorage.addLayoutManager(layoutManager)
+    let textView = NSTextView(
+        frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
+        textContainer: textContainer
+    )
+    let coordinator = MarkdownSourceEditor.Coordinator(
+        text: .constant(""),
+        themeColors: nil,
+        bodyFontSize: 15,
+        useMonospacedFont: false,
+        style: .document
+    )
+    textView.string = markdown
+    coordinator.applyHighlighting(to: textView)
+
+    let nsMarkdown = markdown as NSString
+    func link(at range: NSRange) -> URL? {
+        var effective = NSRange()
+        return textStorage.attribute(.link, at: range.location, effectiveRange: &effective) as? URL
+    }
+    func linkedRange(containing text: String) -> NSRange? {
+        var effective = NSRange()
+        let range = nsMarkdown.range(of: text)
+        guard textStorage.attribute(.link, at: range.location, effectiveRange: &effective) != nil else { return nil }
+        return effective
+    }
+
+    #expect(link(at: nsMarkdown.range(of: "Sentry"))?.absoluteString == "https://sentry.io/issues/1/")
+    #expect(link(at: nsMarkdown.range(of: "sentry.io/issues/1/")) == nil)
+
+    #expect(link(at: nsMarkdown.range(of: "example.com/docs"))?.absoluteString == "https://example.com/docs")
+    #expect(linkedRange(containing: "example.com/docs")?.length == "https://example.com/docs".utf16.count)
+    #expect(link(at: nsMarkdown.range(of: "example.com/wrapped"))?.absoluteString == "https://example.com/wrapped")
+
+    #expect(link(at: nsMarkdown.range(of: "anchor")) == nil)
+    #expect(link(at: nsMarkdown.range(of: "file")) == nil)
+    #expect(link(at: nsMarkdown.range(of: "not-a-link")) == nil)
+}
+
 private extension Data {
     init(hexEncoded string: String) {
         self.init()

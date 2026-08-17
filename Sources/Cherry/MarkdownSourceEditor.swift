@@ -12,6 +12,19 @@ enum NoteEditorStyle {
         self == .document ? 716 : 740
     }
 
+    /// Minimum inset from the pane edge to the marker gutter.
+    var horizontalInset: CGFloat {
+        self == .document ? 12 : 32
+    }
+
+    var verticalInset: CGFloat {
+        self == .document ? 14 : 24
+    }
+
+    var headerSpacing: CGFloat {
+        self == .document ? 16 : 24
+    }
+
     /// Left gutter that syntax markers hang into so text sits flush.
     var textGutter: CGFloat {
         self == .document ? 36 : 0
@@ -52,6 +65,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.drawsBackground = false
         scrollView.autohidesScrollers = true
+        // The pane sits under the transparent titlebar; without this AppKit pads
+        // the content down by the titlebar height.
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         let textStorage = NSTextStorage()
         let layoutManager = MarkdownLayoutManager()
@@ -75,6 +92,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.delegate = context.coordinator
+        textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
         textView.defaultParagraphStyle = context.coordinator.bodyParagraphStyle
         textView.typingAttributes = context.coordinator.baseAttributes
 
@@ -164,6 +182,20 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             scrollSelectionIntoView(in: textView)
         }
 
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            let url: URL?
+            if let value = link as? URL {
+                url = value
+            } else if let value = link as? String {
+                url = URL(string: value)
+            } else {
+                url = nil
+            }
+            guard let url else { return false }
+            NSWorkspace.shared.open(url)
+            return true
+        }
+
         private func scrollSelectionIntoView(in textView: NSTextView) {
             guard let layoutManager = textView.layoutManager,
                   let textContainer = textView.textContainer,
@@ -240,7 +272,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         }
 
         private var foregroundColor: NSColor {
-            themeColors.flatMap { NSColor(hexRGB: $0.foreground) } ?? .labelColor
+            let raw = themeColors.flatMap { NSColor(hexRGB: $0.foreground) } ?? .labelColor
+            guard style == .document else { return raw }
+            let background = themeColors.flatMap { NSColor(hexRGB: $0.background) }
+            return raw.boostedForReading(against: background)
         }
 
         private func paletteColor(_ index: Int) -> NSColor? {
@@ -363,7 +398,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private static let boldPattern = #"(\*\*|__)([^\n]+?)(\*\*|__)"#
         private static let italicPattern = #"(?<!\*)(\*)([^\n*]+?)(\*)(?!\*)"#
         private static let inlineCodePattern = #"(`)([^`\n]+)(`)"#
-        private static let linkPattern = #"(\[)([^\]\n]+)(\]\([^\)\n]+\))"#
+        private static let linkPattern = #"(\[)([^\]\n]+)(\]\()([^\)\n]+)(\))"#
+        private static let bareURLPattern = #"(?<![\w/])(?:https?://|cherry://|file://|mailto:)[^\s<>"'`\)\]]+"#
         private static let headingMarkerPattern = #"(?m)^(#{1,6}[ \t])"#
         private static let fenceLinePattern = #"(?m)^(`{3}.*)$"#
         private static let fencedBlockPattern = #"(?m)^```[\s\S]*?^```"#
@@ -389,6 +425,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 }
             }
 
+            applyLinks(to: storage, text: text, nsText: nsText, fencedCodeRanges: fencedCodeRanges)
+
             if style == .document {
                 applyFlushLayout(
                     to: storage,
@@ -397,6 +435,68 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                     fencedCodeRanges: fencedCodeRanges
                 )
             }
+        }
+
+        /// Marks markdown link labels and bare URLs with `.link` so a click opens them.
+        /// Link destinations inside `](...)` stay plain so the URL is still click-editable.
+        private func applyLinks(
+            to storage: NSTextStorage,
+            text: String,
+            nsText: NSString,
+            fencedCodeRanges: [NSRange]
+        ) {
+            let fullRange = NSRange(location: 0, length: nsText.length)
+            func isInsideFencedCode(_ range: NSRange) -> Bool {
+                fencedCodeRanges.contains { NSIntersectionRange($0, range).length > 0 }
+            }
+
+            var markdownLinkRanges: [NSRange] = []
+            if let regex = try? NSRegularExpression(pattern: Self.linkPattern) {
+                for match in regex.matches(in: text, range: fullRange) {
+                    let labelRange = match.range(at: 2)
+                    let destinationRange = match.range(at: 4)
+                    guard labelRange.location != NSNotFound,
+                          destinationRange.location != NSNotFound,
+                          !isInsideFencedCode(match.range)
+                    else { continue }
+                    markdownLinkRanges.append(match.range)
+                    guard let url = Self.linkURL(from: nsText.substring(with: destinationRange)) else { continue }
+                    storage.addAttribute(.link, value: url, range: labelRange)
+                }
+            }
+
+            guard let regex = try? NSRegularExpression(pattern: Self.bareURLPattern) else { return }
+            let urlColor = paletteColor(4) ?? paletteColor(12) ?? .linkColor
+            for match in regex.matches(in: text, range: fullRange) {
+                var range = match.range
+                guard range.location != NSNotFound,
+                      !isInsideFencedCode(range),
+                      !markdownLinkRanges.contains(where: { NSIntersectionRange($0, range).length > 0 })
+                else { continue }
+                // Trailing sentence punctuation is almost never part of the URL.
+                while range.length > 0,
+                      ".,;:!?".contains(Character(nsText.substring(with: NSRange(location: range.location + range.length - 1, length: 1)))) {
+                    range.length -= 1
+                }
+                guard range.length > 0,
+                      let url = Self.linkURL(from: nsText.substring(with: range))
+                else { continue }
+                storage.addAttributes([.link: url, .foregroundColor: urlColor], range: range)
+            }
+        }
+
+        /// Only destinations with a scheme are opened; `#anchor` / relative paths are left alone.
+        private static func linkURL(from destination: String) -> URL? {
+            var candidate = destination.trimmingCharacters(in: .whitespaces)
+            if candidate.hasPrefix("<"), candidate.hasSuffix(">"), candidate.count >= 2 {
+                candidate = String(candidate.dropFirst().dropLast())
+            }
+            // `[label](url "title")` — drop the optional title.
+            if let space = candidate.firstIndex(where: \.isWhitespace) {
+                candidate = String(candidate[..<space])
+            }
+            guard let url = URL(string: candidate), url.scheme != nil else { return nil }
+            return url
         }
 
         private static func fencedCodeRanges(in text: String, range: NSRange) -> [NSRange] {
@@ -436,11 +536,16 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private func documentRules() -> [Rule] {
             let fg = foregroundColor
             let accent = paletteColor(4) ?? paletteColor(12) ?? .controlAccentColor
-            let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: fg.withAlphaComponent(0.26)]
-            let quoteColor = fg.withAlphaComponent(0.62)
-            let chipColor = fg.withAlphaComponent(0.08)
-            let bulletColor = fg.withAlphaComponent(0.4)
-            let linkAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: accent]
+            let markerAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: fg.withAlphaComponent(0.4)]
+            let quoteColor = fg.withAlphaComponent(0.7)
+            let chipColor = fg.withAlphaComponent(0.09)
+            let bulletColor = fg.withAlphaComponent(0.55)
+            let linkAttributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: accent,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: accent.withAlphaComponent(0.45)
+            ]
+            let linkDestinationAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: fg.withAlphaComponent(0.55)]
 
             let fencedBlockAttributes: [NSAttributedString.Key: Any] = [
                 .foregroundColor: fg.withAlphaComponent(0.9),
@@ -471,7 +576,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 Rule(pattern: Coordinator.fenceLinePattern, captureGroup: 1, attributes: markerAttributes, skipsFencedCode: false),
                 Rule(pattern: Coordinator.linkPattern, captureGroup: 2, attributes: linkAttributes),
                 Rule(pattern: Coordinator.linkPattern, captureGroup: 1, attributes: markerAttributes),
-                Rule(pattern: Coordinator.linkPattern, captureGroup: 3, attributes: markerAttributes)
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 3, attributes: markerAttributes),
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 4, attributes: linkDestinationAttributes),
+                Rule(pattern: Coordinator.linkPattern, captureGroup: 5, attributes: markerAttributes)
             ]
         }
 
@@ -549,6 +656,24 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 }
             }
         }
+    }
+}
+
+extension NSColor {
+    /// Terminal-theme foregrounds are tuned for a text grid and often sit at a
+    /// soft gray; prose wants a crisper contrast. Pulls the color part-way toward
+    /// white (on dark backgrounds) or black (on light ones).
+    func boostedForReading(against background: NSColor?, amount: CGFloat = 0.5) -> NSColor {
+        guard let background else { return self }
+        let pole: NSColor = background.relativeLuminance < 0.5 ? .white : .black
+        guard let base = usingColorSpace(.sRGB), let target = pole.usingColorSpace(.sRGB) else { return self }
+        func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * amount }
+        return NSColor(
+            srgbRed: mix(base.redComponent, target.redComponent),
+            green: mix(base.greenComponent, target.greenComponent),
+            blue: mix(base.blueComponent, target.blueComponent),
+            alpha: base.alphaComponent
+        )
     }
 }
 

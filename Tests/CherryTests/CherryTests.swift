@@ -7612,6 +7612,27 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(indicatorSource.contains("SidebarAgentWorkingIndicatorView.viewSize"))
 }
 
+@Test func attentionToolsMenuDoesNotObserveLiveTerminalSession() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let repoRoot = testFile
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let sourceURL = repoRoot.appending(path: "Sources/Cherry/ContentView.swift")
+    let source = String(decoding: try Data(contentsOf: sourceURL), as: UTF8.self)
+
+    let start = try #require(source.range(of: "private struct AttentionToolsMenu"))
+    let end = try #require(source.range(
+        of: "@MainActor\nprivate enum AttentionDebugPresenter",
+        range: start.upperBound..<source.endIndex
+    ))
+    let menuSource = String(source[start.lowerBound..<end.lowerBound])
+
+    #expect(!menuSource.contains("@ObservedObject"))
+    #expect(menuSource.contains("let prediction: TerminalAttentionPrediction?"))
+    #expect(menuSource.contains("let currentTag: TerminalAttentionCorrection?"))
+}
+
 @MainActor
 @Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
     let session = TerminalSession(

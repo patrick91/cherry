@@ -10344,18 +10344,26 @@ private struct RoundedTerminalSplitPaneModifier: ViewModifier {
 }
 
 private struct AttentionToolsMenu: View {
-    @ObservedObject var session: TerminalSession
+    let session: TerminalSession
+    let prediction: TerminalAttentionPrediction?
+    let currentTag: TerminalAttentionCorrection?
+
+    init(session: TerminalSession) {
+        self.session = session
+        prediction = session.attentionClassifierPrediction
+        currentTag = session.currentAttentionScreenTag
+    }
 
     var body: some View {
         Button(currentLabelTitle) {}
             .disabled(true)
 
-        if let prediction = session.attentionClassifierPrediction,
-           session.currentAttentionScreenTag != nil {
+        if let prediction,
+           currentTag != nil {
             Button(modelLabelTitle(prediction)) {}
                 .disabled(true)
         }
-        if let prediction = session.attentionClassifierPrediction {
+        if let prediction {
             Button("Show Attention Debug...") {
                 AttentionDebugPresenter.present(prediction)
             }
@@ -10387,15 +10395,15 @@ private struct AttentionToolsMenu: View {
     }
 
     private func menuTitle(for correction: TerminalAttentionCorrection) -> String {
-        let checkmark = session.currentAttentionScreenTag == correction ? "✓ " : ""
+        let checkmark = currentTag == correction ? "✓ " : ""
         return checkmark + correction.title
     }
 
     private var currentLabelTitle: String {
-        if let tag = session.currentAttentionScreenTag {
+        if let tag = currentTag {
             return "Current label: \(tag.title) (manual)"
         }
-        if let prediction = session.attentionClassifierPrediction {
+        if let prediction {
             return "Current label: \(prediction.displayName) (\(prediction.confidenceDescription), model)"
         }
         return "Current label: Not tagged"

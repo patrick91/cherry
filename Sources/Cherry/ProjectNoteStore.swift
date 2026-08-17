@@ -27,6 +27,18 @@ private final class ProjectNotePersistence: @unchecked Sendable {
         queue.sync {}
     }
 
+    func loadSynchronously(projectRoot: String) -> [ProjectNote] {
+        queue.sync {
+            guard let data = try? Data(contentsOf: fileURL) else { return [] }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let decoded = try? decoder.decode([ProjectNote].self, from: data) else { return [] }
+            return decoded
+                .filter { $0.projectRoot == projectRoot }
+                .sorted(by: projectNoteDisplayOrder)
+        }
+    }
+
     private static func write(_ notes: [ProjectNote], to fileURL: URL) throws {
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(),
@@ -43,23 +55,26 @@ private final class ProjectNotePersistence: @unchecked Sendable {
 @MainActor
 final class ProjectNoteStore: ObservableObject {
     @Published private(set) var notes: [ProjectNote] = []
+    @Published private(set) var isLoading = false
 
     let projectRoot: String
-    private let fileURL: URL
     private let persistence: ProjectNotePersistence
-    private let decoder = JSONDecoder()
+    private var backgroundLoadTask: Task<Void, Never>?
 
     init(
         projectRoot: String,
-        storageDirectory: URL = ProjectNoteStore.defaultStorageDirectory()
+        storageDirectory: URL = ProjectNoteStore.defaultStorageDirectory(),
+        loadsInBackground: Bool = false
     ) {
         self.projectRoot = projectRoot
         let fileURL = storageDirectory
             .appendingPathComponent(Self.projectStorageName(projectRoot: projectRoot), isDirectory: false)
-        self.fileURL = fileURL
         persistence = ProjectNotePersistence(fileURL: fileURL)
-        decoder.dateDecodingStrategy = .iso8601
-        load()
+        if loadsInBackground {
+            loadInBackground()
+        } else {
+            load()
+        }
     }
 
     static func defaultStorageDirectory() -> URL {
@@ -78,6 +93,7 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     func create(title: String, markdown: String) throws -> ProjectNote {
+        try requireLoaded()
         let now = Date()
         let note = ProjectNote(
             id: UUID(),
@@ -94,6 +110,7 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     func update(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
+        try requireLoaded()
         let note = try mutate(id: id, title: title, markdown: markdown)
         try save()
         return note
@@ -102,6 +119,7 @@ final class ProjectNoteStore: ObservableObject {
     /// Editor autosaves update observable state immediately but keep JSON
     /// encoding and atomic disk I/O off the main actor.
     func updateFromEditor(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
+        try requireLoaded()
         let note = try mutate(id: id, title: title, markdown: markdown)
         persistence.saveInBackground(notes)
         return note
@@ -125,6 +143,7 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     func delete(id: UUID) throws {
+        try requireLoaded()
         let originalCount = notes.count
         notes.removeAll { $0.id == id }
         guard notes.count != originalCount else {
@@ -134,6 +153,7 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     func note(id: UUID) throws -> ProjectNote {
+        try requireLoaded()
         guard let note = notes.first(where: { $0.id == id }) else {
             throw CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
         }
@@ -141,14 +161,22 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? decoder.decode([ProjectNote].self, from: data)
-        else {
-            notes = []
-            return
+        notes = persistence.loadSynchronously(projectRoot: projectRoot)
+    }
+
+    private func loadInBackground() {
+        isLoading = true
+        let persistence = persistence
+        let projectRoot = projectRoot
+        backgroundLoadTask = Task { @MainActor [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) {
+                persistence.loadSynchronously(projectRoot: projectRoot)
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            self.notes = loaded
+            self.isLoading = false
+            self.backgroundLoadTask = nil
         }
-        notes = decoded.filter { $0.projectRoot == projectRoot }
-        sortNotes()
     }
 
     private func save() throws {
@@ -160,15 +188,26 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     private func sortNotes() {
-        notes.sort { lhs, rhs in
-            if lhs.updatedAt == rhs.updatedAt {
-                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
-            }
-            return lhs.updatedAt > rhs.updatedAt
+        notes.sort(by: projectNoteDisplayOrder)
+    }
+
+    private func requireLoaded() throws {
+        guard !isLoading else {
+            throw CherryControlError(
+                code: "notes_loading",
+                message: "Cherry is still loading this project's notes."
+            )
         }
     }
 
     private func normalizedTitle(_ title: String) -> String {
         title.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+}
+
+private func projectNoteDisplayOrder(_ lhs: ProjectNote, _ rhs: ProjectNote) -> Bool {
+    if lhs.updatedAt == rhs.updatedAt {
+        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+    }
+    return lhs.updatedAt > rhs.updatedAt
 }

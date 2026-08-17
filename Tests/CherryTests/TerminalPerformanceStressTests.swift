@@ -1,6 +1,8 @@
 import AppKit
+import CherryControl
 import Darwin
 import Foundation
+import SwiftUI
 import Testing
 @testable import Cherry
 
@@ -96,6 +98,95 @@ import Testing
             result,
             extra: "lines=\(session.lineCount) rawBytes=\(rawOutput.data.count) truncated=\(rawOutput.truncated)"
         )
+    }
+
+    @MainActor
+    @Test func sidebarSwitchesWorkspacesWithLargeNoteCollection() throws {
+        guard TerminalPerfHarness.isEnabled else { return }
+        let scale = TerminalPerfHarness.scale
+        let noteCount = switch scale.name {
+        case "smoke": 500
+        case "soak": 5_000
+        default: 2_000
+        }
+        let switchCount = switch scale.name {
+        case "smoke": 20
+        case "soak": 200
+        default: 80
+        }
+        let projectRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CherryLargeNotes-\(UUID().uuidString)", isDirectory: true)
+        let noteStorage = projectRoot.appendingPathComponent("notes", isDirectory: true)
+        let todoStorage = projectRoot.appendingPathComponent("todos", isDirectory: true)
+        try FileManager.default.createDirectory(at: noteStorage, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        try "[features]\nnotes = true\n".write(
+            to: projectRoot.appendingPathComponent("cherry.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let now = Date()
+        let markdown = String(repeating: "Large note body for sidebar performance.\n", count: 32)
+        let notes = (0..<noteCount).map { index in
+            ProjectNote(
+                id: UUID(),
+                projectRoot: projectRoot.path,
+                title: "Performance note \(index)",
+                markdown: markdown,
+                createdAt: now.addingTimeInterval(-Double(index)),
+                updatedAt: now.addingTimeInterval(-Double(index))
+            )
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let noteData = try encoder.encode(notes)
+        try noteData.write(
+            to: noteStorage.appendingPathComponent(
+                ProjectNoteStore.projectStorageName(projectRoot: projectRoot.path)
+            )
+        )
+
+        let noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: noteStorage)
+        let todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todoStorage)
+        let firstWorkspace = TerminalWorkspace(projectRoot: projectRoot.path, createInitialSession: false)
+        let secondWorkspace = TerminalWorkspace(projectRoot: projectRoot.path, createInitialSession: false)
+        let repository = RepositoryWorkspace(projectRoot: projectRoot.path)
+        let selection = LargeNoteSidebarSelection(workspace: firstWorkspace)
+        let chromeState = ProjectWindowChromeState()
+        let rootView = LargeNoteSidebarHost(
+            repository: repository,
+            selection: selection,
+            chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore
+        )
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        hostingView.layoutSubtreeIfNeeded()
+
+        let result = TerminalPerfHarness.measure(
+            name: "sidebar-large-notes-workspace-switch",
+            bytes: noteData.count,
+            metadata: "\(scale.description) notes=\(noteCount) switches=\(switchCount)"
+        ) {
+            for index in 0..<switchCount {
+                selection.workspace = index.isMultiple(of: 2) ? secondWorkspace : firstWorkspace
+                hostingView.layoutSubtreeIfNeeded()
+            }
+        }
+
+        window.close()
+        repository.closeAllSessions()
+        TerminalPerfHarness.printResult(result)
     }
 
     @MainActor
@@ -297,6 +388,54 @@ import Testing
         TerminalPerfHarness.printResult(
             result,
             extra: "sessions=\(scale.smallOutputSessionCount) chunksPerSession=\(scale.smallOutputChunksPerSession) rawChunks=\(retainedChunks) rawBytes=\(retainedRawBytes) truncatedSessions=\(truncatedCount)"
+        )
+    }
+}
+
+@MainActor
+private final class LargeNoteSidebarSelection: ObservableObject {
+    @Published var workspace: TerminalWorkspace
+
+    init(workspace: TerminalWorkspace) {
+        self.workspace = workspace
+    }
+}
+
+private struct LargeNoteSidebarHost: View {
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var selection: LargeNoteSidebarSelection
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    @State private var storedSidebarWidth = 320.0
+
+    init(
+        repository: RepositoryWorkspace,
+        selection: LargeNoteSidebarSelection,
+        chromeState: ProjectWindowChromeState,
+        noteStore: ProjectNoteStore,
+        todoStore: ProjectTodoStore
+    ) {
+        self.repository = repository
+        self.selection = selection
+        self.chromeState = chromeState
+        self.noteStore = noteStore
+        self.todoStore = todoStore
+    }
+
+    var body: some View {
+        ContentView(
+            repository: repository,
+            workspace: selection.workspace,
+            chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
+            projectRoot: selection.workspace.projectRoot,
+            openProject: { _ in },
+            isSidebarHidden: $chromeState.isSidebarHidden,
+            isSidebarRevealed: $chromeState.isSidebarRevealed,
+            isCursorOverSidebar: $chromeState.isCursorOverSidebar,
+            storedSidebarWidth: $storedSidebarWidth
         )
     }
 }

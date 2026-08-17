@@ -2036,6 +2036,49 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func projectNoteStoreCanLoadLargeCollectionsOffTheMainActor() async throws {
+    let projectRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let storageRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: projectRoot)
+        try? FileManager.default.removeItem(at: storageRoot)
+    }
+
+    let now = Date()
+    let notes = (0..<1_000).map { index in
+        ProjectNote(
+            id: UUID(),
+            projectRoot: projectRoot.path,
+            title: "Note \(index)",
+            markdown: String(repeating: "Body \(index)\n", count: 32),
+            createdAt: now.addingTimeInterval(-Double(index)),
+            updatedAt: now.addingTimeInterval(-Double(index))
+        )
+    }
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let fileURL = storageRoot.appendingPathComponent(
+        ProjectNoteStore.projectStorageName(projectRoot: projectRoot.path)
+    )
+    try encoder.encode(notes).write(to: fileURL)
+
+    let store = ProjectNoteStore(
+        projectRoot: projectRoot.path,
+        storageDirectory: storageRoot,
+        loadsInBackground: true
+    )
+    #expect(store.isLoading)
+    #expect(store.notes.isEmpty)
+    #expect(await waitForCondition(timeout: 5) { !store.isLoading })
+    #expect(store.notes.count == notes.count)
+    #expect(store.notes.first?.id == notes.first?.id)
+}
+
+@MainActor
 @Test func projectTodoStorePersistsProjectTodosAndComments() async throws {
     let projectRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

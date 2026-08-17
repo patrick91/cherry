@@ -4507,7 +4507,6 @@ private struct SidebarTabsView: View {
                         openProject: openProject
                     )
                     .equatable()
-                    .id(targetRoot)
                     .offset(x: targetPageOffset)
                     .allowsHitTesting(false)
                 }
@@ -4522,7 +4521,6 @@ private struct SidebarTabsView: View {
                     openProject: openProject
                 )
                 .equatable()
-                .id(displayedSourceRoot)
                 .offset(x: swipeState.offset)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4643,7 +4641,7 @@ private struct SidebarTabsPage: View {
             presentation: presentation
         )
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 12) {
                 SidebarAgentSessionSection(
                     settings: agentSettings,
                     workspace: workspace,
@@ -4657,6 +4655,7 @@ private struct SidebarTabsPage: View {
                     showShortcutHints: chromeState.isCommandKeyPressed,
                     openSettings: { openSettings() }
                 )
+                .id("agents-\(projectRoot ?? "")")
 
                 SidebarSessionSection(
                     title: "Terminals",
@@ -4670,6 +4669,7 @@ private struct SidebarTabsPage: View {
                     shortcutStartIndex: visibleAgentItems.count,
                     showShortcutHints: chromeState.isCommandKeyPressed
                 )
+                .id("terminals-\(projectRoot ?? "")")
 
                 SidebarCommandSection(
                     settings: agentSettings,
@@ -4682,6 +4682,7 @@ private struct SidebarTabsPage: View {
                     shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
                     showShortcutHints: chromeState.isCommandKeyPressed
                 )
+                .id("commands-\(projectRoot ?? "")")
 
                 if features.todosEnabled {
                     SidebarTodosSection(
@@ -4702,8 +4703,7 @@ private struct SidebarTabsPage: View {
                     SidebarNotesSection(
                         noteStore: noteStore,
                         chromeState: chromeState,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
+                        selectedNoteID: chromeState.selectedNoteID,
                         palette: palette,
                         shortcutStartIndex: visibleAgentItems.count
                             + workspace.terminalDisplayItems.count
@@ -4711,6 +4711,7 @@ private struct SidebarTabsPage: View {
                             + (features.todosEnabled ? 1 : 0),
                         showShortcutHints: chromeState.isCommandKeyPressed
                     )
+                    .equatable()
                 }
             }
             // Keep the sidebar's text column aligned with the native
@@ -5757,17 +5758,30 @@ private struct SidebarCommandSection: View {
     }
 }
 
-private struct SidebarNotesSection: View {
+private struct SidebarNotesSection: View, @preconcurrency Equatable {
     @ObservedObject var noteStore: ProjectNoteStore
-    @ObservedObject var chromeState: ProjectWindowChromeState
-    let projectRoot: String?
-    let presentation: SidebarPresentation
+    let chromeState: ProjectWindowChromeState
+    let selectedNoteID: UUID?
     let palette: SidebarPalette
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.noteStore === rhs.noteStore
+            && lhs.chromeState === rhs.chromeState
+            && lhs.selectedNoteID == rhs.selectedNoteID
+            && lhs.palette == rhs.palette
+            && lhs.shortcutStartIndex == rhs.shortcutStartIndex
+            && lhs.showShortcutHints == rhs.showShortcutHints
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let shortcutNumbersByNoteID = Dictionary(uniqueKeysWithValues: noteStore.notes
+            .prefix(max(0, 9 - shortcutStartIndex))
+            .enumerated()
+            .map { index, note in (note.id, shortcutStartIndex + index + 1) })
+
+        LazyVStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 SidebarSectionHeader(title: "Notes", count: noteStore.notes.count, palette: palette)
 
@@ -5779,14 +5793,18 @@ private struct SidebarNotesSection: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(noteStore.isLoading)
                 .help("New note")
             }
 
             if noteStore.notes.isEmpty {
-                SidebarEmptyRow(title: "No notes", palette: palette)
+                SidebarEmptyRow(
+                    title: noteStore.isLoading ? "Loading notes…" : "No notes",
+                    palette: palette
+                )
             } else {
-                ForEach(Array(noteStore.notes.enumerated()), id: \.element.id) { index, note in
-                    let shortcutNumber = shortcutStartIndex + index + 1
+                ForEach(noteStore.notes) { note in
+                    let shortcutNumber = shortcutNumbersByNoteID[note.id]
                     Button {
                         chromeState.selectNote(id: note.id)
                     } label: {
@@ -5810,7 +5828,7 @@ private struct SidebarNotesSection: View {
 
                             Spacer(minLength: 8)
 
-                            if showShortcutHints, shortcutNumber <= 9 {
+                            if showShortcutHints, let shortcutNumber {
                                 SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected(note), palette: palette)
                             }
                         }
@@ -5858,7 +5876,7 @@ private struct SidebarNotesSection: View {
     }
 
     private func isSelected(_ note: ProjectNote) -> Bool {
-        chromeState.selectedNoteID == note.id
+        selectedNoteID == note.id
     }
 }
 
@@ -9410,7 +9428,17 @@ private struct SidebarIconDebugResource: Identifiable {
     ]
 }
 
-private struct SidebarPalette {
+private struct SidebarPalette: Equatable {
+    private struct Signature: Equatable {
+        let themeColors: TerminalThemeColors
+        let fallbackIsDark: Bool
+        let sidebarBackgroundDepth: Double
+        let projectColor: ProjectIdentityColor?
+        let projectColorDisplayMode: String
+        let presentation: SidebarPresentation
+    }
+
+    private let signature: Signature
     let backgroundMaterial: AnyShapeStyle
     let backgroundTint: Color
     let backgroundOverlay: [Color]
@@ -9424,7 +9452,12 @@ private struct SidebarPalette {
     let selectedStroke: Color
     let selectedShadow: Color
 
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.signature == rhs.signature
+    }
+
     private init(
+        signature: Signature,
         backgroundMaterial: AnyShapeStyle,
         backgroundTint: Color,
         backgroundOverlay: [Color],
@@ -9438,6 +9471,7 @@ private struct SidebarPalette {
         selectedStroke: Color,
         selectedShadow: Color
     ) {
+        self.signature = signature
         self.backgroundMaterial = backgroundMaterial
         self.backgroundTint = backgroundTint
         self.backgroundOverlay = backgroundOverlay
@@ -9460,6 +9494,14 @@ private struct SidebarPalette {
         projectColorDisplayMode: ProjectColorDisplayMode = .accent,
         presentation: SidebarPresentation
     ) {
+        let signature = Signature(
+            themeColors: themeColors,
+            fallbackIsDark: fallbackColorScheme == .dark,
+            sidebarBackgroundDepth: sidebarBackgroundDepth,
+            projectColor: projectColor,
+            projectColorDisplayMode: projectColorDisplayMode.rawValue,
+            presentation: presentation
+        )
         let sample = SidebarThemeSample(
             themeColors: themeColors,
             fallbackColorScheme: fallbackColorScheme,
@@ -9480,6 +9522,7 @@ private struct SidebarPalette {
 
         if sample.isDark {
             self = Self(
+                signature: signature,
                 backgroundMaterial: AnyShapeStyle(sidebarBackground),
                 backgroundTint: presentation == .floating ? background.opacity(0.10) : .clear,
                 backgroundOverlay: [
@@ -9500,6 +9543,7 @@ private struct SidebarPalette {
             )
         } else {
             self = Self(
+                signature: signature,
                 backgroundMaterial: AnyShapeStyle(sidebarBackground),
                 backgroundTint: presentation == .floating ? background.opacity(0.08) : .clear,
                 backgroundOverlay: [

@@ -545,7 +545,10 @@ private struct ProjectWorkspaceView: View {
 
     init(projectRoot: String) {
         _repository = StateObject(wrappedValue: RepositoryWorkspace(projectRoot: projectRoot))
-        _noteStore = StateObject(wrappedValue: ProjectNoteStore(projectRoot: projectRoot))
+        _noteStore = StateObject(wrappedValue: ProjectNoteStore(
+            projectRoot: projectRoot,
+            loadsInBackground: true
+        ))
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
@@ -620,6 +623,11 @@ private struct ProjectWorkspaceView: View {
             // every switch.
             openPendingDeepLinks()
         }
+        .onChange(of: noteStore.isLoading) { _, isLoading in
+            if !isLoading {
+                openPendingDeepLinks()
+            }
+        }
         .onChange(of: terminalSettings.worktreeSpacesEnabled) { _, isEnabled in
             if isEnabled {
                 Task {
@@ -653,6 +661,7 @@ private struct ProjectWorkspaceView: View {
     }
 
     private func openPendingDeepLinks() {
+        guard !noteStore.isLoading else { return }
         guard let projectRoot = workspace.projectRoot else { return }
         var links = CherryDeepLinkOpenQueue.shared.consume(projectRoot: projectRoot)
         if repository.repositoryRoot != projectRoot {

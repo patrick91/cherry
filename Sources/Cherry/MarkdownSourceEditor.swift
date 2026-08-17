@@ -117,6 +117,12 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         context.coordinator.textView = textView
         context.coordinator.documentView = documentView
+        context.coordinator.appliedAppearance = Coordinator.Appearance(
+            themeColors: themeColors,
+            bodyFontSize: bodyFontSize,
+            useMonospacedFont: useMonospacedFont,
+            style: style
+        )
         context.coordinator.applyInsertionPoint(to: textView)
         context.coordinator.applySelectionColors(to: textView)
         context.coordinator.setText(text, in: textView)
@@ -138,18 +144,31 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         documentView.needsLayout = true
 
         let textView = documentView.textView
-        context.coordinator.themeColors = themeColors
-        context.coordinator.bodyFontSize = bodyFontSize
-        context.coordinator.useMonospacedFont = useMonospacedFont
-        context.coordinator.style = style
-        textView.defaultParagraphStyle = context.coordinator.bodyParagraphStyle
-        textView.typingAttributes = context.coordinator.baseAttributes
-        context.coordinator.applyInsertionPoint(to: textView)
-        context.coordinator.applySelectionColors(to: textView)
+        let coordinator = context.coordinator
+        let appearance = Coordinator.Appearance(
+            themeColors: themeColors,
+            bodyFontSize: bodyFontSize,
+            useMonospacedFont: useMonospacedFont,
+            style: style
+        )
+        let appearanceChanged = coordinator.appliedAppearance != appearance
+        coordinator.themeColors = themeColors
+        coordinator.bodyFontSize = bodyFontSize
+        coordinator.useMonospacedFont = useMonospacedFont
+        coordinator.style = style
+        if appearanceChanged {
+            coordinator.appliedAppearance = appearance
+            textView.defaultParagraphStyle = coordinator.bodyParagraphStyle
+            textView.typingAttributes = coordinator.baseAttributes
+            coordinator.applyInsertionPoint(to: textView)
+            coordinator.applySelectionColors(to: textView)
+        }
         if textView.string != text {
-            context.coordinator.setText(text, in: textView)
-        } else {
-            context.coordinator.applyHighlighting(to: textView)
+            coordinator.setText(text, in: textView)
+        } else if appearanceChanged {
+            // Unrelated SwiftUI updates (e.g. typing in the header) must not
+            // re-highlight the whole document: that repaints everything and flashes.
+            coordinator.applyHighlighting(to: textView)
         }
     }
 
@@ -163,6 +182,15 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         var useMonospacedFont: Bool
         var style: NoteEditorStyle
         private var isApplyingText = false
+
+        /// Everything that feeds into highlighting; re-highlight only when it changes.
+        struct Appearance: Equatable {
+            var themeColors: TerminalThemeColors?
+            var bodyFontSize: CGFloat
+            var useMonospacedFont: Bool
+            var style: NoteEditorStyle
+        }
+        var appliedAppearance: Appearance?
 
         init(
             text: Binding<String>,
@@ -207,6 +235,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         }
 
         private func scrollSelectionIntoView(in textView: NSTextView) {
+            // Only follow the caret while the body is being edited. Re-highlighting on
+            // unrelated SwiftUI updates (e.g. typing in the title header) re-sets the
+            // selection and would otherwise yank the scroll position to the caret.
+            guard textView.window?.firstResponder === textView else { return }
             guard let layoutManager = textView.layoutManager,
                   let textContainer = textView.textContainer,
                   let documentView,
@@ -764,7 +796,7 @@ final class MarkdownLayoutManager: NSLayoutManager {
 
 final class MarkdownDocumentView: NSView {
     let textView: NSTextView
-    private var headerHost: NSHostingView<AnyView>?
+    private var headerHost: NSHostingController<AnyView>?
     private var lastReportedContentHeight: CGFloat = 0
 
     var maxContentWidth: CGFloat = 740
@@ -801,13 +833,13 @@ final class MarkdownDocumentView: NSView {
             if let host = headerHost {
                 host.rootView = rootView
             } else {
-                let host = NSHostingView(rootView: rootView)
-                host.translatesAutoresizingMaskIntoConstraints = true
-                addSubview(host)
+                let host = NSHostingController(rootView: rootView)
+                host.view.translatesAutoresizingMaskIntoConstraints = true
+                addSubview(host.view)
                 headerHost = host
             }
         } else if let host = headerHost {
-            host.removeFromSuperview()
+            host.view.removeFromSuperview()
             headerHost = nil
         }
         needsLayout = true
@@ -829,13 +861,10 @@ final class MarkdownDocumentView: NSView {
         var y: CGFloat = verticalInset
 
         if let host = headerHost {
-            if host.frame.size.width != contentWidth {
-                host.frame.size.width = contentWidth
-            }
-            host.layoutSubtreeIfNeeded()
-            let height = host.fittingSize.height
-            host.frame = NSRect(x: horizontal, y: y, width: contentWidth, height: height)
-            y = host.frame.maxY + headerSpacing
+            // Size for the actual column width so a wrapping title reports its full height.
+            let height = host.sizeThatFits(in: NSSize(width: contentWidth, height: .greatestFiniteMagnitude)).height
+            host.view.frame = NSRect(x: horizontal, y: y, width: contentWidth, height: height)
+            y = host.view.frame.maxY + headerSpacing
         }
 
         if textView.frame.origin.x != horizontal || textView.frame.origin.y != y {

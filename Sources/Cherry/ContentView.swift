@@ -1163,8 +1163,9 @@ private struct NoteDetailView: View {
 
     private var titleHeader: some View {
         VStack(alignment: .leading, spacing: 6) {
-            TextField("Untitled", text: $draftTitle)
+            TextField("Untitled", text: $draftTitle, axis: .vertical)
                 .textFieldStyle(.plain)
+                .lineLimit(1...)
                 .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(themeForeground)
                 .onSubmit { saveNow() }
@@ -1196,7 +1197,15 @@ private struct NoteDetailView: View {
                 copyCherryLink(cherryLink(for: note))
             }
         }
-        .onChange(of: draftTitle) { _, _ in scheduleSave() }
+        .onChange(of: draftTitle) { _, title in
+            // The title wraps for display but stays a single line of text.
+            if title.contains(where: \.isNewline) {
+                draftTitle = title.replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\r", with: " ")
+                return
+            }
+            scheduleSave()
+        }
         .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
         .onChange(of: note.id) { _, _ in
             pendingSave?.cancel()

@@ -139,7 +139,11 @@ struct TerminalAttentionNotificationGate {
     }
 
     mutating func acknowledge() {
-        isEpisodeActive = false
+        // Viewing an attention result consumes the current episode. Keep the
+        // gate closed until the classifier leaves attention-needed; otherwise
+        // a debounced observation of the same completed screen can notify as
+        // soon as the user switches away.
+        isEpisodeActive = true
     }
 }
 

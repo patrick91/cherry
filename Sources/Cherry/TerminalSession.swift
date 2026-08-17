@@ -2224,6 +2224,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
     private var attentionObservationTask: Task<Void, Never>?
     private var acknowledgedAttentionAlertGeneration = 0
+    private var isAttentionEpisodeActive = false
     private var attentionNotificationGate = TerminalAttentionNotificationGate()
     private var currentAttentionScreenTagObservationID: UUID?
     private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
@@ -3081,6 +3082,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         attentionAlertGeneration = 0
         acknowledgedAttentionAlertGeneration = 0
         hasUnacknowledgedAttention = false
+        isAttentionEpisodeActive = false
         attentionNotificationGate = TerminalAttentionNotificationGate()
         clearCurrentAttentionScreenTag()
         latestAttentionObservationEvent = .contentChanged
@@ -3802,22 +3804,25 @@ final class TerminalSession: ObservableObject, Identifiable {
             // The user is already handling this turn. Preserve interruption and
             // follow-up screen observations for training without surfacing a
             // new alert until the user submits another turn.
+            isAttentionEpisodeActive = prediction.needsAttention
             hasUnacknowledgedAttention = false
             attentionNotificationGate.acknowledge()
             attentionObservationRecorder?.record(observation)
             return
         }
         if prediction.needsAttention {
-            // Draft edits can cause classifier refreshes, but they are not new
-            // agent activity and must not resurrect an alert the user already
-            // acknowledged. Output, state, notification, submission, and exit
-            // events represent a fresh screen state and receive a generation.
-            if event != .inputChanged {
+            // One continuous run of attention-needed predictions is one alert
+            // episode. Acknowledging the visible result must cover later
+            // debounced observations of that same completed screen.
+            if !isAttentionEpisodeActive, event != .inputChanged {
                 attentionAlertGeneration &+= 1
+                isAttentionEpisodeActive = true
             }
             hasUnacknowledgedAttention =
-                attentionAlertGeneration > acknowledgedAttentionAlertGeneration
+                isAttentionEpisodeActive
+                && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
         } else {
+            isAttentionEpisodeActive = false
             hasUnacknowledgedAttention = false
         }
         updateAttentionNotification(for: prediction)

@@ -7557,6 +7557,12 @@ enum SidebarAgentAttentionPresentation {
     }
 }
 
+enum SidebarAgentWorkingPresentation {
+    static func shouldShow(prediction: TerminalAttentionPrediction?) -> Bool {
+        prediction?.turnState == .active && prediction?.needsAttention == false
+    }
+}
+
 private struct SidebarAgentAttentionIndicator: View {
     let prediction: TerminalAttentionPrediction
 
@@ -7729,7 +7735,9 @@ private struct SidebarTabRow: View {
                           isFocused: isSelected
                       ) {
                 SidebarAgentAttentionIndicator(prediction: prediction)
-            } else if rowState.agentActivityState.showsWorkingIndicator {
+            } else if SidebarAgentWorkingPresentation.shouldShow(
+                prediction: rowState.attentionClassifierPrediction
+            ) {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 

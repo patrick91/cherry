@@ -298,15 +298,16 @@ Swift. The classifier runs locally for every agent session even when bulk study
 collection is disabled, so the standard native Ghostty path remains available.
 No MLX dependency is needed for the 47-parameter logistic regression.
 
-The sidebar uses the model only for its attention state:
+The sidebar uses the model for the agent's turn presentation:
 
 - a pink exclamation means the model predicts `attention_needed`;
 - the existing hand remains the native permission indicator;
-- the existing spinner remains the native working indicator when the model does
-  not request attention.
+- the spinner appears when the model predicts `no_attention_needed` during an
+  active submitted turn.
 
-Native harness notifications are unchanged. The classifier does not create
-system notifications during this test phase.
+High-confidence attention predictions can create system notifications for
+top-level agents. Notification gating deduplicates an attention episode and
+avoids duplicating native harness notifications.
 
 The agent-tab context menu shows the current prediction and probability. Choose
 **Show Attention Debug...** to inspect the input event, native activity

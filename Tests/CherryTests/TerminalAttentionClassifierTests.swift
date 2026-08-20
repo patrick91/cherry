@@ -165,8 +165,26 @@ struct TerminalAttentionClassifierTests {
                 millisecondsSinceLastOutput: 100,
                 millisecondsSinceLastContentChange: 100,
                 millisecondsSinceLastHumanInput: 200
-            )
+            ),
+            turnState: .active
         ))
+        let completedTurnWobble = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .activityStateChanged,
+            activityState: "working",
+            evidence: "output_activity",
+            grid: ["• Result ready", "> "],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 5_000,
+            terminalFocused: false,
+            timing: .init(
+                millisecondsSinceStarted: 60_000,
+                millisecondsSinceLastOutput: 100,
+                millisecondsSinceLastContentChange: 100,
+                millisecondsSinceLastHumanInput: 5_000
+            ),
+            turnState: .completed
+        ))
+        #expect(!completedTurnWobble.needsAttention)
         var gate = TerminalAttentionNotificationGate()
 
         #expect(TerminalAttentionNotificationPolicy.shouldNotify(
@@ -215,6 +233,21 @@ struct TerminalAttentionClassifierTests {
             hasUnacknowledgedAttention: true
         )
         #expect(!acknowledgedEpisodeRefresh)
+
+        let completedTurnWobbleNotification = gate.shouldNotify(
+            prediction: completedTurnWobble,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: false
+        )
+        #expect(!completedTurnWobbleNotification)
+        let sameCompletedTurnNotification = gate.shouldNotify(
+            prediction: attention,
+            isTopLevelAgent: true,
+            hasUnreadNativeNotification: false,
+            hasUnacknowledgedAttention: true
+        )
+        #expect(!sameCompletedTurnNotification)
 
         let composingNotification = gate.shouldNotify(
             prediction: composing,
@@ -272,7 +305,7 @@ struct TerminalAttentionClassifierTests {
         #expect(prediction.modelID == TerminalAttentionClassifier.modelID)
     }
 
-    @Test func acknowledgedAlertStaysConsumedUntilClassifierLeavesAttentionEpisode() async throws {
+    @Test func acknowledgedAlertStaysConsumedThroughCompletedTurnClassifierWobble() async throws {
         var notificationProbabilities: [Double] = []
         let session = TerminalSession(
             title: "Acknowledgement fixture",
@@ -316,11 +349,29 @@ struct TerminalAttentionClassifierTests {
         #expect(!session.hasUnacknowledgedAttention)
         #expect(notificationProbabilities.count == 1)
 
-        session.noteNativeHostInput(event: returnKey)
-        session.ingestTestingData(Data("• Working (2s • esc to interrupt)\n› still working\n".utf8))
+        // A repaint/reflow can make an unchanged completed screen briefly look
+        // like fresh working output. That classifier wobble is not a new turn.
+        session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H• Working (2s • esc to interrupt)\n› still working\n".utf8))
         try await Task.sleep(for: .milliseconds(1_250))
 
         #expect(session.attentionClassifierPrediction?.needsAttention == false)
+        #expect(session.attentionClassifierPrediction?.turnState == .completed)
+
+        session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H• The completed result is still ready\n› \n".utf8))
+        session.ingestNativeNotification(title: nil, body: "Task complete")
+        try await Task.sleep(for: .milliseconds(1_250))
+
+        #expect(session.attentionClassifierPrediction?.needsAttention == true)
+        #expect(session.attentionAlertGeneration == firstGeneration)
+        #expect(!session.hasUnacknowledgedAttention)
+        #expect(notificationProbabilities.count == 1)
+
+        session.noteNativeHostInput(event: returnKey)
+        session.ingestTestingData(Data("• Working on a new turn (2s • esc to interrupt)\n› still working\n".utf8))
+        try await Task.sleep(for: .milliseconds(1_250))
+
+        #expect(session.attentionClassifierPrediction?.needsAttention == false)
+        #expect(session.attentionClassifierPrediction?.turnState == .active)
 
         session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H• A genuinely new result is ready\n› \n".utf8))
         session.ingestNativeNotification(title: nil, body: "Task complete")

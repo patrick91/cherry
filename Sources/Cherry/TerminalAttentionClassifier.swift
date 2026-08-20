@@ -115,7 +115,13 @@ struct TerminalAttentionNotificationGate {
         hasUnacknowledgedAttention: Bool
     ) -> Bool {
         guard prediction.needsAttention else {
-            isEpisodeActive = false
+            // A completed turn can briefly look active when its unchanged
+            // terminal screen is reflowed or repainted. Do not let that
+            // classifier wobble rearm a notification for the same turn. A
+            // submitted/active turn is the boundary that opens the next episode.
+            if prediction.turnState != .completed {
+                isEpisodeActive = false
+            }
             return false
         }
         guard hasUnacknowledgedAttention else { return false }

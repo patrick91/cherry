@@ -7614,6 +7614,43 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(session.agentActivityState.showsWorkingIndicator)
 }
 
+@MainActor
+@Test func renderedPiInputPromptDoesNotTurnAnIdleRepaintIntoWorkingOutput() async throws {
+    TerminalNotificationCenter.shared.isDeliveryEnabled = false
+    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
+
+    let session = TerminalSession(
+        title: "Pi",
+        subtitle: "pi",
+        tint: .systemPink,
+        launchShell: false,
+        kind: .agent,
+        agentName: "Pi"
+    )
+
+    session.applyAutomaticSummary(
+        "Finished validating authorization",
+        useAsTitle: true,
+        agentActivityState: .idle
+    )
+    #expect(session.agentActivityState == .idle)
+
+    // Pi's composer uses a plain `>` prompt. Reflowing this settled screen must
+    // not be classified as new output and then settled again by the quiet timer.
+    session.ingestTestingData(Data("""
+    Validation passed.
+
+     GPT-5.6 Sol  think:xhigh  cloud
+    ────────────────────────────────────────
+    >
+    ────────────────────────────────────────
+    """.utf8))
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(session.agentActivityState == .idle)
+    #expect(session.agentActivityEvidenceIsStrong)
+}
+
 @Test func sidebarWorkingIndicatorAvoidsSwiftUITimelineInvalidation() throws {
     let testFile = URL(fileURLWithPath: #filePath)
     let repoRoot = testFile

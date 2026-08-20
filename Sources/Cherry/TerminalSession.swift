@@ -3822,7 +3822,13 @@ final class TerminalSession: ObservableObject, Identifiable {
                 isAttentionEpisodeActive
                 && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
         } else {
-            isAttentionEpisodeActive = false
+            // Preserve a consumed/completed episode through transient classifier
+            // wobble. Native screen reflow can momentarily make an idle agent
+            // look working without any new turn or agent output. The next active
+            // turn will still clear the episode and allow its result to alert.
+            if prediction.turnState != .completed {
+                isAttentionEpisodeActive = false
+            }
             hasUnacknowledgedAttention = false
         }
         updateAttentionNotification(for: prediction)
@@ -4343,7 +4349,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             return true
         }
 
-        if normalizedAgentName == "claude" || normalizedAgentName == "gemini" {
+        if normalizedAgentName == "claude" ||
+            normalizedAgentName == "gemini" ||
+            normalizedAgentName == "pi" {
             return isPromptLine(trimmed, prompt: ">")
         }
 

@@ -9949,6 +9949,72 @@ private func waitForSummaryCallCount(
     ))
 }
 
+@Test func commandPaletteRankingPrefersExactAgentNameOverLooseCommandMatches() {
+    let pi = ResolvedAgentTool(
+        definition: AgentToolDefinition(name: "Pi", command: "pi"),
+        source: .global
+    )
+    let zed = ExternalEditorCatalog.all.first { $0.id == "zed" }!
+
+    let items = CommandPaletteRootItem.filteredItems(
+        query: "pi",
+        agents: [pi],
+        projects: [],
+        installedEditors: [InstalledEditor(
+            editor: zed,
+            bundleIdentifier: "dev.zed.Zed",
+            appURL: URL(fileURLWithPath: "/Applications/Zed.app")
+        )],
+        hasOpenProject: true,
+        supportsWorktrees: true
+    )
+
+    #expect(items.first?.id == "agent:pi")
+    #expect(items.first?.title == "Pi")
+}
+
+@Test func commandPaletteUsageLearnsFrequentlySelectedItemsWithoutDefeatingExactMatches() {
+    let pi = ResolvedAgentTool(
+        definition: AgentToolDefinition(name: "Pi", command: "pi"),
+        source: .global
+    )
+    let usageScores = ["agent:pi": 200]
+
+    let defaultItems = CommandPaletteRootItem.filteredItems(
+        query: "",
+        agents: [pi],
+        projects: [],
+        usageScores: usageScores
+    )
+    #expect(defaultItems.first?.id == "agent:pi")
+
+    let searchedItems = CommandPaletteRootItem.filteredItems(
+        query: "add project",
+        agents: [pi],
+        projects: [],
+        usageScores: usageScores
+    )
+    #expect(searchedItems.first?.id == "command:addProject")
+}
+
+@MainActor
+@Test func commandPaletteUsageStorePersistsFrequencyAndRecency() {
+    let suiteName = "CommandPaletteUsageStoreTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let selectedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let store = CommandPaletteUsageStore(defaults: defaults, storageKey: "usage")
+    store.recordSelection(id: "agent:pi", at: selectedAt)
+    store.recordSelection(id: "agent:pi", at: selectedAt.addingTimeInterval(60))
+
+    let restored = CommandPaletteUsageStore(defaults: defaults, storageKey: "usage")
+    #expect(restored.entries["agent:pi"]?.selectionCount == 2)
+    #expect(
+        restored.rankingScores(at: selectedAt.addingTimeInterval(120))["agent:pi"] == 124
+    )
+}
+
 @MainActor
 @Test func commandPaletteRootItemsExcludeProjectsUntilSearchQueryExists() async throws {
     let directory = FileManager.default.temporaryDirectory

@@ -2738,10 +2738,6 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
         }
     }
 
-    func matches(_ query: String) -> Bool {
-        CommandPaletteMatcher.matches(query: query, fields: [title, subtitle])
-    }
-
     var requiresWorktreeSupport: Bool {
         switch self {
         case .worktrees, .newWorktree, .renameWorktree, .removeWorktree, .manageWorktrees:
@@ -2754,31 +2750,149 @@ enum CommandPaletteCommand: String, CaseIterable, Identifiable {
 
 enum CommandPaletteMatcher {
     static func matches(query: String, fields: [String]) -> Bool {
-        let tokens = query
-            .split(whereSeparator: \.isWhitespace)
-            .map(String.init)
-        guard !tokens.isEmpty else { return true }
+        score(query: query, fields: fields) != nil
+    }
 
-        return tokens.allSatisfy { token in
-            fields.contains { field in
-                fieldMatches(token, in: field)
+    static func score(query: String, fields: [String]) -> Int? {
+        score(query: PreparedQuery(query), fields: fields)
+    }
+
+    static func ranked<Element>(
+        query: String,
+        items: [Element],
+        usageScores: [String: Int] = [:],
+        id: (Element) -> String,
+        fields: (Element) -> [String]
+    ) -> [Element] {
+        let preparedQuery = PreparedQuery(query)
+        return items.enumerated()
+            .compactMap { offset, item -> RankedItem<Element>? in
+                guard let matchScore = score(query: preparedQuery, fields: fields(item)) else {
+                    return nil
+                }
+                let usageScore = min(max(usageScores[id(item)] ?? 0, 0), 250)
+                return RankedItem(
+                    item: item,
+                    score: matchScore + usageScore,
+                    originalOffset: offset
+                )
             }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score {
+                    return lhs.score > rhs.score
+                }
+                return lhs.originalOffset < rhs.originalOffset
+            }
+            .map(\.item)
+    }
+
+    private struct RankedItem<Element> {
+        let item: Element
+        let score: Int
+        let originalOffset: Int
+    }
+
+    private struct PreparedQuery {
+        let tokens: [[Character]]
+
+        init(_ query: String) {
+            tokens = query
+                .split(whereSeparator: \.isWhitespace)
+                .map { Array(normalized(String($0))) }
+                .filter { !$0.isEmpty }
         }
     }
 
-    private static func fieldMatches(_ token: String, in field: String) -> Bool {
-        let normalizedToken = normalized(token)
-        guard !normalizedToken.isEmpty else { return true }
+    private struct PreparedField {
+        let characters: [Character]
+        let wordStarts: Set<Int>
 
-        let normalizedField = normalized(field)
-        var fieldIndex = normalizedField.startIndex
-        for character in normalizedToken {
-            guard let matchIndex = normalizedField[fieldIndex...].firstIndex(of: character) else {
-                return false
+        init(_ field: String) {
+            characters = Array(normalized(field))
+            var starts = Set<Int>()
+            for index in characters.indices {
+                if index == 0 || !characters[index - 1].isLetter && !characters[index - 1].isNumber {
+                    starts.insert(index)
+                }
             }
-            fieldIndex = normalizedField.index(after: matchIndex)
+            wordStarts = starts
         }
-        return true
+    }
+
+    private static func score(query: PreparedQuery, fields: [String]) -> Int? {
+        guard !query.tokens.isEmpty else { return 0 }
+        let preparedFields = fields.map(PreparedField.init)
+
+        var total = 0
+        for token in query.tokens {
+            var bestScore: Int?
+            for (fieldIndex, field) in preparedFields.enumerated() {
+                guard let fieldScore = score(token: token, in: field) else { continue }
+                let weightedScore = fieldScore - fieldIndex * 700
+                bestScore = max(bestScore ?? Int.min, weightedScore)
+            }
+            guard let bestScore else { return nil }
+            total += bestScore
+        }
+        return total
+    }
+
+    private static func score(token: [Character], in field: PreparedField) -> Int? {
+        guard !token.isEmpty else { return 0 }
+        guard token.count <= field.characters.count else { return nil }
+
+        if token == field.characters {
+            return 12_000 - field.characters.count
+        }
+
+        if field.characters.starts(with: token) {
+            return 10_000 - field.characters.count
+        }
+
+        if let start = contiguousStart(of: token, in: field.characters) {
+            let base = field.wordStarts.contains(start) ? 9_000 : 7_500
+            return base - start * 4 - field.characters.count
+        }
+
+        var positions: [Int] = []
+        positions.reserveCapacity(token.count)
+        var fieldIndex = 0
+        for character in token {
+            guard let matchIndex = field.characters[fieldIndex...].firstIndex(of: character) else {
+                return nil
+            }
+            positions.append(matchIndex)
+            fieldIndex = matchIndex + 1
+        }
+
+        var result = 4_000 - field.characters.count
+        result -= (positions.first ?? 0) * 8
+        for index in positions.indices {
+            if field.wordStarts.contains(positions[index]) {
+                result += 250
+            }
+            guard index > 0 else { continue }
+            let gap = positions[index] - positions[index - 1] - 1
+            if gap == 0 {
+                result += 180
+            } else {
+                result -= gap * 30
+            }
+        }
+        return result
+    }
+
+    private static func contiguousStart(
+        of token: [Character],
+        in field: [Character]
+    ) -> Int? {
+        guard token.count <= field.count else { return nil }
+        for start in 0...(field.count - token.count) {
+            if field[start..<(start + token.count)].elementsEqual(token) {
+                return start
+            }
+        }
+        return nil
     }
 
     private static func normalized(_ value: String) -> String {
@@ -2860,12 +2974,12 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
         installedEditors: [InstalledEditor] = [],
         defaultEditorID: String = "",
         hasOpenProject: Bool = false,
-        supportsWorktrees: Bool = false
+        supportsWorktrees: Bool = false,
+        usageScores: [String: Int] = [:]
     ) -> [CommandPaletteRootItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let commands = CommandPaletteCommand.allCases
             .filter { !$0.requiresWorktreeSupport || supportsWorktrees }
-            .filter { $0.matches(query) }
             .map(CommandPaletteRootItem.command)
         var editorItems: [CommandPaletteRootItem] = []
         if hasOpenProject,
@@ -2874,34 +2988,21 @@ enum CommandPaletteRootItem: Identifiable, Equatable {
                preferredID: defaultEditorID
            ) {
             editorItems = [.openInDefaultEditor(defaultEditor), .otherEditors]
-                .filter { item in
-                    CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                        item.title,
-                        item.subtitle
-                    ])
-                }
         }
         let matchedAgents = agents
-            .filter { agent in
-                guard !normalizedQuery.isEmpty else { return true }
-                return CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                    agent.name,
-                    agent.commandLine
-                ])
-            }
             .map(CommandPaletteRootItem.agent)
         let matchedProjects = normalizedQuery.isEmpty
             ? []
             : projects
-                .filter { project in
-                    CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                        project.name,
-                        project.root
-                    ])
-                }
                 .map(CommandPaletteRootItem.project)
 
-        return commands + editorItems + matchedAgents + matchedProjects
+        return CommandPaletteMatcher.ranked(
+            query: normalizedQuery,
+            items: commands + editorItems + matchedAgents + matchedProjects,
+            usageScores: usageScores,
+            id: \.id,
+            fields: { [$0.title, $0.subtitle] }
+        )
     }
 
     func isCurrent(selectedProjectRoot: String?) -> Bool {
@@ -2919,6 +3020,7 @@ private struct CommandPaletteOverlay: View {
     @ObservedObject var settings: AgentSettings
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject private var editorDiscovery = ExternalEditorDiscovery.shared
+    @ObservedObject private var usageStore = CommandPaletteUsageStore.shared
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
@@ -2937,6 +3039,7 @@ private struct CommandPaletteOverlay: View {
     @State private var worktreeRemovalError: String?
     @State private var isRemovingWorktree = false
     @State private var searchFocusRequest = 0
+    @State private var keyboardNavigationRequest = 0
     @State private var didAppear = false
 
     @AppStorage(CommandPaletteDesign.usesGlassKey) private var usesGlass = CommandPaletteDesign.defaultUsesGlass
@@ -2963,9 +3066,9 @@ private struct CommandPaletteOverlay: View {
                 }
 
             VStack(spacing: 0) {
-                HStack(spacing: 9) {
+                HStack(spacing: 11) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(.secondary)
 
                     CommandPaletteSearchField(
@@ -2975,15 +3078,29 @@ private struct CommandPaletteOverlay: View {
                         onSubmit: commitSelection
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                            requestSearchFocus()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 24, height: 24)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear search")
+                    }
                 }
-                .padding(.horizontal, 14)
-                .frame(height: 48)
+                .padding(.horizontal, 17)
+                .frame(height: 56)
 
                 Divider()
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(spacing: 4) {
+                        LazyVStack(spacing: 4) {
                             Color.clear
                                 .frame(height: 0)
                                 .id(Self.scrollTopMarkerID)
@@ -3009,8 +3126,10 @@ private struct CommandPaletteOverlay: View {
                         .padding(7)
                         .frame(maxWidth: .infinity, alignment: .top)
                     }
+                    .scrollIndicators(.hidden)
+                    .scrollBounceBehavior(.basedOnSize)
                     .frame(maxHeight: listMaxHeight)
-                    .onChange(of: selectedIndex) { _, _ in
+                    .onChange(of: keyboardNavigationRequest) { _, _ in
                         scrollSelectionIntoView(proxy)
                     }
                     .onChange(of: mode) { _, _ in
@@ -3026,10 +3145,15 @@ private struct CommandPaletteOverlay: View {
                     footer
                 }
             }
-            .frame(width: CGFloat(panelWidth))
-            .modifier(CommandPaletteSurface(usesGlass: usesGlass, cornerRadius: CGFloat(cornerRadius)))
+            .frame(maxWidth: CGFloat(panelWidth))
+            .modifier(CommandPaletteSurface(
+                usesGlass: usesGlass,
+                cornerRadius: CGFloat(cornerRadius),
+                colorScheme: colorScheme
+            ))
             .scaleEffect(didAppear ? 1 : 0.97, anchor: .top)
             .opacity(didAppear ? 1 : 0)
+            .padding(.horizontal, 20)
             .padding(.top, 86)
         }
         .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
@@ -3105,14 +3229,14 @@ private struct CommandPaletteOverlay: View {
 
     private var prompt: String {
         switch mode {
-        case .commands: "Command"
-        case .projects: "Project"
-        case .worktrees: "Worktree"
-        case .renameWorktree: "Worktree to Rename"
-        case .removeWorktree: "Worktree to Remove"
-        case .agents: "Agent"
-        case .agentPresets: "Agent"
-        case .editors: "Editor"
+        case .commands: "Search commands, agents, and projects…"
+        case .projects: "Search projects…"
+        case .worktrees: "Search worktrees…"
+        case .renameWorktree: "Search worktrees to rename…"
+        case .removeWorktree: "Search worktrees to remove…"
+        case .agents: "Search agents…"
+        case .agentPresets: "Search agent presets…"
+        case .editors: "Search editors…"
         }
     }
 
@@ -3174,110 +3298,110 @@ private struct CommandPaletteOverlay: View {
             installedEditors: editorDiscovery.installedEditors,
             defaultEditorID: terminalSettings.defaultEditorID,
             hasOpenProject: project.validProjectRoot != nil,
-            supportsWorktrees: repository.supportsWorktrees
+            supportsWorktrees: repository.supportsWorktrees,
+            usageScores: usageScores
         )
     }
 
     private var filteredProjects: [CherryProject] {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return settings.projects }
-        return settings.projects.filter { project in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                project.name,
-                project.root
-            ])
-        }
+        ranked(
+            settings.projects,
+            id: { "project:\($0.root)" },
+            fields: { [$0.name, $0.root] }
+        )
     }
 
     private var filteredAgents: [ResolvedAgentTool] {
         let agents = settings.resolvedProject(for: selectedProjectRoot).launchableAgents
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return agents }
-        return agents.filter { agent in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                agent.name,
-                agent.commandLine
-            ])
-        }
+        return ranked(
+            agents,
+            id: { "agent:\($0.id)" },
+            fields: { [$0.name, $0.commandLine] }
+        )
     }
 
     private var filteredWorktrees: [GitWorktree] {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return repository.worktrees }
-        return repository.worktrees.filter { worktree in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                worktree.displayName,
-                worktree.branch ?? "",
-                worktree.root
-            ])
-        }
+        ranked(
+            repository.worktrees,
+            id: { "worktree:\($0.root)" },
+            fields: { [$0.displayName, $0.branch ?? "", $0.root] }
+        )
     }
 
     private var filteredWorktreeActions: [CommandPaletteCommand] {
-        [CommandPaletteCommand.newWorktree, .renameWorktree, .removeWorktree, .manageWorktrees]
-            .filter { $0.matches(query) }
+        ranked(
+            [CommandPaletteCommand.newWorktree, .renameWorktree, .removeWorktree, .manageWorktrees],
+            id: { "command:\($0.id)" },
+            fields: { [$0.title, $0.subtitle] }
+        )
     }
 
     private var filteredRenamableWorktrees: [GitWorktree] {
         let renamable = repository.worktrees.filter(repository.canRename)
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return renamable }
-        return renamable.filter { worktree in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                worktree.displayName,
-                worktree.branch ?? "",
-                worktree.root
-            ])
-        }
+        return ranked(
+            renamable,
+            id: { "worktree:\($0.root)" },
+            fields: { [$0.displayName, $0.branch ?? "", $0.root] }
+        )
     }
 
     private var filteredRemovableWorktrees: [GitWorktree] {
         let removable = repository.worktrees.filter(repository.canRemove)
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return removable }
-        return removable.filter { worktree in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                worktree.displayName,
-                worktree.branch ?? "",
-                worktree.root
-            ])
-        }
+        return ranked(
+            removable,
+            id: { "worktree:\($0.root)" },
+            fields: { [$0.displayName, $0.branch ?? "", $0.root] }
+        )
     }
 
     private var filteredAgentPresets: [AgentToolDefinition] {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return AgentConfiguration.presets }
-        return AgentConfiguration.presets.filter { preset in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                preset.name,
-                preset.commandLine
-            ])
-        }
+        ranked(
+            AgentConfiguration.presets,
+            id: { "agent:\($0.id)" },
+            fields: { [$0.name, $0.commandLine] }
+        )
     }
 
     private var filteredEditors: [InstalledEditor] {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty else { return editorDiscovery.installedEditors }
-        return editorDiscovery.installedEditors.filter { editor in
-            CommandPaletteMatcher.matches(query: normalizedQuery, fields: [
-                editor.displayName
-            ])
-        }
+        ranked(
+            editorDiscovery.installedEditors,
+            id: { "editor:\($0.id)" },
+            fields: { [$0.displayName] }
+        )
+    }
+
+    private var usageScores: [String: Int] {
+        usageStore.rankingScores()
+    }
+
+    private func ranked<Element>(
+        _ items: [Element],
+        id: (Element) -> String,
+        fields: (Element) -> [String]
+    ) -> [Element] {
+        CommandPaletteMatcher.ranked(
+            query: query.trimmingCharacters(in: .whitespacesAndNewlines),
+            items: items,
+            usageScores: usageScores,
+            id: id,
+            fields: fields
+        )
     }
 
     @ViewBuilder
     private var commandRows: some View {
-        if filteredRootItems.isEmpty {
+        let items = filteredRootItems
+        if items.isEmpty {
             CommandPaletteEmptyRow(title: "No commands")
         } else if showsSectionHeaders {
-            ForEach(Array(groupedRootItems.enumerated()), id: \.offset) { _, group in
+            ForEach(Array(groupedRootItems(items).enumerated()), id: \.offset) { _, group in
                 CommandPaletteSectionHeader(title: group.title)
                 ForEach(group.rows, id: \.item.id) { row in
                     rootRow(index: row.offset, item: row.item)
                 }
             }
         } else {
-            ForEach(Array(filteredRootItems.enumerated()), id: \.element.id) { index, item in
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                 rootRow(index: index, item: item)
             }
         }
@@ -3293,9 +3417,9 @@ private struct CommandPaletteOverlay: View {
         let item: CommandPaletteRootItem
     }
 
-    private var groupedRootItems: [RootItemGroup] {
+    private func groupedRootItems(_ items: [CommandPaletteRootItem]) -> [RootItemGroup] {
         var groups: [RootItemGroup] = []
-        for (offset, item) in filteredRootItems.enumerated() {
+        for (offset, item) in items.enumerated() {
             let row = RootItemRow(offset: offset, item: item)
             if let lastIndex = groups.indices.last, groups[lastIndex].title == item.sectionTitle {
                 groups[lastIndex].rows.append(row)
@@ -3311,6 +3435,7 @@ private struct CommandPaletteOverlay: View {
             style: rowStyle,
             icon: item.icon,
             nsImage: rootItemImage(for: item),
+            agentIcon: rootItemAgentIcon(for: item),
             tileColor: item.tileColor,
             title: item.title,
             matchFlags: highlightFlags(for: item.title),
@@ -3541,6 +3666,7 @@ private struct CommandPaletteOverlay: View {
                 CommandPaletteRow(
                     style: rowStyle,
                     icon: "terminal",
+                    agentIcon: AgentToolIconDescriptor(agent: agent.definition),
                     tileColor: .purple,
                     title: agent.name,
                     matchFlags: highlightFlags(for: agent.name),
@@ -3567,6 +3693,7 @@ private struct CommandPaletteOverlay: View {
                 CommandPaletteRow(
                     style: rowStyle,
                     icon: preset.command.isEmpty ? "plus" : "terminal",
+                    agentIcon: AgentToolIconDescriptor(agent: preset),
                     tileColor: .purple,
                     title: preset.name,
                     matchFlags: highlightFlags(for: preset.name),
@@ -3616,6 +3743,11 @@ private struct CommandPaletteOverlay: View {
         return editorDiscovery.icon(for: editor)
     }
 
+    private func rootItemAgentIcon(for item: CommandPaletteRootItem) -> AgentToolIconDescriptor? {
+        guard case .agent(let agent) = item else { return nil }
+        return AgentToolIconDescriptor(agent: agent.definition)
+    }
+
     private var resultCount: Int {
         switch mode {
         case .commands: filteredRootItems.count
@@ -3630,6 +3762,12 @@ private struct CommandPaletteOverlay: View {
     }
 
     private func handleKeyDown(_ event: NSEvent) -> Bool {
+        let navigationModifiers = event.modifierFlags.intersection([
+            .shift,
+            .control,
+            .option,
+            .command
+        ])
         switch event.keyCode {
         case 53:
             handleEscape()
@@ -3637,11 +3775,17 @@ private struct CommandPaletteOverlay: View {
         case 36, 76:
             commitSelection()
             return true
-        case 125:
+        case 125 where navigationModifiers.isEmpty:
             moveSelection(by: 1)
             return true
-        case 126:
+        case 126 where navigationModifiers.isEmpty:
             moveSelection(by: -1)
+            return true
+        case 116 where navigationModifiers.isEmpty:
+            moveSelection(by: -(visibleRowCount - 1))
+            return true
+        case 121 where navigationModifiers.isEmpty:
+            moveSelection(by: visibleRowCount - 1)
             return true
         default:
             return false
@@ -3651,7 +3795,9 @@ private struct CommandPaletteOverlay: View {
     private func moveSelection(by delta: Int) {
         let count = resultCount
         guard count > 0 else { return }
-        selectedIndex = (selectedIndex + delta + count) % count
+        let nextIndex = (selectedIndex + delta) % count
+        selectedIndex = nextIndex >= 0 ? nextIndex : nextIndex + count
+        keyboardNavigationRequest &+= 1
     }
 
     private func rowID(for index: Int) -> String {
@@ -3659,7 +3805,7 @@ private struct CommandPaletteOverlay: View {
     }
 
     private var visibleRowCount: Int {
-        6
+        7
     }
 
     private var rowIDPrefix: String {
@@ -3677,7 +3823,7 @@ private struct CommandPaletteOverlay: View {
 
     private static let scrollTopMarkerID = "palette-scroll-top"
 
-    private func scrollSelectionIntoView(_ proxy: ScrollViewProxy, animated: Bool = true) {
+    private func scrollSelectionIntoView(_ proxy: ScrollViewProxy) {
         guard resultCount > 0 else { return }
         // anchor nil scrolls the minimum needed for full visibility; rows and
         // section headers have different heights, so index math can't predict
@@ -3687,13 +3833,7 @@ private struct CommandPaletteOverlay: View {
         let id = isFirst ? Self.scrollTopMarkerID : rowID(for: selectedIndex)
         let anchor: UnitPoint? = isFirst ? .top : nil
         DispatchQueue.main.async {
-            if animated {
-                withAnimation(.snappy(duration: 0.12)) {
-                    proxy.scrollTo(id, anchor: anchor)
-                }
-            } else {
-                proxy.scrollTo(id, anchor: anchor)
-            }
+            proxy.scrollTo(id, anchor: anchor)
         }
     }
 
@@ -3707,7 +3847,9 @@ private struct CommandPaletteOverlay: View {
         switch mode {
         case .commands:
             guard filteredRootItems.indices.contains(selectedIndex) else { return }
-            switch filteredRootItems[selectedIndex] {
+            let item = filteredRootItems[selectedIndex]
+            usageStore.recordSelection(id: item.id)
+            switch item {
             case .command(let command):
                 switch command {
                 case .projects:
@@ -3749,11 +3891,13 @@ private struct CommandPaletteOverlay: View {
             }
             guard filteredProjects.indices.contains(selectedIndex) else { return }
             let project = filteredProjects[selectedIndex]
+            usageStore.recordSelection(id: "project:\(project.root)")
             dismiss()
             openProject(project)
         case .worktrees:
             if filteredWorktrees.indices.contains(selectedIndex) {
                 let worktree = filteredWorktrees[selectedIndex]
+                usageStore.recordSelection(id: "worktree:\(worktree.root)")
                 _ = repository.activate(
                     worktreeRoot: worktree.root,
                     chromeState: chromeState
@@ -3763,7 +3907,9 @@ private struct CommandPaletteOverlay: View {
             }
             let actionIndex = selectedIndex - filteredWorktrees.count
             guard filteredWorktreeActions.indices.contains(actionIndex) else { return }
-            switch filteredWorktreeActions[actionIndex] {
+            let command = filteredWorktreeActions[actionIndex]
+            usageStore.recordSelection(id: "command:\(command.id)")
+            switch command {
             case .newWorktree:
                 presentNewWorktree()
             case .renameWorktree:
@@ -3777,23 +3923,33 @@ private struct CommandPaletteOverlay: View {
             }
         case .renameWorktree:
             guard filteredRenamableWorktrees.indices.contains(selectedIndex) else { return }
-            presentRenameWorktree(filteredRenamableWorktrees[selectedIndex])
+            let worktree = filteredRenamableWorktrees[selectedIndex]
+            usageStore.recordSelection(id: "worktree:\(worktree.root)")
+            presentRenameWorktree(worktree)
         case .removeWorktree:
             guard !isRemovingWorktree,
                   filteredRemovableWorktrees.indices.contains(selectedIndex)
             else {
                 return
             }
-            removalCandidate = filteredRemovableWorktrees[selectedIndex]
+            let worktree = filteredRemovableWorktrees[selectedIndex]
+            usageStore.recordSelection(id: "worktree:\(worktree.root)")
+            removalCandidate = worktree
         case .agents:
             guard filteredAgents.indices.contains(selectedIndex) else { return }
-            launch(filteredAgents[selectedIndex])
+            let agent = filteredAgents[selectedIndex]
+            usageStore.recordSelection(id: "agent:\(agent.id)")
+            launch(agent)
         case .agentPresets:
             guard filteredAgentPresets.indices.contains(selectedIndex) else { return }
-            editingAgent = filteredAgentPresets[selectedIndex]
+            let agent = filteredAgentPresets[selectedIndex]
+            usageStore.recordSelection(id: "agent:\(agent.id)")
+            editingAgent = agent
         case .editors:
             guard filteredEditors.indices.contains(selectedIndex) else { return }
-            openInEditor(filteredEditors[selectedIndex])
+            let editor = filteredEditors[selectedIndex]
+            usageStore.recordSelection(id: "editor:\(editor.id)")
+            openInEditor(editor)
         }
     }
 
@@ -4021,6 +4177,7 @@ private struct CommandPaletteRow: View {
     let style: CommandPaletteRowStyle
     let icon: String
     var nsImage: NSImage? = nil
+    var agentIcon: AgentToolIconDescriptor? = nil
     var tileColor: Color = .blue
     let title: String
     var matchFlags: [Bool]? = nil
@@ -4036,6 +4193,7 @@ private struct CommandPaletteRow: View {
             HStack(spacing: 10) {
                 iconView
                     .frame(width: 24)
+                    .accessibilityHidden(true)
 
                 if style.isCompact {
                     compactText
@@ -4089,7 +4247,23 @@ private struct CommandPaletteRow: View {
 
     @ViewBuilder
     private var iconView: some View {
-        if let nsImage {
+        if let agentIcon {
+            if let logoResourceName = agentIcon.logoResourceName {
+                AgentLogoImage(
+                    resourceName: logoResourceName,
+                    rendersAsTemplate: agentIcon.rendersAsTemplate,
+                    fallbackLabel: agentIcon.label
+                )
+                .frame(width: 19, height: 19)
+                .foregroundStyle(isAccentSelected ? Color.white : Color.primary.opacity(0.78))
+            } else {
+                Text(agentIcon.label)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(isAccentSelected ? Color.white : Color.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+        } else if let nsImage {
             Image(nsImage: nsImage)
                 .resizable()
                 .scaledToFit()
@@ -4217,6 +4391,7 @@ private struct CommandPaletteFooterHint: View {
 private struct CommandPaletteSurface: ViewModifier {
     let usesGlass: Bool
     let cornerRadius: CGFloat
+    let colorScheme: ColorScheme
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -4225,14 +4400,22 @@ private struct CommandPaletteSurface: ViewModifier {
             content
                 .clipShape(shape)
                 .glassEffect(.regular, in: shape)
-                .shadow(color: .black.opacity(0.18), radius: 24, y: 14)
+                .shadow(
+                    color: colorScheme == .dark ? .clear : .black.opacity(0.18),
+                    radius: 24,
+                    y: 14
+                )
         } else {
             content
                 .background(.regularMaterial, in: shape)
                 .overlay {
                     shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
                 }
-                .shadow(color: .black.opacity(0.22), radius: 28, y: 18)
+                .shadow(
+                    color: colorScheme == .dark ? .clear : .black.opacity(0.22),
+                    radius: 28,
+                    y: 18
+                )
         }
     }
 }
@@ -8085,6 +8268,18 @@ private struct AgentToolIconDescriptor {
             agentName: session.agentName,
             title: session.title,
             commandLine: session.subtitle
+        )
+    }
+
+    init?(agent: AgentToolDefinition) {
+        guard let brand = AgentToolBrand.detect(
+            name: agent.name,
+            commandLine: agent.commandLine
+        ) else { return nil }
+
+        self.init(
+            label: brand.fallbackLabel,
+            logoResourceName: brand.logoResourceName
         )
     }
 

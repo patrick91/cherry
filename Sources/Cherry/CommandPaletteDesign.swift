@@ -23,18 +23,18 @@ enum CommandPaletteDesign {
     static let showsFooterKey = "commandPalette.design.showsFooter"
 
     static let defaultUsesGlass = true
-    static let defaultCornerRadius = 18.0
-    static let defaultPanelWidth = 520.0
-    static let defaultScrimOpacity = 0.17
+    static let defaultCornerRadius = 16.0
+    static let defaultPanelWidth = 620.0
+    static let defaultScrimOpacity = 0.12
     static let defaultAnimatesEntrance = true
     static let defaultUsesCompactRows = false
-    static let defaultRowHeight = 50.0
-    static let defaultSelectionStyle = CommandPaletteSelectionStyle.softTint.rawValue
+    static let defaultRowHeight = 48.0
+    static let defaultSelectionStyle = CommandPaletteSelectionStyle.flat.rawValue
     static let defaultUsesIconTiles = false
     static let defaultHighlightsMatches = true
     static let defaultShowsSectionHeaders = false
-    static let defaultShowsKindLabels = false
-    static let defaultShowsFooter = false
+    static let defaultShowsKindLabels = true
+    static let defaultShowsFooter = true
 
     static func reset() {
         let defaults = UserDefaults.standard

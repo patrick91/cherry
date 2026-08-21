@@ -3040,6 +3040,7 @@ private struct CommandPaletteOverlay: View {
     @State private var isRemovingWorktree = false
     @State private var searchFocusRequest = 0
     @State private var keyboardNavigationRequest = 0
+    @State private var hoverSelectionSuppressionLocation: NSPoint?
     @State private var didAppear = false
 
     @AppStorage(CommandPaletteDesign.usesGlassKey) private var usesGlass = CommandPaletteDesign.defaultUsesGlass
@@ -3102,7 +3103,7 @@ private struct CommandPaletteOverlay: View {
                     ScrollView {
                         LazyVStack(spacing: 4) {
                             Color.clear
-                                .frame(height: 0)
+                                .frame(height: 3)
                                 .id(Self.scrollTopMarkerID)
 
                             if mode == .commands {
@@ -3123,7 +3124,9 @@ private struct CommandPaletteOverlay: View {
                                 agentPresetRows
                             }
                         }
-                        .padding(7)
+                        .id(listContentID)
+                        .padding(.horizontal, 7)
+                        .padding(.bottom, 7)
                         .frame(maxWidth: .infinity, alignment: .top)
                     }
                     .scrollIndicators(.hidden)
@@ -3156,10 +3159,14 @@ private struct CommandPaletteOverlay: View {
             .padding(.horizontal, 20)
             .padding(.top, 86)
         }
-        .background(CommandPaletteKeyMonitor(handle: handleKeyDown))
+        .background(CommandPaletteKeyMonitor(
+            handle: handleKeyDown,
+            onScroll: suppressHoverSelection
+        ))
         .onAppear {
             requestSearchFocus()
             selectedIndex = 0
+            suppressHoverSelection()
             editorDiscovery.refresh()
             if animatesEntrance {
                 withAnimation(.snappy(duration: 0.18)) {
@@ -3173,9 +3180,11 @@ private struct CommandPaletteOverlay: View {
             requestSearchFocus()
         }
         .onChange(of: query) { _, _ in
+            suppressHoverSelection()
             selectedIndex = 0
         }
         .onChange(of: mode) { _, _ in
+            suppressHoverSelection()
             query = ""
             selectedIndex = 0
             requestSearchFocus()
@@ -3443,7 +3452,7 @@ private struct CommandPaletteOverlay: View {
             kindLabel: showsKindLabels ? item.kindLabel : nil,
             isSelected: index == selectedIndex,
             isCurrent: item.isCurrent(selectedProjectRoot: selectedProjectRoot),
-            onHover: { selectedIndex = index },
+            onHover: { selectOnHover(index) },
             action: {
                 selectedIndex = index
                 commitSelection()
@@ -3480,7 +3489,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: project.root,
                     isSelected: index == selectedIndex,
                     isCurrent: project.root == selectedProjectRoot,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3508,7 +3517,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: worktree.root,
                     isSelected: index == selectedIndex,
                     isCurrent: worktree.root == repository.activeWorktreeRoot,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3528,7 +3537,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: command.subtitle,
                     isSelected: index == selectedIndex,
                     isCurrent: false,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3554,7 +3563,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: worktree.root,
                     isSelected: index == selectedIndex,
                     isCurrent: worktree.root == repository.activeWorktreeRoot,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3590,7 +3599,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: removalSubtitle(for: worktree),
                     isSelected: index == selectedIndex,
                     isCurrent: worktree.root == repository.activeWorktreeRoot,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3673,7 +3682,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: agent.commandLine,
                     isSelected: index == selectedIndex,
                     isCurrent: false,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3700,7 +3709,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: preset.commandLine.isEmpty ? "Custom agent tool" : preset.commandLine,
                     isSelected: index == selectedIndex,
                     isCurrent: false,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3727,7 +3736,7 @@ private struct CommandPaletteOverlay: View {
                     subtitle: "Open project in \(editor.displayName)",
                     isSelected: index == selectedIndex,
                     isCurrent: false,
-                    onHover: { selectedIndex = index },
+                    onHover: { selectOnHover(index) },
                     action: {
                         selectedIndex = index
                         commitSelection()
@@ -3795,6 +3804,7 @@ private struct CommandPaletteOverlay: View {
     private func moveSelection(by delta: Int) {
         let count = resultCount
         guard count > 0 else { return }
+        suppressHoverSelection()
         let nextIndex = (selectedIndex + delta) % count
         selectedIndex = nextIndex >= 0 ? nextIndex : nextIndex + count
         keyboardNavigationRequest &+= 1
@@ -3806,6 +3816,25 @@ private struct CommandPaletteOverlay: View {
 
     private var visibleRowCount: Int {
         7
+    }
+
+    private var listContentID: String {
+        "\(rowIDPrefix):\(query)"
+    }
+
+    private func suppressHoverSelection() {
+        hoverSelectionSuppressionLocation = NSEvent.mouseLocation
+    }
+
+    private func selectOnHover(_ index: Int) {
+        if let suppressedLocation = hoverSelectionSuppressionLocation {
+            let currentLocation = NSEvent.mouseLocation
+            let moved = abs(currentLocation.x - suppressedLocation.x) >= 1
+                || abs(currentLocation.y - suppressedLocation.y) >= 1
+            guard moved else { return }
+            hoverSelectionSuppressionLocation = nil
+        }
+        selectedIndex = index
     }
 
     private var rowIDPrefix: String {
@@ -4433,20 +4462,24 @@ private struct CommandPaletteEmptyRow: View {
 
 private struct CommandPaletteKeyMonitor: NSViewRepresentable {
     let handle: (NSEvent) -> Bool
+    let onScroll: () -> Void
 
     func makeNSView(context: Context) -> CommandPaletteKeyMonitorView {
         let view = CommandPaletteKeyMonitorView()
         view.handle = handle
+        view.onScroll = onScroll
         return view
     }
 
     func updateNSView(_ nsView: CommandPaletteKeyMonitorView, context: Context) {
         nsView.handle = handle
+        nsView.onScroll = onScroll
     }
 }
 
 private final class CommandPaletteKeyMonitorView: NSView {
     var handle: ((NSEvent) -> Bool)?
+    var onScroll: (() -> Void)?
     private var monitor: Any?
 
     override func viewDidMoveToWindow() {
@@ -4460,8 +4493,12 @@ private final class CommandPaletteKeyMonitorView: NSView {
 
     private func installMonitor() {
         guard monitor == nil else { return }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
+            if event.type == .scrollWheel {
+                self.onScroll?()
+                return event
+            }
             return self.handle?(event) == true ? nil : event
         }
     }

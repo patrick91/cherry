@@ -53,9 +53,9 @@ import "../styles/global.css";
           <section class="page-intro">
             <div>
               <p class="kicker">Terminal attention study</p>
-              <h1>Review attention labels.</h1>
+              <h1>Review agent action labels.</h1>
               <p>
-                Understand what Cherry thinks needs your attention, why it chose that label, and
+                Understand what Cherry thinks needs action, why it chose that label, and
                 what was visible in the terminal.
               </p>
             </div>
@@ -107,9 +107,9 @@ import "../styles/global.css";
                     <option value="">All labels</option>
                     <option value="labeled" selected>All provisional labels</option>
                     <option value="unlabeled">Unlabeled</option>
-                    <option value="attention_needed">Attention needed</option>
-                    <option value="no_attention_needed">No attention needed</option>
-                    <option value="unknown">Unknown</option>
+                    <option value="attention_needed">Action needed</option>
+                    <option value="no_attention_needed">No action needed</option>
+                    <option value="unknown">Not sure</option>
                   </select>
                 </label>
                 <label>
@@ -209,19 +209,22 @@ import "../styles/global.css";
                         <label>
                           <span>Human label</span>
                           <select id="review-label" name="review-label">
-                            <option value="attention_needed">Attention needed</option>
-                            <option value="no_attention_needed">No attention needed</option>
-                            <option value="unknown">Unknown</option>
+                            <option value="attention_needed">Action needed</option>
+                            <option value="no_attention_needed">No action needed</option>
+                            <option value="unknown">Not sure</option>
                           </select>
                         </label>
                         <label>
                           <span>Reason</span>
                           <select id="review-reason" name="review-reason">
-                            <option value="">Not applicable</option>
-                            <option value="result_ready">Result ready</option>
-                            <option value="waiting_for_input">Waiting for input</option>
-                            <option value="waiting_for_approval">Waiting for approval</option>
-                            <option value="blocked_or_error">Blocked or error</option>
+                            <option value="" data-label="unknown">Not applicable</option>
+                            <option value="result_ready" data-label="attention_needed">Result ready for review</option>
+                            <option value="waiting_for_input" data-label="attention_needed">Needs my input</option>
+                            <option value="waiting_for_approval" data-label="attention_needed">Needs my approval</option>
+                            <option value="blocked_or_error" data-label="attention_needed">Blocked or errored</option>
+                            <option value="agent_working" data-label="no_attention_needed">Agent is working</option>
+                            <option value="user_responding" data-label="no_attention_needed">I'm already responding</option>
+                            <option value="idle_no_active_task" data-label="no_attention_needed">Idle / no active task</option>
                           </select>
                         </label>
                       </div>

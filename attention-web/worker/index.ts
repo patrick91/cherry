@@ -137,8 +137,13 @@ function observationStatements(env: Env, bundleID: string, observation: Observat
              AND json_extract(payload_json, '$.annotation.provenance')
                    = 'cherry_in_app_human_correction'
              AND (
-               ?2 = 'no_attention_needed'
+               (?2 = 'unknown' AND ?3 IS NULL)
                OR json_extract(payload_json, '$.annotation.reason') = ?3
+               OR (
+                 ?2 = 'no_attention_needed'
+                 AND ?3 IS NULL
+                 AND json_extract(payload_json, '$.annotation.reason') IS NULL
+               )
              )
         )`,
   ).bind(
@@ -435,9 +440,9 @@ async function reviewObservation(request: Request, env: Env, id: string): Promis
     reason = normalizedReason(stored.label, stored.payload);
     if (label === null) return json({ error: "unlabeled observations cannot be accepted" }, 409);
     if (label === "attention_needed" && reason === null) {
-      return json({ error: "attention labels need a reason before they can be accepted" }, 409);
+      return json({ error: "action-needed labels need a reason before they can be accepted" }, 409);
     }
-    if (label !== "attention_needed") reason = null;
+    if (label === "unknown") reason = null;
   }
 
   await env.DB.prepare(

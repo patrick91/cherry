@@ -14,6 +14,9 @@ enum TerminalAttentionReason: String, Codable, CaseIterable, Equatable, Sendable
     case waitingForInput = "waiting_for_input"
     case waitingForApproval = "waiting_for_approval"
     case blockedOrError = "blocked_or_error"
+    case agentWorking = "agent_working"
+    case userResponding = "user_responding"
+    case idleNoActiveTask = "idle_no_active_task"
 }
 
 enum TerminalAttentionCorrection: CaseIterable, Equatable, Sendable {
@@ -21,25 +24,41 @@ enum TerminalAttentionCorrection: CaseIterable, Equatable, Sendable {
     case waitingForInput
     case waitingForApproval
     case blockedOrError
-    case noAttentionNeeded
+    case agentWorking
+    case userResponding
+    case idleNoActiveTask
+    case unknown
 
     var title: String {
         switch self {
         case .resultReady:
-            "Result is ready"
+            "Result ready for review"
         case .waitingForInput:
-            "Waiting for my input"
+            "Needs my input"
         case .waitingForApproval:
-            "Waiting for my approval"
+            "Needs my approval"
         case .blockedOrError:
             "Blocked or errored"
-        case .noAttentionNeeded:
-            "No attention needed"
+        case .agentWorking:
+            "Agent is working"
+        case .userResponding:
+            "I'm already responding"
+        case .idleNoActiveTask:
+            "Idle / no active task"
+        case .unknown:
+            "Not sure"
         }
     }
 
     var label: TerminalAttentionLabel {
-        self == .noAttentionNeeded ? .noAttentionNeeded : .attentionNeeded
+        switch self {
+        case .resultReady, .waitingForInput, .waitingForApproval, .blockedOrError:
+            .attentionNeeded
+        case .agentWorking, .userResponding, .idleNoActiveTask:
+            .noAttentionNeeded
+        case .unknown:
+            .unknown
+        }
     }
 
     var reason: TerminalAttentionReason? {
@@ -52,7 +71,13 @@ enum TerminalAttentionCorrection: CaseIterable, Equatable, Sendable {
             .waitingForApproval
         case .blockedOrError:
             .blockedOrError
-        case .noAttentionNeeded:
+        case .agentWorking:
+            .agentWorking
+        case .userResponding:
+            .userResponding
+        case .idleNoActiveTask:
+            .idleNoActiveTask
+        case .unknown:
             nil
         }
     }

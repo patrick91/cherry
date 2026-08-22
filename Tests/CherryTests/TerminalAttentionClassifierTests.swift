@@ -378,7 +378,8 @@ struct TerminalAttentionClassifierTests {
         try await Task.sleep(for: .milliseconds(1_250))
 
         #expect(session.attentionAlertGeneration > firstGeneration)
-        #expect(notificationProbabilities.count == 2)
+        #expect(!session.hasUnreadNotification)
+        #expect(notificationProbabilities.count == 1)
     }
 
     private func returnKeyEvent() -> NSEvent? {

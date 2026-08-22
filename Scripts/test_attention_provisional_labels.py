@@ -81,7 +81,7 @@ class ProvisionalLabelTests(unittest.TestCase):
             result[1]["annotation"]["rationale"],
             "user_composing_at_prompt",
         )
-        self.assertNotIn("reason", result[1]["annotation"])
+        self.assertEqual(result[1]["annotation"]["reason"], "user_responding")
 
     def test_identical_short_window_notifications_collapse_to_latest(self) -> None:
         result = self.write([

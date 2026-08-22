@@ -90,15 +90,15 @@ type LabelInformation = {
 
 const labelInformation: Record<string, LabelInformation> = {
   attention_needed: {
-    name: "Attention needed",
+    name: "Action needed",
     description: "The agent needs you to review a result, provide input, approve an action, or resolve a problem.",
   },
   no_attention_needed: {
-    name: "No attention needed",
-    description: "The agent was still working, so there was nothing for you to do at that moment.",
+    name: "No action needed",
+    description: "The agent is working, you are already responding, or there is no active task.",
   },
   unknown: {
-    name: "Unknown",
+    name: "Not sure",
     description: "The captured state was ambiguous or interrupted and needs a human judgment.",
   },
   labeled: {
@@ -128,7 +128,31 @@ const reasonInformation: Record<string, LabelInformation> = {
     name: "Blocked or error",
     description: "The agent stopped because it encountered an interruption or problem.",
   },
+  agent_working: {
+    name: "Agent is working",
+    description: "The submitted turn is active and the agent does not need anything from you.",
+  },
+  user_responding: {
+    name: "I'm already responding",
+    description: "You are already composing or otherwise handling the agent's request.",
+  },
+  idle_no_active_task: {
+    name: "Idle / no active task",
+    description: "There is no submitted turn or outstanding action on this screen.",
+  },
 };
+
+const actionNeededReasons = new Set([
+  "result_ready",
+  "waiting_for_input",
+  "waiting_for_approval",
+  "blocked_or_error",
+]);
+const noActionNeededReasons = new Set([
+  "agent_working",
+  "user_responding",
+  "idle_no_active_task",
+]);
 
 const reviewInformation: Record<string, LabelInformation> = {
   pending: {
@@ -471,10 +495,21 @@ function renderTerminal(
 }
 
 function updateReasonControl(): void {
-  const needsReason = reviewLabel.value === "attention_needed";
-  if (needsReason && reviewReason.value === "") reviewReason.value = "result_ready";
-  if (!needsReason) reviewReason.value = "";
-  reviewReason.disabled = reviewBusy || !needsReason;
+  const label = reviewLabel.value;
+  const allowed = label === "attention_needed"
+    ? actionNeededReasons
+    : label === "no_attention_needed"
+      ? noActionNeededReasons
+      : new Set<string>();
+  for (const option of reviewReason.options) {
+    option.hidden = option.value === "" ? label !== "unknown" : !allowed.has(option.value);
+  }
+  if (label === "unknown") {
+    reviewReason.value = "";
+  } else if (!allowed.has(reviewReason.value)) {
+    reviewReason.value = label === "attention_needed" ? "result_ready" : "agent_working";
+  }
+  reviewReason.disabled = reviewBusy || label === "unknown";
 }
 
 function setReviewControlsDisabled(disabled: boolean): void {
@@ -499,11 +534,9 @@ function renderHumanReview(observation: ObservationSummary): void {
       ? selectedLabel
       : "unknown";
   const selectedReason = observation.reviewReason ?? observation.reason;
-  reviewReason.value = reviewLabel.value !== "attention_needed"
-    ? ""
-    : selectedReason !== null && reasonInformation[selectedReason] !== undefined
-      ? selectedReason
-      : "result_ready";
+  reviewReason.value = selectedReason !== null && reasonInformation[selectedReason] !== undefined
+    ? selectedReason
+    : "";
   reviewBusy = false;
   setReviewControlsDisabled(false);
 
@@ -712,7 +745,7 @@ async function submitReview(action: "accept" | "correct" | "skip"): Promise<void
     ? {
         action,
         label: reviewLabel.value,
-        reason: reviewLabel.value === "attention_needed" ? reviewReason.value : null,
+        reason: reviewLabel.value === "unknown" ? null : reviewReason.value,
       }
     : { action };
 

@@ -95,13 +95,17 @@ def correction_summary(payload: dict[str, Any]) -> dict[str, Any]:
         raise AugmentError(f"correction {identifier} is missing its recording time")
     if not EXPORTER.is_in_app_human_correction(payload):
         raise AugmentError(f"observation {payload.get('id')} is not an in-app human correction")
-    if label not in EXPORTER.BINARY_LABELS:
-        raise AugmentError(f"correction {payload.get('id')} does not have a binary label")
+    if label not in EXPORTER.BINARY_LABELS | {"unknown"}:
+        raise AugmentError(f"correction {payload.get('id')} does not have a supported label")
     if not isinstance(annotation, dict) or not isinstance(session, dict):
         raise AugmentError(f"correction {payload.get('id')} is missing annotation or session context")
     reason = annotation.get("reason")
+    if label in EXPORTER.BINARY_LABELS and reason is not None and not isinstance(reason, str):
+        raise AugmentError(f"correction {payload.get('id')} has an invalid reason")
     if label == "attention_needed" and not isinstance(reason, str):
-        raise AugmentError(f"attention correction {payload.get('id')} has no reason")
+        raise AugmentError(f"action-needed correction {payload.get('id')} has no reason")
+    if label == "unknown" and reason is not None:
+        raise AugmentError(f"unknown correction {payload.get('id')} cannot have a reason")
     session_id = session.get("id")
     if not isinstance(session_id, str) or not session_id:
         raise AugmentError(f"correction {payload.get('id')} has no session id")
@@ -112,7 +116,7 @@ def correction_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "reviewLabel": label,
         "reviewSource": "human",
         "reviewProvenance": "cherry_in_app_human_correction",
-        "reviewReason": reason if label == "attention_needed" else None,
+        "reviewReason": reason if label in EXPORTER.BINARY_LABELS else None,
         "reviewStatus": "accepted",
         "reviewedAt": payload.get("recordedAt"),
         "harness": session.get("harness"),

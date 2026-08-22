@@ -238,6 +238,34 @@ describe("attention dashboard Worker", () => {
     expect(reviewed).toContain('"reviewReason":"waiting_for_approval"');
   });
 
+  it("preserves specific no-action reasons and unknown in-app corrections", async () => {
+    await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
+    const noAction = structuredClone(observation);
+    noAction.id = "5cd5c9dc-2734-4447-837e-e1060831d16c";
+    noAction.label = "no_attention_needed";
+    noAction.annotation.provenance = "cherry_in_app_human_correction";
+    noAction.annotation.rationale = "human_corrected_action_label";
+    noAction.annotation.reason = "agent_working";
+
+    const uncertain = structuredClone(observation);
+    uncertain.id = "9af9a217-7458-487a-ae5f-3bb339b65216";
+    uncertain.label = "unknown";
+    uncertain.annotation.provenance = "cherry_in_app_human_correction";
+    uncertain.annotation.rationale = "human_corrected_action_label";
+    delete (uncertain.annotation as { reason?: string }).reason;
+
+    const upload = await api(`/api/bundles/${bundleID}/observations`, {
+      method: "POST",
+      body: JSON.stringify({ observations: [noAction, uncertain] }),
+    });
+    expect(upload.status).toBe(202);
+
+    const reviewed = await responseText("/api/dashboard?review=reviewed");
+    expect(reviewed).toContain('"reviewLabel":"no_attention_needed"');
+    expect(reviewed).toContain('"reviewReason":"agent_working"');
+    expect(reviewed).toContain('"reviewLabel":"unknown"');
+  });
+
   it("does not apply correction metadata from a conflicting duplicate id", async () => {
     await api("/api/bundles", { method: "POST", body: JSON.stringify(bundle) });
     await api(`/api/bundles/${bundleID}/observations`, {
@@ -272,14 +300,18 @@ describe("attention dashboard Worker", () => {
 
     const corrected = await api(`/api/observations/${observationID}/review`, {
       method: "PUT",
-      body: JSON.stringify({ action: "correct", label: "no_attention_needed", reason: null }),
+      body: JSON.stringify({
+        action: "correct",
+        label: "no_attention_needed",
+        reason: "agent_working",
+      }),
     });
     expect(corrected.status).toBe(200);
     await expect(corrected.json()).resolves.toMatchObject({
       review: {
         status: "corrected",
         label: "no_attention_needed",
-        reason: null,
+        reason: "agent_working",
         source: "human",
       },
     });
@@ -309,7 +341,16 @@ describe("attention dashboard Worker", () => {
     });
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
-      error: "review.reason is required for attention_needed",
+      error: "review.reason must describe why action is needed",
+    });
+
+    const noActionResponse = await api(`/api/observations/${observationID}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ action: "correct", label: "no_attention_needed", reason: null }),
+    });
+    expect(noActionResponse.status).toBe(400);
+    await expect(noActionResponse.json()).resolves.toEqual({
+      error: "review.reason must describe why no action is needed",
     });
   });
 

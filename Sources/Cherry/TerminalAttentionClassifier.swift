@@ -38,7 +38,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     }
 
     var displayName: String {
-        needsAttention ? "Attention needed" : "No attention needed"
+        needsAttention ? "Action needed" : "No action needed"
     }
 
     var debugReport: String {
@@ -74,7 +74,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
                 "Turn state: \(turn)",
                 "",
                 "Strongest feature contributions",
-                "(positive pushes toward attention needed)",
+                "(positive pushes toward action needed)",
             ]
             + strongest
         ).joined(separator: "\n")

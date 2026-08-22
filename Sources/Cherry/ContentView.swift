@@ -7822,7 +7822,7 @@ private struct SidebarAgentAttentionIndicator: View {
             .help(
                 "Model: \(prediction.displayName) · \(prediction.confidenceDescription)"
             )
-            .accessibilityLabel("Model predicts attention needed")
+            .accessibilityLabel("Model predicts user action is needed")
     }
 }
 
@@ -10648,24 +10648,41 @@ private struct AttentionToolsMenu: View {
         Divider()
 
         Menu("Tag Current Screen") {
-            ForEach(
-                [
-                    TerminalAttentionCorrection.resultReady,
-                    .waitingForInput,
-                    .waitingForApproval,
-                    .blockedOrError,
-                ],
-                id: \.title
-            ) { correction in
-                Button(menuTitle(for: correction)) {
-                    save(correction)
+            Menu("Needs action from me") {
+                ForEach(
+                    [
+                        TerminalAttentionCorrection.resultReady,
+                        .waitingForInput,
+                        .waitingForApproval,
+                        .blockedOrError,
+                    ],
+                    id: \.title
+                ) { correction in
+                    Button(menuTitle(for: correction)) {
+                        save(correction)
+                    }
+                }
+            }
+
+            Menu("No action from me") {
+                ForEach(
+                    [
+                        TerminalAttentionCorrection.agentWorking,
+                        .userResponding,
+                        .idleNoActiveTask,
+                    ],
+                    id: \.title
+                ) { correction in
+                    Button(menuTitle(for: correction)) {
+                        save(correction)
+                    }
                 }
             }
 
             Divider()
 
-            Button(menuTitle(for: .noAttentionNeeded)) {
-                save(.noAttentionNeeded)
+            Button(menuTitle(for: .unknown)) {
+                save(.unknown)
             }
         }
     }

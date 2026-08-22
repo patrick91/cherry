@@ -37,7 +37,11 @@ def summary(
         "sessionID": session_id,
         "reviewLabel": label,
         "reviewSource": source,
-        "reviewReason": "result_ready" if label == "attention_needed" else None,
+        "reviewReason": (
+            "result_ready" if label == "attention_needed"
+            else "agent_working" if label == "no_attention_needed"
+            else None
+        ),
         "reviewStatus": "accepted",
         "reviewedAt": "2026-07-27T13:00:00Z",
         "harness": "Codex",
@@ -60,7 +64,7 @@ def dataset_record(
         "harness": "Codex",
         "split": split,
         "target": label,
-        "attentionReason": "result_ready" if attention else None,
+        "attentionReason": "result_ready" if attention else "agent_working",
         "review": {
             "status": "accepted",
             "source": source,
@@ -272,6 +276,7 @@ class AttentionModelPipelineTests(unittest.TestCase):
             record["review"]["provenance"],
             "cherry_in_app_human_correction",
         )
+        self.assertEqual(record["attentionReason"], "agent_working")
         without_review = json.loads(json.dumps(record))
         without_review.pop("review")
         self.assertEqual(

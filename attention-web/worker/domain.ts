@@ -20,11 +20,22 @@ const attentionLabels = new Set([
   "ready_for_review",
 ]);
 
-const attentionReasons = new Set([
+const actionNeededReasons = new Set([
   "result_ready",
   "waiting_for_input",
   "waiting_for_approval",
   "blocked_or_error",
+]);
+
+const noActionNeededReasons = new Set([
+  "agent_working",
+  "user_responding",
+  "idle_no_active_task",
+]);
+
+const attentionReasons = new Set([
+  ...actionNeededReasons,
+  ...noActionNeededReasons,
 ]);
 
 const humanReviewLabels = new Set([
@@ -78,7 +89,10 @@ export type AttentionReason =
   | "result_ready"
   | "waiting_for_input"
   | "waiting_for_approval"
-  | "blocked_or_error";
+  | "blocked_or_error"
+  | "agent_working"
+  | "user_responding"
+  | "idle_no_active_task";
 
 export type ReviewInput =
   | { action: "accept" }
@@ -345,14 +359,24 @@ export function parseObservation(value: unknown): ObservationRecord {
   }
   let humanCorrectionLabel: HumanReviewLabel | null = null;
   if (annotationProvenance === "cherry_in_app_human_correction") {
-    if (label !== "attention_needed" && label !== "no_attention_needed") {
-      throw new ValidationError("in-app human corrections need a binary observation label");
+    if (label !== "attention_needed" && label !== "no_attention_needed" && label !== "unknown") {
+      throw new ValidationError("in-app human corrections need a supported observation label");
     }
-    if (label === "attention_needed" && annotationReason === null) {
-      throw new ValidationError("in-app attention corrections need an attention reason");
+    if (label === "attention_needed" && (
+      annotationReason === null || !actionNeededReasons.has(annotationReason)
+    )) {
+      throw new ValidationError("in-app action-needed corrections need an action-needed reason");
+    }
+    // Historical no-attention corrections did not record a reason. Continue
+    // accepting them, while all new Cherry corrections carry a negative reason.
+    if (label === "no_attention_needed" && annotationReason !== null
+      && !noActionNeededReasons.has(annotationReason)) {
+      throw new ValidationError("in-app no-action corrections need a no-action reason");
+    }
+    if (label === "unknown" && annotationReason !== null) {
+      throw new ValidationError("in-app unknown corrections cannot have a reason");
     }
     humanCorrectionLabel = label;
-    if (label === "no_attention_needed") annotationReason = null;
   }
   if (!Array.isArray(terminal.grid) || terminal.grid.length > 200) {
     throw new ValidationError("observation.terminal.grid must contain at most 200 lines");
@@ -417,12 +441,18 @@ export function parseReview(value: unknown): ReviewInput {
     throw new ValidationError("review.label must be attention_needed, no_attention_needed, or unknown");
   }
   const reason = optionalString(review.reason, "review.reason", 64);
-  if (label === "attention_needed") {
-    if (reason === null || !attentionReasons.has(reason)) {
-      throw new ValidationError("review.reason is required for attention_needed");
-    }
-  } else if (reason !== null) {
-    throw new ValidationError("review.reason is only valid for attention_needed");
+  if (label === "attention_needed" && (
+    reason === null || !actionNeededReasons.has(reason)
+  )) {
+    throw new ValidationError("review.reason must describe why action is needed");
+  }
+  if (label === "no_attention_needed" && (
+    reason === null || !noActionNeededReasons.has(reason)
+  )) {
+    throw new ValidationError("review.reason must describe why no action is needed");
+  }
+  if (label === "unknown" && reason !== null) {
+    throw new ValidationError("review.reason is not valid for unknown");
   }
 
   return {

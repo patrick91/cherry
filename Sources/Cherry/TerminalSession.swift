@@ -2225,6 +2225,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionObservationTask: Task<Void, Never>?
     private var acknowledgedAttentionAlertGeneration = 0
     private var isAttentionEpisodeActive = false
+    private var hasHarnessNotificationForAttentionEpisode = false
     private var attentionNotificationGate = TerminalAttentionNotificationGate()
     private var currentAttentionScreenTagObservationID: UUID?
     private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
@@ -3083,6 +3084,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         acknowledgedAttentionAlertGeneration = 0
         hasUnacknowledgedAttention = false
         isAttentionEpisodeActive = false
+        hasHarnessNotificationForAttentionEpisode = false
         attentionNotificationGate = TerminalAttentionNotificationGate()
         clearCurrentAttentionScreenTag()
         latestAttentionObservationEvent = .contentChanged
@@ -3440,9 +3442,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
 
             case .notification(let notification):
-                if handleAgentNotification(notification) == .passThrough {
-                    handleTerminalNotification(notification)
-                }
+                handleIncomingNotification(notification)
                 didChange = true
 
             case .resolvedCommandLine(let commandLine):
@@ -3485,12 +3485,31 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func handleTerminalNotification(_ notification: TerminalNotificationRequest) {
+    private func handleTerminalNotification(
+        _ notification: TerminalNotificationRequest,
+        marksUnread: Bool = true
+    ) {
         guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
         guard !(kind == .agent && parentAgentID != nil) else { return }
-        lastNotification = notification
-        hasUnreadNotification = true
+        if marksUnread {
+            lastNotification = notification
+            hasUnreadNotification = true
+        }
         TerminalNotificationCenter.shared.post(notification, for: self)
+    }
+
+    private func handleIncomingNotification(_ notification: TerminalNotificationRequest) {
+        let isAgentCompletion = kind == .agent
+            && Self.notificationBodyIndicatesCompletion(notification.body)
+        if isAgentCompletion {
+            // Completion status is an attention-episode signal, not a second
+            // unread-dot source. Deliver the harness notification first and
+            // remember that it owns this episode so the classifier can avoid a
+            // duplicate fallback even though `hasUnreadNotification` stays false.
+            hasHarnessNotificationForAttentionEpisode = true
+        }
+        handleTerminalNotification(notification, marksUnread: !isAgentCompletion)
+        handleAgentNotification(notification)
     }
 
     // MARK: - Native-PTY chrome ingestion
@@ -3526,9 +3545,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func ingestNativeNotification(title: String?, body: String) {
         let notification = TerminalNotificationRequest(title: title, body: body, source: .osc777)
-        if handleAgentNotification(notification) == .passThrough {
-            handleTerminalNotification(notification)
-        }
+        handleIncomingNotification(notification)
         bumpRevision()
     }
 
@@ -3734,7 +3751,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 schemaVersion: 1,
                 provenance: "cherry_in_app_human_correction",
                 confidence: 1,
-                rationale: "human_corrected_attention_label",
+                rationale: "human_corrected_action_label",
                 reason: correction.reason
             ),
             scenarioID: "in-app-attention-correction",
@@ -3839,7 +3856,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard attentionNotificationGate.shouldNotify(
             prediction: prediction,
             isTopLevelAgent: kind == .agent && parentAgentID == nil,
-            hasUnreadNativeNotification: hasUnreadNotification,
+            hasUnreadNativeNotification:
+                hasUnreadNotification || hasHarnessNotificationForAttentionEpisode,
             hasUnacknowledgedAttention: hasUnacknowledgedAttention
         ) else {
             return
@@ -3984,15 +4002,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         return String(value.prefix(160))
     }
 
-    enum AgentNotificationDisposition {
-        case passThrough
-        case suppress
-    }
-
     private func handleAgentNotification(
         _ notification: TerminalNotificationRequest
-    ) -> AgentNotificationDisposition {
-        guard kind == .agent else { return .passThrough }
+    ) {
+        guard kind == .agent else { return }
         defer {
             scheduleAttentionObservation(event: .notification)
         }
@@ -4000,14 +4013,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         let body = notification.body
         if Self.notificationBodyIndicatesPermission(body) {
             setAgentActivityState(.permission, source: .notification)
-            return .passThrough
+            return
         }
         if Self.notificationBodyIndicatesCompletion(body) {
             setAgentActivityState(.idle, source: .notification)
-            clearUnreadNotification()
-            return .suppress
         }
-        return .passThrough
     }
 
     private var agentStateHasDirectEvidence: Bool {
@@ -4601,6 +4611,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             scheduleAttentionObservation(event: .inputChanged)
         case .submitted:
             hasUnsubmittedHumanInput = false
+            hasHarnessNotificationForAttentionEpisode = false
             noteHumanInputIfNeeded()
             agentTurnState = .active
             setAgentActivityState(.working, source: .inputSubmit)

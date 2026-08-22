@@ -148,6 +148,7 @@ def attention_annotation(
 
 
 def no_attention_annotation(
+    reason: str,
     rationale: str,
     confidence: float = 0.99,
 ) -> tuple[str, dict[str, Any]]:
@@ -156,15 +157,16 @@ def no_attention_annotation(
         "provenance": "codex_transition_review",
         "confidence": confidence,
         "rationale": rationale,
+        "reason": reason,
     }
 
 
 def working_annotation() -> tuple[str, dict[str, Any]]:
-    return no_attention_annotation("active_working_indicator")
+    return no_attention_annotation("agent_working", "active_working_indicator")
 
 
 def user_composing_annotation() -> tuple[str, dict[str, Any]]:
-    return no_attention_annotation(USER_COMPOSING_RATIONALE)
+    return no_attention_annotation("user_responding", USER_COMPOSING_RATIONALE)
 
 
 def classify_idle(

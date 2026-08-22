@@ -133,7 +133,7 @@ struct TerminalAttentionObservationTests {
         #expect(annotation.schemaVersion == 1)
         #expect(annotation.provenance == "cherry_in_app_human_correction")
         #expect(annotation.confidence == 1)
-        #expect(annotation.rationale == "human_corrected_attention_label")
+        #expect(annotation.rationale == "human_corrected_action_label")
         #expect(annotation.reason == .resultReady)
         let correction = try #require(observation.correction)
         #expect(correction.sourceEvent == .contentChanged)
@@ -168,13 +168,14 @@ struct TerminalAttentionObservationTests {
 
         session.ingestTestingData(Data("Conversation interrupted\n› \n".utf8))
         let first = try session.captureAttentionCorrection(.blockedOrError)
-        let replacement = try session.captureAttentionCorrection(.noAttentionNeeded)
+        let replacement = try session.captureAttentionCorrection(.agentWorking)
         let observations = try decodeObservations(Data(contentsOf: replacement.outputURL))
         let observation = try #require(observations.first { $0.id == replacement.id })
 
         #expect(observation.correction?.supersedesObservationID == first.id)
         #expect(observation.label == .noAttentionNeeded)
-        #expect(session.currentAttentionScreenTag == .noAttentionNeeded)
+        #expect(observation.annotation?.reason == .agentWorking)
+        #expect(session.currentAttentionScreenTag == .agentWorking)
     }
 
     @Test func observationsCaptureAgentTurnLifecycle() async throws {
@@ -238,7 +239,7 @@ struct TerminalAttentionObservationTests {
         #expect(observations.first { $0.id == completedCapture.id }?.turn?.state == .completed)
     }
 
-    @Test func noAttentionCorrectionOmitsAttentionReason() throws {
+    @Test func noActionCorrectionRecordsSpecificReason() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("cherry-no-attention-correction-\(UUID().uuidString)", isDirectory: true)
         defer {
@@ -258,13 +259,42 @@ struct TerminalAttentionObservationTests {
             session.stop()
         }
 
-        let capture = try session.captureAttentionCorrection(.noAttentionNeeded)
+        let capture = try session.captureAttentionCorrection(.userResponding)
         let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
         let observation = try #require(observations.first { $0.id == capture.id })
 
         #expect(observation.label == .noAttentionNeeded)
+        #expect(observation.annotation?.reason == .userResponding)
+        #expect(session.currentAttentionScreenTag == .userResponding)
+    }
+
+    @Test func uncertainCorrectionIsRecordedAsUnknown() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cherry-unknown-correction-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let session = TerminalSession(
+            title: "Correction fixture",
+            subtitle: "fixture-agent",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Fixture",
+            attentionObservationDirectoryProvider: { directory }
+        )
+        defer {
+            session.stop()
+        }
+
+        let capture = try session.captureAttentionCorrection(.unknown)
+        let observations = try decodeObservations(Data(contentsOf: capture.outputURL))
+        let observation = try #require(observations.first { $0.id == capture.id })
+
+        #expect(observation.label == .unknown)
         #expect(observation.annotation?.reason == nil)
-        #expect(session.currentAttentionScreenTag == .noAttentionNeeded)
+        #expect(session.currentAttentionScreenTag == .unknown)
     }
 
     @Test func anyTerminalScreenCanBeTaggedWithoutBulkStudyCollection() throws {

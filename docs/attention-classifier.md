@@ -9,8 +9,8 @@ credentials, and other sensitive text.
 
 The classifier target is deliberately small:
 
-- `attention_needed`: the user needs to review a result, provide input, approve an action, or resolve a problem.
-- `no_attention_needed`: the harness is actively working and needs no user action.
+- `attention_needed`: an outstanding user action exists: review a result, provide input, approve an action, or resolve a problem.
+- `no_attention_needed`: there is no outstanding user action because the harness is working, the user is already responding, or there is no active task.
 - `unknown`: the screen is ambiguous, out of distribution, or should be handled by abstention. This is an abstention/review state rather than a positive model target.
 
 `attention_needed` observations keep one reason as annotation metadata:
@@ -19,6 +19,16 @@ The classifier target is deliberately small:
 - `waiting_for_input`
 - `waiting_for_approval`
 - `blocked_or_error`
+
+`no_attention_needed` observations can likewise keep the reason:
+
+- `agent_working`
+- `user_responding`
+- `idle_no_active_task`
+
+Historical negative observations without a reason remain valid. Whether an
+action alert has been seen is tracked independently; acknowledging a result
+does not relabel its screen state.
 
 Older schema-1 labels (`approval_required`, `waiting_for_input`, and
 `ready_for_review`) remain importable and are normalized to
@@ -160,13 +170,14 @@ whenever a form control is not focused.
 Right-click any terminal tab and open **Tag Current Screen**. Choose the state
 that is actually visible:
 
-- Result is ready
-- Waiting for my input
-- Waiting for my approval
-- Blocked or errored
-- No attention needed
+- **Needs action from me**: Result ready for review, Needs my input, Needs my
+  approval, or Blocked or errored.
+- **No action from me**: Agent is working, I'm already responding, or Idle / no
+  active task.
+- **Not sure** for an ambiguous screen. This is retained as `unknown` and is
+  excluded from binary model fitting.
 
-For example, if the user is still typing, choose **No attention needed**. Cherry
+For example, if the user is still typing, choose **I'm already responding**. Cherry
 writes the current terminal snapshot as a `human_corrected` labeled checkpoint
 with `cherry_in_app_human_correction` provenance. The context menu shows the
 active manual tag as the current label and checkmarks it. The tag clears when
@@ -305,9 +316,10 @@ The sidebar uses the model for the agent's turn presentation:
 - the spinner appears when the model predicts `no_attention_needed` during an
   active submitted turn.
 
-High-confidence attention predictions can create system notifications for
-top-level agents. Notification gating deduplicates an attention episode and
-avoids duplicating native harness notifications.
+High-confidence action predictions can create fallback system notifications for
+top-level agents that do not notify on their own. A native harness notification
+owns the episode and is delivered first, so the classifier does not send a
+duplicate. Notification acknowledgement remains separate from classification.
 
 The agent-tab context menu shows the current prediction and probability. Choose
 **Show Attention Debug...** to inspect the input event, native activity

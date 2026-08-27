@@ -291,6 +291,39 @@ struct ControlActivityTests {
         #expect(session.agentActivityState == .working)
     }
 
+    @Test func piSpinnerWorkingMarkerOutranksVisibleComposer() async throws {
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: "/bin/cat"))
+        harness.server.start()
+
+        let session = try await harness.spawnAgentSession(named: "Pi")
+        session.noteTestingInput(Data("run the tests\r".utf8))
+        session.ingestTestingData(Data("⠏ Working...\n> \n".utf8))
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentActivityEvidenceIsStrong == true)
+    }
+
+    @Test func piProseMentioningWorkingDoesNotOutrankComposer() async throws {
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: "/bin/cat"))
+        harness.server.start()
+
+        let session = try await harness.spawnAgentSession(named: "Pi")
+        session.ingestTestingData(Data("The service is working...\n> \n".utf8))
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(session.agentActivityState == .idle)
+        #expect(session.agentActivityEvidenceIsStrong == true)
+    }
+
     // Real screen captured live on 2026-07-08: the agent's own FINAL MESSAGE contains
     // the prose "~3–5% while working (0% idle)", which the old bare "working ("
     // substring match treated as a working status marker. With that sentence pinned

@@ -4405,11 +4405,22 @@ final class TerminalSession: ObservableObject, Identifiable {
     // running") only count on lines led by a spinner glyph.
     private static let claudeStatusMarkerPhrases = ["whisking", "still thinking", "shell still running"]
     private static let claudeSpinnerGlyphs: Set<Character> = ["·", "✢", "✳", "✶", "✻", "✽", "∗", "*"]
+    private static let piSpinnerGlyphs: Set<Character> = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
         let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         if trimmedLines.contains(where: { $0.lowercased().contains("esc to interrupt") }) {
             return true
+        }
+
+        if normalizedAgentName == "pi" {
+            return trimmedLines.contains { line in
+                guard let first = line.first, piSpinnerGlyphs.contains(first) else { return false }
+                let status = line.dropFirst()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                return status == "working..." || status == "working…"
+            }
         }
 
         guard normalizedAgentName == "claude" else { return false }

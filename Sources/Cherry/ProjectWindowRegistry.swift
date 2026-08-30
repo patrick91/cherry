@@ -27,6 +27,19 @@ final class ProjectWindowRegistry {
         return !workspaces.isEmpty
     }
 
+    /// A live project window still owned by the registry. AppKit can retain a
+    /// closed SwiftUI `NSWindow` in `NSApp.windows`; callers must not use that
+    /// broader list for app-reopen routing because the retained scene's
+    /// workspace has already been torn down.
+    func firstRegisteredProjectWindow() -> NSWindow? {
+        pruneStaleWindows()
+        if let activeProjectRoot,
+           let window = windows[repositoryRoot(for: activeProjectRoot)]?.window {
+            return window
+        }
+        return windows.values.lazy.compactMap(\.window).first
+    }
+
     /// Live workspaces across every registered project window.
     func allWorkspaces() -> [TerminalWorkspace] {
         pruneStaleWindows()
@@ -1054,6 +1067,7 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     private var isCloseConfirmed = false
     private var isPresentingCloseAlert = false
     private var shouldCloseAfterSheetEnds = false
+    private var closeAfterSheetDetachesTask: Task<Void, Never>?
     private var didCloseWorkspace = false
 
     init(window: NSWindow) {
@@ -1081,6 +1095,8 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        closeAfterSheetDetachesTask?.cancel()
+        closeAfterSheetDetachesTask = nil
         if let window = notification.object as? NSWindow {
             closeWorkspaceIfNeeded()
             ProjectWindowRegistry.shared.unregister(window: window, projectRoot: projectRoot)
@@ -1093,14 +1109,11 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         previousDelegate?.windowDidEndSheet?(notification)
 
         guard shouldCloseAfterSheetEnds,
-              let window = notification.object as? NSWindow,
-              window === self.window
-        else {
-            return
-        }
-
-        shouldCloseAfterSheetEnds = false
-        window.close()
+              let window,
+              let endedWindow = notification.object as? NSWindow,
+              endedWindow === window
+        else { return }
+        scheduleCloseAfterSheetDetaches(from: window)
     }
 
     private func presentCloseAlert(for window: NSWindow, runningProcessCount: Int) {
@@ -1130,16 +1143,38 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
 
         isCloseConfirmed = true
         closeWorkspaceIfNeeded()
+        shouldCloseAfterSheetEnds = true
+        scheduleCloseAfterSheetDetaches(from: window)
+    }
 
-        // The original traffic-light click already passed through
-        // `windowShouldClose`. Do not simulate another click while AppKit is
-        // still dismissing the confirmation sheet: that can leave the sheet
-        // orphaned over the next key window. Close directly once the sheet has
-        // fully detached instead.
-        if window.attachedSheet == nil {
-            window.close()
-        } else {
-            shouldCloseAfterSheetEnds = true
+    /// `NSAlert` calls its completion while the sheet is still being ordered
+    /// out. The delegate's `windowDidEndSheet` callback can arrive before the
+    /// completion's MainActor task, so using that single callback as the close
+    /// trigger loses a race and leaves a zero-session window behind. Wait for
+    /// AppKit's authoritative attachment relationship to clear, then close the
+    /// parent directly without replaying the original traffic-light action.
+    private func scheduleCloseAfterSheetDetaches(from window: NSWindow) {
+        closeAfterSheetDetachesTask?.cancel()
+        closeAfterSheetDetachesTask = Task { @MainActor [weak self, weak window] in
+            while !Task.isCancelled {
+                guard let self,
+                      let window,
+                      self.shouldCloseAfterSheetEnds
+                else { return }
+
+                if window.attachedSheet == nil {
+                    self.shouldCloseAfterSheetEnds = false
+                    self.closeAfterSheetDetachesTask = nil
+                    window.close()
+                    return
+                }
+
+                do {
+                    try await Task.sleep(for: .milliseconds(10))
+                } catch {
+                    return
+                }
+            }
         }
     }
 

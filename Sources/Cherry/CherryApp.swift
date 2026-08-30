@@ -24,15 +24,16 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            if let window = Self.firstProjectCapableWindow {
-                window.makeKeyAndOrderFront(nil)
-            } else {
-                let openDefaultProjectWindow = openDefaultProjectWindow
-                Task { @MainActor in
-                    openDefaultProjectWindow?()
-                }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows _: Bool) -> Bool {
+        let projectWindow = MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.firstRegisteredProjectWindow()
+        }
+        if let projectWindow {
+            projectWindow.makeKeyAndOrderFront(nil)
+        } else {
+            let openDefaultProjectWindow = openDefaultProjectWindow
+            Task { @MainActor in
+                openDefaultProjectWindow?()
             }
         }
 

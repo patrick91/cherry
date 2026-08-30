@@ -5963,6 +5963,58 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func confirmedProjectWindowCloseHandlesRealAlertSheetOrdering() async {
+    let closingWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    let otherWindow = NSWindow(
+        contentRect: NSRect(x: 40, y: 40, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    let closeDelegate = ProjectWindowCloseDelegate(window: closingWindow)
+
+    closingWindow.isReleasedWhenClosed = false
+    otherWindow.isReleasedWhenClosed = false
+    closingWindow.delegate = closeDelegate
+    otherWindow.orderFrontRegardless()
+    closingWindow.orderFrontRegardless()
+
+    defer {
+        closingWindow.attachedSheet?.close()
+        closingWindow.close()
+        otherWindow.close()
+    }
+
+    let alert = NSAlert()
+    alert.messageText = "Close window?"
+    alert.informativeText = "This window has a running process. It will be stopped."
+    alert.addButton(withTitle: "Stop and close")
+    alert.addButton(withTitle: "Cancel")
+    alert.beginSheetModal(for: closingWindow) { response in
+        Task { @MainActor in
+            closeDelegate.finishCloseAlert(response: response, for: closingWindow)
+        }
+    }
+
+    #expect(await waitForCondition {
+        closingWindow.attachedSheet != nil
+    })
+
+    alert.buttons[0].performClick(nil)
+
+    #expect(await waitForCondition(timeout: 2) {
+        !closingWindow.isVisible
+    })
+    #expect(otherWindow.isVisible)
+    #expect(otherWindow.attachedSheet == nil)
+}
+
+@MainActor
 @Test func workspaceCloseReleasesGhosttyBridge() async throws {
     let startingBridgeCount = GhosttySessionBridge.liveBridgeCount
     let workspace = TerminalWorkspace(launchBackend: .hostManaged)

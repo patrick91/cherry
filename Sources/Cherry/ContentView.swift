@@ -37,6 +37,40 @@ struct ContentView: View {
     @State private var floatingSidebarAnimationDepth = 0
     @StateObject private var worktreeSwipeState = WorktreeSidebarSwipeState()
 
+    private var projectNavigationPrototypeStyle: ProjectNavigationPrototypeStyle {
+        PrototypeFeatureFlags.projectNavigationStyle
+    }
+
+    private var showsProjectNavigationPrototype: Bool {
+        chromeState.isProjectTabsPrototypePresented
+    }
+
+    private var showsProjectRailPrototype: Bool {
+        showsProjectNavigationPrototype && projectNavigationPrototypeStyle == .rail
+    }
+
+    private var showsProjectStackPrototype: Bool {
+        showsProjectNavigationPrototype && projectNavigationPrototypeStyle == .stack
+    }
+
+    private var showsWorkspacePrototype: Bool {
+        showsProjectNavigationPrototype && projectNavigationPrototypeStyle == .workspace
+    }
+
+    private var showsWorkspaceFlatPrototype: Bool {
+        showsProjectNavigationPrototype && projectNavigationPrototypeStyle == .workspaceFlat
+    }
+
+    private var projectNavigationTopInset: CGFloat {
+        guard showsProjectNavigationPrototype else { return 0 }
+        switch projectNavigationPrototypeStyle {
+        case .tabs, .segmented, .workspace:
+            return ProjectTabsPrototypeLayout.barHeight
+        case .rail, .stack, .workspaceFlat:
+            return 0
+        }
+    }
+
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
     }
@@ -64,6 +98,16 @@ struct ContentView: View {
                 .allowsHitTesting(false)
 
             HStack(spacing: 0) {
+                if showsProjectRailPrototype, !isSidebarHidden {
+                    ProjectRailPrototype(
+                        settings: agentSettings,
+                        projectRoot: projectRoot,
+                        openProject: openProject
+                    )
+                    .frame(width: ProjectRailPrototypeLayout.width)
+                    .ignoresSafeArea(.all, edges: .top)
+                }
+
                 dockedSidebarSlot
 
                 DetailPaneView(
@@ -73,7 +117,8 @@ struct ContentView: View {
                     todoStore: todoStore,
                     projectRoot: projectRoot,
                     includeLeadingPadding: isSidebarHidden,
-                    usesWorktreeSurfaceTransition: worktreeSwipeState.targetRoot != nil
+                    usesWorktreeSurfaceTransition: worktreeSwipeState.targetRoot != nil,
+                    projectNavigationTopInset: projectNavigationTopInset
                 )
                     .ignoresSafeArea(.all, edges: .top)
             }
@@ -97,42 +142,121 @@ struct ContentView: View {
                 .allowsHitTesting(isSidebarRevealed)
             }
 
-            // Project picker, anchored to the window's top-leading corner so
-            // it shares coordinate space with the traffic-light overlay
-            // (which positions correctly at this level). It rides the same
-            // chrome translation as the traffic lights so it slides off
-            // with the sidebar, and is hidden via offset when the sidebar
-            // is fully gone.
-            TitlebarProjectPicker(
-                settings: AgentSettings.shared,
-                repository: repository,
-                chromeState: chromeState,
-                swipeState: worktreeSwipeState,
-                projectRoot: projectRoot,
-                presentation: isSidebarRevealed ? .floating : .docked,
-                sidebarWidth: sidebarWidth,
-                maximumWidth: titlebarProjectPickerMaximumWidth,
-                openProject: openProject,
-                openSettings: { openSettings() }
-            )
-            .padding(.leading, titlebarProjectPickerLeadingInset)
-            .padding(.top, 12)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            // Drive the picker's offset off the same animated
-            // (dockedWidth, floatingWidth) pair the traffic lights use,
-            // so it goes through the same `min(0, max(...) - sidebarWidth)`
-            // clamping each tick. With a plain `.offset(x:)` bound to a
-            // computed CGFloat, SwiftUI springs the offset directly and lets
-            // the value overshoot past `-sidebarWidth` — but the traffic
-            // lights are clamped by `max(docked, 0)`, so they pin at
-            // `-sidebarWidth` while the picker bounces. Same modifier,
-            // identical math: they slide in lockstep.
-            .modifier(ChromeOffsetModifier(
-                dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
-                floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
-                sidebarWidth: sidebarWidth
-            ))
-            .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
+            if showsProjectStackPrototype, !isSidebarHidden {
+                ProjectStackPrototypeSidebar(
+                    settings: agentSettings,
+                    workspace: workspace,
+                    projectRoot: projectRoot,
+                    openProject: openProject
+                )
+                .frame(width: sidebarWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .ignoresSafeArea(.all, edges: .top)
+                .zIndex(850)
+            }
+
+            if showsWorkspacePrototype, !isSidebarHidden {
+                WorkspaceFoldersPrototypeSidebar(
+                    settings: agentSettings,
+                    workspace: workspace,
+                    projectRoot: projectRoot,
+                    openProject: openProject
+                )
+                .frame(width: sidebarWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .ignoresSafeArea(.all, edges: .top)
+                .zIndex(850)
+            }
+
+            if showsWorkspaceFlatPrototype, !isSidebarHidden {
+                WorkspaceFlatPrototypeSidebar(
+                    settings: agentSettings,
+                    projectRoot: projectRoot
+                )
+                .frame(width: sidebarWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .ignoresSafeArea(.all, edges: .top)
+                .zIndex(850)
+            }
+
+            if showsProjectNavigationPrototype {
+                Group {
+                    switch projectNavigationPrototypeStyle {
+                    case .tabs:
+                        ProjectTabsPrototypeBar(
+                            settings: agentSettings,
+                            projectRoot: projectRoot,
+                            presentation: isSidebarRevealed ? .floating : .docked,
+                            leadingInset: projectTabsLeadingInset,
+                            openProject: openProject
+                        )
+                    case .segmented:
+                        ProjectSegmentedPrototypeBar(
+                            settings: agentSettings,
+                            projectRoot: projectRoot,
+                            presentation: isSidebarRevealed ? .floating : .docked,
+                            leadingInset: projectTabsLeadingInset,
+                            openProject: openProject
+                        )
+                    case .workspace:
+                        WorkspaceTabsPrototypeBar(
+                            settings: agentSettings,
+                            projectRoot: projectRoot,
+                            presentation: isSidebarRevealed ? .floating : .docked,
+                            leadingInset: projectTabsLeadingInset
+                        )
+                    case .workspaceFlat:
+                        WorkspaceTitlePrototypePicker(
+                            settings: agentSettings,
+                            projectRoot: projectRoot,
+                            presentation: isSidebarRevealed ? .floating : .docked
+                        )
+                        .padding(.leading, titlebarProjectPickerLeadingInset)
+                        .padding(.top, 12)
+                    case .rail, .stack:
+                        EmptyView()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .zIndex(900)
+            } else {
+                // Project picker, anchored to the window's top-leading corner so
+                // it shares coordinate space with the traffic-light overlay
+                // (which positions correctly at this level). It rides the same
+                // chrome translation as the traffic lights so it slides off
+                // with the sidebar, and is hidden via offset when the sidebar
+                // is fully gone.
+                TitlebarProjectPicker(
+                    settings: AgentSettings.shared,
+                    repository: repository,
+                    chromeState: chromeState,
+                    swipeState: worktreeSwipeState,
+                    projectRoot: projectRoot,
+                    presentation: isSidebarRevealed ? .floating : .docked,
+                    sidebarWidth: sidebarWidth,
+                    maximumWidth: titlebarProjectPickerMaximumWidth,
+                    openProject: openProject,
+                    openSettings: { openSettings() }
+                )
+                .padding(.leading, titlebarProjectPickerLeadingInset)
+                .padding(.top, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                // Drive the picker's offset off the same animated
+                // (dockedWidth, floatingWidth) pair the traffic lights use,
+                // so it goes through the same `min(0, max(...) - sidebarWidth)`
+                // clamping each tick. With a plain `.offset(x:)` bound to a
+                // computed CGFloat, SwiftUI springs the offset directly and lets
+                // the value overshoot past `-sidebarWidth` — but the traffic
+                // lights are clamped by `max(docked, 0)`, so they pin at
+                // `-sidebarWidth` while the picker bounces. Same modifier,
+                // identical math: they slide in lockstep.
+                .modifier(ChromeOffsetModifier(
+                    dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
+                    floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+                    sidebarWidth: sidebarWidth
+                ))
+                .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
+            }
 
             if chromeState.isCommandPalettePresented {
                 CommandPaletteOverlay(
@@ -411,6 +535,12 @@ struct ContentView: View {
             0,
             sidebarWidth - titlebarProjectPickerLeadingInset - SidebarLayout.trailingInset
         )
+    }
+
+    private var projectTabsLeadingInset: CGFloat {
+        isSidebarHidden && !isSidebarRevealed
+            ? SidebarLayout.trailingInset
+            : TitlebarProjectPickerLayout.leadingInset
     }
 
     private var sidebarRevealTrackingWidth: CGFloat {
@@ -957,6 +1087,7 @@ private struct DetailPaneView: View {
     let projectRoot: String?
     let includeLeadingPadding: Bool
     let usesWorktreeSurfaceTransition: Bool
+    let projectNavigationTopInset: CGFloat
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
@@ -992,7 +1123,7 @@ private struct DetailPaneView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .padding(.top, 5)
+        .padding(.top, projectNavigationTopInset + 5)
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
@@ -4551,6 +4682,29 @@ private enum TitlebarProjectPickerLayout {
     }
 }
 
+private enum ProjectTabsPrototypeLayout {
+    static let barHeight: CGFloat = 43
+    static let tabHeight: CGFloat = 29
+    static let tabCornerRadius: CGFloat = 8
+    static let tabSpacing: CGFloat = 4
+    static let horizontalPadding: CGFloat = 10
+}
+
+private enum ProjectRailPrototypeLayout {
+    static let width: CGFloat = 46
+    static let itemSize: CGFloat = 30
+    static let itemCornerRadius: CGFloat = 9
+}
+
+private enum ProjectNavigationPrototypeStyle: String {
+    case tabs
+    case segmented
+    case rail
+    case stack
+    case workspace
+    case workspaceFlat = "workspace-flat"
+}
+
 private enum AgentTreeLayout {
     static let tuningEnvironmentKey = "CHERRY_AGENT_TREE_TUNING"
 
@@ -4597,6 +4751,17 @@ private enum AgentTreeLayout {
 enum PrototypeFeatureFlags {
     static var isIconDebugEnabled: Bool {
         truthyEnvironmentValue(for: "CHERRY_ICON_DEBUG")
+    }
+
+    static var isProjectTabsPrototypeEnabled: Bool {
+        truthyEnvironmentValue(for: "CHERRY_PROJECT_TABS_PROTOTYPE")
+    }
+
+    fileprivate static var projectNavigationStyle: ProjectNavigationPrototypeStyle {
+        let value = ProcessInfo.processInfo.environment["CHERRY_PROJECT_NAVIGATION_STYLE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return ProjectNavigationPrototypeStyle(rawValue: value ?? "") ?? .tabs
     }
 
     private static func truthyEnvironmentValue(for key: String) -> Bool {
@@ -4955,6 +5120,1553 @@ private struct SidebarTabsPage: View {
         presentation == .docked ? SidebarLayout.floatingOuterInset : 0
     }
 
+}
+
+/// Visual prototype for treating saved projects as peers in one titlebar.
+/// Selection intentionally routes through Cherry's existing project-opening
+/// path: this keeps the mockup safe to try without changing project/window
+/// ownership or the lifetime of any terminal session.
+private struct ProjectTabsPrototypeBar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let leadingInset: CGFloat
+    let openProject: (CherryProject) -> Void
+
+    var body: some View {
+        let currentPalette = palette(for: projectRoot)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: ProjectTabsPrototypeLayout.tabSpacing) {
+                ForEach(displayedProjects) { project in
+                    ProjectTabsPrototypeButton(
+                        project: project,
+                        palette: palette(for: project.root),
+                        isSelected: project.id == selectedProjectID,
+                        isOpen: ProjectWindowRegistry.shared.hasWindow(for: project.root),
+                        action: { openProject(project) }
+                    )
+                }
+
+                ProjectTabsPrototypeAddButton(
+                    palette: currentPalette,
+                    action: chooseProjectRoot
+                )
+            }
+            .padding(.leading, leadingInset)
+            .padding(.trailing, ProjectTabsPrototypeLayout.horizontalPadding)
+            .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(currentPalette.rowText.opacity(0.09))
+                .frame(height: 1)
+        }
+        .accessibilityLabel("Projects")
+    }
+
+    private var displayedProjects: [CherryProject] {
+        var projects = settings.projects
+        guard let selectedProject,
+              !projects.contains(where: { $0.id == selectedProject.id })
+        else {
+            return projects
+        }
+        projects.insert(selectedProject, at: 0)
+        return projects
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+
+    private var selectedProjectID: CherryProject.ID? {
+        selectedProject?.id
+    }
+
+    private func palette(for root: String?) -> SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: root).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+        openProject(project)
+    }
+}
+
+/// A compact, toolbar-like treatment for people who read project switching as
+/// a mode change instead of opening and closing documents.
+private struct ProjectSegmentedPrototypeBar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let leadingInset: CGFloat
+    let openProject: (CherryProject) -> Void
+
+    var body: some View {
+        let currentPalette = palette(for: projectRoot)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                HStack(spacing: 2) {
+                    ForEach(displayedProjects) { project in
+                        ProjectSegmentedPrototypeButton(
+                            project: project,
+                            palette: palette(for: project.root),
+                            isSelected: project.id == selectedProjectID,
+                            action: { openProject(project) }
+                        )
+                    }
+                }
+                .padding(2)
+                .background {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(currentPalette.rowText.opacity(0.055))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(currentPalette.rowText.opacity(0.09), lineWidth: 1)
+                }
+
+                ProjectTabsPrototypeAddButton(
+                    palette: currentPalette,
+                    action: chooseProjectRoot
+                )
+            }
+            .padding(.leading, leadingInset)
+            .padding(.trailing, ProjectTabsPrototypeLayout.horizontalPadding)
+            .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(currentPalette.rowText.opacity(0.09))
+                .frame(height: 1)
+        }
+        .accessibilityLabel("Projects")
+    }
+
+    private var displayedProjects: [CherryProject] {
+        var projects = settings.projects
+        guard let selectedProject,
+              !projects.contains(where: { $0.id == selectedProject.id })
+        else {
+            return projects
+        }
+        projects.insert(selectedProject, at: 0)
+        return projects
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+
+    private var selectedProjectID: CherryProject.ID? {
+        selectedProject?.id
+    }
+
+    private func palette(for root: String?) -> SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: root).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+        openProject(project)
+    }
+}
+
+private struct ProjectSegmentedPrototypeButton: View {
+    let project: CherryProject
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                if palette.showsProjectAccent {
+                    Circle()
+                        .fill(palette.projectAccent)
+                        .frame(width: 7, height: 7)
+                }
+
+                Text(project.name)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(.horizontal, 9)
+            .frame(maxWidth: 164)
+            .frame(height: 25)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(segmentFill)
+            }
+            .overlay {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(palette.selectedStroke.opacity(0.75), lineWidth: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(project.root)
+        .accessibilityLabel(project.name)
+        .accessibilityValue(isSelected ? "Current project" : "Project")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var segmentFill: Color {
+        if isSelected {
+            return palette.selectedFill
+        }
+        return isHovering ? palette.hoverFill : .clear
+    }
+}
+
+/// The combined direction: titlebar peers are user-defined workspaces, not
+/// repository roots. Folders within the selected workspace live in the
+/// sidebar and share notes and todos.
+private struct WorkspaceTabsPrototypeBar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+    let leadingInset: CGFloat
+
+    var body: some View {
+        let palette = currentPalette
+
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: ProjectTabsPrototypeLayout.tabSpacing) {
+                WorkspacePrototypeTabButton(
+                    title: "Development",
+                    accent: palette.projectAccent,
+                    palette: palette,
+                    isSelected: true,
+                    action: {}
+                )
+
+                WorkspacePrototypeTabButton(
+                    title: "Client Work",
+                    accent: Color.orange.opacity(0.78),
+                    palette: palette,
+                    isSelected: false,
+                    action: {}
+                )
+
+                ProjectTabsPrototypeAddButton(
+                    palette: palette,
+                    action: {}
+                )
+                .help("New workspace")
+            }
+            .padding(.leading, leadingInset)
+            .padding(.trailing, ProjectTabsPrototypeLayout.horizontalPadding)
+            .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: ProjectTabsPrototypeLayout.barHeight)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(palette.rowText.opacity(0.09))
+                .frame(height: 1)
+        }
+        .accessibilityLabel("Workspaces")
+    }
+
+    private var currentPalette: SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+    }
+}
+
+private struct WorkspacePrototypeTabButton: View {
+    let title: String
+    let accent: Color
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(accent)
+                    .frame(width: 7, height: 7)
+
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: 188)
+            .frame(height: ProjectTabsPrototypeLayout.tabHeight)
+            .background {
+                RoundedRectangle(
+                    cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                    style: .continuous
+                )
+                .fill(tabFill)
+            }
+            .overlay {
+                if isSelected {
+                    RoundedRectangle(
+                        cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                        style: .continuous
+                    )
+                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(
+                cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                style: .continuous
+            ))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .accessibilityLabel(title)
+        .accessibilityValue(isSelected ? "Current workspace" : "Workspace")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var tabFill: Color {
+        if isSelected {
+            return palette.selectedFill
+        }
+        return isHovering ? palette.hoverFill : .clear
+    }
+}
+
+private struct WorkspaceTitlePrototypePicker: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let presentation: SidebarPresentation
+
+    @State private var isHovering = false
+
+    var body: some View {
+        let palette = currentPalette
+
+        Button(action: {}) {
+            HStack(spacing: 6) {
+                if palette.showsProjectAccent {
+                    Circle()
+                        .fill(palette.projectAccent)
+                        .frame(width: 7, height: 7)
+                }
+
+                Text("Development")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(palette.rowText)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(palette.rowText.opacity(0.46))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isHovering ? palette.hoverFill : .clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help("Development workspace · 3 folders")
+        .accessibilityLabel("Development")
+        .accessibilityValue("Current workspace, 3 folders")
+    }
+
+    private var currentPalette: SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+    }
+}
+
+/// A deliberately conservative multi-folder workspace mockup. Folder is
+/// metadata on rows, while the existing flat sidebar hierarchy stays intact.
+private struct WorkspaceFlatPrototypeSidebar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+
+    var body: some View {
+        let palette = currentPalette
+
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    WorkspaceFlatSectionHeader(
+                        title: "Agents",
+                        count: 2,
+                        showsAdd: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Implement workspace model",
+                        detail: "pix · main",
+                        systemImage: "sparkles",
+                        activityColor: .green,
+                        isSelected: false,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Review API changes",
+                        detail: "cherry · feature/api",
+                        systemImage: "sparkles",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    WorkspaceFlatSectionHeader(
+                        title: "Terminals",
+                        count: 2,
+                        showsAdd: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "pix",
+                        detail: "patrick91/pix",
+                        systemImage: "terminal",
+                        activityColor: nil,
+                        isSelected: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "api",
+                        detail: "patrick91/cherry",
+                        systemImage: "terminal",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    WorkspaceFlatSectionHeader(
+                        title: "Commands",
+                        count: 2,
+                        showsAdd: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Run app",
+                        detail: "cherry",
+                        systemImage: "play.fill",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Run tests",
+                        detail: "pix",
+                        systemImage: "checkmark.circle",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    WorkspaceFlatSectionHeader(
+                        title: "Todos",
+                        count: 3,
+                        showsAdd: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Unify notes storage",
+                        detail: "Workspace",
+                        systemImage: "checklist",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    WorkspaceFlatSectionHeader(
+                        title: "Notes",
+                        count: 2,
+                        showsAdd: true,
+                        palette: palette
+                    )
+
+                    WorkspaceFlatRow(
+                        title: "Workspace model",
+                        detail: "Shared across folders",
+                        systemImage: "note.text",
+                        activityColor: nil,
+                        isSelected: false,
+                        palette: palette
+                    )
+                }
+            }
+            .padding(.leading, SidebarLayout.trafficLightLeadingInset)
+            .padding(.trailing, SidebarLayout.trailingInset)
+            .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + 3)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: .docked)
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(palette.rowText.opacity(0.09))
+                .frame(width: 1)
+        }
+        .accessibilityLabel("Development workspace sidebar")
+    }
+
+    private var currentPalette: SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: projectRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: .docked
+        )
+    }
+}
+
+private struct WorkspaceFlatSectionHeader: View {
+    let title: String
+    let count: Int
+    let showsAdd: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Text(title.uppercased())
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(palette.rowText.opacity(0.68))
+
+            Rectangle()
+                .fill(palette.rowText.opacity(0.10))
+                .frame(height: 1)
+
+            Text(String(count))
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(palette.rowText.opacity(0.46))
+
+            if showsAdd {
+                Image(systemName: "plus")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(palette.rowText.opacity(0.56))
+            }
+        }
+        .frame(height: 14)
+    }
+}
+
+private struct WorkspaceFlatRow: View {
+    let title: String
+    let detail: String
+    let systemImage: String
+    let activityColor: Color?
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {}) {
+            HStack(spacing: 8) {
+                ZStack(alignment: .bottomTrailing) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(
+                            isSelected
+                                ? palette.selectedText.opacity(0.80)
+                                : palette.rowText.opacity(0.58)
+                        )
+                        .frame(width: 13)
+
+                    if let activityColor {
+                        Circle()
+                            .fill(activityColor)
+                            .frame(width: 5, height: 5)
+                            .offset(x: 2, y: 1)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Text(detail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(
+                            isSelected
+                                ? palette.selectedText.opacity(0.56)
+                                : palette.rowText.opacity(0.50)
+                        )
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 39)
+            .background {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(rowFill)
+            }
+            .overlay {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .accessibilityLabel(title)
+        .accessibilityValue(detail)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var rowFill: Color {
+        if isSelected {
+            return palette.selectedFill
+        }
+        return isHovering ? palette.hoverFill : .clear
+    }
+}
+
+/// Arc-inspired project spaces. Each rail item represents a retained Cherry
+/// context rather than a terminal or a file within that context.
+private struct ProjectRailPrototype: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    let projectRoot: String?
+    let openProject: (CherryProject) -> Void
+
+    var body: some View {
+        VStack(spacing: 7) {
+            Color.clear.frame(height: ProjectTabsPrototypeLayout.barHeight)
+
+            ForEach(displayedProjects) { project in
+                ProjectRailPrototypeButton(
+                    project: project,
+                    palette: palette(for: project.root),
+                    isSelected: project.id == selectedProjectID,
+                    action: { openProject(project) }
+                )
+            }
+
+            Spacer(minLength: 8)
+
+            ProjectRailAddButton(
+                palette: palette(for: projectRoot),
+                action: chooseProjectRoot
+            )
+            .padding(.bottom, 9)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: .docked)
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(palette(for: projectRoot).rowText.opacity(0.09))
+                .frame(width: 1)
+        }
+        .accessibilityLabel("Project spaces")
+    }
+
+    private var displayedProjects: [CherryProject] {
+        var projects = settings.projects
+        guard let selectedProject,
+              !projects.contains(where: { $0.id == selectedProject.id })
+        else {
+            return projects
+        }
+        projects.insert(selectedProject, at: 0)
+        return projects
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+
+    private var selectedProjectID: CherryProject.ID? {
+        selectedProject?.id
+    }
+
+    private func palette(for root: String?) -> SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: root).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: .docked
+        )
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+        openProject(project)
+    }
+}
+
+private struct ProjectRailPrototypeButton: View {
+    let project: CherryProject
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(monogram)
+                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(isSelected ? palette.selectedText : palette.rowText.opacity(0.82))
+                .frame(
+                    width: ProjectRailPrototypeLayout.itemSize,
+                    height: ProjectRailPrototypeLayout.itemSize
+                )
+                .background {
+                    RoundedRectangle(
+                        cornerRadius: ProjectRailPrototypeLayout.itemCornerRadius,
+                        style: .continuous
+                    )
+                    .fill(itemFill)
+                }
+                .overlay {
+                    RoundedRectangle(
+                        cornerRadius: ProjectRailPrototypeLayout.itemCornerRadius,
+                        style: .continuous
+                    )
+                    .strokeBorder(
+                        isSelected ? palette.projectAccent.opacity(0.72) : palette.rowText.opacity(0.08),
+                        lineWidth: 1
+                    )
+                }
+                .contentShape(RoundedRectangle(
+                    cornerRadius: ProjectRailPrototypeLayout.itemCornerRadius,
+                    style: .continuous
+                ))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(project.name)
+        .accessibilityLabel(project.name)
+        .accessibilityValue(isSelected ? "Current project" : "Project")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var monogram: String {
+        String(project.name.prefix(1)).uppercased()
+    }
+
+    private var itemFill: Color {
+        if isSelected {
+            return palette.selectedFill
+        }
+        if isHovering {
+            return palette.hoverFill
+        }
+        return palette.rowText.opacity(0.035)
+    }
+}
+
+private struct ProjectRailAddButton: View {
+    let palette: SidebarPalette
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(palette.rowText.opacity(0.68))
+                .frame(
+                    width: ProjectRailPrototypeLayout.itemSize,
+                    height: ProjectRailPrototypeLayout.itemSize
+                )
+                .background {
+                    RoundedRectangle(
+                        cornerRadius: ProjectRailPrototypeLayout.itemCornerRadius,
+                        style: .continuous
+                    )
+                    .fill(isHovering ? palette.hoverFill : .clear)
+                }
+                .contentShape(RoundedRectangle(
+                    cornerRadius: ProjectRailPrototypeLayout.itemCornerRadius,
+                    style: .continuous
+                ))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help("Add project")
+        .accessibilityLabel("Add project")
+    }
+}
+
+/// Zed-inspired alternative: projects become the top level of the existing
+/// sidebar hierarchy. The active project expands in place and retains the
+/// familiar Agents / Terminals / Commands grouping below it.
+private struct ProjectStackPrototypeSidebar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
+    let openProject: (CherryProject) -> Void
+
+    var body: some View {
+        let currentPalette = palette(for: projectRoot)
+
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 5) {
+                ForEach(displayedProjects) { project in
+                    ProjectStackHeader(
+                        project: project,
+                        palette: palette(for: project.root),
+                        isSelected: project.id == selectedProjectID,
+                        isOpen: ProjectWindowRegistry.shared.hasWindow(for: project.root),
+                        action: { openProject(project) }
+                    )
+
+                    if project.id == selectedProjectID {
+                        currentProjectContents(palette: currentPalette)
+                            .padding(.leading, 13)
+                    }
+                }
+
+                Button(action: chooseProjectRoot) {
+                    Label("Add project", systemImage: "plus")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(currentPalette.rowText.opacity(0.68))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .frame(height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.leading, SidebarLayout.trafficLightLeadingInset)
+            .padding(.trailing, SidebarLayout.trailingInset)
+            .padding(.top, ProjectTabsPrototypeLayout.barHeight + 5)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: .docked)
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(currentPalette.rowText.opacity(0.09))
+                .frame(width: 1)
+        }
+        .accessibilityLabel("Projects")
+    }
+
+    @ViewBuilder
+    private func currentProjectContents(palette: SidebarPalette) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ProjectStackSectionLabel(title: "Agents", count: 0, palette: palette)
+
+            Text("No agents")
+                .font(.system(size: 12.5))
+                .foregroundStyle(palette.rowText.opacity(0.55))
+                .padding(.leading, 8)
+
+            ProjectStackSectionLabel(
+                title: "Terminals",
+                count: max(1, workspace.terminalDisplayItems.count),
+                palette: palette
+            )
+
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(palette.selectedText.opacity(0.82))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(workspace.selectedSession?.title ?? selectedProject?.name ?? "Shell")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(palette.selectedText)
+                        .lineLimit(1)
+
+                    if let projectRoot {
+                        Text(URL(fileURLWithPath: projectRoot).deletingLastPathComponent().lastPathComponent + "/" + URL(fileURLWithPath: projectRoot).lastPathComponent)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(palette.selectedText.opacity(0.56))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 42)
+            .background {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(palette.selectedFill)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+            }
+
+            ProjectStackSectionLabel(
+                title: "Commands",
+                count: settings.launchableProjectCommands(for: projectRoot).count,
+                palette: palette
+            )
+
+            Text("No commands")
+                .font(.system(size: 12.5))
+                .foregroundStyle(palette.rowText.opacity(0.55))
+                .padding(.leading, 8)
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var displayedProjects: [CherryProject] {
+        var projects = settings.projects
+        guard let selectedProject,
+              !projects.contains(where: { $0.id == selectedProject.id })
+        else {
+            return projects
+        }
+        projects.insert(selectedProject, at: 0)
+        return projects
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+
+    private var selectedProjectID: CherryProject.ID? {
+        selectedProject?.id
+    }
+
+    private func palette(for root: String?) -> SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: root).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: .docked
+        )
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+        openProject(project)
+    }
+}
+
+private struct WorkspaceFoldersPrototypeSidebar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+
+    @ObservedObject var settings: AgentSettings
+    @ObservedObject var workspace: TerminalWorkspace
+    let projectRoot: String?
+    let openProject: (CherryProject) -> Void
+
+    var body: some View {
+        let currentPalette = palette(for: projectRoot)
+
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 6) {
+                ProjectStackSectionLabel(title: "Shared", count: 2, palette: currentPalette)
+
+                WorkspaceSharedRow(
+                    title: "Todos",
+                    count: 8,
+                    systemImage: "checklist",
+                    palette: currentPalette,
+                    action: {}
+                )
+
+                WorkspaceSharedRow(
+                    title: "Notes",
+                    count: 4,
+                    systemImage: "note.text",
+                    palette: currentPalette,
+                    action: {}
+                )
+
+                ProjectStackSectionLabel(
+                    title: "Folders",
+                    count: displayedProjects.count,
+                    palette: currentPalette
+                )
+                .padding(.top, 7)
+
+                ForEach(displayedProjects) { project in
+                    WorkspaceFolderHeader(
+                        project: project,
+                        palette: palette(for: project.root),
+                        isSelected: project.id == selectedProjectID,
+                        status: folderStatus(for: project),
+                        action: { openProject(project) }
+                    )
+
+                    if project.id == selectedProjectID {
+                        currentFolderContents(palette: currentPalette)
+                            .padding(.leading, 13)
+                    }
+                }
+
+                Button(action: chooseProjectRoot) {
+                    Label("Add folder", systemImage: "plus")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(currentPalette.rowText.opacity(0.68))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .frame(height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.leading, SidebarLayout.trafficLightLeadingInset)
+            .padding(.trailing, SidebarLayout.trailingInset)
+            .padding(.top, ProjectTabsPrototypeLayout.barHeight + 5)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            SidebarBackground(projectRoot: projectRoot, presentation: .docked)
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(currentPalette.rowText.opacity(0.09))
+                .frame(width: 1)
+        }
+        .accessibilityLabel("Development workspace")
+    }
+
+    @ViewBuilder
+    private func currentFolderContents(palette: SidebarPalette) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ProjectStackSectionLabel(title: "Agents", count: 0, palette: palette)
+
+            Text("No agents")
+                .font(.system(size: 12.5))
+                .foregroundStyle(palette.rowText.opacity(0.55))
+                .padding(.leading, 8)
+
+            ProjectStackSectionLabel(
+                title: "Terminals",
+                count: max(1, workspace.terminalDisplayItems.count),
+                palette: palette
+            )
+
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(palette.selectedText.opacity(0.82))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(workspace.selectedSession?.title ?? selectedProject?.name ?? "Shell")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(palette.selectedText)
+                        .lineLimit(1)
+
+                    if let projectRoot {
+                        Text(compactFolderPath(projectRoot))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(palette.selectedText.opacity(0.56))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 42)
+            .background {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(palette.selectedFill)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+            }
+
+            ProjectStackSectionLabel(
+                title: "Commands",
+                count: settings.launchableProjectCommands(for: projectRoot).count,
+                palette: palette
+            )
+
+            Text("No commands")
+                .font(.system(size: 12.5))
+                .foregroundStyle(palette.rowText.opacity(0.55))
+                .padding(.leading, 8)
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var displayedProjects: [CherryProject] {
+        var projects = settings.projects
+        guard let selectedProject,
+              !projects.contains(where: { $0.id == selectedProject.id })
+        else {
+            return projects
+        }
+        projects.insert(selectedProject, at: 0)
+        return projects
+    }
+
+    private var selectedProject: CherryProject? {
+        settings.selectedProject(for: projectRoot)
+    }
+
+    private var selectedProjectID: CherryProject.ID? {
+        selectedProject?.id
+    }
+
+    private func folderStatus(for project: CherryProject) -> String? {
+        guard project.id != selectedProjectID else { return nil }
+        return ProjectWindowRegistry.shared.hasWindow(for: project.root) ? "open" : nil
+    }
+
+    private func compactFolderPath(_ root: String) -> String {
+        let url = URL(fileURLWithPath: root)
+        return url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
+    }
+
+    private func palette(for root: String?) -> SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: root).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: .docked
+        )
+    }
+
+    private func chooseProjectRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let project = settings.addProject(path: url.path)
+        else {
+            return
+        }
+        openProject(project)
+    }
+}
+
+private struct WorkspaceSharedRow: View {
+    let title: String
+    let count: Int
+    let systemImage: String
+    let palette: SidebarPalette
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(palette.rowText.opacity(0.66))
+                    .frame(width: 13)
+
+                Text(title)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(palette.rowText)
+
+                Spacer(minLength: 0)
+
+                Text(String(count))
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(palette.rowText.opacity(0.46))
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovering ? palette.hoverFill : .clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .accessibilityLabel("\(title), \(count)")
+    }
+}
+
+private struct WorkspaceFolderHeader: View {
+    let project: CherryProject
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let status: String?
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: isSelected ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(palette.rowText.opacity(0.48))
+                    .frame(width: 8)
+
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(
+                        palette.showsProjectAccent
+                            ? palette.projectAccent.opacity(0.88)
+                            : palette.rowText.opacity(0.46)
+                    )
+
+                Text(project.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+
+                if let status {
+                    Text(status)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(palette.rowText.opacity(0.46))
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 31)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovering ? palette.hoverFill : .clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(project.root)
+        .accessibilityLabel(project.name)
+        .accessibilityValue(isSelected ? "Expanded folder" : "Collapsed folder")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct ProjectStackHeader: View {
+    let project: CherryProject
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let isOpen: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: isSelected ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(palette.rowText.opacity(0.48))
+                    .frame(width: 8)
+
+                Circle()
+                    .fill(palette.showsProjectAccent ? palette.projectAccent : palette.rowText.opacity(0.35))
+                    .frame(width: 7, height: 7)
+
+                Text(project.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+
+                if isOpen, !isSelected {
+                    Circle()
+                        .fill(palette.rowText.opacity(0.32))
+                        .frame(width: 5, height: 5)
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 31)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovering ? palette.hoverFill : .clear)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(project.root)
+        .accessibilityLabel(project.name)
+        .accessibilityValue(isSelected ? "Expanded current project" : "Collapsed project")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct ProjectStackSectionLabel: View {
+    let title: String
+    let count: Int
+    let palette: SidebarPalette
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Text(title.uppercased())
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(palette.rowText.opacity(0.68))
+
+            Rectangle()
+                .fill(palette.rowText.opacity(0.10))
+                .frame(height: 1)
+
+            Text(String(count))
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(palette.rowText.opacity(0.46))
+        }
+        .frame(height: 14)
+    }
+}
+
+private struct ProjectTabsPrototypeButton: View {
+    let project: CherryProject
+    let palette: SidebarPalette
+    let isSelected: Bool
+    let isOpen: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                if palette.showsProjectAccent {
+                    Circle()
+                        .fill(palette.projectAccent)
+                        .frame(width: 7, height: 7)
+                }
+
+                Text(project.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if isOpen, !isSelected {
+                    Circle()
+                        .fill(palette.rowText.opacity(0.34))
+                        .frame(width: 5, height: 5)
+                        .accessibilityLabel("Open in another window")
+                }
+            }
+            .padding(.leading, palette.showsProjectAccent ? 9 : 10)
+            .padding(.trailing, isOpen && !isSelected ? 9 : 10)
+            .frame(maxWidth: 188)
+            .frame(height: ProjectTabsPrototypeLayout.tabHeight)
+            .background {
+                RoundedRectangle(
+                    cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                    style: .continuous
+                )
+                .fill(tabFill)
+            }
+            .overlay {
+                if isSelected {
+                    RoundedRectangle(
+                        cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                        style: .continuous
+                    )
+                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(
+                cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                style: .continuous
+            ))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(project.root)
+        .accessibilityLabel(project.name)
+        .accessibilityValue(isSelected ? "Current project" : "Project")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var tabFill: Color {
+        if isSelected {
+            return palette.selectedFill
+        }
+        return isHovering ? palette.hoverFill : .clear
+    }
+}
+
+private struct ProjectTabsPrototypeAddButton: View {
+    let palette: SidebarPalette
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(palette.rowText.opacity(0.72))
+                .frame(
+                    width: ProjectTabsPrototypeLayout.tabHeight,
+                    height: ProjectTabsPrototypeLayout.tabHeight
+                )
+                .background {
+                    RoundedRectangle(
+                        cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                        style: .continuous
+                    )
+                    .fill(isHovering ? palette.hoverFill : .clear)
+                }
+                .contentShape(RoundedRectangle(
+                    cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
+                    style: .continuous
+                ))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help("Add project")
+        .accessibilityLabel("Add project")
+    }
 }
 
 private struct TitlebarProjectPicker: View {
@@ -10316,22 +12028,7 @@ private struct TerminalSceneView: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            TerminalSurfaceView(
-                session: session,
-                chromeState: chromeState,
-                isActivePane: isActivePane,
-                usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
-                onActivate: onActivate
-            )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(
-                    LinearGradient(
-                        colors: backgroundColors,
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .ignoresSafeArea(.container, edges: .top)
+            paneContent
 
             if session.kind == .command {
                 CommandExitStatusBar(session: session)
@@ -10346,7 +12043,7 @@ private struct TerminalSceneView: View {
                     focusRequest: chromeState.terminalSearchFocusRequest,
                     onClose: closeSearch
                 )
-                .padding(.top, 12)
+                .padding(.top, showsTerminalContextBar ? 48 : 12)
                 .padding(.trailing, 12)
             }
         }
@@ -10369,6 +12066,41 @@ private struct TerminalSceneView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             acknowledgeAttentionIfVisible()
         }
+    }
+
+    @ViewBuilder
+    private var paneContent: some View {
+        if showsTerminalContextBar {
+            VStack(spacing: 0) {
+                TerminalContextBar(session: session, isActivePane: isActivePane)
+                terminalSurface
+            }
+        } else {
+            terminalSurface
+        }
+    }
+
+    private var showsTerminalContextBar: Bool {
+        session.kind == .terminal || session.kind == .agent
+    }
+
+    private var terminalSurface: some View {
+        TerminalSurfaceView(
+            session: session,
+            chromeState: chromeState,
+            isActivePane: isActivePane,
+            usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
+            onActivate: onActivate
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            LinearGradient(
+                colors: backgroundColors,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     private var backgroundColors: [Color] {
@@ -10413,6 +12145,101 @@ private struct TerminalSceneView: View {
     private func acknowledgeAttentionIfVisible() {
         guard isActivePane, chromeState.isShowingTerminalContent, NSApp.isActive else { return }
         session.acknowledgeAttentionAlert()
+    }
+}
+
+private struct TerminalContextBar: View {
+    private static let height: CGFloat = 36
+
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject var session: TerminalSession
+    let isActivePane: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            leadingIcon
+                .frame(width: 15, height: 15)
+                .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.70 : 0.46))
+                .accessibilityHidden(true)
+
+            Text(contextLabel)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.68 : 0.46))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, minHeight: Self.height, maxHeight: Self.height, alignment: .leading)
+        .background(backgroundColor)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(foregroundColor.opacity(isActivePane ? 0.10 : 0.07))
+                .frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    @ViewBuilder
+    private var leadingIcon: some View {
+        if let descriptor = AgentToolIconDescriptor(session: session),
+           let logoResourceName = descriptor.logoResourceName {
+            AgentLogoImage(
+                resourceName: logoResourceName,
+                rendersAsTemplate: descriptor.rendersAsTemplate,
+                fallbackLabel: descriptor.label
+            )
+        } else {
+            Image(systemName: session.kind == .agent ? "sparkles" : "terminal")
+                .font(.system(size: 12, weight: .medium))
+        }
+    }
+
+    private var contextLabel: String {
+        "\(displayPath)  ›  \(sessionLabel)"
+    }
+
+    private var displayPath: String {
+        SidebarTerminalPathFormatter.displayPath(session.workingDirectory)
+    }
+
+    private var sessionLabel: String {
+        if session.kind == .agent {
+            return SidebarAgentTitleFormatter.title(
+                title: session.title,
+                titleSource: session.titleSource,
+                agentName: session.agentName,
+                commandLine: session.subtitle
+            )
+        }
+
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if title.isEmpty || SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+            title: title,
+            workingDirectory: session.workingDirectory
+        ) {
+            return session.subtitle.replacingOccurrences(of: " login shell", with: "")
+        }
+        return title
+    }
+
+    private var accessibilityLabel: String {
+        "\(session.kind == .agent ? "Agent" : "Terminal"), \(displayPath), \(sessionLabel)"
+    }
+
+    private var themeColors: TerminalThemeColors {
+        terminalSettings.ghosttyThemeColors(for: colorScheme)
+    }
+
+    private var backgroundColor: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.background) ?? .windowBackgroundColor)
+    }
+
+    private var foregroundColor: Color {
+        Color(nsColor: NSColor(hexRGB: themeColors.foreground) ?? .labelColor)
     }
 }
 

@@ -682,6 +682,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isIconDebugOverlayPresented = false
     @Published var isSidebarPlaygroundPresented = false
     @Published var isCommandPalettePlaygroundPresented = false
+    @Published var isProjectTabsPrototypePresented = PrototypeFeatureFlags.isProjectTabsPrototypeEnabled
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
@@ -820,6 +821,10 @@ final class ProjectWindowChromeState: ObservableObject {
         if isCommandPalettePlaygroundPresented, !isCommandPalettePresented {
             presentCommandPalette()
         }
+    }
+
+    func toggleProjectTabsPrototype() {
+        isProjectTabsPrototypePresented.toggle()
     }
 
     func selectNote(id: UUID?) {

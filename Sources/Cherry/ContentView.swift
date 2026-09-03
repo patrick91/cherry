@@ -12100,7 +12100,6 @@ private struct TerminalSceneView: View {
                 endPoint: .bottomTrailing
             )
         )
-        .ignoresSafeArea(.container, edges: .top)
     }
 
     private var backgroundColors: [Color] {

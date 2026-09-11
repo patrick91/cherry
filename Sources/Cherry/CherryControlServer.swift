@@ -588,7 +588,7 @@ final class CherryControlServer: @unchecked Sendable {
                 state: session.state.label,
                 kind: session.kind.rawValue,
                 agentName: session.agentName,
-                summary: session.summary,
+                summary: nil,
                 parentAgentID: session.parentAgentID?.uuidString,
                 childAgentCount: workspace.childAgentCount(of: session),
                 projectRoot: projectRoot,
@@ -978,7 +978,7 @@ final class CherryControlServer: @unchecked Sendable {
                     link: link(for: session, workspace: workspace),
                     kind: session.kind.rawValue,
                     agentName: session.agentName,
-                    summary: session.summary,
+                    summary: nil,
                     parentAgentID: session.parentAgentID?.uuidString,
                     childAgentCount: workspace.childAgentCount(of: session)
                 )
@@ -1182,7 +1182,7 @@ final class CherryControlServer: @unchecked Sendable {
             // hooks per session, saturating the main actor (list_processes timeouts).
             lineCount: session.listingLineCount,
             outputVersion: session.outputVersion,
-            summary: session.summary,
+            summary: nil,
             selected: workspace.selectedSessionID == session.id,
             agentName: session.agentName,
             commandName: session.commandName,
@@ -2083,7 +2083,7 @@ final class CherryControlServer: @unchecked Sendable {
             state: session.state.label,
             kind: session.kind.rawValue,
             agentName: session.agentName,
-            summary: session.summary,
+            summary: nil,
             parentAgentID: session.parentAgentID?.uuidString,
             childAgentCount: workspace.childAgentCount(of: session)
         )

@@ -1145,21 +1145,7 @@ private struct DetailPaneView: View {
                 if NSApp.isActive {
                     workspace.acknowledgeAttentionForSelectedSession()
                 }
-            } else {
-                workspace.scheduleHiddenAgentSummaries()
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMiniaturizeNotification)) { notification in
-            guard notification.object as? NSWindow === ProjectWindowRegistry.shared.window(for: chromeState) else {
-                return
-            }
-            workspace.scheduleHiddenAgentSummaries()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { notification in
-            guard notification.object as? NSWindow === ProjectWindowRegistry.shared.window(for: chromeState) else {
-                return
-            }
-            workspace.scheduleHiddenAgentSummaries()
         }
     }
 
@@ -9820,7 +9806,7 @@ private final class SidebarTabRowState: ObservableObject {
     }
 
     private func observe(_ session: TerminalSession) {
-        Publishers.CombineLatest4(session.$title, session.$titleSource, session.$subtitle, session.$summary)
+        Publishers.CombineLatest3(session.$title, session.$titleSource, session.$subtitle)
             .combineLatest(session.$workingDirectory)
             .sink { [weak self] _ in
                 Task { @MainActor [weak self] in

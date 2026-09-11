@@ -29,8 +29,8 @@ struct MacOSServiceDetector: ServiceDetecting {
 
     func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord] {
         // `ps`/`lsof` are blocking subprocesses; run them off the @MainActor control
-        // server (mirrors AgentSummaryRunner) so they can't pin it and starve every
-        // other MCP request — the cause of nested-agent "Transport closed" hangs.
+        // server so they can't pin it and starve every other MCP request — the
+        // cause of nested-agent "Transport closed" hangs.
         let processTreeProvider = self.processTreeProvider
         let lsofOutputProvider = self.lsofOutputProvider
         let (processTree, lsofOutput) = try await Task.detached(priority: .utility) {

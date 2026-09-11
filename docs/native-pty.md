@@ -66,11 +66,11 @@ native-PTY environment switch; the app has one production terminal path.
   - **Data layer** (`2235f73`): `TerminalSurface.readText(screen:)` over
     `ghostty_surface_read_text` + `free_text`. `getProcessRawOutput` and a native
     line model behind `lineCount`/`snapshot(range:)` (→ search, getTerminalOutput,
-    agent summaries) pull the surface scrollback lazily on read (throttled). A
+    agent activity) pull the surface scrollback lazily on read (throttled). A
     full-screen-hash change probe — driven by a debounced `GHOSTTY_ACTION_RENDER`
     signal (new `TerminalSurfaceRenderDelegate`) *and* on every read — advances
     `outputVersion`/`contentVersion`/`lastContentChangeAt` and the agent
-    activity+summary hooks, so `waitForProcessIdle` and agent idle work.
+    activity hooks, so `waitForProcessIdle` and agent idle work.
   - **Input** (`2235f73`): `send(text:)`/`send(data:)`/`sendInterrupt` route to the
     surface under native (`shellProcess` is nil). Printable runs go through
     `ghostty_surface_text`; CR/LF and Ctrl-C become real key events

@@ -198,9 +198,17 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
 
     private func writeJSONLine(_ value: [String: Any]) throws {
         guard let stdinPipe else { throw RunnerError.launchFailed("") }
-        let data = try JSONSerialization.data(withJSONObject: value)
-        stdinPipe.fileHandleForWriting.write(data)
-        stdinPipe.fileHandleForWriting.write(Data([0x0A]))
+        var data = try JSONSerialization.data(withJSONObject: value)
+        data.append(0x0A)
+
+        do {
+            try writeCodexMCPData(data, to: stdinPipe.fileHandleForWriting.fileDescriptor)
+        } catch let error as CodexMCPPipeWriteError {
+            drainStderr()
+            let details = launchFailureDetails(fallback: error.localizedDescription)
+            stopServer()
+            throw RunnerError.launchFailed(details)
+        }
     }
 
     private func drainStdout() throws {
@@ -262,15 +270,15 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         return sanitizedSummary(output, maxLength: 240)
     }
 
-    private func launchFailureDetails() -> String {
+    private func launchFailureDetails(fallback: String = "") -> String {
         let stderr = stderrText()
         if !stderr.isEmpty {
             return stderr
         }
-        if let process {
+        if let process, !process.isRunning {
             return "process exited with status \(process.terminationStatus)"
         }
-        return ""
+        return fallback
     }
 
     private func nextStdoutLine() -> String? {
@@ -305,6 +313,53 @@ final class CodexMCPSummaryRunner: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL)
         if flags >= 0 {
             _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+    }
+}
+
+enum CodexMCPPipeWriteError: LocalizedError, Equatable {
+    case configureFailed(Int32)
+    case writeFailed(Int32)
+
+    var errorDescription: String? {
+        let errorCode: Int32
+        switch self {
+        case .configureFailed(let code), .writeFailed(let code):
+            errorCode = code
+        }
+
+        let message = String(cString: strerror(errorCode))
+        switch self {
+        case .configureFailed:
+            return "Could not configure the codex mcp-server input pipe: \(message)"
+        case .writeFailed:
+            return "Could not write to the codex mcp-server input pipe: \(message)"
+        }
+    }
+}
+
+func writeCodexMCPData(_ data: Data, to fileDescriptor: Int32) throws {
+    guard fcntl(fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+        throw CodexMCPPipeWriteError.configureFailed(errno)
+    }
+
+    var offset = 0
+    try data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else { return }
+        while offset < data.count {
+            let written = Darwin.write(
+                fileDescriptor,
+                baseAddress.advanced(by: offset),
+                data.count - offset
+            )
+            if written > 0 {
+                offset += written
+            } else if written < 0, errno == EINTR {
+                continue
+            } else {
+                let errorCode = written < 0 ? errno : EIO
+                throw CodexMCPPipeWriteError.writeFailed(errorCode)
+            }
         }
     }
 }

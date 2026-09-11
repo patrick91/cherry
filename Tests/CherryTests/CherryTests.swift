@@ -9678,6 +9678,19 @@ private func waitForSummaryCallCount(
     }
 }
 
+@Test func codexMCPSummaryPipeWriteHandlesClosedReader() throws {
+    var descriptors = [Int32](repeating: -1, count: 2)
+    try #require(pipe(&descriptors) == 0)
+    let readDescriptor = descriptors[0]
+    let writeDescriptor = descriptors[1]
+    _ = Darwin.close(readDescriptor)
+    defer { _ = Darwin.close(writeDescriptor) }
+
+    #expect(throws: CodexMCPPipeWriteError.writeFailed(EPIPE)) {
+        try writeCodexMCPData(Data("{}\n".utf8), to: writeDescriptor)
+    }
+}
+
 @Test func agentSummaryPromptFramesTranscriptAsSidebarSummaryTask() {
     let prompt = summaryPrompt(for: "tell me a funny joke about this repo")
 

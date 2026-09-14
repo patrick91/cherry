@@ -3028,6 +3028,11 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func configureScrollView() {
+        // The scrollback document can extend above the visible terminal. Keep
+        // its background and the Metal surface inside this pane's bounds so
+        // they cannot paint over the SwiftUI context bar above the terminal.
+        clipsToBounds = true
+
         // Ghostty's macOS app wraps the renderer in an NSScrollView instead of
         // relying on wheel events alone. The document view mirrors Ghostty's
         // scrollback metrics, which gives us native overlay scrollbars and lets

@@ -3273,6 +3273,10 @@ final class GhosttyTerminalContainerView: NSView {
 
         sidebarResizeLog("synchronizeTerminalFrame -> \(targetFrame.size)")
         terminalView.setFrameOrigin(targetFrame.origin)
+        // Scrolling moves the renderer with the clip view but does not resize
+        // its terminal grid. A refit here needlessly calls into Ghostty's resize
+        // and render paths for every scrollback row.
+        guard force || widthDelta > 1.0 || heightDelta > 1.0 else { return }
         terminalView.setFrameSize(targetFrame.size)
         terminalView.needsLayout = true
         terminalView.layoutSubtreeIfNeeded()

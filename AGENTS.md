@@ -5,7 +5,7 @@
 - `swift run Cherry` uses the embedded Ghostty-backed terminal path:
   `TerminalSurfaceView` -> `GhosttyTerminalContainerView` -> `GhosttySessionBridge` -> `GhosttyTerminal.TerminalView`.
 - `TerminalCanvasView` in `TerminalSurface.swift` is the fallback/prototype renderer and input path. Do not assume changes there affect the default running app.
-- `TerminalSession` still ingests raw PTY output into `PrototypeTerminalBuffer` even when Ghostty renders the UI. Session state such as cursor visibility, mouse modes, alternate screen, enhanced keyboard protocol, and application cursor keys can live in Cherry while display/input is Ghostty-backed.
+- Running sessions default to the native PTY (`.nativePTY` / `.exec`) backend: Ghostty owns process I/O, terminal state, and rendering. Cherry reads screen text for its content model. The host-managed path and injected test output still use Cherry's terminal buffer; do not assume its parser or output-coalescing delays affect native Neovim sessions. Check `usesNativePTYBackend` when investigating performance or input.
 
 ## Keyboard Input
 

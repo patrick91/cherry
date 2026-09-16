@@ -341,3 +341,35 @@ Currently useful without installing anything extra:
 - macOS unified logging for `TerminalPerformanceMonitor` output.
 
 If these stop being enough, the next useful additions would be a small automated UI driver for opening many windows/tabs and a checked-in Instruments template for Cherry-specific captures.
+
+## Neovim Scrolling
+
+Compare release builds at the same terminal grid size, font, display, and refresh
+rate. Run this from the repository root in each terminal (use a different report
+path for each run):
+
+```bash
+CHERRY_NVIM_SCROLL_REPORT=/tmp/cherry-nvim-scroll.json \
+  nvim --clean -n -i NONE -c 'luafile Scripts/perf-nvim-scroll.lua'
+```
+
+The workload opens a generated Lua buffer with syntax highlighting, waits three
+seconds, then scrolls three lines and redraws every eight milliseconds for 2,400
+iterations. It exits its own fresh Neovim process and writes JSON with grid size,
+Neovim version, elapsed time, redraw gap percentiles, and per-redraw timestamps.
+Override `CHERRY_NVIM_SCROLL_FRAMES` or `CHERRY_NVIM_SCROLL_INTERVAL_MS` to change
+the workload. It does not load the user's Neovim configuration or edit files.
+
+These are **Neovim workload timings**, not presented frame rates or input latency:
+a terminal can consume output quickly while dropping or delaying visual frames.
+Compare physical trackpad and keyboard scrolling as well. For a CPU profile,
+run `sample <terminal-pid> 5 -file /tmp/nvim-scroll.sample` while the workload is
+active. Cherry's `renderTicks` counter measures host callbacks; native Ghostty
+renders on its own thread, so this counter is not a native frame-rate meter.
+
+The AppKit wrapper should let Ghostty's input/PTY handlers wake the renderer.
+Adding an unconditional host refresh to every input event schedules unnecessary
+work, even for key releases and sub-row wheel deltas. Similarly, moving the
+scrollback viewport should update the renderer's origin without resizing its
+terminal grid. `TerminalScrollingTests` covers both paths and checks that an
+actual resize still updates the grid.

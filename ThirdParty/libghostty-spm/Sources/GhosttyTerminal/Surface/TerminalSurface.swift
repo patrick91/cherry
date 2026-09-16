@@ -277,6 +277,11 @@ public final class TerminalSurface {
 
     // MARK: - Process
 
+    var needsConfirmQuit: Bool {
+        guard let s = surface else { return false }
+        return ghostty_surface_needs_confirm_quit(s)
+    }
+
     var foregroundPid: pid_t? {
         guard let s = surface else { return nil }
         let pid = ghostty_surface_foreground_pid(s)

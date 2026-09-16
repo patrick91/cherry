@@ -1656,8 +1656,10 @@ final class TerminalWorkspace: ObservableObject {
         terminalSplitGroups.removeAll()
         selectedSessionID = nil
         removedSessions.forEach { session in
-            session.releaseGhosttyBridge()
+            // Snapshot and stop the native process tree while its PTY still
+            // exists; releasing the bridge first loses the teardown anchor.
             session.stop()
+            session.releaseGhosttyBridge()
         }
     }
 
@@ -1883,8 +1885,8 @@ final class TerminalWorkspace: ObservableObject {
         sessions.removeAll { removedIDs.contains($0.id) }
         removeClosedSessionsFromTerminalDisplay(removedIDs)
         removedSessions.forEach { session in
-            session.releaseGhosttyBridge()
             session.stop()
+            session.releaseGhosttyBridge()
         }
 
         guard let currentSelectedSessionID = selectedSessionID,
@@ -2533,12 +2535,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         case .command, .agent:
             return true
         case .terminal:
-            guard let shellPID = childProcessID
-                ?? ghosttyBridgeStorage?.nativeSessionLeaderPID()
-            else {
-                return false
+            if usesNativePTYBackend {
+                // The native session leader can be /usr/bin/login, whose child
+                // is the idle shell itself. Counting its children marks every
+                // terminal busy; Ghostty already tracks the actual prompt.
+                return ghosttyBridgeStorage?.terminalView.needsConfirmQuit ?? false
             }
-            return ShellProcessController.shellHasChildProcess(shellPID: shellPID)
+            guard let shellPID = childProcessID else { return false }
+            return ShellProcessController.shellHasForegroundProcess(shellPID: shellPID)
         }
     }
 

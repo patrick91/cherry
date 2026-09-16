@@ -6035,6 +6035,194 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(session.rawOutputObserverCount == 0)
 }
 
+private struct QuitCountWindowTestHost: View {
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var workspace: TerminalWorkspace
+
+    var body: some View {
+        Text("Sessions: \(workspace.sessions.count)")
+            .background(ProjectWindowBinder(
+                projectRoot: repository.repositoryRoot,
+                workspace: repository.activeWorkspace,
+                repository: repository,
+                noteStore: nil,
+                todoStore: nil,
+                chromeState: nil
+            ))
+    }
+}
+
+@MainActor
+@Test func quitCountUsesGhosttyPromptState() async throws {
+    let input = InMemoryTerminalSession(write: { _ in }, resize: { _ in })
+    let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    view.configuration = TerminalSurfaceOptions(backend: .inMemory(input))
+    view.controller = TerminalController()
+    let window = NSWindow(
+        contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.contentView = view
+    window.orderFrontRegardless()
+    defer {
+        view.freeSurface()
+        window.close()
+    }
+    #expect(await waitForCondition { view.needsConfirmQuit })
+    let prompt = "\u{1b}]133;A\u{7}$ \u{1b}]133;B\u{7}"
+    input.receive(prompt)
+    #expect(await waitForCondition { !view.needsConfirmQuit })
+    input.receive("cat\r\n\u{1b}]133;C\u{7}running\r\n")
+    #expect(await waitForCondition { view.needsConfirmQuit })
+    input.receive("\u{1b}]133;D;0\u{7}" + prompt)
+    #expect(await waitForCondition { !view.needsConfirmQuit })
+}
+
+@MainActor
+@Test func quitCountIgnoresIdleShellBackgroundHelpers() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryIdleShell-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let helperPIDFile = directory.appendingPathComponent("helper.pid")
+    let session = TerminalSession(
+        title: "Idle shell", subtitle: "", tint: .systemBlue,
+        workingDirectory: directory.path,
+        launchEnvironment: ["CHERRY_ORIGINAL_ZDOTDIR": directory.path],
+        launchBackend: .hostManaged
+    )
+    defer {
+        if let text = try? String(contentsOf: helperPIDFile, encoding: .utf8),
+           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 {
+            _ = kill(pid, SIGKILL)
+        }
+        session.stop()
+        session.releaseGhosttyBridge()
+        try? FileManager.default.removeItem(at: directory)
+    }
+    #expect(await waitForCondition(timeout: 5) { session.childProcessID != nil })
+    #expect(await waitForCondition { !session.hasRunningProcess() })
+    // A background helper (like a prompt's git-status daemon) is a child of
+    // an otherwise idle shell. It must not count as a foreground program.
+    session.send(text: "/bin/sleep 30 & printf '%s\\n' $! > helper.pid\n")
+    #expect(await waitForCondition(timeout: 5) { FileManager.default.fileExists(atPath: helperPIDFile.path) })
+    let shellPID = try #require(session.childProcessID)
+    let helperPID = try #require(Int32(String(contentsOf: helperPIDFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)))
+    #expect(kill(helperPID, 0) == 0)
+    #expect(getpgid(helperPID) != getpgid(shellPID))
+    #expect(await waitForCondition { !session.hasRunningProcess() })
+
+    session.send(text: "/bin/cat\n")
+    #expect(await waitForCondition { session.hasRunningProcess() })
+    session.sendInterrupt()
+    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(kill(helperPID, 0) == 0)
+}
+
+@MainActor
+@Test func quitCountDropsClosedWindowsAndTheirInactiveWorktrees() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CherryQuitCount-\(UUID().uuidString)", isDirectory: true)
+    let closingRoot = directory.appendingPathComponent("closing", isDirectory: true)
+    let remainingRoot = directory.appendingPathComponent("remaining", isDirectory: true)
+    let worktreeRoot = directory.appendingPathComponent("feature", isDirectory: true)
+    try FileManager.default.createDirectory(at: closingRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: remainingRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    try runGitForTest(["-C", closingRoot.path, "init", "-b", "main"])
+    try runGitForTest(["-C", closingRoot.path, "-c", "user.name=Cherry Tests",
+                       "-c", "user.email=cherry@example.invalid", "commit", "--allow-empty", "-m", "Initial"])
+    try runGitForTest(["-C", closingRoot.path, "worktree", "add", "-b", "feature", worktreeRoot.path])
+    let previousWorktreeSpacesEnabled = TerminalSettings.shared.worktreeSpacesEnabled
+    TerminalSettings.shared.worktreeSpacesEnabled = true
+    defer { TerminalSettings.shared.worktreeSpacesEnabled = previousWorktreeSpacesEnabled }
+
+    let closingRepository = RepositoryWorkspace(projectRoot: try canonicalPathForTest(closingRoot))
+    let remainingRepository = RepositoryWorkspace(projectRoot: try canonicalPathForTest(remainingRoot))
+    defer {
+        closingRepository.closeAllSessions()
+        remainingRepository.closeAllSessions()
+    }
+    await closingRepository.refresh()
+    let closingWorkspace = closingRepository.activeWorkspace
+    let remainingWorkspace = remainingRepository.activeWorkspace
+    let inactiveWorkspace = try #require(closingRepository.prepareWorkspace(
+        worktreeRoot: try canonicalPathForTest(worktreeRoot)
+    ))
+    closingWorkspace.closeAllSessions()
+    remainingWorkspace.closeAllSessions()
+    let definition = AgentToolDefinition(name: "Quit count", command: "/bin/cat")
+    for (workspace, count) in [(closingWorkspace, 3), (inactiveWorkspace, 3), (remainingWorkspace, 4)] {
+        for _ in 0..<count {
+            workspace.addAgentSession(agent: definition, projectRoot: try #require(workspace.projectRoot))
+        }
+    }
+    let closingSessions = closingWorkspace.sessions + inactiveWorkspace.sessions
+    let remainingSessions = remainingWorkspace.sessions
+    let registry = ProjectWindowRegistry.shared
+    let initialCount = registry.runningProcessCount()
+    let closingWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable], backing: .buffered, defer: false
+    )
+    let remainingWindow = NSWindow(
+        contentRect: NSRect(x: 40, y: 40, width: 640, height: 400),
+        styleMask: [.titled, .closable], backing: .buffered, defer: false
+    )
+    closingWindow.isReleasedWhenClosed = false
+    remainingWindow.isReleasedWhenClosed = false
+    closingWindow.contentView = NSHostingView(rootView: QuitCountWindowTestHost(
+        repository: closingRepository, workspace: closingWorkspace
+    ))
+    remainingWindow.contentView = NSHostingView(rootView: QuitCountWindowTestHost(
+        repository: remainingRepository, workspace: remainingWorkspace
+    ))
+    defer {
+        closingWindow.close()
+        remainingWindow.close()
+        registry.unregister(window: closingWindow, projectRoot: closingRepository.repositoryRoot)
+        registry.unregister(window: remainingWindow, projectRoot: remainingRepository.repositoryRoot)
+    }
+    closingWindow.orderFrontRegardless()
+    remainingWindow.orderFrontRegardless()
+    #expect(await waitForCondition(timeout: 5) {
+        registry.runningProcessCount() == initialCount + 10
+    })
+
+    // Count inactive worktrees once, even after switching the registered workspace.
+    _ = closingRepository.activate(worktreeRoot: try canonicalPathForTest(worktreeRoot), chromeState: nil)
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(registry.runningProcessCount() == initialCount + 10)
+    closingWindow.performClose(nil)
+    #expect(await waitForCondition { closingWindow.attachedSheet != nil })
+    let alert = try #require(closingWindow.attachedSheet)
+    let stopButton = try #require(findSubview(in: alert.contentView!) {
+        ($0 as? NSButton)?.title == "Stop and close"
+    } as? NSButton)
+    stopButton.performClick(nil)
+    #expect(await waitForCondition { !closingWindow.isVisible })
+    #expect(closingSessions.allSatisfy { !$0.isRunning })
+    #expect(closingWorkspace.sessions.isEmpty)
+    #expect(inactiveWorkspace.sessions.isEmpty)
+    #expect(remainingSessions.allSatisfy { $0.isRunning })
+    #expect(registry.runningProcessCount() == initialCount + 4)
+
+    // AppKit/SwiftUI can retain a closed window and update its hosted view.
+    // Those updates must not bring its workspace back into the quit count.
+    closingWindow.contentView?.layoutSubtreeIfNeeded()
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(!registry.allWorkspaces().contains { $0 === closingWorkspace || $0 === inactiveWorkspace })
+    #expect(registry.runningProcessCount() == initialCount + 4)
+
+    // Closing individual panes must also immediately remove them from the total.
+    for (index, session) in remainingSessions.enumerated() {
+        remainingWorkspace.close(session, allowEmptyWorkspace: true)
+        #expect(!session.isRunning)
+        #expect(registry.runningProcessCount() == initialCount + 3 - index)
+    }
+}
+
 @MainActor
 @Test func ghosttyLiveBridgeCountTracksReleasedResourcesBeforeObjectDeinit() {
     let session = TerminalSession(

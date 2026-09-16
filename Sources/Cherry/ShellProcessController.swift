@@ -391,13 +391,17 @@ final class ShellProcessController: @unchecked Sendable {
 
     static let defaultShellName = URL(fileURLWithPath: defaultShellPath).lastPathComponent
 
-    /// True if `shellPID` has at least one child process — i.e. the shell is
-    /// running a foreground/background program rather than idling at its prompt.
-    /// The kernel-truth "is a command running" check for a plain terminal pane;
-    /// works under native-PTY where the host holds no PTY fd to `tcgetpgrp`.
-    static func shellHasChildProcess(shellPID: pid_t) -> Bool {
-        guard shellPID > 1 else { return false }
-        return enumerateProcesses().contains { $0.parentPID == shellPID }
+    /// Host-managed shells are busy when another process group owns the
+    /// terminal. Background prompt helpers must not make an idle shell busy.
+    /// Native EXEC sessions use Ghostty's prompt-aware check instead: their
+    /// session leader can be a login wrapper rather than the interactive shell.
+    static func shellHasForegroundProcess(shellPID: pid_t) -> Bool {
+        guard shellPID > 1,
+              let shell = enumerateProcesses().first(where: { $0.pid == shellPID }),
+              shell.foregroundProcessGroupID > 1
+        else { return false }
+        let shellGroup = getpgid(shellPID)
+        return shellGroup > 1 && shell.foregroundProcessGroupID != shellGroup
     }
 
     /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
@@ -580,6 +584,7 @@ final class ShellProcessController: @unchecked Sendable {
         let pid: pid_t
         let parentPID: pid_t
         let controllingTTY: dev_t
+        let foregroundProcessGroupID: pid_t
     }
 
     /// One-shot snapshot of every process (pid, ppid, controlling tty) via
@@ -602,7 +607,8 @@ final class ShellProcessController: @unchecked Sendable {
             ProcessSnapshotEntry(
                 pid: info.kp_proc.p_pid,
                 parentPID: info.kp_eproc.e_ppid,
-                controllingTTY: info.kp_eproc.e_tdev
+                controllingTTY: info.kp_eproc.e_tdev,
+                foregroundProcessGroupID: info.kp_eproc.e_tpgid
             )
         }
     }

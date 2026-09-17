@@ -21,5 +21,6 @@ Program logo sources:
 - `gnuemacs.svg`: Simple Icons `gnuemacs`, CC0 1.0.
 - `nextdotjs.svg`: Simple Icons `nextdotjs`, CC0 1.0.
 - `pytest.svg`: Simple Icons `pytest`, CC0 1.0.
+- `shortcake.svg`: Official Shortcake mark from https://shortcake.patrick.wtf/static/favicon.svg, rendered as a template to match the sidebar's program icons.
 
 These marks may still be subject to trademark restrictions. Use them only as product-identifying UI badges.

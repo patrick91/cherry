@@ -11350,6 +11350,7 @@ private struct SidebarIconDebugResource: Identifiable {
         .init(kind: .programs, name: "pytest", fallback: "Py"),
         .init(kind: .programs, name: "ruff", fallback: "Rf"),
         .init(kind: .programs, name: "rust", fallback: "Rs"),
+        .init(kind: .programs, name: "shortcake", fallback: "Sc"),
         .init(kind: .programs, name: "swift", fallback: "Sw"),
         .init(kind: .programs, name: "uv", fallback: "uv"),
         .init(kind: .programs, name: "vim", fallback: "Vi"),

@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import SwiftUI
 
 enum NoteEditorStyle {
@@ -441,7 +442,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private static let italicPattern = #"(?<!\*)(\*)([^\n*]+?)(\*)(?!\*)"#
         private static let inlineCodePattern = #"(`)([^`\n]+)(`)"#
         private static let linkPattern = #"(\[)([^\]\n]+)(\]\()([^\)\n]+)(\))"#
-        private static let bareURLPattern = #"(?<![\w/])(?:https?://|cherry://|file://|mailto:)[^\s<>"'`\)\]]+"#
+        private static let bareURLPattern = #"(?<![\w/])(?:https?://|"#
+            + NSRegularExpression.escapedPattern(for: CherryDeepLink.scheme)
+            + #"://|file://|mailto:)[^\s<>"'`\)\]]+"#
         private static let headingMarkerPattern = #"(?m)^(#{1,6}[ \t])"#
         private static let fenceLinePattern = #"(?m)^(`{3}.*)$"#
         private static let fencedBlockPattern = #"(?m)^```[\s\S]*?^```"#

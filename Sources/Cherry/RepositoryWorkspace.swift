@@ -24,6 +24,7 @@ struct WorktreeRemovalBlockers: Equatable {
 @MainActor
 final class RepositoryWorkspace: ObservableObject {
     @Published private(set) var worktrees: [GitWorktree]
+    @Published private(set) var folders: [CherryProjectFolder]
     @Published private(set) var activeWorktreeRoot: String
     @Published private(set) var commonDirectory: String?
     @Published private(set) var isRefreshing = false
@@ -34,6 +35,8 @@ final class RepositoryWorkspace: ObservableObject {
 
     let repositoryRoot: String
 
+    private let settings: AgentSettings
+    private let launchBackend: TerminalSessionLaunchBackend
     private let service: GitWorktreeService
     private var workspaces: [String: TerminalWorkspace]
     private var resolvedPathsByInput: [String: String]
@@ -44,26 +47,37 @@ final class RepositoryWorkspace: ObservableObject {
 
     init(
         projectRoot: String,
-        service: GitWorktreeService = GitWorktreeService()
+        service: GitWorktreeService = GitWorktreeService(),
+        settings: AgentSettings = .shared,
+        createInitialSession: Bool = true,
+        launchBackend: TerminalSessionLaunchBackend = .nativePTY
     ) {
         let root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-        let savedRoot = TerminalSettings.shared.worktreeSpacesEnabled
-            ? AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
-            : root
-        let existingRoot = FileManager.default.fileExists(atPath: savedRoot) ? savedRoot : root
+        self.settings = settings
+        self.launchBackend = launchBackend
+        let projectFolders = settings.selectedProject(for: root)?.folders ?? CherryProject(root: root).folders
+        folders = projectFolders
+        let firstFolderPath = projectFolders.first?.path ?? root
+        let savedRoot = settings.lastActiveWorktreeRoot(for: root) ?? firstFolderPath
+        let savedFolderIsOwned = projectFolders.contains { Self.resolvedPath($0.path) == Self.resolvedPath(savedRoot) }
+        let existingRoot = savedFolderIsOwned && CherryProjectFolder(path: savedRoot).isAvailable ? savedRoot : firstFolderPath
         let initialRoot = Self.resolvedPath(existingRoot)
         repositoryRoot = root
         self.service = service
         activeWorktreeRoot = initialRoot
 
-        let initialWorkspace = TerminalWorkspace(projectRoot: initialRoot)
+        let initialWorkspace = TerminalWorkspace(
+            projectRoot: initialRoot,
+            createInitialSession: createInitialSession && CherryProjectFolder(path: initialRoot).isAvailable,
+            launchBackend: launchBackend
+        )
         workspaces = [initialRoot: initialWorkspace]
-        var initialResolvedPaths = [root: initialRoot]
+        var initialResolvedPaths = [root: Self.resolvedPath(firstFolderPath)]
         initialResolvedPaths[initialRoot] = initialRoot
         resolvedPathsByInput = initialResolvedPaths
         loadedWorktreeRoots = [initialRoot]
         hiddenWorktreeRoots = Set(
-            AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath)
+            settings.hiddenWorktreeRoots(for: root).map(Self.resolvedPath)
         )
         worktrees = [GitWorktree(
             root: initialRoot,
@@ -75,6 +89,14 @@ final class RepositoryWorkspace: ObservableObject {
             lockReason: nil,
             pruneReason: nil
         )]
+        for folder in projectFolders {
+            let folderRoot = Self.resolvedPath(folder.path)
+            resolvedPathsByInput[folder.path] = folderRoot
+            if workspaces[folderRoot] == nil {
+                workspaces[folderRoot] = TerminalWorkspace(projectRoot: folderRoot, createInitialSession: false, launchBackend: launchBackend)
+                loadedWorktreeRoots.insert(folderRoot)
+            }
+        }
     }
 
     var activeWorkspace: TerminalWorkspace {
@@ -106,12 +128,15 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func allLoadedWorkspaces() -> [TerminalWorkspace] {
-        worktrees.compactMap { workspaces[$0.root] }
+        let orderedRoots = folders.map(\.path) + worktrees.map(\.root)
+        var seen = Set<ObjectIdentifier>()
+        return (orderedRoots.compactMap { workspaces[standardized($0)] } + Array(workspaces.values))
+            .filter { seen.insert(ObjectIdentifier($0)).inserted }
     }
 
     func contains(worktreeRoot: String) -> Bool {
         let root = standardized(worktreeRoot)
-        return worktrees.contains { $0.root == root }
+        return folders.contains { standardized($0.path) == root } || worktrees.contains { $0.root == root }
     }
 
     func refresh() async {
@@ -129,15 +154,16 @@ final class RepositoryWorkspace: ObservableObject {
             discoveryError = nil
             hiddenWorktreeRoots.formIntersection(Set(snapshot.worktrees.map(\.root)))
             persistHiddenWorktrees()
-            AgentSettings.shared.registerWorktreeRoots(
+            settings.registerWorktreeRoots(
                 snapshot.worktrees.map(\.root),
                 repositoryRoot: repositoryRoot
             )
-            if !snapshot.worktrees.contains(where: { $0.root == activeWorktreeRoot }) {
+            if !snapshot.worktrees.contains(where: { $0.root == activeWorktreeRoot })
+                && !folders.contains(where: { standardized($0.path) == activeWorktreeRoot }) {
                 let fallback = snapshot.worktrees.first?.root ?? repositoryRoot
                 activate(worktreeRoot: fallback, chromeState: nil)
             }
-            AgentSettings.shared.markWorktreeOpened(
+            settings.markWorktreeOpened(
                 activeWorktreeRoot,
                 repositoryRoot: repositoryRoot
             )
@@ -169,8 +195,19 @@ final class RepositoryWorkspace: ObservableObject {
         chromeState: ProjectWindowChromeState?
     ) -> TerminalWorkspace? {
         let root = standardized(requestedRoot)
-        guard worktrees.contains(where: { $0.root == root }) || root == repositoryRoot else {
+        guard contains(worktreeRoot: root) || root == repositoryRoot else {
             return nil
+        }
+        // Opening a Git checkout makes it a regular project folder, so every
+        // newly activated workspace has a visible owner in the sidebar.
+        if !folders.contains(where: { standardized($0.path) == root }),
+           worktrees.contains(where: { $0.root == root }) {
+            if settings.project(for: repositoryRoot) != nil {
+                guard settings.addFolder(path: root, toProjectRoot: repositoryRoot) != nil else { return nil }
+                synchronizeFolders()
+            } else {
+                folders.append(CherryProjectFolder(path: root))
+            }
         }
         guard root != activeWorktreeRoot else {
             return workspaces[root]
@@ -185,10 +222,44 @@ final class RepositoryWorkspace: ObservableObject {
         if let chromeState {
             (selectionByRoot[root] ?? .terminal).apply(to: chromeState)
         }
-        autoStartCommandsIfNeeded(workspace: nextWorkspace, root: root)
+        if CherryProjectFolder(path: root).isAvailable {
+            autoStartCommandsIfNeeded(workspace: nextWorkspace, root: root)
+        }
         ProjectWindowRegistry.shared.repositoryDidActivate(self)
         return nextWorkspace
     }
+
+    /// Folder navigation is independent of Git discovery. Workspaces stay alive
+    /// in this cache, including while their folder is collapsed or unavailable.
+    func synchronizeFolders() {
+        let updated = settings.selectedProject(for: repositoryRoot)?.folders ?? folders
+        guard updated != folders else { return }
+        folders = updated
+        for folder in updated {
+            _ = workspace(for: standardized(folder.path))
+        }
+        if let first = updated.first {
+            resolvedPathsByInput[repositoryRoot] = Self.resolvedPath(first.path)
+        }
+        ProjectWindowRegistry.shared.repositoryDidRefresh(self)
+    }
+
+    @discardableResult
+    func activateFolder(path: String, chromeState: ProjectWindowChromeState?, clearSelection: Bool = false) -> TerminalWorkspace? {
+        guard folders.contains(where: { standardized($0.path) == standardized(path) }) else { return nil }
+        // Preserve project tool selection; it is not owned by the current folder.
+        let projectSelection = chromeState.map(WorktreeSelectionState.init)
+        guard let workspace = activate(worktreeRoot: path, chromeState: nil) else { return nil }
+        if clearSelection {
+            workspace.selectedSessionID = nil
+            chromeState?.selectTerminal()
+        } else if let chromeState, let projectSelection {
+            projectSelection.apply(to: chromeState)
+        }
+        return workspace
+    }
+
+    var sidebarFolders: [CherryProjectFolder] { folders }
 
     func activateAdjacent(offset: Int, chromeState: ProjectWindowChromeState?) {
         guard let worktree = adjacentWorktree(offset: offset) else { return }
@@ -196,7 +267,13 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func adjacentWorktree(offset: Int) -> GitWorktree? {
-        let visible = visibleWorktrees
+        let visible = folders.map { folder in
+            let root = standardized(folder.path)
+            return worktrees.first(where: { $0.root == root }) ?? GitWorktree(
+                root: root, head: "", branch: nil, isMain: root == standardized(repositoryRoot),
+                isBare: false, isDetached: false, lockReason: nil, pruneReason: nil
+            )
+        }
         guard offset != 0,
               visible.count > 1,
               let currentIndex = visible.firstIndex(where: { $0.root == activeWorktreeRoot })
@@ -210,7 +287,7 @@ final class RepositoryWorkspace: ObservableObject {
     @discardableResult
     func prepareWorkspace(worktreeRoot requestedRoot: String) -> TerminalWorkspace? {
         let root = standardized(requestedRoot)
-        guard worktrees.contains(where: { $0.root == root }) else { return nil }
+        guard contains(worktreeRoot: root) else { return nil }
         return workspace(for: root)
     }
 
@@ -424,7 +501,7 @@ final class RepositoryWorkspace: ObservableObject {
         // ghostty surface synchronously (~350ms+ measured), which lands on the
         // first tick of a swipe gesture via `prepareWorkspace`. The user opens
         // terminals explicitly; loaded workspaces then stay in memory.
-        let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
+        let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false, launchBackend: launchBackend)
         workspaces[root] = workspace
         loadedWorktreeRoots.insert(root)
         return workspace
@@ -447,7 +524,7 @@ final class RepositoryWorkspace: ObservableObject {
             else {
                 return
             }
-            for command in AgentSettings.shared.launchableProjectCommands(for: root)
+            for command in self.settings.launchableProjectCommands(for: root)
             where command.autoStart {
                 workspace.addCommandSession(command: command, projectRoot: root, select: false)
             }
@@ -465,13 +542,13 @@ final class RepositoryWorkspace: ObservableObject {
             else {
                 return
             }
-            AgentSettings.shared.markWorktreeOpened(root, repositoryRoot: self.repositoryRoot)
+            settings.markWorktreeOpened(root, repositoryRoot: self.repositoryRoot)
             self.activeRootPersistenceTask = nil
         }
     }
 
     private func persistHiddenWorktrees() {
-        AgentSettings.shared.setHiddenWorktreeRoots(hiddenWorktreeRoots, for: repositoryRoot)
+        settings.setHiddenWorktreeRoots(hiddenWorktreeRoots, for: repositoryRoot)
     }
 
     private func forgetWorktree(_ worktree: GitWorktree) {

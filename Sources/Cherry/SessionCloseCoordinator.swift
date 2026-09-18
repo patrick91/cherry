@@ -15,6 +15,9 @@ enum SessionCloseCoordinator {
         for workspace: TerminalWorkspace,
         repository: RepositoryWorkspace?
     ) -> Bool {
+        // A folder remains useful with no terminals. Closing its final row
+        // must not tear down the project window or sibling folder sessions.
+        if repository != nil { return false }
         guard workspace.sessions.count <= 1 else { return false }
         return !hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository)
     }

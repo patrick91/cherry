@@ -99,7 +99,7 @@ final class ProjectWindowRegistry {
     var knownProjectRoots: [String] {
         pruneStaleWindows()
         let repositoryRoots = repositories.values.flatMap {
-            $0.repository?.worktrees.map(\.root) ?? []
+            ($0.repository?.worktrees.map(\.root) ?? []) + ($0.repository?.folders.map(\.path) ?? [])
         }
         return Array(Set(repositoryRoots + Array(workspaces.keys))).sorted()
     }
@@ -116,7 +116,7 @@ final class ProjectWindowRegistry {
     func projectRoot(forProjectKey projectKey: String) -> String? {
         pruneStaleWindows()
         let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var roots = repositories.values.flatMap { $0.repository?.worktrees.map(\.root) ?? [] }
+        var roots = repositories.values.flatMap { ($0.repository?.worktrees.map(\.root) ?? []) + ($0.repository?.folders.map(\.path) ?? []) }
         roots.append(contentsOf: workspaces.keys)
         roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
         if let activeProjectRoot {
@@ -589,8 +589,8 @@ final class ProjectWindowRegistry {
             $0.value != repositoryRoot
         }
         repositoryRootByWorktreeRoot[repositoryRoot] = repositoryRoot
-        for worktree in repository.worktrees {
-            repositoryRootByWorktreeRoot[worktree.root] = repositoryRoot
+        for root in repository.worktrees.map(\.root) + repository.folders.map(\.path) {
+            repositoryRootByWorktreeRoot[root] = repositoryRoot
         }
     }
 
@@ -689,6 +689,9 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
     @Published var collapsedAgentGroupIDs: Set<UUID> = []
+    @Published var collapsedFolderIDs: Set<String> = []
+    @Published var isProjectCommandsExpanded = false
+    @Published var isProjectNotesExpanded = false
     @Published var pendingAgentCloseSessionID: UUID?
     @Published var pendingAgentCloseAllowsEmptyWorkspace = false
     @Published var pendingAgentGroupCloseSessionID: UUID?

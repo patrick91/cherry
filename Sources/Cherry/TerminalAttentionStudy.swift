@@ -1,3 +1,4 @@
+import CherryControl
 import Foundation
 
 enum TerminalAttentionStudy {
@@ -26,7 +27,7 @@ enum TerminalAttentionStudy {
         let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
         return applicationSupport
-            .appendingPathComponent("Cherry", isDirectory: true)
+            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
             .appendingPathComponent("Attention Study", isDirectory: true)
             .appendingPathComponent("Recordings", isDirectory: true)
     }
@@ -35,7 +36,7 @@ enum TerminalAttentionStudy {
         let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
         return applicationSupport
-            .appendingPathComponent("Cherry", isDirectory: true)
+            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
             .appendingPathComponent("Attention Study", isDirectory: true)
             .appendingPathComponent("Corrections", isDirectory: true)
     }

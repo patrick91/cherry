@@ -11,7 +11,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         if Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") == nil,
-           let iconURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+           Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil,
+           let iconURL = CherryResources.bundle.url(forResource: "AppIcon", withExtension: "icns"),
            let icon = NSImage(contentsOf: iconURL) {
             NSApp.applicationIconImage = icon
         }
@@ -306,6 +307,8 @@ struct CherryApp: App {
                 .disabled(focusedChromeState == nil)
 
                 Button("New Tab") {
+                    guard CherryProjectFolder(path: keyWindowWorkspace?.projectRoot ?? "").isAvailable else { return }
+                    keyWindowChromeState?.selectTerminal()
                     keyWindowWorkspace?.addSession()
                 }
                 .keyboardShortcut("t")
@@ -332,10 +335,7 @@ struct CherryApp: App {
                             session,
                             in: workspace,
                             chromeState: chromeState,
-                            allowEmptyWorkspace: SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(
-                                than: workspace,
-                                repository: keyWindowRepository
-                            )
+                            allowEmptyWorkspace: keyWindowRepository != nil
                         )
                     } else {
                         NSApp.keyWindow?.performClose(nil)
@@ -560,7 +560,7 @@ private struct ProjectWorkspaceView: View {
 
     /// Folder name of the project, or "Cherry" for a project-less window.
     private var projectName: String {
-        repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
+        agentSettings.selectedProject(for: repository.repositoryRoot)?.name ?? repository.repositoryName
     }
 
     private var workspace: TerminalWorkspace {

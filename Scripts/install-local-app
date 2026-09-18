@@ -5,14 +5,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${CHERRY_CONFIGURATION:-release}"
 APP_NAME="${CHERRY_APP_NAME:-Cherry}"
 BUNDLE_ID="${CHERRY_BUNDLE_ID:-dev.patrick.cherry.local}"
+URL_SCHEME="${CHERRY_URL_SCHEME:-cherry}"
+APPLICATION_SUPPORT_NAME="${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry}"
+CUSTOM_ICON="${CHERRY_ICON_PATH:-}"
 INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
 CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
 BUILD_DIR="$ROOT/.build/install"
 APP_PATH="$BUILD_DIR/$APP_NAME.app"
 INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
+# Keep the GUI and CLI names distinct on case-insensitive macOS filesystems.
+GUI_EXECUTABLE="CherryApp"
 ICON_SOURCE="$ROOT/Sources/Cherry/Resources/AppIcon.icon"
 ICON_FALLBACK="$ROOT/Sources/Cherry/Resources/AppIcon.icns"
 ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
+ICON_NAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
+
+if [[ -n "$CUSTOM_ICON" && ! -f "$CUSTOM_ICON" ]]; then
+  echo "Missing custom app icon: $CUSTOM_ICON" >&2
+  exit 1
+fi
 
 cd "$ROOT"
 
@@ -44,20 +55,26 @@ BUILD_NUMBER="$(date +%Y%m%d%H%M%S)"
 
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
-cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/Cherry"
+cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"
 cp "$MCP_HELPER_PATH" "$APP_PATH/Contents/MacOS/CherryMCP"
+if ! cmp -s "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"; then
+  echo "Packaged GUI executable was overwritten; GUI and helper filenames must be distinct." >&2
+  exit 1
+fi
 
-# SwiftPM resource bundles (Cherry_Cherry.bundle et al.) must ship inside the
-# app: the swiftbuild-generated Bundle.module accessor only searches the app's
-# Resources directory and fatalErrors otherwise. (The old native-build-system
-# accessor fell back to an absolute path into this repo's .build directory,
-# which is why installed apps used to work without them.)
+# CherryResources and GhosttyRuntimeResources explicitly resolve packaged
+# bundles from Contents/Resources. Native SwiftPM's generated Bundle.module
+# instead searches the app root, then the original build directory; relying on
+# that fallback makes a broken package appear to work on the build machine.
 for RESOURCE_BUNDLE in "$BIN_DIR"/*.bundle; do
   [[ -e "$RESOURCE_BUNDLE" ]] || continue
   cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
 done
 
-if [[ -d "$ICON_SOURCE" ]] && xcrun --find actool >/dev/null 2>&1; then
+if [[ -n "$CUSTOM_ICON" ]]; then
+  cp "$CUSTOM_ICON" "$APP_PATH/Contents/Resources/AppIcon.icns"
+  ICON_NAME_PLIST=""
+elif [[ -d "$ICON_SOURCE" ]] && xcrun --find actool >/dev/null 2>&1; then
   if xcrun actool "$ICON_SOURCE" \
     --compile "$APP_PATH/Contents/Resources" \
     --output-format human-readable-text \
@@ -92,17 +109,20 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>
   <string>$APP_NAME</string>
   <key>CFBundleExecutable</key>
-  <string>Cherry</string>
+  <string>$GUI_EXECUTABLE</string>
   <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>CFBundleIconName</key>
-  <string>AppIcon</string>
+  <string>AppIcon.icns</string>
+  $ICON_NAME_PLIST
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
   <string>$APP_NAME</string>
+  <key>CherryApplicationSupportName</key>
+  <string>$APPLICATION_SUPPORT_NAME</string>
+  <key>CherryURLScheme</key>
+  <string>$URL_SCHEME</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -114,7 +134,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
       <string>$BUNDLE_ID.deep-link</string>
       <key>CFBundleURLSchemes</key>
       <array>
-        <string>cherry</string>
+        <string>$URL_SCHEME</string>
       </array>
     </dict>
   </array>
@@ -133,6 +153,8 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+plutil -lint "$APP_PATH/Contents/Info.plist" >/dev/null
 
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --deep --sign "$CODE_SIGN_IDENTITY" "$APP_PATH" >/dev/null

@@ -4,9 +4,17 @@
 
 This is a design and implementation plan, accompanied by two interactive layouts in the portable [Cherry sidebar studies.html](../../Design/SidebarExploration/Cherry%20sidebar%20studies.html). Open that file directly in a browser; it contains its assets and needs no server or network. The editable entry point is [index.html](../../Design/SidebarExploration/index.html); the [README](../../Design/SidebarExploration/README.md) covers previewing, export, inspiration sources, and asset attribution.
 
-The layouts use synthetic data and a shared state engine. Actions do not access project files, launch processes, or establish remote connections. Edits live in page memory and reset when changing scenario or reloading; changing layout keeps the current scenario and work. Native behavior is unchanged.
+The HTML layouts use synthetic data and a shared state engine. Actions do not access project files, launch processes, or establish remote connections. Edits live in page memory and reset when changing scenario or reloading; changing layout keeps the current scenario and work. A separate native preview is described below.
 
 The exploration starts from `main` at `0d16c2e`, on `codex/sidebar-exploration`. Persistent-session and multiplexer work is parked on `codex/persistent-sessions` at `039f4c9`. Remote projects are a future design case, not functionality delivered by this exploration.
+
+## Native preview implementation status
+
+The preview on `codex/native-project-sidebar` implements layout A with a focused project picker, real saved folders, and unified terminal rows for shells, agents, and command runs. Commands and Notes sit at the bottom and retain project scope; command runs open under their configured folder. Folder switching selects the existing native workspace without stopping its processes, and collapsing a folder only hides its rows.
+
+Project creation still requires a first folder; folderless projects remain a future capability. The project picker retains Cherry’s existing separate-window behavior. Relocating an unavailable folder requires closing its terminals first. Terminals retain their normal native lifetime: explicitly closing a terminal stops it, and closing its project window or quitting the app ends its processes. The proposed background mode below is not implemented, and this preview does not include the parked session host.
+
+Run `Scripts/package-dmg` from the repository root to build the isolated **Cherry Sessions** app. The default Apple Silicon output is `dist/Cherry Sessions Sidebar-arm64.dmg`. Its bundle identifier, URL scheme, settings, application data, and icon are separate from regular Cherry, so the two apps can coexist. This section describes the implemented preview; the product model, migration targets, and future proposals below also include work still to be completed.
 
 ## Product model
 
@@ -78,7 +86,7 @@ Persist project/folder IDs with host identity and host-issued session IDs. Recon
 
 During a mixed session, quit/close warnings should count only processes that will actually stop. Turning the setting off must not terminate already-hosted work. A future remote project naturally uses its remote host; the local default must never change a remote terminal's lifetime.
 
-Resolve the last-terminal shortcut explicitly: current Cmd+W delegates to window close when only one session remains. It must not accidentally change from stopping a terminal to detaching it based solely on the number of rows. The parked preview currently treats tab close as disconnect; any revised stop behavior needs its own host operation and clear labeling.
+Resolve the last-terminal shortcut explicitly for background mode. Before the native sidebar preview, Cmd+W delegated to window close when only one session remained; the sidebar preview instead leaves the folder empty. The shortcut must not accidentally change from stopping a terminal to detaching it based solely on the number of rows. The parked persistent-session preview treats tab close as disconnect; any revised stop behavior needs its own host operation and clear labeling.
 
 The parked host already supplies create/list/attach/terminate operations and survives client exit. Remaining integration includes routing every local launch through it, durable project/folder/session mapping, reopen recovery, lifecycle-specific teardown, accurate process/activity reporting, command restart policy, and terminal feature/performance verification. Automatic command restart while the app is absent requires host-side supervision; GUI timers do not continue after quit.
 

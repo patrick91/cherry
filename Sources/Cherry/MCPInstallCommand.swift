@@ -1,3 +1,4 @@
+import CherryControl
 import Foundation
 
 enum MCPHarness: String, CaseIterable, Identifiable {
@@ -34,15 +35,15 @@ enum MCPInstallCommandBuilder {
         return shellQuoted(helperURL.path)
     }
 
-    static func commands() -> [MCPInstallCommand] {
+    static func commands(identity: CherryAppIdentity = .current) -> [MCPInstallCommand] {
         return [
             MCPInstallCommand(
                 harness: .codex,
-                command: "codex mcp add cherry -- \(helperCommand)"
+                command: "codex mcp add \(identity.urlScheme) -- \(helperCommand)"
             ),
             MCPInstallCommand(
                 harness: .claude,
-                command: "claude mcp add --transport stdio --scope user cherry -- \(helperCommand)"
+                command: "claude mcp add --transport stdio --scope user \(identity.urlScheme) -- \(helperCommand)"
             )
         ]
     }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct AgentToolDefinition: Codable, Equatable, Identifiable {
@@ -559,14 +560,62 @@ enum ProjectCommandConfigurationError: LocalizedError, Equatable {
     }
 }
 
-struct CherryProject: Codable, Equatable, Identifiable {
-    let root: String
-
-    var id: String { root }
+struct CherryProjectFolder: Codable, Equatable, Identifiable {
+    let id: String
+    var path: String
 
     var name: String {
-        URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
+        let component = URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+        return component.isEmpty ? path : component
     }
+
+    var isAvailable: Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    init(path: String, id: String? = nil) {
+        self.id = id ?? "folder:\(path)"
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? "folder:\(path)"
+    }
+}
+
+struct CherryProject: Codable, Equatable, Identifiable {
+    let id: String
+    /// The original root remains an alias for persisted project settings, notes,
+    /// and Todos. Moving the first folder must not change this key.
+    let root: String
+    var name: String
+    var folders: [CherryProjectFolder]
+
+    init(root: String, id: String? = nil, name: String? = nil, folders: [CherryProjectFolder]? = nil) {
+        self.id = id ?? "project:\(root)"
+        self.root = root
+        self.name = name ?? CherryProjectFolder(path: root).name
+        self.folders = folders ?? [CherryProjectFolder(path: root)]
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        root = try container.decode(String.self, forKey: .root)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? "project:\(root)"
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+            ?? CherryProjectFolder(path: root).name
+        folders = try container.decodeIfPresent([CherryProjectFolder].self, forKey: .folders)
+            ?? [CherryProjectFolder(path: root)]
+    }
+}
+
+private struct SavedCherryProjects: Codable {
+    var version = 2
+    var projects: [CherryProject]
 }
 
 enum AgentConfiguration {
@@ -658,7 +707,7 @@ final class AgentSettings: ObservableObject {
         self.defaults = defaults
         var loadedProjects = Self.loadProjects(from: defaults)
         for projectRoot in Self.performanceProjectRoots(environment: ProcessInfo.processInfo.environment)
-            where !loadedProjects.contains(where: { $0.root == projectRoot }) {
+            where !loadedProjects.contains(where: { $0.root == projectRoot || $0.folders.contains(where: { $0.path == projectRoot }) }) {
             loadedProjects.append(CherryProject(root: projectRoot))
         }
         projects = loadedProjects
@@ -676,15 +725,28 @@ final class AgentSettings: ObservableObject {
     }
 
     func selectedProject(for root: String?) -> CherryProject? {
+        if let project = project(for: root) { return project }
         guard let root = repositoryRoot(for: root) else { return nil }
-        return projects.first(where: { $0.root == root }) ?? CherryProject(root: root)
+        return CherryProject(root: root)
+    }
+
+    /// Finds a saved project without requiring its folders to be mounted.
+    func project(for requestedRoot: String?) -> CherryProject? {
+        guard let root = Self.savedDirectoryPath(requestedRoot ?? "") else { return nil }
+        if let project = projects.first(where: { Self.pathsAreEquivalent($0.root, root) })
+            ?? projects.first(where: { $0.folders.contains { Self.pathsAreEquivalent($0.path, root) } }) {
+            return project
+        }
+        guard let repositoryRoot = registeredRepositoryRoot(for: root) else { return nil }
+        return projects.first(where: { Self.pathsAreEquivalent($0.root, repositoryRoot) })
+            ?? projects.first(where: { $0.folders.contains { Self.pathsAreEquivalent($0.path, repositoryRoot) } })
     }
 
     func projectRoot(for requestedRoot: String?) -> String? {
-        if let root = Self.validDirectory(requestedRoot ?? "") {
+        if let root = selectableDirectory(requestedRoot) {
             return root
         }
-        if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
+        if let root = selectableDirectory(lastOpenedProjectRoot) {
             return root
         }
         return projects.first?.root
@@ -694,27 +756,33 @@ final class AgentSettings: ObservableObject {
         requestedRoot: String?,
         onboardedRoot: String?
     ) -> String? {
-        if let root = Self.validDirectory(onboardedRoot ?? "") {
+        if let root = selectableDirectory(onboardedRoot) {
             return root
         }
-        if let root = Self.validDirectory(requestedRoot ?? "") {
+        if let root = selectableDirectory(requestedRoot) {
             return root
         }
-        if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
+        if let root = selectableDirectory(lastOpenedProjectRoot) {
             return root
         }
         return projects.first?.root
     }
 
     func resolvedProject(for requestedRoot: String?) -> ResolvedAgentProject {
-        let root = Self.validDirectory(requestedRoot ?? "")
+        let folderPath = checkoutPath(for: requestedRoot)
+        let root = folderPath.flatMap { path in
+            CherryProjectFolder(path: path).isAvailable ? Self.validDirectory(path) : nil
+        }
         return ResolvedAgentProject(root: root, agents: resolvedAgents)
     }
 
     func projectCommands(for requestedRoot: String?) -> [ProjectCommandDefinition] {
-        guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return [] }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
-        var commands = CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
+        guard let checkoutRoot = checkoutPath(for: requestedRoot),
+              project(for: checkoutRoot) != nil || CherryProjectFolder(path: checkoutRoot).isAvailable
+        else { return [] }
+        let settingsRoot = commandSettingsRoot(for: checkoutRoot)
+        var commands = CherryProjectFolder(path: checkoutRoot).isAvailable
+            ? CherryProjectFile.loadCommands(projectRoot: checkoutRoot) : []
         for localCommand in commandsByProject[settingsRoot] ?? [] {
             if let index = commands.firstIndex(where: { $0.normalizedName == localCommand.normalizedName }) {
                 commands[index] = localCommand
@@ -726,20 +794,24 @@ final class AgentSettings: ObservableObject {
     }
 
     func launchableProjectCommands(for requestedRoot: String?) -> [ProjectCommandDefinition] {
-        projectCommands(for: requestedRoot).filter(\.isLaunchable)
+        guard let checkoutRoot = checkoutPath(for: requestedRoot),
+              CherryProjectFolder(path: checkoutRoot).isAvailable
+        else { return [] }
+        return projectCommands(for: checkoutRoot).filter(\.isLaunchable)
     }
 
     /// Where the effective definition of a command currently lives. Local
     /// definitions shadow cherry.toml ones in `projectCommands(for:)`, so a
     /// name present in both is reported as `.local`.
     func commandStorage(named name: String, for requestedRoot: String?) -> ProjectCommandStorage {
-        guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return .local }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        guard let checkoutRoot = checkoutPath(for: requestedRoot) else { return .local }
+        let settingsRoot = commandSettingsRoot(for: checkoutRoot)
         let normalizedName = AgentToolDefinition.normalizedName(name)
         if (commandsByProject[settingsRoot] ?? []).contains(where: { $0.normalizedName == normalizedName }) {
             return .local
         }
-        if CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
+        if CherryProjectFolder(path: checkoutRoot).isAvailable,
+           CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
             .contains(where: { $0.normalizedName == normalizedName }) {
             return .projectFile
         }
@@ -747,12 +819,11 @@ final class AgentSettings: ObservableObject {
     }
 
     func projectFeatures(for requestedRoot: String?) -> ProjectFeatureSettings {
-        guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else {
+        guard let root = repositoryRoot(for: requestedRoot) else {
             return .disabled
         }
-        let root = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
 
-        let shared = CherryProjectFile.loadFeatureSettings(projectRoot: root) ?? .disabled
+        let shared = CherryProjectFile.loadFeatureSettings(projectRoot: configurationRoot(for: root)) ?? .disabled
         guard let local = featureOverridesByProject[root] else {
             return shared
         }
@@ -775,7 +846,7 @@ final class AgentSettings: ObservableObject {
             return .none
         }
 
-        let shared = CherryProjectFile.loadAppearanceSettings(projectRoot: root) ?? .none
+        let shared = CherryProjectFile.loadAppearanceSettings(projectRoot: configurationRoot(for: root)) ?? .none
         guard let local = appearanceOverridesByProject[root],
               let localColor = local.color
         else {
@@ -794,12 +865,12 @@ final class AgentSettings: ObservableObject {
 
     func projectFileConfiguresFeatures(for requestedRoot: String?) -> Bool {
         guard let root = repositoryRoot(for: requestedRoot) else { return false }
-        return CherryProjectFile.loadFeatureSettings(projectRoot: root) != nil
+        return CherryProjectFile.loadFeatureSettings(projectRoot: configurationRoot(for: root)) != nil
     }
 
     func projectFileConfiguresAppearance(for requestedRoot: String?) -> Bool {
         guard let root = repositoryRoot(for: requestedRoot) else { return false }
-        return CherryProjectFile.loadAppearanceSettings(projectRoot: root) != nil
+        return CherryProjectFile.loadAppearanceSettings(projectRoot: configurationRoot(for: root)) != nil
     }
 
     func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectFeatureStorage) throws {
@@ -811,7 +882,7 @@ final class AgentSettings: ObservableObject {
             overrides.todosEnabled = features.todosEnabled
             try setFeatureOverrides(overrides, for: root)
         case .projectFile:
-            try CherryProjectFile.writeFeatureSettings(features, projectRoot: root)
+            try CherryProjectFile.writeFeatureSettings(features, projectRoot: configurationRoot(for: root))
         }
     }
 
@@ -821,7 +892,7 @@ final class AgentSettings: ObservableObject {
         case .local:
             try setAppearanceOverrides(ProjectAppearanceOverrides(color: appearance.color), for: root)
         case .projectFile:
-            try CherryProjectFile.writeAppearanceSettings(appearance, projectRoot: root)
+            try CherryProjectFile.writeAppearanceSettings(appearance, projectRoot: configurationRoot(for: root))
         }
     }
 
@@ -839,13 +910,79 @@ final class AgentSettings: ObservableObject {
 
     @discardableResult
     func addProject(path: String) -> CherryProject? {
-        guard let root = Self.validDirectory(path) else { return nil }
+        if let existing = project(for: path) { return existing }
+        guard let root = Self.validDirectory(path), CherryProjectFolder(path: root).isAvailable else { return nil }
         let project = CherryProject(root: root)
-        if !projects.contains(where: { $0.root == root }) {
-            projects.append(project)
-            saveProjects()
-        }
+        projects.append(project)
+        saveProjects()
         return project
+    }
+
+    @discardableResult
+    func addFolder(path: String, toProjectRoot projectRoot: String) -> CherryProjectFolder? {
+        guard let path = Self.savedDirectoryPath(path),
+              let project = project(for: projectRoot),
+              let projectIndex = projects.firstIndex(where: { $0.id == project.id })
+        else { return nil }
+        if let existing = project.folders.first(where: { Self.pathsAreEquivalent($0.path, path) }) { return existing }
+        guard CherryProjectFolder(path: path).isAvailable else { return nil }
+        // One owner keeps folder-to-project lookup and project windows unambiguous.
+        guard self.project(for: path) == nil else { return nil }
+        let folder = CherryProjectFolder(path: path)
+        projects[projectIndex].folders.append(folder)
+        saveProjects()
+        return folder
+    }
+
+    @discardableResult
+    func relocateFolder(id: String, path: String, inProjectRoot projectRoot: String) -> Bool {
+        guard let path = Self.validDirectory(path), CherryProjectFolder(path: path).isAvailable,
+              let project = project(for: projectRoot),
+              let projectIndex = projects.firstIndex(where: { $0.id == project.id }),
+              let folderIndex = project.folders.firstIndex(where: { $0.id == id })
+        else { return false }
+        let previousPath = project.folders[folderIndex].path
+        if Self.pathsAreEquivalent(previousPath, path) { return true }
+        guard !projects.contains(where: { candidate in
+            (Self.pathsAreEquivalent(candidate.root, path) && (candidate.id != project.id || folderIndex != 0))
+                || candidate.folders.contains { Self.pathsAreEquivalent($0.path, path) }
+        }) else { return false }
+
+        // Primary-folder commands retain the legacy root key. Other folders
+        // carry their local command definitions with them to the new location.
+        if folderIndex != 0, let commands = commandsByProject[previousPath] {
+            let destinationCommands = commandsByProject[path] ?? []
+            guard commands.allSatisfy({ command in
+                guard let existing = destinationCommands.first(where: { $0.normalizedName == command.normalizedName }) else {
+                    return true
+                }
+                return existing == command
+            }) else { return false }
+            let destinationNames = Set(destinationCommands.map(\.normalizedName))
+            commandsByProject[path] = destinationCommands
+                + commands.filter { !destinationNames.contains($0.normalizedName) }
+            commandsByProject.removeValue(forKey: previousPath)
+            saveCommands()
+        }
+        projects[projectIndex].folders[folderIndex].path = path
+        if lastOpenedProjectRoot == previousPath {
+            lastOpenedProjectRoot = project.root
+            saveLastOpenedProjectRoot()
+        }
+        saveProjects()
+        return true
+    }
+
+    @discardableResult
+    func renameProject(_ name: String, for projectRoot: String) -> Bool {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              let project = project(for: projectRoot),
+              let index = projects.firstIndex(where: { $0.id == project.id })
+        else { return false }
+        projects[index].name = name
+        saveProjects()
+        return true
     }
 
     func removeProject(_ project: CherryProject) {
@@ -855,7 +992,7 @@ final class AgentSettings: ObservableObject {
         appearanceOverridesByProject.removeValue(forKey: project.root)
         hiddenWorktreesByProject.removeValue(forKey: project.root)
         lastActiveWorktreeByProject.removeValue(forKey: project.root)
-        if lastOpenedProjectRoot == project.root {
+        if lastOpenedProjectRoot == project.root || project.folders.contains(where: { $0.path == lastOpenedProjectRoot }) {
             lastOpenedProjectRoot = projects.first?.root
             saveLastOpenedProjectRoot()
         }
@@ -868,7 +1005,7 @@ final class AgentSettings: ObservableObject {
     }
 
     func markProjectOpened(_ projectRoot: String?) {
-        guard let root = Self.validDirectory(projectRoot ?? "") else { return }
+        guard let root = selectableDirectory(projectRoot) else { return }
         guard lastOpenedProjectRoot != root else { return }
         lastOpenedProjectRoot = root
         saveLastOpenedProjectRoot()
@@ -884,8 +1021,50 @@ final class AgentSettings: ObservableObject {
     }
 
     func repositoryRoot(for requestedRoot: String?) -> String? {
+        if let project = project(for: requestedRoot) { return project.root }
         guard let root = Self.validDirectory(requestedRoot ?? "") else { return nil }
-        return repositoryRootByWorktreeRoot[root] ?? root
+        return registeredRepositoryRoot(for: root) ?? root
+    }
+
+    private func selectableDirectory(_ path: String?) -> String? {
+        guard let path = Self.savedDirectoryPath(path ?? "") else { return nil }
+        return project(for: path) != nil ? path : Self.validDirectory(path)
+    }
+
+    private func configurationRoot(for projectRoot: String) -> String {
+        project(for: projectRoot)?.folders.first?.path ?? projectRoot
+    }
+
+    private func checkoutPath(for requestedRoot: String?) -> String? {
+        guard let root = Self.savedDirectoryPath(requestedRoot ?? "") else { return nil }
+        if let project = project(for: root), Self.pathsAreEquivalent(project.root, root) {
+            return project.folders.first?.path
+        }
+        return root
+    }
+
+    private func commandSettingsRoot(for checkoutRoot: String) -> String {
+        // An explicitly added folder is its own command scope, even if Git
+        // also identifies it as a worktree of another folder in the project.
+        if let root = savedFolderCommandRoot(for: checkoutRoot) { return root }
+        let repositoryRoot = registeredRepositoryRoot(for: checkoutRoot) ?? checkoutRoot
+        if let root = savedFolderCommandRoot(for: repositoryRoot) { return root }
+        if commandsByProject[repositoryRoot] != nil { return repositoryRoot }
+        return commandsByProject.keys.first(where: { Self.pathsAreEquivalent($0, repositoryRoot) }) ?? repositoryRoot
+    }
+
+    private func savedFolderCommandRoot(for path: String) -> String? {
+        for project in projects {
+            if let folder = project.folders.first(where: { Self.pathsAreEquivalent($0.path, path) }) {
+                return project.folders.first?.id == folder.id ? project.root : folder.path
+            }
+        }
+        return nil
+    }
+
+    private func registeredRepositoryRoot(for root: String) -> String? {
+        repositoryRootByWorktreeRoot[root]
+            ?? repositoryRootByWorktreeRoot.first(where: { Self.pathsAreEquivalent($0.key, root) })?.value
     }
 
     func hiddenWorktreeRoots(for repositoryRoot: String) -> Set<String> {
@@ -950,7 +1129,7 @@ final class AgentSettings: ObservableObject {
         storage: ProjectCommandStorage = .local
     ) throws {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = commandSettingsRoot(for: checkoutRoot)
         let validatedCommand = try ProjectCommandConfiguration.validated([
             command.withPortableWorkingDirectory(projectRoot: checkoutRoot)
         ]).first!
@@ -983,7 +1162,7 @@ final class AgentSettings: ObservableObject {
 
     func removeCommand(named name: String, for requestedRoot: String) {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = commandSettingsRoot(for: checkoutRoot)
         let normalizedName = AgentToolDefinition.normalizedName(name)
         let nextCommands = (commandsByProject[settingsRoot] ?? []).filter { $0.normalizedName != normalizedName }
         try? setCommands(nextCommands, for: settingsRoot)
@@ -1064,16 +1243,19 @@ final class AgentSettings: ObservableObject {
     }
 
     private static func loadProjects(from defaults: UserDefaults) -> [CherryProject] {
-        guard let data = defaults.data(forKey: Keys.projects),
-              let decoded = try? JSONDecoder().decode([CherryProject].self, from: data)
-        else {
-            return []
+        guard let data = defaults.data(forKey: Keys.projects) else { return [] }
+        if let saved = try? JSONDecoder().decode(SavedCherryProjects.self, from: data) {
+            return saved.projects
         }
-        return decoded.filter { validDirectory($0.root) != nil }
+        guard let legacy = try? JSONDecoder().decode([CherryProject].self, from: data) else { return [] }
+        // Decoding supplies deterministic IDs and a first folder for old {root}
+        // entries, including unavailable folders that the user may reconnect.
+        saveProjects(legacy, to: defaults)
+        return legacy
     }
 
     private static func loadLastOpenedProjectRoot(from defaults: UserDefaults) -> String? {
-        validDirectory(defaults.string(forKey: Keys.lastOpenedProjectRoot) ?? "")
+        savedDirectoryPath(defaults.string(forKey: Keys.lastOpenedProjectRoot) ?? "")
     }
 
     private static func loadAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
@@ -1095,7 +1277,7 @@ final class AgentSettings: ObservableObject {
 
         var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
         for (root, commands) in decoded {
-            guard let validRoot = validDirectory(root),
+            guard let validRoot = savedDirectoryPath(root),
                   let validatedCommands = try? ProjectCommandConfiguration.validated(commands),
                   !validatedCommands.isEmpty
             else {
@@ -1115,7 +1297,7 @@ final class AgentSettings: ObservableObject {
 
         var overridesByProject: [String: ProjectFeatureOverrides] = [:]
         for (root, overrides) in decoded {
-            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
+            guard let validRoot = savedDirectoryPath(root), !overrides.isEmpty else {
                 continue
             }
             overridesByProject[validRoot] = overrides
@@ -1132,7 +1314,7 @@ final class AgentSettings: ObservableObject {
 
         var overridesByProject: [String: ProjectAppearanceOverrides] = [:]
         for (root, overrides) in decoded {
-            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
+            guard let validRoot = savedDirectoryPath(root), !overrides.isEmpty else {
                 continue
             }
             overridesByProject[validRoot] = overrides
@@ -1149,8 +1331,8 @@ final class AgentSettings: ObservableObject {
 
         var result: [String: Set<String>] = [:]
         for (repositoryRoot, worktreeRoots) in decoded {
-            guard let root = validDirectory(repositoryRoot) else { continue }
-            let normalized = Set(worktreeRoots.compactMap(validDirectory))
+            guard let root = savedDirectoryPath(repositoryRoot) else { continue }
+            let normalized = Set(worktreeRoots.compactMap(savedDirectoryPath))
             if !normalized.isEmpty {
                 result[root] = normalized
             }
@@ -1167,8 +1349,8 @@ final class AgentSettings: ObservableObject {
 
         var result: [String: String] = [:]
         for (repositoryRoot, worktreeRoot) in decoded {
-            guard let root = validDirectory(repositoryRoot),
-                  let worktree = validDirectory(worktreeRoot)
+            guard let root = savedDirectoryPath(repositoryRoot),
+                  let worktree = savedDirectoryPath(worktreeRoot)
             else {
                 continue
             }
@@ -1198,7 +1380,7 @@ final class AgentSettings: ObservableObject {
     }
 
     private static func saveProjects(_ projects: [CherryProject], to defaults: UserDefaults) {
-        guard let data = try? JSONEncoder().encode(projects) else { return }
+        guard let data = try? JSONEncoder().encode(SavedCherryProjects(projects: projects)) else { return }
         defaults.set(data, forKey: Keys.projects)
     }
 
@@ -1235,6 +1417,28 @@ final class AgentSettings: ObservableObject {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         return NSString(string: trimmed).expandingTildeInPath
+    }
+
+    /// Persistence normalization must not depend on whether a drive is mounted.
+    private static func savedDirectoryPath(_ path: String) -> String? {
+        let normalized = normalizedPath(path)
+        guard !normalized.isEmpty else { return nil }
+        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+    }
+
+    private static func pathsAreEquivalent(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+        return resolvedDirectoryPath(lhs) == resolvedDirectoryPath(rhs)
+    }
+
+    /// Match runtime paths such as /private/var/... against saved /var/...
+    /// aliases without replacing the persisted keys. Missing paths keep their
+    /// standardized spelling so disconnected folders still retain identity.
+    private static func resolvedDirectoryPath(_ path: String) -> String {
+        let standardized = savedDirectoryPath(path) ?? path
+        guard let resolved = standardized.withCString({ realpath($0, nil) }) else { return standardized }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     static func performanceProjectRoots(environment: [String: String]) -> [String] {

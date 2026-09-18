@@ -217,10 +217,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 switch event.keyCode {
                 case 123:
                     animateAdjacentWorktree(offset: -1)
-                    return repository?.supportsWorktrees == true
+                    return (repository?.folders.count ?? 0) > 1
                 case 124:
                     animateAdjacentWorktree(offset: 1)
-                    return repository?.supportsWorktrees == true
+                    return (repository?.folders.count ?? 0) > 1
                 case 126:
                     cycleSidebarSelection(offset: -1)
                     return true
@@ -244,27 +244,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
         }
 
         private func animateAdjacentWorktree(offset: Int) {
-            guard let repository,
-                  repository.supportsWorktrees,
-                  let worktreeSwipeState,
-                  let target = repository.adjacentWorktree(offset: offset),
-                  repository.prepareWorkspace(worktreeRoot: target.root) != nil
-            else {
-                return
-            }
-
-            _ = worktreeSwipeState.animateSwitch(
-                sourceRoot: repository.activeWorktreeRoot,
-                targetRoot: target.root,
-                direction: offset,
-                sidebarWidth: sidebarWidth,
-                duration: worktreeSettleDuration
-            ) { [weak repository, weak chromeState] in
-                _ = repository?.activate(
-                    worktreeRoot: target.root,
-                    chromeState: chromeState
-                )
-            }
+            guard let repository, let target = repository.adjacentWorktree(offset: offset) else { return }
+            _ = repository.activateFolder(path: target.root, chromeState: chromeState)
         }
 
         private func perform(_ action: ShortcutAction) {
@@ -276,6 +257,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
             case .toggleSidebar:
                 chromeState?.toggleSidebar()
             case .addSession:
+                guard CherryProjectFolder(path: workspace?.projectRoot ?? "").isAvailable else { return }
+                chromeState?.selectTerminal()
                 workspace?.addSession()
             case .splitDuplicate:
                 workspace?.splitDuplicateActiveTerminal()
@@ -307,10 +290,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                     session,
                     in: workspace,
                     chromeState: chromeState,
-                    allowEmptyWorkspace: SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(
-                        than: workspace,
-                        repository: repository
-                    )
+                    allowEmptyWorkspace: repository != nil
                 )
             } else {
                 window?.performClose(nil)
@@ -334,15 +314,15 @@ struct AppShortcutMonitor: NSViewRepresentable {
         private func sidebarItems() -> [SidebarItem] {
             guard let workspace else { return [] }
             var items: [SidebarItem] = []
-            items += workspace.visibleAgentSessions(
-                collapsedIDs: chromeState?.collapsedAgentGroupIDs ?? []
-            ).map { .session($0) }
-            items += workspace.terminalDisplaySessions.map { .session($0) }
-            items += visibleCommands.map { .command($0) }
-            if projectFeatures.todosEnabled {
-                items.append(.todoBoard)
+            if let repository {
+                for folder in repository.sidebarFolders where !(chromeState?.collapsedFolderIDs.contains(folder.id) ?? false) {
+                    items += (repository.workspaceIfLoaded(for: folder.path)?.sidebarOrderedSessions ?? []).map { .session($0) }
+                }
+            } else {
+                items += workspace.sidebarOrderedSessions.map { .session($0) }
             }
-            if projectFeatures.notesEnabled, let noteStore {
+            if projectFeatures.todosEnabled { items.append(.todoBoard) }
+            if projectFeatures.notesEnabled, chromeState?.isProjectNotesExpanded == true, let noteStore {
                 items += noteStore.notes.map { .note($0.id) }
             }
             return items
@@ -388,8 +368,14 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard let workspace, let chromeState else { return }
             switch item {
             case .session(let session):
+                let owningWorkspace: TerminalWorkspace
+                if let repository, let root = repository.root(containing: session.id) {
+                    owningWorkspace = repository.activateFolder(path: root, chromeState: chromeState)
+                        ?? repository.activate(worktreeRoot: root, chromeState: chromeState)
+                        ?? workspace
+                } else { owningWorkspace = workspace }
                 chromeState.selectTerminal()
-                workspace.select(session)
+                owningWorkspace.select(session)
             case .command(let command):
                 if let session = workspace.commandSession(named: command.name) {
                     chromeState.selectTerminal()

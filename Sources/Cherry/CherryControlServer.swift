@@ -536,6 +536,7 @@ final class CherryControlServer: @unchecked Sendable {
             let todoStore = try activeTodoStore(for: workspace)
             return .init(result: .listTodos(listTodos(todoStore: todoStore)))
         case .createTerminal(let request):
+            try requireAvailableLaunchFolder(workspace)
             let session = workspace.addSession(
                 title: request.title,
                 workingDirectory: request.workingDirectory,
@@ -544,6 +545,7 @@ final class CherryControlServer: @unchecked Sendable {
             )
             return .init(result: .createTerminal(summary(for: session, workspace: workspace)))
         case .runAgent(let request):
+            try requireAvailableLaunchFolder(workspace)
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
@@ -1242,7 +1244,15 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func requireAvailableLaunchFolder(_ workspace: TerminalWorkspace) throws {
+        if let root = workspace.projectRoot, !CherryProjectFolder(path: root).isAvailable {
+            throw CherryControlError(code: "project_unavailable", message: "The terminal’s folder is unavailable. Locate it before starting a process.")
+        }
+    }
+
+    @MainActor
     private func spawnProcess(_ request: SpawnProcessRequest, workspace: TerminalWorkspace) async throws -> (TerminalSession, Int) {
+        try requireAvailableLaunchFolder(workspace)
         let kind = try requiredProcessKind(from: request.kind)
         let session: TerminalSession
         let agent: AgentToolDefinition?
@@ -1338,6 +1348,7 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func startProcess(_ request: ProcessLifecycleRequest, workspace: TerminalWorkspace) throws -> TerminalSession {
+        try requireAvailableLaunchFolder(workspace)
         if let session = try? resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName) {
             switch session.state {
             case .launching, .live:

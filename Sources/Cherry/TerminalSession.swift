@@ -1097,8 +1097,8 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     var selectedSession: TerminalSession? {
-        guard let selectedSessionID else { return sessions.first }
-        return sessions.first(where: { $0.id == selectedSessionID }) ?? sessions.first
+        guard let selectedSessionID else { return nil }
+        return sessions.first(where: { $0.id == selectedSessionID })
     }
 
     var agentSessions: [TerminalSession] {
@@ -1152,12 +1152,29 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .command }
     }
 
+    /// One chronological folder sequence for shells, agents, and command runs.
+    /// Split panes retain their existing group and occupy one sidebar row.
+    var unifiedDisplayItems: [TerminalDisplayItem] {
+        var seenGroups = Set<UUID>()
+        return sessions.compactMap { session in
+            if let group = splitGroup(containing: session.id) {
+                return seenGroups.insert(group.id).inserted ? .split(group.id) : nil
+            }
+            return .single(session.id)
+        }
+    }
+
     var sidebarOrderedSessions: [TerminalSession] {
-        visibleAgentSessions() + terminalDisplaySessions + commandSessions
+        unifiedDisplayItems.compactMap { item in
+            switch item {
+            case .single(let id): return session(withID: id)
+            case .split(let id): return splitGroup(id: id).flatMap { session(withID: $0.activeSessionID) }
+            }
+        }
     }
 
     func sidebarOrderedSessions(visibleCommandNames: [String]) -> [TerminalSession] {
-        visibleAgentSessions() + terminalDisplaySessions + commandSessions(orderedBy: visibleCommandNames)
+        sidebarOrderedSessions
     }
 
     func childAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
@@ -1616,7 +1633,7 @@ final class TerminalWorkspace: ObservableObject {
 
     func canCloseSplitGroup(id groupID: UUID) -> Bool {
         guard let group = splitGroup(id: groupID) else { return false }
-        return sessions.count > group.paneSessionIDs.count
+        return !group.paneSessionIDs.isEmpty
     }
 
     func closeSplitGroup(id groupID: UUID) {
@@ -1625,7 +1642,7 @@ final class TerminalWorkspace: ObservableObject {
         else {
             return
         }
-        closeSessions(withIDs: Set(group.paneSessionIDs))
+        closeSessions(withIDs: Set(group.paneSessionIDs), allowEmptyWorkspace: true)
     }
 
     func close(_ session: TerminalSession, allowEmptyWorkspace: Bool = false) {

@@ -75,7 +75,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "resolve_link",
-            "Resolve a cherry://project/... link for a note, todo, or live terminal without changing the Cherry UI.",
+            "Resolve a \(CherryDeepLink.scheme)://project/... link for a note, todo, or live terminal without changing the Cherry UI.",
             properties: [
                 "link": string("Cherry deep link to resolve."),
                 "include_output": boolean("For terminal links, include rendered output. Defaults to false."),

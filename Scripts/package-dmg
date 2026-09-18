@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build a self-contained local-test disk image without replacing an installed app.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+app_name=${CHERRY_APP_NAME:-Cherry Sessions}
+bundle_id=${CHERRY_BUNDLE_ID:-dev.patrick.cherry.sessions}
+url_scheme=${CHERRY_URL_SCHEME:-cherry-sessions}
+support_name=${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry Sessions}
+icon=${CHERRY_ICON_PATH:-"$root/Design/SessionsIcon/AppIconSessions.icns"}
+architecture=$(uname -m)
+# Preserve the parked persistent-session disk image when building this preview.
+output=${CHERRY_DMG_OUTPUT:-"$root/dist/$app_name Sidebar-$architecture.dmg"}
+mkdir -p "$root/.build" "$(dirname "$output")"
+stage=$(mktemp -d "$root/.build/dmg.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+
+CHERRY_CONFIGURATION="${CHERRY_CONFIGURATION:-release}" CHERRY_APP_NAME="$app_name" CHERRY_INSTALL_DIR="$stage" \
+  CHERRY_BUNDLE_ID="$bundle_id" CHERRY_URL_SCHEME="$url_scheme" \
+  CHERRY_APPLICATION_SUPPORT_NAME="$support_name" CHERRY_ICON_PATH="$icon" \
+  "$root/Scripts/install-local-app"
+ln -s /Applications "$stage/Applications"
+
+cat > "$stage/Start Here.txt" <<EOF
+$app_name — native project sidebar preview
+
+Requires macOS 26 or later on $architecture.
+
+This separate app can run alongside your current Cherry. It has its own
+identifier ($bundle_id), icon, settings, and application data. Your existing
+Cherry installation is not replaced.
+
+1. Drag $app_name.app to Applications, then open it from Applications.
+2. Create a project by opening its first folder. Projects need a first folder
+   in this preview; creating a project without a folder is planned.
+3. Use Add folder to put a second folder in the same project.
+4. Open a shell or agent under either folder. Both appear in that folder's
+   terminal list; switch between folders and their terminals to compare them.
+5. Expand Commands and Notes at the bottom of the sidebar to explore the
+   selected project's tools.
+
+This preview uses native Ghostty terminals. Terminal processes end when you
+close their terminal or quit the app. Project entries can be reopened, but
+running shell processes and terminal state do not survive app exit.
+
+Persistent terminal sessions are planned and are not enabled in this preview.
+No persistent-session host or command-line client is included.
+
+This build replaces an earlier Cherry Sessions app if you install it in the
+same location. It does not replace the regular Cherry app. Finish work in an
+earlier Cherry Sessions build before replacing it.
+
+This is a locally signed test build; it is not notarized for distribution.
+EOF
+
+codesign --verify --deep --strict "$stage/$app_name.app"
+"$root/Scripts/test-packaged-app" "$stage/$app_name.app"
+hdiutil create -volname "$app_name" -srcfolder "$stage" -format UDZO -ov "$output"
+hdiutil verify "$output"
+shasum -a 256 "$output" > "$output.sha256"
+printf 'Created %s\n' "$output"

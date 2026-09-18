@@ -9141,31 +9141,17 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         command.id
     ])
     #expect(workspace.sidebarOrderedSessions.map(\.id) == [
-        firstAgent.id,
-        secondAgent.id,
-        firstTerminal.id,
-        secondTerminal.id,
-        command.id
+        firstTerminal.id, secondTerminal.id, firstAgent.id, secondAgent.id, command.id
     ])
 
-    workspace.select(firstAgent)
-    workspace.selectNextSession()
-    #expect(workspace.selectedSessionID == secondAgent.id)
-
-    workspace.selectNextSession()
-    #expect(workspace.selectedSessionID == firstTerminal.id)
-
-    workspace.selectNextSession()
-    #expect(workspace.selectedSessionID == secondTerminal.id)
-
-    workspace.selectNextSession()
-    #expect(workspace.selectedSessionID == command.id)
-
-    workspace.selectNextSession()
-    #expect(workspace.selectedSessionID == firstAgent.id)
-
+    workspace.select(firstTerminal)
+    for nextID in [secondTerminal.id, firstAgent.id, secondAgent.id, command.id, firstTerminal.id] {
+        workspace.selectNextSession()
+        #expect(workspace.selectedSessionID == nextID)
+    }
     workspace.selectPreviousSession()
     #expect(workspace.selectedSessionID == command.id)
+
 }
 
 @MainActor
@@ -9192,7 +9178,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func workspaceShortcutSelectionFollowsVisibleCommandOrder() async throws {
+@Test func workspaceShortcutSelectionKeepsCommandRunsInFolderOrder() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -9220,22 +9206,22 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(workspace.commandSessions.map(\.id) == [tilt.id, web.id])
     #expect(workspace.sidebarOrderedSessions(visibleCommandNames: ["Web", "Tilt"]).map(\.id) == [
         terminal.id,
-        web.id,
-        tilt.id
+        tilt.id,
+        web.id
     ])
 
     workspace.select(terminal)
     workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
-    #expect(workspace.selectedSessionID == web.id)
+    #expect(workspace.selectedSessionID == tilt.id)
 
     workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
-    #expect(workspace.selectedSessionID == tilt.id)
+    #expect(workspace.selectedSessionID == web.id)
 
     workspace.selectNextSession(visibleCommandNames: ["Web", "Tilt"])
     #expect(workspace.selectedSessionID == terminal.id)
 
     workspace.selectPreviousSession(visibleCommandNames: ["Web", "Tilt"])
-    #expect(workspace.selectedSessionID == tilt.id)
+    #expect(workspace.selectedSessionID == web.id)
 }
 
 @Test func agentDefinitionsValidateAndNormalize() async throws {

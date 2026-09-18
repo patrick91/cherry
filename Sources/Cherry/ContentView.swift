@@ -1110,13 +1110,17 @@ private struct DetailPaneView: View {
                 )
             } else {
                 ContentUnavailableView {
-                    Label("No Active Session", systemImage: "rectangle.stack")
+                    Label(workspace.sessions.isEmpty ? "No terminals in this folder" : "Choose a terminal", systemImage: "terminal")
                 } description: {
-                    Text("Open a terminal to get started.")
+                    Text(!CherryProjectFolder(path: projectRoot ?? "").isAvailable
+                        ? "This folder is unavailable. Locate it from the sidebar to open new terminals."
+                        : "Open a terminal in this folder, or select a terminal from the sidebar.")
                 } actions: {
-                    Button("New Terminal") {
-                        _ = workspace.addSession()
+                    Button("Open Terminal") {
+                        chromeState.selectTerminal()
+                        _ = workspace.addSession(workingDirectory: projectRoot)
                     }
+                    .disabled(!CherryProjectFolder(path: projectRoot ?? "").isAvailable)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: .windowBackgroundColor))
@@ -4851,6 +4855,470 @@ private func cherryLink(for session: TerminalSession, projectRoot: String?) -> S
     return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
 }
 
+/// Production project sidebar. Folder ownership is fixed when a terminal opens;
+/// its reported working directory never changes this hierarchy.
+private struct NativeProjectSidebar: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var settings = AgentSettings.shared
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    let presentation: SidebarPresentation
+    @State private var errorMessage: String?
+
+    private var palette: SidebarPalette {
+        SidebarPalette(
+            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
+            fallbackColorScheme: colorScheme,
+            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
+            projectColor: settings.projectAppearance(for: repository.repositoryRoot).color,
+            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
+            presentation: presentation
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Text("FOLDERS")
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(1)
+                            .foregroundStyle(palette.headerText)
+                        Spacer()
+                        Button(action: addFolder) {
+                            Image(systemName: "folder.badge.plus")
+                                .font(.system(size: 13))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Add folder to project")
+                        .accessibilityLabel("Add folder to project")
+                    }
+                    ForEach(repository.sidebarFolders) { folder in
+                        NativeFolderSection(
+                            folder: folder,
+                            repository: repository,
+                            workspace: repository.prepareWorkspace(worktreeRoot: folder.path)!,
+                            chromeState: chromeState,
+                            palette: palette,
+                            presentation: presentation,
+                            shortcutStartIndex: shortcutOffset(for: folder)
+                        )
+                    }
+                    Button(action: addFolder) {
+                        Label("Add folder", systemImage: "plus")
+                            .font(.system(size: 12))
+                            .foregroundStyle(palette.headerText)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 7)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + 4)
+                .padding(.bottom, 16)
+            }
+            Divider().opacity(0.45)
+            NativeProjectTools(
+                repository: repository,
+                chromeState: chromeState,
+                noteStore: noteStore,
+                todoStore: todoStore,
+                palette: palette,
+                presentation: presentation
+            )
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+        }
+        .background {
+            if presentation == .floating {
+                SidebarBackground(projectRoot: repository.repositoryRoot, presentation: presentation)
+            }
+        }
+        .overlay(alignment: .top) {
+            SidebarTopChromeShield(projectRoot: repository.repositoryRoot, presentation: presentation)
+        }
+        .onChange(of: settings.projects) { _, _ in repository.synchronizeFolders() }
+        .alert("Couldn’t add folder", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("OK") { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
+
+    private func shortcutOffset(for folder: CherryProjectFolder) -> Int {
+        repository.sidebarFolders.prefix { $0.id != folder.id }.reduce(0) { count, candidate in
+            count + (chromeState.collapsedFolderIDs.contains(candidate.id) ? 0 : (repository.workspaceIfLoaded(for: candidate.path)?.unifiedDisplayItems.count ?? 0))
+        }
+    }
+
+    private func addFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add Folder"
+        panel.message = "Add folders to this project. Each folder keeps its own terminals."
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let folder = settings.addFolder(path: url.path, toProjectRoot: repository.repositoryRoot) else {
+                errorMessage = "The folder could not be added. It may already belong to another project."
+                continue
+            }
+            repository.synchronizeFolders()
+            chromeState.collapsedFolderIDs.remove(folder.id)
+            _ = repository.activateFolder(path: folder.path, chromeState: chromeState, clearSelection: true)
+        }
+    }
+}
+
+private struct NativeFolderSection: View {
+    let folder: CherryProjectFolder
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let palette: SidebarPalette
+    let presentation: SidebarPresentation
+    let shortcutStartIndex: Int
+    @ObservedObject private var settings = AgentSettings.shared
+    @ObservedObject private var terminalSettings = TerminalSettings.shared
+    @State private var locationError: String?
+
+    private var isExpanded: Bool { !chromeState.collapsedFolderIDs.contains(folder.id) }
+    private var isActive: Bool { repository.activeWorkspace === workspace }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Button {
+                    if isExpanded { chromeState.collapsedFolderIDs.insert(folder.id) }
+                    else { chromeState.collapsedFolderIDs.remove(folder.id) }
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 12, height: 24)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(folder.name)")
+                Button {
+                    chromeState.collapsedFolderIDs.remove(folder.id)
+                    _ = repository.activateFolder(path: folder.path, chromeState: chromeState, clearSelection: true)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: folder.isAvailable ? "folder" : "folder.badge.questionmark")
+                            .foregroundStyle(folder.isAvailable ? palette.headerText : .orange)
+                        Text(folder.name).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(folder.path)
+                Menu {
+                    Button("Shell", action: openShell)
+                    ForEach(settings.resolvedAgents.filter(\.isLaunchable)) { agent in
+                        Button(agent.name) { openAgent(agent) }
+                    }
+                } label: {
+                    Image(systemName: "plus").font(.system(size: 11, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .disabled(!folder.isAvailable)
+                .help("Open terminal in \(folder.name)")
+                .accessibilityLabel("Open terminal in \(folder.name)")
+            }
+            .foregroundStyle(palette.rowText)
+            .padding(.vertical, 2)
+            .contextMenu {
+                Button("Open Terminal", action: openShell).disabled(!folder.isAvailable)
+                Button("Reveal in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
+                    .disabled(!folder.isAvailable)
+                if !folder.isAvailable { Button("Locate Folder…", action: locateFolder) }
+            }
+
+            if isExpanded {
+                if !folder.isAvailable {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Folder unavailable").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Button("Locate folder…", action: locateFolder).buttonStyle(.plain).font(.system(size: 12))
+                    }
+                    .padding(.leading, 26).padding(.vertical, 6)
+                }
+                ForEach(Array(workspace.unifiedDisplayItems.enumerated()), id: \.element.id) { index, item in
+                    row(item, index: index)
+                        .padding(.leading, 20)
+                }
+                if workspace.sessions.isEmpty && folder.isAvailable {
+                    Button(action: openShell) {
+                        Label("Open terminal", systemImage: "terminal")
+                            .font(.system(size: 12))
+                            .foregroundStyle(palette.headerText)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.leading, 26)
+                }
+            }
+        }
+        .alert("Couldn’t locate folder", isPresented: Binding(get: { locationError != nil }, set: { if !$0 { locationError = nil } })) {
+            Button("OK") { locationError = nil }
+        } message: { Text(locationError ?? "") }
+    }
+
+    @ViewBuilder private func row(_ item: TerminalDisplayItem, index: Int) -> some View {
+        switch item {
+        case .single(let id):
+            if let session = workspace.session(withID: id) {
+                SidebarTabRow(
+                    session: session,
+                    isSelected: isActive && chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+                    projectRoot: repository.repositoryRoot,
+                    presentation: presentation,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    shortcutNumber: shortcutStartIndex + index + 1,
+                    showShortcutHint: chromeState.isCommandKeyPressed,
+                    onSelect: { select(session) }
+                )
+                .contextMenu {
+                    Button("Rename…") { promptRenameSession(session) }
+                    Button("Copy Link") { copyCherryLink(cherryLink(for: session, projectRoot: folder.path)) }
+                    Button("Clear Scrollback") { session.clearScrollback() }
+                    Button("Restart") { session.restart() }.disabled(!folder.isAvailable)
+                    if session.kind == .command { Button("Stop") { session.stopManagedCommand() } }
+                    Divider()
+                    Button("Close Terminal", role: .destructive) {
+                        _ = repository.activateFolder(path: folder.path, chromeState: chromeState)
+                        SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState, allowEmptyWorkspace: true)
+                    }
+                }
+            }
+        case .split(let id):
+            if let group = workspace.splitGroup(id: id) {
+                SidebarSplitTabRow(
+                    group: group, workspace: workspace, chromeState: chromeState,
+                    projectRoot: repository.repositoryRoot, presentation: presentation,
+                    pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
+                    shortcutNumber: shortcutStartIndex + index + 1,
+                    showShortcutHint: chromeState.isCommandKeyPressed, palette: palette,
+                    isActiveWorkspace: isActive,
+                    onActivate: { _ = repository.activateFolder(path: folder.path, chromeState: chromeState) }
+                )
+            }
+        }
+    }
+
+    private func select(_ session: TerminalSession) {
+        _ = repository.activateFolder(path: folder.path, chromeState: chromeState)
+        chromeState.selectTerminal()
+        workspace.select(session)
+    }
+    private func openShell() {
+        guard folder.isAvailable else { return }
+        _ = repository.activateFolder(path: folder.path, chromeState: chromeState)
+        chromeState.selectTerminal()
+        chromeState.collapsedFolderIDs.remove(folder.id)
+        workspace.addSession(workingDirectory: folder.path)
+    }
+    private func openAgent(_ agent: ResolvedAgentTool) {
+        guard folder.isAvailable else { return }
+        _ = repository.activateFolder(path: folder.path, chromeState: chromeState)
+        chromeState.selectTerminal()
+        chromeState.collapsedFolderIDs.remove(folder.id)
+        workspace.addAgentSession(agent: agent.definition, projectRoot: folder.path)
+    }
+    private func locateFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Locate Folder"
+        guard panel.runModal() == .OK, let path = panel.url?.path else { return }
+        // Live sessions retain their original workspace ownership; relocation
+        // is safe once those terminals have been explicitly closed.
+        guard workspace.sessions.isEmpty else {
+            locationError = "Close this folder’s terminals before changing its location."
+            return
+        }
+        guard settings.relocateFolder(id: folder.id, path: path, inProjectRoot: repository.repositoryRoot) else {
+            locationError = "The selected location could not be used."
+            return
+        }
+        repository.synchronizeFolders()
+        _ = repository.activateFolder(path: path, chromeState: chromeState, clearSelection: true)
+    }
+}
+
+private struct NativeProjectTools: View {
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    @ObservedObject var noteStore: ProjectNoteStore
+    @ObservedObject var todoStore: ProjectTodoStore
+    let palette: SidebarPalette
+    let presentation: SidebarPresentation
+    @ObservedObject private var settings = AgentSettings.shared
+    @State private var editingCommand: ProjectCommandDefinition?
+    @State private var editingOriginalName: String?
+    @State private var editingFolderPath = ""
+    @State private var commandError: String?
+    @State private var noteError: String?
+
+    private var features: ProjectFeatureSettings { settings.projectFeatures(for: repository.repositoryRoot) }
+    private var commandCount: Int { repository.folders.reduce(0) { $0 + settings.projectCommands(for: $1.path).filter(\.isLaunchable).count } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Commands", icon: "play", count: commandCount, expanded: $chromeState.isProjectCommandsExpanded) {
+                addCommand()
+            }
+            if chromeState.isProjectCommandsExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(repository.folders) { folder in
+                            ForEach(settings.projectCommands(for: folder.path).filter(\.isLaunchable)) { command in
+                                commandRow(command, folder: folder)
+                            }
+                        }
+                        if commandCount == 0 {
+                            Text("Save commands you run often.").font(.system(size: 11)).foregroundStyle(palette.headerText)
+                                .padding(.vertical, 7)
+                        }
+                    }
+                }.frame(maxHeight: 190)
+            }
+            if features.notesEnabled {
+                sectionHeader("Notes", icon: "note.text", count: noteStore.notes.count, expanded: $chromeState.isProjectNotesExpanded) {
+                    createNote()
+                }
+                if chromeState.isProjectNotesExpanded {
+                    ScrollView {
+                        SidebarNotesSection(
+                            noteStore: noteStore, chromeState: chromeState,
+                            selectedNoteID: chromeState.selectedNoteID, palette: palette,
+                            shortcutStartIndex: 99, showShortcutHints: false, showsHeader: false
+                        )
+                    }.frame(maxHeight: 190)
+                }
+            } else {
+                Button {
+                    let enabled = ProjectFeatureSettings(notesEnabled: true, todosEnabled: features.todosEnabled)
+                    try? settings.setProjectFeatures(enabled, for: repository.repositoryRoot, storage: .local)
+                    chromeState.isProjectNotesExpanded = true
+                } label: {
+                    Label("Enable Notes", systemImage: "note.text")
+                        .font(.system(size: 12)).foregroundStyle(palette.headerText)
+                }.buttonStyle(.plain)
+            }
+            if features.todosEnabled {
+                Button { chromeState.selectTodo(id: nil) } label: {
+                    Label("Todos", systemImage: "checklist")
+                        .font(.system(size: 12)).foregroundStyle(palette.headerText)
+                }.buttonStyle(.plain)
+            }
+        }
+        .sheet(item: $editingCommand) { command in
+            VStack(spacing: 0) {
+                if editingOriginalName == nil {
+                    Picker("Folder", selection: $editingFolderPath) {
+                        ForEach(repository.folders.filter(\.isAvailable)) { folder in Text(folder.name).tag(folder.path) }
+                    }.padding(20)
+                }
+                ProjectCommandEditor(
+                    command: command, projectRoot: editingFolderPath,
+                    storage: settings.commandStorage(named: editingOriginalName ?? command.name, for: editingFolderPath),
+                    canDelete: editingOriginalName != nil, errorMessage: commandError,
+                    onSave: { updated, storage in
+                        do {
+                            try settings.upsertCommand(updated, for: editingFolderPath, replacing: editingOriginalName, storage: storage)
+                            repository.workspaceIfLoaded(for: editingFolderPath)?.updateCommandSession(named: editingOriginalName, with: updated, projectRoot: editingFolderPath)
+                            editingCommand = nil
+                            commandError = nil
+                        } catch { commandError = error.localizedDescription }
+                    },
+                    onDelete: {
+                        settings.removeCommand(named: command.name, for: editingFolderPath)
+                        editingCommand = nil
+                    },
+                    onCancel: { editingCommand = nil; commandError = nil }
+                )
+            }
+        }
+        .alert("Couldn’t create note", isPresented: Binding(get: { noteError != nil }, set: { if !$0 { noteError = nil } })) {
+            Button("OK") { noteError = nil }
+        } message: { Text(noteError ?? "") }
+    }
+
+    private func sectionHeader(_ title: String, icon: String, count: Int, expanded: Binding<Bool>, add: @escaping () -> Void) -> some View {
+        HStack(spacing: 6) {
+            Button { expanded.wrappedValue.toggle() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold))
+                    Image(systemName: icon).frame(width: 15)
+                    Text(title).font(.system(size: 12, weight: .medium))
+                    Spacer(minLength: 0)
+                    if count > 0 { Text("\(count)").font(.system(size: 10)).foregroundStyle(palette.headerText) }
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            Button(action: add) { Image(systemName: "plus").font(.system(size: 11)).frame(width: 22, height: 24) }
+                .buttonStyle(.plain).help(title == "Notes" ? "Write a note" : "Add command")
+                .accessibilityLabel(title == "Notes" ? "Write a note" : "Add command")
+        }.foregroundStyle(palette.rowText)
+    }
+
+    private func commandRow(_ command: ProjectCommandDefinition, folder: CherryProjectFolder) -> some View {
+        Button { run(command, folder: folder) } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "play.fill").font(.system(size: 9)).frame(width: 16)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(command.name).font(.system(size: 12)).lineLimit(1)
+                    Text(folder.name).font(.system(size: 10)).foregroundStyle(palette.headerText).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }.foregroundStyle(palette.rowText).padding(.leading, 18).padding(.vertical, 6).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!folder.isAvailable)
+        .help("\(command.commandLine) in \(folder.path)")
+        .contextMenu {
+            Button("Run") { run(command, folder: folder) }
+            Button("Restart") { run(command, folder: folder, restart: true) }
+            Button("Stop") { repository.workspaceIfLoaded(for: folder.path)?.commandSession(named: command.name)?.stopManagedCommand() }
+            Divider()
+            Button("Edit…") { editingFolderPath = folder.path; editingOriginalName = command.name; editingCommand = command }
+            Button("Remove Definition", role: .destructive) { settings.removeCommand(named: command.name, for: folder.path) }
+        }
+    }
+    private func run(_ command: ProjectCommandDefinition, folder: CherryProjectFolder, restart: Bool = false) {
+        guard folder.isAvailable,
+              let workspace = repository.activateFolder(path: folder.path, chromeState: chromeState)
+        else { return }
+        chromeState.collapsedFolderIDs.remove(folder.id)
+        chromeState.selectTerminal()
+        if let session = workspace.commandSession(named: command.name) {
+            if restart { session.restart() } else { session.restartManagedCommandIfNeeded() }
+            workspace.select(session)
+        } else { workspace.addCommandSession(command: command, projectRoot: folder.path) }
+    }
+    private func addCommand() {
+        guard let folder = repository.folders.first(where: { $0.path == repository.activeWorktreeRoot && $0.isAvailable }) ?? repository.folders.first(where: \.isAvailable) else { return }
+        editingFolderPath = folder.path
+        editingOriginalName = nil
+        commandError = nil
+        editingCommand = ProjectCommandDefinition(name: "", command: "")
+        chromeState.isProjectCommandsExpanded = true
+    }
+    private func createNote() {
+        do {
+            let note = try noteStore.create(title: "Untitled Note", markdown: "# Untitled Note\n")
+            chromeState.isProjectNotesExpanded = true
+            chromeState.selectNote(id: note.id)
+        } catch { noteError = error.localizedDescription }
+    }
+}
+
 private struct SidebarTabsView: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
@@ -4864,59 +5332,10 @@ private struct SidebarTabsView: View {
     let sidebarWidth: CGFloat
 
     var body: some View {
-        VStack(spacing: 0) {
-            ZStack {
-                if let targetRoot = swipeState.targetRoot,
-                   let targetWorkspace = repository.workspaceIfLoaded(for: targetRoot) {
-                    EquatableSidebarTabsPage(
-                        workspace: targetWorkspace,
-                        chromeState: chromeState,
-                        noteStore: noteStore,
-                        todoStore: todoStore,
-                        projectRoot: targetRoot,
-                        presentation: presentation,
-                        openProject: openProject
-                    )
-                    .equatable()
-                    .offset(x: targetPageOffset)
-                    .allowsHitTesting(false)
-                }
-
-                EquatableSidebarTabsPage(
-                    workspace: displayedSourceWorkspace,
-                    chromeState: chromeState,
-                    noteStore: noteStore,
-                    todoStore: todoStore,
-                    projectRoot: displayedSourceRoot,
-                    presentation: presentation,
-                    openProject: openProject
-                )
-                .equatable()
-                .offset(x: swipeState.offset)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
-
-            if repository.supportsWorktrees {
-                WorktreeSpaceRail(
-                    repository: repository,
-                    chromeState: chromeState,
-                    swipeState: swipeState,
-                    sidebarWidth: sidebarWidth
-                )
-                .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
-                .padding(.trailing, SidebarLayout.trailingInset)
-                .padding(.bottom, 8 + dockedCompensation)
-            }
-        }
-        .background {
-            if presentation == .floating {
-                SidebarBackground(projectRoot: repository.repositoryRoot, presentation: presentation)
-            }
-        }
-        .overlay(alignment: .top) {
-            SidebarTopChromeShield(projectRoot: repository.repositoryRoot, presentation: presentation)
-        }
+        NativeProjectSidebar(
+            repository: repository, chromeState: chromeState,
+            noteStore: noteStore, todoStore: todoStore, presentation: presentation
+        )
     }
 
     private var displayedSourceRoot: String? {
@@ -6750,47 +7169,6 @@ private struct TitlebarProjectPicker: View {
         let menu = NSMenu()
         var targets: [TitlebarProjectMenuTarget] = []
 
-        if repository.supportsWorktrees {
-            menu.addItem(NSMenuItem.sectionHeader(title: "Worktrees"))
-            for worktree in repository.worktrees {
-                let item = NSMenuItem(title: worktree.displayName, action: nil, keyEquivalent: "")
-                item.state = worktree.root == repository.activeWorktreeRoot ? .on : .off
-                if repository.hiddenWorktreeRoots.contains(worktree.root) {
-                    item.title += " — Hidden"
-                }
-                let target = TitlebarProjectMenuTarget {
-                    _ = repository.activate(
-                        worktreeRoot: worktree.root,
-                        chromeState: chromeState
-                    )
-                }
-                targets.append(target)
-                item.target = target
-                item.action = #selector(TitlebarProjectMenuTarget.invoke)
-                menu.addItem(item)
-            }
-
-            let newWorktreeItem = NSMenuItem(title: "New Worktree...", action: nil, keyEquivalent: "")
-            let newWorktreeTarget = TitlebarProjectMenuTarget {
-                isNewWorktreePresented = true
-            }
-            targets.append(newWorktreeTarget)
-            newWorktreeItem.target = newWorktreeTarget
-            newWorktreeItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-            menu.addItem(newWorktreeItem)
-
-            let manageWorktreesItem = NSMenuItem(title: "Manage Worktrees...", action: nil, keyEquivalent: "")
-            let manageWorktreesTarget = TitlebarProjectMenuTarget {
-                isWorktreeManagerPresented = true
-            }
-            targets.append(manageWorktreesTarget)
-            manageWorktreesItem.target = manageWorktreesTarget
-            manageWorktreesItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-            menu.addItem(manageWorktreesItem)
-
-            menu.addItem(.separator())
-        }
-
         if settings.projects.isEmpty {
             let item = NSMenuItem(title: "No Projects", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -6821,6 +7199,24 @@ private struct TitlebarProjectPicker: View {
         addItem.target = addTarget
         addItem.action = #selector(TitlebarProjectMenuTarget.invoke)
         menu.addItem(addItem)
+
+        let renameItem = NSMenuItem(title: "Rename Project…", action: nil, keyEquivalent: "")
+        let renameTarget = TitlebarProjectMenuTarget {
+            let alert = NSAlert()
+            alert.messageText = "Rename Project"
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            let field = NSTextField(string: repositoryTitle)
+            field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+            alert.accessoryView = field
+            if alert.runModal() == .alertFirstButtonReturn {
+                _ = settings.renameProject(field.stringValue, for: repository.repositoryRoot)
+            }
+        }
+        targets.append(renameTarget)
+        renameItem.target = renameTarget
+        renameItem.action = #selector(TitlebarProjectMenuTarget.invoke)
+        menu.addItem(renameItem)
 
         let editItem = NSMenuItem(title: "Edit Projects...", action: nil, keyEquivalent: "")
         let editTarget = TitlebarProjectMenuTarget(openSettings)
@@ -6862,33 +7258,15 @@ private struct TitlebarProjectPicker: View {
     }
 
     private var selectedProject: CherryProject? {
-        settings.selectedProject(for: projectRoot)
+        settings.selectedProject(for: repository.repositoryRoot)
     }
 
-    private var projectTitle: String {
-        guard let worktreeName
-        else {
-            return repositoryTitle
-        }
-        return "\(repositoryTitle) / \(worktreeName)"
-    }
-
+    private var projectTitle: String { repositoryTitle }
     private var repositoryTitle: String {
-        let name = selectedProject?.name ?? repository.repositoryName
-        return name.isEmpty ? "No Project" : name
+        selectedProject?.name ?? repository.repositoryName
     }
-
-    private var worktreeName: String? {
-        activeWorktree?.displayName
-    }
-
-    private var activeWorktree: GitWorktree? {
-        guard repository.supportsWorktrees else { return nil }
-        let root = swipeState.targetRoot == nil
-            ? repository.activeWorktreeRoot
-            : swipeState.sourceRoot ?? repository.activeWorktreeRoot
-        return repository.worktrees.first { $0.root == root }
-    }
+    private var worktreeName: String? { nil }
+    private var activeWorktree: GitWorktree? { nil }
 
     private var swipeTargetWorktree: GitWorktree? {
         guard let targetRoot = swipeState.targetRoot else { return nil }
@@ -7684,6 +8062,8 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
     let shortcutStartIndex: Int
     let showShortcutHints: Bool
 
+    var showsHeader = true
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.noteStore === rhs.noteStore
             && lhs.chromeState === rhs.chromeState
@@ -7700,6 +8080,7 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
             .map { index, note in (note.id, shortcutStartIndex + index + 1) })
 
         LazyVStack(alignment: .leading, spacing: 4) {
+            if showsHeader {
             HStack(spacing: 8) {
                 SidebarSectionHeader(title: "Notes", count: noteStore.notes.count, palette: palette)
 
@@ -7713,6 +8094,7 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
                 .buttonStyle(.plain)
                 .disabled(noteStore.isLoading)
                 .help("New note")
+            }
             }
 
             if noteStore.notes.isEmpty {
@@ -8289,6 +8671,9 @@ private struct SidebarSplitTabRow: View {
     let showShortcutHint: Bool
     let palette: SidebarPalette
 
+    var isActiveWorkspace = true
+    var onActivate: (() -> Void)? = nil
+
     @State private var isHovered = false
 
     var body: some View {
@@ -8312,10 +8697,11 @@ private struct SidebarSplitTabRow: View {
                         workspace: workspace,
                         chromeState: chromeState,
                         pathDisplayMode: pathDisplayMode,
-                        isActive: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
+                        isActive: isActiveWorkspace && chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
                         isRowSelected: isSelected,
                         palette: palette,
                         onSelect: {
+                            onActivate?()
                             chromeState.selectTerminal()
                             workspace.select(session)
                         }
@@ -8338,6 +8724,7 @@ private struct SidebarSplitTabRow: View {
         .padding(.leading, -SidebarLayout.rowHorizontalInset)
         .onTapGesture {
             if let session = workspace.session(withID: group.activeSessionID) {
+                onActivate?()
                 chromeState.selectTerminal()
                 workspace.select(session)
             }
@@ -8375,7 +8762,7 @@ private struct SidebarSplitTabRow: View {
     }
 
     private var isSelected: Bool {
-        guard chromeState.isShowingTerminalContent,
+        guard isActiveWorkspace, chromeState.isShowingTerminalContent,
               let selectedSessionID = workspace.selectedSessionID
         else {
             return false
@@ -10261,15 +10648,15 @@ private struct AgentLogoImage: View {
             return cachedImage
         }
 
-        let url = Bundle.module.url(
+        let url = CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg",
             subdirectory: "AgentLogos"
-        ) ?? Bundle.module.url(
+        ) ?? CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg",
             subdirectory: "ProgramLogos"
-        ) ?? Bundle.module.url(
+        ) ?? CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg"
         )

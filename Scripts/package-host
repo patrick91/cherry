@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Build a native archive. Run this on each supported release architecture.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+"$root/Scripts/build-host" release
+target=$(rustc -vV | sed -n 's/^host: //p')
+output="$root/dist/host"
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$output" "$stage/cherry-host"
+cp "$root/Host/target/release/cherry" "$root/Host/target/release/cherry-host" "$stage/cherry-host/"
+cp "$root/Host/README.md" "$stage/cherry-host/README.md"
+cp -R "$root/Host/packaging" "$stage/cherry-host/packaging"
+mkdir -p "$stage/cherry-host/vendor/ghostty-vt" "$stage/cherry-host/crates/cherry-vt"
+cp "$root/Host/vendor/ghostty-vt/README.md" "$stage/cherry-host/vendor/ghostty-vt/README.md"
+cp "$root/Host/crates/cherry-vt/README.md" "$stage/cherry-host/crates/cherry-vt/README.md"
+cp "$root/Host/THIRD_PARTY_NOTICES.txt" "$stage/cherry-host/THIRD_PARTY_NOTICES.txt"
+mkdir -p "$stage/cherry-host/licenses"
+cp "$root/Host/vendor/ghostty-vt/LICENSE" "$stage/cherry-host/licenses/Ghostty-LICENSE"
+cp "$root/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$stage/cherry-host/licenses/Ghostty-THIRD_PARTY_NOTICES.txt"
+tar -czf "$output/cherry-host-$target.tar.gz" -C "$stage" cherry-host
+printf '%s\n' "$output/cherry-host-$target.tar.gz"

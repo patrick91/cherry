@@ -2466,6 +2466,16 @@ final class GhosttyTerminalContainerView: NSView {
             if isActivePane {
                 requestTerminalFocus()
             }
+        } else if activeBridge !== session.ghosttyBridge {
+            // Disconnecting a hosted session releases its bridge while this
+            // container still displays the same session. Mount the replacement
+            // after reconnecting; session identity alone cannot detect it.
+            cancelSurfaceTransition()
+            resetSidebarAnimationStateForSurfaceChange()
+            session.ghosttyBridge.attach(to: self)
+            if isActivePane {
+                requestTerminalFocus()
+            }
         }
 
         if isActivePane, !wasActivePane {

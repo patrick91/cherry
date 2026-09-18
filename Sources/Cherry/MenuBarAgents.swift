@@ -626,8 +626,8 @@ private struct MenuBarAgentGlyph: View {
         if let cached = cache[name] { return cached }
         // `.process` flattens the resource tree, so the SVGs live at the bundle root,
         // not under AgentLogos/ — try the subdirectory first, then the flattened path.
-        let url = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "AgentLogos")
-            ?? Bundle.module.url(forResource: name, withExtension: "svg")
+        let url = CherryResources.bundle.url(forResource: name, withExtension: "svg", subdirectory: "AgentLogos")
+            ?? CherryResources.bundle.url(forResource: name, withExtension: "svg")
         let image = url.flatMap { NSImage(contentsOf: $0) }
         cache[name] = image
         return image

@@ -82,7 +82,7 @@ final class ProjectNoteStore: ObservableObject {
             .homeDirectoryForCurrentUser
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("Cherry", isDirectory: true)
+            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
             .appendingPathComponent("Notes", isDirectory: true)
     }
 

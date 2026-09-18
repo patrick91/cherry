@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+configuration=${1:-release}
+case "$configuration" in debug|release) ;; *) echo "Usage: Scripts/build-host [debug|release]" >&2; exit 1;; esac
+target=$(rustc -vV | sed -n 's/^host: //p')
+if [ ! -f "$root/Host/vendor/ghostty-vt/$target/lib/libghostty-vt.a" ]; then
+  "$root/Scripts/build-host-vt" "$target"
+fi
+if [ "$configuration" = release ]; then
+  cargo build --manifest-path "$root/Host/Cargo.toml" --locked --release --bins
+else
+  cargo build --manifest-path "$root/Host/Cargo.toml" --locked --bins
+fi
+printf 'Built %s and %s\n' "$root/Host/target/$configuration/cherry" "$root/Host/target/$configuration/cherry-host"

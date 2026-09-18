@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Mac client -> actual system SSH -> isolated Linux host, using disposable keys.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+"$root/Scripts/test-host-linux"
+"$root/Scripts/build-host" debug
+fixture=$(mktemp -d /tmp/cherry-ssh.XXXXXX)
+container=""
+cleanup() {
+  if [ -n "$container" ]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+  rm -rf "$fixture"
+}
+trap cleanup EXIT
+ssh-keygen -q -t ed25519 -N '' -f "$fixture/id_ed25519"
+container=$(docker run -d --rm \
+  -p 127.0.0.1::22 \
+  -v "$root/Host/target/linux:/target:ro" \
+  -v "$fixture/id_ed25519.pub:/test-key.pub:ro" \
+  cherry-host-test:local bash -c \
+  'mkdir -p /root/.ssh; chmod 700 /root/.ssh; cp /test-key.pub /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; ln -s /target/debug/cherry-host /usr/local/bin/cherry-host; exec /usr/sbin/sshd -D -e')
+port=$(docker port "$container" 22/tcp | sed -n 's/^127\.0\.0\.1://p')
+case "$port" in ''|*[!0-9]*) echo "Cannot resolve isolated SSH port" >&2; exit 1;; esac
+host_key=$(docker exec "$container" cat /etc/ssh/ssh_host_ed25519_key.pub)
+printf '[127.0.0.1]:%s %s\n' "$port" "$host_key" > "$fixture/known_hosts"
+cat > "$fixture/config" <<EOF
+Host cherry-proof
+    HostName 127.0.0.1
+    Port $port
+    User root
+    IdentityFile $fixture/id_ed25519
+    IdentitiesOnly yes
+    UserKnownHostsFile $fixture/known_hosts
+    StrictHostKeyChecking yes
+    BatchMode yes
+    ConnectTimeout 5
+EOF
+for attempt in $(seq 1 30); do
+  if ssh -F "$fixture/config" cherry-proof true 2>/dev/null; then break; fi
+  if [ "$attempt" = 30 ]; then echo "SSH fixture failed to start" >&2; exit 1; fi
+  sleep 0.1
+done
+CHERRY_TEST_SSH_HOST=cherry-proof CHERRY_TEST_SSH_CONFIG="$fixture/config" \
+  cargo test --manifest-path "$root/Host/Cargo.toml" --locked -p cherry-cli --test ssh_host -- --ignored --nocapture

@@ -1,0 +1,14 @@
+[package]
+name = "cherry-vt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+libc.workspace = true

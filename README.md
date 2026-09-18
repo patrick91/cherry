@@ -32,6 +32,32 @@ distance threshold based on their velocity.
 
 ## Local Install
 
+For opt-in sessions that survive app exit or SSH disconnection, open
+**File → Persistent Sessions…** (`Cmd-Shift-R`). The portable Mac/Linux host,
+installation, CLI commands, and current limits are documented in
+[Host/README.md](Host/README.md).
+
+To build a disk image for testing on this Mac:
+
+```bash
+Scripts/package-dmg
+open "dist/Cherry Sessions-$(uname -m).dmg"
+```
+
+Drag **Cherry Sessions** into Applications. This test build has a distinct icon,
+bundle identifier (`dev.patrick.cherry.sessions`), settings, and private app data,
+so it can run alongside Cherry. The app includes its persistent-session helpers;
+no separate CLI installation is needed for **This Mac**. Create a persistent
+session, close Cherry Sessions, then reopen and attach to the same running session.
+Multiple devices can stay attached and type into one session. This is a local
+test build, signed ad-hoc by default and not notarized. See the host guide before
+upgrading an already-running session daemon.
+
+Packaging verifies the copied app can open a terminal and render shell output
+with access to the source checkout blocked. This requires a logged-in macOS GUI
+session. To repeat the standalone check, run
+`Scripts/test-packaged-app "/path/to/Cherry Sessions.app"`.
+
 Build and install a local `.app` copy into `~/Applications`:
 
 ```bash

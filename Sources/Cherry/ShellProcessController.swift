@@ -26,7 +26,7 @@ struct ShellIntegrationBootstrap {
         let directory = homeDirectory
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("Cherry", isDirectory: true)
+            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
             .appendingPathComponent("ShellIntegration", isDirectory: true)
             .appendingPathComponent("zsh", isDirectory: true)
 

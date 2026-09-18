@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Exercise a packaged Cherry terminal with the source checkout inaccessible.
+
+Run in a logged-in macOS GUI session:
+    Scripts/test-packaged-app '/path/to/Cherry Sessions.app'
+
+The source app is verified, copied, given disposable preferences, and launched
+under a per-process sandbox. No shared build directories are moved or changed.
+Opening a real project and reading a command's rendered terminal output catches
+resource lookup failures that a launch-only check (or the developer's checkout)
+can conceal. The temporary test window is closed when the check finishes.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+
+
+def run(*command, **kwargs):
+    return subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)
+
+
+def request(name, fields=None):
+    return {name: {} if fields is None else {"_0": fields}}
+
+
+def control(socket_path, value, timeout=3):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(json.dumps(value).encode() + b"\n")
+        connection.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while not response.endswith(b"\n"):
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            response.extend(chunk)
+    if not response:
+        raise RuntimeError("Cherry closed the control connection without a response")
+    decoded = json.loads(response)
+    if decoded.get("error"):
+        raise RuntimeError(f"Cherry control error: {decoded['error']}")
+    result = decoded["result"]
+    return next(iter(result.values()))["_0"]
+
+
+def check_running(process):
+    if process.poll() is not None:
+        raise RuntimeError(f"Packaged GUI exited unexpectedly (status {process.returncode})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("app", type=Path)
+    parser.add_argument("--timeout", type=float, default=45,
+                        help="Maximum seconds for GUI startup and terminal output (default: 45)")
+    parser.add_argument("--deny-path", action="append", default=[], type=Path,
+                        help="Also make this source/build directory inaccessible to the app")
+    parser.add_argument("--keep-fixture", action="store_true",
+                        help="Retain the isolated app, home, sandbox profile, and log for diagnosis")
+    args = parser.parse_args()
+    original = args.app.expanduser().resolve()
+    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
+        parser.error("This check requires macOS, sandbox-exec, and a logged-in GUI session")
+    if not (original / "Contents/Info.plist").is_file():
+        parser.error(f"Not an application bundle: {original}")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+
+    run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(original))
+    fixture = Path(tempfile.mkdtemp(prefix="cherry-package-", dir="/private/tmp"))
+    process = None
+    log = fixture / "app.log"
+    terminal_ids = []
+    socket_path = fixture / "control.sock"
+    project = fixture / "project"
+    success = False
+    try:
+        app = fixture / original.name
+        shutil.copytree(original, app, symlinks=True)
+        info_path = app / "Contents/Info.plist"
+        with info_path.open("rb") as file:
+            info = plistlib.load(file)
+        unique = uuid.uuid4().hex
+        info["CFBundleIdentifier"] = "dev.patrick.cherry.packaged-smoke." + unique
+        info["CherryApplicationSupportName"] = "Cherry Package Smoke " + unique
+        info["CherryURLScheme"] = "cherry-package-smoke-" + unique
+        info.pop("CFBundleURLTypes", None)
+        # Exercise Cherry's own resource-bundle lookup as well as Ghostty's:
+        # the default fallback Dock icon is loaded through CherryResources.
+        info.pop("CFBundleIconFile", None)
+        info.pop("CFBundleIconName", None)
+        with info_path.open("wb") as file:
+            plistlib.dump(info, file)
+        run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
+        executable = app / "Contents/MacOS" / info["CFBundleExecutable"]
+
+        # Always hide this checkout. Also detect compiled SwiftPM .build paths
+        # in case the artifact was built from a different checkout on this Mac.
+        denied = {str(REPOSITORY), *(str(path.expanduser().resolve()) for path in args.deny_path)}
+        for line in run("/usr/bin/strings", "-a", str(executable)).stdout.splitlines():
+            match = re.match(r"^(/[^\r\n]*?)/\.build(?:/|$)", line)
+            if match:
+                denied.add(match.group(1))
+        sentinel = fixture / "hidden-build-probe"
+        sentinel.write_text("the child must not be able to read this file\n")
+        denied.add(str(sentinel))
+        profile = fixture / "sandbox.sb"
+        # macOS refuses setuid login inside a seatbelt sandbox. Only that
+        # system child may run normally; Cherry itself remains sandboxed, so
+        # its resource resolution cannot access any source/build fallback.
+        profile.write_text("(version 1)\n(allow default)\n"
+                           '(allow process-exec (with no-sandbox) (literal "/usr/bin/login"))\n' + "".join(
+            f"(deny file-read* (subpath {json.dumps(path)}))\n" for path in sorted(denied)
+        ))
+        sandbox = ["/usr/bin/sandbox-exec", "-f", str(profile)]
+        # Fail closed if the policy cannot be applied, or stops denying reads.
+        probe = subprocess.run(sandbox + ["/bin/cat", str(sentinel)], capture_output=True, text=True)
+        if probe.returncode == 0 or "Operation not permitted" not in probe.stderr:
+            raise RuntimeError(f"Resource isolation sandbox failed its read-denial probe: {probe.stderr}")
+        for path in sorted(denied - {str(sentinel)}):
+            if Path(path).exists():
+                probe = subprocess.run(sandbox + ["/usr/bin/stat", path], capture_output=True)
+                if probe.returncode == 0:
+                    raise RuntimeError(f"Sandbox did not conceal checkout: {path}")
+        print("Verified source/build reads are denied to the test process.", flush=True)
+
+        home = fixture / "home"
+        home.mkdir()
+        project.mkdir()
+        # An empty repository avoids developer config, hooks, and project commands.
+        run("/usr/bin/git", "-c", "init.templateDir=", "init", "--quiet", str(project))
+        environment = dict(os.environ)
+        for key in list(environment):
+            if (key.startswith("CHERRY_") or key.startswith("GHOSTTY_")
+                    or key.startswith("DYLD_") or key in {"BASH_ENV", "ENV", "CDPATH"}):
+                environment.pop(key)
+        environment.update({
+            "HOME": str(home),
+            "CFFIXED_USER_HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local/share"),
+            "XDG_STATE_HOME": str(home / ".local/state"),
+            "ZDOTDIR": str(home),
+            "SHELL": "/bin/zsh",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "CHERRY_CONTROL_SOCKET": str(socket_path),
+            "CHERRY_TERMINAL_PERF": "1",
+            "CHERRY_PERF_PROJECT_ROOTS": str(project),
+        })
+        with log.open("wb") as output:
+            process = subprocess.Popen(sandbox + [str(executable)], cwd=fixture,
+                                       env=environment, stdout=output, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            check_running(process)
+            try:
+                control(socket_path, request("listProjects"))
+                break
+            except (OSError, ValueError, RuntimeError):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Timed out waiting for the packaged GUI control socket")
+                time.sleep(0.1)
+
+        def scoped(name, fields=None):
+            return control(socket_path, request("scoped", {
+                "projectRoot": str(project), "request": request(name, fields)
+            }))
+
+        # This initializes GhosttyTerminal.TerminalController through the real
+        # app window, including Bundle.module and the native renderer/PTY path.
+        control(socket_path, request("openProject", {"projectRoot": str(project)}))
+        terminals = scoped("listTerminals")["terminals"]
+        terminal_ids.extend(terminal["id"] for terminal in terminals)
+        created = scoped("createTerminal", {"title": "Packaged app smoke", "workingDirectory": str(project)})
+        terminal_id = created["terminalID"]
+        terminal_ids.append(terminal_id)
+        scoped("selectTerminal", {"terminalID": terminal_id})
+        while True:
+            check_running(process)
+            initial = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            if any("Ghostty failed to launch" in line for line in initial["lines"]):
+                raise RuntimeError(f"Native shell did not launch: {initial['lines']}")
+            if any(line.strip() for line in initial["lines"]):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for the native shell's first rendered output")
+            time.sleep(0.1)
+        # The complete marker never occurs in the input, so echoed input cannot
+        # pass this check without the shell actually executing the command.
+        marker = "CHERRY_PACKAGED_" + unique
+        scoped("sendInput", {"terminalID": terminal_id,
+                             "text": "printf '\\n%s%s\\n' 'CHERRY_PACKAGED_' '" + unique + "'\n"})
+        while True:
+            check_running(process)
+            output = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            if any(line.strip() == marker for line in output["lines"]):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Shell marker did not appear in rendered Ghostty screen: {output}")
+            time.sleep(0.1)
+        print("PASS: packaged GUI opened a native Ghostty terminal and rendered shell output with checkout hidden.",
+              flush=True)
+        success = True
+    finally:
+        if process is not None and process.poll() is None:
+            for terminal_id in terminal_ids:
+                try:
+                    control(socket_path, request("scoped", {
+                        "projectRoot": str(project),
+                        "request": request("closeTerminal", {"terminalID": terminal_id}),
+                    }), timeout=1)
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if not success and log.exists():
+            print("Packaged GUI log (last 8 KB):\n" + log.read_text(errors="replace")[-8192:], file=sys.stderr)
+        if args.keep_fixture:
+            print(f"Fixture retained at {fixture}", flush=True)
+        else:
+            shutil.rmtree(fixture)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr, file=sys.stderr)
+        sys.exit(1)

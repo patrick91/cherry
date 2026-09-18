@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Build the pinned, GUI-free Ghostty C library used by the Rust host.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+revision=7aab0a0392369613472bd5dcfd66bef58e78c3ec
+zig_version=0.16.0
+target=${1:-$(rustc -vV | sed -n 's/^host: //p')}
+case "$target" in
+  aarch64-apple-darwin) zig_target=aarch64-macos ;;
+  x86_64-apple-darwin) zig_target=x86_64-macos ;;
+  aarch64-unknown-linux-gnu) zig_target=aarch64-linux-gnu.2.31 ;;
+  x86_64-unknown-linux-gnu) zig_target=x86_64-linux-gnu.2.31 ;;
+  *) echo "Unsupported host target: $target" >&2; exit 1 ;;
+esac
+cache=${CHERRY_VT_BUILD_CACHE:-"$root/Host/vendor/ghostty-vt/.cache"}
+prefix="$root/Host/vendor/ghostty-vt/$target"
+mkdir -p "$cache"
+
+verify_sha() {
+  local actual
+  if command -v sha256sum >/dev/null; then actual=$(sha256sum "$1" | cut -d ' ' -f 1)
+  else actual=$(shasum -a 256 "$1" | cut -d ' ' -f 1); fi
+  [ "$actual" = "$2" ] || { echo "SHA256 mismatch for $1" >&2; exit 1; }
+}
+
+if [ -n "${ZIG:-}" ]; then zig=$ZIG
+elif command -v zig >/dev/null && [ "$(zig version)" = "$zig_version" ]; then zig=$(command -v zig)
+else
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) platform=aarch64-macos; digest=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+    Darwin:x86_64) platform=x86_64-macos; digest=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7 ;;
+    Linux:aarch64) platform=aarch64-linux; digest=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+    Linux:x86_64) platform=x86_64-linux; digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+    *) echo "Unsupported build machine" >&2; exit 1 ;;
+  esac
+  archive="$cache/zig-$platform-$zig_version.tar.xz"
+  if [ ! -f "$archive" ]; then curl -fL --retry 3 "https://ziglang.org/download/$zig_version/zig-$platform-$zig_version.tar.xz" -o "$archive.tmp"; mv "$archive.tmp" "$archive"; fi
+  verify_sha "$archive" "$digest"
+  if [ ! -x "$cache/zig-$platform-$zig_version/zig" ]; then tar -xf "$archive" -C "$cache"; fi
+  zig="$cache/zig-$platform-$zig_version/zig"
+fi
+[ "$("$zig" version)" = "$zig_version" ] || { echo "Zig $zig_version is required" >&2; exit 1; }
+
+source_dir=${GHOSTTY_SRC:-"$cache/ghostty-$revision"}
+if [ ! -d "$source_dir/.git" ]; then
+  mkdir -p "$source_dir"
+  git -C "$source_dir" init -q
+  git -C "$source_dir" remote add origin https://github.com/ghostty-org/ghostty.git
+  git -C "$source_dir" fetch --depth=1 origin "$revision"
+  git -C "$source_dir" checkout --detach -q FETCH_HEAD
+fi
+[ "$(git -C "$source_dir" rev-parse HEAD)" = "$revision" ] || { echo "Wrong Ghostty revision" >&2; exit 1; }
+[ -z "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ] || { echo "Ghostty source must be unmodified" >&2; exit 1; }
+(
+  cd "$source_dir"
+  "$zig" build -Demit-lib-vt -Demit-xcframework=false -Doptimize=ReleaseFast \
+    -Dtarget="$zig_target" --prefix "$prefix"
+)
+printf '%s\n' "$revision" > "$prefix/SOURCE_REVISION"
+printf 'Built %s\n' "$prefix/lib/libghostty-vt.a"

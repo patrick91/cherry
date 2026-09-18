@@ -8,7 +8,7 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         case terminal
     }
 
-    public static let scheme = "cherry"
+    public static var scheme: String { CherryAppIdentity.current.urlScheme }
     public static let host = "project"
 
     public let projectKey: String
@@ -61,7 +61,7 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
               components.scheme?.lowercased() == Self.scheme,
               components.host?.lowercased() == Self.host
         else {
-            throw CherryControlError(code: "invalid_deep_link", message: "Cherry link must start with cherry://project/.")
+            throw CherryControlError(code: "invalid_deep_link", message: "Cherry link must start with \(Self.scheme)://project/.")
         }
 
         let pathComponents = components.path

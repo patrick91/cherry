@@ -11,7 +11,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         if Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") == nil,
-           let iconURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+           Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil,
+           let iconURL = CherryResources.bundle.url(forResource: "AppIcon", withExtension: "icns"),
            let icon = NSImage(contentsOf: iconURL) {
             NSApp.applicationIconImage = icon
         }
@@ -238,6 +239,13 @@ struct CherryApp: App {
         .restorationBehavior(.automatic)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(after: .newItem) {
+                Button("Persistent Sessions…") {
+                    keyWindowChromeState?.isHostedSessionsPresented = true
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(focusedWorkspace == nil)
+            }
             CommandGroup(replacing: .printItem) {
                 Button("Command Palette") {
                     keyWindowChromeState?.presentCommandPalette()
@@ -368,7 +376,7 @@ struct CherryApp: App {
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
                 .disabled(focusedWorkspace == nil)
 
-                Button("Restart Active Tab") {
+                Button(focusedWorkspace?.selectedSession?.hostedAttachment == nil ? "Restart Active Tab" : "Reconnect Active Tab") {
                     keyWindowWorkspace?.restartSelectedSession()
                 }
                 .keyboardShortcut("r")

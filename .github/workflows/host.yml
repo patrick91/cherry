@@ -1,0 +1,54 @@
+name: Portable session host
+
+on:
+  push:
+    paths:
+      - "Host/**"
+      - "Scripts/*host*"
+      - ".github/workflows/host.yml"
+  pull_request:
+    paths:
+      - "Host/**"
+      - "Scripts/*host*"
+      - ".github/workflows/host.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94.0
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl xz-utils neovim
+      - name: Install Neovim on macOS
+        if: runner.os == 'macOS'
+        run: brew list --versions neovim || brew install neovim
+      - name: Build pinned Ghostty VT library
+        run: Scripts/build-host-vt
+      - name: Check formatting
+        run: cargo fmt --manifest-path Host/Cargo.toml --all -- --check
+      - name: Lint
+        run: cargo clippy --manifest-path Host/Cargo.toml --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path Host/Cargo.toml --locked --workspace -- --test-threads=1
+      - name: Build host and client
+        run: cargo build --manifest-path Host/Cargo.toml --locked --bins
+      - name: Exercise real host reconnect
+        run: cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_host -- --ignored
+      - name: Exercise real Neovim restoration
+        run: cargo test --manifest-path Host/Cargo.toml --locked -p cherry-vt --test neovim -- --ignored

@@ -10,3 +10,5 @@ DerivedData/
 __pycache__/
 *.pyc
 /tmp/
+/Host/target/
+/Host/.deps/

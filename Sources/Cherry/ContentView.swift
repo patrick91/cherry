@@ -353,6 +353,9 @@ struct ContentView: View {
             chromeState: chromeState
         ))
         .frame(minWidth: 320, minHeight: 460)
+        .sheet(isPresented: $chromeState.isHostedSessionsPresented) {
+            HostedSessionsSheet(workspace: workspace, chromeState: chromeState)
+        }
         .sheet(isPresented: $chromeState.isNewWorktreePresented) {
             NewWorktreeSheet(
                 repository: repository,
@@ -7169,7 +7172,7 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            Button("Restart") {
+            Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
                 session.restart()
             }
 
@@ -7185,7 +7188,7 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            Button("Close", role: .destructive) {
+            Button(session.hostedAttachment == nil ? "Close" : "Disconnect & Close", role: session.hostedAttachment == nil ? .destructive : nil) {
                 close(session)
             }
             .disabled(workspace.sessions.count <= 1)
@@ -8255,7 +8258,7 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        Button("Restart") {
+        Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
             session.restart()
         }
 
@@ -8271,7 +8274,7 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        Button("Close", role: .destructive) {
+        Button(session.hostedAttachment == nil ? "Close" : "Disconnect & Close", role: session.hostedAttachment == nil ? .destructive : nil) {
             workspace.close(session)
         }
         .disabled(workspace.sessions.count <= 1)
@@ -8583,7 +8586,7 @@ private struct SidebarSplitPaneIconSelector: View {
 
             Divider()
 
-            Button("Restart") {
+            Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
                 session.restart()
             }
 
@@ -9806,6 +9809,13 @@ private final class SidebarTabRowState: ObservableObject {
     }
 
     private func observe(_ session: TerminalSession) {
+        session.$hostedAttachmentStatus
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.refreshLabel() }
+            }
+            .store(in: &cancellables)
+
         Publishers.CombineLatest3(session.$title, session.$titleSource, session.$subtitle)
             .combineLatest(session.$workingDirectory)
             .sink { [weak self] _ in
@@ -10261,15 +10271,15 @@ private struct AgentLogoImage: View {
             return cachedImage
         }
 
-        let url = Bundle.module.url(
+        let url = CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg",
             subdirectory: "AgentLogos"
-        ) ?? Bundle.module.url(
+        ) ?? CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg",
             subdirectory: "ProgramLogos"
-        ) ?? Bundle.module.url(
+        ) ?? CherryResources.bundle.url(
             forResource: name,
             withExtension: "svg"
         )
@@ -12059,7 +12069,11 @@ private struct TerminalSceneView: View {
     private var paneContent: some View {
         if showsTerminalContextBar {
             VStack(spacing: 0) {
-                TerminalContextBar(session: session, isActivePane: isActivePane)
+                if session.hostedAttachment != nil {
+                    HostedSessionConnectionBar(session: session)
+                } else {
+                    TerminalContextBar(session: session, isActivePane: isActivePane)
+                }
                 terminalSurface
             }
         } else {

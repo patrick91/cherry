@@ -1,0 +1,10 @@
+[Unit]
+Description=Cherry persistent terminal host
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cherry-host serve
+Restart=no
+
+[Install]
+WantedBy=default.target

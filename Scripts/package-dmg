@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Build a self-contained local-test disk image without replacing an installed app.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+app_name=${CHERRY_APP_NAME:-Cherry Sessions}
+bundle_id=${CHERRY_BUNDLE_ID:-dev.patrick.cherry.sessions}
+url_scheme=${CHERRY_URL_SCHEME:-cherry-sessions}
+support_name=${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry Sessions}
+icon=${CHERRY_ICON_PATH:-"$root/Design/SessionsIcon/AppIconSessions.icns"}
+architecture=$(uname -m)
+output="$root/dist/$app_name-$architecture.dmg"
+mkdir -p "$root/.build" "$root/dist"
+stage=$(mktemp -d "$root/.build/dmg.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+
+CHERRY_CONFIGURATION=release CHERRY_APP_NAME="$app_name" CHERRY_INSTALL_DIR="$stage" \
+  CHERRY_BUNDLE_ID="$bundle_id" CHERRY_URL_SCHEME="$url_scheme" \
+  CHERRY_APPLICATION_SUPPORT_NAME="$support_name" CHERRY_ICON_PATH="$icon" \
+  "$root/Scripts/install-local-app"
+ln -s /Applications "$stage/Applications"
+
+cat > "$stage/Start Here.txt" <<EOF
+$app_name — persistent session test build
+
+Requires macOS 26 or later on $architecture.
+
+This separate app can run alongside your current Cherry. It has its own
+identifier ($bundle_id), icon, settings, and application data. Your existing
+Cherry installation is not replaced.
+
+1. Drag $app_name.app to Applications, then open it from Applications.
+2. Open File > Persistent Sessions (Command-Shift-R).
+3. Select This Mac, enter a name, and choose Create & Attach.
+   Leave the working directory empty to use your home directory.
+4. Start a shell command or editor. Close the tab or quit Cherry.
+5. Reopen Persistent Sessions, select the same session, and attach again.
+   The original process and terminal state are still there.
+
+You can attach to the same session on another device while this one stays
+connected. Both terminals can type and see the same output. The shared
+terminal fits the smallest attached window and grows when it disconnects.
+Larger windows show the active screen; their native scrollback is unavailable
+while a smaller terminal determines the shared size. The host keeps its
+bounded history. Terminate stops the session; disconnecting does not.
+
+Both cherry and cherry-host are included inside:
+  $app_name.app/Contents/MacOS/
+Local persistent sessions work without a separate command-line installation.
+
+For a remote Mac, install this app there and put its cherry-host executable
+on that machine's SSH command PATH. First verify ordinary SSH access and:
+  ssh your-host 'command -v cherry-host'
+Then add that SSH alias in Persistent Sessions on your laptop.
+The portable host can also be built for Linux from the source repository.
+
+Sessions survive app exit and SSH disconnection while the host daemon runs.
+They do not survive a host reboot or daemon restart. Existing regular local
+tabs are not converted into persistent sessions automatically.
+
+Upgrading an earlier persistent-session build: shared sessions use protocol 2.
+Finish all existing jobs, then use the OLD app's cherry helper to run shutdown
+before replacing it. Update both client and remote host helpers together.
+An incompatible daemon is never killed or replaced automatically. An ordinary
+app update does not update a daemon that is already running.
+
+This is a locally signed test build; it is not notarized for distribution.
+EOF
+
+codesign --verify --deep --strict "$stage/$app_name.app"
+"$root/Scripts/test-packaged-app" "$stage/$app_name.app"
+hdiutil create -volname "$app_name" -srcfolder "$stage" -format UDZO -ov "$output"
+hdiutil verify "$output"
+shasum -a 256 "$output" > "$output.sha256"
+printf 'Created %s\n' "$output"

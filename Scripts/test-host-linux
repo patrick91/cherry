@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Native Linux PTY/Neovim tests through the local Docker engine.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+architecture=$(docker info --format '{{.Architecture}}')
+case "$architecture" in aarch64|arm64) target=aarch64-unknown-linux-gnu;; x86_64|amd64) target=x86_64-unknown-linux-gnu;; *) exit 1;; esac
+if [ ! -f "$root/Host/vendor/ghostty-vt/$target/lib/libghostty-vt.a" ]; then
+  "$root/Scripts/build-host-vt" "$target"
+fi
+docker build -t cherry-host-test:local -f "$root/Host/tests/Dockerfile" "$root/Host/tests"
+mkdir -p "$root/Host/target/linux" "$root/Host/.deps/linux-cargo"
+docker run --rm \
+  -v "$root/Host:/work:ro" \
+  -v "$root/Host/target/linux:/target" \
+  -v "$root/Host/.deps/linux-cargo:/cache" \
+  -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/cache \
+  -e CHERRY_TEST_HOST=/target/debug/cherry-host \
+  -w /work cherry-host-test:local \
+  bash -c 'cargo test --locked --workspace -- --test-threads=1 && cargo build --locked --bins && cargo test --locked -p cherry-cli --test real_host -- --ignored && cargo test --locked -p cherry-vt --test neovim -- --ignored'

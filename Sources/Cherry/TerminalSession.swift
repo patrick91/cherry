@@ -1335,6 +1335,31 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     @discardableResult
+    func attachHostedSession(_ attachment: HostedSessionAttachment, launchShell: Bool = true) -> TerminalSession {
+        if let existing = sessions.first(where: {
+            $0.hostedAttachment?.hostID == attachment.hostID
+                && $0.hostedAttachment?.sessionID == attachment.sessionID
+        }) {
+            select(existing)
+            if !existing.isRunning, launchShell { existing.reconnectHostedSession() }
+            return existing
+        }
+        let session = TerminalSession(
+            title: attachment.name,
+            titleSource: .explicit,
+            subtitle: "\(attachment.host.displayName) · \(attachment.remoteWorkingDirectory)",
+            tint: Self.palette[sessions.count % Self.palette.count],
+            workingDirectory: NSHomeDirectory(),
+            launchShell: launchShell,
+            hostedAttachment: attachment
+        )
+        sessions.append(session)
+        terminalDisplayItems.append(.single(session.id))
+        select(session)
+        return session
+    }
+
+    @discardableResult
     func addCommandSession(
         command: ProjectCommandDefinition,
         projectRoot: String,
@@ -1496,7 +1521,8 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     func canAddSplitPane(to sessionID: UUID) -> Bool {
-        guard session(withID: sessionID)?.kind == .terminal else { return false }
+        guard let session = session(withID: sessionID), session.kind == .terminal,
+              session.hostedAttachment == nil else { return false }
         guard let group = splitGroup(containing: sessionID) else { return true }
         guard group.paneSessionIDs.count < Self.maximumSplitPaneCount else { return false }
         let nextPaneCount = group.paneSessionIDs.count + 1
@@ -2149,6 +2175,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
+    let hostedAttachment: HostedSessionAttachment?
+    @Published private(set) var hostedAttachmentStatus: HostedAttachmentStatus?
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
@@ -2308,6 +2336,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchEnvironment: [String: String] = [:],
         restartOnExit: Bool = false,
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
+        hostedAttachment: HostedSessionAttachment? = nil,
         attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
             TerminalAttentionObservationRecorder.configuredDirectoryURL
         },
@@ -2331,6 +2360,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.maxScrollback = maxScrollback
         self.kind = kind
         self.launchBackend = launchBackend
+        self.hostedAttachment = hostedAttachment
+        self.hostedAttachmentStatus = hostedAttachment.map { _ in .disconnected(adapterExitCode: nil) }
         self.agentName = agentName
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
@@ -2530,6 +2561,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Product intent is to eventually narrow this back to running agents only; at
     /// that point the body becomes `kind == .agent && isRunning`.
     func hasRunningProcess() -> Bool {
+        // Closing a hosted tab only stops its disposable attach client.
+        guard hostedAttachment == nil else { return false }
         guard isRunning else { return false }
         switch kind {
         case .command, .agent:
@@ -2556,6 +2589,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     var sidebarDetail: String {
+        if let hostedAttachment {
+            return isRunning
+                ? hostedAttachment.host.displayName
+                : "\(hostedAttachment.host.displayName) · disconnected"
+        }
         guard kind != .terminal else { return "" }
         return subtitle
     }
@@ -2740,6 +2778,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         startShell()
     }
 
+    func reconnectHostedSession() {
+        guard hostedAttachment != nil, !isRunning else { return }
+        restart()
+    }
+
+    func disconnectHostedSession() {
+        guard hostedAttachment != nil else { return }
+        stop()
+        releaseGhosttyBridge()
+    }
+
     func restartManagedCommandIfNeeded() {
         guard kind == .command else { return }
         resetAutoRestartPolicy()
@@ -2806,6 +2855,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         shellProcess?.terminate()
         shellProcess = nil
+        if hostedAttachment != nil {
+            hostedAttachmentStatus = .disconnected(adapterExitCode: nil)
+            state = .exited(0)
+            bumpRevision()
+        }
     }
 
     func releaseGhosttyBridge() {
@@ -2953,6 +3007,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Native-PTY (EXEC) command + environment for the ghostty surface to spawn,
     /// resolved from the same configuration the host-managed shell uses.
     var nativeExecLaunch: (command: String?, environment: [String: String]) {
+        if let attachment = hostedAttachment {
+            return (attachment.execCommand, ["TERM": "xterm-256color", "COLORTERM": "truecolor"])
+        }
         let resolved = ShellProcessController.nativeExecLaunch(for: shellLaunchConfiguration())
         return (resolved.command, resolved.environment)
     }
@@ -2960,6 +3017,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
+        if hostedAttachment != nil { hostedAttachmentStatus = .active }
         resetAutomaticTitleForNewAgentLaunch()
         resetKeyboardProtocolState()
         outputHoldUntil = nil
@@ -3131,6 +3189,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
         state = .exited(status)
+        if hostedAttachment != nil {
+            hostedAttachmentStatus = .disconnected(adapterExitCode: status)
+            bumpRevision()
+            return
+        }
         if kind == .agent || kind == .command {
             let hideCursor = Data("\u{1B}[?25l".utf8)
             renderedReplayCache = nil
@@ -3425,6 +3488,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestNativeWorkingDirectory(_ path: String) {
+        // Host paths must never become input to local filesystem/project APIs.
+        guard hostedAttachment == nil else { return }
         var didChange = false
         if workingDirectory != path {
             workingDirectory = path

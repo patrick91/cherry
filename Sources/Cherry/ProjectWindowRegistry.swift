@@ -674,6 +674,7 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
+    @Published var isHostedSessionsPresented = false
     @Published var isNewWorktreePresented = false
     @Published var isWorktreeManagerPresented = false
     @Published var worktreeToRename: GitWorktree?

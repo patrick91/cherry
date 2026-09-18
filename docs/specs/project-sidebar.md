@@ -59,6 +59,33 @@ Continue using `cherry.toml` for shared command configuration and local settings
 
 Notes belong to the project and remain available with no folder or selected terminal. Preserve note IDs, text, timestamps, feature settings, and existing links during migration. Todos are outside this layout comparison, not removed from the product: preserve their IDs, descriptions, comments, tags, ordering, status, and enabled state. Their final navigation placement remains a design decision.
 
+## Proposed session lifetime setting
+
+Add a global setting under Terminal: **Keep terminals running after Cherry closes**. This is a proposed opt-in mode, not a setting implemented by the HTML prototypes or native app. Keep it off initially while the hosted path is validated for everyday local use. Apply it to all newly created local terminals, including shells, agents, and command runs; avoid a separate persistent-terminal section in the sidebar.
+
+When enabled, new processes belong to the local Cherry session host. The app renders and attaches to them. Turning off quit confirmation alone cannot provide this behavior: current local terminals are owned by the app's Ghostty PTYs, and quit/window teardown explicitly terminates their processes.
+
+| Action | Proposed behavior in background mode |
+| --- | --- |
+| Quit Cherry or close a project window | Disconnect the views; keep hosted processes running. Do not warn that these processes will stop. |
+| Reopen Cherry or the project | Reattach its existing terminals and restore folder ownership, ordering, splits, and selection. Do not rerun the launch command. |
+| Explicitly stop a terminal | Terminate the host-owned process, retaining appropriate confirmation for running work. Stopping it also affects other attached clients. |
+| Hide/disconnect a terminal view | Keep the process discoverable under its folder; distinguish this from stopping it. Final row-close affordance needs to make that distinction clear. |
+| Change the setting | Affect future terminals. Existing terminals retain their actual lifetime policy; no silent restart or attempted transfer of a live app-owned PTY. |
+| Host unavailable | Show a recoverable connection error; do not silently create a temporary local terminal. |
+
+Persist project/folder IDs with host identity and host-issued session IDs. Reconcile these records with the host on return, including exited sessions, missing hosts, and uncertain creation results. Persisting a command string and launching it again is not session restoration. Project switching and reconnecting must not create duplicate sessions or resend previous keyboard input.
+
+During a mixed session, quit/close warnings should count only processes that will actually stop. Turning the setting off must not terminate already-hosted work. A future remote project naturally uses its remote host; the local default must never change a remote terminal's lifetime.
+
+Resolve the last-terminal shortcut explicitly: current Cmd+W delegates to window close when only one session remains. It must not accidentally change from stopping a terminal to detaching it based solely on the number of rows. The parked preview currently treats tab close as disconnect; any revised stop behavior needs its own host operation and clear labeling.
+
+The parked host already supplies create/list/attach/terminate operations and survives client exit. Remaining integration includes routing every local launch through it, durable project/folder/session mapping, reopen recovery, lifecycle-specific teardown, accurate process/activity reporting, command restart policy, and terminal feature/performance verification. Automatic command restart while the app is absent requires host-side supervision; GUI timers do not continue after quit.
+
+The current host preserves processes while its daemon and machine remain alive. Background mode must not promise uninterrupted work while the machine sleeps, or process survival across logout, reboot, daemon failure, or daemon upgrades. Evaluate those service and upgrade behaviors separately.
+
+Introduce this after the project/folder identity and sidebar model are settled. It reuses the parked multiplexer without making the sidebar exploration depend on shipping it. A per-project override can be considered later if the global preference proves insufficient.
+
 ## Native migration seams
 
 Locations below refer to baseline `main` at `0d16c2e`; symbols are the stable references as lines move.

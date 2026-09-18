@@ -4882,21 +4882,7 @@ private struct NativeProjectSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        Text("FOLDERS")
-                            .font(.system(size: 10, weight: .semibold))
-                            .tracking(1)
-                            .foregroundStyle(palette.headerText)
-                        Spacer()
-                        Button(action: addFolder) {
-                            Image(systemName: "folder.badge.plus")
-                                .font(.system(size: 13))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Add folder to project")
-                        .accessibilityLabel("Add folder to project")
-                    }
+                LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(repository.sidebarFolders) { folder in
                         NativeFolderSection(
                             folder: folder,
@@ -4989,7 +4975,7 @@ private struct NativeFolderSection: View {
     private var isActive: Bool { repository.activeWorkspace === workspace }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 6) {
                 Button {
                     if isExpanded { chromeState.collapsedFolderIDs.insert(folder.id) }
@@ -5032,7 +5018,7 @@ private struct NativeFolderSection: View {
                 .accessibilityLabel("Open terminal in \(folder.name)")
             }
             .foregroundStyle(palette.rowText)
-            .padding(.vertical, 2)
+            .padding(.vertical, 1)
             .contextMenu {
                 Button("Open Terminal", action: openShell).disabled(!folder.isAvailable)
                 Button("Reveal in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
@@ -5050,7 +5036,7 @@ private struct NativeFolderSection: View {
                 }
                 ForEach(Array(workspace.unifiedDisplayItems.enumerated()), id: \.element.id) { index, item in
                     row(item, index: index)
-                        .padding(.leading, 20)
+                        .padding(.leading, 14)
                 }
                 if workspace.sessions.isEmpty && folder.isAvailable {
                     Button(action: openShell) {
@@ -5082,6 +5068,7 @@ private struct NativeFolderSection: View {
                     pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed,
+                    isCompact: true,
                     onSelect: { select(session) }
                 )
                 .contextMenu {
@@ -5105,6 +5092,7 @@ private struct NativeFolderSection: View {
                     pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed, palette: palette,
+                    isCompact: true,
                     isActiveWorkspace: isActive,
                     onActivate: { _ = repository.activateFolder(path: folder.path, chromeState: chromeState) }
                 )
@@ -8670,6 +8658,7 @@ private struct SidebarSplitTabRow: View {
     let shortcutNumber: Int
     let showShortcutHint: Bool
     let palette: SidebarPalette
+    var isCompact: Bool = false
 
     var isActiveWorkspace = true
     var onActivate: (() -> Void)? = nil
@@ -8683,7 +8672,8 @@ private struct SidebarSplitTabRow: View {
                     session: activeSession,
                     pathDisplayMode: pathDisplayMode,
                     isSelected: isSelected,
-                    palette: palette
+                    palette: palette,
+                    isCompact: isCompact
                 )
             }
 
@@ -8714,14 +8704,14 @@ private struct SidebarSplitTabRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 50)
-        .padding(.leading, SidebarLayout.rowHorizontalInset)
-        .padding(.trailing, SidebarLayout.rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(height: isCompact ? 32 : 50)
+        .padding(.leading, isCompact ? 8 : SidebarLayout.rowHorizontalInset)
+        .padding(.trailing, isCompact ? 8 : SidebarLayout.rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
         .background {
             rowBackground
         }
-        .padding(.leading, -SidebarLayout.rowHorizontalInset)
+        .padding(.leading, isCompact ? -8 : -SidebarLayout.rowHorizontalInset)
         .onTapGesture {
             if let session = workspace.session(withID: group.activeSessionID) {
                 onActivate?()
@@ -8776,16 +8766,17 @@ private struct SidebarSplitTabRow: View {
 
     @ViewBuilder
     private var rowBackground: some View {
+        let cornerRadius: CGFloat = isCompact ? 10 : 14
         if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(palette.selectedFill)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .strokeBorder(palette.selectedStroke, lineWidth: 1)
                 }
                 .shadow(color: palette.selectedShadow, radius: 9, y: 4)
         } else if isHovered {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(palette.hoverFill)
         }
     }
@@ -8809,6 +8800,7 @@ private struct SidebarSplitActivePaneSummary: View {
     let pathDisplayMode: SidebarTerminalPathDisplayMode
     let isSelected: Bool
     let palette: SidebarPalette
+    let isCompact: Bool
 
     @StateObject private var rowState: SidebarTabRowState
     @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons =
@@ -8818,12 +8810,14 @@ private struct SidebarSplitActivePaneSummary: View {
         session: TerminalSession,
         pathDisplayMode: SidebarTerminalPathDisplayMode,
         isSelected: Bool,
-        palette: SidebarPalette
+        palette: SidebarPalette,
+        isCompact: Bool = false
     ) {
         self.session = session
         self.pathDisplayMode = pathDisplayMode
         self.isSelected = isSelected
         self.palette = palette
+        self.isCompact = isCompact
         _rowState = StateObject(wrappedValue: SidebarTabRowState(
             session: session,
             pathDisplayMode: pathDisplayMode
@@ -8831,15 +8825,19 @@ private struct SidebarSplitActivePaneSummary: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            if shouldShowLeadingIcon {
+        let label = isCompact ? rowState.compactLabel : rowState.label
+
+        HStack(spacing: isCompact ? 6 : 8) {
+            if isCompact {
+                compactLeadingIcon(label: label)
+            } else if shouldShowLeadingIcon {
                 SidebarProgramIcon(label: rowState.label, isSelected: isSelected, palette: palette)
             }
 
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: isCompact ? 0 : 1) {
                 HStack(spacing: 5) {
-                    Text(rowState.label.title)
-                        .font(.system(size: 15, weight: .regular))
+                    Text(label.title)
+                        .font(.system(size: isCompact ? 14 : 15, weight: .regular))
                         .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                         .lineLimit(1)
 
@@ -8853,7 +8851,7 @@ private struct SidebarSplitActivePaneSummary: View {
                     }
                 }
 
-                if let detail = rowState.label.detail {
+                if !isCompact, let detail = rowState.label.detail {
                     HStack(spacing: 4) {
                         if let resourceName = rowState.label.detailIconResourceName {
                             SidebarDetailIcon(resourceName: resourceName)
@@ -8883,6 +8881,21 @@ private struct SidebarSplitActivePaneSummary: View {
     private var shouldShowLeadingIcon: Bool {
         rowState.label.detail == nil
             && (rowState.label.leadingIconResourceName != nil || rowState.label.leadingIconFallback != nil)
+    }
+
+    @ViewBuilder
+    private func compactLeadingIcon(label: SidebarTerminalPathLabel) -> some View {
+        if let descriptor = rowState.agentIconDescriptor {
+            AgentToolIcon(descriptor: descriptor, isSelected: isSelected, palette: palette)
+        } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+        } else {
+            Image(systemName: "terminal")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
+                .accessibilityHidden(true)
+        }
     }
 }
 
@@ -9924,6 +9937,7 @@ private struct SidebarTabRow: View {
     let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutNumber: Int
     let showShortcutHint: Bool
+    let isCompact: Bool
     let nestingDepth: Int
     let showsDisclosure: Bool
     let isDisclosureExpanded: Bool
@@ -9948,6 +9962,7 @@ private struct SidebarTabRow: View {
         pathDisplayMode: SidebarTerminalPathDisplayMode,
         shortcutNumber: Int,
         showShortcutHint: Bool,
+        isCompact: Bool = false,
         nestingDepth: Int = 0,
         showsDisclosure: Bool = false,
         isDisclosureExpanded: Bool = true,
@@ -9964,6 +9979,7 @@ private struct SidebarTabRow: View {
         self.pathDisplayMode = pathDisplayMode
         self.shortcutNumber = shortcutNumber
         self.showShortcutHint = showShortcutHint
+        self.isCompact = isCompact
         self.nestingDepth = nestingDepth
         self.showsDisclosure = showsDisclosure
         self.isDisclosureExpanded = isDisclosureExpanded
@@ -9980,19 +9996,22 @@ private struct SidebarTabRow: View {
             projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
             presentation: presentation
         )
-        let label = rowState.label
+        let label = isCompact ? rowState.compactLabel : rowState.label
         let nested = nestingDepth > 0
         let nestedGuideReservationWidth = CGFloat(guideX + guideElbowStartInset + guideElbowWidth + 2)
+        let rowHorizontalInset = isCompact ? 8.0 : SidebarLayout.rowHorizontalInset
         let nestedBackgroundLeadingInset = nested
-            ? SidebarLayout.rowHorizontalInset + nestedGuideReservationWidth + 2
+            ? rowHorizontalInset + nestedGuideReservationWidth + 2
             : 0
         let rowHeight: CGFloat = if nested {
             CGFloat(label.detail == nil ? childRowHeight : childDetailRowHeight)
+        } else if isCompact {
+            32
         } else {
             label.detail == nil ? 42 : 50
         }
 
-        HStack(spacing: nested ? 6 : 8) {
+        HStack(spacing: isCompact ? 6 : (nested ? 6 : 8)) {
             if nested {
                 Color.clear
                     .frame(width: nestedGuideReservationWidth, height: rowHeight)
@@ -10011,7 +10030,9 @@ private struct SidebarTabRow: View {
                 .padding(.trailing, -6)
             }
 
-            if let icon = rowState.agentIconDescriptor {
+            if isCompact {
+                compactLeadingIcon(label: label, palette: palette)
+            } else if let icon = rowState.agentIconDescriptor {
                 if !usesInlineAgentIconsForRow {
                     AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
                 }
@@ -10021,10 +10042,10 @@ private struct SidebarTabRow: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: isCompact ? 0 : 1) {
                 HStack(spacing: 5) {
                     Text(label.title)
-                        .font(.system(size: 15, weight: .regular))
+                        .font(.system(size: isCompact ? 14 : 15, weight: .regular))
                         .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                         .lineLimit(1)
 
@@ -10038,7 +10059,7 @@ private struct SidebarTabRow: View {
                     }
                 }
 
-                if let detail = label.detail {
+                if !isCompact, let detail = label.detail {
                     HStack(spacing: 4) {
                         if let resourceName = label.detailIconResourceName {
                             SidebarDetailIcon(resourceName: resourceName)
@@ -10085,15 +10106,15 @@ private struct SidebarTabRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: rowHeight)
-        .padding(.leading, SidebarLayout.rowHorizontalInset)
-        .padding(.trailing, SidebarLayout.rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.leading, rowHorizontalInset)
+        .padding(.trailing, rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
         .background(alignment: .leading) {
             rowBackground(palette: palette)
                 .padding(.leading, nestedBackgroundLeadingInset)
         }
-        .padding(.leading, -SidebarLayout.rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.leading, -rowHorizontalInset)
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
         .onTapGesture(perform: onSelect)
         .accessibilityAddTraits(.isButton)
         .onHover { hovering in
@@ -10110,17 +10131,33 @@ private struct SidebarTabRow: View {
 
     @ViewBuilder
     private func rowBackground(palette: SidebarPalette) -> some View {
+        let cornerRadius: CGFloat = isCompact ? 10 : 14
         if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(palette.selectedFill)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .strokeBorder(palette.selectedStroke, lineWidth: 1)
                 }
                 .shadow(color: palette.selectedShadow, radius: 9, y: 4)
         } else if isHovered {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(palette.hoverFill)
+        }
+    }
+
+    @ViewBuilder
+    private func compactLeadingIcon(label: SidebarTerminalPathLabel, palette: SidebarPalette) -> some View {
+        if let icon = rowState.agentIconDescriptor {
+            AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+        } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
+            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+        } else {
+            Image(systemName: "terminal")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
+                .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
+                .accessibilityHidden(true)
         }
     }
 
@@ -10140,6 +10177,7 @@ private final class SidebarTabRowState: ObservableObject {
     private(set) var agentIconDescriptor: AgentToolIconDescriptor?
 
     @Published private(set) var label: SidebarTerminalPathLabel
+    @Published private(set) var compactLabel: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
     @Published private(set) var agentActivityState: AgentActivityState
     @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
@@ -10161,6 +10199,7 @@ private final class SidebarTabRowState: ObservableObject {
             commandLine: session.subtitle
         )
         self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        self.compactLabel = Self.compactLabel(for: session)
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
         self.attentionClassifierPrediction = session.attentionClassifierPrediction
@@ -10266,8 +10305,63 @@ private final class SidebarTabRowState: ObservableObject {
             commandLine: session.subtitle
         )
         let nextLabel = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        let nextCompactLabel = Self.compactLabel(for: session)
+        if compactLabel != nextCompactLabel {
+            compactLabel = nextCompactLabel
+        }
         guard label != nextLabel else { return }
         label = nextLabel
+    }
+
+    private static func compactLabel(for session: TerminalSession) -> SidebarTerminalPathLabel {
+        switch session.kind {
+        case .agent:
+            return label(for: session, pathDisplayMode: .repoFocused)
+        case .command:
+            let title = if session.hasExplicitTitle {
+                session.title
+            } else {
+                session.commandName?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nilIfEmpty
+                    ?? session.title
+            }
+            let iconLabel = SidebarTerminalProgramFormatter.label(
+                for: session.subtitle,
+                workingDirectory: session.workingDirectory,
+                resolvedCommandLine: session.subtitle
+            )
+            return SidebarTerminalPathLabel(
+                title: title,
+                leadingIconResourceName: iconLabel?.leadingIconResourceName,
+                leadingIconFallback: iconLabel?.leadingIconFallback,
+                leadingIconRendersAsTemplate: iconLabel?.leadingIconRendersAsTemplate ?? false
+            )
+        case .terminal:
+            if session.hasExplicitTitle {
+                return .init(title: session.title)
+            }
+
+            if let programLabel = SidebarTerminalProgramFormatter.label(
+                for: session.title,
+                workingDirectory: session.workingDirectory,
+                resolvedCommandLine: session.resolvedCommandLine
+            ) {
+                return programLabel
+            }
+
+            if let commandLine = session.resolvedCommandLine?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty,
+               let command = commandLine.split(whereSeparator: \.isWhitespace).first {
+                let commandName = URL(fileURLWithPath: String(command)).lastPathComponent
+                if !commandName.isEmpty {
+                    return .init(title: commandName)
+                }
+            }
+
+            return .init(title: "Shell")
+        }
     }
 
     private static func label(

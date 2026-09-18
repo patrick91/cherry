@@ -429,7 +429,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         let proxy = GhosttySessionProxy(session: session)
         let inMemorySession = Self.makeInMemorySession(proxy: proxy)
         let isNativePTYBacked = session.usesNativePTYBackend
-        let terminalConfiguration = TerminalSettings.shared.ghosttyConfiguration()
+        let terminalConfiguration = TerminalSettings.shared.ghosttyConfiguration(usesManagedCommand: session.kind == .command)
         let terminalTheme = TerminalSettings.shared.ghosttyTheme()
 
         self.proxy = proxy
@@ -2299,7 +2299,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private func applyTerminalSettings() {
         let settings = TerminalSettings.shared
-        let nextConfiguration = settings.ghosttyConfiguration()
+        let nextConfiguration = settings.ghosttyConfiguration(usesManagedCommand: proxy.session?.kind == .command)
         let nextTheme = settings.ghosttyTheme()
         var needsFit = false
 

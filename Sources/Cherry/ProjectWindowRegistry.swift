@@ -15,12 +15,15 @@ final class ProjectWindowRegistry {
     private var todoStores: [String: WeakTodoStore] = [:]
     private var chromeStates: [String: WeakChromeState] = [:]
     private var activeProjectRoot: String?
+    private let settings: AgentSettings
     weak var activeWorkspace: TerminalWorkspace?
     weak var activeNoteStore: ProjectNoteStore?
     weak var activeTodoStore: ProjectTodoStore?
     weak var activeChromeState: ProjectWindowChromeState?
 
-    private init() {}
+    init(settings: AgentSettings = .shared) {
+        self.settings = settings
+    }
 
     var hasRegisteredProjectWindow: Bool {
         pruneStaleWindows()
@@ -118,7 +121,7 @@ final class ProjectWindowRegistry {
         let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var roots = repositories.values.flatMap { ($0.repository?.worktrees.map(\.root) ?? []) + ($0.repository?.folders.map(\.path) ?? []) }
         roots.append(contentsOf: workspaces.keys)
-        roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
+        roots.append(contentsOf: settings.projects.map(\.root))
         if let activeProjectRoot {
             roots.append(activeProjectRoot)
         }
@@ -296,7 +299,7 @@ final class ProjectWindowRegistry {
                 chromeState: chromeStates[repositoryRoot]?.chromeState
             )
         } else {
-            AgentSettings.shared.markProjectOpened(repositoryRoot)
+            settings.markProjectOpened(repositoryRoot)
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -314,7 +317,7 @@ final class ProjectWindowRegistry {
 
         switch deepLink.kind {
         case .note:
-            guard AgentSettings.shared.projectFeatures(for: projectRoot).notesEnabled else {
+            guard settings.projectFeatures(for: projectRoot).notesEnabled else {
                 return false
             }
             guard let noteID = UUID(uuidString: deepLink.targetID),
@@ -325,7 +328,7 @@ final class ProjectWindowRegistry {
             chromeState.selectNote(id: noteID)
             return true
         case .todo:
-            guard AgentSettings.shared.projectFeatures(for: projectRoot).todosEnabled else {
+            guard settings.projectFeatures(for: projectRoot).todosEnabled else {
                 return false
             }
             guard let todoID = UUID(uuidString: deepLink.targetID),
@@ -352,7 +355,7 @@ final class ProjectWindowRegistry {
     func markCurrentActiveProjectOpened() {
         refreshActiveWindow()
         guard let activeProjectRoot else { return }
-        AgentSettings.shared.markWorktreeOpened(
+        settings.markWorktreeOpened(
             activeProjectRoot,
             repositoryRoot: repositoryRoot(for: activeProjectRoot)
         )
@@ -484,7 +487,7 @@ final class ProjectWindowRegistry {
         activeTodoStore = todoStore
         activeChromeState = chromeState
         if recordsOpening {
-            AgentSettings.shared.markWorktreeOpened(
+            settings.markWorktreeOpened(
                 effectiveRoot,
                 repositoryRoot: repositoryRoot(for: projectRoot)
             )
@@ -571,14 +574,16 @@ final class ProjectWindowRegistry {
             fileURLWithPath: projectRoot,
             isDirectory: true
         ).standardizedFileURL.path
-        let normalizedRoot: String
-        if let resolved = standardizedRoot.withCString({ realpath($0, nil) }) {
-            normalizedRoot = String(cString: resolved)
-            free(resolved)
-        } else {
-            normalizedRoot = standardizedRoot
-        }
+        if let root = repositoryRootByWorktreeRoot[standardizedRoot] { return root }
+        let normalizedRoot = Self.resolvedPath(standardizedRoot)
         return repositoryRootByWorktreeRoot[normalizedRoot] ?? normalizedRoot
+    }
+
+    private static func resolvedPath(_ path: String) -> String {
+        let standardized = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+        guard let resolved = standardized.withCString({ realpath($0, nil) }) else { return standardized }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     private func updateWorktreeMappings(
@@ -588,9 +593,12 @@ final class ProjectWindowRegistry {
         repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter {
             $0.value != repositoryRoot
         }
-        repositoryRootByWorktreeRoot[repositoryRoot] = repositoryRoot
-        for root in repository.worktrees.map(\.root) + repository.folders.map(\.path) {
-            repositoryRootByWorktreeRoot[root] = repositoryRoot
+        let roots = [repositoryRoot, repository.repositoryRoot]
+            + repository.worktrees.map(\.root) + repository.folders.map(\.path)
+        for root in roots {
+            let standardized = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
+            repositoryRootByWorktreeRoot[standardized] = repositoryRoot
+            repositoryRootByWorktreeRoot[Self.resolvedPath(standardized)] = repositoryRoot
         }
     }
 

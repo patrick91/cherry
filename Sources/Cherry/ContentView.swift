@@ -5187,7 +5187,7 @@ private struct NativeProjectTools: View {
                                 .padding(.vertical, 7)
                         }
                     }
-                }.frame(maxHeight: 190)
+                }.frame(height: min(190, CGFloat(max(commandCount, 1)) * 44))
             }
             if features.notesEnabled {
                 sectionHeader("Notes", icon: "note.text", count: noteStore.notes.count, expanded: $chromeState.isProjectNotesExpanded) {
@@ -5200,7 +5200,7 @@ private struct NativeProjectTools: View {
                             selectedNoteID: chromeState.selectedNoteID, palette: palette,
                             shortcutStartIndex: 99, showShortcutHints: false, showsHeader: false
                         )
-                    }.frame(maxHeight: 190)
+                    }.frame(height: min(190, CGFloat(max(noteStore.notes.count, 1)) * 50))
                 }
             } else {
                 Button {

@@ -261,18 +261,20 @@ final class TerminalSettings: ObservableObject {
             || action.hasPrefix("esc:") || action == "ignore"
     }
 
-    func ghosttyConfiguration() -> TerminalConfiguration {
+    func ghosttyConfiguration(usesManagedCommand: Bool = false) -> TerminalConfiguration {
         Self.ghosttyConfiguration(
             fontSize: fontSize,
             cursorBlink: cursorBlink,
-            minimumContrast: minimumContrast
+            minimumContrast: minimumContrast,
+            usesManagedCommand: usesManagedCommand
         )
     }
 
     static func ghosttyConfiguration(
         fontSize: Double,
         cursorBlink: Bool,
-        minimumContrast: Double
+        minimumContrast: Double,
+        usesManagedCommand: Bool = false
     ) -> TerminalConfiguration {
         TerminalConfiguration { builder in
             builder.withFontFamily("Menlo")
@@ -283,6 +285,13 @@ final class TerminalSettings: ObservableObject {
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
             builder.withCustom("scrollback-limit", "\(Defaults.ghosttyScrollbackLimitBytes)")
+            if usesManagedCommand {
+                // On macOS Ghostty treats even exit 0 as a launch failure when
+                // a process finishes below this runtime threshold. Managed
+                // commands may legitimately be short-lived; Cherry owns their
+                // exit status UI and retains their output after completion.
+                builder.withCustom("abnormal-command-exit-runtime", "0")
+            }
             // The Ghostty surface owns the keyboard for every running session, so
             // honor the same input-producing bindings as standalone Ghostty.
             // App-action bindings (new tabs, splits, and windows) remain Cherry's

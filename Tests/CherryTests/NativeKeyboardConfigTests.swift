@@ -76,3 +76,15 @@ private func parsed(_ s: String) -> [String] {
         "macos-option-as-alt = true",
     ])
 }
+
+@MainActor
+@Test func managedCommandConfigurationAllowsSuccessfulShortLivedProcesses() {
+    let commandConfiguration = TerminalSettings.ghosttyConfiguration(
+        fontSize: 14, cursorBlink: true, minimumContrast: 1, usesManagedCommand: true
+    )
+    #expect(commandConfiguration.rendered.contains("abnormal-command-exit-runtime = 0"))
+    let shellConfiguration = TerminalSettings.ghosttyConfiguration(
+        fontSize: 14, cursorBlink: true, minimumContrast: 1
+    )
+    #expect(!shellConfiguration.rendered.contains("abnormal-command-exit-runtime"))
+}

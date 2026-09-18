@@ -8773,6 +8773,10 @@ private struct SidebarSplitTabRow: View {
             if isSelected {
                 Rectangle()
                     .fill(palette.selectedFill)
+                    .overlay {
+                        Rectangle()
+                            .fill(palette.rowText.opacity(0.10))
+                    }
             } else if isHovered {
                 Rectangle()
                     .fill(palette.hoverFill)
@@ -10151,6 +10155,10 @@ private struct SidebarTabRow: View {
             if isSelected {
                 Rectangle()
                     .fill(palette.selectedFill)
+                    .overlay {
+                        Rectangle()
+                            .fill(palette.rowText.opacity(0.10))
+                    }
             } else if isHovered {
                 Rectangle()
                     .fill(palette.hoverFill)

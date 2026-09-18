@@ -10,3 +10,13 @@ DerivedData/
 __pycache__/
 *.pyc
 /tmp/
+
+# Cached builds left by the parked persistent-session branch.
+/Host/target/
+/Host/.deps/
+/Host/vendor/ghostty-vt/.cache/
+/Host/vendor/ghostty-vt/aarch64-apple-darwin/
+/Host/vendor/ghostty-vt/x86_64-apple-darwin/
+/Host/vendor/ghostty-vt/aarch64-unknown-linux-gnu/
+/Host/vendor/ghostty-vt/x86_64-unknown-linux-gnu/
+/Design/SessionsIcon/*.iconset/

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cherry · Sidebar studies</title>
+  <link rel="preload" href="assets/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="study">
+    <header class="study-header">
+      <div class="study-title"><img src="assets/cherry.png" alt="" width="36" height="36"><div><h1>Room for your work.</h1><p>Cherry / Sidebar studies · September 2026</p></div></div>
+      <div class="prototype-label">Interactive prototype · Sample data</div>
+    </header>
+    <section class="controls" aria-label="Prototype controls">
+      <div class="variants" role="group" aria-label="Sidebar direction">
+        <button type="button" data-variant="focused" aria-pressed="true">A <span>Focused project</span></button>
+        <button type="button" data-variant="outline" aria-pressed="false">B <span>Project outline</span></button>
+      </div>
+      <div class="scenarios"><label for="scenario">Explore a state</label><select id="scenario" name="scenario" aria-label="Explore a state">
+        <option value="working">Everyday work</option>
+        <option value="no-projects">No projects</option>
+        <option value="empty-project">Project without folders</option>
+        <option value="empty-folder">Folder without terminals</option>
+        <option value="single">One folder, fresh terminal</option>
+        <option value="nothing-open">Nothing selected</option>
+        <option value="no-commands">No commands</option>
+        <option value="no-notes">No notes</option>
+        <option value="missing">Folder unavailable</option>
+        <option value="remote">Remote project · future</option>
+      </select></div>
+      <button type="button" id="reset" class="reset">Reset state</button>
+    </section>
+    <div class="app-window" id="app" aria-label="Cherry prototype"></div>
+    <footer class="study-note"><div><p class="note-label" id="direction-label"></p><p id="direction-note"></p></div><div><p class="note-label">Try it</p><p id="try-note">Switch projects, expand a folder, open a terminal, or run a command. Compare both layouts in the same state.</p></div></footer>
+    <div id="announcement" class="sr-only" role="status" aria-live="polite"></div>
+  </div>
+  <dialog id="editor" aria-labelledby="dialog-title"></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

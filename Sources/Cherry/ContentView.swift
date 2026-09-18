@@ -4902,8 +4902,8 @@ private struct NativeProjectSidebar: View {
                             .padding(.vertical, 7)
                     }
                     .buttonStyle(.plain)
+                    .padding(.horizontal, 18)
                 }
-                .padding(.horizontal, 18)
                 .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + 4)
                 .padding(.bottom, 16)
             }
@@ -5019,6 +5019,7 @@ private struct NativeFolderSection: View {
             }
             .foregroundStyle(palette.rowText)
             .padding(.vertical, 1)
+            .padding(.horizontal, 18)
             .contextMenu {
                 Button("Open Terminal", action: openShell).disabled(!folder.isAvailable)
                 Button("Reveal in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
@@ -5032,11 +5033,10 @@ private struct NativeFolderSection: View {
                         Text("Folder unavailable").font(.system(size: 11)).foregroundStyle(.secondary)
                         Button("Locate folder…", action: locateFolder).buttonStyle(.plain).font(.system(size: 12))
                     }
-                    .padding(.leading, 26).padding(.vertical, 6)
+                    .padding(.leading, 44).padding(.vertical, 6)
                 }
                 ForEach(Array(workspace.unifiedDisplayItems.enumerated()), id: \.element.id) { index, item in
                     row(item, index: index)
-                        .padding(.leading, 14)
                 }
                 if workspace.sessions.isEmpty && folder.isAvailable {
                     Button(action: openShell) {
@@ -5047,7 +5047,7 @@ private struct NativeFolderSection: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
-                    .padding(.leading, 26)
+                    .padding(.leading, 44)
                 }
             }
         }
@@ -5069,6 +5069,7 @@ private struct NativeFolderSection: View {
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed,
                     isCompact: true,
+                    compactContentLeadingInset: 32,
                     onSelect: { select(session) }
                 )
                 .contextMenu {
@@ -5093,6 +5094,7 @@ private struct NativeFolderSection: View {
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed, palette: palette,
                     isCompact: true,
+                    compactContentLeadingInset: 32,
                     isActiveWorkspace: isActive,
                     onActivate: { _ = repository.activateFolder(path: folder.path, chromeState: chromeState) }
                 )
@@ -8659,6 +8661,7 @@ private struct SidebarSplitTabRow: View {
     let showShortcutHint: Bool
     let palette: SidebarPalette
     var isCompact: Bool = false
+    var compactContentLeadingInset: CGFloat = 0
 
     var isActiveWorkspace = true
     var onActivate: (() -> Void)? = nil
@@ -8705,13 +8708,13 @@ private struct SidebarSplitTabRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: isCompact ? 32 : 50)
-        .padding(.leading, isCompact ? 8 : SidebarLayout.rowHorizontalInset)
+        .padding(.leading, isCompact ? max(8, compactContentLeadingInset) : SidebarLayout.rowHorizontalInset)
         .padding(.trailing, isCompact ? 8 : SidebarLayout.rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 0 : 14, style: .continuous))
         .background {
             rowBackground
         }
-        .padding(.leading, isCompact ? -8 : -SidebarLayout.rowHorizontalInset)
+        .padding(.leading, isCompact ? 0 : -SidebarLayout.rowHorizontalInset)
         .onTapGesture {
             if let session = workspace.session(withID: group.activeSessionID) {
                 onActivate?()
@@ -8766,17 +8769,24 @@ private struct SidebarSplitTabRow: View {
 
     @ViewBuilder
     private var rowBackground: some View {
-        let cornerRadius: CGFloat = isCompact ? 10 : 14
-        if isSelected {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if isCompact {
+            if isSelected {
+                Rectangle()
+                    .fill(palette.selectedFill)
+            } else if isHovered {
+                Rectangle()
+                    .fill(palette.hoverFill)
+            }
+        } else if isSelected {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.selectedFill)
                 .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(palette.selectedStroke, lineWidth: 1)
                 }
                 .shadow(color: palette.selectedShadow, radius: 9, y: 4)
         } else if isHovered {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
     }
@@ -9938,6 +9948,7 @@ private struct SidebarTabRow: View {
     let shortcutNumber: Int
     let showShortcutHint: Bool
     let isCompact: Bool
+    let compactContentLeadingInset: CGFloat
     let nestingDepth: Int
     let showsDisclosure: Bool
     let isDisclosureExpanded: Bool
@@ -9963,6 +9974,7 @@ private struct SidebarTabRow: View {
         shortcutNumber: Int,
         showShortcutHint: Bool,
         isCompact: Bool = false,
+        compactContentLeadingInset: CGFloat = 0,
         nestingDepth: Int = 0,
         showsDisclosure: Bool = false,
         isDisclosureExpanded: Bool = true,
@@ -9980,6 +9992,7 @@ private struct SidebarTabRow: View {
         self.shortcutNumber = shortcutNumber
         self.showShortcutHint = showShortcutHint
         self.isCompact = isCompact
+        self.compactContentLeadingInset = compactContentLeadingInset
         self.nestingDepth = nestingDepth
         self.showsDisclosure = showsDisclosure
         self.isDisclosureExpanded = isDisclosureExpanded
@@ -9999,9 +10012,12 @@ private struct SidebarTabRow: View {
         let label = isCompact ? rowState.compactLabel : rowState.label
         let nested = nestingDepth > 0
         let nestedGuideReservationWidth = CGFloat(guideX + guideElbowStartInset + guideElbowWidth + 2)
-        let rowHorizontalInset = isCompact ? 8.0 : SidebarLayout.rowHorizontalInset
+        let rowLeadingInset = isCompact
+            ? max(8, compactContentLeadingInset)
+            : SidebarLayout.rowHorizontalInset
+        let rowTrailingInset = isCompact ? 8.0 : SidebarLayout.rowHorizontalInset
         let nestedBackgroundLeadingInset = nested
-            ? rowHorizontalInset + nestedGuideReservationWidth + 2
+            ? rowLeadingInset + nestedGuideReservationWidth + 2
             : 0
         let rowHeight: CGFloat = if nested {
             CGFloat(label.detail == nil ? childRowHeight : childDetailRowHeight)
@@ -10106,15 +10122,15 @@ private struct SidebarTabRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: rowHeight)
-        .padding(.leading, rowHorizontalInset)
-        .padding(.trailing, rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
+        .padding(.leading, rowLeadingInset)
+        .padding(.trailing, rowTrailingInset)
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 0 : 14, style: .continuous))
         .background(alignment: .leading) {
             rowBackground(palette: palette)
                 .padding(.leading, nestedBackgroundLeadingInset)
         }
-        .padding(.leading, -rowHorizontalInset)
-        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 10 : 14, style: .continuous))
+        .padding(.leading, isCompact ? 0 : -rowLeadingInset)
+        .contentShape(RoundedRectangle(cornerRadius: isCompact ? 0 : 14, style: .continuous))
         .onTapGesture(perform: onSelect)
         .accessibilityAddTraits(.isButton)
         .onHover { hovering in
@@ -10131,17 +10147,24 @@ private struct SidebarTabRow: View {
 
     @ViewBuilder
     private func rowBackground(palette: SidebarPalette) -> some View {
-        let cornerRadius: CGFloat = isCompact ? 10 : 14
-        if isSelected {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if isCompact {
+            if isSelected {
+                Rectangle()
+                    .fill(palette.selectedFill)
+            } else if isHovered {
+                Rectangle()
+                    .fill(palette.hoverFill)
+            }
+        } else if isSelected {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.selectedFill)
                 .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(palette.selectedStroke, lineWidth: 1)
                 }
                 .shadow(color: palette.selectedShadow, radius: 9, y: 4)
         } else if isHovered {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
     }

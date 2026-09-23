@@ -4651,6 +4651,26 @@ private enum SidebarLayout {
     static let agentTreeRowSpacing: CGFloat = 4
 }
 
+private enum NativeProjectSidebarLayout {
+    static let iconLeadingInset: CGFloat = 12
+    static let iconColumnWidth: CGFloat = 20
+    static let iconGlyphSize: CGFloat = 16
+    static let trailingInset: CGFloat = 18
+}
+
+private struct NativeSidebarSymbol: View {
+    let name: String
+
+    var body: some View {
+        Image(systemName: name)
+            .resizable()
+            .scaledToFit()
+            .frame(width: NativeProjectSidebarLayout.iconGlyphSize, height: NativeProjectSidebarLayout.iconGlyphSize)
+            .frame(width: NativeProjectSidebarLayout.iconColumnWidth, height: NativeProjectSidebarLayout.iconColumnWidth)
+            .accessibilityHidden(true)
+    }
+}
+
 private enum TrafficLightLayout {
     static let leadingInset: CGFloat = 18
     static let topInset: CGFloat = 18
@@ -4895,14 +4915,19 @@ private struct NativeProjectSidebar: View {
                         )
                     }
                     Button(action: addFolder) {
-                        Label("Add folder", systemImage: "plus")
-                            .font(.system(size: 12))
-                            .foregroundStyle(palette.headerText)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 7)
+                        HStack(spacing: 7) {
+                            NativeSidebarSymbol(name: "plus")
+                            Text("Add folder")
+                            Spacer(minLength: 0)
+                        }
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.headerText)
+                        .padding(.vertical, 7)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
-                    .padding(.horizontal, 18)
+                    .padding(.leading, NativeProjectSidebarLayout.iconLeadingInset)
+                    .padding(.trailing, NativeProjectSidebarLayout.trailingInset)
                 }
                 .padding(.top, TopChromeShieldMetrics.projectSidebar.contentTopInset + 4)
                 .padding(.bottom, 16)
@@ -4916,7 +4941,8 @@ private struct NativeProjectSidebar: View {
                 palette: palette,
                 presentation: presentation
             )
-            .padding(.horizontal, 18)
+            .padding(.leading, NativeProjectSidebarLayout.iconLeadingInset)
+            .padding(.trailing, NativeProjectSidebarLayout.trailingInset)
             .padding(.vertical, 12)
         }
         .background {
@@ -4935,7 +4961,7 @@ private struct NativeProjectSidebar: View {
 
     private func shortcutOffset(for folder: CherryProjectFolder) -> Int {
         repository.sidebarFolders.prefix { $0.id != folder.id }.reduce(0) { count, candidate in
-            count + (chromeState.collapsedFolderIDs.contains(candidate.id) ? 0 : (repository.workspaceIfLoaded(for: candidate.path)?.unifiedDisplayItems.count ?? 0))
+            count + (repository.workspaceIfLoaded(for: candidate.path)?.unifiedDisplayItems.count ?? 0)
         }
     }
 
@@ -4971,29 +4997,16 @@ private struct NativeFolderSection: View {
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @State private var locationError: String?
 
-    private var isExpanded: Bool { !chromeState.collapsedFolderIDs.contains(folder.id) }
     private var isActive: Bool { repository.activeWorkspace === workspace }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 6) {
                 Button {
-                    if isExpanded { chromeState.collapsedFolderIDs.insert(folder.id) }
-                    else { chromeState.collapsedFolderIDs.remove(folder.id) }
-                } label: {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .frame(width: 12, height: 24)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(folder.name)")
-                Button {
                     chromeState.collapsedFolderIDs.remove(folder.id)
                     _ = repository.activateFolder(path: folder.path, chromeState: chromeState, clearSelection: true)
                 } label: {
                     HStack(spacing: 7) {
-                        Image(systemName: folder.isAvailable ? "folder" : "folder.badge.questionmark")
-                            .foregroundStyle(folder.isAvailable ? palette.headerText : .orange)
                         Text(folder.name).lineLimit(1)
                         Spacer(minLength: 0)
                     }
@@ -5019,7 +5032,8 @@ private struct NativeFolderSection: View {
             }
             .foregroundStyle(palette.rowText)
             .padding(.vertical, 1)
-            .padding(.horizontal, 18)
+            .padding(.leading, NativeProjectSidebarLayout.iconLeadingInset)
+            .padding(.trailing, NativeProjectSidebarLayout.trailingInset)
             .contextMenu {
                 Button("Open Terminal", action: openShell).disabled(!folder.isAvailable)
                 Button("Reveal in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
@@ -5027,28 +5041,32 @@ private struct NativeFolderSection: View {
                 if !folder.isAvailable { Button("Locate Folder…", action: locateFolder) }
             }
 
-            if isExpanded {
-                if !folder.isAvailable {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Folder unavailable").font(.system(size: 11)).foregroundStyle(.secondary)
-                        Button("Locate folder…", action: locateFolder).buttonStyle(.plain).font(.system(size: 12))
+            if !folder.isAvailable {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Folder unavailable").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Button("Locate folder…", action: locateFolder).buttonStyle(.plain).font(.system(size: 12))
+                }
+                .padding(.leading, NativeProjectSidebarLayout.iconLeadingInset)
+                .padding(.vertical, 6)
+            }
+            ForEach(Array(workspace.unifiedDisplayItems.enumerated()), id: \.element.id) { index, item in
+                row(item, index: index)
+            }
+            if workspace.sessions.isEmpty && folder.isAvailable {
+                Button(action: openShell) {
+                    HStack(spacing: 7) {
+                        NativeSidebarSymbol(name: "terminal")
+                        Text("Open terminal")
+                        Spacer(minLength: 0)
                     }
-                    .padding(.leading, 44).padding(.vertical, 6)
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.headerText)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                ForEach(Array(workspace.unifiedDisplayItems.enumerated()), id: \.element.id) { index, item in
-                    row(item, index: index)
-                }
-                if workspace.sessions.isEmpty && folder.isAvailable {
-                    Button(action: openShell) {
-                        Label("Open terminal", systemImage: "terminal")
-                            .font(.system(size: 12))
-                            .foregroundStyle(palette.headerText)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.leading, 44)
-                }
+                .buttonStyle(.plain)
+                .padding(.leading, NativeProjectSidebarLayout.iconLeadingInset)
+                .padding(.trailing, NativeProjectSidebarLayout.trailingInset)
             }
         }
         .alert("Couldn’t locate folder", isPresented: Binding(get: { locationError != nil }, set: { if !$0 { locationError = nil } })) {
@@ -5069,7 +5087,7 @@ private struct NativeFolderSection: View {
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed,
                     isCompact: true,
-                    compactContentLeadingInset: 32,
+                    compactContentLeadingInset: NativeProjectSidebarLayout.iconLeadingInset,
                     onSelect: { select(session) }
                 )
                 .contextMenu {
@@ -5094,7 +5112,7 @@ private struct NativeFolderSection: View {
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: chromeState.isCommandKeyPressed, palette: palette,
                     isCompact: true,
-                    compactContentLeadingInset: 32,
+                    compactContentLeadingInset: NativeProjectSidebarLayout.iconLeadingInset,
                     isActiveWorkspace: isActive,
                     onActivate: { _ = repository.activateFolder(path: folder.path, chromeState: chromeState) }
                 )
@@ -5188,7 +5206,9 @@ private struct NativeProjectTools: View {
                         SidebarNotesSection(
                             noteStore: noteStore, chromeState: chromeState,
                             selectedNoteID: chromeState.selectedNoteID, palette: palette,
-                            shortcutStartIndex: 99, showShortcutHints: false, showsHeader: false
+                            shortcutStartIndex: 99, showShortcutHints: false, showsHeader: false,
+                            iconColumnWidth: NativeProjectSidebarLayout.iconColumnWidth,
+                            usesUniformIconSize: true
                         )
                     }.frame(height: min(190, CGFloat(max(noteStore.notes.count, 1)) * 50))
                 }
@@ -5198,14 +5218,22 @@ private struct NativeProjectTools: View {
                     try? settings.setProjectFeatures(enabled, for: repository.repositoryRoot, storage: .local)
                     chromeState.isProjectNotesExpanded = true
                 } label: {
-                    Label("Enable Notes", systemImage: "note.text")
-                        .font(.system(size: 12)).foregroundStyle(palette.headerText)
+                    HStack(spacing: 7) {
+                        NativeSidebarSymbol(name: "note.text")
+                        Text("Enable Notes")
+                    }
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.headerText)
                 }.buttonStyle(.plain)
             }
             if features.todosEnabled {
                 Button { chromeState.selectTodo(id: nil) } label: {
-                    Label("Todos", systemImage: "checklist")
-                        .font(.system(size: 12)).foregroundStyle(palette.headerText)
+                    HStack(spacing: 7) {
+                        NativeSidebarSymbol(name: "checklist")
+                        Text("Todos")
+                    }
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.headerText)
                 }.buttonStyle(.plain)
             }
         }
@@ -5245,8 +5273,7 @@ private struct NativeProjectTools: View {
         HStack(spacing: 6) {
             Button { expanded.wrappedValue.toggle() } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .semibold))
-                    Image(systemName: icon).frame(width: 15)
+                    NativeSidebarSymbol(name: icon)
                     Text(title).font(.system(size: 12, weight: .medium))
                     Spacer(minLength: 0)
                     if count > 0 { Text("\(count)").font(.system(size: 10)).foregroundStyle(palette.headerText) }
@@ -5261,13 +5288,16 @@ private struct NativeProjectTools: View {
     private func commandRow(_ command: ProjectCommandDefinition, folder: CherryProjectFolder) -> some View {
         Button { run(command, folder: folder) } label: {
             HStack(spacing: 8) {
-                Image(systemName: "play.fill").font(.system(size: 9)).frame(width: 16)
+                NativeSidebarSymbol(name: "play.fill")
                 VStack(alignment: .leading, spacing: 2) {
                     Text(command.name).font(.system(size: 12)).lineLimit(1)
                     Text(folder.name).font(.system(size: 10)).foregroundStyle(palette.headerText).lineLimit(1)
                 }
                 Spacer(minLength: 0)
-            }.foregroundStyle(palette.rowText).padding(.leading, 18).padding(.vertical, 6).contentShape(Rectangle())
+            }
+            .foregroundStyle(palette.rowText)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(!folder.isAvailable)
@@ -8053,6 +8083,9 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
     let showShortcutHints: Bool
 
     var showsHeader = true
+    var leadingInset: CGFloat = 0
+    var iconColumnWidth: CGFloat = 18
+    var usesUniformIconSize = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.noteStore === rhs.noteStore
@@ -8061,6 +8094,9 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
             && lhs.palette == rhs.palette
             && lhs.shortcutStartIndex == rhs.shortcutStartIndex
             && lhs.showShortcutHints == rhs.showShortcutHints
+            && lhs.leadingInset == rhs.leadingInset
+            && lhs.iconColumnWidth == rhs.iconColumnWidth
+            && lhs.usesUniformIconSize == rhs.usesUniformIconSize
     }
 
     var body: some View {
@@ -8099,10 +8135,16 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
                         chromeState.selectNote(id: note.id)
                     } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: "note.text")
-                                .font(.system(size: 13, weight: .regular))
-                                .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
-                                .frame(width: 18)
+                            Group {
+                                if usesUniformIconSize {
+                                    NativeSidebarSymbol(name: "note.text")
+                                } else {
+                                    Image(systemName: "note.text")
+                                        .font(.system(size: 13, weight: .regular))
+                                        .frame(width: iconColumnWidth, height: 20)
+                                }
+                            }
+                            .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
 
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(note.title.isEmpty ? "Untitled Note" : note.title)
@@ -8157,6 +8199,7 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
                 }
             }
         }
+        .padding(.leading, leadingInset)
     }
 
     private func createNote() {
@@ -8900,12 +8943,11 @@ private struct SidebarSplitActivePaneSummary: View {
     @ViewBuilder
     private func compactLeadingIcon(label: SidebarTerminalPathLabel) -> some View {
         if let descriptor = rowState.agentIconDescriptor {
-            AgentToolIcon(descriptor: descriptor, isSelected: isSelected, palette: palette)
+            AgentToolIcon(descriptor: descriptor, isSelected: isSelected, palette: palette, glyphSizeOverride: NativeProjectSidebarLayout.iconGlyphSize)
         } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
-            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette, glyphSizeOverride: NativeProjectSidebarLayout.iconGlyphSize)
         } else {
-            Image(systemName: "terminal")
-                .font(.system(size: 13, weight: .semibold))
+            NativeSidebarSymbol(name: "terminal")
                 .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                 .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
                 .accessibilityHidden(true)
@@ -10180,12 +10222,11 @@ private struct SidebarTabRow: View {
     @ViewBuilder
     private func compactLeadingIcon(label: SidebarTerminalPathLabel, palette: SidebarPalette) -> some View {
         if let icon = rowState.agentIconDescriptor {
-            AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+            AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette, glyphSizeOverride: NativeProjectSidebarLayout.iconGlyphSize)
         } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
-            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette)
+            SidebarProgramIcon(label: label, isSelected: isSelected, palette: palette, glyphSizeOverride: NativeProjectSidebarLayout.iconGlyphSize)
         } else {
-            Image(systemName: "terminal")
-                .font(.system(size: 13, weight: .semibold))
+            NativeSidebarSymbol(name: "terminal")
                 .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
                 .frame(width: SidebarIconMetrics.programFrameSize, height: SidebarIconMetrics.programFrameSize)
                 .accessibilityHidden(true)
@@ -10586,13 +10627,14 @@ private struct AgentToolIcon: View {
     let descriptor: AgentToolIconDescriptor
     let isSelected: Bool
     let palette: SidebarPalette
+    var glyphSizeOverride: CGFloat? = nil
 
     @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
     @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let iconColor = isSelected ? palette.selectedText : palette.rowText
-        let glyphSize = SidebarIconMetrics.agentGlyphSize * CGFloat(agentGlyphScale)
+        let glyphSize = glyphSizeOverride ?? (SidebarIconMetrics.agentGlyphSize * CGFloat(agentGlyphScale))
 
         ZStack {
             if usesIconBackgroundCircles {
@@ -10624,13 +10666,14 @@ private struct SidebarProgramIcon: View {
     let label: SidebarTerminalPathLabel
     let isSelected: Bool
     let palette: SidebarPalette
+    var glyphSizeOverride: CGFloat? = nil
 
     @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
     @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
 
     var body: some View {
         let iconColor = isSelected ? palette.selectedText : palette.rowText
-        let glyphSize = SidebarIconMetrics.programGlyphSize * CGFloat(programGlyphScale)
+        let glyphSize = glyphSizeOverride ?? (SidebarIconMetrics.programGlyphSize * CGFloat(programGlyphScale))
 
         ZStack {
             if let resourceName = label.leadingIconResourceName {

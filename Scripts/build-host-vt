@@ -4,6 +4,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 revision=7aab0a0392369613472bd5dcfd66bef58e78c3ec
 zig_version=0.16.0
+# The host parses untrusted output from every session in one daemon, so the
+# library keeps Zig's runtime safety checks (bounds, overflow, unreachable).
+# cherry-vt's build script refuses an archive without this stamp.
+optimize=ReleaseSafe
 target=${1:-$(rustc -vV | sed -n 's/^host: //p')}
 case "$target" in
   aarch64-apple-darwin) zig_target=aarch64-macos ;;
@@ -51,10 +55,13 @@ if [ ! -d "$source_dir/.git" ]; then
 fi
 [ "$(git -C "$source_dir" rev-parse HEAD)" = "$revision" ] || { echo "Wrong Ghostty revision" >&2; exit 1; }
 [ -z "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ] || { echo "Ghostty source must be unmodified" >&2; exit 1; }
+# An interrupted build must not leave stamps that vouch for a partial install.
+rm -f "$prefix/SOURCE_REVISION" "$prefix/OPTIMIZE"
 (
   cd "$source_dir"
-  "$zig" build -Demit-lib-vt -Demit-xcframework=false -Doptimize=ReleaseFast \
+  "$zig" build -Demit-lib-vt -Demit-xcframework=false -Doptimize="$optimize" \
     -Dtarget="$zig_target" --prefix "$prefix"
 )
 printf '%s\n' "$revision" > "$prefix/SOURCE_REVISION"
+printf '%s\n' "$optimize" > "$prefix/OPTIMIZE"
 printf 'Built %s\n' "$prefix/lib/libghostty-vt.a"

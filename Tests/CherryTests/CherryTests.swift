@@ -10848,7 +10848,7 @@ private func isProcessAlive(_ pid: pid_t) -> Bool {
 }
 
 @MainActor
-private final class ControlServerHarness {
+final class ControlServerHarness {
     let defaultsName: String
     let defaults: UserDefaults
     let settings: AgentSettings

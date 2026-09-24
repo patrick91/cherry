@@ -4,10 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${CHERRY_CONFIGURATION:-release}"
 APP_NAME="${CHERRY_APP_NAME:-Cherry}"
-BUNDLE_ID="${CHERRY_BUNDLE_ID:-dev.patrick.cherry.local}"
+DEFAULT_BUNDLE_ID="dev.patrick.cherry.local"
+BUNDLE_ID="${CHERRY_BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
 URL_SCHEME="${CHERRY_URL_SCHEME:-cherry}"
 APPLICATION_SUPPORT_NAME="${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry}"
 CUSTOM_ICON="${CHERRY_ICON_PATH:-}"
+SKIP_HOST="${CHERRY_SKIP_HOST:-0}"
 INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
 CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
 BUILD_DIR="$ROOT/.build/install"
@@ -19,10 +21,77 @@ ICON_SOURCE="$ROOT/Sources/Cherry/Resources/AppIcon.icon"
 ICON_FALLBACK="$ROOT/Sources/Cherry/Resources/AppIcon.icns"
 ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
 ICON_NAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
+# Only the app's runtime resource bundles. After a test build the SwiftPM bin
+# directory also holds Cherry_CherryTests.bundle (recorded terminal fixtures),
+# and it keeps bundles from removed targets; neither belongs in the app.
+RESOURCE_BUNDLES="Cherry_Cherry.bundle GhosttyKit_GhosttyTerminal.bundle"
 
-if [[ -n "$CUSTOM_ICON" && ! -f "$CUSTOM_ICON" ]]; then
-  echo "Missing custom app icon: $CUSTOM_ICON" >&2
+fail() {
+  echo "$*" >&2
   exit 1
+}
+
+# Regular expressions are matched in the C locale so ranges mean ASCII.
+matches() {
+  (LC_ALL=C; [[ "$1" =~ $2 ]])
+}
+
+lowercase() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+case "$SKIP_HOST" in
+  0) BUNDLE_HOST=1 ;;
+  1) BUNDLE_HOST=0 ;;
+  *) fail "CHERRY_SKIP_HOST must be 0 or 1, not '$SKIP_HOST'" ;;
+esac
+
+# Validate everything before the long builds. CherryAppIdentity silently falls
+# back to the main Cherry's data directory and URL scheme for values it
+# rejects, so an invalid override must stop here instead.
+matches "$BUNDLE_ID" '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$' \
+  || fail "CHERRY_BUNDLE_ID may contain only letters, digits, '-' and '.'-separated components: '$BUNDLE_ID'"
+matches "$URL_SCHEME" '^[a-z][a-z0-9+.-]*$' \
+  || fail "CHERRY_URL_SCHEME must start with a lowercase letter followed by lowercase letters, digits, '+', '.' or '-': '$URL_SCHEME'"
+case "$APPLICATION_SUPPORT_NAME" in
+  ""|.|..|*/*|[[:space:]]*|*[[:space:]])
+    fail "CHERRY_APPLICATION_SUPPORT_NAME must be a single directory name without '/' or surrounding whitespace: '$APPLICATION_SUPPORT_NAME'" ;;
+esac
+if [[ "$APPLICATION_SUPPORT_NAME" != "Cherry" && "$(lowercase "$APPLICATION_SUPPORT_NAME")" == "cherry" ]]; then
+  fail "CHERRY_APPLICATION_SUPPORT_NAME '$APPLICATION_SUPPORT_NAME' is the main Cherry's data directory on a case-insensitive volume; choose a distinct name"
+fi
+case "$APP_NAME" in
+  ""|.|..|*/*) fail "CHERRY_APP_NAME must be a file name without '/': '$APP_NAME'" ;;
+esac
+if [[ "$BUNDLE_ID" != "$DEFAULT_BUNDLE_ID" ]]; then
+  if [[ "$APPLICATION_SUPPORT_NAME" == "Cherry" ]]; then
+    echo "warning: $BUNDLE_ID shares the main Cherry's application data; set CHERRY_APPLICATION_SUPPORT_NAME for a separate variant" >&2
+  fi
+  if [[ "$URL_SCHEME" == "cherry" ]]; then
+    echo "warning: $BUNDLE_ID registers the main Cherry's cherry:// URL scheme; set CHERRY_URL_SCHEME for a separate variant" >&2
+  fi
+fi
+
+if [[ -n "$CUSTOM_ICON" ]]; then
+  [[ -f "$CUSTOM_ICON" ]] || fail "Missing custom app icon: $CUSTOM_ICON"
+  # Resolve against the caller's directory before changing to $ROOT.
+  CUSTOM_ICON="$(cd "$(dirname "$CUSTOM_ICON")" && pwd)/$(basename "$CUSTOM_ICON")"
+fi
+
+if [[ "$BUNDLE_HOST" == 1 ]]; then
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+    fail "Rust (cargo and rustc) is required to build the cherry and cherry-host helpers that Persistent Sessions use.
+Install it from https://rustup.rs, or rerun with CHERRY_SKIP_HOST=1 to install Cherry without them."
+  fi
+  # Cargo's precedence for its output directory. A relative value is relative
+  # to the caller's directory; export it absolute for Scripts/build-host.
+  HOST_TARGET_DIR="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$ROOT/Host/target}}"
+  case "$HOST_TARGET_DIR" in /*) ;; *) HOST_TARGET_DIR="$PWD/$HOST_TARGET_DIR" ;; esac
+  export CARGO_TARGET_DIR="$HOST_TARGET_DIR"
 fi
 
 cd "$ROOT"
@@ -44,9 +113,17 @@ fi
 
 echo "Building with native PTY (Ghostty owns the PTY)"
 
+# The helpers build first: on a fresh checkout this downloads Zig and fetches
+# Ghostty, so a network or toolchain failure stops before the Swift build.
+if [[ "$BUNDLE_HOST" == 1 ]]; then
+  "$ROOT/Scripts/build-host" "$CONFIGURATION" \
+    || fail "Building the Persistent Sessions helpers failed. Rerun with CHERRY_SKIP_HOST=1 to install Cherry without them."
+else
+  echo "Skipping the Persistent Sessions helpers (CHERRY_SKIP_HOST=1)"
+fi
+# shellcheck disable=SC2086 # EXTRA_BUILD_ARGS is split on purpose (see above).
 swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS
 swift build -c "$CONFIGURATION" --product CherryMCP
-"$ROOT/Scripts/build-host" "$CONFIGURATION"
 
 BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
 BINARY_PATH="$BIN_DIR/Cherry"
@@ -58,24 +135,32 @@ rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"
 cp "$MCP_HELPER_PATH" "$APP_PATH/Contents/MacOS/CherryMCP"
-cp "$ROOT/Host/target/$CONFIGURATION/cherry" "$APP_PATH/Contents/MacOS/cherry"
-cp "$ROOT/Host/target/$CONFIGURATION/cherry-host" "$APP_PATH/Contents/MacOS/cherry-host"
-if ! cmp -s "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"; then
-  echo "Packaged GUI executable was overwritten; GUI and helper filenames must be distinct." >&2
-  exit 1
+if [[ "$BUNDLE_HOST" == 1 ]]; then
+  cp "$HOST_TARGET_DIR/$CONFIGURATION/cherry" "$APP_PATH/Contents/MacOS/cherry"
+  cp "$HOST_TARGET_DIR/$CONFIGURATION/cherry-host" "$APP_PATH/Contents/MacOS/cherry-host"
+  if ! cmp -s "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"; then
+    fail "Packaged GUI executable was overwritten; GUI and helper filenames must be distinct."
+  fi
+  mkdir -p "$APP_PATH/Contents/Resources/HostLicenses"
+  cp "$ROOT/Host/vendor/ghostty-vt/LICENSE" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-LICENSE"
+  cp "$ROOT/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-THIRD_PARTY_NOTICES.txt"
+  cp "$ROOT/Host/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Rust-THIRD_PARTY_NOTICES.txt"
 fi
-mkdir -p "$APP_PATH/Contents/Resources/HostLicenses"
-cp "$ROOT/Host/vendor/ghostty-vt/LICENSE" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-LICENSE"
-cp "$ROOT/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-THIRD_PARTY_NOTICES.txt"
-cp "$ROOT/Host/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Rust-THIRD_PARTY_NOTICES.txt"
 
 # CherryResources and GhosttyRuntimeResources explicitly resolve packaged
 # bundles from Contents/Resources. Native SwiftPM's generated Bundle.module
 # instead searches the app root, then the original build directory; relying on
 # that fallback makes a broken package appear to work on the build machine.
+for RESOURCE_BUNDLE in $RESOURCE_BUNDLES; do
+  [[ -d "$BIN_DIR/$RESOURCE_BUNDLE" ]] || fail "Missing resource bundle $BIN_DIR/$RESOURCE_BUNDLE"
+  cp -R "$BIN_DIR/$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
+done
 for RESOURCE_BUNDLE in "$BIN_DIR"/*.bundle; do
   [[ -e "$RESOURCE_BUNDLE" ]] || continue
-  cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
+  RESOURCE_NAME="$(basename "$RESOURCE_BUNDLE")"
+  case " $RESOURCE_BUNDLES " in *" $RESOURCE_NAME "*) continue ;; esac
+  case "$RESOURCE_NAME" in *Tests.bundle) continue ;; esac
+  echo "note: not packaging $RESOURCE_NAME; add it to RESOURCE_BUNDLES in Scripts/install-local-app if the app loads it" >&2
 done
 
 if [[ -n "$CUSTOM_ICON" ]]; then
@@ -106,6 +191,9 @@ else
   cp "$ICON_FALLBACK" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi
 
+APP_NAME_XML="$(xml_escape "$APP_NAME")"
+APPLICATION_SUPPORT_NAME_XML="$(xml_escape "$APPLICATION_SUPPORT_NAME")"
+
 cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -114,7 +202,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>$APP_NAME</string>
+  <string>$APP_NAME_XML</string>
   <key>CFBundleExecutable</key>
   <string>$GUI_EXECUTABLE</string>
   <key>CFBundleIconFile</key>
@@ -125,9 +213,9 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>$APP_NAME</string>
+  <string>$APP_NAME_XML</string>
   <key>CherryApplicationSupportName</key>
-  <string>$APPLICATION_SUPPORT_NAME</string>
+  <string>$APPLICATION_SUPPORT_NAME_XML</string>
   <key>CherryURLScheme</key>
   <string>$URL_SCHEME</string>
   <key>CFBundlePackageType</key>
@@ -177,3 +265,12 @@ fi
 
 echo "Installed $INSTALL_PATH"
 echo "Open it with: open '$INSTALL_PATH'"
+if [[ "$BUNDLE_HOST" == 0 ]]; then
+  # A packaged app only uses its bundled helper or CHERRY_CLI_PATH from its
+  # own launch environment; it ignores cherry on PATH.
+  echo "Built without the Persistent Sessions helpers, so Persistent Sessions is unavailable in this copy."
+  echo "To use helpers built elsewhere, launch the app with CHERRY_CLI_PATH set to the absolute path"
+  echo "of a cherry executable that has cherry-host beside it, while Cherry is not running:"
+  echo "  open --env CHERRY_CLI_PATH=/absolute/path/to/cherry '$INSTALL_PATH'"
+  echo "A variable exported in a shell does not reach an app opened from Finder or the Dock."
+fi

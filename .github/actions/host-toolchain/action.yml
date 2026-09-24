@@ -1,0 +1,79 @@
+name: Host toolchain
+description: >-
+  Install the pinned Rust toolchain and restore the pinned Ghostty VT library
+  from the Actions cache, building it (and caching the Zig download) only when
+  Scripts/build-host-vt changed.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git curl xz-utils
+
+    - name: Install Rust
+      shell: bash
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
+        rustup default 1.94.0
+
+    # The revision and Zig version are pinned in Scripts/build-host-vt, so its
+    # digest identifies the library. The Zig archive is keyed on its version.
+    - name: Resolve pinned inputs
+      id: pins
+      shell: bash
+      run: |
+        echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+        echo "zig=$(sed -n 's/^zig_version=//p' Scripts/build-host-vt)" >> "$GITHUB_OUTPUT"
+        if command -v sha256sum >/dev/null 2>&1; then
+          digest=$(sha256sum Scripts/build-host-vt | cut -d ' ' -f 1)
+        else
+          digest=$(shasum -a 256 Scripts/build-host-vt | cut -d ' ' -f 1)
+        fi
+        echo "script=$digest" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Ghostty VT library
+      id: vt
+      uses: actions/cache/restore@v4
+      with:
+        path: Host/vendor/ghostty-vt/${{ steps.pins.outputs.triple }}
+        key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.script }}
+
+    - name: Restore Zig download
+      id: zig
+      if: steps.vt.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: Host/vendor/ghostty-vt/.cache/zig-*-${{ steps.pins.outputs.zig }}.tar.xz
+        key: zig-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.zig }}
+
+    - name: Build pinned Ghostty VT library
+      if: steps.vt.outputs.cache-hit != 'true'
+      shell: bash
+      run: Scripts/build-host-vt
+
+    # Save right away rather than in a post step, which only runs when the
+    # whole job succeeds; a failing test must not force the next run to
+    # rebuild the library.
+    - name: Save Zig download
+      if: steps.vt.outputs.cache-hit != 'true' && steps.zig.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: Host/vendor/ghostty-vt/.cache/zig-*-${{ steps.pins.outputs.zig }}.tar.xz
+        key: ${{ steps.zig.outputs.cache-primary-key }}
+
+    - name: Save Ghostty VT library
+      if: steps.vt.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: Host/vendor/ghostty-vt/${{ steps.pins.outputs.triple }}
+        key: ${{ steps.vt.outputs.cache-primary-key }}

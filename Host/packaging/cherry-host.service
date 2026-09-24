@@ -1,10 +1,32 @@
+# Cherry persistent terminal host as a systemd user service.
+#
+# Install with cherry-host in ~/.local/bin (edit ExecStart otherwise):
+#   mkdir -p ~/.config/systemd/user
+#   cp cherry-host.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cherry-host.service
+# `loginctl enable-linger` keeps the user service manager, and so this
+# daemon, running after the last login ends.
+#
+# `serve` takes no --socket: it listens on the default socket
+# (/tmp/cherry-host-<uid>/host.sock, or $CHERRY_HOST_SOCKET), which is where
+# `cherry` and the SSH gateway (`cherry-host gateway`) look without flags.
+
 [Unit]
 Description=Cherry persistent terminal host
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cherry-host serve
+# A new daemon cannot recover the jobs of one that exited or crashed, so an
+# automatic restart would only hide the loss.
 Restart=no
+# Stop signals only the daemon. Its sessions end when it closes their PTYs,
+# as without systemd. Processes that hosted sessions deliberately detached
+# into their own session (tmux or pm2 servers, `emacs --daemon`,
+# `setsid nohup job &`) stay in this unit's cgroup but are not killed with it.
+# systemd logs them as left-over processes when the unit starts again.
+KillMode=process
 
 [Install]
 WantedBy=default.target

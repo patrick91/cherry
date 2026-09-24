@@ -618,11 +618,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         inMemorySession = nextSession
         outputSink.setSession(nextSession)
 
-        if let terminalSession = proxy.session {
+        // Every reset is followed by startShell, which rebuilds a native surface
+        // with fresh options. Assigning them here would rebuild it once more
+        // when they changed (after a `cd` or a command edit), spawning an extra
+        // shell or command that the relaunch kills straight away.
+        if !isNativePTYBacked, let terminalSession = proxy.session {
             terminalView.configuration = Self.makeOptions(
                 for: terminalSession,
                 inMemorySession: nextSession,
-                useNativePTY: isNativePTYBacked
+                useNativePTY: false
             )
         }
         lastReplayedGridSize = nil
@@ -757,9 +761,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// command produces an equivalent configuration — so force the rebuild.
     /// Tearing down the old surface closes its PTY, which also terminates a
     /// still-running child before the new one spawns.
+    ///
+    /// ghostty routes queued surface messages by surface address, and the
+    /// replacement surface is often allocated at the freed one's address. A
+    /// child that already exited (e.g. one `stop()` just signalled) has queued
+    /// `child_exited`; delivered after the rebuild, it would end the new launch
+    /// and mark the new surface's child as exited. Free the old surface and
+    /// drain the app mailbox first, so those messages are dropped.
     func relaunchNativeSurface() {
         guard !isReleased, let session = proxy.session else { return }
         isNativePTYBacked = true
+        terminalView.freeSurface()
+        terminalView.controller?.tick()
         terminalView.relaunchSurface(
             configuration: Self.makeOptions(
                 for: session,

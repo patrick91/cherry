@@ -453,7 +453,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
         case .restartProcess(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            restartProcess(session)
+            try restartProcess(session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .restartProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
         case .closeProcess(let request):
@@ -807,7 +807,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(terminalID: session.id.uuidString, cleared: true)))
         case .restartTerminal(let request):
             let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            session.restart()
+            try restartProcess(session)
             return .init(result: .restartTerminal(summary(for: session, workspace: sessionWorkspace)))
         case .closeTerminal(let request):
             let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
@@ -1191,7 +1191,8 @@ final class CherryControlServer: @unchecked Sendable {
             agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
             usesAlternateScreen: session.usesAlternateScreen,
             lastContentChangeAt: session.lastContentChangeAt,
-            contentVersion: session.contentVersion
+            contentVersion: session.contentVersion,
+            failureMessage: session.state.failureMessage
         )
     }
 
@@ -1339,11 +1340,18 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func startProcess(_ request: ProcessLifecycleRequest, workspace: TerminalWorkspace) throws -> TerminalSession {
         if let session = try? resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName) {
+            try rejectEndedHostedSession(session)
             switch session.state {
             case .launching, .live:
                 return session
+            case .disconnected:
+                session.reconnectHostedSession()
+                return session
             case .exited, .failed:
-                if session.kind == .command {
+                if session.hostedAttachment != nil {
+                    // A failed attach; an ended session was rejected above.
+                    session.reconnectHostedSession()
+                } else if session.kind == .command {
                     session.restartManagedCommandIfNeeded()
                 } else {
                     session.restart()
@@ -1509,6 +1517,8 @@ final class CherryControlServer: @unchecked Sendable {
             switch session.state {
             case .exited, .failed:
                 return result(reason: .exited)
+            case .disconnected:
+                return result(reason: .disconnected)
             case .launching, .live:
                 break
             }
@@ -1589,11 +1599,24 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func stopProcess(_ session: TerminalSession) {
+        // A hosted tab is a terminal: stopping it ends only the local attach
+        // client, so it reports `disconnected` and its program keeps running.
         if session.kind == .command {
             session.stopManagedCommand()
         } else {
             session.stop()
         }
+    }
+
+    /// A hosted session that ended on its host cannot be started again; a
+    /// silent no-op would leave the caller waiting on an exited process.
+    @MainActor
+    private func rejectEndedHostedSession(_ session: TerminalSession) throws {
+        guard session.hostedAttachment != nil, session.hostedSessionEnded else { return }
+        throw CherryControlError(
+            code: "hosted_session_ended",
+            message: "Persistent session '\(session.title)' ended on its host and cannot be restarted. Create a new session instead."
+        )
     }
 
     @MainActor
@@ -1628,11 +1651,13 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func restartProcess(_ session: TerminalSession) {
-        if session.kind == .command {
-            session.restart()
-        } else {
-            session.restart()
+    private func restartProcess(_ session: TerminalSession) throws {
+        // Restarting a hosted tab reconnects its attach client. A connected
+        // tab may learn that its session ended only when restart() stops the
+        // adapter and reads the outcome it wrote.
+        try rejectEndedHostedSession(session)
+        if !session.restart() {
+            try rejectEndedHostedSession(session)
         }
     }
 
@@ -2279,7 +2304,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         while true {
             switch session.state {
-            case .exited, .failed:
+            case .exited, .failed, .disconnected:
                 return
             case .launching, .live:
                 break

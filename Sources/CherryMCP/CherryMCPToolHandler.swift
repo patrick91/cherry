@@ -86,12 +86,12 @@ public enum CherryMCPTools {
         ),
         tool(
             "list_processes",
-            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes agent_activity_state for agents (working, idle, permission = blocked on approval, error), uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn).",
+            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes state (launching, live, exit N, failed = the launch failed or a persistent-session tab could not attach, with failure_message saying why, or disconnected = a persistent-session tab whose attach client stopped while its hosted program may still run; it has no exit_code), agent_activity_state for agents (working, idle, permission = blocked on approval, error), uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn).",
             properties: ["kind": string("Optional process kind filter: terminal, agent, or command.")]
         ),
         tool(
             "get_process_status",
-            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. For agents, agent_activity_state is working, idle, permission (blocked on approval), or error. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn).",
+            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. state is launching, live, exit N, failed (the launch failed, or a persistent-session tab could not attach; failure_message says why), or disconnected (a persistent-session tab whose attach client stopped; the hosted program may still run, so there is no exit_code). For agents, agent_activity_state is working, idle, permission (blocked on approval), or error. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn).",
             properties: processSelectorProperties(),
             required: []
         ),
@@ -122,7 +122,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "wait_for_process_idle",
-            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval and agent_error when it hit an error.",
+            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
             properties: idleWaitProperties()
         ),
         tool(
@@ -186,22 +186,22 @@ public enum CherryMCPTools {
         ),
         tool(
             "start_process",
-            "Start an existing stopped process, or start a configured command/agent by process_name and kind, without selecting it.",
+            "Start an existing stopped process, or start a configured command/agent by process_name and kind, without selecting it. A persistent-session tab that is disconnected or could not attach is reconnected; one whose session ended on its host is rejected with hosted_session_ended.",
             properties: processSelectorProperties(lifecycleProperties())
         ),
         tool(
             "stop_process",
-            "Stop one process by process_id or process_name without selecting it.",
+            "Stop one process by process_id or process_name without selecting it. For a persistent-session tab this only disconnects the tab (state becomes disconnected); the hosted program keeps running on its host.",
             properties: processSelectorProperties(lifecycleProperties())
         ),
         tool(
             "restart_process",
-            "Restart one process by process_id or process_name without selecting it.",
+            "Restart one process by process_id or process_name without selecting it. For a persistent-session tab this reconnects its attach client; one whose session ended on its host is rejected with hosted_session_ended.",
             properties: processSelectorProperties(lifecycleProperties())
         ),
         tool(
             "close_process",
-            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy.",
+            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy. Closing a persistent-session tab disconnects it; the hosted program keeps running on its host.",
             properties: processSelectorProperties([
                 "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
             ])

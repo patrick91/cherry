@@ -20,6 +20,21 @@ ignored. `ZIG`, `GHOSTTY_SRC`, and `CHERRY_VT_BUILD_CACHE` optionally select
 existing build inputs; their version, revision, and clean source state are
 checked. `CHERRY_GHOSTTY_VT_DIR` overrides the installed prefix for Cargo.
 
+The library is built with `-Doptimize=ReleaseSafe`: the daemon parses untrusted
+output from every session, so Zig's runtime safety checks (bounds, overflow,
+unreachable) stay on. After a successful build the script writes two stamps
+into the prefix, `SOURCE_REVISION` (the Ghostty revision) and `OPTIMIZE`
+(`ReleaseSafe`); it deletes both before building, so an interrupted build
+leaves none. `cherry-vt`'s build script refuses an archive whose stamps are
+missing or different, including one built before the stamps existed, and asks
+for `Scripts/build-host-vt` to be run. A prefix given with
+`CHERRY_GHOSTTY_VT_DIR` needs the same stamps. `Scripts/build-host` and
+`Scripts/test-host-linux` rebuild the library in this directory when it is
+missing or its stamps do not match; `Scripts/build-host` skips that check when
+`CHERRY_GHOSTTY_VT_DIR` is set. CI caches the built library keyed on the digest
+of `Scripts/build-host-vt`, so a change to the pinned revision, Zig version, or
+optimize mode rebuilds it.
+
 Supported host targets are macOS arm64/x86_64 and GNU Linux arm64/x86_64.
 Linux library builds target glibc 2.31; the final Rust binary must also be built
 against an appropriate sysroot/container. Alpine/musl is not supported yet.

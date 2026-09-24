@@ -5,43 +5,87 @@ the design reference, not a claim that every proposed feature has shipped.
 
 ## Implementation status
 
-The Rust workspace in `Host/` implements the local daemon, persistent PTYs,
-pinned headless Ghostty state, framed Unix-socket/SSH transport, and the
-`cherry` create/list/attach/kill/remove/shutdown CLI. The Mac app exposes these
-through **Persistent Sessions…** with saved SSH destinations and explicit
-disconnect/reconnect. Existing native local project terminals are unchanged.
-Build, install, service setup, commands, and current bounds are documented in
-[Host/README.md](../../Host/README.md).
+The Rust workspace in `Host/` implements the daemon (`cherry-host`), persistent
+PTYs, pinned headless Ghostty state (`cherry-vt`, built as ReleaseSafe from a
+pinned revision), a framed Unix-socket transport with an SSH stdio gateway, and
+the `cherry` start/list/new/attach/kill/remove/shutdown CLI. The Mac app exposes
+these through **Persistent Sessions…** with saved SSH destinations, pinned host
+identities, explicit disconnect/reconnect, and takeover. Existing native local
+project terminals are unchanged. Build, install, service setup, commands, and
+current bounds are documented in [Host/README.md](../../Host/README.md); where it
+differs from the design below, it describes current behaviour.
 
-Multiple terminals can attach to one session and type into it concurrently.
-The host uses the minimum requested columns and rows across attached clients;
-larger views display the shared active screen at the top left. A larger view's
-native terminal scrollback is unavailable while its dimensions differ from the
-shared grid. Matching views retain ordinary stream/snapshot history, and the
-grid grows again when smaller clients disconnect. The CLI's optional
-`attach --takeover` explicitly disconnects other clients; ordinary Mac app
-Attach and Reconnect keep them connected.
+What exists, relative to the design:
 
-Workloads survive app exit and SSH disconnection while the daemon remains alive; it
-does not recover jobs after a daemon crash or reboot. Linux logout policies
-may require the supplied systemd user service and lingering. Upgrades require
-finishing running jobs and shutting down the old daemon; there is no hot
-upgrade. Shared attachments require protocol version 2: finish existing jobs
-and shut down a version 1 daemon with the old client before updating both
-helpers. The new client never automatically kills an incompatible daemon.
-Remote project/Git/worktree integration, previews, port forwarding,
-file transfer, automatic reconnect, and remote MCP support remain deferred.
+- **Protocol.** Version 3, exact match only. There is no capability negotiation
+  and no compatibility with earlier versions: a client or gateway that finds a
+  daemon speaking another version refuses it and never stops or replaces it.
+  Frames are length-prefixed JSON with base64 terminal bytes.
+- **Ownership.** Clients trust a socket only in a private directory owned by the
+  user, served by a process of the same user; the daemon drops other users'
+  connections. Host identity, lock, and log live in a durable per-user state
+  directory, so the identity survives daemon restarts, reboots, and `/tmp`
+  cleanup.
+- **Environment.** The daemon runs with an allowlisted environment and working
+  directory `/`. Clients pass only locale and time zone. Sessions get a stable
+  `SSH_AUTH_SOCK` link that `new` and `attach` repoint at the caller's agent
+  while the caller is connected, plus a 2-second grace period; over SSH only
+  `attach` forwards one (other commands run `ssh -a`).
+  Working directories are absolute, `~`, or `~/…`, resolved on the host.
+- **Shared attachment.** Several terminals attach to one session and type
+  concurrently (the delivery plan below had deferred multi-writer sessions). The
+  minimum requested columns and rows set the shared grid, applied once the
+  requested size settles; larger views paint the shared active screen at the
+  top left without native scrollback. `attach --takeover` (Attach & Take Over
+  in the app) disconnects the others.
+- **Liveness and flow control.** Attached clients send heartbeats and silent
+  ones are evicted, except while the host holds back their input. A lagging
+  client's queued output is dropped and replaced by a fresh snapshot, followed
+  by the live-only output it missed (titles, clipboard writes, notifications),
+  rather than disconnecting it; forwarded queries wait for the resync and
+  follow it once. Input backpressure paces large pastes, and Detach is ordered
+  after earlier input. Snapshots are limited to 8 MiB by dropping the oldest
+  history.
+- **Termination.** Kill escalates from SIGHUP to SIGTERM to SIGKILL across the
+  session's processes. A natural exit is a hangup, so `nohup`'d jobs survive.
+  Signal deaths report 128 plus the signal, with the signal itself.
+- **Queries.** The host answers a fixed set of terminal queries, also while
+  detached, and sends the rest to one attached client whose terminal answers
+  queries (the one that typed last, or else the most recently attached), so
+  a query gets one reply, not one from each client. Clients without a
+  terminal (scripted input, redirected output) are never asked. With no such
+  client attached, queries get no reply.
+- **SSH.** The gateway prints a preamble line, so output from remote shell
+  startup files is skipped or reported clearly. Management commands use batch
+  authentication, and the client never becomes an SSH ControlMaster. Kill,
+  remove, and shutdown never start a daemon.
+- **Service setup.** A systemd user unit (`Restart=no`, `KillMode=process`) is
+  provided; while it is enabled, clients start it instead of a daemon of their
+  own. No launchd agent is provided for macOS.
+
+Remote project/Git/worktree integration, previews, port forwarding, file
+transfer, automatic reconnect, remote MCP support, daemon-crash and reboot
+recovery, and hot upgrades remain deferred. There is no event channel: each
+attached tab runs its own `cherry` process, and its own SSH connection unless
+the user's SSH configuration multiplexes them. Linux logout policies may require
+the systemd user service and lingering. Updating requires finishing running jobs
+and shutting down the old daemon with the old binaries, before installing the
+new ones.
 
 `Scripts/package-dmg` builds a self-contained Mac test app and disk image with
-both helpers. Local persistent sessions require no separate CLI installation.
+both helpers, and `Scripts/install-local-app` bundles them too (it needs Rust
+unless `CHERRY_SKIP_HOST=1`). Local persistent sessions require no separate CLI
+installation.
 
-VT tests cover terminal queries while detached, UTF-8, resizing, snapshots,
-and a real Neovim alternate-screen round trip. The snapshot has documented
-limits for graphics, palette/theme state, cursor shape, OSC 7, and legacy
-alternate-screen/saved-cursor behavior. CI is configured for native macOS
-arm64 and GNU Linux x86_64/arm64; its configuration is not a completed CI run.
-The Ghostty library targets glibc 2.31, while complete Linux binaries have
-been exercised on Debian 12 rather than validated against that minimum.
+VT tests cover terminal queries while detached, UTF-8, resizing, snapshots with
+exact row positions and styles, and a real Neovim alternate-screen round trip;
+host tests reattach Neovim at a new size. The snapshot has documented limits for
+graphics, palette/theme state, cursor shape, OSC 7, an inactive alternate
+screen, hyperlink ids, and prompt marks. CI is configured for native macOS
+arm64 and GNU Linux x86_64/arm64, a real SSH client-to-Linux test, and the Mac
+app's hosted-session tests on macOS 26; its configuration is not a completed
+CI run. The Ghostty library targets glibc 2.31, while complete Linux binaries
+have been exercised on Debian 12 rather than validated against that minimum.
 
 ## User outcome
 
@@ -100,8 +144,10 @@ until explicitly recreated under the host.
   (connecting/connected/disconnected). Exiting SSH is not evidence of shell exit.
 - Share input and output among attached clients. The minimum requested columns
   and rows determine the canonical terminal size. Size changes publish an
-  ordered snapshot to every attachment; a client whose physical size differs
-  renders a bounded viewport. Explicit takeover can disconnect other clients.
+  ordered snapshot to every attachment: the screens only, except a full
+  snapshot for a window that leaves viewport rendering; a newer one supersedes
+  an older one still queued. A client whose physical size differs renders a
+  bounded viewport. Explicit takeover can disconnect other clients.
 - Never automatically resend keyboard input after connection loss. A control
   operation with an uncertain outcome must be reconciled by ID/state; retries of
   session creation must not launch duplicate processes.

@@ -6,6 +6,8 @@
   `TerminalSurfaceView` -> `GhosttyTerminalContainerView` -> `GhosttySessionBridge` -> `GhosttyTerminal.TerminalView`.
 - `TerminalCanvasView` in `TerminalSurface.swift` is the fallback/prototype renderer and input path. Do not assume changes there affect the default running app.
 - Running sessions default to the native PTY (`.nativePTY` / `.exec`) backend: Ghostty owns process I/O, terminal state, and rendering. Cherry reads screen text for its content model. The host-managed path and injected test output still use Cherry's terminal buffer; do not assume its parser or output-coalescing delays affect native Neovim sessions. Check `usesNativePTYBackend` when investigating performance or input.
+- Ghostty routes queued surface messages by surface address, and a replacement surface usually reuses the freed one's address. Freeing a native surface and creating another on the same bridge (one `TerminalController` per bridge) in one main-thread turn can deliver the old surface's pending `child_exited`/`close` to the new one and end its launch; drain with `controller.tick()` in between, as `relaunchNativeSurface` does.
+- After init, a native EXEC surface is rebuilt only by `GhosttySessionBridge.relaunchNativeSurface`. Assigning changed options to an EXEC surface (`terminalView.configuration`) rebuilds it, which spawns a child, so `reset()` leaves a native surface's options alone (`startShell` relaunches it).
 
 ## Keyboard Input
 

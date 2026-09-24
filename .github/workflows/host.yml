@@ -6,15 +6,21 @@ on:
       - "Host/**"
       - "Scripts/*host*"
       - ".github/workflows/host.yml"
+      - ".github/actions/host-toolchain/**"
   pull_request:
     paths:
       - "Host/**"
       - "Scripts/*host*"
       - ".github/workflows/host.yml"
+      - ".github/actions/host-toolchain/**"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   test:
@@ -26,20 +32,29 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.94.0
-      - name: Install Linux dependencies
+      - name: Install Rust and the pinned Ghostty VT library
+        uses: ./.github/actions/host-toolchain
+      # apt's Neovim (0.6 on 22.04, 0.9 on 24.04) predates the terminal
+      # queries current Neovim sends at startup. Keep the version and digests
+      # in sync with Host/tests/Dockerfile.
+      - name: Install Neovim on Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git curl xz-utils neovim
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; digest=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875 ;;
+            aarch64) arch=arm64; digest=1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725 ;;
+            *) echo "No pinned Neovim build for $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/nvim.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-$arch.tar.gz"
+          echo "$digest  $archive" | sha256sum -c -
+          sudo mkdir -p /opt/nvim
+          sudo tar -xzf "$archive" -C /opt/nvim --strip-components=1
+          sudo ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
       - name: Install Neovim on macOS
         if: runner.os == 'macOS'
         run: brew list --versions neovim || brew install neovim
-      - name: Build pinned Ghostty VT library
-        run: Scripts/build-host-vt
       - name: Check formatting
         run: cargo fmt --manifest-path Host/Cargo.toml --all -- --check
       - name: Lint
@@ -49,6 +64,23 @@ jobs:
       - name: Build host and client
         run: cargo build --manifest-path Host/Cargo.toml --locked --bins
       - name: Exercise real host reconnect
-        run: cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_host -- --ignored
+        run: cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_host -- --ignored --test-threads=1
+      # Every ignored test in cherry-host and cherry-vt runs here, including
+      # any host-level Neovim test.
       - name: Exercise real Neovim restoration
-        run: cargo test --manifest-path Host/Cargo.toml --locked -p cherry-vt --test neovim -- --ignored
+        run: |
+          nvim --version | head -n 1
+          cargo test --manifest-path Host/Cargo.toml --locked -p cherry-host -p cherry-vt -- --ignored --test-threads=1
+
+  ssh:
+    name: SSH client to a Linux host
+    # Runs the Debian 12 Docker suite (Scripts/test-host-linux), then the real
+    # SSH, gateway and Neovim test against that container with disposable keys.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and the pinned Ghostty VT library
+        uses: ./.github/actions/host-toolchain
+      - name: Test through SSH
+        run: Scripts/test-host-ssh

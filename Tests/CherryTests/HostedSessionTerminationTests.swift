@@ -16,6 +16,11 @@ private struct HostedTerminationFixture {
         #!/bin/sh
         cd \(path) || exit 90
         printf '%s\\n' "$*" >> calls
+        if [ -f killed ] && [ '\(behavior)' = failpoll ]; then
+          printf 'cherry: interrupted by signal 15; the host session was not terminated\\n' >&2
+          exit 143
+        fi
+        if [ -f killed ] && [ '\(behavior)' = hangpoll ]; then exec /bin/sleep 10; fi
         case " $* " in
           *" kill session-a "*) : > killed; exit 0 ;;
           *" list --json "*) ;;
@@ -37,7 +42,7 @@ private struct HostedTerminationFixture {
         """
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        client = HostedSessionClient(executableURL: executable, timeout: 2)
+        client = HostedSessionClient(executableURL: executable, timeout: 2, loginEnvironment: { _ in .init(environment: [:]) })
     }
 
     func cleanUp() { try? FileManager.default.removeItem(at: directory) }
@@ -52,7 +57,9 @@ private struct HostedTerminationFixture {
 @MainActor func HostedSessionTerminationWaitsForItsSessionWithoutRetryingKill(behavior: String) async throws {
     let fixture = try HostedTerminationFixture(behavior: behavior)
     defer { fixture.cleanUp() }
-    let controller = HostedSessionsController(clientProvider: { fixture.client })
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let controller = HostedSessionsController(clientProvider: { fixture.client }, hostStore: store)
     let host = try HostedSessionHost.ssh("devbox")
     await controller.refresh(host)
     let target = try #require(controller.sessions.first { $0.id == "session-a" })
@@ -73,7 +80,9 @@ private struct HostedTerminationFixture {
 @Test @MainActor func HostedSessionTerminationRejectsReplacementHostIdentity() async throws {
     let fixture = try HostedTerminationFixture(behavior: "identity")
     defer { fixture.cleanUp() }
-    let controller = HostedSessionsController(clientProvider: { fixture.client })
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let controller = HostedSessionsController(clientProvider: { fixture.client }, hostStore: store)
     await controller.refresh(.local)
     let target = try #require(controller.sessions.first { $0.id == "session-a" })
 
@@ -90,7 +99,11 @@ private struct HostedTerminationFixture {
 @Test @MainActor func HostedSessionTerminationBoundsExitWaitAndReleasesBusyState() async throws {
     let fixture = try HostedTerminationFixture(behavior: "running")
     defer { fixture.cleanUp() }
-    let controller = HostedSessionsController(clientProvider: { fixture.client }, terminationTimeout: 0.35)
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let controller = HostedSessionsController(
+        clientProvider: { fixture.client }, hostStore: store, terminationTimeout: 0.35
+    )
     await controller.refresh(.local)
     let target = try #require(controller.sessions.first { $0.id == "session-a" })
     let started = Date()
@@ -107,7 +120,9 @@ private struct HostedTerminationFixture {
 @Test @MainActor func HostedSessionTerminationCancellationReleasesBusyState() async throws {
     let fixture = try HostedTerminationFixture(behavior: "running")
     defer { fixture.cleanUp() }
-    let controller = HostedSessionsController(clientProvider: { fixture.client })
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let controller = HostedSessionsController(clientProvider: { fixture.client }, hostStore: store)
     await controller.refresh(.local)
     let target = try #require(controller.sessions.first { $0.id == "session-a" })
     let operation = Task { await controller.terminate(target, on: .local) }
@@ -121,5 +136,30 @@ private struct HostedTerminationFixture {
 
     #expect(!controller.isBusy)
     #expect(controller.error == nil)
+    #expect(fixture.calls.filter { $0.contains(" kill ") }.count == 1)
+}
+
+@Test(arguments: ["failpoll", "hangpoll"])
+@MainActor func HostedSessionTerminationPollFailureDoesNotClaimTheSessionSurvived(behavior: String) async throws {
+    let fixture = try HostedTerminationFixture(behavior: behavior)
+    defer { fixture.cleanUp() }
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let controller = HostedSessionsController(
+        clientProvider: { fixture.client }, hostStore: store, terminationTimeout: 0.5
+    )
+    await controller.refresh(.local)
+    let target = try #require(controller.sessions.first { $0.id == "session-a" })
+    let started = Date()
+
+    await controller.terminate(target, on: .local)
+
+    #expect(Date().timeIntervalSince(started) < 4)
+    // The host accepted the kill; a failed or timed-out confirmation poll must
+    // not surface the helper's "was not terminated" interruption text.
+    #expect(controller.error?.contains("Termination was requested") == true)
+    #expect(controller.error?.contains("not terminated") == false)
+    #expect(!controller.isBusy)
+    #expect(controller.hostID == "host-a")
     #expect(fixture.calls.filter { $0.contains(" kill ") }.count == 1)
 }

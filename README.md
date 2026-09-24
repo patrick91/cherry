@@ -30,11 +30,21 @@ worktrees. The sliders button opens a temporary dogfooding panel for tuning the
 swipe trigger distance and settle duration. Quick flicks can commit below the
 distance threshold based on their velocity.
 
-## Local Install
+## Persistent Sessions
 
-For opt-in sessions that survive app exit or SSH disconnection, open
-**File → Persistent Sessions…** (`Cmd-Shift-R`). The portable Mac/Linux host,
-installation, CLI commands, and current limits are documented in
+Persistent sessions are an opt-in alternative to ordinary tabs. A Rust daemon,
+`cherry-host`, owns each session's PTY and a headless Ghostty terminal, on this
+Mac or on a Mac or Linux machine reached over SSH; the `cherry` client attaches
+to it. Closing the tab, quitting Cherry, or losing SSH leaves the program
+running, and attaching again restores its screen. Several terminals can attach
+to one session and type into it; the shared terminal fits the smallest one.
+Sessions do not survive a daemon crash or restart, or a reboot of the host.
+Existing local tabs are unchanged.
+
+Open **File → Persistent Sessions…** (`Cmd-Shift-R`), choose **This Mac** or add
+an SSH destination, then create or attach to a session. A remote machine needs
+`cherry-host` on its SSH command `PATH`. Building the host, the `cherry` CLI,
+service setup, the protocol, and current limits are documented in
 [Host/README.md](Host/README.md).
 
 To build a disk image for testing on this Mac:
@@ -44,19 +54,34 @@ Scripts/package-dmg
 open "dist/Cherry Sessions-$(uname -m).dmg"
 ```
 
-Drag **Cherry Sessions** into Applications. This test build has a distinct icon,
-bundle identifier (`dev.patrick.cherry.sessions`), settings, and private app data,
-so it can run alongside Cherry. The app includes its persistent-session helpers;
-no separate CLI installation is needed for **This Mac**. Create a persistent
-session, close Cherry Sessions, then reopen and attach to the same running session.
-Multiple devices can stay attached and type into one session. This is a local
-test build, signed ad-hoc by default and not notarized. See the host guide before
-upgrading an already-running session daemon.
+Drag **Cherry Sessions** into Applications and open it from there; **This Mac**
+sessions are unavailable while the app runs from the disk image. This test build
+has a distinct icon, bundle identifier (`dev.patrick.cherry.sessions`), settings,
+and Application Support folder, so it can run alongside Cherry. Its sessions
+are not separate: both apps use the same local session daemon
+(`/tmp/cherry-host-<uid>/host.sock`), so **This Mac** shows the same sessions
+in each. The daemon runs the `cherry-host` of whichever app started it and
+serves both, so build both from the same version. The app includes its
+persistent-session helpers; no separate CLI installation is needed for
+**This Mac**. Create a persistent session, close Cherry Sessions, then reopen and
+attach to the same running session. Multiple devices can stay attached and type
+into one session. This is a local test build, signed ad-hoc by default and not
+notarized. The disk image always includes the helpers, so building it needs the
+same tools as the installer below. Replacing the app does not replace a session
+daemon that is already running, and the new version can neither use nor stop
+it. Before updating, finish or terminate your sessions and stop the daemon with
+the app you still have, for example
+`"/Applications/Cherry Sessions.app/Contents/MacOS/cherry" shutdown` (and
+`… --host your-host shutdown` for each remote host); see the host guide.
 
 Packaging verifies the copied app can open a terminal and render shell output
-with access to the source checkout blocked. This requires a logged-in macOS GUI
-session. To repeat the standalone check, run
-`Scripts/test-packaged-app "/path/to/Cherry Sessions.app"`.
+with access to the source checkout blocked, and that its bundled `cherry` and
+`cherry-host` can start a daemon on a private socket and create, list, kill, and
+remove a session. This requires a logged-in macOS GUI session. To repeat the
+standalone check, run `Scripts/test-packaged-app "/path/to/Cherry Sessions.app"`
+(add `--skip-helpers` for an app built with `CHERRY_SKIP_HOST=1`).
+
+## Local Install
 
 Build and install a local `.app` copy into `~/Applications`:
 
@@ -65,12 +90,56 @@ Scripts/install-local-app
 open ~/Applications/Cherry.app
 ```
 
+The installer also builds the `cherry` and `cherry-host` helpers that
+Persistent Sessions uses and bundles them inside the app. That needs Rust
+(`cargo` and `rustc`, from [rustup.rs](https://rustup.rs)) and the Xcode
+command-line tools. The first build also needs network access:
+`Scripts/build-host-vt` downloads a checksum-pinned Zig 0.16.0 and fetches a
+pinned Ghostty revision, and Cargo fetches crates. Later builds reuse them.
+The helpers are built into `CARGO_TARGET_DIR` (or `CARGO_BUILD_TARGET_DIR`)
+when set, otherwise `Host/target`. To install without the helpers, and without
+Rust:
+
+```bash
+CHERRY_SKIP_HOST=1 Scripts/install-local-app
+```
+
+Persistent Sessions is then unavailable in that copy: the default release build
+uses only the `cherry` bundled beside it, never one on `PATH`. To use helpers
+built elsewhere, quit the app and relaunch it with
+`open --env CHERRY_CLI_PATH=/absolute/path/to/cherry ~/Applications/Cherry.app`.
+That `cherry` starts the daemon from `CHERRY_HOST_PATH`, else the `cherry-host`
+beside it, else one on your login shell's `PATH`. The lookup is described in
+[Host/README.md](Host/README.md#use-in-the-mac-app).
+
 Run the installer again after making changes to replace the installed copy.
-You can customize the destination/name if you want a separate dogfood build:
+You can customize the destination and name:
 
 ```bash
 CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
 ```
+
+That copy keeps the default bundle identifier, so it shares the installed
+Cherry's settings and data. For a separate dogfood build, also set its own
+`CHERRY_BUNDLE_ID`, `CHERRY_APPLICATION_SUPPORT_NAME` (the folder in
+`~/Library/Application Support`), and `CHERRY_URL_SCHEME` (its deep links and
+MCP server name); the installer warns when a non-default bundle identifier
+still shares Cherry's data folder or `cherry://` scheme:
+
+```bash
+CHERRY_APP_NAME="Cherry Local" CHERRY_BUNDLE_ID=com.example.cherry-local \
+  CHERRY_APPLICATION_SUPPORT_NAME="Cherry Local" CHERRY_URL_SCHEME=cherry-local \
+  Scripts/install-local-app
+```
+
+The installer checks these values before building and stops on an invalid
+one: the bundle identifier uses letters, digits, and `-` in `.`-separated
+parts; the URL scheme starts with a lowercase letter followed by lowercase
+letters, digits, `+`, `.`, or `-`; the app and folder names are single names
+without `/`, and the folder name has no surrounding spaces and may not differ
+from `Cherry` only by case. `CHERRY_ICON_PATH` sets an `.icns` icon; a relative
+path is relative to your current directory. A build whose Info.plist holds an
+invalid folder name or scheme logs a warning and uses Cherry's.
 
 Installed builds keep recently-used Ghostty terminal surfaces alive across tab
 switches (no per-switch replay). To build the older replay-on-switch behavior

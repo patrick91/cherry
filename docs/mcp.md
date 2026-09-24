@@ -64,6 +64,35 @@ Use process tools for new automation:
 The older terminal-tab MCP namespace has been removed. Use `process_id` with the
 process tools instead.
 
+## Process States
+
+Every process summary has a `state`:
+
+- `launching`, `live`, or `exit N` (the process ended with status `N`, also
+  reported as `exit_code`).
+- `failed`: the launch failed, or a persistent-session tab could not attach to
+  its hosted session. `failure_message` says why.
+- `disconnected`: a persistent-session tab whose attach client stopped (after
+  `stop_process` or Disconnect, a lost connection, or another client taking the
+  session over). The hosted program may still be running on its host, so there
+  is no `exit_code`.
+
+A persistent-session tab reports `exit N` only when its hosted program ended.
+`stop_process` on such a tab disconnects it and leaves the program running;
+`close_process` disconnects it and closes the tab, and the program also keeps
+running. `start_process` reconnects a tab that is `disconnected` or `failed`,
+and `restart_process` reconnects its attach client. Both fail with the error
+code `hosted_session_ended` when the session has ended on its host; create a
+new session in Cherry instead.
+
+A persistent-session tab reports no `pid`: the hosted program is not a local
+child of Cherry. `get_process_ports`, `services_list`, and `wait_for_bound_port`
+therefore never attribute ports to it. On This Mac, a hosted program's
+localhost listeners can appear only among unattributed services
+(`include_unattributed: true`); on a remote host they are not visible. Programs
+inside a persistent session do not receive `CHERRY_PROCESS_ID`, so a CherryMCP
+helper started there cannot identify its tab.
+
 ## Process Activity Fields
 
 Process summaries from `list_processes`, `get_process_status`, and the other
@@ -101,10 +130,16 @@ for new output and then a quiet period:
 
 The default `require_new_output: true` prevents a false idle result immediately
 after a prompt is submitted. The result includes `reason` (`idle`, `exited`,
-`timed_out`, `permission`, or `agent_error`), `observed_new_output`,
-`since_output_version`, `output_version`, `agent_activity_state`, process
-status, and the rendered output tail. Timeouts return a normal result with
-partial output rather than a tool error.
+`disconnected`, `timed_out`, `permission`, or `agent_error`),
+`observed_new_output`, `since_output_version`, `output_version`,
+`agent_activity_state`, process status, and the rendered output tail. Timeouts
+return a normal result with partial output rather than a tool error.
+
+`exited` covers a process that ended and one whose state is `failed`, including
+a persistent-session tab that could not attach. `disconnected` means a
+persistent-session tab lost its attach client: the hosted program may still be
+running and there is no `exit_code`. Reconnect it with `start_process` before
+waiting again.
 
 For agent processes with a known activity state, the wait is state-aware:
 

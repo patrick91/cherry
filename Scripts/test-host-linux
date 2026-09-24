@@ -2,13 +2,31 @@
 # Native Linux PTY/Neovim tests through the local Docker engine.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+command -v docker >/dev/null 2>&1 || { echo "Scripts/test-host-linux needs Docker" >&2; exit 1; }
 architecture=$(docker info --format '{{.Architecture}}')
-case "$architecture" in aarch64|arm64) target=aarch64-unknown-linux-gnu;; x86_64|amd64) target=x86_64-unknown-linux-gnu;; *) exit 1;; esac
-if [ ! -f "$root/Host/vendor/ghostty-vt/$target/lib/libghostty-vt.a" ]; then
+case "$architecture" in
+  aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
+  x86_64|amd64) target=x86_64-unknown-linux-gnu ;;
+  *) echo "Unsupported Docker architecture: $architecture" >&2; exit 1 ;;
+esac
+# Rebuild when missing or built from another revision or optimize level
+# (cherry-vt refuses it).
+revision=$(sed -n 's/^revision=//p' "$root/Scripts/build-host-vt")
+optimize=$(sed -n 's/^optimize=//p' "$root/Scripts/build-host-vt")
+if [ -z "$revision" ] || [ -z "$optimize" ]; then
+  echo "Could not read the pinned revision and optimize level from Scripts/build-host-vt" >&2
+  exit 1
+fi
+prefix="$root/Host/vendor/ghostty-vt/$target"
+if [ ! -f "$prefix/lib/libghostty-vt.a" ] \
+  || [ "$(cat "$prefix/SOURCE_REVISION" 2>/dev/null)" != "$revision" ] \
+  || [ "$(cat "$prefix/OPTIMIZE" 2>/dev/null)" != "$optimize" ]; then
   "$root/Scripts/build-host-vt" "$target"
 fi
 docker build -t cherry-host-test:local -f "$root/Host/tests/Dockerfile" "$root/Host/tests"
 mkdir -p "$root/Host/target/linux" "$root/Host/.deps/linux-cargo"
+# The ignored tests need the built binaries (real_host) and Neovim (neovim and
+# any host-level Neovim test); the image provides a current Neovim.
 docker run --rm \
   -v "$root/Host:/work:ro" \
   -v "$root/Host/target/linux:/target" \
@@ -16,4 +34,10 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/cache \
   -e CHERRY_TEST_HOST=/target/debug/cherry-host \
   -w /work cherry-host-test:local \
-  bash -c 'cargo test --locked --workspace -- --test-threads=1 && cargo build --locked --bins && cargo test --locked -p cherry-cli --test real_host -- --ignored && cargo test --locked -p cherry-vt --test neovim -- --ignored'
+  bash -euo pipefail -c '
+    nvim --version | head -n 1
+    cargo test --locked --workspace -- --test-threads=1
+    cargo build --locked --bins
+    cargo test --locked -p cherry-cli --test real_host -- --ignored --test-threads=1
+    cargo test --locked -p cherry-host -p cherry-vt -- --ignored --test-threads=1
+  '

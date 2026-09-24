@@ -7172,9 +7172,10 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
+            Button(session.restartActionTitle) {
                 session.restart()
             }
+            .disabled(!session.canRestart)
 
             Button("Clear Scrollback") {
                 session.clearScrollback()
@@ -7188,7 +7189,7 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            Button(session.hostedAttachment == nil ? "Close" : "Disconnect & Close", role: session.hostedAttachment == nil ? .destructive : nil) {
+            Button(session.closeActionTitle, role: session.hostedAttachment == nil ? .destructive : nil) {
                 close(session)
             }
             .disabled(workspace.sessions.count <= 1)
@@ -8036,7 +8037,7 @@ private extension TerminalSession {
         switch state {
         case .launching, .live:
             true
-        case .exited, .failed:
+        case .exited, .failed, .disconnected:
             false
         }
     }
@@ -8258,9 +8259,10 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
+        Button(session.restartActionTitle) {
             session.restart()
         }
+        .disabled(!session.canRestart)
 
         Button("Clear Scrollback") {
             session.clearScrollback()
@@ -8274,7 +8276,7 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        Button(session.hostedAttachment == nil ? "Close" : "Disconnect & Close", role: session.hostedAttachment == nil ? .destructive : nil) {
+        Button(session.closeActionTitle, role: session.hostedAttachment == nil ? .destructive : nil) {
             workspace.close(session)
         }
         .disabled(workspace.sessions.count <= 1)
@@ -8586,9 +8588,10 @@ private struct SidebarSplitPaneIconSelector: View {
 
             Divider()
 
-            Button(session.hostedAttachment == nil ? "Restart" : "Reconnect") {
+            Button(session.restartActionTitle) {
                 session.restart()
             }
+            .disabled(!session.canRestart)
 
             Button("Clear Scrollback") {
                 session.clearScrollback()
@@ -11682,7 +11685,9 @@ struct TerminalSplitSceneView: View {
                         chromeState: chromeState,
                         isActivePane: workspace.selectedSessionID == session.id,
                         usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
-                        onActivate: activate
+                        onActivate: activate,
+                        // Matches the sidebar: a workspace's last tab stays open.
+                        closeHostedSession: workspace.sessions.count > 1 ? { workspace.close($0) } : nil
                     )
                     .frame(width: width(at: index, in: widths))
                     .roundedTerminalSplitPane(
@@ -12021,6 +12026,7 @@ private struct TerminalSceneView: View {
     let isActivePane: Bool
     let usesWorktreeSurfaceTransition: Bool
     let onActivate: (UUID) -> Void
+    let closeHostedSession: ((TerminalSession) -> Void)?
     @StateObject private var searchState = TerminalSearchState()
 
     var body: some View {
@@ -12070,7 +12076,10 @@ private struct TerminalSceneView: View {
         if showsTerminalContextBar {
             VStack(spacing: 0) {
                 if session.hostedAttachment != nil {
-                    HostedSessionConnectionBar(session: session)
+                    HostedSessionConnectionBar(
+                        session: session,
+                        close: closeHostedSession.map { close in { close(session) } }
+                    )
                 } else {
                     TerminalContextBar(session: session, isActivePane: isActivePane)
                 }
@@ -12269,6 +12278,9 @@ private struct CommandExitStatusBar: View {
             }
         case .failed(let message):
             Status(text: "Launch failed: \(message)", isFailure: true)
+        case .disconnected:
+            // Only hosted tabs disconnect; their connection bar reports it.
+            nil
         }
     }
 

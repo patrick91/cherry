@@ -190,6 +190,7 @@
           <div>
             <h2 class="max-w-[16ch] text-3xl font-semibold tracking-tight text-balance text-white sm:text-4xl">Build a local copy in one command.</h2>
             <p class="mt-5 max-w-[48ch] text-base text-pretty text-zinc-400">Cherry is an open prototype. Clone it, build it, and dogfood it as your daily driver.</p>
+            <p class="mt-3 max-w-[48ch] text-sm text-pretty text-zinc-500">The build needs Xcode and Rust, plus network access the first time to fetch Zig and Ghostty for the Persistent Sessions helpers. Prefix the install command with <code class="font-mono text-zinc-400">CHERRY_SKIP_HOST=1</code> to build without them and without Rust.</p>
             <a href="https://github.com/patrick91/cherry" class="mt-7 inline-flex items-center gap-x-2 text-sm font-medium text-cherry-300 hover:text-cherry-200">Star on GitHub →</a>
           </div>
           <div class="min-w-0 overflow-hidden rounded-xl bg-black/40 ring-1 ring-inset ring-white/10">
@@ -199,6 +200,7 @@
             </div>
             <pre class="overflow-x-auto p-5 font-mono text-sm leading-7"><code><span class="text-zinc-500"># clone, build, and run</span>
 <span class="text-cherry-400">$</span> <span class="text-zinc-200">git clone https://github.com/patrick91/cherry</span>
+<span class="text-cherry-400">$</span> <span class="text-zinc-200">cd cherry</span>
 <span class="text-cherry-400">$</span> <span class="text-zinc-200">Scripts/install-local-app</span>
 <span class="text-cherry-400">$</span> <span class="text-zinc-200">open ~/Applications/Cherry.app</span></code></pre>
           </div>

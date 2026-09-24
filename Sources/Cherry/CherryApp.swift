@@ -376,11 +376,11 @@ struct CherryApp: App {
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
                 .disabled(focusedWorkspace == nil)
 
-                Button(focusedWorkspace?.selectedSession?.hostedAttachment == nil ? "Restart Active Tab" : "Reconnect Active Tab") {
+                Button("\(focusedWorkspace?.selectedSession?.restartActionTitle ?? "Restart") Active Tab") {
                     keyWindowWorkspace?.restartSelectedSession()
                 }
                 .keyboardShortcut("r")
-                .disabled(focusedWorkspace == nil)
+                .disabled(focusedWorkspace == nil || focusedWorkspace?.selectedSession?.canRestart == false)
 
                 Button("Clear Scrollback") {
                     keyWindowWorkspace?.clearSelectedSessionScrollback()

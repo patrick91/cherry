@@ -77,7 +77,20 @@ fn reconnect_to_real_neovim_then_restore_the_shell_screen() {
     let mut workload = Workload(command.spawn().expect("nvim must be installed"));
     drop(slave);
     let mut original = Terminal::new(80, 24, 1024 * 1024).unwrap();
-    original.feed(b"shell prompt> nvim\r\n");
+    // A renderer that follows the shell but misses Neovim's startup, and is
+    // brought up to date with a refresh instead of a snapshot.
+    let mut follower = Terminal::new(80, 24, 1024 * 1024).unwrap();
+    // Retained history plus a cleared screen leaves the primary screen with
+    // trailing blank rows under the editor.
+    for line in 0..40 {
+        let bytes = format!("output line {line}\r\n");
+        original.feed(bytes.as_bytes());
+        follower.feed(bytes.as_bytes());
+    }
+    original.feed(b"\x1b[H\x1b[2Jshell prompt> nvim\r\n");
+    follower.feed(b"\x1b[H\x1b[2Jshell prompt> nvim\r\n");
+    let history = follower.inspect().unwrap().history;
+    let mut refreshed = false;
     let mut copy: Option<Terminal> = None;
     let mut quit_sent = false;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -101,6 +114,9 @@ fn reconnect_to_real_neovim_then_restore_the_shell_screen() {
                     if let Some(copy) = copy.as_mut() {
                         copy.feed(&buffer[..n]);
                     }
+                    if refreshed {
+                        follower.feed(&buffer[..n]);
+                    }
                     quiet_since = Instant::now();
                 }
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
@@ -116,11 +132,17 @@ fn reconnect_to_real_neovim_then_restore_the_shell_screen() {
         {
             let mut restored = Terminal::new(80, 24, 1024 * 1024).unwrap();
             restored.feed(&original.snapshot().unwrap());
-            assert_eq!(
-                original.screen_text().unwrap(),
-                restored.screen_text().unwrap()
-            );
+            let editor = original.inspect().unwrap();
+            assert!(editor.alternate);
+            assert_eq!(editor, restored.inspect().unwrap());
             copy = Some(restored);
+            follower.feed(&original.refresh().unwrap());
+            let shown = follower.inspect().unwrap();
+            assert_eq!(shown.active, editor.active);
+            assert_eq!(shown.cursor, editor.cursor);
+            assert_eq!(shown.modes, editor.modes);
+            assert_eq!(shown.kitty_flags, editor.kitty_flags);
+            refreshed = true;
             master.write_all(b"\x1b:qa!\r").unwrap();
             quit_sent = true;
         }
@@ -132,8 +154,18 @@ fn reconnect_to_real_neovim_then_restore_the_shell_screen() {
     }
     assert!(quit_sent, "Neovim did not render the test buffer in time");
     let copy = copy.unwrap();
-    assert_eq!(original.screen_text().unwrap(), copy.screen_text().unwrap());
-    assert!(copy.screen_text().unwrap().contains("shell prompt> nvim"));
+    let shell = copy.inspect().unwrap();
+    assert_eq!(original.inspect().unwrap(), shell);
+    assert!(!shell.alternate);
+    assert_eq!(shell.active[0], "shell prompt> nvim");
+    assert_eq!(shell.history[0], "output line 0");
+    // The follower's own history was left alone, and quitting showed the
+    // primary screen the refresh painted under the editor.
+    let followed = follower.inspect().unwrap();
+    assert_eq!(followed.history, history);
+    assert_eq!(followed.active, shell.active);
+    assert_eq!(followed.cursor, shell.cursor);
+    assert_eq!(followed.modes, shell.modes);
     // PTY EOF can precede waitpid observing the exiting process briefly.
     for _ in 0..50 {
         if workload.0.try_wait().unwrap().is_some() {

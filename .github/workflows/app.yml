@@ -1,0 +1,96 @@
+name: Mac app
+
+on:
+  push:
+    paths:
+      - "Sources/**"
+      - "Tests/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "ThirdParty/**"
+      - "Host/**"
+      - "Scripts/**"
+      - ".github/workflows/app.yml"
+      - ".github/actions/host-toolchain/**"
+  pull_request:
+    paths:
+      - "Sources/**"
+      - "Tests/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "ThirdParty/**"
+      - "Host/**"
+      - "Scripts/**"
+      - ".github/workflows/app.yml"
+      - ".github/actions/host-toolchain/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  swift:
+    name: Swift build and hosted-session tests
+    # The package requires macOS 26, so its tests only run on macOS 26 or later.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select an Xcode for the package's Swift tools version
+        run: |
+          required=$(sed -n 's#^// swift-tools-version: *\([0-9][0-9.]*\).*#\1#p' Package.swift | head -n 1)
+          at_least() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]; }
+          swift_version() {
+            DEVELOPER_DIR="$1" xcrun swift --version 2>/dev/null \
+              | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1
+          }
+          # Prefer the image's default Xcode, else the newest stable one.
+          selected=$(xcode-select -p)
+          if ! at_least "$(swift_version "$selected")" "$required"; then
+            selected=""
+            candidates=$(printf '%s\n' /Applications/Xcode_*.app \
+              | grep -viE 'beta|_rc|release_candidate' | sort -V -r || true)
+            while IFS= read -r app; do
+              [ -d "$app" ] || continue
+              if at_least "$(swift_version "$app/Contents/Developer")" "$required"; then
+                selected="$app/Contents/Developer"
+                break
+              fi
+            done <<< "$candidates"
+          fi
+          if [ -z "$selected" ]; then
+            echo "::error::No installed Xcode provides Swift $required"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$selected" xcrun swift --version
+      - name: Install Rust and the pinned Ghostty VT library
+        uses: ./.github/actions/host-toolchain
+      # The real-host test runs Host/target/debug/cherry and cherry-host.
+      - name: Build the Rust host helpers
+        run: Scripts/build-host debug
+      - name: Build the Swift package and tests
+        run: swift build --build-tests
+      # Each filter must match tests that actually ran; a rename or a skipped
+      # test would otherwise pass silently.
+      - name: Hosted-session and app-identity tests
+        run: |
+          log="$RUNNER_TEMP/hosted-session.log"
+          swift test --skip-build --no-parallel --filter 'HostedSession|[Aa]ppIdentity' 2>&1 | tee "$log"
+          for name in HostedSession '[Aa]ppIdentity'; do
+            grep -Eq "Test ${name}[^ ]* passed" "$log" \
+              || { echo "::error::No ${name} test passed"; exit 1; }
+          done
+      - name: Real host through native Ghostty
+        env:
+          CHERRY_TEST_HOST_INTEGRATION: "1"
+        run: |
+          log="$RUNNER_TEMP/real-host.log"
+          swift test --skip-build --no-parallel --filter HostedSessionRealHost 2>&1 | tee "$log"
+          grep -Eq 'Test HostedSessionRealHost[^ ]* passed' "$log" \
+            || { echo "::error::No HostedSessionRealHost test passed"; exit 1; }

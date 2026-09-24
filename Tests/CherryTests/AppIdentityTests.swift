@@ -10,21 +10,72 @@ import Testing
 }
 
 @Test func appIdentityReadsVariantAndRejectsUnsafeComponents() {
+    var warnings: [String] = []
     let identity = CherryAppIdentity(infoDictionary: [
         "CherryApplicationSupportName": "Cherry Sessions",
         "CherryURLScheme": "cherry-sessions",
-    ])
+    ], warn: { warnings.append($0) })
     #expect(identity.applicationSupportName == "Cherry Sessions")
     #expect(identity.urlScheme == "cherry-sessions")
+    #expect(warnings.isEmpty)
     #expect(MCPInstallCommandBuilder.commands(identity: identity).allSatisfy {
         $0.command.contains(" cherry-sessions -- ")
     })
 
+    // Absent keys are the standard build and are not worth a warning.
+    #expect(CherryAppIdentity(infoDictionary: [:], warn: { warnings.append($0) }) == CherryAppIdentity())
+    #expect(warnings.isEmpty)
+
     let invalid = CherryAppIdentity(infoDictionary: [
         "CherryApplicationSupportName": "../Cherry",
         "CherryURLScheme": "cherry; exit",
-    ])
+    ], warn: { warnings.append($0) })
     #expect(invalid == CherryAppIdentity())
+    #expect(warnings.count == 2)
+    #expect(warnings.contains { $0.contains("CherryApplicationSupportName \"../Cherry\"") && $0.contains("\"Cherry\"") })
+    #expect(warnings.contains { $0.contains("CherryURLScheme \"cherry; exit\"") && $0.contains("\"cherry\"") })
+}
+
+@Test func appIdentityWarnsForEveryOverrideThatFallsBackToCherry() {
+    let invalidSupportNames: [Any] = ["", "  ", ".", "..", "Cherry/Sessions", "a\u{0}b", 42]
+    for value in invalidSupportNames {
+        var warnings: [String] = []
+        let identity = CherryAppIdentity(
+            infoDictionary: ["CherryApplicationSupportName": value, "CherryURLScheme": "cherry-dev"],
+            warn: { warnings.append($0) }
+        )
+        #expect(identity.applicationSupportName == "Cherry")
+        #expect(identity.urlScheme == "cherry-dev")
+        #expect(warnings.count == 1 && warnings[0].hasPrefix("Ignoring invalid CherryApplicationSupportName"),
+                "\(value): \(warnings)")
+    }
+
+    let invalidSchemes: [Any] = ["", "cherry_sessions", "1cherry", "cherry sessions", "chérry", "cherry\ndev", false]
+    for value in invalidSchemes {
+        var warnings: [String] = []
+        let identity = CherryAppIdentity(
+            infoDictionary: ["CherryApplicationSupportName": "Cherry Dev", "CherryURLScheme": value],
+            warn: { warnings.append($0) }
+        )
+        #expect(identity.applicationSupportName == "Cherry Dev")
+        #expect(identity.urlScheme == "cherry")
+        #expect(warnings.count == 1 && warnings[0].hasPrefix("Ignoring invalid CherryURLScheme"),
+                "\(value): \(warnings)")
+    }
+    // Control characters are escaped instead of breaking the log line.
+    var escaped: [String] = []
+    _ = CherryAppIdentity(infoDictionary: ["CherryURLScheme": "cherry\ndev"], warn: { escaped.append($0) })
+    #expect(escaped.first?.contains(#""cherry\ndev""#) == true)
+
+    // Accepted, but on a case-insensitive volume it is the main app's folder.
+    var caseWarnings: [String] = []
+    let caseVariant = CherryAppIdentity(
+        infoDictionary: ["CherryApplicationSupportName": "cherry", "CherryURLScheme": "Cherry-Dev"],
+        warn: { caseWarnings.append($0) }
+    )
+    #expect(caseVariant.applicationSupportName == "cherry")
+    #expect(caseVariant.urlScheme == "cherry-dev")
+    #expect(caseWarnings.count == 1 && caseWarnings[0].contains("only by case"))
 }
 
 @Test func appIdentityUsesContainingBundleForMCPHelper() throws {

@@ -1282,9 +1282,10 @@ final class TerminalWorkspace: ObservableObject {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
         // inherit the selected session's last trusted OSC 7 cwd report. In an
         // empty workspace (worktree spaces start with no sessions) fall back
-        // to the project root rather than the process home directory.
+        // to the project root rather than the process home directory. A hosted
+        // tab's directory is on its host and never seeds a local shell.
         let resolvedWorkingDirectory = workingDirectory
-            ?? selectedSession?.workingDirectory
+            ?? selectedSession.flatMap { $0.hostedAttachment == nil ? $0.workingDirectory : nil }
             ?? projectRoot
         let session = Self.makeSession(
             index: sessions.count + 1,
@@ -1334,14 +1335,21 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
+    /// `takeover` disconnects the session's other clients for this launch only.
     @discardableResult
-    func attachHostedSession(_ attachment: HostedSessionAttachment, launchShell: Bool = true) -> TerminalSession {
+    func attachHostedSession(
+        _ attachment: HostedSessionAttachment,
+        takeover: Bool = false,
+        launchShell: Bool = true
+    ) -> TerminalSession {
         if let existing = sessions.first(where: {
             $0.hostedAttachment?.hostID == attachment.hostID
                 && $0.hostedAttachment?.sessionID == attachment.sessionID
         }) {
             select(existing)
-            if !existing.isRunning, launchShell { existing.reconnectHostedSession() }
+            if launchShell, takeover || !existing.isRunning {
+                existing.reconnectHostedSession(takeover: takeover)
+            }
             return existing
         }
         let session = TerminalSession(
@@ -1351,7 +1359,8 @@ final class TerminalWorkspace: ObservableObject {
             tint: Self.palette[sessions.count % Self.palette.count],
             workingDirectory: NSHomeDirectory(),
             launchShell: launchShell,
-            hostedAttachment: attachment
+            hostedAttachment: attachment,
+            hostedTakeover: takeover
         )
         sessions.append(session)
         terminalDisplayItems.append(.single(session.id))
@@ -2134,7 +2143,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         case launching
         case live
         case exited(Int32)
+        /// The launch failed. For a hosted tab, the attach client could not
+        /// attach; the message says why and reconnecting retries.
         case failed(String)
+        /// A hosted tab whose attach client stopped. The program may still be
+        /// running on its host, so this is never an exit and has no exit code.
+        case disconnected
 
         var label: String {
             switch self {
@@ -2146,9 +2160,15 @@ final class TerminalSession: ObservableObject, Identifiable {
                 "exit \(status)"
             case .failed:
                 "failed"
+            case .disconnected:
+                "disconnected"
             }
         }
 
+        var failureMessage: String? {
+            if case .failed(let message) = self { return message }
+            return nil
+        }
     }
 
     let id = UUID()
@@ -2177,6 +2197,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
     let hostedAttachment: HostedSessionAttachment?
     @Published private(set) var hostedAttachmentStatus: HostedAttachmentStatus?
+    /// The ended hosted session was deleted on its host; the tab only shows its output.
+    @Published private(set) var hostedSessionRemovedFromHost = false
+    /// `--status-file` of the latest adapter launch. It stays in the exec
+    /// command after the outcome is read: a changed surface configuration
+    /// rebuilds the surface, which would start another adapter.
+    private var hostedLaunchStatusFile: URL?
+    /// That launch's private directory while its outcome is still unread.
+    private var hostedPendingStatusDirectory: URL?
+    private var hostedTakeoverForNextLaunch = false
+    private var hostedLaunchTakesOver = false
+    /// Signals a native-PTY session's processes when the tab stops. Tests
+    /// wrap it to answer the hangup the way a hosted attach adapter does.
+    var terminateNativeSession: (pid_t) -> Void = { ShellProcessController.terminateNativeShellSession(anchorPID: $0) }
     private(set) var isEnhancedKeyboardProtocolActive = false
     private(set) var keyboardProtocolFlags = 0
 
@@ -2337,6 +2370,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         restartOnExit: Bool = false,
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
         hostedAttachment: HostedSessionAttachment? = nil,
+        hostedTakeover: Bool = false,
         attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
             TerminalAttentionObservationRecorder.configuredDirectoryURL
         },
@@ -2361,7 +2395,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.kind = kind
         self.launchBackend = launchBackend
         self.hostedAttachment = hostedAttachment
-        self.hostedAttachmentStatus = hostedAttachment.map { _ in .disconnected(adapterExitCode: nil) }
+        self.hostedAttachmentStatus = hostedAttachment.map { _ in .disconnected(nil) }
+        self.hostedTakeoverForNextLaunch = hostedAttachment != nil && hostedTakeover
         self.agentName = agentName
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
@@ -2396,7 +2431,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if launchShell {
             startShell()
         } else {
-            state = .exited(0)
+            state = hostedAttachment == nil ? .exited(0) : .disconnected
         }
     }
 
@@ -2590,12 +2625,33 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var sidebarDetail: String {
         if let hostedAttachment {
-            return isRunning
-                ? hostedAttachment.host.displayName
-                : "\(hostedAttachment.host.displayName) · disconnected"
+            guard !isRunning, let label = hostedAttachmentStatus?.sidebarLabel else {
+                return hostedAttachment.host.displayName
+            }
+            return "\(hostedAttachment.host.displayName) · \(label)"
         }
         guard kind != .terminal else { return "" }
         return subtitle
+    }
+
+    /// A hosted session that ended on its host has nothing to reconnect to.
+    var hostedSessionEnded: Bool {
+        hostedAttachmentStatus?.sessionEnded == true
+    }
+
+    var canRestart: Bool { !hostedSessionEnded }
+
+    func noteHostedSessionRemovedFromHost() {
+        guard hostedSessionEnded else { return }
+        hostedSessionRemovedFromHost = true
+    }
+
+    var restartActionTitle: String {
+        hostedAttachment == nil ? "Restart" : "Reconnect"
+    }
+
+    var closeActionTitle: String {
+        hostedAttachment == nil || hostedSessionEnded ? "Close" : "Disconnect & Close"
     }
 
     func snapshot(range: Range<Int>) -> [String] {
@@ -2771,16 +2827,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
-    func restart() {
+    /// Returns false when nothing was relaunched because the hosted session
+    /// ended. A live hosted tab learns that from `stop()`: the adapter may
+    /// have written its `exited` outcome before the tab saw it exit.
+    @discardableResult
+    func restart() -> Bool {
+        guard canRestart else { return false }
         resetAutoRestartPolicy()
         stop()
+        guard canRestart else { return false }
         clearScrollback(preservingTerminalState: false)
         startShell()
+        return true
     }
 
-    func reconnectHostedSession() {
-        guard hostedAttachment != nil, !isRunning else { return }
-        restart()
+    /// `takeover` also relaunches a connected tab so it replaces the
+    /// session's other clients.
+    @discardableResult
+    func reconnectHostedSession(takeover: Bool = false) -> Bool {
+        guard hostedAttachment != nil, takeover || !isRunning else { return false }
+        hostedTakeoverForNextLaunch = takeover
+        let relaunched = restart()
+        hostedTakeoverForNextLaunch = false
+        return relaunched
     }
 
     func disconnectHostedSession() {
@@ -2796,7 +2865,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         switch state {
         case .launching, .live:
             return
-        case .exited, .failed:
+        case .exited, .failed, .disconnected:
             clearScrollback(preservingTerminalState: false)
             startShell()
         }
@@ -2843,6 +2912,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.endLaunch(launchID)
         updateShellOutputPauseState()
         hostInputWriter.set(nil)
+        // Stopping kills only the local adapter. A close reported before the
+        // exit callback may follow an outcome the adapter already wrote, so
+        // read it before signalling: what the adapter writes while handling
+        // this hangup ("interrupted by signal 1") describes this stop, not
+        // the session. That late write is why the directory stays a while.
+        let hostedStatus = hostedAttachment != nil && launchID != nil
+            ? consumeHostedLaunchStatus(removingAfter: 2) ?? .disconnected(nil)
+            : nil
         if ghosttyBridgeStorage?.isNativePTYBacked == true {
             // Native-PTY: ghostty owns the PTY and there is no shellProcess to
             // terminate, so signal the whole controlling-terminal session. A
@@ -2850,16 +2927,45 @@ final class TerminalSession: ObservableObject, Identifiable {
             // otherwise survive both the PTY close and a shell-only kill.
             if let anchorPID = childProcessID
                 ?? ghosttyBridgeStorage?.nativeSessionLeaderPID() {
-                ShellProcessController.terminateNativeShellSession(anchorPID: anchorPID)
+                terminateNativeSession(anchorPID)
             }
         }
         shellProcess?.terminate()
         shellProcess = nil
-        if hostedAttachment != nil {
-            hostedAttachmentStatus = .disconnected(adapterExitCode: nil)
-            state = .exited(0)
-            bumpRevision()
+        if let hostedStatus {
+            applyHostedStatus(hostedStatus)
         }
+    }
+
+    /// The hosted program's state as the adapter reported it. Only an
+    /// `exited` outcome is an exit. An attach that failed is a failed launch,
+    /// not a disconnect: nothing was attached, and its message says why.
+    private func applyHostedStatus(_ status: HostedAttachmentStatus) {
+        hostedAttachmentStatus = status
+        switch status {
+        case .exited(let code, let signal):
+            let reportedCode = code ?? signal.map { 128 + $0 } ?? 0
+            exitCode = reportedCode
+            exitedAt = Date()
+            state = .exited(reportedCode)
+        case .failed(let message):
+            exitCode = nil
+            exitedAt = nil
+            state = .failed(message)
+        case .active, .disconnected, .takenOver:
+            exitCode = nil
+            exitedAt = nil
+            state = .disconnected
+        }
+        bumpRevision()
+    }
+
+    private func consumeHostedLaunchStatus(removingAfter delay: TimeInterval) -> HostedAttachmentStatus? {
+        guard let directory = hostedPendingStatusDirectory else { return nil }
+        hostedPendingStatusDirectory = nil
+        let status = HostedAttachmentStatusFile.read(from: directory)
+        HostedAttachmentStatusFile.removeLaunchDirectory(directory, after: delay)
+        return status
     }
 
     func releaseGhosttyBridge() {
@@ -3008,7 +3114,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// resolved from the same configuration the host-managed shell uses.
     var nativeExecLaunch: (command: String?, environment: [String: String]) {
         if let attachment = hostedAttachment {
-            return (attachment.execCommand, ["TERM": "xterm-256color", "COLORTERM": "truecolor"])
+            return (
+                attachment.execCommand(statusFile: hostedLaunchStatusFile, takeover: hostedLaunchTakesOver),
+                attachment.adapterEnvironment
+            )
         }
         let resolved = ShellProcessController.nativeExecLaunch(for: shellLaunchConfiguration())
         return (resolved.command, resolved.environment)
@@ -3017,7 +3126,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
-        if hostedAttachment != nil { hostedAttachmentStatus = .active }
+        if hostedAttachment != nil {
+            hostedAttachmentStatus = .active
+            hostedLaunchTakesOver = hostedTakeoverForNextLaunch
+            hostedTakeoverForNextLaunch = false
+            if let previous = hostedPendingStatusDirectory {
+                HostedAttachmentStatusFile.removeLaunchDirectory(previous, after: 2)
+            }
+            // Each adapter launch reports through its own fresh status file.
+            hostedPendingStatusDirectory = try? HostedAttachmentStatusFile.makeLaunchDirectory()
+            hostedLaunchStatusFile = hostedPendingStatusDirectory.map(HostedAttachmentStatusFile.statusFileURL(in:))
+        }
         resetAutomaticTitleForNewAgentLaunch()
         resetKeyboardProtocolState()
         outputHoldUntil = nil
@@ -3076,7 +3195,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             } else {
                 _ = ghosttyBridge
             }
-            captureNativeShellIdentity()
+            // A hosted tab's local process is only the attach adapter; the
+            // hosted program has no local PID to report.
+            if hostedAttachment == nil {
+                captureNativeShellIdentity()
+            }
             return
         }
 
@@ -3188,12 +3311,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputHoldUntil = nil
         processor.endLaunch(launchID)
         resumeOutputIfPausedForInteraction()
-        state = .exited(status)
         if hostedAttachment != nil {
-            hostedAttachmentStatus = .disconnected(adapterExitCode: status)
-            bumpRevision()
+            // The adapter's own exit status does not say whether the hosted
+            // program ended; its status file does.
+            applyHostedStatus(consumeHostedLaunchStatus(removingAfter: 0) ?? .disconnected(nil))
             return
         }
+        state = .exited(status)
         if kind == .agent || kind == .command {
             let hideCursor = Data("\u{1B}[?25l".utf8)
             renderedReplayCache = nil

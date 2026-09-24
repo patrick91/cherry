@@ -1231,6 +1231,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let usesAlternateScreen: Bool?
     public let lastContentChangeAt: Date?
     public let contentVersion: Int?
+    /// Why the launch failed, when `state` is `failed`.
+    public let failureMessage: String?
 
     public init(
         id: String,
@@ -1258,7 +1260,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         agentActivityState: String? = nil,
         usesAlternateScreen: Bool? = nil,
         lastContentChangeAt: Date? = nil,
-        contentVersion: Int? = nil
+        contentVersion: Int? = nil,
+        failureMessage: String? = nil
     ) {
         self.id = id
         self.link = link
@@ -1286,6 +1289,7 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.usesAlternateScreen = usesAlternateScreen
         self.lastContentChangeAt = lastContentChangeAt
         self.contentVersion = contentVersion
+        self.failureMessage = failureMessage
     }
 }
 
@@ -1389,6 +1393,9 @@ public struct ProcessStatusResult: Codable, Equatable, Sendable {
 public enum ProcessIdleWaitReason: String, Codable, Equatable, Sendable {
     case idle
     case exited
+    /// A persistent-session tab lost its attach client; the hosted program
+    /// may still be running.
+    case disconnected
     case timedOut = "timed_out"
     case permission
     case agentError = "agent_error"

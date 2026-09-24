@@ -1,15 +1,55 @@
 #!/usr/bin/env bash
+# Build the native cherry and cherry-host executables.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 configuration=${1:-release}
 case "$configuration" in debug|release) ;; *) echo "Usage: Scripts/build-host [debug|release]" >&2; exit 1;; esac
+if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+  echo "Scripts/build-host needs Rust (cargo and rustc); install it from https://rustup.rs" >&2
+  exit 1
+fi
 target=$(rustc -vV | sed -n 's/^host: //p')
-if [ ! -f "$root/Host/vendor/ghostty-vt/$target/lib/libghostty-vt.a" ]; then
-  "$root/Scripts/build-host-vt" "$target"
+
+# Cargo's own precedence for the output directory. Passing it explicitly keeps
+# a build.target-dir from a Cargo config file from moving the executables away
+# from where callers (install-local-app, package-host) copy them.
+target_dir=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/Host/target}}
+case "$target_dir" in /*) ;; *) target_dir="$PWD/$target_dir" ;; esac
+# The helpers are always native. A build target would move them into
+# <target dir>/<triple>/, and the VT library is only built for the host.
+unset CARGO_BUILD_TARGET
+
+# Rebuild the VT library when it is missing or was built from another revision
+# or optimize level; cherry-vt's build script refuses a mismatched archive.
+if [ -z "${CHERRY_GHOSTTY_VT_DIR:-}" ]; then
+  revision=$(sed -n 's/^revision=//p' "$root/Scripts/build-host-vt")
+  optimize=$(sed -n 's/^optimize=//p' "$root/Scripts/build-host-vt")
+  if [ -z "$revision" ] || [ -z "$optimize" ]; then
+    echo "Could not read the pinned revision and optimize level from Scripts/build-host-vt" >&2
+    exit 1
+  fi
+  prefix="$root/Host/vendor/ghostty-vt/$target"
+  if [ ! -f "$prefix/lib/libghostty-vt.a" ] \
+    || [ "$(cat "$prefix/SOURCE_REVISION" 2>/dev/null)" != "$revision" ] \
+    || [ "$(cat "$prefix/OPTIMIZE" 2>/dev/null)" != "$optimize" ]; then
+    "$root/Scripts/build-host-vt" "$target"
+  fi
 fi
+
+# Cargo links fresh copies of the executables into <target dir>/<cfg>/ on
+# every build, even when nothing changed. Removing them first means the check
+# below only passes for executables this build produced; a build.target in a
+# Cargo config file would otherwise leave stale ones there for callers to copy.
+rm -f "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"
 if [ "$configuration" = release ]; then
-  cargo build --manifest-path "$root/Host/Cargo.toml" --locked --release --bins
+  cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --release --bins
 else
-  cargo build --manifest-path "$root/Host/Cargo.toml" --locked --bins
+  cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --bins
 fi
-printf 'Built %s and %s\n' "$root/Host/target/$configuration/cherry" "$root/Host/target/$configuration/cherry-host"
+for binary in cherry cherry-host; do
+  if [ ! -x "$target_dir/$configuration/$binary" ]; then
+    echo "Cargo did not produce $target_dir/$configuration/$binary; remove any build.target setting from your Cargo config" >&2
+    exit 1
+  fi
+done
+printf 'Built %s and %s\n' "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"

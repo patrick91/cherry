@@ -76,6 +76,97 @@ extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
 
+/// Settings → Sessions, as one value for close and backend decisions.
+struct SessionPersistenceSettings: Equatable, Sendable {
+    /// Run new local terminal, command and agent tabs as persistent sessions.
+    var persistLocalSessions: Bool
+    /// Closing a local persistent tab detaches instead of ending its session.
+    var keepLocalSessionsAfterTabClose: Bool
+    /// Quitting (and closing a window) ends local persistent sessions.
+    var endLocalSessionsOnQuit: Bool
+
+    static let defaults = SessionPersistenceSettings(
+        persistLocalSessions: true,
+        keepLocalSessionsAfterTabClose: false,
+        endLocalSessionsOnQuit: false
+    )
+
+    /// Everything native, as tests expect unless they opt in.
+    static let native = SessionPersistenceSettings(
+        persistLocalSessions: false,
+        keepLocalSessionsAfterTabClose: false,
+        endLocalSessionsOnQuit: false
+    )
+}
+
+/// How a workspace picks the backend for new tabs and what closing a tab
+/// does. Workspaces take it at construction: the app passes `.userSettings`,
+/// tests get `.native` and never read `TerminalSettings.shared` or start a
+/// session host.
+@MainActor
+struct SessionBackendPolicy {
+    /// Read at every decision, so a settings change applies to the next one.
+    var settings: @MainActor () -> SessionPersistenceSettings
+    /// Whether local persistent tabs follow the Sessions settings when
+    /// closed; see `SessionClosePolicy.hostedLocalTabsFollowSettings`.
+    var hostedLocalTabsFollowSettings = SessionClosePolicy.hostedLocalTabsFollowSettings
+    /// Ends a local persistent tab's session on its host after a
+    /// `.terminate` close action detached the tab: Kill, then Remove once the
+    /// host reports the exit (bounded). Tests replace it to record calls.
+    var terminateHostedSession: @MainActor (TerminalSession, SessionCloseIntent) -> Void = { session, _ in
+        session.endPersistentSession()
+    }
+    /// Runs new local tabs as persistent sessions when the settings prefer
+    /// them and the local host can run them. Nil keeps every new tab native.
+    var localSessions: PersistentLocalSessions?
+
+    static let native = SessionBackendPolicy(settings: { .native })
+
+    static let userSettings = SessionBackendPolicy(
+        settings: { TerminalSettings.shared.sessionPersistenceSettings },
+        localSessions: .shared
+    )
+
+    /// Whether new local tabs should be persistent sessions (the setting;
+    /// `persistentHostingForNewTab()` also checks the host can run them).
+    var prefersPersistentLocalSessions: Bool {
+        settings().persistLocalSessions
+    }
+
+    /// Where a new local tab runs its program: the local host, when the
+    /// settings prefer persistent sessions and it can run them now; nil for
+    /// a native tab. When the host cannot, `PersistentSessionsStatus` says why.
+    func persistentHostingForNewTab() -> PersistentLocalSessions? {
+        guard let localSessions, prefersPersistentLocalSessions else { return nil }
+        return localSessions.canHostNewTabs() ? localSessions : nil
+    }
+
+    func closeAction(for session: TerminalSession, intent: SessionCloseIntent) -> SessionCloseAction {
+        SessionClosePolicy.closeAction(
+            for: session,
+            intent: intent,
+            settings: settings(),
+            hostedLocalTabsFollowSettings: hostedLocalTabsFollowSettings
+        )
+    }
+}
+
+/// Runtime state of local persistent sessions, shown on Settings → Sessions.
+@MainActor
+final class PersistentSessionsStatus: ObservableObject {
+    static let shared = PersistentSessionsStatus()
+
+    /// Why new local tabs fall back to the native backend (disk image, App
+    /// Translocation, missing helper, the daemon failing to start), as full
+    /// sentences like `HostedSessionInstallation.localHostUnavailableReason()`.
+    /// Nil while local sessions can run. `PersistentLocalSessions` sets it.
+    @Published var localSessionsUnavailableReason: String?
+
+    init(localSessionsUnavailableReason: String? = nil) {
+        self.localSessionsUnavailableReason = localSessionsUnavailableReason
+    }
+}
+
 struct TerminalThemeColors: Equatable {
     let background: String
     let foreground: String
@@ -152,6 +243,31 @@ final class TerminalSettings: ObservableObject {
         didSet { save(defaultEditorID, forKey: Keys.defaultEditorID, notifyTerminal: false) }
     }
 
+    // Session settings apply to the next tab or close; they never touch the
+    // Ghostty configuration.
+
+    @Published var persistLocalSessions: Bool {
+        didSet { save(persistLocalSessions, forKey: Keys.persistLocalSessions, notifyTerminal: false) }
+    }
+
+    @Published var keepLocalSessionsAfterTabClose: Bool {
+        didSet {
+            save(keepLocalSessionsAfterTabClose, forKey: Keys.keepLocalSessionsAfterTabClose, notifyTerminal: false)
+        }
+    }
+
+    @Published var endLocalSessionsOnQuit: Bool {
+        didSet { save(endLocalSessionsOnQuit, forKey: Keys.endLocalSessionsOnQuit, notifyTerminal: false) }
+    }
+
+    var sessionPersistenceSettings: SessionPersistenceSettings {
+        SessionPersistenceSettings(
+            persistLocalSessions: persistLocalSessions,
+            keepLocalSessionsAfterTabClose: keepLocalSessionsAfterTabClose,
+            endLocalSessionsOnQuit: endLocalSessionsOnQuit
+        )
+    }
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -176,6 +292,12 @@ final class TerminalSettings: ObservableObject {
         darkTerminalThemeName = defaults.object(forKey: Keys.darkTerminalThemeName) as? String
             ?? Defaults.darkTerminalThemeName
         defaultEditorID = defaults.object(forKey: Keys.defaultEditorID) as? String ?? Defaults.defaultEditorID
+        persistLocalSessions = defaults.object(forKey: Keys.persistLocalSessions) as? Bool
+            ?? Defaults.sessions.persistLocalSessions
+        keepLocalSessionsAfterTabClose = defaults.object(forKey: Keys.keepLocalSessionsAfterTabClose) as? Bool
+            ?? Defaults.sessions.keepLocalSessionsAfterTabClose
+        endLocalSessionsOnQuit = defaults.object(forKey: Keys.endLocalSessionsOnQuit) as? Bool
+            ?? Defaults.sessions.endLocalSessionsOnQuit
     }
 
     func resetTerminalAppearance() {
@@ -364,6 +486,7 @@ final class TerminalSettings: ObservableObject {
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
         static let defaultEditorID = ""
+        static let sessions = SessionPersistenceSettings.defaults
     }
 
     private enum Keys {
@@ -379,6 +502,9 @@ final class TerminalSettings: ObservableObject {
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"
         static let defaultEditorID = "editor.default"
+        static let persistLocalSessions = "sessions.persistLocal"
+        static let keepLocalSessionsAfterTabClose = "sessions.keepAfterTabClose"
+        static let endLocalSessionsOnQuit = "sessions.endOnQuit"
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

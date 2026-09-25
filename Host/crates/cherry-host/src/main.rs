@@ -1,13 +1,17 @@
 mod connection;
 mod daemon;
 mod environment;
+mod holder;
 mod launch;
+mod link;
 mod outbox;
 mod paths;
 mod processes;
+mod screen;
 mod session;
 mod signals;
 mod stream;
+mod watch;
 
 use anyhow::Result;
 use cherry_protocol::default_socket_path;
@@ -28,12 +32,21 @@ enum Action {
     Start,
     /// Run the host in the foreground.
     Serve,
-    /// Relay protocol frames between stdin/stdout and the host (for SSH).
+    /// Relay protocol frames between stdin/stdout and the host (for SSH),
+    /// starting one if none is running, and replacing one that speaks an
+    /// older protocol (its sessions carry on). With CHERRY_EXPECTED_HOST_ID
+    /// set, a host of another identity is relayed as it is, for the client
+    /// to refuse.
     Gateway {
-        /// Fail when no host is running instead of starting one.
+        /// Fail when no host of this version is running instead of starting
+        /// or replacing one.
         #[arg(long)]
         no_start: bool,
     },
+    /// Hold one session for the daemon (started by the daemon, with its
+    /// link on descriptor 3).
+    #[command(hide = true)]
+    Hold,
 }
 
 fn main() {
@@ -48,6 +61,13 @@ fn run() -> Result<()> {
     match args.command {
         Action::Start => launch::start(&path),
         Action::Serve => daemon::serve(&path),
-        Action::Gateway { no_start } => launch::gateway(&path, !no_start),
+        Action::Gateway { no_start } => {
+            // Set by the CLI (see `cherry_protocol::EXPECTED_HOST_ID_VAR`).
+            let expected = std::env::var(cherry_protocol::EXPECTED_HOST_ID_VAR)
+                .ok()
+                .filter(|id| !id.is_empty());
+            launch::gateway(&path, !no_start, expected.as_deref())
+        }
+        Action::Hold => holder::hold(&path),
     }
 }

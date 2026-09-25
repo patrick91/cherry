@@ -9,6 +9,7 @@ use std::{
     fs,
     os::unix::net::UnixStream,
     path::Path,
+    thread,
     time::{Duration, Instant},
 };
 use support::*;
@@ -498,4 +499,145 @@ fn a_resync_delivers_the_clipboard_writes_of_output_the_client_missed() {
     assert!(all[last_title..].starts_with(b"\x1b]2;SECOND\x07"));
     assert_eq!(slow_screen.offset, fast_screen.offset);
     assert_eq!(active(&slow_screen), active(&fast_screen));
+}
+
+/// Many lines where every cell has its own true colour: a large snapshot.
+const STYLED_HISTORY: &str = r#"awk 'BEGIN { for (i = 0; i < 6000; i++) { line = ""; for (j = 0; j < 78; j++) line = line sprintf("\033[38;2;%d;%d;%dm%c", (i * 7 + j) % 256, (j * 13) % 256, (i + j * 3) % 256, 65 + (i + j) % 26); print line "\033[0m" } }'"#;
+
+/// A holder that answers late, as one busy with a large history or a flood
+/// does: stopped until dropped (or `resume`).
+struct Stopped(i32);
+
+impl Stopped {
+    fn new(holder: i32) -> Self {
+        unsafe { libc::kill(holder, libc::SIGSTOP) };
+        Self(holder)
+    }
+
+    fn resume(self) {}
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
+/// Take what the client has queued, until nothing arrives for a moment.
+fn drain(screen: &mut Screen, socket: &mut UnixStream) {
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    loop {
+        match read_frame::<_, ServerMessage>(socket) {
+            Ok(Some(message)) => screen.apply(&message),
+            Ok(None) => panic!("the connection closed"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
+    let host = Host::new();
+    let session = host.create(shell(
+        "stty -echo; printf 'READY\\n'; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done",
+    ));
+    let (mut first, _, offset, snapshot) = host.attach(&session.id, 100, 30);
+    let mut first_screen = Screen::new(100, 30, offset, &snapshot);
+    first_screen.wait_text(&mut first, "READY");
+    let holder = Stopped::new(holder_of(&host.sandbox, &session.id));
+    // A larger window attaches: the grid stays, and its snapshot is asked
+    // for...
+    let mut second = host.connect();
+    send(
+        &mut second,
+        &ClientMessage::Attach {
+            id: session.id.clone(),
+            cols: 120,
+            rows: 40,
+            takeover: false,
+            answers_queries: true,
+        },
+    );
+    thread::sleep(Duration::from_millis(300));
+    // ...before the other window makes the grid smaller.
+    send(&mut first, &ClientMessage::Resize { cols: 90, rows: 25 });
+    host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
+    holder.resume();
+    // The snapshot shows the grid it was taken at; the new grid follows.
+    let mut second_screen = match receive(&mut second) {
+        ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: attached,
+            offset,
+            snapshot,
+        } => {
+            assert_eq!((attached.cols, attached.rows), (100, 30));
+            Screen::new(100, 30, offset, &snapshot)
+        }
+        other => panic!("expected the attach's snapshot, not {other:?}"),
+    };
+    second_screen.wait_size(&mut second, 90, 25);
+    assert_eq!(second_screen.attached, [AttachReason::Resize]);
+    first_screen.wait_size(&mut first, 90, 25);
+    input(&mut first, b"after\n");
+    second_screen.wait_text(&mut second, "LINE:after");
+    first_screen.wait_text(&mut first, "LINE:after");
+    assert_eq!(second_screen.offset, first_screen.offset);
+    assert_eq!(second_screen.text(), first_screen.text());
+}
+
+#[test]
+fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
+    let host = Host::new();
+    // Far more styled output than a client may have queued: a client that
+    // does not read falls behind, and stays behind, since the large resync
+    // snapshot queued for it keeps it from catching up.
+    let session = host.create(shell(&format!(
+        "stty -echo; IFS= read -r start; {STYLED_HISTORY}; printf 'FLOOD_%s\\n' DONE; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done"
+    )));
+    let (mut lagging, _, offset, snapshot) = host.attach(&session.id, 100, 30);
+    let mut lagging_screen = Screen::new(100, 30, offset, &snapshot);
+    let (mut active, _, offset, snapshot) = host.attach(&session.id, 100, 30);
+    let mut screen = Screen::new(100, 30, offset, &snapshot);
+    input(&mut active, b"start\n");
+    active
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    // The lagging socket is not read during the flood.
+    screen.wait_text(&mut active, "FLOOD_DONE");
+    let holder = Stopped::new(holder_of(&host.sandbox, &session.id));
+    // The lagging client takes what was queued for it; its resync is asked
+    // for then...
+    drain(&mut lagging_screen, &mut lagging);
+    thread::sleep(Duration::from_millis(300));
+    // ...and the grid changes before the holder answers.
+    send(&mut active, &ClientMessage::Resize { cols: 90, rows: 25 });
+    host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
+    holder.resume();
+    lagging_screen.wait_size(&mut lagging, 90, 25);
+    let reasons = &lagging_screen.attached;
+    let resync = reasons
+        .iter()
+        .rposition(|reason| *reason == AttachReason::Resync)
+        .unwrap_or_else(|| panic!("no resync: {reasons:?}"));
+    assert_eq!(reasons[resync + 1..], [AttachReason::Resize], "{reasons:?}");
+    screen.wait_size(&mut active, 90, 25);
+    input(&mut active, b"after\n");
+    lagging_screen.wait_text(&mut lagging, "LINE:after");
+    screen.wait_text(&mut active, "LINE:after");
+    assert_eq!(lagging_screen.offset, screen.offset);
+    assert_eq!(lagging_screen.text(), screen.text());
 }

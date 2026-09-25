@@ -1,7 +1,8 @@
 //! The CLI against scripted fake hosts (and a fake ssh), without a daemon.
 use cherry_protocol::{
-    encode_frame, read_frame, write_frame, AttachReason, ClientMessage, ServerMessage, SessionInfo,
-    SessionState, DEFAULT_COLS, DEFAULT_ROWS, PROTOCOL_VERSION,
+    encode_frame, read_frame, write_frame, AttachReason, ClientMessage, Request, Response,
+    ServerMessage, SessionEvent, SessionInfo, SessionState, DEFAULT_COLS, DEFAULT_ROWS,
+    PROTOCOL_VERSION,
 };
 use std::{
     fs::File,
@@ -15,7 +16,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -28,20 +29,34 @@ fn session() -> SessionInfo {
     sized_session(120, 32)
 }
 
+/// Built from JSON, so that fields a newer protocol adds take their
+/// defaults.
 fn sized_session(cols: u16, rows: u16) -> SessionInfo {
-    SessionInfo {
-        id: "test-session".into(),
-        name: "Example".into(),
-        cwd: "/work".into(),
-        command: vec!["/bin/sh".into()],
-        cols,
-        rows,
-        state: SessionState::Running,
-        pid: Some(42),
-        exit_code: None,
-        attached: true,
-        exit_signal: None,
-    }
+    serde_json::from_value(serde_json::json!({
+        "id": "test-session",
+        "name": "Example",
+        "cwd": "/work",
+        "command": ["/bin/sh"],
+        "cols": cols,
+        "rows": rows,
+        "state": SessionState::Running,
+        "pid": 42,
+        "exit_code": null,
+        "attached": true,
+        "exit_signal": null,
+        "clients": 1,
+    }))
+    .unwrap()
+}
+
+/// A session list, built from JSON like `sized_session`.
+fn sessions_reply(host_id: &str, sessions: Vec<SessionInfo>) -> ServerMessage {
+    serde_json::from_value(serde_json::json!({
+        "type": "sessions",
+        "host_id": host_id,
+        "sessions": sessions,
+    }))
+    .unwrap()
 }
 
 /// A private directory, as the CLI requires for a host socket.
@@ -65,6 +80,9 @@ fn listener() -> (tempfile::TempDir, UnixListener, Command) {
     // Fake terminals do not answer the query written when leaving a session
     // that enabled reports; tests that answer it set their own wait.
     command.env("CHERRY_CLI_REPORT_WAIT_MS", "200");
+    // A lost connection ends the attachment at once, as it did before
+    // attachments connected again; the reconnection tests set their own.
+    command.env("CHERRY_CLI_RECONNECT_WINDOW_MS", "0");
     (directory, listener, command)
 }
 
@@ -174,7 +192,7 @@ struct Collected {
 }
 
 impl Collected {
-    fn new(mut stdout: ChildStdout) -> Self {
+    fn new(mut stdout: impl Read + Send + 'static) -> Self {
         let (tx, chunks) = mpsc::channel();
         thread::spawn(move || {
             let mut buffer = [0u8; 65536];
@@ -204,6 +222,17 @@ impl Collected {
             }
         }
     }
+
+    /// Everything up to the end of the output.
+    fn all(mut self) -> Vec<u8> {
+        loop {
+            match self.chunks.recv_timeout(Duration::from_secs(10)) {
+                Ok(chunk) => self.received.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return self.received,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("output did not end"),
+            }
+        }
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -225,14 +254,7 @@ fn list_json_has_host_identity_and_plain_session_descriptors() {
             read_client(&mut stream),
             Some(ClientMessage::List)
         ));
-        write_frame(
-            &mut stream,
-            &ServerMessage::Sessions {
-                host_id: "host-1".into(),
-                sessions: vec![session()],
-            },
-        )
-        .unwrap();
+        write_frame(&mut stream, &sessions_reply("host-1", vec![session()])).unwrap();
     });
     let result = command.args(["list", "--json"]).output().unwrap();
     assert!(
@@ -1253,13 +1275,7 @@ fn a_resize_while_waiting_for_the_detach_is_never_sent() {
 #[test]
 fn unsolicited_pongs_are_ignored_at_any_time() {
     for (arguments, reply) in [
-        (
-            &["list", "--json"][..],
-            ServerMessage::Sessions {
-                host_id: "host-1".into(),
-                sessions: vec![],
-            },
-        ),
+        (&["list", "--json"][..], sessions_reply("host-1", vec![])),
         (
             &["new", "--cwd=/work"],
             ServerMessage::Created { session: session() },
@@ -1610,13 +1626,17 @@ fn a_lost_connection_is_reported_as_disconnected() {
     let (directory, listener, mut command) = listener();
     let status = directory.path().join("status.json");
     let server = thread::spawn(move || drop(accept_attach(listener, session(), b"")));
-    let output = command
+    // Its input stays open: end of input would detach, and the Detach could
+    // be handled before the lost connection is noticed.
+    let mut child = command
         .args(["attach", "test-session", "--status-file"])
         .arg(&status)
         .stdin(Stdio::piped())
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(wait(&mut child).code(), Some(1));
     server.join().unwrap();
     let value = read_status(&status);
     assert_eq!(value["outcome"], "disconnected");
@@ -2617,14 +2637,17 @@ fn ssh_uses_one_quoted_gateway_command_and_never_becomes_a_control_master() {
         "printf '%s\\n' \"$@\" > \"$CHERRY_TEST_SSH_LOG\"\nexit 1\n",
     );
     let options = "-T\n-o\nControlMaster=no\n-o\nRemoteCommand=none\n-o\nClearAllForwardings=yes\n-o\nPermitLocalCommand=no\n-o\nServerAliveInterval=15\n-o\nServerAliveCountMax=3\n";
-    // Only an attachment forwards the agent: no other command's connection
-    // lasts as long as the sessions that would use it.
+    // Only an attachment or a control connection forwards the agent: no
+    // other command's connection lasts as long as the sessions that would use
+    // it. Only an attachment has a terminal to prompt in.
     let batch = "-a\n-o\nBatchMode=yes\n-o\nConnectTimeout=10\n";
+    let control = "-o\nBatchMode=yes\n-o\nConnectTimeout=10\n";
     // Only commands that need a session may start the remote host.
     for (arguments, batch, gateway) in [
         (&["list", "--json"][..], batch, "gateway"),
         (&["new", "--cwd=/work"], batch, "gateway"),
         (&["attach", "S"], "", "gateway"),
+        (&["control"], control, "gateway"),
         (&["kill", "S"], batch, "gateway --no-start"),
         (&["remove", "S"], batch, "gateway --no-start"),
         (&["shutdown"], batch, "gateway --no-start"),
@@ -2643,6 +2666,30 @@ fn ssh_uses_one_quoted_gateway_command_and_never_becomes_a_control_master() {
             logged,
             format!("{options}{batch}--\nuser@studio\ncherry-host {gateway} --socket '/tmp/a'\\''b; $(literal)'\n"),
             "{arguments:?}"
+        );
+    }
+    // The identity a command insists on reaches the gateway, in the
+    // environment, so that it neither replaces nor reports another host.
+    let id = "5b2e7f3c-9a41-4d8e-b0c6-2f1a9e8d7c6b";
+    for (arguments, gateway) in [
+        (&["list", "--json"][..], "gateway"),
+        (&["kill", "S"], "gateway --no-start"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args(["--host", "user@studio", "--expected-host-id", id])
+            .args(arguments)
+            .env("PATH", directory.path())
+            .env("CHERRY_TEST_SSH_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.ends_with(&format!(
+                "--\nuser@studio\nenv CHERRY_EXPECTED_HOST_ID='{id}' cherry-host {gateway}\n"
+            )),
+            "{arguments:?}: {logged}"
         );
     }
 }
@@ -2674,16 +2721,13 @@ fn ssh_shell_output_before_the_gateway_preamble_is_skipped() {
     let log = directory.path().join("exit");
     let stream = [
         b"Welcome to devbox\r\nYou have mail.\n".as_slice(),
-        b"CHERRY-GATEWAY 3\n",
+        format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").as_bytes(),
         &frames(&[
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: "remote".into(),
             },
-            ServerMessage::Sessions {
-                host_id: "remote".into(),
-                sessions: vec![session()],
-            },
+            sessions_reply("remote", vec![session()]),
         ]),
     ]
     .concat();
@@ -2861,7 +2905,7 @@ fn ssh_shell_output_without_a_gateway_is_explained() {
         .unwrap();
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
-        error.contains("version 2") && error.contains("version 3"),
+        error.contains("version 2") && error.contains(&format!("version {PROTOCOL_VERSION}")),
         "{error}"
     );
 }
@@ -3163,10 +3207,7 @@ fn the_agent_link_follows_only_local_clients_that_create_or_attach_sessions() {
             let mut stream = accept(listener);
             let reply = match read_client(&mut stream) {
                 Some(ClientMessage::Create { .. }) => ServerMessage::Created { session: session() },
-                Some(ClientMessage::List) => ServerMessage::Sessions {
-                    host_id: "host-1".into(),
-                    sessions: vec![],
-                },
+                Some(ClientMessage::List) => sessions_reply("host-1", vec![]),
                 Some(ClientMessage::Kill { .. }) => ServerMessage::Ok,
                 Some(ClientMessage::Attach { .. }) => {
                     write_frame(
@@ -4014,4 +4055,2772 @@ fn detach_with_reports(snapshot: &[u8], while_detaching: &[u8], after_reset: &[u
         String::from_utf8_lossy(&received[reset..])
     );
     pending_input(&pty.slave)
+}
+
+// Protocol 4: `cherry control`, replacing an older host, `new` metadata and
+// `--ssh-control-path`.
+
+fn encoded<T: serde::Serialize>(message: &T) -> Vec<u8> {
+    encode_frame(message).unwrap()
+}
+
+/// A frame around raw JSON, for messages no version knows yet.
+fn raw_frame(json: &[u8]) -> Vec<u8> {
+    [&(json.len() as u32).to_be_bytes()[..], json].concat()
+}
+
+/// The Welcome `cherry control` writes before anything the host sends.
+fn welcome(host_id: &str) -> Vec<u8> {
+    encoded(&ServerMessage::Welcome {
+        version: PROTOCOL_VERSION,
+        host_id: host_id.into(),
+    })
+}
+
+/// The host's end of a connection the client closed: no further frame.
+fn assert_client_closed(stream: &mut UnixStream) {
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "client sent {rest:?}");
+}
+
+fn spawn_control(command: &mut Command) -> Child {
+    command
+        .arg("control")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn control_writes_the_welcome_then_relays_frames_verbatim_both_ways() {
+    let (_directory, listener, mut command) = listener();
+    // Requests with and without ids, and one that only the host may judge.
+    let requests = [
+        encoded(&Request::new(Some(1), ClientMessage::Subscribe)),
+        encoded(&Request::new(Some(u64::MAX), ClientMessage::List)),
+        raw_frame(br#"{"op":"from_the_future","req":3,"x":[1,2]}"#),
+        encoded(&ClientMessage::Ping),
+    ]
+    .concat();
+    let replies = [
+        encoded(&Response::new(Some(1), ServerMessage::Ok)),
+        encoded(&ServerMessage::Event {
+            event: SessionEvent::Bell {
+                id: "test-session".into(),
+            },
+        }),
+        encoded(&Response::new(
+            Some(u64::MAX),
+            sessions_reply("host-1", vec![session()]),
+        )),
+        raw_frame(br#"{"type":"from_the_future","req":3}"#),
+        encoded(&ServerMessage::Pong),
+    ]
+    .concat();
+    let (expected_requests, host_replies) = (requests.clone(), replies.clone());
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        let mut received = vec![0; expected_requests.len()];
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected_requests);
+        stream.write_all(&host_replies).unwrap();
+        // The app closing its input ends the connection.
+        assert_client_closed(&mut stream);
+    });
+    let mut child = spawn_control(&mut command);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&requests).unwrap();
+    let mut output = Collected::new(child.stdout.take().unwrap());
+    let expected = [welcome("host-1"), replies].concat();
+    output.expect(&expected);
+    drop(stdin);
+    let status = wait(&mut child);
+    let error = stderr_of(&mut child);
+    assert!(status.success(), "{error}");
+    assert_eq!(error, "");
+    assert_eq!(output.all(), expected, "standard output holds only frames");
+    server.join().unwrap();
+}
+
+#[test]
+fn control_sends_scripted_input_and_relays_the_answers_that_follow_its_end() {
+    // Regular files, which Darwin's poll rejects, on both sides.
+    let (directory, listener, mut command) = listener();
+    let requests = [
+        encoded(&Request::new(Some(7), ClientMessage::List)),
+        encoded(&ClientMessage::Ping),
+    ]
+    .concat();
+    let replies = [
+        encoded(&Response::new(Some(7), sessions_reply("host-1", vec![]))),
+        encoded(&ServerMessage::Pong),
+    ]
+    .concat();
+    let (expected_requests, host_replies) = (requests.clone(), replies.clone());
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        // Everything, then the end of the input, before any answer.
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).unwrap();
+        assert_eq!(received, expected_requests);
+        stream.write_all(&host_replies).unwrap();
+    });
+    let input = directory.path().join("input");
+    let output = directory.path().join("output");
+    std::fs::write(&input, &requests).unwrap();
+    let result = command
+        .arg("control")
+        .stdin(File::open(&input).unwrap())
+        .stdout(File::create(&output).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        [welcome("host-1"), replies].concat()
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn control_moves_large_bursts_both_ways_at_once() {
+    // Neither direction waits for the other: the host writes while the app
+    // still sends, and each reads only after the other side wrote a lot.
+    const FRAMES: usize = 64;
+    let payload = alphabet(60 * 1024);
+    let request = encoded(&Request::new(
+        Some(1),
+        ClientMessage::SendInput {
+            id: "test-session".into(),
+            data: payload.clone(),
+        },
+    ));
+    let reply = encoded(&ServerMessage::Output {
+        offset: 0,
+        data: payload,
+    });
+    let (_directory, listener, mut command) = listener();
+    let (expected, host_reply) = (request.clone(), reply.clone());
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let replies = thread::spawn(move || {
+            for _ in 0..FRAMES {
+                writer.write_all(&host_reply).unwrap();
+            }
+        });
+        let mut received = vec![0; expected.len()];
+        for _ in 0..FRAMES {
+            stream.read_exact(&mut received).unwrap();
+            assert!(received == expected, "request changed on the way");
+        }
+        replies.join().unwrap();
+        assert_client_closed(&mut stream);
+    });
+    let mut child = spawn_control(&mut command);
+    let mut stdin = child.stdin.take().unwrap();
+    let sender = thread::spawn(move || {
+        for _ in 0..FRAMES {
+            stdin.write_all(&request).unwrap();
+        }
+    });
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = vec![0; welcome("host-1").len()];
+    stdout.read_exact(&mut first).unwrap();
+    assert_eq!(first, welcome("host-1"));
+    let mut received = vec![0; reply.len()];
+    for _ in 0..FRAMES {
+        stdout.read_exact(&mut received).unwrap();
+        assert!(received == reply, "reply changed on the way");
+    }
+    sender.join().unwrap();
+    let status = wait_within(&mut child, Duration::from_secs(30));
+    assert!(status.success(), "{}", stderr_of(&mut child));
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn control_fails_when_the_host_closes_first_after_relaying_what_it_sent() {
+    let (_directory, listener, mut command) = listener();
+    let event = encoded(&ServerMessage::Event {
+        event: SessionEvent::Resync,
+    });
+    let sent = event.clone();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        stream.write_all(&sent).unwrap();
+    });
+    let mut child = spawn_control(&mut command);
+    let _stdin = child.stdin.take().unwrap();
+    let output = Collected::new(child.stdout.take().unwrap());
+    assert_eq!(wait(&mut child).code(), Some(1));
+    let error = stderr_of(&mut child);
+    assert_eq!(error, "cherry: host connection closed unexpectedly\n");
+    assert_eq!(output.all(), [welcome("host-1"), event].concat());
+    server.join().unwrap();
+}
+
+#[test]
+fn control_ends_on_a_termination_signal() {
+    let (_directory, listener, mut command) = listener();
+    let (connected_tx, connected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        connected_tx.send(()).unwrap();
+        assert_client_closed(&mut stream);
+    });
+    let mut child = spawn_control(&mut command);
+    let _stdin = child.stdin.take().unwrap();
+    let mut output = Collected::new(child.stdout.take().unwrap());
+    connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    output.expect(&welcome("host-1"));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(wait(&mut child).code(), Some(128 + libc::SIGTERM));
+    assert_eq!(output.all(), welcome("host-1"));
+    server.join().unwrap();
+}
+
+/// A pipe for a child's standard output whose write end the test keeps as
+/// well: file status flags belong to the open pipe, so the test sees the
+/// flags the child leaves behind. Returns (reader, writer, flags).
+fn output_pipe() -> (File, File, i32) {
+    let mut descriptors = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    for fd in descriptors {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let mut reader = unsafe { File::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+    // Darwin adds a kernel bookkeeping flag on the first successful write.
+    writer.write_all(b"x").unwrap();
+    reader.read_exact(&mut [0]).unwrap();
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    (reader, writer, flags)
+}
+
+fn flags_of(file: &File) -> i32 {
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) }
+}
+
+#[test]
+fn control_ends_quietly_when_the_app_closes_its_output_and_leaves_its_flags_alone() {
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Ping)
+        ));
+        write_frame(&mut stream, &ServerMessage::Pong).unwrap();
+        assert_client_closed(&mut stream);
+    });
+    let (mut reader, writer, flags) = output_pipe();
+    let mut child = command
+        .arg("control")
+        .stdin(Stdio::piped())
+        .stdout(writer.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = vec![0; welcome("host-1").len()];
+    reader.read_exact(&mut first).unwrap();
+    assert_eq!(first, welcome("host-1"));
+    // The app stops reading, while its input stays open; the Pong is the
+    // next thing the client writes.
+    drop(reader);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&encoded(&ClientMessage::Ping)).unwrap();
+    let status = wait(&mut child);
+    let error = stderr_of(&mut child);
+    assert!(status.success(), "{error}");
+    assert_eq!(error, "");
+    assert_eq!(flags_of(&writer), flags, "O_NONBLOCK leaked to the app");
+    server.join().unwrap();
+}
+
+#[test]
+fn control_succeeds_when_a_host_never_closes_after_the_input_ended() {
+    const QUIET: Duration = Duration::from_millis(500);
+    let (_directory, listener, mut command) = listener();
+    let (half_closed_tx, half_closed_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Ping)
+        ));
+        write_frame(&mut stream, &ServerMessage::Pong).unwrap();
+        // The app's end of input arrives as end of file ...
+        assert_client_closed(&mut stream);
+        half_closed_tx.send(()).unwrap();
+        // ... but this host never closes its side.
+        let _ = done_rx.recv();
+    });
+    let (mut reader, writer, flags) = output_pipe();
+    let mut child = command
+        .arg("control")
+        .env("CHERRY_CLI_QUIET_WAIT_MS", QUIET.as_millis().to_string())
+        .stdin(Stdio::piped())
+        .stdout(writer.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&encoded(&ClientMessage::Ping)).unwrap();
+    let expected = [welcome("host-1"), encoded(&ServerMessage::Pong)].concat();
+    let mut received = vec![0; expected.len()];
+    reader.read_exact(&mut received).unwrap();
+    assert_eq!(received, expected);
+    let ended = Instant::now();
+    drop(stdin);
+    half_closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let status = wait(&mut child);
+    let exited = Instant::now();
+    let error = stderr_of(&mut child);
+    assert!(status.success(), "{error}");
+    assert_eq!(error, "");
+    // Once nothing moved for the quiet wait, and not before.
+    assert!(exited >= ended + QUIET, "{:?}", exited - ended);
+    // Nothing else on standard output.
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    assert!(
+        matches!(reader.read(&mut [0]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(flags_of(&writer), flags, "O_NONBLOCK leaked to the app");
+    drop(done_tx);
+    server.join().unwrap();
+}
+
+#[test]
+fn control_writes_nothing_to_standard_output_when_it_cannot_connect() {
+    // Answers that end the handshake, and what the error must say.
+    let failures = [
+        (
+            Some("12345678-1234-4234-8234-123456789abc"),
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                host_id: "host-1".into(),
+            },
+            "host identity changed",
+        ),
+        (
+            None,
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION + 1,
+                host_id: "host-1".into(),
+            },
+            "protocol version mismatch",
+        ),
+        // A host older than protocol 4 refuses the Hello outright.
+        (
+            None,
+            ServerMessage::error(
+                "version_mismatch",
+                "expected Cherry host protocol version 3",
+            ),
+            "host rejected request (version_mismatch): expected Cherry host protocol version 3",
+        ),
+    ];
+    for (expected_host_id, reply, message) in failures {
+        let (_directory, listener, mut command) = listener();
+        let server = thread::spawn(move || {
+            let mut stream = accept_raw(listener);
+            assert!(matches!(
+                read_client(&mut stream),
+                Some(ClientMessage::Hello { .. })
+            ));
+            write_frame(&mut stream, &reply).unwrap();
+            // Nothing else, and certainly no Replace.
+            assert_client_closed(&mut stream);
+        });
+        if let Some(id) = expected_host_id {
+            command.args(["--expected-host-id", id]);
+        }
+        let output = command
+            .arg("control")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        assert!(output.stdout.is_empty(), "{message}");
+        assert!(error.contains(message), "{error}");
+        server.join().unwrap();
+    }
+
+    // No host, and none can be started.
+    let directory = private_directory();
+    let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .arg("--socket")
+        .arg(directory.path().join("host.sock"))
+        .arg("control")
+        .env("CHERRY_HOST_PATH", "/nonexistent/cherry-host")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not start"));
+
+    // Usage errors.
+    for arguments in [
+        &["control", "extra"][..],
+        &["--ssh-control-path", "/tmp/cp", "control"],
+        &["--host", "studio", "--ssh-control-path", "cp", "control"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args(arguments)
+            .env("PATH", "/nonexistent")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn control_lends_the_agent_while_it_is_connected() {
+    let (directory, listener, mut command) = listener();
+    let agents = tempfile::tempdir().unwrap();
+    let agent = agents.path().join("agent");
+    let _agent = UnixListener::bind(&agent).unwrap();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        assert_client_closed(&mut stream);
+    });
+    let mut child = spawn_control(command.env("SSH_AUTH_SOCK", &agent));
+    let stdin = child.stdin.take().unwrap();
+    let mut output = Collected::new(child.stdout.take().unwrap());
+    output.expect(&welcome("host-1"));
+    assert_eq!(
+        std::fs::read_link(directory.path().join("agent.sock")).ok(),
+        Some(agent)
+    );
+    drop(stdin);
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    server.join().unwrap();
+}
+
+/// A fake ssh for successive connections: run N logs its arguments to
+/// `arguments.N`, prints `streams[N - 1]` and saves its input, once that
+/// ends, to `input.N`.
+fn scripted_ssh(directory: &Path, streams: &[Vec<u8>]) {
+    for (index, stream) in streams.iter().enumerate() {
+        std::fs::write(directory.join(format!("stream.{}", index + 1)), stream).unwrap();
+    }
+    script(
+        &directory.join("ssh"),
+        &format!(
+            "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\nprintf '%s\\n' \"$@\" > \"$d/arguments.$n\"\n/bin/cat \"$d/stream.$n\"\n/bin/cat > \"$d/input.$n.tmp\"\n/bin/mv \"$d/input.$n.tmp\" \"$d/input.$n\"\n",
+            directory.display()
+        ),
+    );
+}
+
+fn read_when_written(path: &Path) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(bytes) = std::fs::read(path) {
+            return bytes;
+        }
+        assert!(Instant::now() < deadline, "{} not written", path.display());
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn control_over_ssh_relays_what_follows_the_gateway_preamble_and_forwards_the_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let event = encoded(&ServerMessage::Event {
+        event: SessionEvent::Removed { id: "gone".into() },
+    });
+    let pong = encoded(&ServerMessage::Pong);
+    scripted_ssh(
+        directory.path(),
+        &[[
+            b"Welcome to devbox\r\n".as_slice(),
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").as_bytes(),
+            &frames(&[ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                host_id: "remote".into(),
+            }]),
+            &event,
+            &pong,
+        ]
+        .concat()],
+    );
+    let ping = encoded(&ClientMessage::Ping);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args([
+            "--host",
+            "devbox",
+            "--ssh-control-path",
+            "/tmp/cherry-cp/%h",
+            "control",
+        ])
+        .env("PATH", directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&ping).unwrap();
+    let output = Collected::new(child.stdout.take().unwrap());
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    assert_eq!(output.all(), [welcome("remote"), event, pong].concat());
+    assert_eq!(
+        read_when_written(&directory.path().join("input.1")),
+        [encoded(&ClientMessage::hello()), ping].concat()
+    );
+    // Batch mode (standard input carries frames, not answers to prompts),
+    // with the agent forwarded as configured: no -a.
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("arguments.1")).unwrap(),
+        "-T\n-o\nControlMaster=no\n-o\nControlPath=/tmp/cherry-cp/%%h\n-o\nRemoteCommand=none\n-o\nClearAllForwardings=yes\n-o\nPermitLocalCommand=no\n-o\nServerAliveInterval=15\n-o\nServerAliveCountMax=3\n-o\nBatchMode=yes\n-o\nConnectTimeout=10\n--\ndevbox\ncherry-host gateway\n"
+    );
+}
+
+#[test]
+fn control_fails_once_writes_to_the_host_fail_after_relaying_what_it_sent() {
+    // A connection whose far end stops taking bytes but never ends what it
+    // sends: after the Hello, this ssh closes its input and keeps its output
+    // open. Portable, unlike a socket shut down for reading.
+    let directory = tempfile::tempdir().unwrap();
+    let event = encoded(&ServerMessage::Event {
+        event: SessionEvent::Resync,
+    });
+    let stream = directory.path().join("stream");
+    std::fs::write(
+        &stream,
+        [
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").as_bytes(),
+            &welcome("remote"),
+            &event,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let closed = directory.path().join("closed");
+    script(
+        &directory.path().join("ssh"),
+        &format!(
+            "/bin/cat '{}'\n/bin/dd bs=1 count={} of=/dev/null 2>/dev/null\nexec 0<&-\n: > '{}'\nexec /bin/sleep 30\n",
+            stream.display(),
+            encoded(&ClientMessage::hello()).len(),
+            closed.display()
+        ),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args(["--host", "devbox", "control"])
+        .env("PATH", directory.path())
+        .env("CHERRY_CLI_CLOSED_WAIT_MS", "300")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut output = Collected::new(child.stdout.take().unwrap());
+    output.expect(&[welcome("remote"), event.clone()].concat());
+    read_when_written(&closed);
+    // The app's input stays open; this request cannot be sent.
+    stdin.write_all(&encoded(&ClientMessage::Ping)).unwrap();
+    let status = wait(&mut child);
+    assert_eq!(
+        stderr_of(&mut child),
+        "cherry: host connection closed unexpectedly (errors from ssh or cherry-host, if any, are shown above)\n"
+    );
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(output.all(), [welcome("remote"), event].concat());
+}
+
+#[test]
+fn every_ssh_uses_the_control_path_with_percent_signs_doubled() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("arguments");
+    script(
+        &directory.path().join("ssh"),
+        "printf '%s\\n' \"$@\" > \"$CHERRY_TEST_SSH_LOG\"\nexit 1\n",
+    );
+    for arguments in [
+        &["list", "--json"][..],
+        &["new", "--cwd=/work"],
+        &["attach", "S"],
+        &["kill", "S"],
+        &["remove", "S"],
+        &["shutdown"],
+        &["control"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args([
+                "--host",
+                "user@studio",
+                "--ssh-control-path",
+                "/tmp/cherry-501/%C-%h.%%",
+            ])
+            .args(arguments)
+            .env("PATH", directory.path())
+            .env("CHERRY_TEST_SSH_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.starts_with(
+                "-T\n-o\nControlMaster=no\n-o\nControlPath=/tmp/cherry-501/%%C-%%h.%%%%\n-o\nRemoteCommand=none\n"
+            ),
+            "{arguments:?}: {logged}"
+        );
+        assert_eq!(logged.matches("ControlPath").count(), 1, "{logged}");
+    }
+}
+
+/// A fake `cherry-host` for `start --socket PATH`: it logs its arguments to
+/// `log`, then waits for the test to listen at PATH, as a started host would.
+fn fake_host_starter(directory: &Path, log: &Path) -> PathBuf {
+    let host = directory.join("fake-cherry-host");
+    script(
+        &host,
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{}'\ni=0\nwhile [ ! -S \"$3\" ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done\n",
+            log.display()
+        ),
+    );
+    host
+}
+
+/// An older host at `listener`: it welcomes the client, expects Replace, and
+/// makes way as a host does (its socket gone before the Ok), or, unless it
+/// `confirms`, as a host that made way for another client at the same time
+/// (gone without answering). Then, once the client started "its" host, the
+/// new host at the same path welcomes it with `version` and `serve` goes on.
+fn older_host_making_way(
+    listener: UnixListener,
+    socket: PathBuf,
+    started: PathBuf,
+    confirms: bool,
+    version: u32,
+    serve: impl FnOnce(UnixStream) + Send + 'static,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut stream = accept_raw(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Hello {
+                version: PROTOCOL_VERSION
+            })
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION - 1,
+                host_id: "host-1".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Replace)
+        ));
+        std::fs::remove_file(&socket).unwrap();
+        if confirms {
+            write_frame(&mut stream, &ServerMessage::Ok).unwrap();
+        }
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "the client started no host");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut stream = accept_raw(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Hello {
+                version: PROTOCOL_VERSION
+            })
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::Welcome {
+                version,
+                host_id: "host-1".into(),
+            },
+        )
+        .unwrap();
+        serve(stream);
+    })
+}
+
+#[test]
+fn an_older_host_makes_way_and_the_command_goes_on_with_the_host_it_starts() {
+    let pong = encoded(&ServerMessage::Pong);
+    for (arguments, confirms) in [
+        (&["list", "--json"][..], true),
+        (&["new", "--cwd=/work"], true),
+        (&["attach", "test-session"], true),
+        (&["control"], true),
+        // The host made way for another client asking at the same moment.
+        (&["list", "--json"], false),
+        (&["control"], false),
+    ] {
+        let (directory, listener, mut command) = listener();
+        let socket = directory.path().join("host.sock");
+        let log = directory.path().join("started");
+        let host = fake_host_starter(directory.path(), &log);
+        let server = older_host_making_way(
+            listener,
+            socket.clone(),
+            log.clone(),
+            confirms,
+            PROTOCOL_VERSION,
+            |mut stream| {
+                let reply = match read_client(&mut stream) {
+                    Some(ClientMessage::List) => sessions_reply("host-1", vec![]),
+                    Some(ClientMessage::Create { .. }) => {
+                        ServerMessage::Created { session: session() }
+                    }
+                    Some(ClientMessage::Attach { .. }) => {
+                        write_frame(
+                            &mut stream,
+                            &ServerMessage::Attached {
+                                reason: AttachReason::Attach,
+                                session: session(),
+                                offset: 0,
+                                snapshot: Vec::new(),
+                            },
+                        )
+                        .unwrap();
+                        while !matches!(read_client(&mut stream), Some(ClientMessage::Detach)) {}
+                        ServerMessage::Ok
+                    }
+                    Some(ClientMessage::Ping) => {
+                        write_frame(&mut stream, &ServerMessage::Pong).unwrap();
+                        assert_client_closed(&mut stream);
+                        return;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                };
+                write_frame(&mut stream, &reply).unwrap();
+            },
+        );
+        let mut child = command
+            .args(arguments)
+            .env("CHERRY_HOST_PATH", &host)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if arguments == ["control"] {
+            stdin.write_all(&encoded(&ClientMessage::Ping)).unwrap();
+        }
+        drop(stdin);
+        let output = Collected::new(child.stdout.take().unwrap());
+        let status = wait(&mut child);
+        assert!(status.success(), "{arguments:?}: {}", stderr_of(&mut child));
+        let stdout = output.all();
+        match arguments[0] {
+            // Only the new host's Welcome.
+            "control" => assert_eq!(stdout, [welcome("host-1"), pong.clone()].concat()),
+            "list" => {
+                let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(value["host_id"], "host-1");
+            }
+            "new" => {
+                let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(value["id"], "test-session");
+            }
+            _ => {}
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("start --socket {}\n", socket.display()),
+            "{arguments:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_host_started_in_place_of_an_older_one_is_not_replaced_again() {
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let log = directory.path().join("started");
+    let host = fake_host_starter(directory.path(), &log);
+    let server = older_host_making_way(
+        listener,
+        socket,
+        log,
+        true,
+        PROTOCOL_VERSION - 1,
+        |mut stream| assert_client_closed(&mut stream),
+    );
+    let output = command
+        .arg("control")
+        .env("CHERRY_HOST_PATH", &host)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(&format!(
+            "the cherry-host speaking protocol {} was asked to make way, but the host answering now speaks protocol {}, not {PROTOCOL_VERSION}",
+            PROTOCOL_VERSION - 1,
+            PROTOCOL_VERSION - 1
+        )),
+        "{error}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn replacing_an_older_host_and_connecting_again_share_one_deadline() {
+    // The older host takes half the limit to make way, and the host started
+    // in its place never answers. Connecting again gets what is left, not a
+    // limit of its own, which would take one and a half limits in all.
+    const LIMIT: Duration = Duration::from_secs(5);
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let log = directory.path().join("started");
+    let host = fake_host_starter(directory.path(), &log);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let started = log.clone();
+    let server = thread::spawn(move || {
+        let mut stream = accept_raw(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Hello { .. })
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION - 1,
+                host_id: "host-1".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Replace)
+        ));
+        std::fs::remove_file(&socket).unwrap();
+        thread::sleep(LIMIT / 2);
+        write_frame(&mut stream, &ServerMessage::Ok).unwrap();
+        drop(stream);
+        while !started.exists() {
+            if !matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                return Vec::new();
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut accepted = Vec::new();
+        while matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            if let Ok((stream, _)) = listener.accept() {
+                accepted.push(stream);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        accepted
+    });
+    let began = Instant::now();
+    let output = command
+        .arg("control")
+        .env("CHERRY_HOST_PATH", &host)
+        .env(
+            "CHERRY_CLI_CONNECT_TIMEOUT_MS",
+            LIMIT.as_millis().to_string(),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let elapsed = began.elapsed();
+    drop(done_tx);
+    let accepted = server.join().unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(
+        error.contains(&format!(
+            "the cherry-host speaking protocol {} was asked to make way, but no cherry-host speaking protocol {PROTOCOL_VERSION} could be reached: timed out waiting for host",
+            PROTOCOL_VERSION - 1
+        )),
+        "{error}"
+    );
+    assert!(elapsed >= LIMIT, "{elapsed:?}");
+    assert!(elapsed < LIMIT + LIMIT / 2, "{elapsed:?}");
+    // The new host got a Hello and nothing else.
+    let [mut stream] = <[UnixStream; 1]>::try_from(accepted).unwrap();
+    stream.set_nonblocking(false).unwrap();
+    assert!(matches!(
+        read_client(&mut stream),
+        Some(ClientMessage::Hello { .. })
+    ));
+    assert_client_closed(&mut stream);
+}
+
+#[test]
+fn kill_remove_and_shutdown_never_replace_an_older_host() {
+    for arguments in [&["kill", "S"][..], &["remove", "S"], &["shutdown"]] {
+        let (directory, listener, mut command) = listener();
+        let log = directory.path().join("started");
+        let host = fake_host_starter(directory.path(), &log);
+        let server = thread::spawn(move || {
+            let mut stream = accept_raw(listener);
+            assert!(matches!(
+                read_client(&mut stream),
+                Some(ClientMessage::Hello { .. })
+            ));
+            write_frame(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION - 1,
+                    host_id: "host-1".into(),
+                },
+            )
+            .unwrap();
+            assert_client_closed(&mut stream);
+        });
+        let output = command
+            .args(arguments)
+            .env("CHERRY_HOST_PATH", &host)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!(
+                "cherry-host speaks version {}, this cherry speaks version {PROTOCOL_VERSION}; this command never replaces a host",
+                PROTOCOL_VERSION - 1
+            )),
+            "{arguments:?}: {error}"
+        );
+        assert!(!log.exists(), "{arguments:?} started a host");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn an_older_host_that_refuses_to_make_way_is_reported_and_left_alone() {
+    for arguments in [&["list"][..], &["new", "--cwd=/work"], &["control"]] {
+        let (directory, listener, mut command) = listener();
+        let log = directory.path().join("started");
+        let host = fake_host_starter(directory.path(), &log);
+        let server = thread::spawn(move || {
+            let mut stream = accept_raw(listener);
+            assert!(matches!(
+                read_client(&mut stream),
+                Some(ClientMessage::Hello { .. })
+            ));
+            write_frame(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION - 1,
+                    host_id: "host-1".into(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_client(&mut stream),
+                Some(ClientMessage::Replace)
+            ));
+            write_frame(
+                &mut stream,
+                &ServerMessage::error("request_failed", "host still owns running sessions"),
+            )
+            .unwrap();
+        });
+        let output = command
+            .args(arguments)
+            .env("CHERRY_HOST_PATH", &host)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {error}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        assert!(
+            error.contains(&format!(
+                "could not replace the cherry-host speaking protocol {} (this cherry speaks protocol {PROTOCOL_VERSION}): host rejected request (request_failed): host still owns running sessions",
+                PROTOCOL_VERSION - 1
+            )),
+            "{arguments:?}: {error}"
+        );
+        assert!(!log.exists(), "{arguments:?} started a host");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn newer_hosts_and_other_hosts_are_never_replaced() {
+    for (version, expected_host_id, message) in [
+        (PROTOCOL_VERSION + 1, None, "protocol version mismatch"),
+        (
+            PROTOCOL_VERSION - 1,
+            Some("12345678-1234-4234-8234-123456789abc"),
+            "host identity changed",
+        ),
+    ] {
+        for arguments in [&["list"][..], &["attach", "S"], &["control"]] {
+            let (_directory, listener, mut command) = listener();
+            let server = thread::spawn(move || {
+                let mut stream = accept_raw(listener);
+                assert!(matches!(
+                    read_client(&mut stream),
+                    Some(ClientMessage::Hello { .. })
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerMessage::Welcome {
+                        version,
+                        host_id: "host-1".into(),
+                    },
+                )
+                .unwrap();
+                assert_client_closed(&mut stream);
+            });
+            if let Some(id) = expected_host_id {
+                command.args(["--expected-host-id", id]);
+            }
+            let output = command
+                .args(arguments)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{arguments:?}: {error}");
+            assert!(error.contains(message), "{arguments:?}: {error}");
+            assert!(output.stdout.is_empty(), "{arguments:?}");
+            server.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_older_host_behind_a_gateway_makes_way_and_the_next_gateway_starts_a_new_one() {
+    let older = |then: &ServerMessage| {
+        [
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+            frames(&[
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION - 1,
+                    host_id: "remote".into(),
+                },
+                then.clone(),
+            ]),
+        ]
+        .concat()
+    };
+    let current = |then: &ServerMessage| {
+        [
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+            frames(&[
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    host_id: "remote".into(),
+                },
+                then.clone(),
+            ]),
+        ]
+        .concat()
+    };
+    let sessions = sessions_reply("remote", vec![]);
+    for (arguments, reply, request) in [
+        (&["list", "--json"][..], sessions, ClientMessage::List),
+        (&["control"], ServerMessage::Pong, ClientMessage::Ping),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        scripted_ssh(
+            directory.path(),
+            &[older(&ServerMessage::Ok), current(&reply)],
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args(["--host", "devbox"])
+            .args(arguments)
+            .env("PATH", directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if arguments == ["control"] {
+            stdin.write_all(&encoded(&request)).unwrap();
+        }
+        drop(stdin);
+        let output = Collected::new(child.stdout.take().unwrap());
+        assert!(
+            wait(&mut child).success(),
+            "{arguments:?}: {}",
+            stderr_of(&mut child)
+        );
+        let stdout = output.all();
+        if arguments == ["control"] {
+            assert_eq!(stdout, [welcome("remote"), encoded(&reply)].concat());
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(value["host_id"], "remote");
+        }
+        let path = |name: &str| directory.path().join(name);
+        assert_eq!(
+            read_when_written(&path("input.1")),
+            [
+                encoded(&ClientMessage::hello()),
+                encoded(&ClientMessage::Replace)
+            ]
+            .concat()
+        );
+        assert_eq!(
+            read_when_written(&path("input.2")),
+            [encoded(&ClientMessage::hello()), encoded(&request)].concat()
+        );
+        // The same gateway both times; it may start a host.
+        let first = std::fs::read_to_string(path("arguments.1")).unwrap();
+        assert!(
+            first.ends_with("--\ndevbox\ncherry-host gateway\n"),
+            "{first}"
+        );
+        assert_eq!(std::fs::read_to_string(path("arguments.2")).unwrap(), first);
+        assert!(!path("stream.3").exists() && !path("arguments.3").exists());
+    }
+}
+
+#[test]
+fn new_sends_environment_owner_and_tags() {
+    let (_directory, host, mut command) = listener();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept(host);
+        let request = read_client(&mut stream).unwrap();
+        tx.send(serde_json::to_value(&request).unwrap()).unwrap();
+        write_frame(&mut stream, &ServerMessage::Created { session: session() }).unwrap();
+    });
+    let output = command
+        .args([
+            "new",
+            "--cwd=/work",
+            "--env",
+            "CHERRY_PROCESS_ID=0F1E",
+            "--env=TERM=xterm-ghostty",
+            "--env",
+            "CHERRY_PROCESS_ID=A=B",
+            "--env=LANG=it_IT.UTF-8",
+            "--owner=dev.cherry",
+            "--tag",
+            "cherry.tab=T1",
+            "--tag=cherry.kind=agent",
+            "--tag",
+            "cherry.tab=T2",
+            "--tag=empty=",
+        ])
+        .env("LANG", "en_GB.UTF-8")
+        .env("LC_ALL", "C")
+        .env("TZ", "Europe/Rome")
+        .env("UNRELATED", "x")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(request["op"], "create");
+    assert_eq!(request["owner"], "dev.cherry");
+    assert_eq!(
+        request["tags"],
+        serde_json::json!({"cherry.kind": "agent", "cherry.tab": "T2", "empty": ""})
+    );
+    // The last value of a name wins; an explicit locale replaces the
+    // terminal's (LC_ALL would override it), TZ still comes along.
+    assert_eq!(
+        request["env"],
+        serde_json::json!({
+            "CHERRY_PROCESS_ID": "A=B",
+            "LANG": "it_IT.UTF-8",
+            "TERM": "xterm-ghostty",
+            "TZ": "Europe/Rome",
+        })
+    );
+    server.join().unwrap();
+
+    // Without any: no owner, no tags, the terminal's locale.
+    let (_directory, listener, mut command) = listener();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        let request = read_client(&mut stream).unwrap();
+        tx.send(serde_json::to_value(&request).unwrap()).unwrap();
+        write_frame(&mut stream, &ServerMessage::Created { session: session() }).unwrap();
+    });
+    let output = command
+        .args(["new", "--cwd=/work"])
+        .env("LANG", "en_GB.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("TZ")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(request["owner"].is_null());
+    assert_eq!(request["tags"], serde_json::json!({}));
+    assert_eq!(request["env"]["LANG"], "en_GB.UTF-8");
+    server.join().unwrap();
+}
+
+#[test]
+fn invalid_new_options_are_usage_errors_before_connecting() {
+    let (directory, host, _) = listener();
+    let too_many: Vec<String> = (0..=cherry_protocol::MAX_TAGS)
+        .map(|n| format!("--tag=k{n}=v"))
+        .collect();
+    let owner = format!(
+        "--owner={}",
+        "o".repeat(cherry_protocol::MAX_OWNER_BYTES + 1)
+    );
+    for arguments in [
+        vec!["--env", "1ABC=x"],
+        vec!["--env", "NO_VALUE"],
+        vec!["--env", "A-B=x"],
+        vec!["--tag", "no-value"],
+        vec!["--tag", "=v"],
+        vec![owner.as_str()],
+        too_many.iter().map(String::as_str).collect(),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .arg("--socket")
+            .arg(directory.path().join("host.sock"))
+            .args(["new", "--cwd=/work"])
+            .args(&arguments)
+            .env("CHERRY_HOST_PATH", "/nonexistent/cherry-host")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert!(
+        matches!(host.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "a usage error connected"
+    );
+}
+
+#[test]
+fn events_and_screen_text_never_end_a_command_or_an_attachment() {
+    let event = ServerMessage::Event {
+        event: SessionEvent::Bell {
+            id: "test-session".into(),
+        },
+    };
+    let (_directory, host, mut command) = listener();
+    let pushed = event.clone();
+    let server = thread::spawn(move || {
+        let mut stream = accept(host);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::List)
+        ));
+        write_frame(&mut stream, &pushed).unwrap();
+        write_frame(&mut stream, &sessions_reply("host-1", vec![])).unwrap();
+    });
+    let output = command.args(["list", "--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, session(), b"screen");
+        for message in [
+            event,
+            ServerMessage::ScreenText {
+                id: "test-session".into(),
+                text: "stray".into(),
+                cursor_row: 0,
+                cursor_col: 0,
+                alternate_screen: false,
+            },
+            ServerMessage::Output {
+                offset: 0,
+                data: b"+live".to_vec(),
+            },
+        ] {
+            write_frame(&mut stream, &message).unwrap();
+        }
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Detach)
+        ));
+        write_frame(&mut stream, &ServerMessage::Ok).unwrap();
+    });
+    let mut child = command
+        .args(["attach", "test-session"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut output = Collected::new(child.stdout.take().unwrap());
+    output.expect(b"screen+live");
+    drop(stdin);
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    assert!(!contains(&output.all(), b"stray"));
+    server.join().unwrap();
+}
+
+// An attachment that lost its connection connects again.
+
+/// Wait until the status file satisfies `accept`, returning it.
+fn wait_for_status(path: &Path, accept: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = None;
+    loop {
+        if let Ok(bytes) = std::fs::read(path) {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if accept(&value) {
+                return value;
+            }
+            last = Some(value);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status never matched; last {last:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn live(reconnecting: bool) -> impl Fn(&serde_json::Value) -> bool {
+    move |status| status["outcome"] == "attached" && status["reconnecting"] == reconnecting
+}
+
+/// The live state has exactly the fields the app reads.
+fn assert_live(status: &serde_json::Value, viewport: bool, reconnecting: bool) {
+    assert_eq!(
+        status,
+        &serde_json::json!({
+            "outcome": "attached",
+            "viewport": viewport,
+            "reconnecting": reconnecting,
+            "exit_code": null,
+            "signal": null,
+            "message": null,
+        })
+    );
+}
+
+/// The input the client sends until it ends with `expected`; heartbeats are
+/// skipped, anything else fails.
+fn input_until(stream: &mut UnixStream, expected: &[u8]) -> Vec<u8> {
+    let mut input = Vec::new();
+    while !input.ends_with(expected) {
+        match read_client(stream) {
+            Some(ClientMessage::Input { data }) => input.extend(data),
+            Some(ClientMessage::Ping) => {}
+            other => panic!("expected input, received {other:?} after {input:?}"),
+        }
+    }
+    input
+}
+
+/// A host stops: its connection ends and its socket is gone.
+fn host_gone(stream: UnixStream, socket: &Path) {
+    drop(stream);
+    std::fs::remove_file(socket).unwrap();
+}
+
+/// A host starts again at `socket`.
+fn host_back(socket: &Path) -> UnixListener {
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    listener
+}
+
+/// Answer an Attach (at `size`, never a takeover) with `snapshot` at `offset`.
+fn reattach(stream: &mut UnixStream, size: (u16, u16), offset: u64, snapshot: &[u8]) {
+    match read_client(stream) {
+        Some(ClientMessage::Attach {
+            id,
+            cols,
+            rows,
+            takeover: false,
+            ..
+        }) if id == "test-session" && (cols, rows) == size => {}
+        other => panic!("expected an Attach at {size:?}, received {other:?}"),
+    }
+    write_frame(
+        stream,
+        &ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: sized_session(size.0, size.1),
+            offset,
+            snapshot: snapshot.to_vec(),
+        },
+    )
+    .unwrap();
+}
+
+fn exit_session(stream: &mut UnixStream, code: u32) {
+    write_frame(
+        stream,
+        &ServerMessage::Exit {
+            id: "test-session".into(),
+            exit_code: code,
+            signal: None,
+        },
+    )
+    .unwrap();
+}
+
+/// No client connected (or tried to) since the last accept.
+fn assert_no_connection(listener: &UnixListener) {
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("the client connected again"),
+        Err(error) => panic!("accept failed: {error}"),
+    }
+}
+
+#[test]
+fn a_host_restart_mid_attach_reattaches_within_the_window_and_input_keeps_flowing() {
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    let original = pty.termios();
+    let mut screen = Collected::new(pty.master.try_clone().unwrap());
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .env("CHERRY_CLI_HEARTBEAT_INTERVAL_MS", "200")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = accept_attach(listener, session(), b"FIRST-SCREEN");
+    screen.expect(b"FIRST-SCREEN");
+    assert_live(&wait_for_status(&status, live(false)), false, false);
+    (&pty.master).write_all(b"one").unwrap();
+    assert_eq!(input_until(&mut first, b"one"), b"one");
+
+    // The daemon crashes. The attachment keeps its terminal and says so.
+    host_gone(first, &socket);
+    assert_live(&wait_for_status(&status, live(true)), false, true);
+    assert_eq!(pty.termios().c_lflag & libc::ICANON, 0, "left raw mode");
+    // Typed at a stale screen: discarded, and the screen says so.
+    (&pty.master).write_all(b"blind").unwrap();
+    screen.expect(b"cherry: reconnecting; input is discarded");
+
+    // A daemon with the same identity comes back: a fresh snapshot, and the
+    // output continues at its offset.
+    let listener = host_back(&socket);
+    let mut second = accept(listener);
+    reattach(&mut second, (120, 32), 1000, b"SECOND-SCREEN");
+    write_frame(
+        &mut second,
+        &ServerMessage::Output {
+            offset: 1000,
+            data: b"+after".to_vec(),
+        },
+    )
+    .unwrap();
+    screen.expect(b"SECOND-SCREEN+after");
+    assert_live(&wait_for_status(&status, live(false)), false, false);
+    // Input goes to the new connection, without what was typed meanwhile,
+    // and heartbeats go on.
+    (&pty.master).write_all(b"two").unwrap();
+    assert_eq!(input_until(&mut second, b"two"), b"two");
+    match read_client(&mut second) {
+        Some(ClientMessage::Ping) => {}
+        other => panic!("expected a heartbeat, received {other:?}"),
+    }
+    exit_session(&mut second, 3);
+    assert_eq!(wait(&mut child).code(), Some(3));
+    assert_mode_restored(&original, &pty.termios());
+    let status = read_status(&status);
+    assert_eq!(status["outcome"], "exited");
+    assert_eq!(status["exit_code"], 3);
+    assert!(status.get("reconnecting").is_none(), "{status}");
+}
+
+#[test]
+fn a_host_that_stays_away_for_the_whole_window_ends_the_attachment_as_disconnected() {
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let status = directory.path().join("status.json");
+    // Every attempt finds no socket and starts a host, which fails.
+    let starter = directory.path().join("cherry-host");
+    script(
+        &starter,
+        "echo 'cherry-host: cannot start here' >&2\nexit 1\n",
+    );
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_HOST_PATH", &starter)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "1500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stream = accept_attach(listener, session(), b"");
+    wait_for_status(&status, live(false));
+    let lost = Instant::now();
+    host_gone(stream, &socket);
+    wait_for_status(&status, live(true));
+    assert_eq!(
+        wait_within(&mut child, Duration::from_secs(10)).code(),
+        Some(1)
+    );
+    assert!(lost.elapsed() >= Duration::from_millis(1500));
+    // What the host it started said reaches the terminal only in the final
+    // message, not once per attempt in the middle of the session's screen.
+    let error = stderr_of(&mut child);
+    assert!(error.contains("connection lost"), "{error}");
+    assert!(
+        error.contains("could not reconnect within 1.5 s (cherry-host start failed (exit status: 1): cherry-host: cannot start here)"),
+        "{error}"
+    );
+    assert_eq!(error.matches("cannot start here").count(), 1, "{error}");
+    let status = read_status(&status);
+    assert_eq!(status["outcome"], "disconnected");
+    let message = status["message"].as_str().unwrap();
+    assert!(
+        message.contains("could not reconnect within 1.5 s"),
+        "{message}"
+    );
+    assert!(message.contains("cannot start here"), "{message}");
+}
+
+#[test]
+fn an_exit_a_takeover_a_detach_or_a_refusal_never_reconnects() {
+    type Host = fn(&mut UnixStream);
+    let cases: [(&str, Host, &str, Option<i32>); 5] = [
+        ("exit", |stream| exit_session(stream, 0), "exited", Some(0)),
+        (
+            "takeover",
+            |stream| {
+                write_frame(
+                    stream,
+                    &ServerMessage::error("taken_over", "Another device took over"),
+                )
+                .unwrap()
+            },
+            "taken_over",
+            Some(1),
+        ),
+        (
+            // End of input detaches; the host closes without confirming.
+            "detach",
+            |stream| loop {
+                match read_client(stream) {
+                    Some(ClientMessage::Ping) => {}
+                    Some(ClientMessage::Detach) => break,
+                    other => panic!("expected the detach, received {other:?}"),
+                }
+            },
+            "detached",
+            Some(0),
+        ),
+        (
+            "refusal",
+            |stream| write_frame(stream, &ServerMessage::error("request_failed", "boom")).unwrap(),
+            "disconnected",
+            Some(1),
+        ),
+        (
+            "out of sequence",
+            |stream| {
+                write_frame(
+                    stream,
+                    &ServerMessage::Output {
+                        offset: 7,
+                        data: b"x".to_vec(),
+                    },
+                )
+                .unwrap()
+            },
+            "disconnected",
+            Some(1),
+        ),
+    ];
+    for (case, host, outcome, code) in cases {
+        let (directory, listener, mut command) = listener();
+        let status = directory.path().join("status.json");
+        let mut child = command
+            .args(["attach", "test-session", "--status-file"])
+            .arg(&status)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The client's input stays open, except where its end detaches.
+        let mut stdin = child.stdin.take();
+        let mut stream = accept_attach(listener.try_clone().unwrap(), session(), b"");
+        wait_for_status(&status, live(false));
+        if case == "detach" {
+            stdin.take();
+        }
+        host(&mut stream);
+        drop(stream);
+        assert_eq!(wait(&mut child).code(), code, "{case}");
+        drop(stdin);
+        assert_no_connection(&listener);
+        let status = read_status(&status);
+        assert_eq!(status["outcome"], outcome, "{case}: {status}");
+    }
+}
+
+#[test]
+fn another_host_identity_or_a_newer_protocol_ends_the_reconnection_at_once() {
+    for (host_id, version, expected) in [
+        ("host-2", PROTOCOL_VERSION, "host identity changed"),
+        ("host-1", PROTOCOL_VERSION + 1, "protocol version mismatch"),
+    ] {
+        let (directory, listener, mut command) = listener();
+        let status = directory.path().join("status.json");
+        let mut child = command
+            .args(["attach", "test-session", "--status-file"])
+            .arg(&status)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stream = accept_attach(listener.try_clone().unwrap(), session(), b"");
+        wait_for_status(&status, live(false));
+        drop(stream);
+        let mut other = accept_raw(listener.try_clone().unwrap());
+        assert!(matches!(
+            read_client(&mut other),
+            Some(ClientMessage::Hello { .. })
+        ));
+        write_frame(
+            &mut other,
+            &ServerMessage::Welcome {
+                version,
+                host_id: host_id.into(),
+            },
+        )
+        .unwrap();
+        // Well within the window.
+        assert_eq!(
+            wait_within(&mut child, Duration::from_secs(5)).code(),
+            Some(1)
+        );
+        let error = stderr_of(&mut child);
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("connection lost"), "{error}");
+        // Neither used nor replaced.
+        assert!(read_client(&mut other).is_none(), "{expected}");
+        assert_no_connection(&listener);
+        let status = read_status(&status);
+        assert_eq!(status["outcome"], "disconnected");
+        assert!(status["message"].as_str().unwrap().contains(expected));
+    }
+}
+
+#[test]
+fn a_restarted_host_that_does_not_know_the_session_yet_is_asked_again_only_while_it_may() {
+    let unknown = || ServerMessage::error("unknown_session", "unknown session test-session");
+    // What the host lists after refusing the Attach, and whether the client
+    // tries again.
+    let cases: [(&str, Vec<u8>, bool); 3] = [
+        (
+            "listed by now",
+            encode_frame(&sessions_reply("host-1", vec![session()])).unwrap(),
+            true,
+        ),
+        (
+            "holders still expected",
+            raw_frame(
+                br#"{"type":"sessions","host_id":"host-1","sessions":[],"pending_holders":1}"#,
+            ),
+            true,
+        ),
+        (
+            "gone",
+            encode_frame(&sessions_reply("host-1", vec![])).unwrap(),
+            false,
+        ),
+    ];
+    for (case, listing, again) in cases {
+        let (directory, listener, mut command) = listener();
+        let status = directory.path().join("status.json");
+        let mut child = command
+            .args(["attach", "test-session", "--status-file"])
+            .arg(&status)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take().unwrap();
+        let stream = accept_attach(listener.try_clone().unwrap(), session(), b"");
+        wait_for_status(&status, live(false));
+        drop(stream);
+        let mut restarted = accept(listener.try_clone().unwrap());
+        assert!(matches!(
+            read_client(&mut restarted),
+            Some(ClientMessage::Attach { .. })
+        ));
+        write_frame(&mut restarted, &unknown()).unwrap();
+        assert!(matches!(
+            read_client(&mut restarted),
+            Some(ClientMessage::List)
+        ));
+        restarted.write_all(&listing).unwrap();
+        // The attempt is over either way.
+        assert!(read_client(&mut restarted).is_none(), "{case}");
+        if again {
+            let mut stream = accept(listener.try_clone().unwrap());
+            reattach(&mut stream, (DEFAULT_COLS, DEFAULT_ROWS), 0, b"");
+            wait_for_status(&status, live(false));
+            exit_session(&mut stream, 0);
+            assert_eq!(wait(&mut child).code(), Some(0), "{case}");
+            assert_eq!(read_status(&status)["outcome"], "exited", "{case}");
+        } else {
+            assert_eq!(
+                wait_within(&mut child, Duration::from_secs(5)).code(),
+                Some(1),
+                "{case}"
+            );
+            let error = stderr_of(&mut child);
+            assert!(
+                error.contains("the host no longer has session test-session"),
+                "{case}: {error}"
+            );
+            assert_no_connection(&listener);
+            assert_eq!(read_status(&status)["outcome"], "disconnected", "{case}");
+        }
+    }
+}
+
+#[test]
+fn the_detach_key_ends_a_reconnection_and_the_viewport_is_reported() {
+    // The key alone detaches once the wait for a second press ends; the key
+    // and another at once detach right away.
+    for keys in [&b"\x1d"[..], b"\x1dx"] {
+        let (directory, listener, mut command) = listener();
+        let socket = directory.path().join("host.sock");
+        let status = directory.path().join("status.json");
+        // A window larger than the shared grid shows a viewport.
+        let pty = Pty::open(100, 40);
+        let original = pty.termios();
+        let mut screen = Collected::new(pty.master.try_clone().unwrap());
+        let mut child = command
+            .args(["attach", "test-session", "--status-file"])
+            .arg(&status)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+            .stdin(pty.slave.try_clone().unwrap())
+            .stdout(pty.slave.try_clone().unwrap())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stream = accept_attach(listener, sized_session(80, 24), b"GRID");
+        screen.expect(b"GRID");
+        assert_live(&wait_for_status(&status, live(false)), true, false);
+        host_gone(stream, &socket);
+        assert_live(&wait_for_status(&status, live(true)), true, true);
+        (&pty.master).write_all(keys).unwrap();
+        assert_eq!(wait(&mut child).code(), Some(0), "{keys:?}");
+        assert_mode_restored(&original, &pty.termios());
+        let error = stderr_of(&mut child);
+        assert!(error.contains("detached while reconnecting"), "{error}");
+        let status = read_status(&status);
+        assert_eq!(status["outcome"], "detached");
+        assert!(status["message"]
+            .as_str()
+            .unwrap()
+            .contains("while reconnecting"));
+    }
+}
+
+/// An attachment reading a pipe, with the detach key off.
+fn attach_reading_a_pipe(command: &mut Command, status: &Path) -> Child {
+    command
+        .args([
+            "attach",
+            "test-session",
+            "--detach-key",
+            "none",
+            "--status-file",
+        ])
+        .arg(status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn piped_input_waits_while_reconnecting_and_follows_once_reattached() {
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let status = directory.path().join("status.json");
+    let mut child = attach_reading_a_pipe(&mut command, &status);
+    let mut stdin = child.stdin.take().unwrap();
+    let first = accept_attach(listener, session(), b"");
+    wait_for_status(&status, live(false));
+    // Nothing was sent before the loss.
+    host_gone(first, &socket);
+    wait_for_status(&status, live(true));
+    stdin.write_all(b"later").unwrap();
+    drop(stdin);
+    // A few attempts fail meanwhile.
+    thread::sleep(Duration::from_millis(600));
+    let mut second = accept(host_back(&socket));
+    reattach(&mut second, (DEFAULT_COLS, DEFAULT_ROWS), 0, b"");
+    assert_eq!(input_until(&mut second, b"later"), b"later");
+    // Then the end of input detaches.
+    loop {
+        match read_client(&mut second) {
+            Some(ClientMessage::Ping) => {}
+            Some(ClientMessage::Detach) => break,
+            other => panic!("expected the detach, received {other:?}"),
+        }
+    }
+    write_frame(&mut second, &ServerMessage::Ok).unwrap();
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    assert_eq!(read_status(&status)["outcome"], "detached");
+}
+
+#[test]
+fn piped_input_sent_before_the_loss_ends_the_attachment_instead() {
+    // Whatever of it the host had not handed to the session is gone, and
+    // nobody watches a screen to notice: going on could splice two lines.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let mut child = attach_reading_a_pipe(&mut command, &status);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut first = accept_attach(listener.try_clone().unwrap(), session(), b"");
+    stdin.write_all(b"rm -rf /tmp/pro").unwrap();
+    assert_eq!(
+        input_until(&mut first, b"rm -rf /tmp/pro"),
+        b"rm -rf /tmp/pro"
+    );
+    drop(first);
+    assert_eq!(
+        wait_within(&mut child, Duration::from_secs(5)).code(),
+        Some(1)
+    );
+    assert_no_connection(&listener);
+    let error = stderr_of(&mut child);
+    assert!(error.contains("connection lost"), "{error}");
+    assert!(error.contains("does not connect again"), "{error}");
+    let status = read_status(&status);
+    assert_eq!(status["outcome"], "disconnected");
+    assert!(status["message"]
+        .as_str()
+        .unwrap()
+        .contains("from a pipe or a file"));
+    drop(stdin);
+}
+
+#[test]
+fn reconnecting_over_ssh_runs_ssh_in_batch_mode_so_it_never_prompts_in_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let greeting = [
+        format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+        frames(&[ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            host_id: "remote".into(),
+        }]),
+    ]
+    .concat();
+    let attached = |snapshot: &[u8]| {
+        encoded(&ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
+            offset: 0,
+            snapshot: snapshot.to_vec(),
+        })
+    };
+    // The first connection ends right after attaching (the remote daemon
+    // restarted); the second attaches again and the program exits.
+    std::fs::write(
+        path.join("stream.1"),
+        [greeting.clone(), attached(b"FIRST")].concat(),
+    )
+    .unwrap();
+    let exit = encoded(&ServerMessage::Exit {
+        id: "test-session".into(),
+        exit_code: 4,
+        signal: None,
+    });
+    std::fs::write(
+        path.join("stream.2"),
+        [greeting, attached(b"SECOND"), exit].concat(),
+    )
+    .unwrap();
+    script(
+        &path.join("ssh"),
+        &format!(
+            "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\nprintf '%s\\n' \"$@\" > \"$d/arguments.$n\"\n/bin/cat \"$d/stream.$n\"\n[ \"$n\" = 1 ] && exit 0\n/bin/cat > /dev/null\n",
+            path.display()
+        ),
+    );
+    let status = path.join("status.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args([
+            "--host",
+            "devbox",
+            "attach",
+            "test-session",
+            "--status-file",
+        ])
+        .arg(&status)
+        .env("PATH", path)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .env("CHERRY_CLI_REPORT_WAIT_MS", "200")
+        .env_remove("CHERRY_SESSION_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let output = Collected::new(child.stdout.take().unwrap());
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(4),
+        "{}",
+        stderr_of(&mut child)
+    );
+    let output = output.all();
+    assert!(contains(&output, b"FIRST") && contains(&output, b"SECOND"));
+    assert_eq!(read_status(&status)["outcome"], "exited");
+    let options = "-T\n-o\nControlMaster=no\n-o\nRemoteCommand=none\n-o\nClearAllForwardings=yes\n-o\nPermitLocalCommand=no\n-o\nServerAliveInterval=15\n-o\nServerAliveCountMax=3\n";
+    let gateway = "--\ndevbox\ncherry-host gateway\n";
+    // Attaching may prompt in the terminal; connecting again may not, and
+    // forwards the agent as configured (no -a). Connecting again also tells
+    // the gateway which host it reattaches to: one of another identity is
+    // neither replaced nor used.
+    assert_eq!(
+        std::fs::read_to_string(path.join("arguments.1")).unwrap(),
+        format!("{options}{gateway}")
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("arguments.2")).unwrap(),
+        format!(
+            "{options}-o\nBatchMode=yes\n-o\nConnectTimeout=10\n--\ndevbox\nenv CHERRY_EXPECTED_HOST_ID='remote' cherry-host gateway\n"
+        )
+    );
+}
+
+#[test]
+fn a_remote_host_of_another_version_ends_the_reconnection_at_once() {
+    // What the remote cherry-host says, once the first connection is lost:
+    // on ssh's standard error, a host of another version that the gateway
+    // does not replace; or a gateway preamble of another version (another
+    // cherry-host build). Connecting again would find the same.
+    let newer = PROTOCOL_VERSION + 1;
+    let report = format!(
+        "a cherry-host speaking protocol {newer} is running at /tmp/cherry-host-7/host.sock; it is newer than this cherry-host (protocol {PROTOCOL_VERSION}), which never replaces it: install the cherry-host (and Cherry) that speaks protocol {newer}"
+    );
+    for (again, expected) in [
+        (
+            format!("echo 'cherry-host: {report}' >&2\nexit 1\n"),
+            report.clone(),
+        ),
+        (
+            format!("printf 'CHERRY-GATEWAY {newer}\\n'\n/bin/cat > /dev/null\n"),
+            format!("the remote cherry-host gateway speaks version {newer}"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let first = [
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+            frames(&[
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    host_id: "remote".into(),
+                },
+                ServerMessage::Attached {
+                    reason: AttachReason::Attach,
+                    session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
+                    offset: 0,
+                    snapshot: b"FIRST".to_vec(),
+                },
+            ]),
+        ]
+        .concat();
+        std::fs::write(path.join("stream.1"), first).unwrap();
+        script(
+            &path.join("ssh"),
+            &format!(
+                "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\nif [ \"$n\" = 1 ]; then /bin/cat \"$d/stream.1\"; exit 0; fi\n{again}",
+                path.display()
+            ),
+        );
+        let status = path.join("status.json");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args([
+                "--host",
+                "devbox",
+                "attach",
+                "test-session",
+                "--status-file",
+            ])
+            .arg(&status)
+            .env("PATH", path)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+            .env("CHERRY_CLI_REPORT_WAIT_MS", "200")
+            .env_remove("CHERRY_SESSION_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take().unwrap();
+        // Well within the window: one attempt, not one every 2 s.
+        assert_eq!(
+            wait_within(&mut child, Duration::from_secs(5)).code(),
+            Some(1)
+        );
+        let error = stderr_of(&mut child);
+        assert!(error.contains("connection lost"), "{error}");
+        assert!(error.contains("could not reconnect: "), "{error}");
+        assert!(error.contains(&expected), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("count")).unwrap(),
+            "2\n",
+            "{error}"
+        );
+        let status = read_status(&status);
+        assert_eq!(status["outcome"], "disconnected");
+        assert!(
+            status["message"].as_str().unwrap().contains(&expected),
+            "{status}"
+        );
+    }
+}
+
+/// Serve one connection as a host would, as far as the client goes: Hello,
+/// then an Attach answered with a snapshot. False once the client is gone.
+fn serve_attach(mut stream: UnixStream, snapshot: &[u8]) -> Option<UnixStream> {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let Ok(Some(ClientMessage::Hello { .. })) = read_frame(&mut stream) else {
+        return None;
+    };
+    write_frame(
+        &mut stream,
+        &ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            host_id: "host-1".into(),
+        },
+    )
+    .ok()?;
+    let Ok(Some(ClientMessage::Attach { .. })) = read_frame(&mut stream) else {
+        return None;
+    };
+    write_frame(
+        &mut stream,
+        &ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: session(),
+            offset: 0,
+            snapshot: snapshot.to_vec(),
+        },
+    )
+    .ok()?;
+    Some(stream)
+}
+
+#[test]
+fn a_host_that_drops_every_attachment_is_attached_to_with_backoff_until_the_window_ends() {
+    // A daemon that crashes whenever it serves this session: each
+    // reattachment is lost at once, which continues the same reconnection.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "2000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let started = Instant::now();
+    let mut attachments = 0;
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the client never gave up ({attachments} attachments)"
+        );
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if serve_attach(stream, b"SNAPSHOT").is_some() {
+                    attachments += 1;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
+    // The first, then at once, after 250 ms, 500 ms and 1 s; the next would
+    // come 2 s later, past the window.
+    assert!((3..=7).contains(&attachments), "{attachments} attachments");
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    let error = stderr_of(&mut child);
+    assert!(
+        error.contains(
+            "could not reconnect within 2 s (attached again, but lost the connection again)"
+        ),
+        "{error}"
+    );
+    assert_eq!(read_status(&status)["outcome"], "disconnected");
+}
+
+#[test]
+fn a_reattachment_that_lasts_starts_a_new_reconnection() {
+    // Each connection lasts longer than a healthy one needs to, and the
+    // losses together last longer than the window: each is a reconnection
+    // of its own, with the window counted afresh.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "1000")
+        .env("CHERRY_CLI_RECONNECT_HEALTHY_MS", "300")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let mut stream = accept_attach(listener.try_clone().unwrap(), session(), b"");
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(500));
+        drop(stream);
+        stream = accept(listener.try_clone().unwrap());
+        reattach(&mut stream, (DEFAULT_COLS, DEFAULT_ROWS), 0, b"");
+    }
+    exit_session(&mut stream, 5);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(5),
+        "{}",
+        stderr_of(&mut child)
+    );
+    assert_eq!(read_status(&status)["outcome"], "exited");
+}
+
+#[test]
+fn an_attempt_the_host_never_answers_leaves_time_for_the_next() {
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "5000")
+        .env("CHERRY_CLI_RECONNECT_ATTEMPT_MS", "300")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let first = accept_attach(listener.try_clone().unwrap(), session(), b"");
+    wait_for_status(&status, live(false));
+    drop(first);
+    let lost = Instant::now();
+    // A hung daemon: the connection is accepted, and nothing answers.
+    let mut hung = accept_raw(listener.try_clone().unwrap());
+    assert!(matches!(
+        read_client(&mut hung),
+        Some(ClientMessage::Hello { .. })
+    ));
+    // The client gives up on it and connects again.
+    assert!(read_client(&mut hung).is_none());
+    let mut stream = accept(listener.try_clone().unwrap());
+    reattach(&mut stream, (DEFAULT_COLS, DEFAULT_ROWS), 0, b"");
+    assert!(
+        lost.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        lost.elapsed()
+    );
+    exit_session(&mut stream, 6);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(6),
+        "{}",
+        stderr_of(&mut child)
+    );
+}
+
+#[test]
+fn the_detach_key_ends_a_reconnection_at_once_while_an_attempt_hangs() {
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    let original = pty.termios();
+    let mut screen = Collected::new(pty.master.try_clone().unwrap());
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = accept_attach(listener.try_clone().unwrap(), session(), b"SCREEN");
+    screen.expect(b"SCREEN");
+    drop(first);
+    let mut hung = accept_raw(listener.try_clone().unwrap());
+    assert!(matches!(
+        read_client(&mut hung),
+        Some(ClientMessage::Hello { .. })
+    ));
+    // The key, then another: a detach at once, without the repeat wait.
+    let pressed = Instant::now();
+    (&pty.master).write_all(b"\x1dx").unwrap();
+    assert_eq!(wait(&mut child).code(), Some(0));
+    assert!(
+        pressed.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        pressed.elapsed()
+    );
+    assert_mode_restored(&original, &pty.termios());
+    // The abandoned attempt's connection is closed too.
+    assert!(read_client(&mut hung).is_none());
+    let error = stderr_of(&mut child);
+    assert!(error.contains("detached while reconnecting"), "{error}");
+    assert_eq!(read_status(&status)["outcome"], "detached");
+}
+
+/// A fake ssh for successive connections: run N prints `stream.N` when
+/// there is one and then reads its input until it ends, except the first,
+/// which ends as the remote end closed; without one it fails as ssh does
+/// with the network down.
+fn unreachable_ssh(directory: &Path, streams: &[(usize, Vec<u8>)]) {
+    for (run, stream) in streams {
+        std::fs::write(directory.join(format!("stream.{run}")), stream).unwrap();
+    }
+    script(
+        &directory.join("ssh"),
+        &format!(
+            "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\nif [ -e \"$d/stream.$n\" ]; then /bin/cat \"$d/stream.$n\"; if [ \"$n\" = 1 ]; then /bin/sleep 0.3; echo 'Connection to devbox closed by remote host.' >&2; exit 255; fi; /bin/cat > /dev/null; exit 0; fi\necho 'ssh: connect to host devbox port 22: Network is unreachable' >&2\nexit 255\n",
+            directory.display()
+        ),
+    );
+}
+
+#[test]
+fn what_ssh_says_while_reconnecting_never_reaches_the_screen() {
+    let greeting = [
+        format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+        frames(&[ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            host_id: "remote".into(),
+        }]),
+    ]
+    .concat();
+    let attached = |snapshot: &[u8]| {
+        encoded(&ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
+            offset: 0,
+            snapshot: snapshot.to_vec(),
+        })
+    };
+    let exit = encoded(&ServerMessage::Exit {
+        id: "test-session".into(),
+        exit_code: 4,
+        signal: None,
+    });
+    // Two attempts fail before the network comes back; or none succeeds.
+    for back in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut streams = vec![(1, [greeting.clone(), attached(b"FIRST")].concat())];
+        if back {
+            streams.push((
+                4,
+                [greeting.clone(), attached(b"SECOND"), exit.clone()].concat(),
+            ));
+        }
+        unreachable_ssh(path, &streams);
+        let status = path.join("status.json");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args([
+                "--host",
+                "devbox",
+                "attach",
+                "test-session",
+                "--status-file",
+            ])
+            .arg(&status)
+            .env("PATH", path)
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "1500")
+            .env("CHERRY_CLI_REPORT_WAIT_MS", "200")
+            .env_remove("CHERRY_SESSION_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take().unwrap();
+        let output = Collected::new(child.stdout.take().unwrap());
+        let code = wait(&mut child).code();
+        let error = stderr_of(&mut child);
+        let output = output.all();
+        assert!(!contains(&output, b"Network is unreachable"), "{back}");
+        assert!(!contains(&output, b"closed by remote host"), "{back}");
+        if back {
+            assert_eq!(code, Some(4), "{error}");
+            assert!(contains(&output, b"SECOND"));
+            assert!(!error.contains("Network is unreachable"), "{error}");
+            assert!(!error.contains("closed by remote host"), "{error}");
+        } else {
+            assert_eq!(code, Some(1), "{error}");
+            // Once, in the final message, after the terminal is restored.
+            assert_eq!(
+                error.matches("Network is unreachable").count(),
+                1,
+                "{error}"
+            );
+            assert_eq!(error.matches("closed by remote host").count(), 1, "{error}");
+            assert!(
+                error.contains("connection lost while attached to test-session (Connection to devbox closed by remote host.); "),
+                "{error}"
+            );
+            assert!(
+                error.contains("could not reconnect within 1.5 s (the SSH connection closed before cherry-host gateway started: ssh: connect to host devbox port 22: Network is unreachable)"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// An attachment (`--detach-key none`, as the app runs it, when `app`) on
+/// a PTY, whose first connection shows a session with bracketed paste on.
+fn paste_attachment(
+    app: bool,
+) -> (
+    tempfile::TempDir,
+    UnixListener,
+    Pty,
+    Collected,
+    Child,
+    UnixStream,
+    PathBuf,
+) {
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    let mut screen = Collected::new(pty.master.try_clone().unwrap());
+    command.args(["attach", "test-session", "--status-file"]);
+    command.arg(&status);
+    if app {
+        command.args(["--detach-key", "none"]);
+    }
+    let child = command
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .env("CHERRY_CLI_PASTE_TAIL_WAIT_MS", "300")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = accept_attach(
+        listener.try_clone().unwrap(),
+        session(),
+        b"\x1b[?2004hPROMPT",
+    );
+    screen.expect(b"PROMPT");
+    (directory, listener, pty, screen, child, first, status)
+}
+
+/// The connection is lost; the attachment reconnects and discards what
+/// the terminal sends meanwhile (`meanwhile`), until the host answers again
+/// with `snapshot`.
+fn lose_and_reattach(
+    first: UnixStream,
+    listener: &UnixListener,
+    pty: &Pty,
+    screen: &mut Collected,
+    status: &Path,
+    meanwhile: &[u8],
+    snapshot: &[u8],
+) -> UnixStream {
+    drop(first);
+    wait_for_status(status, live(true));
+    // The attempt to connect again waits for the host's answer meanwhile.
+    if !meanwhile.is_empty() {
+        (&pty.master).write_all(meanwhile).unwrap();
+        screen.expect(b"cherry: reconnecting; input is discarded");
+    }
+    let mut second = accept(listener.try_clone().unwrap());
+    reattach(&mut second, (120, 32), 0, snapshot);
+    wait_for_status(status, live(false));
+    second
+}
+
+fn finish(mut second: UnixStream, mut child: Child) {
+    exit_session(&mut second, 0);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(0),
+        "{}",
+        stderr_of(&mut child)
+    );
+}
+
+#[test]
+fn a_paste_the_loss_cut_short_is_ended_once_reattached() {
+    // The terminal's paste ended while reconnecting. The session had
+    // bracketed paste on; whether it still does decides whether the end
+    // marker is sent.
+    for app in [false, true] {
+        for (snapshot, ended) in [(&b"\x1b[?2004hPROMPT"[..], true), (b"PROMPT", false)] {
+            let (_directory, listener, pty, mut screen, child, mut first, status) =
+                paste_attachment(app);
+            // The start of a paste, and the connection is lost before the rest.
+            (&pty.master).write_all(b"\x1b[200~first half").unwrap();
+            input_until(&mut first, b"first half");
+            let mut second = lose_and_reattach(
+                first,
+                &listener,
+                &pty,
+                &mut screen,
+                &status,
+                b" second half\x1b[201~",
+                snapshot,
+            );
+            (&pty.master).write_all(b"typed").unwrap();
+            let input = input_until(&mut second, b"typed");
+            if ended {
+                assert_eq!(input, b"\x1b[201~typed", "{app}");
+            } else {
+                assert_eq!(input, b"typed", "{app}");
+            }
+            finish(second, child);
+        }
+    }
+}
+
+#[test]
+fn the_rest_of_a_paste_cut_by_the_loss_never_arrives_as_typed_keys() {
+    for app in [false, true] {
+        let (_directory, listener, pty, mut screen, child, mut first, status) =
+            paste_attachment(app);
+        (&pty.master)
+            .write_all(b"\x1b[200~cd /tmp/build\r")
+            .unwrap();
+        input_until(&mut first, b"cd /tmp/build\r");
+        // The terminal is still sending the paste when the attachment is
+        // back: the rest of it is discarded too, then the paste is ended.
+        let mut second = lose_and_reattach(
+            first,
+            &listener,
+            &pty,
+            &mut screen,
+            &status,
+            b"make clean\r",
+            b"\x1b[?2004hPROMPT",
+        );
+        (&pty.master)
+            .write_all(b"rm -rf *\r\x1b[201~typed")
+            .unwrap();
+        assert_eq!(
+            input_until(&mut second, b"typed"),
+            b"\x1b[201~typed",
+            "{app}"
+        );
+        // Pasted again, from the start: forwarded as it is.
+        (&pty.master)
+            .write_all(b"\x1b[200~whole\r\x1b[201~")
+            .unwrap();
+        assert_eq!(
+            input_until(&mut second, b"\x1b[201~"),
+            b"\x1b[200~whole\r\x1b[201~"
+        );
+        finish(second, child);
+    }
+}
+
+#[test]
+fn a_paste_begun_while_reconnecting_is_discarded_to_its_end() {
+    let (_directory, listener, pty, mut screen, child, first, status) = paste_attachment(true);
+    // Nothing of it reached the session: no end marker is sent for it.
+    let mut second = lose_and_reattach(
+        first,
+        &listener,
+        &pty,
+        &mut screen,
+        &status,
+        b"\x1b[200~while away\r",
+        b"\x1b[?2004hPROMPT",
+    );
+    (&pty.master)
+        .write_all(b"still pasting\r\x1b[201~typed")
+        .unwrap();
+    assert_eq!(input_until(&mut second, b"typed"), b"typed");
+    finish(second, child);
+}
+
+#[test]
+fn a_paste_whose_end_never_comes_stops_being_discarded_after_a_pause() {
+    let (_directory, listener, pty, mut screen, child, mut first, status) = paste_attachment(true);
+    (&pty.master).write_all(b"\x1b[200~first half").unwrap();
+    input_until(&mut first, b"first half");
+    let mut second = lose_and_reattach(
+        first,
+        &listener,
+        &pty,
+        &mut screen,
+        &status,
+        b"",
+        b"\x1b[?2004hPROMPT",
+    );
+    // Nothing arrives for longer than a paste pauses: the paste is ended,
+    // and what is typed next goes to the session.
+    thread::sleep(Duration::from_millis(600));
+    (&pty.master).write_all(b"typed").unwrap();
+    assert_eq!(input_until(&mut second, b"typed"), b"\x1b[201~typed");
+    finish(second, child);
+}
+
+#[test]
+fn a_paste_start_the_lost_connection_never_sent_is_not_ended() {
+    // The host stops reading: the paste's start marker waits behind other
+    // input when the connection is taken for dead, so it never reached the
+    // session, and no end marker is sent for it.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    let mut screen = Collected::new(pty.master.try_clone().unwrap());
+    let mut child = command
+        .args([
+            "attach",
+            "test-session",
+            "--detach-key",
+            "none",
+            "--status-file",
+        ])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .env("CHERRY_CLI_HEARTBEAT_TIMEOUT_MS", "1000")
+        .env("CHERRY_CLI_PASTE_TAIL_WAIT_MS", "300")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let silent = accept_attach(
+        listener.try_clone().unwrap(),
+        session(),
+        b"\x1b[?2004hPROMPT",
+    );
+    screen.expect(b"PROMPT");
+    // More than every buffer on the way holds, but less than the client
+    // queues: all of it is read and queued, ahead of the paste.
+    let mut master = pty.master.try_clone().unwrap();
+    let writer = thread::spawn(move || {
+        master.write_all(&vec![b'x'; 600 * 1024]).unwrap();
+        master.write_all(b"\x1b[200~pasted").unwrap();
+    });
+    wait_for_status(&status, live(true));
+    writer.join().unwrap();
+    drop(silent);
+    let mut second = accept(listener.try_clone().unwrap());
+    reattach(&mut second, (120, 32), 0, b"\x1b[?2004hPROMPT");
+    wait_for_status(&status, live(false));
+    (&pty.master).write_all(b"\x1b[201~typed").unwrap();
+    assert_eq!(input_until(&mut second, b"typed"), b"typed");
+    exit_session(&mut second, 0);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(0),
+        "{}",
+        stderr_of(&mut child)
+    );
+}
+
+#[test]
+fn a_host_that_went_silent_is_connected_to_again() {
+    // Input is waiting and the host neither reads nor writes: the connection
+    // is taken for dead after the heartbeat timeout.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    pty.read_in_background();
+    let mut child = command
+        .args([
+            "attach",
+            "test-session",
+            "--detach-key",
+            "none",
+            "--status-file",
+        ])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .env("CHERRY_CLI_HEARTBEAT_TIMEOUT_MS", "1000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let silent = accept_attach(listener.try_clone().unwrap(), session(), b"");
+    wait_for_status(&status, live(false));
+    // A paste larger than every buffer on the way; the writer is stopped
+    // by the terminal closing once the test is over.
+    let mut master = pty.master.try_clone().unwrap();
+    thread::spawn(move || {
+        let paste: Vec<u8> = (0..3 * 1024 * 1024)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        let _ = master.write_all(&paste);
+    });
+    wait_for_status(&status, live(true));
+    let mut stream = accept(listener.try_clone().unwrap());
+    reattach(&mut stream, (120, 32), 0, b"");
+    wait_for_status(&status, live(false));
+    exit_session(&mut stream, 7);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(7),
+        "{}",
+        stderr_of(&mut child)
+    );
+    drop(silent);
+}
+
+#[test]
+fn a_gateway_that_stopped_reading_is_connected_to_again() {
+    // It stopped reading but keeps its output open: sending fails, and no
+    // end of file arrives.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let greeting = [
+        format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+        frames(&[ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            host_id: "remote".into(),
+        }]),
+    ]
+    .concat();
+    let attached = |snapshot: &[u8]| {
+        encoded(&ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
+            offset: 0,
+            snapshot: snapshot.to_vec(),
+        })
+    };
+    std::fs::write(
+        path.join("stream.1"),
+        [greeting.clone(), attached(b"FIRST")].concat(),
+    )
+    .unwrap();
+    let exit = encoded(&ServerMessage::Exit {
+        id: "test-session".into(),
+        exit_code: 8,
+        signal: None,
+    });
+    std::fs::write(
+        path.join("stream.2"),
+        [greeting, attached(b"SECOND"), exit].concat(),
+    )
+    .unwrap();
+    script(
+        &path.join("ssh"),
+        &format!(
+            "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\n/bin/cat \"$d/stream.$n\"\nif [ \"$n\" = 1 ]; then exec 0<&-; exec /bin/sleep 30; fi\n/bin/cat > /dev/null\n",
+            path.display()
+        ),
+    );
+    let status = path.join("status.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args([
+            "--host",
+            "devbox",
+            "attach",
+            "test-session",
+            "--status-file",
+        ])
+        .arg(&status)
+        .env("PATH", path)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        // A heartbeat soon finds that sending fails.
+        .env("CHERRY_CLI_HEARTBEAT_INTERVAL_MS", "100")
+        .env("CHERRY_CLI_CLOSED_WAIT_MS", "300")
+        .env("CHERRY_CLI_REPORT_WAIT_MS", "200")
+        .env_remove("CHERRY_SESSION_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let output = Collected::new(child.stdout.take().unwrap());
+    assert_eq!(
+        wait_within(&mut child, Duration::from_secs(10)).code(),
+        Some(8),
+        "{}",
+        stderr_of(&mut child)
+    );
+    let output = output.all();
+    assert!(contains(&output, b"FIRST") && contains(&output, b"SECOND"));
 }

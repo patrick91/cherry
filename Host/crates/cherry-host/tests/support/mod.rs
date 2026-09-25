@@ -22,6 +22,8 @@ pub struct Sandbox {
     pub dir: TempDir,
     pub socket: PathBuf,
     pub home: PathBuf,
+    /// The cherry-host executable to run.
+    pub bin: PathBuf,
 }
 
 impl Default for Sandbox {
@@ -44,6 +46,7 @@ impl Sandbox {
             socket: dir.path().join("host.sock"),
             home,
             dir,
+            bin: BIN.into(),
         }
     }
 
@@ -53,7 +56,7 @@ impl Sandbox {
 
     /// `cherry-host <action> --socket <this socket>` with this HOME.
     pub fn command(&self, action: &str) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = Command::new(&self.bin);
         command
             .arg(action)
             .arg("--socket")
@@ -90,6 +93,8 @@ pub struct Host {
     pub child: Child,
     env: Vec<(String, String)>,
     fd_limit: Option<FdLimit>,
+    /// Daemons `respawn` replaced that may not have exited yet.
+    retired: Vec<Child>,
 }
 
 /// A descriptor limit for the daemon: the soft limit, and the hard limit
@@ -154,6 +159,7 @@ impl Host {
             child,
             env,
             fd_limit,
+            retired: Vec::new(),
         };
         host.wait_ready();
         host
@@ -197,6 +203,34 @@ impl Host {
                 Err(error) => panic!("host readiness connection failed: {error}"),
             }
         }
+    }
+
+    /// Kill this daemon without warning (SIGKILL), as a crash would end it.
+    /// Its sessions carry on in their holders.
+    pub fn crash(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+
+    /// Start another daemon on the same socket and state directory, after
+    /// `crash` or a `Replace`, whether or not the previous one has exited
+    /// (see `wait_retired`).
+    pub fn respawn(&mut self) {
+        let env = self.env.clone();
+        let previous = std::mem::replace(
+            &mut self.child,
+            spawn_serve(&self.sandbox, &env, self.fd_limit),
+        );
+        self.retired.push(previous);
+        self.wait_ready();
+    }
+
+    /// How the daemons `respawn` replaced exited.
+    pub fn wait_retired(&mut self) -> Vec<std::process::ExitStatus> {
+        self.retired
+            .drain(..)
+            .map(|mut child| wait_child(&mut child, Duration::from_secs(5)))
+            .collect()
     }
 
     /// Stop this daemon (it must own no running sessions) and start another
@@ -270,6 +304,31 @@ impl Host {
 
     pub fn session(&self, id: &str) -> SessionInfo {
         self.sessions().into_iter().find(|s| s.id == id).unwrap()
+    }
+
+    /// The sessions, once this daemon (a new one, after `respawn`) has
+    /// every holder it expects: they register as soon as its socket
+    /// appears, but a loaded machine may take longer than the one wait its
+    /// first List makes for them.
+    pub fn adopted(&self) -> Vec<SessionInfo> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.call(ClientMessage::List) {
+                ServerMessage::Sessions {
+                    sessions,
+                    pending_holders: 0,
+                    ..
+                } => return sessions,
+                ServerMessage::Sessions {
+                    pending_holders, ..
+                } => assert!(
+                    Instant::now() < deadline,
+                    "{pending_holders} holders never registered"
+                ),
+                other => panic!("list failed {other:?}"),
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
     }
 
     pub fn wait(&self, id: &str, predicate: impl Fn(&SessionInfo) -> bool) -> SessionInfo {
@@ -351,32 +410,15 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // Also clean up if an assertion fails: dropping the daemon alone does
-        // not end processes that ignore the hangup.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let Some(mut socket) = quiet_connect(&self.socket) else {
-                break;
-            };
-            let _ = write_frame(&mut socket, &ClientMessage::List);
-            let Ok(Some(ServerMessage::Sessions { sessions, .. })) = read_frame(&mut socket) else {
-                break;
-            };
-            let running: Vec<_> = sessions
-                .into_iter()
-                .filter(|s| s.state == SessionState::Running)
-                .collect();
-            if running.is_empty() || Instant::now() >= deadline {
-                break;
-            }
-            for session in running {
-                let _ = write_frame(&mut socket, &ClientMessage::Kill { id: session.id });
-                let _ = read_frame::<_, ServerMessage>(&mut socket);
-            }
-            thread::sleep(Duration::from_millis(50));
+        // Also clean up if an assertion fails. Sessions live in holders,
+        // which outlive the daemon: end and remove every session, so its
+        // holder exits, then stop the daemon and whatever holder is left.
+        end_sessions(&self.socket);
+        for child in self.retired.iter_mut().chain([&mut self.child]) {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_holders(&self.sandbox);
     }
 }
 
@@ -387,6 +429,124 @@ pub fn quiet_connect(path: &Path) -> Option<UnixStream> {
     write_frame(&mut socket, &ClientMessage::hello()).ok()?;
     read_frame::<_, ServerMessage>(&mut socket).ok()??;
     Some(socket)
+}
+
+/// Kill every running session of the daemon at `socket` and remove every
+/// session, so their holders exit. Gives up after a few seconds.
+pub fn end_sessions(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let Some(mut connection) = quiet_connect(socket) else {
+            break;
+        };
+        // A List can wait for holders to register.
+        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = write_frame(&mut connection, &ClientMessage::List);
+        let Ok(Some(ServerMessage::Sessions { sessions, .. })) = read_frame(&mut connection) else {
+            break;
+        };
+        if sessions.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        for session in sessions {
+            let request = match session.state {
+                SessionState::Running => ClientMessage::Kill { id: session.id },
+                SessionState::Exited => ClientMessage::Remove { id: session.id },
+            };
+            let _ = write_frame(&mut connection, &request);
+            let _ = read_frame::<_, ServerMessage>(&mut connection);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The holder processes of a sandbox's sessions, from their manifests:
+/// session ID and holder PID.
+pub fn holders(sandbox: &Sandbox) -> Vec<(String, i32)> {
+    let Ok(states) = fs::read_dir(sandbox.state_base()) else {
+        return Vec::new();
+    };
+    states
+        .flatten()
+        .filter_map(|state| fs::read_dir(state.path().join("sessions")).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+            Some((
+                manifest["id"].as_str()?.to_string(),
+                i32::try_from(manifest["holder_pid"].as_u64()?).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// The holder of session `id`, once its manifest is written.
+pub fn holder_of(sandbox: &Sandbox, id: &str) -> i32 {
+    wait_until(&format!("the holder of {id}"), || {
+        holders(sandbox).iter().any(|(session, _)| session == id)
+    });
+    holders(sandbox)
+        .into_iter()
+        .find(|(session, _)| session == id)
+        .unwrap()
+        .1
+}
+
+/// Whether `pid` is a live `cherry-host hold` process.
+pub fn is_holder(pid: i32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat=,command="])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&output.stdout);
+    let status = status.trim();
+    !status.is_empty() && !status.starts_with('Z') && status.contains(" hold ")
+}
+
+/// The processes whose parent is `pid`.
+pub fn children(pid: i32) -> Vec<i32> {
+    // ps is portable between macOS and Linux, unlike /proc.
+    let output = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<i32>);
+            match (fields.next(), fields.next()) {
+                (Some(Ok(child)), Some(Ok(parent))) if parent == pid => Some(child),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Kill the holders a sandbox's daemons left behind (a test that failed
+/// with its daemon down): their programs get the hangup.
+pub fn kill_holders(sandbox: &Sandbox) {
+    for (_, pid) in holders(sandbox) {
+        if is_holder(pid) {
+            kill_holder(pid);
+        }
+    }
+}
+
+/// SIGKILL a holder and its session's program (its child, which leads a
+/// process group of its own): a program that ignores the hangup would
+/// otherwise run on.
+pub fn kill_holder(pid: i32) {
+    for leader in children(pid) {
+        unsafe {
+            libc::kill(-leader, libc::SIGKILL);
+            libc::kill(leader, libc::SIGKILL);
+        }
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
 }
 
 pub fn spawn_serve(
@@ -461,6 +621,31 @@ pub fn receive(socket: &mut UnixStream) -> ServerMessage {
         .expect("unexpected connection EOF")
 }
 
+/// A connection subscribed to events: the host's `Ok` has come.
+pub fn subscribe(host: &Host) -> UnixStream {
+    let mut socket = host.connect();
+    write_frame(&mut socket, &ClientMessage::Subscribe).unwrap();
+    assert_eq!(receive(&mut socket), ServerMessage::Ok);
+    socket
+}
+
+/// The next event on a subscribed connection.
+pub fn next_event(socket: &mut UnixStream) -> SessionEvent {
+    match receive(socket) {
+        ServerMessage::Event { event } => event,
+        other => panic!("expected an event, not {other:?}"),
+    }
+}
+
+/// Whether no process has this ID any more: it has exited and been reaped.
+pub fn is_gone(pid: u32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
 pub fn create_request(request_id: String, command: Vec<String>) -> ClientMessage {
     ClientMessage::Create {
         request_id,
@@ -470,6 +655,8 @@ pub fn create_request(request_id: String, command: Vec<String>) -> ClientMessage
         env: BTreeMap::new(),
         cols: 80,
         rows: 24,
+        owner: None,
+        tags: BTreeMap::new(),
     }
 }
 
@@ -477,8 +664,8 @@ pub fn shell(script: &str) -> Vec<String> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
 }
 
-/// A shell script that can use `$CHERRY_TEST_DIR` (clients cannot set
-/// arbitrary session environment variables).
+/// A shell script that can use `$CHERRY_TEST_DIR`, set by the script itself
+/// so that `create` needs no environment.
 pub fn shell_in(dir: &Path, script: &str) -> Vec<String> {
     shell(&format!(
         "CHERRY_TEST_DIR='{}'; export CHERRY_TEST_DIR\n{script}",
@@ -668,33 +855,17 @@ impl Drop for Stray {
     }
 }
 
-/// Stop a daemon that a test started with `cherry-host start`: kill its
-/// sessions, shut it down and wait for its socket to disappear.
+/// Stop a daemon that a test started with `cherry-host start`: end and
+/// remove its sessions (so their holders exit), shut it down and wait for
+/// its socket to disappear.
 pub fn stop_daemon(socket: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let Some(mut connection) = quiet_connect(socket) else {
-            break;
-        };
-        let _ = write_frame(&mut connection, &ClientMessage::List);
-        let Ok(Some(ServerMessage::Sessions { sessions, .. })) = read_frame(&mut connection) else {
-            break;
-        };
-        let running: Vec<_> = sessions
-            .into_iter()
-            .filter(|s| s.state == SessionState::Running)
-            .collect();
-        if running.is_empty() {
-            let _ = write_frame(&mut connection, &ClientMessage::Shutdown);
-            let _ = read_frame::<_, ServerMessage>(&mut connection);
-            break;
-        }
-        for session in running {
-            let _ = write_frame(&mut connection, &ClientMessage::Kill { id: session.id });
-            let _ = read_frame::<_, ServerMessage>(&mut connection);
-        }
-        thread::sleep(Duration::from_millis(50));
+    end_sessions(socket);
+    if let Some(mut connection) = quiet_connect(socket) {
+        let _ = connection.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = write_frame(&mut connection, &ClientMessage::Shutdown);
+        let _ = read_frame::<_, ServerMessage>(&mut connection);
     }
+    let deadline = Instant::now() + Duration::from_secs(5);
     while socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -706,5 +877,105 @@ pub struct Started(pub PathBuf);
 impl Drop for Started {
     fn drop(&mut self) {
         stop_daemon(&self.0);
+    }
+}
+
+/// The holder link (see `src/link.rs`), spelled out here so that the tests
+/// pin its wire format: `length:u32be kind:u8 version:u16be
+/// meta_length:u32be meta data`.
+pub mod link {
+    use std::io::{self, Read, Write};
+
+    pub const HOLDER_HELLO: u8 = 1;
+    pub const OUTPUT: u8 = 2;
+    pub const QUERY: u8 = 3;
+    pub const SNAPSHOT_REPLY: u8 = 4;
+    pub const INPUT_ACK: u8 = 5;
+    pub const DETACH_DONE: u8 = 6;
+    pub const EXITED: u8 = 7;
+    pub const FAILED: u8 = 8;
+    pub const INFO: u8 = 9;
+    pub const EVENT: u8 = 10;
+    pub const SCREEN_REPLY: u8 = 11;
+    pub const LAUNCH: u8 = 64;
+    pub const INPUT: u8 = 65;
+    pub const DISCARD_LEASE: u8 = 66;
+    pub const DETACH: u8 = 67;
+    pub const RESIZE: u8 = 68;
+    pub const SNAPSHOT: u8 = 69;
+    pub const KILL: u8 = 70;
+    pub const REMOVE: u8 = 71;
+    pub const SCREEN: u8 = 72;
+    pub const UPDATE: u8 = 73;
+    pub const REFUSED: u8 = 74;
+    /// What this build's daemon and holders speak.
+    pub const VERSION: u16 = 4;
+
+    #[derive(Debug)]
+    pub struct Frame {
+        pub kind: u8,
+        pub version: u16,
+        pub meta: serde_json::Value,
+        pub data: Vec<u8>,
+    }
+
+    pub fn encode(kind: u8, version: u16, meta: &serde_json::Value, data: &[u8]) -> Vec<u8> {
+        let meta = serde_json::to_vec(meta).unwrap();
+        let length = 1 + 2 + 4 + meta.len() + data.len();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(length as u32).to_be_bytes());
+        frame.push(kind);
+        frame.extend_from_slice(&version.to_be_bytes());
+        frame.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&meta);
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    pub fn send(
+        stream: &mut impl Write,
+        kind: u8,
+        version: u16,
+        meta: serde_json::Value,
+        data: &[u8],
+    ) {
+        stream
+            .write_all(&encode(kind, version, &meta, data))
+            .unwrap();
+    }
+
+    /// The next frame; None at end of file.
+    pub fn read(stream: &mut impl Read) -> io::Result<Option<Frame>> {
+        let mut length = [0u8; 4];
+        match stream.read(&mut length[..1])? {
+            0 => return Ok(None),
+            _ => stream.read_exact(&mut length[1..])?,
+        }
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body)?;
+        let meta_length = u32::from_be_bytes(body[3..7].try_into().unwrap()) as usize;
+        Ok(Some(Frame {
+            kind: body[0],
+            version: u16::from_be_bytes([body[1], body[2]]),
+            meta: serde_json::from_slice(&body[7..7 + meta_length]).unwrap(),
+            data: body[7 + meta_length..].to_vec(),
+        }))
+    }
+
+    /// The next frame, which must come.
+    pub fn next(stream: &mut impl Read) -> Frame {
+        read(stream).unwrap().expect("the link closed")
+    }
+
+    /// Frames until one of `kind`, which is returned; the others are
+    /// passed to `each`.
+    pub fn until(stream: &mut impl Read, kind: u8, mut each: impl FnMut(&Frame)) -> Frame {
+        loop {
+            let frame = next(stream);
+            if frame.kind == kind {
+                return frame;
+            }
+            each(&frame);
+        }
     }
 }

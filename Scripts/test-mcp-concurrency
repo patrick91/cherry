@@ -13,14 +13,30 @@ Proof: hold a wait_for_bound_port on a port that never binds (it loops ps/lsof e
 ~150ms for ~3.5s) on one connection, and hammer list_processes on others. They must stay
 fast (a pinned actor would stall them and let far fewer through).
 
-Usage: Scripts/test-mcp-concurrency   (launches an isolated Cherry; native PTY default)
+Usage: Scripts/test-mcp-concurrency
+
+Builds Cherry (release) and runs it apart from the user's own Cherry: a private
+HOME (saved workspaces, notes, todos), and its control socket and session-host
+socket (CHERRY_CONTROL_SOCKET, CHERRY_HOST_SOCKET) in a private (0700)
+directory. Local tabs are persistent sessions by default, so the test's tabs run
+on a daemon of its own, never the user's. At the end every session there is
+killed and removed, the daemon is shut down and the directory is deleted.
+Preferences are the unbundled executable's own defaults domain ("Cherry"), which
+the installed app does not use.
 """
-import json, os, socket, subprocess, sys, threading, time
+import json, os, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cherry_private_host  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
-NS = f"mcp-conc-{os.getpid()}"
-SOCK = Path(f"/tmp/cherry-{os.getuid()}") / NS / "control.sock"
+# Private (0700), with the private HOME in it, and short enough for Unix
+# socket paths.
+PRIVATE = cherry_private_host.make_private_directory("cherry-mcp-")
+HOME, SOCK, HOST_SOCK = cherry_private_host.layout(PRIVATE)
+LOG = Path("/tmp/mcp-conc.log")
 
 def ec(n, p=None): return {n: {"_0": p} if p is not None else {}}
 def sc(r): return ec("scoped", {"projectRoot": str(REPO), "request": r})
@@ -46,15 +62,22 @@ def lp():
     _, e = send(sc(ec("listProcesses", {})), t=20)
     return e
 
-env = dict(os.environ)
-env.update({"CHERRY_CONTROL_NAMESPACE": NS, "CHERRY_PERF_PROJECT_ROOTS": str(REPO)})
-proc = subprocess.Popen(["swift", "run", "-c", "release", "Cherry"], cwd=str(REPO),
-                        env=env, stdout=open("/tmp/mcp-conc.log", "w"), stderr=subprocess.STDOUT)
+# Without a Cherry tab's own variables (its control socket, process id), which
+# would point at the user's app; the helper override stays.
+env = cherry_private_host.isolated_environment(os.environ, HOME, SOCK, HOST_SOCK)
+env["CHERRY_PERF_PROJECT_ROOTS"] = str(REPO)
+proc = None
 results = {}
 try:
+    # Built with the user's own HOME, where SwiftPM keeps its caches.
+    subprocess.run(["swift", "build", "-c", "release", "--product", "Cherry"], cwd=str(REPO), check=True)
+    bin_path = subprocess.run(["swift", "build", "-c", "release", "--show-bin-path"], cwd=str(REPO),
+                              check=True, capture_output=True, text=True).stdout.strip()
+    proc = subprocess.Popen([str(Path(bin_path) / "Cherry")], cwd=str(REPO),
+                            env=env, stdout=open(LOG, "w"), stderr=subprocess.STDOUT)
     dl = time.monotonic() + 180
     while time.monotonic() < dl:
-        if proc.poll() is not None: raise RuntimeError("Cherry exited early; see /tmp/mcp-conc.log")
+        if proc.poll() is not None: raise RuntimeError(f"Cherry exited early; see {LOG}")
         if SOCK.exists():
             try: send(ec("listProjects"), 3); break
             except Exception: pass
@@ -108,10 +131,18 @@ try:
     results["server_alive_after"] = (after < 0.30, f"{after*1000:.0f}ms")
 
 finally:
-    if proc.poll() is None:
-        proc.send_signal(2)
+    if proc is not None and proc.poll() is None:
+        proc.send_signal(signal.SIGINT)
         try: proc.wait(5)
-        except Exception: proc.kill()
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.wait(5)
+    # End the tabs' sessions and daemon, and their holders and attach
+    # adapters, with the cherry the app used; then delete PRIVATE.
+    problems = cherry_private_host.stop_private_run(
+        PRIVATE, cherry_private_host.development_cli(REPO, env, cwd=REPO))
+    if problems:
+        print("[mcp-conc] session host cleanup: " + "; ".join(problems), file=sys.stderr)
+        results["private_host_cleaned_up"] = (False, "; ".join(problems))
 
 print("\n[mcp-conc] RESULTS:")
 ok = True

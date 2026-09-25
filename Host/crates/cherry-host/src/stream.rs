@@ -41,17 +41,28 @@ pub struct Batch {
     /// For the renderer that answers queries: each with its position in
     /// `display` (the length `display` had when it came).
     pub queries: Vec<(usize, Vec<u8>)>,
+    /// Complete kitty notification sequences (OSC 99), which the host
+    /// terminal does not report (see `cherry_vt::Osc99`), each with its
+    /// position in `terminal` (the length `terminal` had when it came), so
+    /// that it is reported in order with what the terminal reports.
+    pub notifications: Vec<(usize, Vec<u8>)>,
 }
 
 impl Batch {
     /// Append the batch that follows this one.
     pub fn append(&mut self, next: Batch) {
         let base = self.display.len();
+        let terminal_base = self.terminal.len();
         self.terminal.extend(next.terminal);
         self.display.extend(next.display);
         for (at, query) in next.queries {
             self.push_query(base + at, &query);
         }
+        self.notifications.extend(
+            next.notifications
+                .into_iter()
+                .map(|(at, sequence)| (terminal_base + at, sequence)),
+        );
     }
 
     fn query(&mut self, bytes: &[u8]) {
@@ -85,6 +96,7 @@ const MAX_CONTROL: usize = 64 * 1024;
 /// they may be much larger than other control strings.
 pub const MAX_CLIPBOARD: usize = 8 * 1024 * 1024;
 const CLIPBOARD: &[u8] = b"\x1b]52;";
+const KITTY_NOTIFICATION: &[u8] = b"\x1b]99;";
 const ENQ: u8 = 0x05;
 
 impl DisplayStream {
@@ -209,6 +221,11 @@ impl DisplayStream {
 
     fn finish(&mut self, batch: &mut Batch) {
         if !self.discarding {
+            if self.pending.starts_with(KITTY_NOTIFICATION) {
+                batch
+                    .notifications
+                    .push((batch.terminal.len(), self.pending.clone()));
+            }
             match route(&self.pending) {
                 Route::Both => {
                     batch.terminal.extend(&self.pending);

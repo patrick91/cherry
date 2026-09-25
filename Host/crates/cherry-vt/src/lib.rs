@@ -3,8 +3,47 @@
 use anyhow::{bail, ensure, Result};
 use std::{ffi::c_void, io::Write, marker::PhantomData, ptr::NonNull};
 
+mod events;
+pub use events::{
+    parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
+};
+
 type Handle = *mut c_void;
 type Sink = extern "C" fn(*mut c_void, *const u8, usize);
+type EventFn = extern "C" fn(*mut c_void, *const RawEvent);
+
+// `cherry_vt_string` selectors.
+const TITLE: i32 = 0;
+const PWD: i32 = 1;
+
+// Event kinds, see shim.c.
+const EVENT_TITLE: i32 = 0;
+const EVENT_PWD: i32 = 1;
+const EVENT_BELL: i32 = 2;
+const EVENT_NOTIFICATION: i32 = 3;
+const EVENT_PROGRESS: i32 = 4;
+
+/// `CherryEvent` in shim.c. The strings are borrowed for one call.
+#[repr(C)]
+struct RawEvent {
+    kind: i32,
+    text: *const u8,
+    text_len: usize,
+    body: *const u8,
+    body_len: usize,
+    state: i32,
+    progress: i32,
+}
+
+/// Every Ghostty callback's userdata. shim.c reads `event`, which must stay
+/// the first field, to hand events over.
+#[repr(C)]
+struct Callbacks {
+    event: EventFn,
+    /// PTY replies, taken by `feed` and `resize`.
+    replies: Vec<u8>,
+    events: events::Pending,
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -31,6 +70,7 @@ unsafe extern "C" {
         reply: extern "C" fn(Handle, *mut c_void, *const u8, usize),
     ) -> i32;
     fn cherry_vt_plain(term: Handle, out: *mut *mut u8, len: *mut usize) -> i32;
+    fn cherry_vt_string(term: Handle, which: i32, ptr: *mut *const u8, len: *mut usize) -> i32;
     fn cherry_vt_info(term: Handle, out: *mut Info) -> i32;
     fn cherry_vt_set_terminfo_name(term: Handle, name: *const u8, len: usize) -> i32;
     fn cherry_vt_mode(term: Handle, value: u16, ansi: bool, on: *mut bool) -> i32;
@@ -176,13 +216,52 @@ fn check(code: i32, operation: &str) -> Result<()> {
 }
 
 extern "C" fn reply(_term: Handle, userdata: *mut c_void, bytes: *const u8, len: usize) {
-    // Ghostty invokes this synchronously during a mutating call. The Box's
-    // allocation never moves; its lifetime exceeds the terminal's.
-    if len != 0 {
-        unsafe {
-            (&mut *userdata.cast::<Vec<u8>>())
-                .extend_from_slice(std::slice::from_raw_parts(bytes, len));
+    // Ghostty invokes this synchronously during a mutating call. The
+    // callbacks' allocation never moves and outlives the terminal.
+    unsafe {
+        (*userdata.cast::<Callbacks>())
+            .replies
+            .extend_from_slice(borrowed(bytes, len));
+    }
+}
+
+/// Called by shim.c's callbacks, synchronously inside a mutating call:
+/// copies what the event borrows and queues it. Never touches the terminal.
+extern "C" fn event(userdata: *mut c_void, raw: *const RawEvent) {
+    let (callbacks, raw) = unsafe { (&mut *userdata.cast::<Callbacks>(), &*raw) };
+    let text = |ptr, len| String::from_utf8_lossy(unsafe { borrowed(ptr, len) }).into_owned();
+    let event = match raw.kind {
+        EVENT_TITLE => VtEvent::Title(text(raw.text, raw.text_len)),
+        EVENT_PWD => VtEvent::Pwd(text(raw.text, raw.text_len)),
+        EVENT_BELL => VtEvent::Bell,
+        EVENT_NOTIFICATION => VtEvent::Notification {
+            title: text(raw.text, raw.text_len),
+            body: text(raw.body, raw.body_len),
+        },
+        EVENT_PROGRESS => {
+            let Some(state) = ProgressState::from_raw(raw.state) else {
+                return;
+            };
+            VtEvent::Progress {
+                state,
+                value: u8::try_from(raw.progress).ok().map(|value| value.min(100)),
+            }
         }
+        _ => return,
+    };
+    callbacks.events.push(event);
+}
+
+/// Bytes C lends for the duration of a call; empty for a null pointer.
+///
+/// # Safety
+/// A non-null `ptr` must point at `len` readable bytes for the returned
+/// lifetime.
+unsafe fn borrowed<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
     }
 }
 
@@ -210,10 +289,9 @@ pub struct Terminal {
     handle: NonNull<c_void>,
     cols: u16,
     rows: u16,
-    // C retains the Vec object's address as callback userdata; its backing
-    // allocation alone would not keep that address stable when Terminal moves.
-    #[allow(clippy::box_collection)]
-    replies: Box<Vec<u8>>,
+    // C retains this address as every callback's userdata, so it is a heap
+    // allocation of its own, freed after the terminal (see Drop).
+    callbacks: NonNull<Callbacks>,
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 unsafe impl Send for Terminal {}
@@ -236,35 +314,115 @@ pub struct Inspection {
 }
 
 impl Terminal {
+    /// A terminal that reports titles, working directories, bells, desktop
+    /// notifications and progress reports as events (`take_events`).
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self> {
         ensure!(cols > 0 && rows > 0, "terminal dimensions must be positive");
-        let mut replies = Box::new(Vec::new());
+        let callbacks = NonNull::from(Box::leak(Box::new(Callbacks {
+            event,
+            replies: Vec::new(),
+            events: events::Pending::default(),
+        })));
         let mut handle = std::ptr::null_mut();
-        check(
+        let created = check(
             unsafe {
                 cherry_vt_new(
                     &mut handle,
                     cols,
                     rows,
                     scrollback,
-                    (&mut *replies as *mut Vec<u8>).cast(),
+                    callbacks.as_ptr().cast(),
                     reply,
                 )
             },
             "create",
-        )?;
+        );
+        if let Err(error) = created {
+            drop(unsafe { Box::from_raw(callbacks.as_ptr()) });
+            return Err(error);
+        }
         Ok(Self {
             handle: NonNull::new(handle).expect("successful terminal creation"),
             cols,
             rows,
-            replies,
+            callbacks,
             _not_sync: PhantomData,
         })
     }
 
+    /// The callbacks' state, between calls into the terminal.
+    fn callbacks(&mut self) -> &mut Callbacks {
+        // No callback runs outside a mutating call, which `&mut self`
+        // excludes while this borrow lives.
+        unsafe { self.callbacks.as_mut() }
+    }
+
+    /// Process program output. Returns the replies to write to the PTY;
+    /// events it caused wait for `take_events`.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         write(self.handle.as_ptr(), bytes);
-        std::mem::take(&mut *self.replies)
+        // A reset (RIS) clears the title and working directory without a
+        // callback: report whatever the events have not.
+        for (which, event) in [(TITLE, VtEvent::Title as fn(_) -> _), (PWD, VtEvent::Pwd)] {
+            let current = self.borrowed_string(which);
+            // No callback runs outside a mutating call.
+            let reported = unsafe { self.callbacks.as_ref() }
+                .events
+                .reported(which == PWD);
+            if current == reported.as_bytes() {
+                continue;
+            }
+            let current = String::from_utf8_lossy(current);
+            if current != reported {
+                let current = current.into_owned();
+                self.callbacks().events.push(event(current));
+            }
+        }
+        std::mem::take(&mut self.callbacks().replies)
+    }
+
+    /// The events output caused since they were last taken, in order. They
+    /// never produce replies. Bounded (see `MAX_PENDING_EVENTS`): runs of
+    /// the same kind of change collapse, and the oldest are dropped first.
+    /// A title, working directory or progress report is state, so when the
+    /// bound drops the latest of its kind, that one still comes, first.
+    pub fn take_events(&mut self) -> Vec<VtEvent> {
+        self.callbacks().events.take()
+    }
+
+    /// The title the program set (OSC 0 or 2); None while it has none.
+    pub fn title(&self) -> Option<String> {
+        self.string(TITLE)
+    }
+
+    /// The working directory the program reported, raw (see
+    /// `VtEvent::Pwd`); None while it has reported none.
+    pub fn pwd(&self) -> Option<String> {
+        self.string(PWD)
+    }
+
+    /// Whether mode `value` is set, as the terminal holds it now: a DEC
+    /// private mode (`CSI ? value h`), or an ANSI mode (`CSI value h`) when
+    /// `ansi`. For example `mode(1, false)` is DECCKM, application cursor
+    /// keys. An error for a mode libghostty-vt does not know.
+    pub fn mode(&self, value: u16, ansi: bool) -> Result<bool> {
+        mode(self.handle.as_ptr(), value, ansi)
+    }
+
+    fn string(&self, which: i32) -> Option<String> {
+        // Borrowed until the next mutating call: copied at once.
+        let bytes = self.borrowed_string(which);
+        (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// The title or working directory as the terminal holds it, valid until
+    /// the next mutating call (which `&self` excludes); empty when unset.
+    fn borrowed_string(&self, which: i32) -> &[u8] {
+        let (mut ptr, mut len) = (std::ptr::null(), 0);
+        if unsafe { cherry_vt_string(self.handle.as_ptr(), which, &mut ptr, &mut len) } != 0 {
+            return &[];
+        }
+        unsafe { borrowed(ptr, len) }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<Vec<u8>> {
@@ -275,7 +433,7 @@ impl Terminal {
         )?;
         self.cols = cols;
         self.rows = rows;
-        Ok(std::mem::take(&mut *self.replies))
+        Ok(std::mem::take(&mut self.callbacks().replies))
     }
 
     /// The terminfo entry name the program runs under (its TERM), reported
@@ -1099,6 +1257,8 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe {
             ghostty_terminal_free(self.handle.as_ptr());
+            // No callback can run any more.
+            drop(Box::from_raw(self.callbacks.as_ptr()));
         }
     }
 }

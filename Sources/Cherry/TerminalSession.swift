@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Darwin
 import Foundation
 
@@ -379,7 +380,7 @@ final class TerminalInputWriter: @unchecked Sendable {
 
     private let lock = NSLock()
     private weak var process: ShellProcessController?
-    private let fallbackWriteHandler: WriteHandler?
+    private var fallbackWriteHandler: WriteHandler?
     private var keyboardProtocolFlags = 0
     private var inputHandler: InputHandler?
     private var isInputHandlerScheduled = false
@@ -398,6 +399,13 @@ final class TerminalInputWriter: @unchecked Sendable {
     func setKeyboardProtocolFlags(_ flags: Int) {
         lock.withLock {
             keyboardProtocolFlags = flags
+        }
+    }
+
+    /// Takes what is written while no process is set.
+    func setFallbackWriteHandler(_ handler: WriteHandler?) {
+        lock.withLock {
+            fallbackWriteHandler = handler
         }
     }
 
@@ -969,6 +977,27 @@ enum TerminalInputNormalizer {
 
         return Data("\u{1B}[9u".utf8)
     }
+
+    /// `data` with its unmodified arrow, Home and End keys (`ESC [ A`…,
+    /// `ESC O A`…; `TerminalSession.containsCursorModeKeys`) in the form a
+    /// terminal types them in the program's cursor key mode (DECCKM):
+    /// `ESC O x` while application cursor keys are on, `ESC [ x` while off.
+    /// Everything else is kept as it is.
+    static func encodingCursorKeys(_ data: Data, applicationCursorKeys: Bool) -> Data {
+        var bytes = [UInt8](data)
+        let introducer: UInt8 = applicationCursorKeys ? 0x4F : 0x5B
+        var index = 0
+        while index + 2 < bytes.count {
+            if bytes[index] == 0x1B, bytes[index + 1] == 0x5B || bytes[index + 1] == 0x4F,
+               [0x41, 0x42, 0x43, 0x44, 0x46, 0x48].contains(bytes[index + 2]) {
+                bytes[index + 1] = introducer
+                index += 3
+            } else {
+                index += 1
+            }
+        }
+        return Data(bytes)
+    }
 }
 
 struct AgentSessionTreeItem: Identifiable {
@@ -1059,7 +1088,9 @@ struct TerminalSplitGroup: Identifiable, Equatable {
 
 @MainActor
 final class TerminalWorkspace: ObservableObject {
-    @Published private(set) var sessions: [TerminalSession]
+    @Published private(set) var sessions: [TerminalSession] {
+        didSet { sessionsDidChange() }
+    }
     @Published private(set) var terminalDisplayItems: [TerminalDisplayItem]
     @Published private(set) var terminalSplitGroups: [TerminalSplitGroup] = []
     @Published private(set) var terminalDetailWidth: CGFloat = 0
@@ -1070,15 +1101,35 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
     let projectRoot: String?
+    let backendPolicy: SessionBackendPolicy
     private let launchBackend: TerminalSessionLaunchBackend
+    /// Fires for changes workspace persistence saves that the published
+    /// properties above do not report: a tab rename, a managed command edit,
+    /// or an agent moving to another parent.
+    let persistentStateChanges = PassthroughSubject<Void, Never>()
+    /// What a restored tab was saved with, for the metadata its
+    /// `TerminalSession` cannot carry yet (a hosted tab is always a terminal),
+    /// so saving it again keeps that metadata. Closing the tab drops it.
+    private(set) var restoredSessionRecords: [UUID: WorkspaceSessionRecord] = [:]
+    /// Set once the workspace's window or the app tore it down; its sessions
+    /// are gone and must not be saved as an empty workspace.
+    private(set) var isTornDown = false
+    /// Why every tab was last closed at once (window closed, app quit,
+    /// worktree removed): tabs a restore finishes afterwards end the same way.
+    private(set) var closeAllIntent: SessionCloseIntent?
+    /// Launches restored tabs' attach adapters a few at a time (tests give
+    /// a workspace its own).
+    var restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared
 
     init(
         projectRoot: String? = nil,
         createInitialSession: Bool = true,
-        launchBackend: TerminalSessionLaunchBackend = .nativePTY
+        launchBackend: TerminalSessionLaunchBackend = .nativePTY,
+        backendPolicy: SessionBackendPolicy = .native
     ) {
         self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
         self.launchBackend = launchBackend
+        self.backendPolicy = backendPolicy
         guard createInitialSession else {
             sessions = []
             terminalDisplayItems = []
@@ -1089,11 +1140,56 @@ final class TerminalWorkspace: ObservableObject {
             index: 1,
             workingDirectory: self.projectRoot,
             projectRoot: self.projectRoot,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: launchBackend == .nativePTY ? backendPolicy.persistentHostingForNewTab() : nil
         )
         sessions = [firstSession]
         terminalDisplayItems = [.single(firstSession.id)]
         selectedSessionID = firstSession.id
+        sessionsDidChange()
+    }
+
+    /// Opens the default "Shell 1" in a workspace that restored nothing.
+    /// `ignoringCommands`: also when its only tabs are commands (auto-start
+    /// ran while tabs were still being restored).
+    func addInitialSessionIfEmpty(ignoringCommands: Bool = false) {
+        let isEmpty = ignoringCommands ? sessions.allSatisfy { $0.kind == .command } : sessions.isEmpty
+        guard isEmpty else { return }
+        let firstSession = Self.makeSession(
+            index: 1,
+            workingDirectory: projectRoot,
+            projectRoot: projectRoot,
+            launchBackend: launchBackend,
+            persistentHosting: persistentHostingForNewTab()
+        )
+        sessions = [firstSession] + sessions
+        terminalDisplayItems = [.single(firstSession.id)] + terminalDisplayItems
+        select(firstSession)
+    }
+
+    /// The local host for a new tab's program when this workspace runs new
+    /// local tabs as persistent sessions and the host can run them now; nil
+    /// for a native tab.
+    private func persistentHostingForNewTab() -> PersistentLocalSessions? {
+        guard launchBackend == .nativePTY else { return nil }
+        return backendPolicy.persistentHostingForNewTab()
+    }
+
+    private func sessionsDidChange() {
+        for session in sessions where session.persistentStateDidChange == nil {
+            session.persistentStateDidChange = { [weak self] in
+                self?.persistentStateChanges.send()
+            }
+        }
+    }
+
+    /// `id`, unless a tab here already has it: two tabs with one id would
+    /// break list identity, split panes, MCP lookup and deep links, so the
+    /// new tab gets a fresh id instead.
+    private func unusedSessionID(_ id: UUID) -> UUID {
+        guard sessions.contains(where: { $0.id == id }) else { return id }
+        fputs("Cherry: tab id \(id.uuidString) is already open; the new tab gets another id\n", stderr)
+        return UUID()
     }
 
     var selectedSession: TerminalSession? {
@@ -1105,8 +1201,11 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { $0.kind == .agent }
     }
 
+    /// Agents whose program runs; a persistent agent's runs until its host
+    /// reports the exit, while its attach adapter reconnects too (the menu
+    /// bar lists these).
     var runningAgentSessions: [TerminalSession] {
-        agentSessions.filter(\.isRunning)
+        agentSessions.filter(\.isProgramRunning)
     }
 
     /// Sessions currently running a process across every kind — broader than
@@ -1115,6 +1214,24 @@ final class TerminalWorkspace: ObservableObject {
     /// the process table, so it must never be read from a SwiftUI body.
     func sessionsWithRunningProcess() -> [TerminalSession] {
         sessions.filter { $0.hasRunningProcess() }
+    }
+
+    /// Running tabs that closing everything for `intent` would end: native
+    /// ones, and persistent ones whose close action terminates their session
+    /// (tabs that only detach keep running and are not counted). Drives the
+    /// quit, window-close and worktree-removal confirmations.
+    func sessionsWithRunningProcess(endingWith intent: SessionCloseIntent) -> [TerminalSession] {
+        sessions.filter { session in
+            backendPolicy.closeAction(for: session, intent: intent) != .detach && session.hasRunningProcess()
+        }
+    }
+
+    /// Persistent tabs whose session closing everything for `intent` would
+    /// end, running or not.
+    func persistentSessionsEnded(by intent: SessionCloseIntent) -> [TerminalSession] {
+        sessions.filter { session in
+            session.isPersistentLocalSession && backendPolicy.closeAction(for: session, intent: intent) == .terminate
+        }
     }
 
     var rootAgentSessions: [TerminalSession] {
@@ -1212,8 +1329,11 @@ final class TerminalWorkspace: ObservableObject {
         let clampedIndex = min(max(targetIndex, 0), sessions.count - 1)
         guard currentIndex != clampedIndex else { return }
 
-        let session = sessions.remove(at: currentIndex)
-        sessions.insert(session, at: clampedIndex)
+        // One assignment: observers never see the tab missing mid-move.
+        var reordered = sessions
+        let session = reordered.remove(at: currentIndex)
+        reordered.insert(session, at: clampedIndex)
+        sessions = reordered
     }
 
     func moveSession(id sessionID: UUID, to targetIndex: Int, within kind: TerminalSession.SessionKind) {
@@ -1273,6 +1393,7 @@ final class TerminalWorkspace: ObservableObject {
 
     @discardableResult
     func addSession(
+        id: UUID = UUID(),
         title: String? = nil,
         workingDirectory: String? = nil,
         command: String? = nil,
@@ -1282,17 +1403,21 @@ final class TerminalWorkspace: ObservableObject {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
         // inherit the selected session's last trusted OSC 7 cwd report. In an
         // empty workspace (worktree spaces start with no sessions) fall back
-        // to the project root rather than the process home directory. A hosted
-        // tab's directory is on its host and never seeds a local shell.
+        // to the project root rather than the process home directory. A tab
+        // of This Mac's host (persistent, or attached to a local session)
+        // seeds it like a native one; an SSH host's directory never seeds a
+        // local shell.
         let resolvedWorkingDirectory = workingDirectory
-            ?? selectedSession.flatMap { $0.hostedAttachment == nil ? $0.workingDirectory : nil }
+            ?? selectedSession.flatMap { $0.reportsLocalWorkingDirectory ? $0.workingDirectory : nil }
             ?? projectRoot
         let session = Self.makeSession(
+            id: unusedSessionID(id),
             index: sessions.count + 1,
             title: title,
             workingDirectory: resolvedWorkingDirectory,
             projectRoot: projectRoot,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHostingForNewTab()
         )
         sessions.append(session)
         if displayAsStandalone {
@@ -1313,6 +1438,7 @@ final class TerminalWorkspace: ObservableObject {
 
     @discardableResult
     func addAgentSession(
+        id: UUID = UUID(),
         agent: AgentToolDefinition,
         projectRoot: String,
         title: String? = nil,
@@ -1321,12 +1447,14 @@ final class TerminalWorkspace: ObservableObject {
     ) -> TerminalSession {
         let normalizedParentAgentID = normalizedParentAgentID(parentAgentID)
         let session = Self.makeAgentSession(
+            id: unusedSessionID(id),
             index: agentSessions.count + 1,
             agent: agent,
             workingDirectory: projectRoot,
             title: title,
             parentAgentID: normalizedParentAgentID,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHostingForNewTab()
         )
         sessions.append(session)
         if select {
@@ -1336,31 +1464,59 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     /// `takeover` disconnects the session's other clients for this launch only.
+    ///
+    /// A session on This Mac that this app variant created, that no client
+    /// shows and no open tab owns (`PersistentLocalSessions.canAdopt`)
+    /// becomes this workspace's own persistent tab (`isPersistentLocalSession`)
+    /// when the workspace runs local tabs in the host: it then closes and
+    /// restarts like one. Everything else, including another app's or the
+    /// CLI's sessions, is attached (`hostedAttachment`): closing the tab only
+    /// disconnects it. `info` is the session as listed, when known.
     @discardableResult
     func attachHostedSession(
         _ attachment: HostedSessionAttachment,
+        id: UUID = UUID(),
         takeover: Bool = false,
-        launchShell: Bool = true
+        launchShell: Bool = true,
+        info: HostedSessionInfo? = nil
     ) -> TerminalSession {
-        if let existing = sessions.first(where: {
-            $0.hostedAttachment?.hostID == attachment.hostID
-                && $0.hostedAttachment?.sessionID == attachment.sessionID
-        }) {
+        if let existing = hostedSession(attachedTo: attachment) {
             select(existing)
             if launchShell, takeover || !existing.isRunning {
                 existing.reconnectHostedSession(takeover: takeover)
             }
             return existing
         }
-        let session = TerminalSession(
+        if attachment.host == .local,
+           launchBackend == .nativePTY,
+           let hosting = backendPolicy.localSessions,
+           let info = info ?? hosting.sessionInfo(attachment.sessionID),
+           info.id == attachment.sessionID,
+           hosting.canAdopt(info) {
+            // The tab the session was started for, when none is open: its
+            // program's CHERRY_PROCESS_ID names that id.
+            let startedFor = PersistentLocalSessions.tabID(of: info, owner: hosting.owner)
+                .flatMap { hosting.hasOpenTab(withID: $0) ? nil : $0 }
+            let session = makeAdoptedPersistentSession(
+                PersistentSessionLaunch(attachment: attachment, info: info),
+                id: unusedSessionID(startedFor ?? id),
+                hosting: hosting,
+                takeover: takeover,
+                launchShell: launchShell
+            )
+            sessions.append(session)
+            terminalDisplayItems.append(.single(session.id))
+            select(session)
+            return session
+        }
+        let session = makeHostedSession(
+            attachment,
+            id: unusedSessionID(id),
             title: attachment.name,
             titleSource: .explicit,
-            subtitle: "\(attachment.host.displayName) · \(attachment.remoteWorkingDirectory)",
-            tint: Self.palette[sessions.count % Self.palette.count],
-            workingDirectory: NSHomeDirectory(),
+            takeover: takeover,
             launchShell: launchShell,
-            hostedAttachment: attachment,
-            hostedTakeover: takeover
+            info: info ?? backendPolicy.localSessions?.sessionInfo(attachment.sessionID)
         )
         sessions.append(session)
         terminalDisplayItems.append(.single(session.id))
@@ -1368,13 +1524,496 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
+    /// A hosted tab for a saved record, built the way `attachHostedSession`
+    /// builds one but not added: `restoreSessions(_:from:)` adds it with the
+    /// saved layout. It keeps the record's tab id, title and metadata (kind,
+    /// agent, parent agent, command, launch settings, project), so a
+    /// command or agent comes back as one. `info`: the session as listed,
+    /// when known (a session of This Mac then gives the tab its program's
+    /// pid and directory).
+    ///
+    /// `deferringLaunch` (a restore): the adapter is launched later by
+    /// `RestoredTabLaunchQueue` or when the tab is shown; meanwhile the tab
+    /// follows its session's events through `control`. A session `info`
+    /// lists as ended gets no adapter: the tab shows it ended, with the
+    /// final screen read through `control`.
+    func makeRestoredHostedSession(
+        _ attachment: HostedSessionAttachment,
+        record: WorkspaceSessionRecord,
+        launchShell: Bool = true,
+        info: HostedSessionInfo? = nil,
+        deferringLaunch: Bool = false,
+        following control: HostControl? = nil
+    ) -> TerminalSession {
+        let session = makeHostedSession(
+            attachment,
+            id: record.id,
+            title: record.title.nilIfEmpty ?? attachment.name,
+            titleSource: record.title.isEmpty ? .explicit : record.titleSource,
+            takeover: false,
+            launchShell: launchShell,
+            info: info,
+            record: record,
+            deferringLaunch: deferringLaunch
+        )
+        if let control {
+            session.attachedHostControlProvider = { _ in control }
+        }
+        guard deferringLaunch, launchShell else { return session }
+        if let info, !info.isRunning {
+            session.showEndedHostedSession(
+                exitCode: info.exitCode.map { Int32(clamping: $0) },
+                signal: info.exitSignal,
+                control: control
+            )
+        } else if let control {
+            session.followDeferredHostEvents(from: control)
+        }
+        return session
+    }
+
+    private func makeHostedSession(
+        _ attachment: HostedSessionAttachment,
+        id: UUID,
+        title: String,
+        titleSource: TerminalSession.TitleSource,
+        takeover: Bool,
+        launchShell: Bool,
+        info: HostedSessionInfo?,
+        record: WorkspaceSessionRecord? = nil,
+        deferringLaunch: Bool = false
+    ) -> TerminalSession {
+        // A session of This Mac starts where its host says (it then follows
+        // OSC 7), else where it was saved; another machine's directory is
+        // never local.
+        let workingDirectory = attachment.host == .local
+            ? Self.resolvedWorkingDirectory(
+                info?.localWorkingDirectory ?? record?.workingDirectory ?? attachment.remoteWorkingDirectory
+            )
+            : NSHomeDirectory()
+        let session = TerminalSession(
+            id: id,
+            title: title,
+            titleSource: titleSource,
+            subtitle: "\(attachment.host.displayName) · \(attachment.remoteWorkingDirectory)",
+            tint: Self.palette[sessions.count % Self.palette.count],
+            workingDirectory: workingDirectory,
+            projectRoot: record?.projectRoot,
+            launchShell: launchShell,
+            kind: record?.kind ?? .terminal,
+            agentName: record?.agentName,
+            parentAgentID: record?.parentAgentID,
+            commandName: record?.commandName,
+            launchCommand: record?.launchCommand,
+            launchEnvironment: record?.launchEnvironment ?? [:],
+            restartOnExit: record?.restartOnExit ?? false,
+            hostedAttachment: attachment,
+            hostedTakeover: takeover,
+            deferredLaunch: deferringLaunch
+        )
+        if attachment.host == .local, let hosting = backendPolicy.localSessions {
+            session.attachedHostControlProvider = { _ in hosting.control }
+        }
+        if let info {
+            session.noteAttachedLocalSession(info)
+        }
+        return session
+    }
+
+    /// A persistent tab for a session of This Mac that no tab created: a
+    /// terminal named after the session, in the directory it reported.
+    private func makeAdoptedPersistentSession(
+        _ launch: PersistentSessionLaunch,
+        id: UUID,
+        hosting: PersistentLocalSessions,
+        takeover: Bool,
+        launchShell: Bool
+    ) -> TerminalSession {
+        let workingDirectory = launch.info.localWorkingDirectory ?? launch.info.cwd
+        return TerminalSession(
+            id: id,
+            title: launch.attachment.name.nilIfEmpty ?? launch.info.displayName,
+            titleSource: .explicit,
+            subtitle: "\(ShellProcessController.defaultShellName) login shell",
+            tint: Self.palette[sessions.count % Self.palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: projectRoot,
+            launchShell: launchShell,
+            launchBackend: launchBackend,
+            hostedTakeover: takeover,
+            persistentHosting: hosting,
+            adoptingPersistentSession: launch
+        )
+    }
+
+    /// A persistent tab for a saved record whose session the local host
+    /// still has (running or exited), built like the tab that saved it:
+    /// same id, kind, title, launch settings and project. Not added:
+    /// `restoreSessions(_:from:)` adds it with the saved layout. When an
+    /// open tab (another window's) already owns the session, the record
+    /// comes back only attached to it (`makeRestoredHostedSession`).
+    ///
+    /// `deferringLaunch` (a restore): the tab follows its session at once
+    /// (exit, title, bells, input and screen through the host), and its
+    /// attach adapter launches later (`RestoredTabLaunchQueue`, or when the
+    /// tab is shown). An ended session gets no adapter at all: the tab
+    /// shows its exit and the host's final screen.
+    func makeRestoredPersistentSession(
+        _ launch: PersistentSessionLaunch,
+        record: WorkspaceSessionRecord,
+        hosting: PersistentLocalSessions,
+        launchShell: Bool = true,
+        deferringLaunch: Bool = false
+    ) -> TerminalSession {
+        guard hosting.owningTab(of: launch.attachment.sessionID) == nil else {
+            return makeRestoredHostedSession(
+                launch.attachment, record: record, launchShell: launchShell, info: launch.info,
+                deferringLaunch: deferringLaunch, following: deferringLaunch ? hosting.control : nil
+            )
+        }
+        let workingDirectory = launch.info.localWorkingDirectory ?? record.workingDirectory
+        let subtitle: String = switch record.kind {
+        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
+        case .agent, .command: record.launchCommand ?? ""
+        }
+        return TerminalSession(
+            id: record.id,
+            title: record.title.nilIfEmpty ?? launch.info.displayName,
+            titleSource: record.title.isEmpty ? .explicit : record.titleSource,
+            subtitle: subtitle,
+            tint: Self.palette[sessions.count % Self.palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            projectRoot: record.projectRoot,
+            launchShell: launchShell,
+            kind: record.kind,
+            agentName: record.agentName,
+            parentAgentID: record.parentAgentID,
+            commandName: record.commandName,
+            launchCommand: record.launchCommand,
+            launchEnvironment: record.launchEnvironment,
+            restartOnExit: record.restartOnExit,
+            launchBackend: launchBackend,
+            persistentHosting: hosting,
+            adoptingPersistentSession: launch,
+            deferredLaunch: deferringLaunch
+        )
+    }
+
+    private func hostedSession(attachedTo attachment: HostedSessionAttachment) -> TerminalSession? {
+        sessions.first {
+            $0.hostedSessionBinding?.hostID == attachment.hostID
+                && $0.hostedSessionBinding?.sessionID == attachment.sessionID
+        }
+    }
+
+    /// Adds restored tabs with the saved order (an agent after its parent),
+    /// display items, split groups and selection. A restored tab whose id
+    /// or hosted session is already open, or a tab no saved record names,
+    /// is detached and dropped.
+    ///
+    /// A command runs in one tab per workspace (auto-start and the sidebar
+    /// find it by name). When a restored command meets a tab for the same
+    /// command (opened while the restore ran, or restored before it), the
+    /// one whose program runs keeps the command: a restored tab whose
+    /// program runs replaces a tab whose program does not (that tab is
+    /// closed); otherwise the restored tab is detached. When its program
+    /// still runs, its record is returned (set aside): the caller keeps it
+    /// saved, so its session is not forgotten.
+    ///
+    /// `selectingSavedTab`: the saved selection is selected (false for tabs
+    /// a later retry brings back into a workspace in use).
+    /// `addingAfterOpenTabs`: the tabs go after the tabs already open (tabs
+    /// that come back later into a workspace in use) rather than before
+    /// them (the restore that opened the workspace).
+    /// `launchingAdapters`: restored tabs whose adapter a restore deferred
+    /// are attached a few at a time (`restoredTabLaunchQueue`), the shown
+    /// ones first; false leaves them to `launchRestoredAdapters()` (a
+    /// worktree not shown now) or to being shown.
+    @discardableResult
+    func restoreSessions(
+        _ restoredSessions: [TerminalSession],
+        from record: WorktreeStateRecord,
+        selectingSavedTab: Bool = true,
+        addingAfterOpenTabs: Bool = false,
+        launchingAdapters: Bool = true
+    ) -> Set<UUID> {
+        var recordsByID: [UUID: WorkspaceSessionRecord] = [:]
+        var savedOrder: [UUID: Int] = [:]
+        for (index, sessionRecord) in record.sessions.enumerated() where recordsByID[sessionRecord.id] == nil {
+            recordsByID[sessionRecord.id] = sessionRecord
+            savedOrder[sessionRecord.id] = index
+        }
+
+        var openIDs = Set(sessions.map(\.id))
+        var accepted: [TerminalSession] = []
+        var setAside: Set<UUID> = []
+        // Open tabs a restored command tab replaces, with their replacement.
+        var replaced: [(open: TerminalSession, replacement: TerminalSession)] = []
+        for session in restoredSessions {
+            let isDuplicateAttachment = session.hostedSessionBinding.map { attachment in
+                hostedSession(attachedTo: attachment) != nil || accepted.contains {
+                    $0.hostedSessionBinding?.hostID == attachment.hostID
+                        && $0.hostedSessionBinding?.sessionID == attachment.sessionID
+                }
+            } ?? false
+            guard recordsByID[session.id] != nil,
+                  !isDuplicateAttachment,
+                  !openIDs.contains(session.id)
+            else {
+                finishClosing(session, intent: .duplicateWindowTeardown)
+                continue
+            }
+            if session.kind == .command, let name = session.commandName {
+                let normalizedName = AgentToolDefinition.normalizedName(name)
+                let sameCommand: (TerminalSession) -> Bool = { other in
+                    other.kind == .command
+                        && other.commandName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
+                }
+                let replacedIDs = Set(replaced.map(\.open.id))
+                let incumbent = accepted.first(where: sameCommand)
+                    ?? commandSessions.first { sameCommand($0) && !replacedIDs.contains($0.id) }
+                if let incumbent {
+                    guard !Self.commandProgramRuns(incumbent), Self.commandProgramRuns(session) else {
+                        if Self.commandProgramRuns(session) {
+                            fputs("Cherry: command '\(name)' already has a tab; its restored tab \(session.id.uuidString) is set aside and stays saved\n", stderr)
+                            setAside.insert(session.id)
+                        }
+                        finishClosing(session, intent: .duplicateWindowTeardown)
+                        continue
+                    }
+                    if let index = accepted.firstIndex(where: { $0 === incumbent }) {
+                        accepted.remove(at: index)
+                        openIDs.remove(incumbent.id)
+                        finishClosing(incumbent, intent: .duplicateWindowTeardown)
+                    } else {
+                        replaced.append((incumbent, session))
+                    }
+                }
+            }
+            openIDs.insert(session.id)
+            accepted.append(session)
+        }
+        guard !accepted.isEmpty else { return setAside }
+        accepted.sort { (savedOrder[$0.id] ?? .max) < (savedOrder[$1.id] ?? .max) }
+        accepted = Self.parentsFirst(accepted)
+
+        let displayableIDs = Set(accepted.filter { $0.kind == .terminal }.map(\.id))
+        var restoredItems: [TerminalDisplayItem] = []
+        var restoredGroups: [TerminalSplitGroup] = []
+        var placedIDs = Set<UUID>()
+        for item in record.displayItems {
+            switch item.kind {
+            case .single:
+                guard displayableIDs.contains(item.id), placedIDs.insert(item.id).inserted else { continue }
+                restoredItems.append(.single(item.id))
+            case .split:
+                guard let group = record.splitGroups.first(where: { $0.id == item.id }),
+                      !terminalSplitGroups.contains(where: { $0.id == group.id }),
+                      !restoredGroups.contains(where: { $0.id == group.id })
+                else { continue }
+                var paneIDs: [UUID] = []
+                var weights: [Double] = []
+                for (index, paneID) in group.paneSessionIDs.enumerated()
+                where displayableIDs.contains(paneID) && !placedIDs.contains(paneID) && !paneIDs.contains(paneID) {
+                    paneIDs.append(paneID)
+                    weights.append(group.widthWeights.indices.contains(index) ? group.widthWeights[index] : 0)
+                }
+                if paneIDs.count > Self.maximumSplitPaneCount {
+                    paneIDs = Array(paneIDs.prefix(Self.maximumSplitPaneCount))
+                    weights = Array(weights.prefix(Self.maximumSplitPaneCount))
+                }
+                placedIDs.formUnion(paneIDs)
+                if paneIDs.count >= 2 {
+                    restoredGroups.append(TerminalSplitGroup(
+                        id: group.id,
+                        paneSessionIDs: paneIDs,
+                        activeSessionID: paneIDs.contains(group.activeSessionID) ? group.activeSessionID : paneIDs[0],
+                        widthWeights: Self.normalizedWidthWeights(weights, count: paneIDs.count)
+                    ))
+                    restoredItems.append(.split(group.id))
+                } else if let paneID = paneIDs.first {
+                    restoredItems.append(.single(paneID))
+                }
+            }
+        }
+        for session in accepted where displayableIDs.contains(session.id) && !placedIDs.contains(session.id) {
+            restoredItems.append(.single(session.id))
+        }
+
+        for session in accepted {
+            restoredSessionRecords[session.id] = recordsByID[session.id]
+        }
+        if addingAfterOpenTabs {
+            sessions += accepted
+            terminalSplitGroups += restoredGroups
+            terminalDisplayItems += restoredItems
+        } else {
+            sessions = accepted + sessions
+            terminalSplitGroups = restoredGroups + terminalSplitGroups
+            terminalDisplayItems = restoredItems + terminalDisplayItems
+        }
+        // A tab replaced by a restored one (its program did not run) closes
+        // as a user's close would; the selection moves to its replacement.
+        for (open, replacement) in replaced {
+            closeSessions(
+                withIDs: [open.id],
+                replacementSelectionID: replacement.id,
+                allowEmptyWorkspace: true,
+                intent: .userClosedTab
+            )
+        }
+
+        let savedSelection = selectingSavedTab
+            ? record.selectedSessionID.flatMap { selectedID in accepted.first { $0.id == selectedID } }
+            : nil
+        if let savedSelection {
+            select(savedSelection)
+        } else if selectedSessionID.flatMap(session(withID:)) == nil,
+                  let first = terminalDisplaySessions.first ?? sessions.first {
+            select(first)
+        }
+        for session in accepted where session.id != selectedSessionID {
+            session.scheduleAuxiliaryProcessingSuspensionAfterStartupGrace()
+        }
+        if launchingAdapters {
+            launchRestoredAdapters(accepted)
+        }
+        return setAside
+    }
+
+    /// Queues the attach adapters that restored tabs are still waiting for
+    /// (`restoredTabLaunchQueue`): the selected tab and the other panes of
+    /// its split first. A worktree's workspace calls this when it is shown.
+    func launchRestoredAdapters() {
+        launchRestoredAdapters(sessions)
+    }
+
+    private func launchRestoredAdapters(_ tabs: [TerminalSession]) {
+        let waiting = tabs.filter(\.isAwaitingDeferredLaunch)
+        guard !waiting.isEmpty else { return }
+        var shownIDs: Set<UUID> = []
+        if let selectedSessionID {
+            shownIDs = Set(splitGroup(containing: selectedSessionID)?.paneSessionIDs ?? [selectedSessionID])
+        }
+        restoredTabLaunchQueue.enqueue(waiting, shownFirst: shownIDs)
+    }
+
+    /// Whether a command tab's program runs, or (for a restored tab not
+    /// attached yet) its session does.
+    private static func commandProgramRuns(_ tab: TerminalSession) -> Bool {
+        tab.isRunning || tab.isAwaitingDeferredLaunch
+    }
+
+    // MARK: Commands a restore may bring back
+
+    /// How long a command start waits for a restore that may bring back the
+    /// command's tab (`waitUntilRestored(commandNamed:)`).
+    static let commandRestoreWaitLimit: Duration = .seconds(10)
+
+    /// Normalized names of the commands whose saved tabs a restore still
+    /// under way may bring back (`RepositoryWorkspace` sets them). Starting
+    /// one of them now would start a second copy beside the program its
+    /// restored tab follows: `waitUntilRestored(commandNamed:)` waits for
+    /// the restore first.
+    private(set) var commandNamesBeingRestored: Set<String> = []
+    private var commandRestoreWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    func setCommandNamesBeingRestored(_ names: Set<String>) {
+        let normalized = Set(names.map(AgentToolDefinition.normalizedName))
+        guard normalized != commandNamesBeingRestored else { return }
+        commandNamesBeingRestored = normalized
+        resumeCommandRestoreWaiters()
+    }
+
+    /// Whether a restore under way may bring back a tab for the named
+    /// command (nil: for any command).
+    func isRestoringCommand(named name: String?) -> Bool {
+        guard let name else { return !commandNamesBeingRestored.isEmpty }
+        return commandNamesBeingRestored.contains(AgentToolDefinition.normalizedName(name))
+    }
+
+    /// Returns once no restore under way may bring back a tab for the named
+    /// command (nil: for any command), or after `timeout`. Sidebar and MCP
+    /// command starts wait here, then find the restored tab
+    /// (`addCommandSession` returns it) instead of starting a second copy.
+    func waitUntilRestored(commandNamed name: String?, timeout: Duration = TerminalWorkspace.commandRestoreWaitLimit) async {
+        let deadline = ContinuousClock.now + timeout
+        while isRestoringCommand(named: name), !isTornDown, ContinuousClock.now < deadline {
+            let id = UUID()
+            let timer = Task { @MainActor [weak self] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                self?.resumeCommandRestoreWaiter(id)
+            }
+            await withCheckedContinuation { commandRestoreWaiters[id] = $0 }
+            timer.cancel()
+        }
+    }
+
+    private func resumeCommandRestoreWaiter(_ id: UUID) {
+        commandRestoreWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func resumeCommandRestoreWaiters() {
+        let waiters = commandRestoreWaiters
+        commandRestoreWaiters.removeAll()
+        waiters.values.forEach { $0.resume() }
+    }
+
+    /// `tabs` in the same order, except that an agent comes after the agent
+    /// it names as parent (when that one is among them).
+    static func parentsFirst(_ tabs: [TerminalSession]) -> [TerminalSession] {
+        let ids = Set(tabs.map(\.id))
+        var placed: Set<UUID> = []
+        var ordered: [TerminalSession] = []
+        var waiting: [UUID: [TerminalSession]] = [:]
+        func place(_ tab: TerminalSession) {
+            guard placed.insert(tab.id).inserted else { return }
+            ordered.append(tab)
+            for child in waiting.removeValue(forKey: tab.id) ?? [] {
+                place(child)
+            }
+        }
+        for tab in tabs {
+            if let parentID = tab.parentAgentID, parentID != tab.id, ids.contains(parentID), !placed.contains(parentID) {
+                waiting[parentID, default: []].append(tab)
+            } else {
+                place(tab)
+            }
+        }
+        // Parents that name each other: saved order.
+        for tab in tabs where !placed.contains(tab.id) {
+            place(tab)
+        }
+        return ordered
+    }
+
+    /// This workspace's tabs and layout as workspace persistence saves them.
+    func makeStateRecord(root: String, collapsedAgentGroupIDs: Set<UUID>) -> WorktreeStateRecord {
+        let sessionIDs = Set(sessions.map(\.id))
+        return WorktreeStateRecord(
+            root: root,
+            sessions: sessions.map { session in
+                WorkspaceSessionRecord(session: session, restoredRecord: restoredSessionRecords[session.id])
+            },
+            displayItems: terminalDisplayItems.map(WorkspaceDisplayItemRecord.init),
+            splitGroups: terminalSplitGroups.map(WorkspaceSplitGroupRecord.init),
+            selectedSessionID: selectedSessionID.flatMap { sessionIDs.contains($0) ? $0 : nil },
+            collapsedAgentGroupIDs: collapsedAgentGroupIDs
+                .filter(sessionIDs.contains)
+                .sorted { $0.uuidString < $1.uuidString }
+        )
+    }
+
     @discardableResult
     func addCommandSession(
+        id: UUID = UUID(),
         command: ProjectCommandDefinition,
         projectRoot: String,
         select: Bool = true
     ) -> TerminalSession {
-        if let session = commandSession(named: command.name) {
+        // A restored hosted tab runs its command as a terminal until hosted
+        // tabs carry their kind; it still counts as that command's tab.
+        if let session = commandSession(named: command.name) ?? restoredSession(forCommandNamed: command.name) {
             if select {
                 self.select(session)
             }
@@ -1382,11 +2021,13 @@ final class TerminalWorkspace: ObservableObject {
         }
 
         let session = Self.makeCommandSession(
+            id: unusedSessionID(id),
             index: commandSessions.count + 1,
             command: command,
             workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot),
             projectRoot: projectRoot,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHostingForNewTab()
         )
         sessions.append(session)
         if select {
@@ -1486,6 +2127,15 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    /// A restored tab saved as the named command's tab.
+    func restoredSession(forCommandNamed name: String) -> TerminalSession? {
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        return sessions.first { session in
+            guard let record = restoredSessionRecords[session.id], record.kind == .command else { return false }
+            return record.commandName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
+        }
+    }
+
     func updateCommandSession(
         named originalName: String?,
         with command: ProjectCommandDefinition,
@@ -1529,6 +2179,10 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    /// A local terminal, native or persistent, can be split: the new pane is
+    /// a new tab of the same kind in the active pane's directory (for a
+    /// persistent tab, a new session in the local host). A tab attached to
+    /// a hosted session cannot: its directory is its host's.
     func canAddSplitPane(to sessionID: UUID) -> Bool {
         guard let session = session(withID: sessionID), session.kind == .terminal,
               session.hostedAttachment == nil else { return false }
@@ -1560,7 +2214,7 @@ final class TerminalWorkspace: ObservableObject {
             displayAsStandalone: false
         )
         guard addTerminalPane(session.id, after: activeSession.id) else {
-            closeSessions(withIDs: Set([session.id]))
+            closeSessions(withIDs: Set([session.id]), intent: .userClosedTab)
             return nil
         }
         select(session)
@@ -1575,6 +2229,9 @@ final class TerminalWorkspace: ObservableObject {
               activeSession.id != session.id,
               activeSession.kind == .terminal,
               session.kind == .terminal,
+              // A tab attached to a hosted session stays on its own, as the
+              // active pane would (`canAddSplitPane`).
+              session.hostedAttachment == nil,
               canAddSplitPane(to: activeSession.id)
         else {
             return false
@@ -1654,58 +2311,105 @@ final class TerminalWorkspace: ObservableObject {
         return sessions.count > group.paneSessionIDs.count
     }
 
-    func closeSplitGroup(id groupID: UUID) {
+    func closeSplitGroup(id groupID: UUID, intent: SessionCloseIntent = .userClosedTab) {
         guard let group = splitGroup(id: groupID),
               canCloseSplitGroup(id: groupID)
         else {
             return
         }
-        closeSessions(withIDs: Set(group.paneSessionIDs))
+        closeSessions(withIDs: Set(group.paneSessionIDs), intent: intent)
     }
 
-    func close(_ session: TerminalSession, allowEmptyWorkspace: Bool = false) {
+    func close(
+        _ session: TerminalSession,
+        allowEmptyWorkspace: Bool = false,
+        intent: SessionCloseIntent = .userClosedTab
+    ) {
         if session.kind == .agent {
             promoteChildAgents(of: session)
         }
         closeSessions(
             withIDs: Set([session.id]),
             replacementSelectionID: replacementPaneSelection(afterClosing: session.id),
-            allowEmptyWorkspace: allowEmptyWorkspace
+            allowEmptyWorkspace: allowEmptyWorkspace,
+            intent: intent
         )
     }
 
-    func closeAgentGroup(_ session: TerminalSession, allowEmptyWorkspace: Bool = false) {
+    func closeAgentGroup(
+        _ session: TerminalSession,
+        allowEmptyWorkspace: Bool = false,
+        intent: SessionCloseIntent = .userClosedTab
+    ) {
         let groupIDs = Set(([session] + descendantAgentSessions(of: session)).map(\.id))
-        closeSessions(withIDs: groupIDs, allowEmptyWorkspace: allowEmptyWorkspace)
+        closeSessions(withIDs: groupIDs, allowEmptyWorkspace: allowEmptyWorkspace, intent: intent)
     }
 
-    func closeAgentPromotingChildren(_ session: TerminalSession) {
+    func closeAgentPromotingChildren(_ session: TerminalSession, intent: SessionCloseIntent = .userClosedTab) {
         promoteChildAgents(of: session)
-        closeSessions(withIDs: Set([session.id]))
+        closeSessions(withIDs: Set([session.id]), intent: intent)
     }
 
-    func closeAllSessions() {
+    /// Closes every tab. The default is a window teardown; production callers
+    /// name the intent.
+    func closeAllSessions(intent: SessionCloseIntent = .windowClosed) {
+        if intent.tearsDownWorkspace {
+            isTornDown = true
+            resumeCommandRestoreWaiters()
+        }
+        closeAllIntent = intent
         let removedSessions = sessions
         sessions.removeAll()
+        restoredSessionRecords.removeAll()
         terminalDisplayItems.removeAll()
         terminalSplitGroups.removeAll()
         selectedSessionID = nil
-        removedSessions.forEach { session in
-            // Snapshot and stop the native process tree while its PTY still
-            // exists; releasing the bridge first loses the teardown anchor.
+        removedSessions.forEach { finishClosing($0, intent: intent) }
+    }
+
+    /// Ends tabs a restore built for this workspace after every tab was
+    /// closed, with the intent that closed them (a window close if none did).
+    func discardRestoredSessions(_ restoredSessions: [TerminalSession]) {
+        let intent = closeAllIntent ?? .windowClosed
+        restoredSessions.forEach { finishClosing($0, intent: intent) }
+    }
+
+    func closeSelectedSession(intent: SessionCloseIntent = .userClosedTab) {
+        guard let selectedSession else { return }
+        close(selectedSession, intent: intent)
+    }
+
+    func closeActivePane(intent: SessionCloseIntent = .userClosedTab) {
+        guard let selectedSession else { return }
+        close(selectedSession, intent: intent)
+    }
+
+    /// Ends a removed tab's program the way `intent` asks for its backend.
+    private func finishClosing(_ session: TerminalSession, intent: SessionCloseIntent) {
+        // A persistent tab whose program already ended leaves nothing worth
+        // keeping when someone closes it: its session goes whatever the
+        // settings say.
+        let removesEndedSession = session.isPersistentLocalSession && !session.isRunning
+            && (intent == .userClosedTab || intent == .mcpClose)
+        // Snapshot and stop the native process tree while its PTY still
+        // exists; releasing the bridge first loses the teardown anchor.
+        switch backendPolicy.closeAction(for: session, intent: intent) {
+        case .stop:
             session.stop()
-            session.releaseGhosttyBridge()
+        case .detach:
+            // For a hosted tab, stopping ends only its local attach client;
+            // a persistent tab still creating its session keeps the one its
+            // Create makes (its saved record names it).
+            session.stop(keepingSession: !removesEndedSession)
+            if removesEndedSession {
+                backendPolicy.terminateHostedSession(session, intent)
+            }
+        case .terminate:
+            session.stop()
+            backendPolicy.terminateHostedSession(session, intent)
         }
-    }
-
-    func closeSelectedSession() {
-        guard let selectedSession else { return }
-        close(selectedSession)
-    }
-
-    func closeActivePane() {
-        guard let selectedSession else { return }
-        close(selectedSession)
+        session.persistentTabDidClose()
+        session.releaseGhosttyBridge()
     }
 
     func selectPreviousSession(visibleCommandNames: [String]? = nil) {
@@ -1718,7 +2422,21 @@ final class TerminalWorkspace: ObservableObject {
 
 
     func restartSelectedSession() {
-        selectedSession?.restart()
+        guard let selectedSession else { return }
+        restart(selectedSession)
+    }
+
+    /// Relaunches a tab in place: a native tab restarts its program, an
+    /// attached tab reconnects its attach client, and a persistent tab ends
+    /// its session and starts a new one for the same tab id (its restart
+    /// does both, `TerminalSession.restart()`). Returns false when nothing
+    /// was relaunched because an attached session ended.
+    @discardableResult
+    func restart(_ session: TerminalSession) -> Bool {
+        switch backendPolicy.closeAction(for: session, intent: .restart) {
+        case .stop, .detach, .terminate:
+            return session.restart()
+        }
     }
 
     func clearSelectedSessionScrollback() {
@@ -1907,7 +2625,8 @@ final class TerminalWorkspace: ObservableObject {
     private func closeSessions(
         withIDs removedIDs: Set<UUID>,
         replacementSelectionID: UUID? = nil,
-        allowEmptyWorkspace: Bool = false
+        allowEmptyWorkspace: Bool = false,
+        intent: SessionCloseIntent
     ) {
         guard !removedIDs.isEmpty,
               allowEmptyWorkspace || sessions.count > removedIDs.count
@@ -1918,11 +2637,9 @@ final class TerminalWorkspace: ObservableObject {
         let removedIndex = sessions.firstIndex { removedIDs.contains($0.id) }
         let removedSessions = sessions.filter { removedIDs.contains($0.id) }
         sessions.removeAll { removedIDs.contains($0.id) }
+        removedSessions.forEach { restoredSessionRecords[$0.id] = nil }
         removeClosedSessionsFromTerminalDisplay(removedIDs)
-        removedSessions.forEach { session in
-            session.stop()
-            session.releaseGhosttyBridge()
-        }
+        removedSessions.forEach { finishClosing($0, intent: intent) }
 
         guard let currentSelectedSessionID = selectedSessionID,
               removedIDs.contains(currentSelectedSessionID)
@@ -2000,39 +2717,46 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     private static func makeSession(
+        id: UUID = UUID(),
         index: Int,
         title: String? = nil,
         workingDirectory: String? = nil,
         projectRoot: String? = nil,
-        launchBackend: TerminalSessionLaunchBackend
+        launchBackend: TerminalSessionLaunchBackend,
+        persistentHosting: PersistentLocalSessions? = nil
     ) -> TerminalSession {
         let explicitTitle = title?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         return TerminalSession(
+            id: id,
             title: explicitTitle ?? "Shell \(index)",
             titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
             tint: palette[(index - 1) % palette.count],
             workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
             projectRoot: projectRoot,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHosting
         )
     }
 
     private static func makeAgentSession(
+        id: UUID,
         index: Int,
         agent: AgentToolDefinition,
         workingDirectory: String,
         title requestedTitle: String?,
         parentAgentID: UUID?,
-        launchBackend: TerminalSessionLaunchBackend
+        launchBackend: TerminalSessionLaunchBackend,
+        persistentHosting: PersistentLocalSessions?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         return TerminalSession(
+            id: id,
             title: explicitTitle ?? baseTitle,
             titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: agent.commandLine,
@@ -2043,18 +2767,22 @@ final class TerminalWorkspace: ObservableObject {
             agentName: agent.name,
             parentAgentID: parentAgentID,
             launchCommand: agent.commandLine,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHosting
         )
     }
 
     private static func makeCommandSession(
+        id: UUID,
         index: Int,
         command: ProjectCommandDefinition,
         workingDirectory: String,
         projectRoot: String,
-        launchBackend: TerminalSessionLaunchBackend
+        launchBackend: TerminalSessionLaunchBackend,
+        persistentHosting: PersistentLocalSessions?
     ) -> TerminalSession {
         TerminalSession(
+            id: id,
             title: command.name.isEmpty ? "Command \(index)" : command.name,
             subtitle: command.commandLine,
             tint: palette[(index - 1) % palette.count],
@@ -2065,7 +2793,8 @@ final class TerminalWorkspace: ObservableObject {
             launchCommand: command.commandLine,
             launchEnvironment: command.environment,
             restartOnExit: command.autoRestart,
-            launchBackend: launchBackend
+            launchBackend: launchBackend,
+            persistentHosting: persistentHosting
         )
     }
 
@@ -2171,7 +2900,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    let id = UUID()
+    /// The tab's identity: `CHERRY_PROCESS_ID`/`CHERRY_AGENT_ID` in its
+    /// processes, the MCP process id, deep links, notifications, split panes
+    /// and agent parents. Saved with the workspace, so a restored tab keeps it.
+    let id: UUID
     @Published private(set) var title: String
     @Published private(set) var titleSource: TitleSource
     @Published private(set) var subtitle: String
@@ -2205,13 +2937,238 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var hostedLaunchStatusFile: URL?
     /// That launch's private directory while its outcome is still unread.
     private var hostedPendingStatusDirectory: URL?
+    /// The running adapter's live state, as its status file reports it
+    /// (`HostedAdapterStatusWatcher`): nil until this launch attached (and
+    /// once it ended). A persistent tab takes the adapter to show its
+    /// program, and to pass the program's bells, notifications, title and
+    /// directory through, only while this says so; while it reconnects or
+    /// shows a viewport, the tab reads the program's screen from the host.
+    @Published private(set) var adapterLiveStatus: HostedAdapterLiveStatus?
+    private var adapterStatusWatcher: HostedAdapterStatusWatcher?
+    /// The adapter has reported itself reconnecting (its host restarted)
+    /// for longer than the notice delay: an attached tab's connection bar
+    /// says so, and a persistent tab shows its reconnect bar
+    /// (`.disconnected`). The adapter keeps its surface meanwhile.
+    @Published private(set) var isAdapterReconnecting = false
+    private var adapterReconnectingNotice: DispatchWorkItem?
+    /// For a tab without persistent hosting (attached tabs).
+    private static let adapterReconnectingNoticeDelay: TimeInterval = 2
     private var hostedTakeoverForNextLaunch = false
     private var hostedLaunchTakesOver = false
+    /// The SSH master the latest adapter launch of an SSH-hosted tab shares,
+    /// registered once for that launch in `startShell`; nil for its own ssh.
+    private var hostedLaunchSSHControlPath: String?
+
+    // MARK: Persistent local session (docs/specs/multiplexer-default.md)
+
+    /// Runs this local tab's program as a persistent session in the local
+    /// cherry-host; the tab's surface runs the session's attach adapter.
+    /// Nil for a native tab and for one attached to a session from
+    /// Persistent Sessions without adopting it (`hostedAttachment`). Cleared
+    /// when the host could not start the program: the tab then runs it
+    /// natively.
+    private(set) var persistentHosting: PersistentLocalSessions?
+    /// The host session the tab's program runs in. Set once Create answers
+    /// (or a restore adopts a session), replaced by a restart, and kept after
+    /// the program exits: the host keeps its final screen until the tab
+    /// closes or restarts. Saved with the workspace.
+    @Published private(set) var persistentSession: HostedSessionAttachment?
+    private var persistentPhase: PersistentPhase = .idle
+    /// A running or exited session the next launch attaches to instead of
+    /// creating one (a restored or adopted tab).
+    private var persistentSessionToAdopt: PersistentSessionLaunch?
+    /// Input sent while the session was being created, delivered once it is.
+    /// MCP's input carries a delivery its caller waits on
+    /// (`sendControlInput`); the keyboard's none.
+    private var pendingPersistentInput: [(data: Data, delivery: PersistentInputDelivery?)] = []
+    /// The `request_id` (lowercased) of the Create that started the tab's
+    /// session, or is starting it: chosen before the Create is sent and
+    /// saved with the tab (`WorkspaceSessionRecord.launchRequestID`), so a
+    /// relaunch finds the session even when the answer was never saved.
+    private(set) var persistentLaunchRequestID: String?
+    /// The latest launch's work (ending the previous session, Create): the
+    /// next launch waits for it (`startPersistentLaunch`).
+    private var persistentLaunchTask: Task<Void, Never>?
+    /// What the latest launch does with the session its Create makes when
+    /// the tab no longer follows it by the time Create answers.
+    private var persistentLaunchClaim: PersistentLaunchClaim?
+    private var persistentReconnectFailures = 0
+    private var persistentReconnectMisses = 0
+    private var persistentReconnect: DispatchWorkItem?
+    /// Checks whether a session missing from the host's list is really gone.
+    private var persistentDisappearanceCheck: Task<Void, Never>?
+    /// Where this tab was registered as an open persistent tab (it stays
+    /// registered after a fallback to native, until it closes).
+    private var persistentTabRegistry: PersistentLocalSessions?
+    /// The program's process id as the local host reports it
+    /// (`SessionInfo.pid`: the login shell, or the program it became),
+    /// while a persistent tab's program runs. It routes MCP callers to
+    /// their tab, is the pid MCP reports and roots port detection. Nothing
+    /// signals it: the program is the host's child, and `stop()` only hangs
+    /// up on the tab's own attach adapter. A tab attached to a session of
+    /// This Mac (`hostedAttachment`, host `.local`) has it too, from the
+    /// session as listed, while its adapter runs
+    /// (`noteAttachedLocalSession`); one attached to another machine's
+    /// session never does, so no other machine's pid is used.
+    @Published private(set) var hostedProgramProcessID: Int32?
+    /// The program pid of the session of This Mac this tab is attached to
+    /// (`SessionInfo.pid`, fixed for the session's life), as last listed.
+    private var attachedLocalProgramProcessID: Int32?
+    /// The latest progress the program reported (OSC 9;4) through its host;
+    /// nil when none or removed.
+    @Published private(set) var progressReport: TerminalProgressReport?
+    /// The title and directory the host last reported for the program (raw),
+    /// so a report is applied once, when it changes.
+    private var lastHostReportedTitle: String?
+    private var lastHostReportedDirectory: String?
+    /// Bells and notifications shown lately, and whether they came from the
+    /// surface or the host: the adapter passes to the surface what the host
+    /// also reports, and each is shown once.
+    private var recentSignalDeliveries: [(key: String, fromHost: Bool, at: Date)] = []
+    /// When the attach adapter last started passing the program's signals
+    /// through, and the local host's control connection that was up then
+    /// (`PersistentLocalSessions.connectionGeneration`; nil when none was):
+    /// bells and notifications the host kept while no app was subscribed
+    /// (its daemon restarted) and hands to a later connection may predate
+    /// that adapter, which then never showed them.
+    private var adapterFollowingSince: Date?
+    private var adapterFollowingControlGeneration: Int?
+    /// Bells and notifications the surface showed since then that no host
+    /// report matched yet (its copy of one the host may still hand over).
+    private var surfaceSignalsWhileFollowing: [(key: String, at: Date)] = []
+    private static let notificationDeduplicationWindow: TimeInterval = 3
+    private static let bellDeduplicationWindow: TimeInterval = 1
+    /// Plays the terminal bell (Ghostty's, or one the host reported).
+    /// Tests replace it.
+    var bellHandler: @MainActor (TerminalSession) -> Void = { _ in NSSound.beep() }
+    /// The screen read from the host is in `nativeContentLines`, read at
+    /// this time; nil when it came from the surface.
+    private var hostContentReadAt: Date?
+    private var hostContentUsesAlternateScreen = false
+    private var hostContentRead: Task<Void, Never>?
+    /// Whether the read under way asks for the whole history.
+    private var hostContentReadIsWhole = false
+    private var hostContentReadGeneration = 0
+    /// The lines read from the host hold its whole history (the last read
+    /// did, or a later recent one showed nothing new); otherwise only its
+    /// last `hostScreenRecentLines`.
+    private var hostContentHasHistory = false
+    /// Identifies the last lines read from the host (see
+    /// `hostContentChangeKey`): a new read that has the same ones shows
+    /// nothing new, whether it read the whole history or only recent lines.
+    private var hostContentTailKey: Int?
+
+    // MARK: Restored tabs (deferred attach)
+    //
+    // A restore builds every saved tab at once but launches their attach
+    // adapters a few at a time (`RestoredTabLaunchQueue`), the shown tabs
+    // first; showing a tab launches its adapter at once. Until then a
+    // persistent tab follows its program through the host (title, pwd,
+    // bells, exit, input and screen, as while its adapter reconnects), and
+    // an attached tab follows its session's events through its host's
+    // control connection.
+
+    /// A restored persistent tab whose program runs but whose attach adapter
+    /// was not launched yet.
+    private var persistentAdapterDeferred = false
+    /// The tab started the program it runs now (a native launch, or a new
+    /// session it created), rather than following one that was already
+    /// running: a restored or adopted session, or one attached from its
+    /// host. Only a program the tab just started can be at its startup
+    /// prompt; one it follows may be anywhere, a permission prompt
+    /// included, so MCP input never answers a prompt for it.
+    private(set) var startedCurrentProgram = false
+    /// A restored attached tab whose attach adapter was not launched yet.
+    private var hostedLaunchDeferred = false
+    /// An attached tab's host events while its launch is deferred.
+    private var deferredHostEvents: AnyCancellable?
+    private var deferredHostLease: HostControlLease?
+    /// The control connection an attached tab follows while its launch is
+    /// deferred; MCP input goes through it (`SendInput`) meanwhile.
+    private weak var deferredHostControl: HostControl?
+    /// Where this tab was registered as an open tab attached to a session.
+    private var isRegisteredAsAttachedTab = false
+    /// The ended program's final screen was read from its host (no adapter
+    /// showed it); the read under way, if any.
+    private var finalScreenRead: Task<Void, Never>?
+
+    private enum PersistentPhase: Equatable {
+        case idle
+        /// The session is being created (or adopted); input is queued.
+        case creating
+        /// The attach adapter runs in the surface; its status file says
+        /// whether it attached (`adapterLiveStatus`).
+        case attached
+        /// The adapter ended while the program runs: it is launched again
+        /// with backoff, and input goes through the host's control connection.
+        case reconnecting
+    }
+
     /// Signals a native-PTY session's processes when the tab stops. Tests
     /// wrap it to answer the hangup the way a hosted attach adapter does.
     var terminateNativeSession: (pid_t) -> Void = { ShellProcessController.terminateNativeShellSession(anchorPID: $0) }
-    private(set) var isEnhancedKeyboardProtocolActive = false
-    private(set) var keyboardProtocolFlags = 0
+    /// The kitty keyboard flags the program set, parsed from its output
+    /// (the host-managed path); see `keyboardProtocolFlags`.
+    private var streamKeyboardProtocolFlags = 0
+    /// The session a tab attached to a hosted session (`hostedAttachment`)
+    /// was last reported as (its host's list, or its events while its
+    /// launch is deferred): its alternate screen and keyboard flags until
+    /// its adapter launches.
+    private var attachedSessionInfo: HostedSessionInfo?
+    /// The control connection of the host a tab attached to a hosted
+    /// session (`hostedAttachment`) runs it on: while it is connected, it
+    /// reports the program's modes, and it takes MCP input while the
+    /// adapter reconnects. The workspace sets it for the tabs it builds;
+    /// otherwise the app's registry's control for that host.
+    var attachedHostControlProvider: (@MainActor (HostedSessionHost) -> HostControl)?
+
+    private var attachedHostControl: HostControl? {
+        guard let hostedAttachment else { return nil }
+        if let attachedHostControlProvider { return attachedHostControlProvider(hostedAttachment.host) }
+        return HostControlRegistry.shared.control(for: hostedAttachment.host)
+    }
+
+    /// The kitty keyboard protocol flags the program enabled: as its host
+    /// reports them for a hosted tab (Ghostty's surface parses them for the
+    /// adapter, not for Cherry), else as parsed from its output.
+    var keyboardProtocolFlags: Int {
+        if let flags = hostReportedSessionInfo?.kittyKeyboardFlags { return Int(flags) }
+        return streamKeyboardProtocolFlags
+    }
+
+    var isEnhancedKeyboardProtocolActive: Bool {
+        keyboardProtocolFlags > 0
+    }
+
+    /// The running program's session as its host last reported it, for a
+    /// persistent tab or one attached to a hosted session; nil for a native
+    /// tab, or when not known.
+    ///
+    /// An attached tab follows its session's events only until its adapter
+    /// launches (`followDeferredHostEvents`). From then on the session is
+    /// known only while its host's control connection is up and follows
+    /// the host's events (`HostControl.currentSession`), which keep it
+    /// current; a report from before (its modes may have changed since)
+    /// never applies.
+    private var hostReportedSessionInfo: HostedSessionInfo? {
+        if let persistentHosting {
+            guard isRunning, persistentPhase != .creating,
+                  let sessionID = persistentSession?.sessionID,
+                  let info = persistentHosting.sessionInfo(sessionID), info.isRunning
+            else { return nil }
+            return info
+        }
+        guard let hostedAttachment else { return nil }
+        if hostedLaunchDeferred {
+            guard let info = attachedSessionInfo, info.isRunning else { return nil }
+            return info
+        }
+        guard isRunning,
+              let info = attachedHostControl?.currentSession(hostedAttachment.sessionID, hostID: hostedAttachment.hostID),
+              info.isRunning
+        else { return nil }
+        return info
+    }
 
     let projectRoot: String?
     let tint: NSColor
@@ -2222,9 +3179,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     let agentName: String?
     @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
-    private var launchCommand: String?
-    private var launchEnvironment: [String: String]
-    private var restartOnExit: Bool
+    private(set) var launchCommand: String?
+    private(set) var launchEnvironment: [String: String]
+    private(set) var restartOnExit: Bool
+    /// Set by the owning workspace: called after a rename, a managed command
+    /// edit or a new agent parent, which workspace persistence saves.
+    var persistentStateDidChange: (@MainActor () -> Void)?
     /// True when auto-restart gave up on a crash-looping command (see
     /// `CommandAutoRestartPolicy`); cleared by a manual restart.
     @Published private(set) var isAutoRestartPaused = false
@@ -2352,6 +3312,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let contentFingerprintTailLineLimit = 40
 
     init(
+        id: UUID = UUID(),
         title: String,
         titleSource: TitleSource = .system,
         subtitle: String,
@@ -2371,6 +3332,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
         hostedAttachment: HostedSessionAttachment? = nil,
         hostedTakeover: Bool = false,
+        persistentHosting: PersistentLocalSessions? = nil,
+        adoptingPersistentSession: PersistentSessionLaunch? = nil,
+        deferredLaunch: Bool = false,
         attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
             TerminalAttentionObservationRecorder.configuredDirectoryURL
         },
@@ -2384,6 +3348,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             TerminalNotificationCenter.shared.postAttention(for: session)
         }
     ) {
+        self.id = id
         self.title = title
         self.titleSource = titleSource
         self.subtitle = subtitle
@@ -2396,7 +3361,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.launchBackend = launchBackend
         self.hostedAttachment = hostedAttachment
         self.hostedAttachmentStatus = hostedAttachment.map { _ in .disconnected(nil) }
-        self.hostedTakeoverForNextLaunch = hostedAttachment != nil && hostedTakeover
+        // Only a local Ghostty EXEC tab runs its program in the local host.
+        let persistentHosting = launchBackend == .nativePTY && hostedAttachment == nil ? persistentHosting : nil
+        self.persistentHosting = persistentHosting
+        self.persistentSessionToAdopt = persistentHosting == nil ? nil : adoptingPersistentSession
+        self.hostedTakeoverForNextLaunch = (hostedAttachment != nil || adoptingPersistentSession != nil) && hostedTakeover
         self.agentName = agentName
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
@@ -2427,10 +3396,47 @@ final class TerminalSession: ObservableObject, Identifiable {
             self?.noteInputBurst(data)
             self?.discardPendingOutputForInterrupt(in: data)
         }
+        // What the in-memory surface encodes while no process takes it: a
+        // persistent tab's keys while its session is created or restarted.
+        // Ghostty writes it from the key event on the main thread, where it
+        // is queued at once, in order with the keys the tab's key monitor
+        // sends (`send(data:)`).
+        self.hostInputWriter.setFallbackWriteHandler { [weak self] data in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.surfaceInputWithoutProcess(data) }
+            } else {
+                DispatchQueue.main.async { self?.surfaceInputWithoutProcess(data) }
+            }
+        }
 
-        if launchShell {
+        if let persistentHosting {
+            // A tab adopting a session owns it from now on (the workspace
+            // checked no open tab does): another tab or restore sees that
+            // at once, before the adapter attaches.
+            if let adoptingPersistentSession {
+                persistentSession = adoptingPersistentSession.attachment
+                persistentLaunchRequestID = PersistentLocalSessions.launchRequestID(of: adoptingPersistentSession.info)
+            }
+            persistentHosting.register(self)
+            persistentTabRegistry = persistentHosting
+        }
+        if hostedAttachment != nil {
+            OpenHostedTabs.shared.register(self)
+            isRegisteredAsAttachedTab = true
+        }
+        if launchShell, deferredLaunch, hostedAttachment != nil {
+            // `launchDeferredAdapterIfNeeded` (the restore's queue, or
+            // showing the tab) starts it.
+            hostedLaunchDeferred = true
+            hostedAttachmentStatus = nil
+        } else if launchShell {
+            // A restored persistent tab follows its session at once; only its
+            // adapter waits.
+            persistentAdapterDeferred = deferredLaunch && persistentSessionToAdopt != nil
             startShell()
         } else {
+            // A tab that is not launched only names its session.
+            persistentSessionToAdopt = nil
             state = hostedAttachment == nil ? .exited(0) : .disconnected
         }
     }
@@ -2542,7 +3548,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// like process listings that poll many sessions. The render signal keeps the
     /// native line model current; this just reads it.
     var listingLineCount: Int {
-        ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
+        // Lines read from the host (a persistent tab no surface shows, such
+        // as a restored one whose adapter waits) are the ones MCP output
+        // numbers, as `lineCount` counts them.
+        readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent)
             ? nativeContentLines.count
             : processor.lineCount
     }
@@ -2551,12 +3560,34 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.cursorState
     }
 
+    /// Whether the program shows its alternate screen: as its host reports
+    /// it for a hosted tab, else as the screen read from the host or the
+    /// parsed output shows.
     var usesAlternateScreen: Bool {
-        processor.usesAlternateScreen
+        if let alternate = hostReportedSessionInfo?.alternateScreen { return alternate }
+        return readsContentFromHost ? hostContentUsesAlternateScreen : processor.usesAlternateScreen
     }
 
+    /// Whether the program gets application cursor keys (`ESC O x` for
+    /// unmodified arrows, Home and End): as its host reports it for a
+    /// hosted tab (`hostReportedApplicationCursorKeys`; Ghostty's surface
+    /// parses the mode for the adapter, not for Cherry), else as parsed
+    /// from its output. Keys typed while an adapter is away
+    /// (`HostRoutedKeyEncoder`) and MCP input the host types
+    /// (`hostTypedInputData`) are encoded for it.
     var usesApplicationCursorKeys: Bool {
-        processor.usesApplicationCursorKeys
+        hostReportedApplicationCursorKeys ?? processor.usesApplicationCursorKeys
+    }
+
+    /// Whether a terminal types the program's cursor keys in application
+    /// form, as its host reports its modes: DECCKM is on
+    /// (`HostedSessionInfo.applicationCursorKeys`) and the program uses
+    /// legacy key encoding. Under the kitty keyboard protocol (flags not
+    /// 0) they are always CSI (`ESC [ x`). Nil when the host does not
+    /// report DECCKM (an older host) or reports nothing now.
+    private var hostReportedApplicationCursorKeys: Bool? {
+        guard let info = hostReportedSessionInfo, let application = info.applicationCursorKeys else { return nil }
+        return application && (info.kittyKeyboardFlags ?? 0) == 0
     }
 
     var usesBracketedPasteMode: Bool {
@@ -2571,9 +3602,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         "\(state.label) · \(lineSummary)"
     }
 
+    /// Whether MCP input (`sendControlInput`) can reach the program: when
+    /// the tab takes input, and also for a restored attached tab whose
+    /// adapter is not launched yet (its host's control connection takes the
+    /// input then).
+    var acceptsControlInput: Bool {
+        acceptsInput || (hostedLaunchDeferred && deferredHostControl != nil)
+    }
+
     var acceptsInput: Bool {
         if case .live = state {
             return true
+        }
+        // A persistent tab's program takes input while its session is being
+        // created (queued) and while its adapter reconnects (sent through
+        // the host's control connection).
+        if isPersistentLocalSession, isRunning {
+            switch state {
+            case .launching, .disconnected:
+                return true
+            case .live, .exited, .failed:
+                break
+            }
         }
 
         return false
@@ -2583,8 +3633,68 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeLaunchID != nil
     }
 
+    /// Whether the tab's program runs. A persistent tab's program runs from
+    /// its launch until its host reports the exit, whether or not its attach
+    /// adapter is connected; an exit the host listed before the tab heard of
+    /// it counts. A tab attached to a hosted session only knows while its
+    /// adapter runs.
+    var isProgramRunning: Bool {
+        guard isRunning else { return false }
+        guard let persistentHosting, persistentPhase != .creating,
+              let sessionID = persistentSession?.sessionID,
+              let info = persistentHosting.sessionInfo(sessionID)
+        else { return true }
+        return info.isRunning
+    }
+
+    /// A Ghostty EXEC surface runs this tab's process: its shell, or for a
+    /// hosted tab its attach adapter. Not while a persistent tab's session is
+    /// still being created (a surface made meanwhile shows nothing yet).
     var usesNativePTYBackend: Bool {
-        launchBackend == .nativePTY && isRunning
+        launchBackend == .nativePTY && isRunning && persistentPhase != .creating
+    }
+
+    /// The tab runs its program as a persistent session in the local host
+    /// (it looks and behaves like a native tab).
+    var isPersistentLocalSession: Bool {
+        persistentHosting != nil
+    }
+
+    /// The directories the program reports (OSC 7) are on This Mac: a
+    /// native or persistent tab, or one attached to a local session. A tab
+    /// attached to an SSH host's session keeps its home directory.
+    var reportsLocalWorkingDirectory: Bool {
+        hostedAttachment.map { $0.host == .local } ?? true
+    }
+
+    /// The process id of the tab's program: its shell's session leader for
+    /// a native tab, the local host's report for a persistent tab or one
+    /// attached to a session of This Mac (see `hostedProgramProcessID`).
+    /// For MCP caller routing, the pid MCP reports and port detection only;
+    /// never signalled through this.
+    var programProcessID: Int32? {
+        childProcessID ?? hostedProgramProcessID
+    }
+
+    /// The tab's state as MCP reports it: a persistent tab whose attach
+    /// adapter reconnects is `live`, because its program runs (its input
+    /// and screen go through the host meanwhile).
+    var programStateLabel: String {
+        if case .disconnected = state, isPersistentLocalSession, isRunning {
+            return SessionState.live.label
+        }
+        return state.label
+    }
+
+    /// A persistent tab's session is still being created (or adopted): its
+    /// program has not started, input is queued.
+    var isStartingPersistentSession: Bool {
+        persistentPhase == .creating
+    }
+
+    /// The hosted session this tab shows, attached or persistent.
+    var hostedSessionBinding: HostedSessionAttachment? {
+        hostedAttachment ?? persistentSession
     }
 
     /// Whether closing this session would tear down a live program the user might
@@ -2603,6 +3713,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         case .command, .agent:
             return true
         case .terminal:
+            if let persistentHosting {
+                // The host reports the terminal's foreground job; the shell
+                // is the session leader, so busy means another job runs.
+                guard let sessionID = persistentSession?.sessionID else { return false }
+                return persistentHosting.sessionInfo(sessionID)?.isBusy ?? false
+            }
             if usesNativePTYBackend {
                 // The native session leader can be /usr/bin/login, whose child
                 // is the idle shell itself. Counting its children marks every
@@ -2714,7 +3830,11 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func setParentAgentID(_ parentAgentID: UUID?) {
         guard kind == .agent else { return }
+        let changed = self.parentAgentID != parentAgentID
         self.parentAgentID = parentAgentID
+        if changed {
+            persistentStateDidChange?()
+        }
     }
 
     func send(text: String) {
@@ -2726,6 +3846,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if inputDebugEnabled {
             fputs("[send text] \(text.debugDescription)\n", stderr)
         }
+        if routePersistentInput(data) { return }
         if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(data)
             return
@@ -2744,7 +3865,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func sendInputData(_ data: Data, normalize: Bool) {
-        let outboundData = normalize ? normalizedInputData(data) : data
+        // Ghostty's surface encodes the keys it is given for the program's
+        // current modes (kitty flags, application cursor keys), so it gets
+        // the input as sent. Only bytes that reach the program as they are
+        // (the host's `SendInput`, a host-managed PTY) are normalized for
+        // the kitty flags the program set.
+        let toSurface = ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
+            && !persistentInputGoesThroughHost
+        let outboundData = normalize && !toSurface ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
             noteInputBurst(outboundData)
             discardPendingOutputForInterrupt(in: outboundData)
@@ -2753,11 +3881,269 @@ final class TerminalSession: ObservableObject, Identifiable {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
             fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
         }
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
+        if routePersistentInput(outboundData) { return }
+        if toSurface {
             ghosttyBridgeStorage?.sendNativeInput(outboundData)
             return
         }
         shellProcess?.write(outboundData)
+    }
+
+    /// Keys typed into the tab's EXEC surface reach no program now: a
+    /// persistent tab whose attach adapter ended and is being launched
+    /// again (`.reconnecting`, with backoff), or reconnects to its host by
+    /// itself (it discards input meanwhile). The window's key monitor
+    /// (`GhosttyTerminalContainerView`) sends them through the host
+    /// instead, keeping the last screen shown. While the session is created
+    /// the tab shows an in-memory surface, whose keys come to the tab
+    /// anyway (`surfaceInputWithoutProcess`).
+    var keyboardInputGoesThroughHost: Bool {
+        persistentInputGoesThroughHost && persistentPhase != .creating
+    }
+
+    /// `routePersistentInput` takes a persistent tab's input now (queued
+    /// or sent through its host), not its surface.
+    private var persistentInputGoesThroughHost: Bool {
+        guard persistentHosting != nil, isRunning else { return false }
+        switch persistentPhase {
+        case .creating, .reconnecting:
+            return true
+        case .attached:
+            return adapterLiveStatus?.reconnecting == true && persistentSession != nil
+        case .idle:
+            return false
+        }
+    }
+
+    enum ControlInputError: Error, Equatable {
+        /// The tab takes no input now (its program ended or failed to start,
+        /// or an attached session is disconnected): nothing was sent.
+        case notAccepting(state: String)
+        /// A persistent tab's host did not take the input for its program
+        /// (the session ended, the host cannot be reached): nothing was sent.
+        case notDelivered(String)
+        /// The host took only the first part of the input: it went in
+        /// several requests (longer than `HostProtocol.maxInputBytes`), and
+        /// one after the first failed (`HostInputPartiallyDelivered`). The
+        /// first `deliveredBytes` bytes of what was sent reached the
+        /// program. The `unconfirmedBytes` after them (the part that
+        /// failed, when its answer was lost; 0 when the host refused it)
+        /// may or may not have; the rest was not sent. Resending all of it
+        /// would type the first part twice.
+        case partiallyDelivered(deliveredBytes: Int, reason: String, unconfirmedBytes: Int = 0)
+    }
+
+    /// Input on behalf of MCP, as `send(data:)` (`raw` false) or
+    /// `sendRaw(data:)` types it, that says whether it reached the program.
+    /// A persistent tab whose adapter is not known to be attached (it
+    /// reconnects, or was just launched and the host has not reported it
+    /// attached: `adapterPassesSignalsThrough`) sends it through the host's
+    /// control connection and returns once the host took it. One whose
+    /// session is still being created queues it and returns once the host
+    /// took it after the session was created (or the native shell the tab
+    /// fell back to got it). A tab attached to a hosted session sends it
+    /// through its host's control connection too while its adapter is not
+    /// launched yet (a restore) or reconnects by itself (the adapter
+    /// discards what reaches it then). Throws, having sent nothing, when
+    /// the tab cannot take input or the input did not reach the program;
+    /// `partiallyDelivered` when the host typed only a first part of it.
+    func sendControlInput(_ data: Data, raw: Bool) async throws {
+        guard acceptsControlInput else { throw ControlInputError.notAccepting(state: state.label) }
+        if hostedLaunchDeferred, let control = deferredHostControl, let binding = hostedAttachment {
+            if Self.containsCursorModeKeys(data), !hostEncodesCursorKeys, await adapterTakesModeDependentInput() {
+                sendInputData(data, normalize: !raw)
+                return
+            }
+            // A restored attached tab whose adapter waits for its turn: the
+            // host takes the input for its program now.
+            try await sendAttachedInputThroughHost(data, raw: raw, control: control, binding: binding)
+            return
+        }
+        if persistentHosting == nil, isRunning, adapterLiveStatus?.reconnecting == true,
+           let binding = hostedAttachment, let control = attachedHostControl {
+            // An attached tab whose adapter lost its host and reconnects by
+            // itself: it discards input meanwhile (its screen is stale),
+            // so the host takes it for the program, or says it could not.
+            try await sendAttachedInputThroughHost(data, raw: raw, control: control, binding: binding)
+            return
+        }
+        guard let persistentHosting, isRunning else {
+            sendInputData(data, normalize: !raw)
+            return
+        }
+        let throughHost: Bool
+        switch persistentPhase {
+        case .creating:
+            try await queueControlInputUntilCreated(data, raw: raw, hosting: persistentHosting)
+            return
+        case .reconnecting:
+            throughHost = true
+        case .attached:
+            throughHost = !adapterPassesSignalsThrough
+        case .idle:
+            throughHost = false
+        }
+        guard throughHost, let binding = persistentSession else {
+            sendInputData(data, normalize: !raw)
+            return
+        }
+        if Self.containsCursorModeKeys(data), !hostEncodesCursorKeys, await adapterTakesModeDependentInput() {
+            sendInputData(data, normalize: !raw)
+            return
+        }
+        let outboundData = hostTypedInputData(data, raw: raw)
+        guard !outboundData.isEmpty else { return }
+        noteInputBurst(outboundData)
+        discardPendingOutputForInterrupt(in: outboundData)
+        do {
+            try await persistentHosting.sendInput(outboundData, to: binding).value
+        } catch {
+            throw Self.controlInputError(error)
+        }
+    }
+
+    /// How long MCP input with cursor keys waits for the tab's attach
+    /// adapter (`adapterTakesModeDependentInput`) before it goes through
+    /// the host as sent. Only while the host does not report the program's
+    /// cursor key mode (`hostEncodesCursorKeys`).
+    var modeDependentInputAdapterWait: TimeInterval = 3
+
+    /// The program's host reports its application cursor keys mode
+    /// (DECCKM): MCP input the host types has its cursor keys encoded for
+    /// that mode (`hostTypedInputData`), as a surface would, so it need not
+    /// wait for an attach adapter. An older host does not report it.
+    private var hostEncodesCursorKeys: Bool {
+        hostReportedApplicationCursorKeys != nil
+    }
+
+    /// MCP input as the host types it: normalized for the program's kitty
+    /// flags (unless `raw`), and its unmodified arrow, Home and End keys in
+    /// the form the program's cursor key mode takes, when its host reports
+    /// that mode. A surface re-encodes those keys for the mode too
+    /// (`NativeInputTranslator`), raw or not.
+    private func hostTypedInputData(_ data: Data, raw: Bool) -> Data {
+        let outboundData = raw ? data : normalizedInputData(data)
+        guard let application = hostReportedApplicationCursorKeys else { return outboundData }
+        return TerminalInputNormalizer.encodingCursorKeys(outboundData, applicationCursorKeys: application)
+    }
+
+    /// Arrow, Home and End keys without modifiers (`ESC [ A`…, `ESC O A`…):
+    /// how a terminal encodes them depends on the program's application
+    /// cursor keys mode (DECCKM; `less` and `vim` turn it on), which only a
+    /// host of this version reports (`HostedSessionInfo.applicationCursorKeys`).
+    nonisolated static func containsCursorModeKeys(_ data: Data) -> Bool {
+        let bytes = [UInt8](data)
+        var index = 0
+        while index + 2 < bytes.count {
+            if bytes[index] == 0x1B, bytes[index + 1] == 0x5B || bytes[index + 1] == 0x4F,
+               [0x41, 0x42, 0x43, 0x44, 0x46, 0x48].contains(bytes[index + 2]) {
+                return true
+            }
+            index += 1
+        }
+        return false
+    }
+
+    /// Input whose encoding depends on the program's key modes (cursor
+    /// keys) goes through the attach adapter's surface, whose Ghostty
+    /// encodes keys for the modes the program set, as for a tab shown now.
+    /// A restored tab whose adapter waits for its turn launches it now; an
+    /// adapter just launched is waited for until it attached, at most
+    /// `modeDependentInputAdapterWait`. False when no adapter takes the
+    /// input then (it reconnects, or did not attach in time): the host
+    /// types it as sent.
+    private func adapterTakesModeDependentInput() async -> Bool {
+        if isAwaitingDeferredLaunch {
+            launchDeferredAdapterIfNeeded()
+        }
+        let deadline = Date().addingTimeInterval(modeDependentInputAdapterWait)
+        while true {
+            if persistentHosting != nil {
+                guard isRunning, case .attached = persistentPhase else { return false }
+                if adapterPassesSignalsThrough { return true }
+            } else {
+                guard hostedAttachment != nil, isRunning else { return false }
+                if adapterLiveStatus?.followsProgram == true { return true }
+            }
+            if adapterLiveStatus?.reconnecting == true || Date() >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// MCP input for a tab attached to a hosted session, sent through its
+    /// host's control connection; returns once the host took it.
+    private func sendAttachedInputThroughHost(
+        _ data: Data,
+        raw: Bool,
+        control: HostControl,
+        binding: HostedSessionAttachment
+    ) async throws {
+        let outboundData = hostTypedInputData(data, raw: raw)
+        guard !outboundData.isEmpty else { return }
+        noteInputBurst(outboundData)
+        do {
+            try await control.sendInput(binding.sessionID, outboundData, expectedHostID: binding.hostID)
+        } catch {
+            throw Self.controlInputError(error)
+        }
+    }
+
+    /// MCP input while the session is being created: queued with the
+    /// keyboard's, in order, and waited for until it reached the program
+    /// (`PersistentInputDelivery`), at most `queuedInputTimeout`; input
+    /// still queued then is dropped, so what the caller hears is true.
+    private func queueControlInputUntilCreated(_ data: Data, raw: Bool, hosting: PersistentLocalSessions) async throws {
+        let outboundData = raw ? data : normalizedInputData(data)
+        guard !outboundData.isEmpty else { return }
+        noteInputBurst(outboundData)
+        discardPendingOutputForInterrupt(in: outboundData)
+        let delivery = PersistentInputDelivery()
+        pendingPersistentInput.append((outboundData, delivery))
+        let timeout = hosting.configuration.queuedInputTimeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard !delivery.isResolved else { return }
+            if let self {
+                // Sent already (the host's answer resolves it), or still
+                // queued: then it never will be.
+                guard self.pendingPersistentInput.contains(where: { $0.delivery === delivery }) else { return }
+                self.pendingPersistentInput.removeAll { $0.delivery === delivery }
+            }
+            delivery.resolve(.failure(ControlInputError.notDelivered(
+                "its session was not started within \(Int(timeout)) seconds"
+            )))
+        }
+        try await delivery.value()
+    }
+
+    /// Resolves the deliveries of input still queued for a session that
+    /// will not be created (the tab stopped or started again): nothing of
+    /// it was sent.
+    private func dropPendingPersistentInput(because reason: String) {
+        let dropped = pendingPersistentInput
+        pendingPersistentInput.removeAll()
+        for entry in dropped {
+            entry.delivery?.resolve(.failure(ControlInputError.notDelivered(reason)))
+        }
+    }
+
+    private static func inputFailureReason(_ error: Error) -> String {
+        if let error = error as? ControlInputError, case .notDelivered(let reason) = error { return reason }
+        return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+    }
+
+    /// What MCP hears when its input did not (all) reach the program
+    /// through the host: a first part typed (`HostInputPartiallyDelivered`)
+    /// is not "nothing was sent".
+    private static func controlInputError(_ error: Error) -> ControlInputError {
+        if let error = error as? ControlInputError { return error }
+        if let partial = error as? HostInputPartiallyDelivered {
+            return .partiallyDelivered(
+                deliveredBytes: partial.deliveredBytes,
+                reason: partial.failure.errorDescription ?? partial.failure.localizedDescription,
+                unconfirmedBytes: partial.unconfirmedBytes
+            )
+        }
+        return .notDelivered(inputFailureReason(error))
     }
 
     func sendInterrupt() {
@@ -2768,6 +4154,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         noteAgentDraftCleared()
         noteAgentTurnInterrupted()
         processor.discardPendingOutput()
+        if routePersistentInput(Data([0x03])) { return }
         if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
             ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
             return
@@ -2845,6 +4232,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// session's other clients.
     @discardableResult
     func reconnectHostedSession(takeover: Bool = false) -> Bool {
+        if isPersistentLocalSession {
+            return reconnectPersistentAdapterNow(takeover: takeover)
+        }
         guard hostedAttachment != nil, takeover || !isRunning else { return false }
         hostedTakeoverForNextLaunch = takeover
         let relaunched = restart()
@@ -2865,6 +4255,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         switch state {
         case .launching, .live:
             return
+        case .disconnected where isPersistentLocalSession && isRunning:
+            // The program still runs on its host; only its adapter is
+            // reconnecting. Starting it again would end it.
+            reconnectHostedSession()
         case .exited, .failed, .disconnected:
             clearScrollback(preservingTerminalState: false)
             startShell()
@@ -2877,17 +4271,34 @@ final class TerminalSession: ObservableObject, Identifiable {
             .nilIfEmpty
         guard let trimmedTitle else {
             clearExplicitTitle()
+            persistentStateDidChange?()
             return
         }
 
         title = trimmedTitle
         titleSource = .explicit
         bumpRevision()
+        persistentStateDidChange?()
     }
 
-    func stop() {
+    /// `keepingSession`: the tab closes detaching from its program
+    /// (`SessionCloseAction.detach`: a window close or quit that keeps
+    /// sessions running, or a tab close with Settings › Sessions keeping
+    /// them), which keeps running on its host. A persistent tab whose
+    /// Create is still under way then keeps the session it makes too: the
+    /// tab's saved record names it (`launchRequestID`) and brings it back.
+    /// Otherwise (a stop, restart, or a close that ends sessions) that
+    /// session is ended when Create answers.
+    func stop(keepingSession: Bool = false) {
         pendingAutoRestart?.cancel()
         pendingAutoRestart = nil
+        // A restored tab stopped before its adapter launched: it never will.
+        let wasAwaitingAttach = hostedLaunchDeferred
+        hostedLaunchDeferred = false
+        persistentAdapterDeferred = false
+        stopFollowingDeferredHostEvents()
+        finalScreenRead?.cancel()
+        finalScreenRead = nil
         let launchID = activeLaunchID
         activeLaunchID = nil
         auxiliaryProcessingSuspensionTask?.cancel()
@@ -2920,20 +4331,139 @@ final class TerminalSession: ObservableObject, Identifiable {
         let hostedStatus = hostedAttachment != nil && launchID != nil
             ? consumeHostedLaunchStatus(removingAfter: 2) ?? .disconnected(nil)
             : nil
+        if let persistentHosting {
+            // Only the adapter stops: the program keeps running on its host
+            // unless the caller ends the session (`endPersistentSession`).
+            cancelPersistentReconnect()
+            persistentDisappearanceCheck?.cancel()
+            persistentDisappearanceCheck = nil
+            if persistentPhase == .creating {
+                if keepingSession {
+                    // Left running for the tab's saved record, which names
+                    // it by its Create's request id.
+                    persistentLaunchClaim?.keepsSession = true
+                } else {
+                    // The session being created is ended when Create answers.
+                    persistentLaunchRequestID = nil
+                }
+            }
+            persistentPhase = .idle
+            dropPendingPersistentInput(because: "the tab stopped before its session started")
+            _ = consumeHostedLaunchStatus(removingAfter: 2)
+            if let persistentSession {
+                persistentHosting.unbind(self, from: persistentSession.sessionID)
+            }
+        }
         if ghosttyBridgeStorage?.isNativePTYBacked == true {
             // Native-PTY: ghostty owns the PTY and there is no shellProcess to
             // terminate, so signal the whole controlling-terminal session. A
             // server that ignores SIGHUP and moved into its own process group can
             // otherwise survive both the PTY close and a shell-only kill.
-            if let anchorPID = childProcessID
+            // A hosted tab's own process is its attach adapter. Its program
+            // (`hostedProgramProcessID`) is the host's child, which a stop
+            // must never signal; `childProcessID` stays nil for it, and is
+            // only trusted here for a tab that owns its process tree.
+            let ownsProgram = hostedAttachment == nil && !isPersistentLocalSession
+            if let anchorPID = (ownsProgram ? childProcessID : nil)
                 ?? ghosttyBridgeStorage?.nativeSessionLeaderPID() {
                 terminateNativeSession(anchorPID)
             }
+        }
+        if isPersistentLocalSession {
+            // The tab no longer follows the program (it may keep running).
+            hostedProgramProcessID = nil
+            progressReport = nil
+            forgetHostContent()
+        } else if hostedAttachment != nil {
+            hostedProgramProcessID = nil
         }
         shellProcess?.terminate()
         shellProcess = nil
         if let hostedStatus {
             applyHostedStatus(hostedStatus)
+        } else if wasAwaitingAttach {
+            applyHostedStatus(.disconnected(nil))
+        }
+    }
+
+    /// Stops the tab's program (MCP `stop_process`): a native tab's process
+    /// tree, or a persistent tab's host session. The tab then shows its
+    /// program ended cleanly (`exit 0`, exit code 0, `exitedAt` now), as a
+    /// stopped command does, whatever signal ended it: it stopped because
+    /// it was asked to, and starting it again relaunches it. A tab attached
+    /// to a hosted session only disconnects.
+    func stopProgram() {
+        let wasRunning = isRunning
+        stop()
+        endPersistentSession()
+        guard wasRunning, hostedAttachment == nil else { return }
+        switch state {
+        case .exited, .failed:
+            break
+        case .launching, .live, .disconnected:
+            markStoppedOnRequest()
+        }
+    }
+
+    /// The program was stopped on request: a clean exit, reported as one
+    /// (a program that had ended already keeps its exit time).
+    private func markStoppedOnRequest() {
+        state = .exited(0)
+        exitCode = 0
+        exitedAt = exitedAt ?? Date()
+        bumpRevision()
+    }
+
+    /// Ends a persistent tab's host session: Kill, then Remove once it
+    /// exited (bounded; see `PersistentLocalSessions.end`). The tab no
+    /// longer names it. Close intents that terminate call this after
+    /// `stop()`; a tab still creating its session ends it when Create answers.
+    func endPersistentSession() {
+        guard let persistentHosting, let binding = persistentSession else { return }
+        persistentSession = nil
+        persistentLaunchRequestID = nil
+        persistentHosting.end(binding)
+        persistentStateDidChange?()
+    }
+
+    /// The tab closed (after its close action ran): it no longer owns the
+    /// session it names. A session it kept running can then be attached as
+    /// another tab's own, or restored.
+    func persistentTabDidClose() {
+        persistentDisappearanceCheck?.cancel()
+        persistentDisappearanceCheck = nil
+        persistentTabRegistry?.unregister(self)
+        persistentTabRegistry = nil
+        if isRegisteredAsAttachedTab {
+            OpenHostedTabs.shared.unregister(self)
+            isRegisteredAsAttachedTab = false
+        }
+        stopFollowingDeferredHostEvents()
+    }
+
+    /// Ghostty asked to close the surface (after its process exited and a key
+    /// was pressed). A persistent tab's surface belongs to its adapter; its
+    /// program's fate comes from its host, so this never stops it.
+    func nativeSurfaceDidClose() {
+        guard !isPersistentLocalSession else { return }
+        stop()
+    }
+
+    /// A tab attached to a hosted session (not owning it) takes what its
+    /// host reports about the program: its alternate screen and keyboard
+    /// flags until its adapter launches (then only its host's control
+    /// connection, while up, reports them: `hostReportedSessionInfo`),
+    /// and, for a session of This Mac, its pid, which MCP caller
+    /// routing, the pid MCP reports and port detection use while the
+    /// adapter runs. Nothing signals it (`stop()` hangs up only on the
+    /// adapter). Another machine's session never gives a pid.
+    func noteAttachedLocalSession(_ info: HostedSessionInfo) {
+        guard let hostedAttachment, info.id == hostedAttachment.sessionID else { return }
+        attachedSessionInfo = info
+        guard hostedAttachment.host == .local else { return }
+        attachedLocalProgramProcessID = info.isRunning ? info.pid.map { Int32(bitPattern: $0) } : nil
+        if isRunning, hostedAttachmentStatus == .active {
+            hostedProgramProcessID = attachedLocalProgramProcessID
         }
     }
 
@@ -2942,8 +4472,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// not a disconnect: nothing was attached, and its message says why.
     private func applyHostedStatus(_ status: HostedAttachmentStatus) {
         hostedAttachmentStatus = status
+        if status != .active {
+            // Only known while the adapter runs.
+            hostedProgramProcessID = nil
+        }
         switch status {
         case .exited(let code, let signal):
+            // The program is gone; its pid may be reused.
+            attachedLocalProgramProcessID = nil
             let reportedCode = code ?? signal.map { 128 + $0 } ?? 0
             exitCode = reportedCode
             exitedAt = Date()
@@ -2960,12 +4496,88 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
+    /// The ended launch's final outcome (nil when it wrote none); the
+    /// launch's live state is forgotten.
     private func consumeHostedLaunchStatus(removingAfter delay: TimeInterval) -> HostedAttachmentStatus? {
+        stopWatchingAdapterStatus()
         guard let directory = hostedPendingStatusDirectory else { return nil }
         hostedPendingStatusDirectory = nil
         let status = HostedAttachmentStatusFile.read(from: directory)
         HostedAttachmentStatusFile.removeLaunchDirectory(directory, after: delay)
         return status
+    }
+
+    private func stopWatchingAdapterStatus() {
+        adapterStatusWatcher?.cancel()
+        adapterStatusWatcher = nil
+        adapterReconnectingNotice?.cancel()
+        adapterReconnectingNotice = nil
+        if adapterLiveStatus != nil { adapterLiveStatus = nil }
+        if isAdapterReconnecting { isAdapterReconnecting = false }
+    }
+
+    /// Follows the live state the adapter of the launch in `directory`
+    /// writes to its status file.
+    private func watchAdapterStatus(in directory: URL) {
+        stopWatchingAdapterStatus()
+        adapterStatusWatcher = HostedAdapterStatusWatcher(directory: directory) { [weak self] status in
+            self?.adapterLiveStatusDidChange(status, launchDirectory: directory)
+        }
+    }
+
+    /// The running adapter reported a new live state: attached (following
+    /// the program, possibly as a viewport) or reconnecting by itself. The
+    /// adapter keeps its surface either way: nothing is relaunched. A
+    /// persistent tab's reconnects start over once it follows the program,
+    /// and the host's title and directory apply while it reconnects.
+    private func adapterLiveStatusDidChange(_ status: HostedAdapterLiveStatus, launchDirectory: URL) {
+        guard launchDirectory == hostedPendingStatusDirectory, isRunning else { return }
+        let wasFollowing = adapterLiveStatus?.followsProgram ?? false
+        adapterLiveStatus = status
+        if status.reconnecting {
+            scheduleAdapterReconnectingNotice()
+        } else {
+            adapterReconnectingNotice?.cancel()
+            adapterReconnectingNotice = nil
+            if isAdapterReconnecting { isAdapterReconnecting = false }
+        }
+        if let persistentHosting, case .attached = persistentPhase {
+            if status.followsProgram, !wasFollowing {
+                adapterFollowingSince = Date()
+                adapterFollowingControlGeneration = persistentHosting.control.state == .connected
+                    ? persistentHosting.connectionGeneration
+                    : nil
+                surfaceSignalsWhileFollowing.removeAll()
+            }
+            if status.followsProgram {
+                persistentReconnectFailures = 0
+                if case .disconnected = state { state = .live }
+            } else if wasFollowing, let binding = persistentSession,
+                      let info = persistentHosting.sessionInfo(binding.sessionID), info.isRunning {
+                applyHostReportedTitleAndDirectory(of: info, resynchronizing: true)
+            }
+        }
+        bumpRevision()
+    }
+
+    /// Shows that the adapter reconnects once it has for the notice delay.
+    private func scheduleAdapterReconnectingNotice() {
+        guard adapterReconnectingNotice == nil, !isAdapterReconnecting else { return }
+        let delay = persistentHosting?.configuration.adapterReconnectingNoticeDelay ?? Self.adapterReconnectingNoticeDelay
+        let directory = hostedPendingStatusDirectory
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.hostedPendingStatusDirectory == directory,
+                  self.adapterLiveStatus?.reconnecting == true
+            else { return }
+            self.adapterReconnectingNotice = nil
+            self.isAdapterReconnecting = true
+            if self.isPersistentLocalSession, case .attached = self.persistentPhase, case .live = self.state {
+                self.state = .disconnected
+            }
+            self.bumpRevision()
+        }
+        adapterReconnectingNotice = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     func releaseGhosttyBridge() {
@@ -2980,12 +4592,14 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func stopManagedCommand() {
         guard kind == .command else {
-            stop()
+            stopProgram()
             return
         }
 
-        stop()
-        state = .exited(0)
+        stopProgram()
+        if state != .exited(0) || exitCode != 0 {
+            markStoppedOnRequest()
+        }
         let hideCursor = Data("\u{1B}[?25l".utf8)
         renderedReplayCache = nil
         rawOutputStore.append(hideCursor)
@@ -3008,6 +4622,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         restartOnExit = command.autoRestart
         resetAutoRestartPolicy()
         bumpRevision()
+        persistentStateDidChange?()
     }
 
     func resize(columns: Int, rows: Int, forceShellResize: Bool = false) {
@@ -3050,12 +4665,15 @@ final class TerminalSession: ObservableObject, Identifiable {
 #endif
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
+        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
             // Native-PTY: the host owns no byte stream, so the surface IS the
             // source of truth. NOTE: this is rendered text, not raw VT bytes — a
             // deliberate semantic change for native panes (no escape sequences, no
-            // exact byte fidelity).
-            let text = readNativeSurfaceText() ?? ""
+            // exact byte fidelity). A persistent tab whose surface does not
+            // show its program gives the host's screen instead.
+            let text = readsContentFromHost
+                ? nativeContentLines.joined(separator: "\n")
+                : readNativeSurfaceText() ?? ""
             let full = Data(text.utf8)
             if full.count > maxBytes {
                 return (Data(full.suffix(maxBytes)), true)
@@ -3089,6 +4707,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         if let ghosttyBridgeStorage {
             return ghosttyBridgeStorage
         }
+        // A restored tab being shown attaches now, ahead of the restore's
+        // queue: its adapter's surface is the one to show.
+        if launchDeferredAdapterIfNeeded(), let ghosttyBridgeStorage {
+            return ghosttyBridgeStorage
+        }
 
         let bridge = GhosttySessionBridge(session: self)
         ghosttyBridgeStorage = bridge
@@ -3096,10 +4719,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     /// Launch configuration for the Ghostty EXEC surface.
-    private func shellLaunchConfiguration() -> ShellProcessController.Configuration {
+    private func shellLaunchConfiguration(workingDirectory: String? = nil) -> ShellProcessController.Configuration {
         ShellProcessController.Configuration(
             shellPath: ShellProcessController.defaultShellPath,
-            workingDirectory: workingDirectory,
+            workingDirectory: workingDirectory ?? self.workingDirectory,
             projectRoot: projectRoot,
             processID: id.uuidString,
             agentID: kind == .agent ? id.uuidString : nil,
@@ -3113,29 +4736,67 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Native-PTY (EXEC) command + environment for the ghostty surface to spawn,
     /// resolved from the same configuration the host-managed shell uses.
     var nativeExecLaunch: (command: String?, environment: [String: String]) {
-        if let attachment = hostedAttachment {
+        if let attachment = hostedAttachment ?? (isPersistentLocalSession ? persistentSession : nil) {
+            // Pure: the launch was registered with the SSH master (if any)
+            // when it started, so a rebuilt surface keeps the same command.
             return (
-                attachment.execCommand(statusFile: hostedLaunchStatusFile, takeover: hostedLaunchTakesOver),
+                attachment.execCommand(
+                    statusFile: hostedLaunchStatusFile,
+                    takeover: hostedLaunchTakesOver,
+                    sshControlPath: hostedLaunchSSHControlPath
+                ),
                 attachment.adapterEnvironment
             )
+        }
+        if isPersistentLocalSession {
+            // No session yet: a surface is never launched before the session
+            // exists, but must not fall back to a native shell if it were.
+            return ("/usr/bin/true", [:])
         }
         let resolved = ShellProcessController.nativeExecLaunch(for: shellLaunchConfiguration())
         return (resolved.command, resolved.environment)
     }
 
+    /// Where the Ghostty surface starts its process. A hosted or persistent
+    /// tab's surface runs its attach adapter, which needs no directory of
+    /// the program's: a stable one keeps the adapter launchable when the
+    /// program's directory (which the tab follows) is deleted.
+    var nativeSurfaceWorkingDirectory: String {
+        hostedAttachment != nil || isPersistentLocalSession ? NSHomeDirectory() : workingDirectory
+    }
+
+    /// A fresh status file (and SSH master registration) for the next
+    /// adapter launch; the previous launch's directory goes after a delay.
+    private func prepareHostedAdapterLaunch(for attachment: HostedSessionAttachment) {
+        hostedLaunchTakesOver = hostedTakeoverForNextLaunch
+        hostedTakeoverForNextLaunch = false
+        stopWatchingAdapterStatus()
+        if let previous = hostedPendingStatusDirectory {
+            HostedAttachmentStatusFile.removeLaunchDirectory(previous, after: 2)
+        }
+        // Each adapter launch reports through its own fresh status file.
+        hostedPendingStatusDirectory = try? HostedAttachmentStatusFile.makeLaunchDirectory()
+        hostedLaunchStatusFile = hostedPendingStatusDirectory.map(HostedAttachmentStatusFile.statusFileURL(in:))
+        if let directory = hostedPendingStatusDirectory {
+            watchAdapterStatus(in: directory)
+        }
+        // Registered once per launch, here: computing the command again (a
+        // surface rebuild) must neither register it again nor change it.
+        hostedLaunchSSHControlPath = hostedLaunchStatusFile.flatMap { attachment.registerAdapterLaunch(statusFile: $0) }
+    }
+
     private func startShell() {
         let launchID = UUID()
         activeLaunchID = launchID
-        if hostedAttachment != nil {
+        // A restored or adopted session (`persistentSessionToAdopt`, taken
+        // by `startPersistentLaunch`) and an attached one were running
+        // before this launch.
+        startedCurrentProgram = hostedAttachment == nil
+            && (persistentHosting == nil || persistentSessionToAdopt == nil)
+        cancelPersistentReconnect()
+        if let hostedAttachment {
             hostedAttachmentStatus = .active
-            hostedLaunchTakesOver = hostedTakeoverForNextLaunch
-            hostedTakeoverForNextLaunch = false
-            if let previous = hostedPendingStatusDirectory {
-                HostedAttachmentStatusFile.removeLaunchDirectory(previous, after: 2)
-            }
-            // Each adapter launch reports through its own fresh status file.
-            hostedPendingStatusDirectory = try? HostedAttachmentStatusFile.makeLaunchDirectory()
-            hostedLaunchStatusFile = hostedPendingStatusDirectory.map(HostedAttachmentStatusFile.statusFileURL(in:))
+            prepareHostedAdapterLaunch(for: hostedAttachment)
         }
         resetAutomaticTitleForNewAgentLaunch()
         resetKeyboardProtocolState()
@@ -3169,6 +4830,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         latestAttentionObservationEvent = .contentChanged
         agentTurnState = .notStarted
         childProcessID = nil
+        // A session of This Mac's program, while the adapter runs; never
+        // another machine's.
+        hostedProgramProcessID = hostedAttachment?.host == .local ? attachedLocalProgramProcessID : nil
         exitCode = nil
         nixShellEnvironment = nil
         if kind == .agent {
@@ -3182,23 +4846,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
 
         if launchBackend == .nativePTY {
-            // The Ghostty surface is the sole production PTY owner. Reach `.live`
-            // before constructing it so the bridge selects EXEC, then eagerly
-            // create it: background work must start before its tab is opened.
-            shellProcess = nil
-            hostInputWriter.set(nil)
-            childProcessID = nil
-            state = .live
-            bumpRevision()
-            if let bridge = ghosttyBridgeStorage {
-                bridge.relaunchNativeSurface()
+            if let persistentHosting {
+                startPersistentLaunch(launchID, hosting: persistentHosting)
             } else {
-                _ = ghosttyBridge
-            }
-            // A hosted tab's local process is only the attach adapter; the
-            // hosted program has no local PID to report.
-            if hostedAttachment == nil {
-                captureNativeShellIdentity()
+                launchNativeSurface()
             }
             return
         }
@@ -3243,6 +4894,734 @@ final class TerminalSession: ObservableObject, Identifiable {
             processor.appendPlainLines(["launch failed: \(error.localizedDescription)"])
             bumpRevision()
         }
+    }
+
+    /// The Ghostty surface is the sole production PTY owner. Reach `.live`
+    /// before constructing it so the bridge selects EXEC, then eagerly create
+    /// it: background work must start before its tab is opened.
+    private func launchNativeSurface() {
+        shellProcess = nil
+        hostInputWriter.set(nil)
+        childProcessID = nil
+        state = .live
+        bumpRevision()
+        if let bridge = ghosttyBridgeStorage {
+            bridge.relaunchNativeSurface()
+        } else {
+            _ = ghosttyBridge
+        }
+        // A hosted tab's local process is only the attach adapter; the
+        // hosted program has no local PID to report.
+        if hostedAttachment == nil {
+            captureNativeShellIdentity()
+        }
+    }
+
+    // MARK: Persistent local session
+
+    /// Starts the tab's program in the local host: ends the previous session
+    /// (a restart or auto-restart; bounded), creates a new one with the tab's
+    /// launch configuration, or adopts a restored one, then runs its attach
+    /// adapter in the surface. Until then the tab is `.launching` and input
+    /// is queued. When the host cannot start it, the tab runs natively.
+    private func startPersistentLaunch(_ launchID: UUID, hosting: PersistentLocalSessions) {
+        persistentPhase = .creating
+        persistentReconnectFailures = 0
+        persistentReconnectMisses = 0
+        dropPendingPersistentInput(because: "the tab started again before its session existed")
+        shellProcess = nil
+        hostInputWriter.set(nil)
+        childProcessID = nil
+        hostedProgramProcessID = nil
+        progressReport = nil
+        lastHostReportedTitle = nil
+        lastHostReportedDirectory = nil
+        recentSignalDeliveries.removeAll()
+        forgetHostContent()
+        state = .launching
+        bumpRevision()
+
+        let adopted = persistentSessionToAdopt
+        persistentSessionToAdopt = nil
+        if adopted == nil, let bridge = ghosttyBridgeStorage, bridge.isNativePTYBacked {
+            // A restart: the previous adapter's surface shows a program that
+            // is gone, and keys typed into it would reach nothing. Until the
+            // new session's adapter launches, an in-memory surface takes
+            // them, and they are queued for the new program.
+            bridge.relaunchInMemorySurface()
+        }
+        if let adopted, persistentAdapterDeferred {
+            // A restored tab follows its session from now on, before any
+            // other tab or restore could claim it; its adapter waits.
+            bindPersistentSession(adopted, launchID: launchID, hosting: hosting)
+            return
+        }
+        persistentAdapterDeferred = false
+        let previous = persistentSession.flatMap { $0.sessionID == adopted?.attachment.sessionID ? nil : $0 }
+        if let previous {
+            hosting.unbind(sessionID: previous.sessionID)
+        }
+        let request = PersistentSessionRequest(
+            tabID: id,
+            name: title,
+            kind: kind,
+            agentName: agentName,
+            commandName: commandName,
+            projectRoot: projectRoot,
+            columns: viewportSize.columns,
+            rows: viewportSize.rows
+        )
+        if adopted == nil {
+            // Recorded with the tab now, so a relaunch can find the session
+            // this Create starts even if its answer is never saved (the
+            // record's launch request id matches the session's). The save
+            // is not synchronous: the workspace saves a newly added tab on
+            // the next main-loop turn and a restart after its usual delay,
+            // and the store writes in the background, while the Create goes
+            // out only after this launch's awaits below. So the record
+            // usually, not always, lands first. A crash in between leaves
+            // a session no record names; the next restore still finds it
+            // by its `cherry.tab` tag (WorkspaceRestore's `taggedSession`
+            // for a saved tab that restarted, RepositoryWorkspace's orphan
+            // scan for a new tab).
+            persistentLaunchRequestID = request.requestID.uuidString.lowercased()
+            persistentStateDidChange?()
+        }
+        // What the program starts with is decided now, as for a native tab.
+        // The host refuses a directory that no longer exists (the tab's
+        // last one was deleted): the program starts where the tab started,
+        // or in the project, instead.
+        let configuration = shellLaunchConfiguration(
+            workingDirectory: [workingDirectory, launchWorkingDirectory, projectRoot]
+                .compactMap { $0 }
+                .first(where: Self.isExistingDirectory) ?? NSHomeDirectory()
+        )
+        let earlierLaunch = persistentLaunchTask
+        let restartExitTimeout = hosting.configuration.restartExitTimeout
+        let launchKey = UUID()
+        let claim = PersistentLaunchClaim()
+        persistentLaunchClaim = claim
+        defer {
+            if let task = persistentLaunchTask {
+                Self.persistentLaunchesInFlight[launchKey] = (task, claim)
+                Task { @MainActor in
+                    await task.value
+                    Self.persistentLaunchesInFlight[launchKey] = nil
+                }
+            }
+        }
+        persistentLaunchTask = Task { @MainActor [weak self] in
+            let launch: PersistentSessionLaunch
+            do {
+                if let adopted {
+                    launch = adopted
+                } else {
+                    // One launch at a time: an earlier launch of this tab
+                    // still waiting for its program to exit or for its
+                    // Create (a restart pressed twice, or while a Create is
+                    // under way) finishes first, having ended the session
+                    // it no longer needs, so two programs of the tab never
+                    // run at once (a server releases its port). Bounded: a
+                    // host that does not answer delays this launch no more.
+                    if let earlierLaunch {
+                        await Self.wait(
+                            for: earlierLaunch,
+                            upTo: restartExitTimeout * 2 + .seconds(hosting.configuration.creationTimeout)
+                        )
+                    }
+                    if let previous {
+                        await hosting.end(previous, waitingForExitUpTo: restartExitTimeout).value
+                    }
+                    // Stopped, closed or started again while the previous
+                    // program exited: this launch starts nothing.
+                    guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else { return }
+                    self.schedulePersistentCreationDeadline(launchID, hosting: hosting)
+                    launch = try await hosting.create(request, configuration: configuration)
+                }
+            } catch {
+                guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else { return }
+                self.persistentLaunchFailed(error, launchID: launchID)
+                return
+            }
+            guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else {
+                // The tab closed, stopped or started again meanwhile: nothing
+                // will ever show a session created for this launch. A later
+                // launch of the tab waits until it exited. A tab that closed
+                // detaching from its program keeps it: its saved record
+                // names it, and brings it back.
+                if adopted == nil, !claim.keepsSession {
+                    await hosting.end(launch.attachment, waitingForExitUpTo: restartExitTimeout).value
+                }
+                return
+            }
+            self.bindPersistentSession(launch, launchID: launchID, hosting: hosting)
+        }
+    }
+
+    /// What a launch does with the session its Create makes when, by the
+    /// time Create answers, its tab no longer follows it (it closed,
+    /// stopped or started again). Shared with the launch's task, which
+    /// outlives a closed tab.
+    private final class PersistentLaunchClaim {
+        /// The tab closed detaching from its program (`stop(keepingSession:)`):
+        /// the session is left running for the tab's saved record, instead
+        /// of ended.
+        var keepsSession = false
+    }
+
+    /// Every tab's launch still ending a previous session or waiting for
+    /// its Create, closed tabs' included: a Create that answers after its
+    /// tab closed ends the session it made (`startPersistentLaunch`),
+    /// unless the tab closed keeping it.
+    private static var persistentLaunchesInFlight: [UUID: (task: Task<Void, Never>, claim: PersistentLaunchClaim)] = [:]
+
+    /// Waits until every tab's launch under way that will end what its
+    /// Create makes finished (at most `timeout`): quit waits for this, so a
+    /// session created for a tab that closed ending its session (a quit
+    /// that ends sessions, a stop) is ended before the app goes, not left
+    /// running with no tab and no saved record. A launch whose tab closed
+    /// keeping its session (a quit that keeps sessions, the default) is not
+    /// waited for: its session runs on, and the tab's saved record brings
+    /// it back at the next launch.
+    static func waitForPersistentLaunches(upTo timeout: Duration) async {
+        let deadline = ContinuousClock.now + timeout
+        while let (key, entry) = persistentLaunchesInFlight.first(where: { !$0.value.claim.keepsSession }) {
+            let remaining = deadline - ContinuousClock.now
+            guard remaining > .zero else { return }
+            await wait(for: entry.task, upTo: remaining)
+            persistentLaunchesInFlight[key] = nil
+        }
+    }
+
+    /// A session the host has not started within `creationTimeout` (the
+    /// helper, the daemon or the login environment hangs) is not waited for:
+    /// the tab runs its program natively, and a session Create returns later
+    /// is ended.
+    private func schedulePersistentCreationDeadline(_ launchID: UUID, hosting: PersistentLocalSessions) {
+        let timeout = hosting.configuration.creationTimeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self,
+                  self.activeLaunchID == launchID,
+                  self.persistentHosting === hosting,
+                  self.persistentPhase == .creating
+            else { return }
+            self.persistentLaunchFailed(
+                HostedSessionError.unavailable(
+                    "The local session host did not start a session within \(Int(timeout)) seconds."
+                ),
+                launchID: launchID
+            )
+        }
+    }
+
+    private static func isExistingDirectory(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private func bindPersistentSession(
+        _ launch: PersistentSessionLaunch,
+        launchID: UUID,
+        hosting: PersistentLocalSessions
+    ) {
+        let binding = launch.attachment
+        persistentSession = binding
+        if let requestID = PersistentLocalSessions.launchRequestID(of: hosting.sessionInfo(binding.sessionID) ?? launch.info) {
+            persistentLaunchRequestID = requestID
+        }
+        hosting.bind(self, to: binding.sessionID)
+        persistentStateDidChange?()
+        // Input sent while the session was created, in order, before the
+        // adapter attaches. MCP's callers learn whether the host took it;
+        // a failure of the keyboard's is logged (the program ended at once,
+        // or the host could not be reached).
+        let queued = pendingPersistentInput
+        pendingPersistentInput.removeAll()
+        let tabID = id
+        for (data, delivery) in queued {
+            let sent = hosting.sendInput(data, to: binding)
+            Task { @MainActor in
+                switch await sent.result {
+                case .success:
+                    delivery?.resolve(.success(()))
+                case .failure(let error):
+                    let reason = Self.inputFailureReason(error)
+                    if let delivery {
+                        delivery.resolve(.failure(Self.controlInputError(error)))
+                    } else {
+                        fputs("Cherry: input typed into tab \(tabID.uuidString) while its session started did not reach it: \(reason)\n", stderr)
+                    }
+                }
+            }
+        }
+        // Events may have arrived before the binding: the host's list is
+        // current, the Create answer may not be.
+        let latest = hosting.sessionInfo(binding.sessionID) ?? launch.info
+        hostedProgramProcessID = latest.isRunning ? latest.pid.map { Int32(bitPattern: $0) } : nil
+        // A restored or adopted session's program set its title and
+        // directory before this tab followed it.
+        applyHostReportedTitleAndDirectory(of: latest, resynchronizing: true)
+        if persistentAdapterDeferred {
+            guard latest.isRunning else {
+                // It ended while Cherry was closed: no adapter; the tab shows
+                // the host's final screen and its exit.
+                finishPersistentProgram(status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID)
+                return
+            }
+            // Followed through the host (input, screen, title, bells, exit)
+            // as while an adapter reconnects, until the adapter launches.
+            persistentPhase = .reconnecting
+            if case .launching = state {
+                state = .live
+            }
+            bumpRevision()
+            if ghosttyBridgeStorage != nil {
+                // Shown already.
+                launchDeferredAdapterIfNeeded()
+            }
+            return
+        }
+        launchPersistentAdapter(binding)
+        if !latest.isRunning {
+            // It ended already (or a restore found it ended): the adapter
+            // shows its final screen.
+            finishPersistentProgram(status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID)
+        }
+    }
+
+    private func launchPersistentAdapter(_ binding: HostedSessionAttachment) {
+        persistentAdapterDeferred = false
+        prepareHostedAdapterLaunch(for: binding)
+        // Attached from now on for the surface's configuration (the EXEC
+        // backend); the passthrough waits for the adapter to report itself
+        // attached in its status file. Only that report resets the
+        // reconnect failures and shows a disconnected tab live again
+        // (`adapterLiveStatusDidChange`): the app's own `cherry` always
+        // writes it, so an adapter that runs for a while without it (a
+        // daemon that hangs) is no sign that reconnecting worked.
+        persistentPhase = .attached
+        shellProcess = nil
+        hostInputWriter.set(nil)
+        if case .launching = state {
+            state = .live
+        }
+        bumpRevision()
+        if let bridge = ghosttyBridgeStorage {
+            bridge.relaunchNativeSurface()
+        } else {
+            _ = ghosttyBridge
+        }
+    }
+
+    /// The host could not start the program: this tab runs it natively, as
+    /// new tabs do until the host works again (Settings › Sessions says why).
+    private func persistentLaunchFailed(_ error: Error, launchID: UUID) {
+        guard activeLaunchID == launchID else { return }
+        persistentHosting?.noteLaunchFailure(error)
+        fputs("Cherry: tab \(id.uuidString) runs natively; its persistent session could not start: \(error.localizedDescription)\n", stderr)
+        persistentHosting = nil
+        persistentPhase = .idle
+        persistentSession = nil
+        persistentLaunchRequestID = nil
+        let queued = pendingPersistentInput
+        pendingPersistentInput.removeAll()
+        launchNativeSurface()
+        persistentStateDidChange?()
+        for (data, delivery) in queued {
+            guard let bridge = ghosttyBridgeStorage else {
+                delivery?.resolve(.failure(ControlInputError.notDelivered("the tab has no terminal to type into")))
+                continue
+            }
+            bridge.sendNativeInput(data)
+            delivery?.resolve(.success(()))
+        }
+    }
+
+    /// The adapter ended. Its outcome says whether the program did; if not,
+    /// the adapter is launched again (backoff), and after repeated failures
+    /// the tab shows it is disconnected while it keeps trying.
+    private func persistentAdapterDidExit(launchID: UUID) {
+        guard case .attached = persistentPhase,
+              let persistentHosting,
+              let binding = persistentSession
+        else { return }
+        // An adapter that attached did its job: its end (it gave up
+        // reconnecting, say) is a first failure. One that never reported
+        // itself attached failed, however long it ran.
+        let attached = adapterLiveStatus != nil
+        let outcome = consumeHostedLaunchStatus(removingAfter: 0) ?? .disconnected(nil)
+        persistentPhase = .reconnecting
+        if case .exited(let code, let signal) = outcome {
+            finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 0, launchID: launchID)
+            return
+        }
+        // The host's title and directory are the current ones until an
+        // adapter passes them through again.
+        if let info = persistentHosting.sessionInfo(binding.sessionID), info.isRunning {
+            applyHostReportedTitleAndDirectory(of: info, resynchronizing: true)
+        }
+        if attached {
+            persistentReconnectFailures = 0
+        }
+        persistentReconnectFailures += 1
+        if persistentReconnectFailures > persistentHosting.configuration.reconnectAttemptsBeforeDisconnected,
+           case .live = state {
+            state = .disconnected
+            bumpRevision()
+        }
+        schedulePersistentReconnect(launchID: launchID, binding: binding, hosting: persistentHosting, immediately: false)
+    }
+
+    private func schedulePersistentReconnect(
+        launchID: UUID,
+        binding: HostedSessionAttachment,
+        hosting: PersistentLocalSessions,
+        immediately: Bool
+    ) {
+        persistentReconnect?.cancel()
+        let delays = hosting.configuration.reconnectDelay
+        let delay = immediately
+            ? 0
+            : min(delays.initial * pow(2, Double(max(0, persistentReconnectFailures - 1))), delays.maximum)
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLaunchID == launchID,
+                  self.persistentPhase == .reconnecting,
+                  self.persistentSession == binding
+            else { return }
+            self.persistentReconnect = nil
+            switch hosting.programState(of: binding) {
+            case .exited(let status):
+                self.finishPersistentProgram(status: status, launchID: launchID)
+            case .gone:
+                // Seen twice in a row: a daemon that just restarted lists
+                // every session whose holder came back, so it is gone.
+                self.persistentReconnectMisses += 1
+                if self.persistentReconnectMisses >= 2 {
+                    self.finishPersistentProgram(status: 1, launchID: launchID)
+                } else {
+                    self.launchPersistentAdapter(binding)
+                }
+            case .running, .unknown:
+                self.persistentReconnectMisses = 0
+                self.launchPersistentAdapter(binding)
+            }
+        }
+        persistentReconnect = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func cancelPersistentReconnect() {
+        persistentReconnect?.cancel()
+        persistentReconnect = nil
+    }
+
+    /// Reconnect Now, Start on a command whose adapter reconnects, MCP
+    /// `start_process`, or taking the session over from its other clients:
+    /// launch the adapter now. An adapter that runs is replaced only when
+    /// the tab still shows it is disconnected (it has not reported itself
+    /// attached since, or it reconnects by itself) or for a takeover.
+    private func reconnectPersistentAdapterNow(takeover: Bool) -> Bool {
+        guard let persistentHosting,
+              let launchID = activeLaunchID,
+              let binding = persistentSession
+        else { return false }
+        switch persistentPhase {
+        case .reconnecting:
+            hostedTakeoverForNextLaunch = takeover
+            persistentReconnectFailures = 0
+            schedulePersistentReconnect(launchID: launchID, binding: binding, hosting: persistentHosting, immediately: true)
+            return true
+        case .attached:
+            guard takeover || state == .disconnected else { return false }
+            cancelPersistentReconnect()
+            hostedTakeoverForNextLaunch = takeover
+            persistentReconnectFailures = 0
+            launchPersistentAdapter(binding)
+            return true
+        case .idle, .creating:
+            return false
+        }
+    }
+
+    /// The program ended: the same exit handling a native tab gets (agent
+    /// idle/error, command auto-restart, attention). The adapter prints the
+    /// final screen and exits by itself.
+    private func finishPersistentProgram(status: Int32, launchID: UUID) {
+        guard activeLaunchID == launchID else { return }
+        // A restored tab whose adapter never ran: no surface showed the
+        // program, so its final screen comes from the host.
+        let showsHostFinalScreen = persistentAdapterDeferred
+        persistentAdapterDeferred = false
+        cancelPersistentReconnect()
+        persistentPhase = .idle
+        _ = consumeHostedLaunchStatus(removingAfter: 2)
+        if let persistentHosting, let persistentSession {
+            // Nothing more to follow; the tab still names the session, whose
+            // final screen the host keeps until the tab closes or restarts.
+            persistentHosting.unbind(self, from: persistentSession.sessionID)
+        }
+        finishProcessExit(status: status, launchID: launchID, appendsExitNotice: !showsHostFinalScreen)
+        if showsHostFinalScreen, let persistentHosting, let binding = persistentSession {
+            showFinalScreen(of: binding) { try await persistentHosting.screen(of: binding) }
+        }
+    }
+
+    /// The host reported the program exited (`PersistentLocalSessions`).
+    func persistentProgramDidExit(sessionID: String, status: Int32) {
+        guard persistentSession?.sessionID == sessionID,
+              let launchID = activeLaunchID,
+              persistentPhase != .creating
+        else { return }
+        finishPersistentProgram(status: status, launchID: launchID)
+    }
+
+    /// The host changed what it reports about the running program: its pid,
+    /// and its title and directory, which the tab takes from here while its
+    /// adapter does not pass them to its surface.
+    func persistentSessionDidChange(_ info: HostedSessionInfo) {
+        guard persistentSession?.sessionID == info.id, isRunning, persistentPhase != .creating else { return }
+        let pid = info.pid.map { Int32(bitPattern: $0) }
+        if hostedProgramProcessID != pid {
+            hostedProgramProcessID = pid
+        }
+        // What the host reports up to the adapter's attach still applies:
+        // the snapshot the adapter gets carries no title or directory.
+        applyHostReportedTitleAndDirectory(of: info, resynchronizing: false)
+    }
+
+    /// Takes the title and directory the host reports for the program when
+    /// they changed since its last report, unless the attach adapter passes
+    /// them to the surface (which reports them itself, in order with the
+    /// program's output). `resynchronizing`: the tab starts following a
+    /// session whose program set them earlier, or its adapter just ended
+    /// (the host's are the current ones from now on), so they are taken
+    /// whatever was reported before. A directory on another machine (the
+    /// program ran ssh) is ignored, as Ghostty ignores such an OSC 7.
+    private func applyHostReportedTitleAndDirectory(of info: HostedSessionInfo, resynchronizing: Bool) {
+        let passesThrough = !resynchronizing && adapterPassesSignalsThrough
+        var didChange = false
+        if resynchronizing || info.pwd != lastHostReportedDirectory {
+            lastHostReportedDirectory = info.pwd
+            if !passesThrough, let path = info.localWorkingDirectory {
+                if workingDirectory != path {
+                    workingDirectory = path
+                    didChange = true
+                }
+                if restoreShellTitle(from: path) {
+                    didChange = true
+                }
+            }
+        }
+        if resynchronizing || info.title != lastHostReportedTitle {
+            lastHostReportedTitle = info.title
+            if !passesThrough, let title = info.title?.nilIfEmpty {
+                if kind == .agent {
+                    // A title reported earlier is no sign of what the agent
+                    // does now.
+                    didChange = (resynchronizing ? applyAutomaticAgentTitle(from: title) : recordAgentTitleActivity(title)) || didChange
+                } else if systemTitle != title {
+                    updateSystemTitle(title)
+                    didChange = true
+                }
+            }
+        }
+        if didChange { bumpRevision() }
+    }
+
+    /// The attach adapter reports that it is attached and follows the
+    /// program (`adapterLiveStatus`): it passes the program's bells,
+    /// notifications, title and directory through to the surface (Ghostty
+    /// reports them), and takes the program's input.
+    private var adapterPassesSignalsThrough: Bool {
+        guard case .attached = persistentPhase else { return false }
+        return adapterLiveStatus?.followsProgram ?? false
+    }
+
+    /// A bell, notification or progress report the host passed on for the
+    /// program. Bells and notifications take the same path as the surface's
+    /// (unread dot, desktop notification, agent attention), unless the
+    /// attach adapter passes them to the surface; each shows once either
+    /// way. Progress only comes from here.
+    func persistentHostDidSignal(_ signal: PersistentHostSignal) {
+        guard isPersistentLocalSession, persistentSession != nil else { return }
+        switch signal {
+        case .progress(let state, let value):
+            let report: TerminalProgressReport? = state == .remove ? nil : TerminalProgressReport(state: state, value: value)
+            if progressReport != report {
+                progressReport = report
+                bumpRevision()
+            }
+        case .bell:
+            guard hostSignalMissedTheAdapter(key: "bell"),
+                  noteSignalDelivery(key: "bell", fromHost: true, window: Self.bellDeduplicationWindow)
+            else { return }
+            bellHandler(self)
+        case .notification(let title, let body):
+            let key = Self.notificationKey(title: title, body: body)
+            guard hostSignalMissedTheAdapter(key: key),
+                  noteSignalDelivery(key: key, fromHost: true, window: Self.notificationDeduplicationWindow)
+            else { return }
+            handleIncomingNotification(TerminalNotificationRequest(title: title.nilIfEmpty, body: body, source: .osc777))
+            bumpRevision()
+        }
+    }
+
+    /// Whether a bell or notification the host reports did not reach the
+    /// surface: always while the attach adapter does not pass them through.
+    /// While it does, the surface showed it, unless the host kept it while
+    /// no app was subscribed (its daemon was down: the holder, then the new
+    /// daemon, kept it) and hands it to a control connection that came up
+    /// after the adapter started following the program, which it may
+    /// predate: a snapshot replays no bells or notifications. Then it
+    /// counts as missed unless the surface showed the same one since.
+    private func hostSignalMissedTheAdapter(key: String) -> Bool {
+        guard adapterPassesSignalsThrough else { return true }
+        guard let persistentHosting, let since = adapterFollowingSince,
+              Date().timeIntervalSince(since) <= persistentHosting.configuration.pendingSignalLifetime,
+              persistentHosting.connectionGeneration != adapterFollowingControlGeneration
+        else { return false }
+        if let index = surfaceSignalsWhileFollowing.firstIndex(where: { $0.key == key }) {
+            // The surface's copy of this one.
+            surfaceSignalsWhileFollowing.remove(at: index)
+            return false
+        }
+        return true
+    }
+
+    /// A bell or notification the surface showed while its adapter passes
+    /// them through: the host may report it later (see above).
+    private func noteSurfaceSignalWhileFollowing(key: String) {
+        guard isPersistentLocalSession, adapterPassesSignalsThrough, let persistentHosting else { return }
+        let oldest = Date().addingTimeInterval(-persistentHosting.configuration.pendingSignalLifetime)
+        surfaceSignalsWhileFollowing.removeAll { $0.at < oldest }
+        surfaceSignalsWhileFollowing.append((key, Date()))
+        if surfaceSignalsWhileFollowing.count > persistentHosting.configuration.pendingSignalLimit {
+            surfaceSignalsWhileFollowing.removeFirst(
+                surfaceSignalsWhileFollowing.count - persistentHosting.configuration.pendingSignalLimit
+            )
+        }
+    }
+
+    /// Records a bell or notification about to be shown; false when the
+    /// other source (surface or host) showed the same one within `window`.
+    /// Only a persistent tab gets both.
+    private func noteSignalDelivery(key: String, fromHost: Bool, window: TimeInterval) -> Bool {
+        guard isPersistentLocalSession else { return true }
+        let now = Date()
+        recentSignalDeliveries.removeAll { now.timeIntervalSince($0.at) > Self.notificationDeduplicationWindow }
+        if let index = recentSignalDeliveries.firstIndex(where: {
+            $0.key == key && $0.fromHost != fromHost && now.timeIntervalSince($0.at) <= window
+        }) {
+            // That copy is accounted for.
+            recentSignalDeliveries.remove(at: index)
+            return false
+        }
+        recentSignalDeliveries.append((key, fromHost, now))
+        return true
+    }
+
+    private static func notificationKey(title: String?, body: String) -> String {
+        "notification\u{0}\(title ?? "")\u{0}\(body)"
+    }
+
+    /// The host's list no longer has the running program's session, but
+    /// that may be a list taken before its holder registered again with a
+    /// restarted daemon: the tab takes it as gone only when a later list
+    /// agrees (`PersistentLocalSessions.confirmedProgramState`). Until then
+    /// nothing changes: no exit, no auto-restart.
+    func persistentSessionMayHaveDisappeared(sessionID: String) {
+        guard persistentSession?.sessionID == sessionID,
+              let binding = persistentSession,
+              let hosting = persistentHosting,
+              persistentPhase != .creating,
+              persistentDisappearanceCheck == nil
+        else { return }
+        persistentDisappearanceCheck = Task { @MainActor [weak self] in
+            let state = await hosting.confirmedProgramState(of: binding)
+            guard let self, !Task.isCancelled else { return }
+            self.persistentDisappearanceCheck = nil
+            guard self.persistentSession == binding else { return }
+            switch state {
+            case .gone:
+                self.persistentSessionDidDisappear(sessionID: sessionID)
+            case .exited(let status):
+                if let launchID = self.activeLaunchID {
+                    self.finishPersistentProgram(status: status, launchID: launchID)
+                }
+            case .running(let info):
+                self.persistentSessionDidChange(info)
+            case .unknown:
+                // The host cannot be listed now; the adapter's reconnects
+                // decide (a session missing twice in a row is gone).
+                break
+            }
+        }
+    }
+
+    /// The host no longer has the session. A running program is gone with it
+    /// (a session is removed only after it exited).
+    func persistentSessionDidDisappear(sessionID: String) {
+        guard persistentSession?.sessionID == sessionID, persistentPhase != .creating else { return }
+        persistentHosting?.unbind(sessionID: sessionID)
+        if let launchID = activeLaunchID {
+            finishPersistentProgram(status: exitCode ?? 1, launchID: launchID)
+        }
+        persistentSession = nil
+        persistentLaunchRequestID = nil
+        persistentStateDidChange?()
+    }
+
+    /// Input for a persistent tab whose adapter is not attached: queued
+    /// while its session is created, then sent through the host's control
+    /// connection. False when the surface takes it.
+    private func routePersistentInput(_ data: Data) -> Bool {
+        guard let persistentHosting, isRunning, !data.isEmpty else { return false }
+        switch persistentPhase {
+        case .creating:
+            queueKeyboardInputUntilCreated(data)
+            return true
+        case .reconnecting:
+            guard let binding = persistentSession else { return false }
+            persistentHosting.sendInput(data, to: binding)
+            return true
+        case .attached:
+            // An adapter that reconnects by itself does not reach the
+            // program meanwhile; the host does.
+            guard adapterLiveStatus?.reconnecting == true, let binding = persistentSession else { return false }
+            persistentHosting.sendInput(data, to: binding)
+            return true
+        case .idle:
+            return false
+        }
+    }
+
+    /// The most keyboard input a tab queues while its session is created
+    /// or restarted (typed or pasted; MCP's has its own bound): more is
+    /// dropped, and the program gets what came first.
+    static let maxQueuedKeyboardInputBytes = 64 * 1_024
+
+    /// Keys typed (or pasted) while the session is created: queued, in
+    /// order with MCP's input, for the program once the session exists.
+    private func queueKeyboardInputUntilCreated(_ data: Data) {
+        let queued = pendingPersistentInput.reduce(0) { $0 + ($1.delivery == nil ? $1.data.count : 0) }
+        guard queued + data.count <= Self.maxQueuedKeyboardInputBytes else {
+            if queued < Self.maxQueuedKeyboardInputBytes {
+                fputs("Cherry: tab \(id.uuidString) queues no more than \(Self.maxQueuedKeyboardInputBytes) bytes of input while its session starts; the rest was dropped.\n", stderr)
+            }
+            return
+        }
+        pendingPersistentInput.append((data, nil))
+    }
+
+    /// Input the tab's in-memory surface encoded (Ghostty's keyboard
+    /// encoding) while no process takes it: a persistent tab shows one
+    /// while its session is created or restarted. The keys go to its
+    /// program (queued until the session exists); any other tab without a
+    /// process drops them, as before.
+    private func surfaceInputWithoutProcess(_ data: Data) {
+        guard isPersistentLocalSession, isRunning, !data.isEmpty else { return }
+        _ = routePersistentInput(data)
     }
 
     private func resetAutomaticTitleForNewAgentLaunch() {
@@ -3290,13 +5669,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func finishProcessExit(status: Int32, launchID: UUID) {
+    /// `appendsExitNotice`: a terminal's exit line follows the output; false
+    /// when the final screen is still to come (read from the host), which
+    /// then adds it.
+    private func finishProcessExit(status: Int32, launchID: UUID, appendsExitNotice: Bool = true) {
         guard activeLaunchID == launchID else { return }
 
         activeLaunchID = nil
         hostInputWriter.set(nil)
         shellProcess = nil
         childProcessID = nil
+        hostedProgramProcessID = nil
+        progressReport = nil
         exitCode = status
         nixShellEnvironment = nil
         exitedAt = Date()
@@ -3326,7 +5710,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             if kind == .command, restartOnExit {
                 scheduleAutoRestartAfterExit()
             }
-        } else {
+        } else if appendsExitNotice {
             processor.appendPlainLines([
                 "",
                 "[shell exited with status \(status)]"
@@ -3334,6 +5718,156 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         scheduleAttentionObservation(event: .processExited)
         bumpRevision()
+    }
+
+    // MARK: Restored tabs (deferred attach)
+
+    /// "Session ended (exit N)" for a persistent terminal or agent whose
+    /// program ended while its session (and final screen) is still on the
+    /// host; nil otherwise. Closing the tab removes that session.
+    var persistentSessionEndedMessage: String? {
+        guard isPersistentLocalSession, kind != .command, !isRunning, persistentSession != nil,
+              case .exited(let status) = state
+        else { return nil }
+        return HostedAttachmentStatus.exited(code: status, signal: nil).summary
+    }
+
+    /// Whether this restored tab's attach adapter is still to be launched
+    /// (`launchDeferredAdapterIfNeeded`).
+    var isAwaitingDeferredLaunch: Bool {
+        hostedLaunchDeferred || (persistentAdapterDeferred && isRunning && persistentPhase == .reconnecting)
+    }
+
+    /// Launches the attach adapter a restore deferred: an attached tab
+    /// attaches, a persistent tab whose program runs attaches its adapter.
+    /// True when something was launched; false when nothing was deferred
+    /// (or the program ended, or the tab stopped, meanwhile).
+    @discardableResult
+    func launchDeferredAdapterIfNeeded() -> Bool {
+        if hostedLaunchDeferred {
+            hostedLaunchDeferred = false
+            stopFollowingDeferredHostEvents()
+            startShell()
+            return true
+        }
+        guard persistentAdapterDeferred else { return false }
+        guard isRunning, persistentPhase == .reconnecting, let binding = persistentSession else {
+            persistentAdapterDeferred = false
+            return false
+        }
+        cancelPersistentReconnect()
+        launchPersistentAdapter(binding)
+        return true
+    }
+
+    /// While its launch is deferred, an attached tab follows its session's
+    /// events from `control` (its host's control connection, kept up
+    /// meanwhile): the program's title, bells, notifications and exit. Its
+    /// adapter passes them through once it runs.
+    func followDeferredHostEvents(from control: HostControl) {
+        guard hostedLaunchDeferred, let hostedAttachment else { return }
+        stopFollowingDeferredHostEvents()
+        let sessionID = hostedAttachment.sessionID
+        deferredHostLease = control.retain()
+        deferredHostControl = control
+        // HostControl publishes on the main actor.
+        deferredHostEvents = control.events.sink { [weak self, weak control] event in
+            MainActor.assumeIsolated {
+                guard let self, event.sessionID == sessionID else { return }
+                self.handleDeferredHostEvent(event, control: control)
+            }
+        }
+    }
+
+    private func stopFollowingDeferredHostEvents() {
+        deferredHostEvents?.cancel()
+        deferredHostEvents = nil
+        deferredHostControl = nil
+        deferredHostLease?.release()
+        deferredHostLease = nil
+    }
+
+    private func handleDeferredHostEvent(_ event: HostSessionEvent, control: HostControl?) {
+        guard hostedLaunchDeferred else { return }
+        switch event {
+        case .exited(_, let exitCode, let signal):
+            showEndedHostedSession(exitCode: Int32(clamping: exitCode), signal: signal, control: control)
+        case .added(let info), .changed(let info):
+            guard info.isRunning else {
+                showEndedHostedSession(
+                    exitCode: info.exitCode.map { Int32(clamping: $0) },
+                    signal: info.exitSignal,
+                    control: control
+                )
+                return
+            }
+            noteAttachedLocalSession(info)
+            if let title = info.title?.nilIfEmpty {
+                ingestNativeTitle(title)
+            }
+        case .removed:
+            // Removed, or missing from a list taken before a restarted
+            // daemon heard from its holder again: the adapter finds out.
+            launchDeferredAdapterIfNeeded()
+        case .bell:
+            bellHandler(self)
+        case .notification(_, let title, let body):
+            handleIncomingNotification(TerminalNotificationRequest(title: title.nilIfEmpty, body: body, source: .osc777))
+            bumpRevision()
+        case .progress, .resync:
+            break
+        }
+    }
+
+    /// An attached tab whose session ended before its adapter attached (a
+    /// restore found it ended, or it ended while the tab waited): no
+    /// adapter; the tab shows "Session ended" with the host's final screen,
+    /// read through `control` when given.
+    func showEndedHostedSession(exitCode: Int32?, signal: Int32?, control: HostControl?) {
+        guard let hostedAttachment, !isRunning else { return }
+        hostedLaunchDeferred = false
+        stopFollowingDeferredHostEvents()
+        hostedProgramProcessID = nil
+        attachedLocalProgramProcessID = nil
+        applyHostedStatus(.exited(code: exitCode, signal: signal))
+        guard let control else { return }
+        showFinalScreen(of: hostedAttachment) {
+            try await control.screen(
+                hostedAttachment.sessionID, scrollback: true, expectedHostID: hostedAttachment.hostID
+            )
+        }
+    }
+
+    /// Reads an ended program's final screen (with its history) from its
+    /// host into the tab's lines, which the in-memory surface and MCP show
+    /// while no adapter does. Dropped if the tab starts again first.
+    private func showFinalScreen(
+        of binding: HostedSessionAttachment,
+        read: @escaping @MainActor () async throws -> HostScreenText
+    ) {
+        finalScreenRead?.cancel()
+        finalScreenRead = Task { @MainActor [weak self] in
+            let screen = try? await read()
+            guard let self, !Task.isCancelled else { return }
+            self.finalScreenRead = nil
+            guard !self.isRunning, self.hostedSessionBinding == binding else { return }
+            var lines = screen.map { $0.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) } ?? []
+            while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+                lines.removeLast()
+            }
+            if self.kind == .terminal, case .exited(let status) = self.state {
+                lines += ["", "[shell exited with status \(status)]"]
+            }
+            guard !lines.isEmpty else { return }
+            let data = Data(lines.joined(separator: "\r\n").utf8)
+            self.renderedReplayCache = nil
+            self.rawOutputStore.append(data)
+            self.processor.ingestTestingData(data)
+            self.outputVersion &+= 1
+            self.contentVersion &+= 1
+            self.lastContentChangeAt = Date()
+            self.bumpRevision()
+        }
     }
 
     private func pauseOutputForInteractionIfNeeded() {
@@ -3543,7 +6077,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
 
             case .keyboardProtocolPush(let flags):
-                keyboardProtocolFlagStack.append(keyboardProtocolFlags)
+                keyboardProtocolFlagStack.append(streamKeyboardProtocolFlags)
                 applyKeyboardProtocolFlags(flags)
 
             case .keyboardProtocolPop(let count):
@@ -3612,8 +6146,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestNativeWorkingDirectory(_ path: String) {
-        // Host paths must never become input to local filesystem/project APIs.
-        guard hostedAttachment == nil else { return }
+        // Another machine's paths must never become input to local
+        // filesystem/project APIs. A session on This Mac (a persistent tab,
+        // or one attached to a local session) reports local directories.
+        guard reportsLocalWorkingDirectory else { return }
         var didChange = false
         if workingDirectory != path {
             workingDirectory = path
@@ -3626,13 +6162,29 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func ingestNativeNotification(title: String?, body: String) {
+        // A persistent tab's host may have shown this one already.
+        let key = Self.notificationKey(title: title, body: body)
+        guard noteSignalDelivery(key: key, fromHost: false, window: Self.notificationDeduplicationWindow) else { return }
+        noteSurfaceSignalWhileFollowing(key: key)
         let notification = TerminalNotificationRequest(title: title, body: body, source: .osc777)
         handleIncomingNotification(notification)
         bumpRevision()
     }
 
+    /// Ghostty rang the terminal bell (BEL).
+    func ingestNativeBell() {
+        guard noteSignalDelivery(key: "bell", fromHost: false, window: Self.bellDeduplicationWindow) else { return }
+        noteSurfaceSignalWhileFollowing(key: "bell")
+        bellHandler(self)
+    }
+
     func ingestNativeChildExit(exitCode: Int32) {
         guard let launchID = activeLaunchID else { return }
+        if isPersistentLocalSession {
+            // The surface's process is the attach adapter, not the program.
+            persistentAdapterDidExit(launchID: launchID)
+            return
+        }
         finishProcessExit(status: exitCode, launchID: launchID)
     }
 
@@ -3684,6 +6236,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentLineCount() -> Int {
+        if readsContentFromHost {
+            // Read from the host by `refreshContentFromHostIfNeeded`.
+            return nativeContentLines.count
+        }
         guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
             return processor.lineCount
         }
@@ -3692,10 +6248,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
+        if readsContentFromHost {
+            return nativeContentSnapshot(range: range)
+        }
         guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
             return processor.snapshot(range: range)
         }
         ensureNativeContentFresh()
+        return nativeContentSnapshot(range: range)
+    }
+
+    private func nativeContentSnapshot(range: Range<Int>) -> [String] {
         guard !nativeContentLines.isEmpty else { return [] }
         let clamped = range.clamped(to: 0..<nativeContentLines.count)
         return Array(nativeContentLines[clamped])
@@ -3716,7 +6279,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce) { [weak self] in
             guard let self else { return }
             self.nativeContentRefreshScheduled = false
-            self.refreshNativeContentNow()
+            if self.readsContentFromHost {
+                // Rendering needs the host's last lines no more often.
+                let maximumAge = self.hostContentPollInterval
+                Task { @MainActor [weak self] in
+                    await self?.refreshContentFromHostIfNeeded(maximumAge: maximumAge, recentOnly: true)
+                }
+            } else {
+                self.refreshNativeContentNow()
+            }
         }
     }
 
@@ -3738,6 +6309,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
         guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return false }
+        // The surface does not show the program now; its text comes from
+        // the host (`refreshContentFromHostIfNeeded`).
+        guard !readsContentFromHost else { return false }
         // recordAgentActivitySignal below re-enters this function through
         // contentSnapshot → ensureNativeContentFresh. Without
         // this guard, a session whose screen changes faster than one scan pass
@@ -3748,6 +6322,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         defer { isRefreshingNativeContent = false }
         guard let text = readNativeSurfaceText() else { return false }
         lastNativeContentReadAt = Date()
+        return replaceNativeContent(with: text)
+    }
+
+    /// Takes `text` as the tab's lines; when it changed, advances the output
+    /// and content counters and runs the agent activity hooks.
+    @discardableResult
+    private func replaceNativeContent(with text: String) -> Bool {
         var hasher = Hasher()
         hasher.combine(text)
         let hash = hasher.finalize()
@@ -3770,6 +6351,266 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         bumpRevision()
         return true
+    }
+
+    // MARK: - Content read from the host (persistent tabs)
+    //
+    // A persistent tab's surface runs its attach adapter. Until that adapter
+    // reports itself attached, while it reconnects (by itself, or relaunched
+    // by the tab), and while it shows only a viewport of a session another
+    // client made larger, the surface does not show the program's whole
+    // screen (`adapterLiveStatus`). The data layer (MCP output, search, idle
+    // waits, agent activity) then reads the host's screen into the same line
+    // model: the whole history when a caller needs it, only the last lines
+    // for loops that watch the screen.
+
+    /// Whether the tab's lines come from its host now (see above).
+    var readsContentFromHost: Bool {
+        guard persistentHosting != nil, persistentSession != nil, !usesInjectedTestingContent else { return false }
+        switch persistentPhase {
+        case .reconnecting:
+            return true
+        case .attached:
+            return !(adapterLiveStatus?.showsWholeScreen ?? false)
+        case .creating, .idle:
+            return false
+        }
+    }
+
+    /// How old the host's screen may be for a loop that watches this tab's
+    /// lines (idle waits, agent input readiness, render signals): reads are
+    /// not made more often than this.
+    var hostContentPollInterval: TimeInterval {
+        persistentHosting?.configuration.hostScreenPollInterval ?? 1
+    }
+
+    /// Reads the program's screen from the host when the tab's lines come
+    /// from there (`readsContentFromHost`) and the last read is older than
+    /// `maximumAge` (default `hostScreenReuseInterval`). Waits for the answer
+    /// at most `hostScreenWait`; a later answer still applies. MCP output,
+    /// status, search and idle waits call this before they read the tab's
+    /// lines.
+    ///
+    /// `recentOnly`: the caller looks at the last lines only (a loop that
+    /// watches the screen for new output or agent activity): only the last
+    /// `hostScreenRecentLines` are read, and the tab's lines may then hold
+    /// just those (with their line numbers from the first of them) until a
+    /// caller that needs the whole history reads again. Whether anything
+    /// changed is decided on the last lines either way, so switching between
+    /// the two reads alone never looks like new output.
+    func refreshContentFromHostIfNeeded(maximumAge: TimeInterval? = nil, recentOnly: Bool = false) async {
+        guard readsContentFromHost, let persistentHosting, let binding = persistentSession else { return }
+        let configuration = persistentHosting.configuration
+        let read: Task<Void, Never>
+        if let hostContentRead, hostContentReadIsWhole || recentOnly {
+            read = hostContentRead
+        } else {
+            // A read of the whole history is as recent as the last read
+            // only while the lines still hold that history.
+            let lastRead = recentOnly || hostContentHasHistory ? hostContentReadAt : nil
+            if hostContentRead == nil, let lastRead,
+               Date().timeIntervalSince(lastRead) < maximumAge ?? configuration.hostScreenReuseInterval {
+                return
+            }
+            // Supersedes a read of the recent lines under way.
+            hostContentReadGeneration &+= 1
+            let generation = hostContentReadGeneration
+            let maxLines = recentOnly ? max(1, configuration.hostScreenRecentLines) : nil
+            read = Task { @MainActor [weak self] in
+                let screen = try? await persistentHosting.screen(of: binding, maxLines: maxLines)
+                guard let self, self.hostContentReadGeneration == generation else { return }
+                self.hostContentRead = nil
+                guard let screen, self.persistentSession == binding, self.readsContentFromHost else { return }
+                self.applyHostContent(screen, recentLines: maxLines)
+            }
+            hostContentRead = read
+            hostContentReadIsWhole = !recentOnly
+        }
+        await Self.wait(for: read, upTo: configuration.hostScreenWait)
+    }
+
+    /// Takes a screen read from the host as the tab's lines. `recentLines`:
+    /// the read asked for only that many last lines (a host without the
+    /// limit sends them all, as does one whose history is shorter).
+    private func applyHostContent(_ screen: HostScreenText, recentLines: Int?) {
+        hostContentReadAt = Date()
+        if hostContentUsesAlternateScreen != screen.alternateScreen {
+            hostContentUsesAlternateScreen = screen.alternateScreen
+        }
+        let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let hasHistory = recentLines.map { lines.count < $0 } ?? true
+        let tailKey = Self.hostContentChangeKey(
+            lines, recentLines: persistentHosting?.configuration.hostScreenRecentLines ?? recentLines ?? lines.count
+        )
+        let changed = tailKey != hostContentTailKey
+        hostContentTailKey = tailKey
+        // A read of recent lines that shows nothing new keeps the history.
+        guard changed || hasHistory else { return }
+        hostContentHasHistory = hasHistory
+        if changed {
+            replaceNativeContent(with: screen.text)
+        } else {
+            // The same last lines, now with the history above them.
+            nativeContentLines = lines
+            var hasher = Hasher()
+            hasher.combine(screen.text)
+            nativeContentHash = hasher.finalize()
+        }
+    }
+
+    /// What identifies the last lines of a screen read from the host,
+    /// whether the read had the whole history or its last `recentLines`
+    /// lines: the last half of those, from the last line with text. Half,
+    /// so a host that counts a line more or less at either end gives the
+    /// same key; still more than a screen holds, so any change on screen
+    /// changes it.
+    static func hostContentChangeKey(_ lines: [String], recentLines: Int) -> Int {
+        var end = lines.count
+        while end > 0, lines[end - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+            end -= 1
+        }
+        let count = max(1, recentLines / 2)
+        var hasher = Hasher()
+        for line in lines[max(0, end - count)..<end] {
+            hasher.combine(line)
+        }
+        hasher.combine(end > 0)
+        return hasher.finalize()
+    }
+
+    /// The host's screen is no longer this tab's: the next read takes the
+    /// surface's (or the next session's) text.
+    private func forgetHostContent() {
+        // A read under way no longer applies.
+        hostContentReadGeneration &+= 1
+        hostContentRead?.cancel()
+        hostContentRead = nil
+        hostContentReadAt = nil
+        hostContentUsesAlternateScreen = false
+        hostContentHasHistory = false
+        hostContentTailKey = nil
+        lastNativeContentReadAt = nil
+    }
+
+    // MARK: - The program's screen before MCP types into it
+
+    /// The last lines of what the program shows now, for a caller about to
+    /// type into it (MCP input to an agent, which must never answer a
+    /// permission prompt it cannot see): the surface's text while a surface
+    /// shows the program, else its host's screen (`Screen`), read now. A
+    /// surface that shows nothing yet (a restored tab whose adapter has not
+    /// drawn the program) is not taken as the program's screen. Empty while
+    /// a persistent tab's session is still being created (no program yet).
+    /// Nil when the screen cannot be known: its host did not answer.
+    func programScreenLinesForInput() async -> [String]? {
+        let limit = AgentPermissionPrompt.tailLineLimit * 2
+        if persistentHosting != nil, persistentPhase == .creating {
+            return []
+        }
+        if readsContentFromHost {
+            let started = Date()
+            await refreshContentFromHostIfNeeded(maximumAge: 0, recentOnly: true)
+            guard let readAt = hostContentReadAt, readAt >= started else { return nil }
+            return Array(AgentPermissionPrompt.tail(of: nativeContentLines).suffix(limit))
+        }
+        if let read = hostScreenReaderWhileNoSurfaceShowsProgram() {
+            return await Self.readHostScreenLines(read, limit: limit, timeout: hostScreenWaitForInput)
+        }
+        let count = contentLineCount()
+        let lines = Array(AgentPermissionPrompt.tail(of: contentSnapshot(range: max(0, count - 600)..<count)).suffix(limit))
+        if lines.isEmpty, let read = hostScreenReader() {
+            // Nothing drawn yet: the host knows what the program shows.
+            return await Self.readHostScreenLines(read, limit: limit, timeout: hostScreenWaitForInput)
+        }
+        return lines
+    }
+
+    /// The last lines the tab holds now, without reading the surface or the
+    /// host again (for listings that look at many tabs).
+    var cachedScreenTailLines: [String] {
+        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+            return Array(AgentPermissionPrompt.tail(of: nativeContentLines))
+        }
+        let count = processor.lineCount
+        return Array(AgentPermissionPrompt.tail(of: processor.snapshot(range: max(0, count - 200)..<count)))
+    }
+
+    private var hostScreenWaitForInput: Duration {
+        persistentHosting?.configuration.hostScreenWait ?? .seconds(2)
+    }
+
+    /// Reads the program's screen from its host for a tab attached to a
+    /// hosted session whose surface does not show the program now: its
+    /// adapter waits for its turn (a restore), has not attached yet, or
+    /// reconnects by itself. Nil when a surface shows it (or there is no
+    /// host to ask).
+    private func hostScreenReaderWhileNoSurfaceShowsProgram() -> (@MainActor () async throws -> HostScreenText)? {
+        guard let hostedAttachment else { return nil }
+        if hostedLaunchDeferred {
+            guard let control = deferredHostControl else { return nil }
+            return { [sessionID = hostedAttachment.sessionID, hostID = hostedAttachment.hostID] in
+                try await control.screen(sessionID, scrollback: true, maxLines: 200, expectedHostID: hostID)
+            }
+        }
+        guard isRunning, !(adapterLiveStatus?.showsWholeScreen ?? false) else { return nil }
+        return hostScreenReader()
+    }
+
+    /// Reads the screen of the hosted session the tab shows from its host.
+    private func hostScreenReader() -> (@MainActor () async throws -> HostScreenText)? {
+        if let persistentHosting, let binding = persistentSession {
+            return { try await persistentHosting.screen(of: binding, maxLines: 200) }
+        }
+        guard let hostedAttachment, let control = attachedHostControl else { return nil }
+        return { [sessionID = hostedAttachment.sessionID, hostID = hostedAttachment.hostID] in
+            try await control.screen(sessionID, scrollback: true, maxLines: 200, expectedHostID: hostID)
+        }
+    }
+
+    private static func readHostScreenLines(
+        _ read: @escaping @MainActor () async throws -> HostScreenText,
+        limit: Int,
+        timeout: Duration
+    ) async -> [String]? {
+        let result = HostScreenReadResult()
+        let task = Task { @MainActor in
+            result.screen = try? await read()
+        }
+        await wait(for: task, upTo: timeout)
+        guard let screen = result.screen else { return nil }
+        let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        return Array(AgentPermissionPrompt.tail(of: lines).suffix(limit))
+    }
+
+    @MainActor
+    private final class HostScreenReadResult {
+        var screen: HostScreenText?
+    }
+
+    /// Waits for `task`, or until `timeout` passed, whichever comes first.
+    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
+        let waiter = FirstResume()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiter.continuation = continuation
+            Task { @MainActor in
+                await task.value
+                waiter.resume()
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: timeout)
+                waiter.resume()
+            }
+        }
+    }
+
+    @MainActor
+    private final class FirstResume {
+        var continuation: CheckedContinuation<Void, Never>?
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
     }
 
     @discardableResult
@@ -4771,9 +7612,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func applyKeyboardProtocolFlags(_ flags: Int) {
-        keyboardProtocolFlags = flags
-        isEnhancedKeyboardProtocolActive = keyboardProtocolFlags > 0
-        hostInputWriter.setKeyboardProtocolFlags(keyboardProtocolFlags)
+        streamKeyboardProtocolFlags = flags
+        hostInputWriter.setKeyboardProtocolFlags(flags)
     }
 
     private func resetKeyboardProtocolState() {
@@ -4821,9 +7661,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func keyboardProtocolFlagsByApplying(flags: Int, mode: Int) -> Int {
         switch mode {
         case 2:
-            keyboardProtocolFlags | flags
+            streamKeyboardProtocolFlags | flags
         case 3:
-            keyboardProtocolFlags & ~flags
+            streamKeyboardProtocolFlags & ~flags
         default:
             flags
         }

@@ -5,6 +5,7 @@ import UserNotifications
 
 final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var openDefaultProjectWindow: (@MainActor @Sendable () -> Void)?
+    var openProjectWindow: (@MainActor @Sendable (String) -> Void)?
     private var isQuitConfirmed = false
     private var didScheduleInitialWindowOpen = false
 
@@ -17,12 +18,39 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             NSApp.applicationIconImage = icon
         }
         TerminalNotificationCenter.shared.configure(delegate: self)
+        MainActor.assumeIsolated {
+            Self.startLaunchHousekeeping()
+        }
+        // Reach the local session host now, in the background, so the first
+        // persistent tabs do not wait for its helper, login environment and
+        // daemon to start.
+        MainActor.assumeIsolated {
+            SessionBackendPolicy.userSettings.persistentHostingForNewTab()?.warmUp()
+        }
 
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
             self.scheduleDefaultWindowOpenIfNeeded()
         }
+    }
+
+    /// Launch work that never holds up the first window: stops the SSH
+    /// masters that app runs which ended (a crash, a kill) left logged in
+    /// to their servers (`HostSSHMasterManager.sweepAbandonedMasters`,
+    /// which does its work in the background), whether or not this run
+    /// ever uses SSH or persistent sessions; and tells the user, on the
+    /// first project window, when this copy leaves the persistent sessions
+    /// and saved tabs alone because another copy holds the instance lock
+    /// (`InstanceLockNotice`). The parameters are for tests.
+    @MainActor
+    static func startLaunchHousekeeping(
+        registry: ProjectWindowRegistry = .shared,
+        sweepSSHMasters: () -> Void = { HostSSHMasterManager.sweepAbandonedMasters() },
+        instanceLockNotice: InstanceLockNotice? = nil
+    ) {
+        sweepSSHMasters()
+        registry.installInstanceLockNotice(instanceLockNotice ?? .app(registry: registry))
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows _: Bool) -> Bool {
@@ -62,12 +90,34 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         guard !isQuitConfirmed else { return .terminateNow }
 
-        let runningCount = MainActor.assumeIsolated {
-            ProjectWindowRegistry.shared.runningProcessCount()
+        // Save every window's tabs and the open windows before anything is
+        // torn down: the teardown saves nothing.
+        MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.flushWorkspacePersistence()
+        }
+
+        // What quitting ends: native tabs' processes, and persistent tabs'
+        // sessions only with Settings › Sessions › End sessions when quitting
+        // (otherwise they keep running and come back at the next launch).
+        let (runningCount, endedSessionCount) = MainActor.assumeIsolated {
+            (
+                ProjectWindowRegistry.shared.runningProcessCount(endingWith: .appQuit),
+                ProjectWindowRegistry.shared.persistentSessionCountEndedByQuit()
+            )
         }
         // Nothing running: quit immediately. Idle shells exit on the SIGHUP they
         // receive when Cherry dies, so there's nothing to confirm — like ghostty.
-        guard runningCount > 0 else { return .terminateNow }
+        guard runningCount > 0 else {
+            guard endedSessionCount > 0 else {
+                MainActor.assumeIsolated {
+                    ProjectWindowRegistry.shared.prepareForTermination()
+                }
+                return .terminateNow
+            }
+            // Idle persistent sessions that quitting ends: end them, then quit.
+            finishQuit()
+            return .terminateLater
+        }
 
         let alert = NSAlert()
         alert.messageText = "Quit Cherry?"
@@ -78,37 +128,136 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
 
-        let window = sender.keyWindow ?? sender.windows.first
+        // The sheet goes on a project window the user can see: never the
+        // menu bar panel (which closes as soon as it loses focus), a
+        // closed or minimized window, or the status item's.
+        let window = MainActor.assumeIsolated { Self.visibleProjectWindowForQuitConfirmation() }
         if let window {
-            alert.beginSheetModal(for: window) { [weak self] response in
-                guard response == .alertFirstButtonReturn else { return }
-                self?.confirmQuit()
+            // Closing the sheet's window before it is answered cancels the
+            // quit: AppKit is never left waiting for a reply.
+            let answer = MainActor.assumeIsolated {
+                QuitConfirmationAnswer(parent: window) { [weak self] confirmed in
+                    guard confirmed else {
+                        self?.cancelQuit()
+                        NSApp.reply(toApplicationShouldTerminate: false)
+                        return
+                    }
+                    self?.finishQuit()
+                }
             }
+            alert.beginSheetModal(for: window) { response in
+                MainActor.assumeIsolated { answer.resolve(response == .alertFirstButtonReturn) }
+            }
+            return .terminateLater
         } else if alert.runModal() == .alertFirstButtonReturn {
-            confirmQuit()
+            finishQuit()
+            return .terminateLater
+        } else {
+            cancelQuit()
+            return .terminateCancel
         }
-
-        return .terminateCancel
     }
 
-    /// Tear down every window's running sessions (their processes), then quit once
-    /// the HUP → TERM → KILL escalation has had time to land — app termination
-    /// skips the per-window `windowWillClose` teardown, so without this a
-    /// SIGHUP-ignoring server like `tilt up` would outlive Cherry.
-    private func confirmQuit() {
+    /// The project window a quit confirmation sheet goes on
+    /// (`quitConfirmationParent`), brought on screen (unhidden,
+    /// deminiaturized, in front). Nil when no project window is open; the
+    /// confirmation is then an app-modal alert.
+    @MainActor
+    static func visibleProjectWindowForQuitConfirmation() -> NSWindow? {
+        let registry = ProjectWindowRegistry.shared
+        guard let window = quitConfirmationParent(
+            keyWindow: NSApp.keyWindow,
+            keyWindowIsProjectWindow: registry.keyWindowWorkspace != nil,
+            activeProjectWindow: registry.firstRegisteredProjectWindow()
+        ) else { return nil }
+        if NSApp.isHidden {
+            NSApp.unhide(nil)
+        }
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        return window.isVisible ? window : nil
+    }
+
+    /// Which window the quit confirmation goes on: the key window when it
+    /// is a project window, else the active project's window (the
+    /// registry's; nil when none is open). Never another key window: the
+    /// menu bar panel closes as soon as it loses focus, taking the sheet
+    /// with it, and the status item's window is not one the user sees.
+    @MainActor
+    static func quitConfirmationParent(
+        keyWindow: NSWindow?,
+        keyWindowIsProjectWindow: Bool,
+        activeProjectWindow: NSWindow?
+    ) -> NSWindow? {
+        if let keyWindow, keyWindowIsProjectWindow {
+            return keyWindow
+        }
+        return activeProjectWindow
+    }
+
+    private func cancelQuit() {
+        MainActor.assumeIsolated {
+            ProjectWindowRegistry.shared.cancelTermination()
+        }
+    }
+
+    /// Tear down every window's tabs (tabs and windows that changed while the
+    /// alert was up are saved first), then let the pending termination go
+    /// through once their programs have ended: native tabs get the HUP →
+    /// TERM → KILL escalation's 900 ms (app termination skips the per-window
+    /// `windowWillClose` teardown, so without this a SIGHUP-ignoring server
+    /// like `tilt up` would outlive Cherry), and persistent sessions a quit
+    /// ends get a bounded wait for their host to confirm they exited.
+    private func finishQuit() {
         isQuitConfirmed = true
         MainActor.assumeIsolated {
-            ProjectWindowRegistry.shared.closeAllWorkspaces()
+            ProjectWindowRegistry.shared.tearDownForQuit()
+            Self.hasRepliedToTermination = false
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(900)) {
-            NSApp.terminate(nil)
+        let reply: @MainActor @Sendable () -> Void = {
+            guard !CherryAppDelegate.hasRepliedToTermination else { return }
+            CherryAppDelegate.hasRepliedToTermination = true
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
+        Task { @MainActor in
+            let started = ContinuousClock.now
+            // Tabs whose session was still being created (or whose restart
+            // waited for the previous program) end what their Create makes;
+            // then every ending is waited for, 8 s in all.
+            await TerminalSession.waitForPersistentLaunches(upTo: .seconds(6))
+            let endsBudget = max(.seconds(8) - (ContinuousClock.now - started), .seconds(2))
+            _ = await PersistentLocalSessions.shared.waitForPendingEnds(timeout: endsBudget)
+            let remaining = .milliseconds(900) - (ContinuousClock.now - started)
+            if remaining > .zero {
+                try? await Task.sleep(for: remaining)
+            }
+            reply()
+        }
+        // While a quit waits (`.terminateLater`), AppKit runs the run loop in
+        // its modal panel mode. When the quit was asked for from inside a
+        // main-queue block (a main-actor Task or a DispatchQueue.main block
+        // calling `NSApp.terminate`), the main queue, and with it the task
+        // above, cannot run until the reply: only a run loop timer still
+        // fires, and lets the quit through.
+        let deadline = Timer(timeInterval: Self.quitReplyDeadline, repeats: false) { _ in
+            MainActor.assumeIsolated { reply() }
+        }
+        RunLoop.main.add(deadline, forMode: .common)
+        RunLoop.main.add(deadline, forMode: .modalPanel)
     }
+
+    /// The longest a confirmed quit waits for sessions and processes to end.
+    private static let quitReplyDeadline: TimeInterval = 10
+    @MainActor private static var hasRepliedToTermination = false
 
     private func scheduleDefaultWindowOpenIfNeeded() {
         guard !didScheduleInitialWindowOpen else { return }
         didScheduleInitialWindowOpen = true
         let openDefaultProjectWindow = openDefaultProjectWindow
+        let openProjectWindow = openProjectWindow
 
         Task { @MainActor in
             do {
@@ -117,7 +266,15 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 return
             }
 
-            guard !ProjectWindowRegistry.shared.hasRegisteredProjectWindow,
+            // Windows that had tabs come back even when macOS window
+            // restoration is off. One SwiftUI already restored is skipped, and
+            // opening a scene value that has a window only focuses it.
+            let reopenedProjectWindow = openProjectWindow.map {
+                ProjectWindowRegistry.shared.reopenSavedProjectWindows($0)
+            } ?? false
+
+            guard !reopenedProjectWindow,
+                  !ProjectWindowRegistry.shared.hasRegisteredProjectWindow,
                   !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
             else {
                 return
@@ -151,6 +308,41 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     }
 }
 
+/// The quit confirmation's one answer: the sheet's, or false when the
+/// window it is on closes first (the quit is then cancelled, so AppKit is
+/// never left waiting for a reply to `.terminateLater`). Later answers are
+/// ignored.
+@MainActor
+final class QuitConfirmationAnswer {
+    private var answer: (@MainActor (Bool) -> Void)?
+    private var parentClose: NSObjectProtocol?
+
+    init(parent: NSWindow, answer: @escaping @MainActor (Bool) -> Void) {
+        self.answer = answer
+        // Held by the notification center until resolved.
+        parentClose = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: parent,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { self.resolve(false) }
+        }
+    }
+
+    var isResolved: Bool { answer == nil }
+
+    /// Answers the quit once; later calls do nothing.
+    func resolve(_ confirmed: Bool) {
+        guard let answer else { return }
+        self.answer = nil
+        if let parentClose {
+            NotificationCenter.default.removeObserver(parentClose)
+            self.parentClose = nil
+        }
+        answer(confirmed)
+    }
+}
+
 @main
 struct CherryApp: App {
     private static let projectWindowSceneID = "project"
@@ -166,6 +358,7 @@ struct CherryApp: App {
 
     init() {
         RemoteViewCrashGuard.installIfNeeded()
+        ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
     }
 
     // Menu actions resolve their target from the key window, not the
@@ -327,27 +520,12 @@ struct CherryApp: App {
 
                 Button(focusedChromeState?.selectedNoteID == nil ? closeTabTitle : "Close Note") {
                     guard let workspace = keyWindowWorkspace else { return }
-                    let chromeState = keyWindowChromeState
-                    if chromeState?.closeSelectedNoteIfNeeded() == true {
-                        return
-                    }
-                    if !SessionCloseCoordinator.shouldCloseWindow(
-                        for: workspace,
-                        repository: keyWindowRepository
-                    ) {
-                        guard let session = workspace.selectedSession else { return }
-                        SessionCloseCoordinator.close(
-                            session,
-                            in: workspace,
-                            chromeState: chromeState,
-                            allowEmptyWorkspace: SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(
-                                than: workspace,
-                                repository: keyWindowRepository
-                            )
-                        )
-                    } else {
-                        NSApp.keyWindow?.performClose(nil)
-                    }
+                    SessionCloseCoordinator.closeSelectedTabOrWindow(
+                        workspace: workspace,
+                        repository: keyWindowRepository,
+                        chromeState: keyWindowChromeState,
+                        window: NSApp.keyWindow
+                    )
                 }
                 .keyboardShortcut("w")
                 .disabled(focusedWorkspace == nil)
@@ -422,6 +600,10 @@ struct CherryApp: App {
     }
 
     private func configureDefaultWindowOpener() {
+        appDelegate.openProjectWindow = { projectRoot in
+            guard !ProjectWindowRegistry.shared.hasWindow(for: projectRoot) else { return }
+            openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+        }
         appDelegate.openDefaultProjectWindow = {
             if let projectRoot = agentSettings.projectRoot(for: nil) {
                 agentSettings.markProjectOpened(projectRoot)
@@ -555,10 +737,14 @@ private struct ProjectWorkspaceView: View {
     @StateObject private var noteStore: ProjectNoteStore
     @StateObject private var todoStore: ProjectTodoStore
     @SceneStorage("sidebar.width") private var storedSidebarWidth: Double = 320
-    @State private var didAutoStartCommands = false
 
     init(projectRoot: String) {
-        _repository = StateObject(wrappedValue: RepositoryWorkspace(projectRoot: projectRoot))
+        _repository = StateObject(wrappedValue: RepositoryWorkspace(
+            projectRoot: projectRoot,
+            backendPolicy: .userSettings,
+            stateStore: .shared,
+            sessionRestorer: WorkspaceSessionRestorers.hostedByDefault(localSessions: .shared)
+        ))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(
             projectRoot: projectRoot,
             loadsInBackground: true
@@ -624,7 +810,9 @@ private struct ProjectWorkspaceView: View {
                 _ = workspace.installPreviewAgentTree()
             }
             agentSettings.markProjectOpened(workspace.projectRoot)
-            autoStartCommandsIfNeeded()
+            // Waits for the window's saved tabs to be restored, so a restored
+            // command tab is not started twice.
+            repository.autoStartInitialCommandsIfNeeded()
             openPendingDeepLinks()
             Task {
                 await repository.refresh()
@@ -664,14 +852,6 @@ private struct ProjectWorkspaceView: View {
         agentSettings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
         openWindow(value: project.root)
-    }
-
-    private func autoStartCommandsIfNeeded() {
-        guard !didAutoStartCommands, let projectRoot = workspace.projectRoot else { return }
-        didAutoStartCommands = true
-        for command in agentSettings.launchableProjectCommands(for: projectRoot) where command.autoStart {
-            workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
-        }
     }
 
     private func openPendingDeepLinks() {

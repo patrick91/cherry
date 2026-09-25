@@ -19,8 +19,107 @@ final class ProjectWindowRegistry {
     weak var activeNoteStore: ProjectNoteStore?
     weak var activeTodoStore: ProjectTodoStore?
     weak var activeChromeState: ProjectWindowChromeState?
+    /// Where the open project windows are saved for the next launch. The app
+    /// sets it through `configureWorkspacePersistence(store:)`; tests leave it
+    /// nil, so nothing is written.
+    private(set) var workspaceStateStore: WorkspaceStateStore?
+    private var projectWindowRootsToReopenAtLaunch: [String] = []
+    private var lastSavedOpenWindowRoots: [String]?
+    private var isTerminating = false
+    /// Tells the user when this copy of the app leaves the persistent
+    /// sessions alone (another copy holds the instance lock). The app sets
+    /// it at launch (`installInstanceLockNotice`); tests leave it nil, so
+    /// the app's real lock is never taken.
+    private(set) var instanceLockNotice: InstanceLockNotice?
 
-    private init() {}
+    /// The app uses `shared`; tests make their own.
+    init() {}
+
+    /// Reads the windows to reopen before any window registers (registering
+    /// saves the list again), then saves window changes to `store`.
+    func configureWorkspacePersistence(store: WorkspaceStateStore) {
+        guard workspaceStateStore == nil else { return }
+        projectWindowRootsToReopenAtLaunch = store.projectWindowRootsToReopen()
+        workspaceStateStore = store
+    }
+
+    /// Project windows that were open when Cherry last quit and had tabs,
+    /// once: a later call returns nothing.
+    func takeProjectWindowRootsToReopen() -> [String] {
+        defer { projectWindowRootsToReopenAtLaunch = [] }
+        return projectWindowRootsToReopenAtLaunch
+    }
+
+    /// At launch: opens each saved window to reopen that has no window yet
+    /// (SwiftUI may have restored it). Returns whether it opened any.
+    @discardableResult
+    func reopenSavedProjectWindows(_ openProjectWindow: @MainActor (String) -> Void) -> Bool {
+        var reopened = false
+        for projectRoot in takeProjectWindowRootsToReopen() where !hasWindow(for: projectRoot) {
+            openProjectWindow(projectRoot)
+            reopened = true
+        }
+        return reopened
+    }
+
+    /// Saves every project's tabs and the open windows now, synchronously.
+    func flushWorkspacePersistence() {
+        pruneStaleWindows()
+        repositories.values.compactMap(\.repository).forEach { $0.flushPersistentState() }
+        saveOpenWindowRootsIfChanged(synchronously: true)
+        workspaceStateStore?.flush()
+    }
+
+    /// Right before quit tears anything down: saves, then keeps the saved
+    /// window list as it is until `cancelTermination()`, so windows closing
+    /// while the app terminates do not remove themselves from it.
+    func prepareForTermination() {
+        isTerminating = false
+        flushWorkspacePersistence()
+        isTerminating = true
+    }
+
+    /// The quit was cancelled.
+    func cancelTermination() {
+        isTerminating = false
+    }
+
+    /// A confirmed quit: saves what changed while the confirmation was up,
+    /// then closes every tab with `.appQuit`.
+    func tearDownForQuit() {
+        prepareForTermination()
+        closeAllWorkspaces(intent: .appQuit)
+    }
+
+    private func saveOpenWindowRootsIfChanged(synchronously: Bool = false) {
+        guard let workspaceStateStore, !isTerminating else { return }
+        // The repository's own root: its saved tabs are keyed by it, and a
+        // reopened window passes it to `RepositoryWorkspace` again.
+        let roots = windows.compactMap { root, weakWindow -> String? in
+            guard weakWindow.window != nil else { return nil }
+            return repositories[root]?.repository?.repositoryRoot ?? root
+        }.sorted()
+        guard roots != lastSavedOpenWindowRoots else { return }
+        lastSavedOpenWindowRoots = roots
+        workspaceStateStore.saveOpenProjectWindowRoots(roots, synchronously: synchronously)
+    }
+
+    /// Offers `notice` every project window that registers from now on, and
+    /// the one already registered.
+    func installInstanceLockNotice(_ notice: InstanceLockNotice) {
+        guard instanceLockNotice == nil else { return }
+        instanceLockNotice = notice
+        if let window = firstRegisteredProjectWindow() {
+            notice.projectWindowDidRegister(window)
+        }
+    }
+
+    /// Test seam: saves window changes to `store`, or stops saving them.
+    func setWorkspaceStateStoreForTesting(_ store: WorkspaceStateStore?) {
+        workspaceStateStore = store
+        lastSavedOpenWindowRoots = nil
+        isTerminating = false
+    }
 
     var hasRegisteredProjectWindow: Bool {
         pruneStaleWindows()
@@ -53,17 +152,28 @@ final class ProjectWindowRegistry {
         return repositoryWorkspaces + legacyWorkspaces
     }
 
-    /// Total sessions running a process across all windows — drives the quit
-    /// confirmation.
-    func runningProcessCount() -> Int {
-        allWorkspaces().reduce(0) { $0 + $1.sessionsWithRunningProcess().count }
+    /// Total sessions running a process across all windows that quitting
+    /// would end — drives the quit confirmation. Persistent tabs whose
+    /// sessions a quit keeps (Settings › Sessions) are not counted.
+    func runningProcessCount(endingWith intent: SessionCloseIntent = .appQuit) -> Int {
+        allWorkspaces().reduce(0) { $0 + $1.sessionsWithRunningProcess(endingWith: intent).count }
+    }
+
+    /// Persistent tabs across all windows whose sessions quitting ends
+    /// (Settings › Sessions › End sessions when quitting), running or not.
+    func persistentSessionCountEndedByQuit() -> Int {
+        allWorkspaces().reduce(0) { $0 + $1.persistentSessionsEnded(by: .appQuit).count }
     }
 
     /// Tear down every workspace's sessions (killing their processes). Used on
     /// confirmed app quit, where the per-window `windowWillClose` teardown never
     /// runs — otherwise a SIGHUP-ignoring server would outlive Cherry.
-    func closeAllWorkspaces() {
-        allWorkspaces().forEach { $0.closeAllSessions() }
+    func closeAllWorkspaces(intent: SessionCloseIntent) {
+        pruneStaleWindows()
+        // Repositories first: they stop saving before their workspaces empty,
+        // and they own worktree workspaces `allWorkspaces()` cannot see yet.
+        repositories.values.compactMap(\.repository).forEach { $0.closeAllSessions(intent: intent) }
+        allWorkspaces().forEach { $0.closeAllSessions(intent: intent) }
     }
 
     /// Live workspaces paired with the project-root key they're registered under —
@@ -237,6 +347,8 @@ final class ProjectWindowRegistry {
                 chromeState: chromeState
             )
         }
+        saveOpenWindowRootsIfChanged()
+        instanceLockNotice?.projectWindowDidRegister(window)
         return true
     }
 
@@ -251,6 +363,7 @@ final class ProjectWindowRegistry {
         noteStores.removeValue(forKey: projectRoot)
         todoStores.removeValue(forKey: projectRoot)
         chromeStates.removeValue(forKey: projectRoot)
+        saveOpenWindowRootsIfChanged()
         if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
             activeProjectRoot = nil
             activeWorkspace = nil
@@ -978,11 +1091,12 @@ private final class ProjectWindowBinderView: NSView {
         )
         if !claimed {
             // Another window already owns this project. Close this duplicate
-            // and bring the existing one forward.
+            // and bring the existing one forward. It never restored or saved
+            // anything, and hosted tabs only detach.
             if let repository {
-                repository.closeAllSessions()
+                repository.closeAllSessions(intent: .duplicateWindowTeardown)
             } else {
-                workspace.closeAllSessions()
+                workspace.closeAllSessions(intent: .duplicateWindowTeardown)
             }
             if let projectRoot {
                 _ = ProjectWindowRegistry.shared.focus(projectRoot: projectRoot)
@@ -992,6 +1106,8 @@ private final class ProjectWindowBinderView: NSView {
             }
             return
         }
+        // Only the window that owns the project restores its saved tabs.
+        repository?.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
         let shouldInstallObserver = boundWindow !== window
         boundWindow = window
         installCloseDelegate(for: window)
@@ -1090,8 +1206,8 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         // Confirm for ANY running process (agents, live commands, terminals
         // executing a foreground program) — not just agents. (Product intent is to
         // later narrow this back to running agents only.)
-        let runningCount = repository?.runningProcessCount()
-            ?? workspace.sessionsWithRunningProcess().count
+        let runningCount = repository?.runningProcessCount(endingWith: .windowClosed)
+            ?? workspace.sessionsWithRunningProcess(endingWith: .windowClosed).count
         guard runningCount > 0 else {
             return previousWindowShouldClose(sender)
         }
@@ -1188,9 +1304,11 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         guard !didCloseWorkspace else { return }
         didCloseWorkspace = true
         if let repository {
-            repository.closeAllSessions()
+            // Save the tabs as they are; the teardown itself saves nothing.
+            repository.flushPersistentState()
+            repository.closeAllSessions(intent: .windowClosed)
         } else {
-            workspace?.closeAllSessions()
+            workspace?.closeAllSessions(intent: .windowClosed)
         }
     }
 

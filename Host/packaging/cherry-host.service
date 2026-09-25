@@ -6,7 +6,7 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now cherry-host.service
 # `loginctl enable-linger` keeps the user service manager, and so this
-# daemon, running after the last login ends.
+# daemon and its sessions, running after the last login ends.
 #
 # `serve` takes no --socket: it listens on the default socket
 # (/tmp/cherry-host-<uid>/host.sock, or $CHERRY_HOST_SOCKET), which is where
@@ -18,14 +18,21 @@ Description=Cherry persistent terminal host
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cherry-host serve
-# A new daemon cannot recover the jobs of one that exited or crashed, so an
-# automatic restart would only hide the loss.
-Restart=no
-# Stop signals only the daemon. Its sessions end when it closes their PTYs,
-# as without systemd. Processes that hosted sessions deliberately detached
-# into their own session (tmux or pm2 servers, `emacs --daemon`,
-# `setsid nohup job &`) stay in this unit's cgroup but are not killed with it.
-# systemd logs them as left-over processes when the unit starts again.
+# Each session lives in a holder process of its own (`cherry-host hold`),
+# which the daemon starts and which outlives it. After a crash the restarted
+# daemon adopts every running session: the holders register with it again.
+Restart=on-failure
+# Stop and restart signal only the daemon. Holders, and so the sessions,
+# carry on in this unit's cgroup and register with the next daemon; so do
+# processes that hosted sessions deliberately detached into their own
+# session (tmux or pm2 servers, `emacs --daemon`, `setsid nohup job &`).
+# systemd logs them as left-over processes when the unit starts again. End
+# the sessions themselves with `cherry kill <id>`. An exited session keeps
+# its holder, and its last screen, until `cherry remove <id>`, or until
+# `cherry shutdown` (refused while sessions run) ends every exited one.
+# The daemon keeps starting holders of the build it runs: after installing
+# a new cherry-host, `systemctl --user restart cherry-host.service` moves
+# new sessions to it, and running ones carry on.
 KillMode=process
 
 [Install]

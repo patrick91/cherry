@@ -8,6 +8,7 @@
 #include <ghostty/vt/allocator.h>
 #include <ghostty/vt/style.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,99 @@ static bool terminal_color_scheme(GhosttyTerminal term, void *userdata, GhosttyC
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Terminal events. Ghostty invokes these callbacks synchronously inside
+// ghostty_terminal_vt_write; each only reads what it was handed (or the
+// terminal's title/pwd, as the callback contract allows) and passes borrowed
+// bytes to Rust, which copies them before returning. Nothing here writes to
+// the terminal.
+
+enum {
+    CHERRY_EVENT_TITLE = 0,
+    CHERRY_EVENT_PWD = 1,
+    CHERRY_EVENT_BELL = 2,
+    CHERRY_EVENT_NOTIFICATION = 3,
+    CHERRY_EVENT_PROGRESS = 4,
+};
+
+// Mirrored by `RawEvent` in lib.rs. Strings are borrowed for the call only.
+typedef struct {
+    int32_t kind;
+    const uint8_t *text;  // title, pwd or notification title
+    size_t text_len;
+    const uint8_t *body;  // notification body
+    size_t body_len;
+    int32_t state;        // progress state (GhosttyTerminalProgressState)
+    int32_t progress;     // progress percentage, -1 when omitted
+} CherryEvent;
+
+typedef void (*CherryEventFn)(void *userdata, const CherryEvent *event);
+
+// The head of Rust's `Callbacks`, which is every callback's userdata.
+typedef struct {
+    CherryEventFn event;
+} CherryCallbacks;
+
+static void emit_event(void *userdata, const CherryEvent *event) {
+    ((const CherryCallbacks *)userdata)->event(userdata, event);
+}
+
+static void emit_string(GhosttyTerminal term, void *userdata, int32_t kind, GhosttyTerminalData data) {
+    GhosttyString value = { .ptr = NULL, .len = 0 };
+    if (ghostty_terminal_get(term, data, &value)) return;
+    CherryEvent event = { .kind = kind, .text = value.ptr, .text_len = value.len };
+    emit_event(userdata, &event);
+}
+
+static void on_title_changed(GhosttyTerminal term, void *userdata) {
+    emit_string(term, userdata, CHERRY_EVENT_TITLE, GHOSTTY_TERMINAL_DATA_TITLE);
+}
+
+static void on_pwd_changed(GhosttyTerminal term, void *userdata) {
+    emit_string(term, userdata, CHERRY_EVENT_PWD, GHOSTTY_TERMINAL_DATA_PWD);
+}
+
+static void on_bell(GhosttyTerminal term, void *userdata) {
+    (void)term;
+    CherryEvent event = { .kind = CHERRY_EVENT_BELL };
+    emit_event(userdata, &event);
+}
+
+static void on_notification(GhosttyTerminal term, void *userdata,
+                            const GhosttyTerminalDesktopNotification *notification) {
+    (void)term;
+    // A sized struct: only fields within `size` exist.
+    if (notification->size < offsetof(GhosttyTerminalDesktopNotification, body) + sizeof(GhosttyString)) return;
+    CherryEvent event = {
+        .kind = CHERRY_EVENT_NOTIFICATION,
+        .text = notification->title.ptr, .text_len = notification->title.len,
+        .body = notification->body.ptr, .body_len = notification->body.len,
+    };
+    emit_event(userdata, &event);
+}
+
+static void on_progress(GhosttyTerminal term, void *userdata, const GhosttyTerminalProgressReport *report) {
+    (void)term;
+    if (report->size < offsetof(GhosttyTerminalProgressReport, progress) + sizeof(int8_t)) return;
+    CherryEvent event = {
+        .kind = CHERRY_EVENT_PROGRESS,
+        .state = (int32_t)report->state,
+        .progress = report->progress,
+    };
+    emit_event(userdata, &event);
+}
+
+// The title (which 0) or pwd (1) as a borrowed string, valid until the next
+// mutating call; empty when unset.
+int cherry_vt_string(GhosttyTerminal term, int which, const uint8_t **ptr, size_t *len) {
+    GhosttyString value = { .ptr = NULL, .len = 0 };
+    int rc = ghostty_terminal_get(term, which ? GHOSTTY_TERMINAL_DATA_PWD : GHOSTTY_TERMINAL_DATA_TITLE, &value);
+    *ptr = value.ptr;
+    *len = rc ? 0 : value.len;
+    return rc;
+}
+
+// `userdata` is Rust's `Callbacks`, whose first field is a CherryEventFn.
 int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
                   size_t scrollback, void *userdata, GhosttyTerminalWritePtyFn reply) {
     int rc = ghostty_terminal_new(NULL, out, cols, rows);
@@ -41,6 +135,11 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, &continuation_limit);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_USERDATA, userdata);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (void *)reply);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, (void *)on_title_changed);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_PWD_CHANGED, (void *)on_pwd_changed);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_BELL, (void *)on_bell);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (void *)on_notification);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, (void *)on_progress);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_SIZE, (void *)terminal_size);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, (void *)terminal_color_scheme);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground);

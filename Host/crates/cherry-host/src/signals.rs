@@ -1,14 +1,14 @@
-//! Event-driven wakeups for session workers. SIGCHLD is turned into a byte on
-//! a pipe and broadcast to every worker, so a worker can sleep until something
-//! happens instead of polling for its child's exit.
+//! Event-driven wakeups. A daemon session worker sleeps until a connection
+//! or its holder has something for it (`Wake`). A holder turns SIGCHLD into
+//! a readable byte (`child_exits`), so it can sleep until its child exits
+//! instead of polling for it.
 use std::{
     io::{self, Read, Write},
     os::unix::{io::IntoRawFd, net::UnixStream},
     sync::{
         atomic::{AtomicI32, Ordering},
-        Arc, Mutex, Weak,
+        Arc,
     },
-    thread,
 };
 
 /// The sending half of a worker's wake socket.
@@ -36,7 +36,6 @@ pub fn drain(receiver: &UnixStream) {
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
-static WORKERS: Mutex<Vec<Weak<Wake>>> = Mutex::new(Vec::new());
 
 extern "C" fn on_child(_: libc::c_int) {
     let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
@@ -59,10 +58,13 @@ unsafe fn errno() -> *mut libc::c_int {
     libc::__errno_location()
 }
 
-/// Install the SIGCHLD handler and the thread that fans it out. Once per daemon.
-pub fn install() -> io::Result<()> {
+/// A socket that becomes readable whenever a child process exits (drain it
+/// with `drain`). Installs the SIGCHLD handler: once per process, before the
+/// first child is started, so no exit is missed.
+pub fn child_exits() -> io::Result<UnixStream> {
     let (receiver, sender) = UnixStream::pair()?;
     sender.set_nonblocking(true)?;
+    receiver.set_nonblocking(true)?;
     SIGNAL_PIPE.store(sender.into_raw_fd(), Ordering::SeqCst);
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -73,30 +75,5 @@ pub fn install() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    thread::Builder::new()
-        .name("cherry-sigchld".into())
-        .spawn(move || {
-            let mut buffer = [0u8; 64];
-            loop {
-                match (&receiver).read(&mut buffer) {
-                    Ok(0) => return,
-                    Ok(_) => broadcast(),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => return,
-                }
-            }
-        })?;
-    Ok(())
-}
-
-/// Wake `worker` whenever any child process changes state.
-pub fn register(worker: &Arc<Wake>) {
-    WORKERS.lock().unwrap().push(Arc::downgrade(worker));
-}
-
-fn broadcast() {
-    WORKERS
-        .lock()
-        .unwrap()
-        .retain(|worker| worker.upgrade().map(|worker| worker.wake()).is_some());
+    Ok(receiver)
 }

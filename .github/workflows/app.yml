@@ -71,26 +71,32 @@ jobs:
           DEVELOPER_DIR="$selected" xcrun swift --version
       - name: Install Rust and the pinned Ghostty VT library
         uses: ./.github/actions/host-toolchain
-      # The real-host test runs Host/target/debug/cherry and cherry-host.
+      # Before any Swift test: the real-host tests run Host/target/debug/cherry
+      # and cherry-host.
       - name: Build the Rust host helpers
         run: Scripts/build-host debug
-      - name: Build the Swift package and tests
-        run: swift build --build-tests
-      # Each filter must match tests that actually ran; a rename or a skipped
-      # test would otherwise pass silently.
-      - name: Hosted-session and app-identity tests
-        run: |
-          log="$RUNNER_TEMP/hosted-session.log"
-          swift test --skip-build --no-parallel --filter 'HostedSession|[Aa]ppIdentity' 2>&1 | tee "$log"
-          for name in HostedSession '[Aa]ppIdentity'; do
-            grep -Eq "Test ${name}[^ ]* passed" "$log" \
-              || { echo "::error::No ${name} test passed"; exit 1; }
-          done
-      - name: Real host through native Ghostty
+      # The teardown Scripts/test-packaged-app and Scripts/test-mcp-concurrency
+      # use so that their Cherry's private session host leaves nothing behind.
+      - name: Private session-host teardown for the GUI test scripts
         env:
           CHERRY_TEST_HOST_INTEGRATION: "1"
-        run: |
-          log="$RUNNER_TEMP/real-host.log"
-          swift test --skip-build --no-parallel --filter HostedSessionRealHost 2>&1 | tee "$log"
-          grep -Eq 'Test HostedSessionRealHost[^ ]* passed' "$log" \
-            || { echo "::error::No HostedSessionRealHost test passed"; exit 1; }
+        run: python3 Scripts/test_cherry_private_host.py -v
+      - name: Build the Swift package and tests
+        run: swift build --build-tests
+      # Every hosted and persistent session suite: PersistentLocal*,
+      # PersistentTab*, WorkspacePersistence*, WorkspaceRestore*, HostControl*,
+      # HostedSession*, HostedLaunchSpec*, NativeSurfaceRelaunch*,
+      # MultiplexerSafety*, AgentInputSafety*, SessionCloseFlow* and
+      # AppIdentity. Each group runs on its own and must pass at least one
+      # test, so a filter that stops matching (a rename) fails instead of
+      # passing with nothing run. A session test file no group selects, or a
+      # test skipped here that the real-host step does not run, fails too.
+      - name: Hosted and persistent session tests
+        timeout-minutes: 20
+        run: Scripts/test-session-suites --skip-build unit
+      # Every *RealHost* test (HostedSessionRealHost*, PersistentLocalRealHost*,
+      # AgentInputRealHost*, ...), each against its own daemon on a private
+      # socket with a private HOME; none may skip.
+      - name: Real host through native Ghostty
+        timeout-minutes: 20
+        run: Scripts/test-session-suites --skip-build real-host

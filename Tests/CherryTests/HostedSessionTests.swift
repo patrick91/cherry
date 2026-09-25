@@ -202,6 +202,79 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(!FileManager.default.fileExists(atPath: first.path))
 }
 
+@Test func HostedSessionStatusFileTellsTheLiveStateFromTheFinalOutcome() throws {
+    func live(_ json: String) -> HostedAdapterLiveStatus? {
+        HostedAttachmentStatusFile.liveStatus(from: Data(json.utf8))
+    }
+    #expect(live(HostedSessionFakeCLI.attachedStatus()) == HostedAdapterLiveStatus())
+    #expect(live(HostedSessionFakeCLI.attachedStatus(viewport: true)) == HostedAdapterLiveStatus(viewport: true))
+    #expect(live(HostedSessionFakeCLI.attachedStatus(reconnecting: true)) == HostedAdapterLiveStatus(reconnecting: true))
+    #expect(live(#"{"outcome":"attached"}"#) == HostedAdapterLiveStatus())
+    #expect(live(#"{"outcome":"disconnected","exit_code":null,"signal":null,"message":null}"#) == nil)
+    #expect(live("not json") == nil)
+    #expect(HostedAdapterLiveStatus().followsProgram)
+    #expect(HostedAdapterLiveStatus().showsWholeScreen)
+    #expect(HostedAdapterLiveStatus(viewport: true).followsProgram)
+    #expect(!HostedAdapterLiveStatus(viewport: true).showsWholeScreen)
+    #expect(!HostedAdapterLiveStatus(reconnecting: true).followsProgram)
+    #expect(!HostedAdapterLiveStatus(reconnecting: true).showsWholeScreen)
+
+    let parent = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-live-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let launch = try HostedAttachmentStatusFile.makeLaunchDirectory(in: parent)
+    let file = HostedAttachmentStatusFile.statusFileURL(in: launch)
+    // A running adapter's state is no outcome: it has not ended.
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: file)
+    #expect(HostedAttachmentStatusFile.read(from: launch) == nil)
+    #expect(HostedAttachmentStatusFile.readLive(from: launch) == HostedAdapterLiveStatus(reconnecting: true))
+    // A live state left behind by an adapter that was killed means it ended.
+    #expect(HostedAttachmentStatusFile.status(from: try Data(contentsOf: file)) == .disconnected(nil))
+    try HostedSessionFakeCLI.writeStatus(#"{"outcome":"exited","exit_code":2,"signal":null,"message":null}"#, to: file)
+    #expect(HostedAttachmentStatusFile.read(from: launch) == .exited(code: 2, signal: nil))
+    #expect(HostedAttachmentStatusFile.readLive(from: launch) == nil)
+}
+
+@Test @MainActor func HostedAdapterStatusWatcherReportsEachNewLiveState() async throws {
+    let parent = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-watch-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let launch = try HostedAttachmentStatusFile.makeLaunchDirectory(in: parent)
+    let file = HostedAttachmentStatusFile.statusFileURL(in: launch)
+    let reported = Recorder<[HostedAdapterLiveStatus]>([])
+    let watcher = try #require(HostedAdapterStatusWatcher(directory: launch) { reported.value.append($0) })
+    func waitFor(_ count: Int) async -> Bool {
+        for _ in 0..<500 where reported.value.count < count {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return reported.value.count == count
+    }
+
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(), to: file)
+    #expect(await waitFor(1))
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: file)
+    #expect(await waitFor(2))
+    // The same state again, and a final outcome, are not reported.
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: file)
+    try HostedSessionFakeCLI.writeStatus(#"{"outcome":"disconnected","exit_code":null,"signal":null,"message":null}"#, to: file)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(reported.value == [HostedAdapterLiveStatus(), HostedAdapterLiveStatus(reconnecting: true)])
+    // Nothing after it is cancelled.
+    watcher.cancel()
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(viewport: true), to: file)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(reported.value.count == 2)
+    // A state written before the watch started is reported at once.
+    let written = try HostedAttachmentStatusFile.makeLaunchDirectory(in: parent)
+    try HostedSessionFakeCLI.writeStatus(
+        HostedSessionFakeCLI.attachedStatus(viewport: true), to: HostedAttachmentStatusFile.statusFileURL(in: written)
+    )
+    let early = Recorder<[HostedAdapterLiveStatus]>([])
+    let second = try #require(HostedAdapterStatusWatcher(directory: written) { early.value.append($0) })
+    #expect(early.value == [HostedAdapterLiveStatus(viewport: true)])
+    second.cancel()
+}
+
 @Test func HostedSessionAttachStatusDirectoriesOfQuitAppsAreRemoved() throws {
     let parent = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-status-sweep-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -237,177 +310,178 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(!FileManager.default.fileExists(atPath: otherApp.path))
 }
 
-@Test func HostedSessionClientPassesCreationAsArgumentsAndReadsJSON() async throws {
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
-    let client = cli.client(loginEnvironment: ["SSH_AUTH_SOCK": "/login/agent.sock"])
-    let requestID = UUID()
-    let name = "editor;$(touch should-not-exist)"
-    let session = try await client.create(
-        on: .ssh("devbox"), expectedHostID: "host-a", name: name,
-        cwd: "/remote/path with spaces", requestID: requestID
-    )
-    #expect(session.id == "session-\(requestID.uuidString.lowercased())")
-    #expect(cli.lastArguments == [
-        "--host", "devbox", "--expected-host-id", "host-a", "new",
-        "--name=\(name)", "--cwd=/remote/path with spaces", "--request-id", requestID.uuidString.lowercased()
-    ])
-    #expect(cli.read("created-name") == "\(name)\n")
-    // Helpers run with the login shell's variables, not only the app's.
-    #expect(cli.read("ssh-auth-sock") == "/login/agent.sock")
-
-    // Values that start with "-" stay values; the real parser would otherwise
-    // read them as options and reject the create.
-    for hyphenated in ["-dev", "-- scratch", "--name"] {
-        _ = try await client.create(on: .local, expectedHostID: "host-a", name: hyphenated, cwd: "/tmp", requestID: UUID())
-        #expect(cli.read("created-name") == "\(hyphenated)\n")
-    }
-
-    _ = try await client.create(on: .ssh("devbox"), expectedHostID: "host-a", name: "Default directory", cwd: "", requestID: UUID())
-    #expect(cli.read("created-cwd") == "~\n")
-    _ = try await client.create(on: .ssh("devbox"), expectedHostID: "host-a", name: "Home path", cwd: " ~/code/app ", requestID: UUID())
-    #expect(cli.read("created-cwd") == "~/code/app\n")
-
-    try await client.terminate("session-123", on: .ssh("devbox"), expectedHostID: "host-a")
-    #expect(cli.lastArguments == ["--host", "devbox", "--expected-host-id", "host-a", "kill", "session-123"])
-    try await client.remove("session-123", on: .ssh("devbox"), expectedHostID: "host-a")
-    #expect(cli.lastArguments == ["--host", "devbox", "--expected-host-id", "host-a", "remove", "session-123"])
+private func fixtureSession() throws -> HostedSessionInfo {
+    try JSONDecoder().decode(HostedSessionInfo.self, from: Data(hostedSessionFixture.utf8))
 }
 
-@Test func HostedSessionWorkingDirectoryMustBeAbsoluteOrHomeRelative() async throws {
+@Test @MainActor func HostedSessionCreateSendsNamesAndDirectoriesVerbatim() async throws {
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper()
+    let control = makeFakeHostControl(
+        fake, host: try .ssh("devbox"), hostStore: store, loginEnvironment: ["SSH_AUTH_SOCK": "/login/agent.sock"]
+    )
+    defer { control.disconnect() }
+    let requestID = UUID()
+    let name = "editor;$(touch should-not-exist)"
+    let session = try await control.create(
+        name: name, cwd: "/remote/path with spaces", requestID: requestID, expectedHostID: "host-a"
+    )
+    #expect(session.id == "session-\(requestID.uuidString.lowercased())")
+    let sent = try #require(fake.requests("create").last)
+    #expect(sent.string("name") == name)
+    #expect(sent.string("cwd") == "/remote/path with spaces")
+    #expect(sent.string("request_id") == requestID.uuidString.lowercased())
+    // The helper runs with the login shell's variables, not only the app's.
+    #expect(fake.launches.last?.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
+
+    // Values that start with "-" stay values: no argument parser is involved.
+    for hyphenated in ["-dev", "-- scratch", "--name"] {
+        _ = try await control.create(name: hyphenated, cwd: "/tmp")
+        #expect(fake.requests("create").last?.string("name") == hyphenated)
+    }
+    _ = try await control.create(name: "Default directory", cwd: "")
+    #expect(fake.requests("create").last?.string("cwd") == "~")
+    _ = try await control.create(name: "Home path", cwd: "~/code/app")
+    #expect(fake.requests("create").last?.string("cwd") == "~/code/app")
+    // A path the app passes is used exactly as given: a directory name may
+    // end in a space (only text a person typed is trimmed, by the sheet).
+    _ = try await control.create(name: "Trailing space", cwd: "/Users/me/Client Work ")
+    #expect(fake.requests("create").last?.string("cwd") == "/Users/me/Client Work ")
+    _ = try await control.create(name: "Newline", cwd: "/tmp/odd\n")
+    #expect(fake.requests("create").last?.string("cwd") == "/tmp/odd\n")
+    let creates = fake.requests("create").count
+    await #expect(throws: HostedSessionError.self) {
+        try await control.create(name: "Not trimmed", cwd: " ~/code/app ")
+    }
+    #expect(fake.requests("create").count == creates)
+
+    try await control.terminate("session-123", expectedHostID: "host-a")
+    #expect(fake.requests.last?.op == "kill")
+    #expect(fake.requests.last?.string("id") == "session-123")
+    try await control.remove("session-123", expectedHostID: "host-a")
+    #expect(fake.requests.last?.op == "remove")
+    #expect(fake.requests.last?.string("id") == "session-123")
+}
+
+@Test @MainActor func HostedSessionWorkingDirectoryMustBeAbsoluteOrHomeRelative() async throws {
     #expect(try HostedSessionClient.hostWorkingDirectory("") == "~")
     #expect(try HostedSessionClient.hostWorkingDirectory("~") == "~")
     #expect(try HostedSessionClient.hostWorkingDirectory("~/code") == "~/code")
     #expect(try HostedSessionClient.hostWorkingDirectory("/srv/app") == "/srv/app")
+    // Typed text is trimmed; a path the app passes is not.
+    #expect(try HostedSessionClient.hostWorkingDirectory(" ~/code \n") == "~/code")
+    #expect(try HostedSessionClient.validatedHostWorkingDirectory("/srv/app ") == "/srv/app ")
+    #expect(try HostedSessionClient.validatedHostWorkingDirectory("") == "~")
+    #expect(throws: HostedSessionError.self) { try HostedSessionClient.validatedHostWorkingDirectory(" /srv/app") }
     for relative in ["code/app", ".", "../x", "~other/code"] {
         #expect(throws: HostedSessionError.self) { try HostedSessionClient.hostWorkingDirectory(relative) }
     }
 
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper()
+    let control = makeFakeHostControl(fake, hostStore: store)
     await #expect(throws: HostedSessionError.self) {
-        try await cli.client().create(on: .local, expectedHostID: "host-a", name: "x", cwd: "code/app", requestID: UUID())
+        try await control.create(name: "x", cwd: "code/app")
     }
-    #expect(cli.calls.isEmpty)
-}
-
-@Test func HostedSessionClientClassifiesFailuresAndBoundsHungCommands() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-host-failure-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let executable = root.appendingPathComponent("cherry")
-    func install(_ script: String) throws {
-        try script.write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-    }
-    func failure(of client: HostedSessionClient) async -> HostedSessionError? {
-        do {
-            _ = try await client.list(on: .ssh("devbox"))
-            return nil
-        } catch {
-            return error as? HostedSessionError
-        }
-    }
-    let client = HostedSessionClient(executableURL: executable, timeout: 5, loginEnvironment: { _ in .init(environment: [:]) })
-
-    try install("#!/bin/sh\nprintf 'ssh: connect to host devbox port 22: Connection refused\\n' >&2\nexit 1\n")
-    let refused = await failure(of: client)
-    #expect(refused?.isTransportFailure == true)
-    #expect(refused?.localizedDescription.contains("Connection refused") == true)
-
-    try install("#!/bin/sh\nprintf 'cherry: host rejected request (request_failed): no such session\\n' >&2\nexit 1\n")
-    let rejected = await failure(of: client)
-    #expect(rejected == .message("cherry: host rejected request (request_failed): no such session"))
-
-    try install("#!/bin/sh\nprintf 'error: unexpected argument found\\n' >&2\nexit 2\n")
-    #expect(await failure(of: client)?.isTransportFailure == false)
-
-    try install("#!/bin/sh\nprintf 'cherry: host identity changed (expected a, received b)\\n' >&2\nexit 1\n")
-    #expect(await failure(of: client)?.isIdentityMismatch == true)
-
-    try install("#!/bin/sh\nexec /bin/sleep 10\n")
-    let hungClient = HostedSessionClient(executableURL: executable, timeout: 0.2, loginEnvironment: { _ in .init(environment: [:]) })
-    let start = Date()
-    let hung = await failure(of: hungClient)
-    #expect(Date().timeIntervalSince(start) < 5)
-    #expect(hung?.isTransportFailure == true)
-
-    // A timed-out helper's own interruption text must not become the answer:
-    // it cannot know whether the host acted on the request.
-    try install("""
-    #!/bin/sh
-    trap 'printf "cherry: interrupted by signal 15; the host session was not terminated\\n" >&2; exit 143' TERM
-    /bin/sleep 10 &
-    wait
-    """)
-    let interrupted = await failure(of: hungClient)
-    #expect(interrupted?.isTransportFailure == true)
-    #expect(interrupted?.localizedDescription.contains("did not answer") == true)
-    #expect(interrupted?.localizedDescription.contains("not terminated") == false)
+    #expect(fake.launches.isEmpty)
 }
 
 @Test @MainActor func HostedSessionCreateRetriesTransportFailureWithTheSameRequestID() async throws {
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper()
     let login = ["SSH_AUTH_SOCK": "/login/agent.sock"]
-    let controller = HostedSessionsController(clientProvider: { cli.client(loginEnvironment: login) }, hostStore: store)
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store, clientProvider: {
+        HostedSessionClient(
+            executableURL: URL(fileURLWithPath: "/fake/bin/cherry"), loginEnvironment: { _ in .init(environment: login) }
+        )
+    })
+    defer { registry.disconnectAll() }
+    let controller = HostedSessionsController(controls: registry, hostStore: store)
     await controller.refresh(.local)
     #expect(controller.hostID == "host-a")
 
-    try cli.write("new-transport-failures", "1\n")
+    // The first answer is lost with its connection.
+    let losses = FakeCountdown(1)
+    fake.respond = { request, _ in
+        request.op == "create" && losses.take() ? .exit(stderr: "cherry: connection to the host was lost") : nil
+    }
     let attachment = await controller.create(on: .local, name: "-dev", cwd: "~/code")
     #expect(controller.error == nil)
-    let requestIDs = cli.lines("request-ids")
+    let requestIDs = fake.requests("create").compactMap { $0.string("request_id") }
     #expect(requestIDs.count == 2)
     #expect(Set(requestIDs).count == 1)
     #expect(UUID(uuidString: requestIDs[0]) != nil)
     #expect(attachment?.sessionID == "session-\(requestIDs[0])")
-    #expect(cli.read("created-name") == "-dev\n")
-    #expect(cli.read("created-cwd") == "~/code\n")
-    // The attach adapter gets the same login environment as the helpers.
+    #expect(fake.requests("create").last?.string("name") == "-dev")
+    #expect(fake.requests("create").last?.string("cwd") == "~/code")
+    // What a person typed in the sheet is trimmed before it is sent.
+    fake.respond = nil
+    _ = await controller.create(on: .local, name: "typed", cwd: "  ~/code/app \n")
+    #expect(fake.requests("create").last?.string("cwd") == "~/code/app")
+    fake.respond = { request, _ in
+        request.op == "create" && losses.take() ? .exit(stderr: "cherry: connection to the host was lost") : nil
+    }
+    // The attach adapter gets the helper and login environment the control
+    // connection runs with.
     #expect(attachment?.environment == login)
+    #expect(attachment?.executablePath == "/fake/bin/cherry")
+    #expect(attachment?.hostID == "host-a")
     #expect(controller.sessions.contains { $0.id == attachment?.sessionID })
 
     // A second failure keeps the reconcile hint; the next Create is a new request.
-    try cli.write("new-transport-failures", "2\n")
+    losses.set(2)
     #expect(await controller.create(on: .local, name: "again", cwd: "") == nil)
     #expect(controller.error?.contains("Refresh before trying again") == true)
-    let retried = Array(cli.lines("request-ids").dropFirst(2))
+    let retried = Array(fake.requests("create").compactMap { $0.string("request_id") }.dropFirst(3))
     #expect(retried.count == 2)
     #expect(Set(retried).count == 1)
-    #expect(retried[0] != requestIDs[0])
+    #expect(retried.first != requestIDs[0])
 
     // A host rejection is a definite answer: no retry and no "may have been created".
-    try FileManager.default.removeItem(at: cli.directory.appendingPathComponent("new-transport-failures"))
-    try cli.write("new-rejects", "")
+    fake.respond = { request, _ in
+        request.op == "create"
+            ? .answer(.error(code: "request_failed", message: "working directory does not exist")) : nil
+    }
     #expect(await controller.create(on: .local, name: "rejected", cwd: "/missing") == nil)
     #expect(controller.error?.contains("working directory does not exist") == true)
     #expect(controller.error?.contains("may have been created") == false)
-    #expect(cli.lines("request-ids").count == 5)
+    #expect(fake.requests("create").count == 6)
 }
 
 @Test @MainActor func HostedSessionRefreshPinsSSHHostIdentityUntilTrustedAgain() async throws {
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
-    try cli.write("sessions", hostedSessionFixture)
-    let controller = HostedSessionsController(clientProvider: { cli.client() }, hostStore: store)
+    let fake = FakeControlHelper(sessions: [try fixtureSession()])
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store)
+    defer { registry.disconnectAll() }
+    let controller = HostedSessionsController(controls: registry, hostStore: store)
     let devbox = try store.add("devbox")
+    func dropConnections(of host: HostedSessionHost) async {
+        fake.dropAll()
+        let control = registry.control(for: host)
+        let deadline = Date().addingTimeInterval(5)
+        while control.state == .connected, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+    }
 
     await controller.refresh(devbox)
-    #expect(cli.lastArguments == ["--host", "devbox", "list", "--json"])
+    // The fake's identities are not UUIDs, so the helper is not told which
+    // one to expect (HostControlTests covers that): the app checks the Welcome.
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
     #expect(store.trustedHostID(for: devbox) == "host-a")
     #expect(controller.sessions.count == 1)
 
+    // The connection stays open; a refresh lists again.
+    let launches = fake.launches.count
     await controller.refresh(devbox)
-    #expect(cli.lastArguments == ["--host", "devbox", "--expected-host-id", "host-a", "list", "--json"])
+    #expect(fake.launches.count == launches)
     #expect(controller.error == nil)
 
     // A different machine (or a reset host) answers for the same destination.
-    try cli.write("host-id", "host-b\n")
+    fake.hostID = "host-b"
+    await dropConnections(of: devbox)
     await controller.refresh(devbox)
     #expect(controller.identityMismatchHost == devbox)
     #expect(controller.error?.contains("different host identity") == true)
@@ -420,10 +494,10 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(controller.sessions.isEmpty)
     #expect(store.trustedHostID(for: devbox) == "host-a")
     #expect(await controller.create(on: devbox, name: "blocked", cwd: "") == nil)
-    #expect(cli.lines("request-ids").isEmpty)
+    #expect(fake.requests("create").isEmpty)
 
     await controller.trustNewHostIdentity(devbox)
-    #expect(cli.lastArguments == ["--host", "devbox", "list", "--json"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
     #expect(controller.error == nil)
     #expect(controller.identityMismatchHost == nil)
     #expect(controller.hostID == "host-b")
@@ -433,13 +507,13 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     store.remove(devbox)
     #expect(store.trustedHostID(for: devbox) == nil)
 
-    // This Mac is never pinned: the CLI already rejects a local socket or
+    // This Mac is never pinned: the helper already rejects a local socket or
     // peer owned by another user, so a changed identity is still this user's host.
     await controller.refresh(.local)
-    #expect(cli.lastArguments == ["list", "--json"])
-    try cli.write("host-id", "host-c\n")
+    #expect(fake.launches.last?.arguments == ["control"])
+    fake.hostID = "host-c"
+    await dropConnections(of: .local)
     await controller.refresh(.local)
-    #expect(cli.lastArguments == ["list", "--json"])
     #expect(controller.error == nil)
     #expect(controller.identityMismatchHost == nil)
     #expect(controller.hostID == "host-c")
@@ -447,29 +521,29 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
 }
 
 @Test @MainActor func HostedSessionDiskImageCopyNeverRunsALocalHostCommand() async throws {
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
-    try cli.write("sessions", hostedSessionFixture)
+    let fake = FakeControlHelper(sessions: [try fixtureSession()])
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store)
+    defer { registry.disconnectAll() }
     let controller = HostedSessionsController(
-        clientProvider: { cli.client() }, hostStore: store,
+        controls: registry, hostStore: store,
         localHostUnavailableReason: "Move Cherry to Applications first."
     )
     let devbox = try HostedSessionHost.ssh("devbox")
     #expect(controller.isUnavailable(.local))
     #expect(!controller.isUnavailable(devbox))
 
-    // Even `cherry list` would start the local daemon from the disk image.
+    // Even connecting would start the local daemon from the disk image.
     await controller.refresh(.local)
     await controller.trustNewHostIdentity(.local)
-    #expect(cli.calls.isEmpty)
+    #expect(fake.launches.isEmpty)
     #expect(controller.loadedHost == nil)
     #expect(controller.hostID == nil)
     #expect(controller.error == nil)
     #expect(!controller.isBusy)
     #expect(await controller.create(on: .local, name: "local", cwd: "") == nil)
-    #expect(cli.calls.isEmpty)
+    #expect(fake.launches.isEmpty)
 
     // SSH hosts run their own daemon.
     await controller.refresh(devbox)
@@ -478,13 +552,90 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(controller.attachment(for: session, on: devbox) != nil)
     #expect(await controller.create(on: devbox, name: "remote", cwd: "") != nil)
 
-    // Switching back to This Mac clears the SSH list without a local command.
-    let calls = cli.calls.count
+    // Switching back to This Mac clears the SSH list without a local helper.
+    let launches = fake.launches.count
     await controller.refresh(.local)
-    #expect(cli.calls.count == calls)
+    #expect(fake.launches.count == launches)
+    #expect(fake.launches.allSatisfy { $0.arguments.first == "--host" })
     #expect(controller.sessions.isEmpty)
     #expect(controller.loadedHost == nil)
     #expect(controller.attachment(for: session, on: .local) == nil)
+}
+
+@Test @MainActor func HostedSessionSheetFollowsTheHostsLiveSessionList() async throws {
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper(sessions: [try fixtureSession()])
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store)
+    defer { registry.disconnectAll() }
+    let controller = HostedSessionsController(controls: registry, hostStore: store)
+    await controller.refresh(.local)
+    let connection = try #require(fake.connections.last)
+
+    // Another client creates a session and renames this one: the open sheet
+    // shows it without a refresh.
+    connection.push(.event(.added(hostedSession("other", name: "Other"))))
+    connection.push(.event(.changed(HostedSessionInfo(
+        id: "session-123", name: "Renamed", cwd: "/remote/project", command: ["/bin/zsh"], cols: 100, rows: 35, pid: 1234
+    ))))
+    let deadline = Date().addingTimeInterval(5)
+    while controller.sessions.count < 2 || controller.sessions.first?.name != "Renamed", Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(controller.sessions.map(\.id) == ["session-123", "other"])
+    #expect(controller.sessions.first?.displayName == "Renamed")
+    // The sheet keeps the host's connection while it shows the host.
+    #expect(registry.control(for: .local).state == .connected)
+}
+
+/// SwiftUI's `.task(id: selectedHost.id)` cancels the previous refresh when
+/// the host changes (or the sheet closes).
+@Test @MainActor func HostedSessionSheetSwitchingHostsWhileLoadingShowsTheNewHost() async throws {
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper(sessions: [hostedSession("s1")])
+    let held = FakeHeldRequest()
+    // The SSH host is slow to answer.
+    fake.respond = { request, connection in
+        guard request.op == "subscribe", connection.launch.arguments.first == "--host" else { return nil }
+        return held.hold(request, on: connection)
+    }
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store)
+    defer { registry.disconnectAll() }
+    let controller = HostedSessionsController(controls: registry, hostStore: store, localHostUnavailableReason: nil)
+    let devbox = try store.add("devbox")
+
+    let slow = Task { await controller.refresh(devbox) }
+    #expect(await fake.wait { held.isHeld })
+    #expect(controller.isBusy)
+    // The user picks This Mac: its load replaces the one under way.
+    slow.cancel()
+    await controller.refresh(.local)
+    #expect(controller.loadedHost == .local)
+    #expect(controller.hostID == "host-a")
+    #expect(controller.error == nil)
+    #expect(!controller.isBusy)
+
+    // The replaced load ends without reporting or changing anything.
+    held.answer(.ok)
+    await slow.value
+    #expect(controller.loadedHost == .local)
+    #expect(controller.sessions.map(\.id) == ["s1"])
+    #expect(controller.error == nil)
+    #expect(!controller.isBusy)
+
+    // Closing the sheet while a host loads is not an error either.
+    fake.respond = { request, connection in
+        guard request.op == "list", connection.launch.arguments.first == "--host" else { return nil }
+        return held.hold(request, on: connection)
+    }
+    let closed = Task { await controller.refresh(devbox) }
+    #expect(await fake.wait { held.isHeld })
+    closed.cancel()
+    await closed.value
+    #expect(controller.error == nil)
+    #expect(!controller.isBusy)
+    #expect(controller.loadedHost == nil)
 }
 
 @Test func HostedSessionConnectionBarOffersOnlyActionsTheTabCanTake() {
@@ -881,8 +1032,6 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
 }
 
 @Test @MainActor func HostedSessionSheetResolvesTheLoginEnvironmentOffTheMainActorAndExplainsItsAbsence() async throws {
-    let cli = try HostedSessionFakeCLI()
-    defer { cli.cleanUp() }
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
     final class Login: @unchecked Sendable {
@@ -906,21 +1055,20 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
         }
     }
     let login = Login()
-    let controller = HostedSessionsController(
-        clientProvider: {
-            HostedSessionClient(
-                executableURL: cli.executable, timeout: 5, loginEnvironment: { login.resolve(retryingNow: $0) }
-            )
-        },
-        hostStore: store,
-        terminationTimeout: 0.3
-    )
+    let fake = FakeControlHelper(sessions: [try fixtureSession()])
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store, clientProvider: {
+        HostedSessionClient(
+            executableURL: URL(fileURLWithPath: "/fake/bin/cherry"), loginEnvironment: { login.resolve(retryingNow: $0) }
+        )
+    })
+    defer { registry.disconnectAll() }
+    let controller = HostedSessionsController(controls: registry, hostStore: store, terminationTimeout: 0.3)
     let host = try HostedSessionHost.ssh("devbox")
     let hint = HostedSessionsController.missingLoginEnvironmentHint
     let captured = HostedSessionLoginEnvironment.Capture(environment: ["SSH_AUTH_SOCK": "/login/agent.sock"])
 
     // ssh could not authenticate while Cherry had no login environment: say so.
-    try cli.write("list-fails", "devbox: Permission denied (publickey).\n")
+    fake.exitBeforeWelcome = "devbox: Permission denied (publickey).\n"
     await controller.refresh(host)
     #expect(controller.error?.contains("Permission denied") == true)
     #expect(controller.error?.contains(hint) == true)
@@ -938,34 +1086,48 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(controller.error?.contains("Permission denied") == true)
     #expect(controller.error?.contains(hint) == false)
     // Nor for an answer that says nothing about reaching the host.
-    try FileManager.default.removeItem(at: cli.directory.appendingPathComponent("list-fails"))
-    try cli.write("sessions", "not json")
+    fake.exitBeforeWelcome = nil
+    fake.respond = { request, connection in
+        guard request.op == "list" else { return nil }
+        connection.write(try! HostFrame.frame(body: Data(#"{"type":"sessions","host_id":1,"req":\#(request.req!)}"#.utf8)))
+        return .silence
+    }
     await controller.refresh(host)
     #expect(controller.error?.contains("cannot read") == true)
     #expect(controller.error?.contains(hint) == false)
-    // Only the Refresh button skips the wait after a failed capture.
+    fake.respond = nil
+    // Each new connection resolves once; only the Refresh button skips the
+    // wait after a failed capture.
     #expect(login.resolves == [false, false, false, false, false])
+    login.capture = captured
     await controller.refresh(host, retryingLoginEnvironment: true)
     #expect(login.resolves.last == true)
 
-    // Helpers and attachments get what the last list or create resolved.
-    try cli.write("sessions", hostedSessionFixture)
-    login.capture = captured
-    await controller.refresh(host)
+    // Helpers and attachments get what the connection resolved.
     #expect(controller.error == nil)
     let listed = try #require(controller.sessions.first)
     let resolvesAfterList = login.resolves.count
     login.capture = .init(environment: ["SSH_AUTH_SOCK": "/later/agent.sock"])
     #expect(controller.attachment(for: listed, on: host)?.environment == ["SSH_AUTH_SOCK": "/login/agent.sock"])
-    // A kill and its polls never run the user's shell.
+    // A kill and the wait for its exit never run the user's shell, nor
+    // does a create on the open connection.
     await controller.terminate(listed, on: host)
-    #expect(cli.calls.contains { $0.hasSuffix("kill session-123") })
-    #expect(cli.read("ssh-auth-sock") == "/login/agent.sock")
-    #expect(login.resolves.count == resolvesAfterList)
+    #expect(fake.requests("kill").last?.string("id") == "session-123")
+    #expect(fake.launches.last?.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
     let created = await controller.create(on: host, name: "New", cwd: "~")
-    #expect(created?.environment == ["SSH_AUTH_SOCK": "/later/agent.sock"])
-    #expect(cli.read("ssh-auth-sock") == "/later/agent.sock")
-    #expect(login.resolves.count == resolvesAfterList + 1)
+    #expect(created?.environment == ["SSH_AUTH_SOCK": "/login/agent.sock"])
+    #expect(login.resolves.count == resolvesAfterList)
+    // A new connection resolves again, and its adapters get the new value.
+    fake.dropAll()
+    let control = registry.control(for: host)
+    let deadline = Date().addingTimeInterval(5)
+    while control.loginEnvironment?.environment["SSH_AUTH_SOCK"] != "/later/agent.sock" || control.state != .connected,
+          Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    await controller.refresh(host)
+    #expect(fake.launches.last?.environment["SSH_AUTH_SOCK"] == "/later/agent.sock")
+    #expect(controller.attachment(for: listed, on: host)?.environment == ["SSH_AUTH_SOCK": "/later/agent.sock"])
     #expect(login.resolvedOnMainThread == 0)
 }
 
@@ -1209,10 +1371,18 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
         throw HostedSessionError.message("Timed out waiting for \(description)")
     }
     try await waitFor("isolated host socket") { FileManager.default.fileExists(atPath: socket.path) }
-    let client = HostedSessionClient(
-        executableURL: cliURL, timeout: 10, loginEnvironment: { _ in .init(environment: helperVariables) }
+    // The app's control plane: `cherry control` over the isolated socket.
+    let control = HostControl(
+        host: .local,
+        clientProvider: {
+            HostedSessionClient(executableURL: cliURL, loginEnvironment: { _ in .init(environment: helperVariables) })
+        },
+        hostStore: HostedSessionHostStore(defaults: UserDefaults(suiteName: "CherryTests.RealHost.\(UUID().uuidString)")!),
+        masters: disabledSSHMasters,
+        localHostUnavailableReason: nil
     )
-    let initialList = try await client.list(on: .local)
+    defer { control.disconnect() }
+    let initialList = try await control.list()
     // The host keeps its identity in the private HOME.
     let stateRoot = home.appendingPathComponent("Library/Application Support/cherry-host", isDirectory: true)
     let stateKeys = try FileManager.default.contentsOfDirectory(atPath: stateRoot.path)
@@ -1234,24 +1404,12 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     printf '\\r\\nAFTER_SECOND_DISCONNECT'
     sleep 60
     """
-    // Session creation uses the real CLI with an explicit command. The public
-    // Swift client deliberately offers the simpler default-shell create flow.
-    let creation = Process()
-    let output = Pipe()
-    creation.executableURL = cliURL
-    creation.environment = helperEnvironment
-    creation.arguments = [
-        "--expected-host-id", initialList.hostID, "new", "--cwd=/tmp", "--name=Snapshot integration",
-        "--request-id", UUID().uuidString.lowercased(), "--", "/bin/sh", "-c", command
-    ]
-    creation.standardInput = FileHandle.nullDevice
-    creation.standardOutput = output
-    creation.standardError = FileHandle.standardError
-    try creation.run()
-    let createdJSON = output.fileHandleForReading.readDataToEndOfFile()
-    creation.waitUntilExit()
-    try #require(creation.terminationStatus == 0)
-    let created = try JSONDecoder().decode(HostedSessionInfo.self, from: createdJSON)
+    // Created through the control plane with an explicit command.
+    let created = try await control.create(
+        name: "Snapshot integration", cwd: "/tmp", command: ["/bin/sh", "-c", command],
+        expectedHostID: initialList.hostID
+    )
+    #expect(control.sessions.contains { $0.id == created.id })
     ownedChildPID = created.pid.map(Int32.init)
     try await waitFor("host application alternate screen") { FileManager.default.fileExists(atPath: ready.path) }
 
@@ -1278,7 +1436,7 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     session.disconnectHostedSession()
     #expect(session.hostedAttachmentStatus == .disconnected(nil))
     try await waitFor("second attachment to survive the first disconnect") {
-        let current = try await client.list(on: .local).sessions.first { $0.id == created.id }
+        let current = try await control.list().sessions.first { $0.id == created.id }
         return current?.attached == true && current?.pid == created.pid && current?.isRunning == true
     }
     session.reconnectHostedSession()
@@ -1306,13 +1464,14 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     try await waitFor("first client to continue after the second disconnects") {
         session.ghosttyBridge.readNativeScreenText()?.contains("AFTER_SECOND_DISCONNECT") == true
     }
-    let finalList = try await client.list(on: .local)
+    let finalList = try await control.list()
     #expect(finalList.sessions.count == 1)
     #expect(finalList.sessions.first?.id == created.id)
     #expect(finalList.sessions.first?.pid == created.pid)
-    try await client.terminate(created.id, on: .local, expectedHostID: initialList.hostID)
+    try await control.terminate(created.id, expectedHostID: initialList.hostID)
+    // The exit arrives as an event.
     try await waitFor("host process termination") {
-        try await client.list(on: .local).sessions.first?.isRunning == false
+        control.sessions.first { $0.id == created.id }?.isRunning == false
     }
     ownedChildPID = nil
     // The still-attached adapter reports the exit through its status file.

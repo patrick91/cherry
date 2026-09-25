@@ -294,27 +294,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
         func closeSelectedSessionOrWindow() {
             guard let workspace else { return }
-            if chromeState?.closeSelectedNoteIfNeeded() == true {
-                return
-            }
-
-            if !SessionCloseCoordinator.shouldCloseWindow(
-                for: workspace,
-                repository: repository
-            ) {
-                guard let session = workspace.selectedSession else { return }
-                SessionCloseCoordinator.close(
-                    session,
-                    in: workspace,
-                    chromeState: chromeState,
-                    allowEmptyWorkspace: SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(
-                        than: workspace,
-                        repository: repository
-                    )
-                )
-            } else {
-                window?.performClose(nil)
-            }
+            SessionCloseCoordinator.closeSelectedTabOrWindow(
+                workspace: workspace,
+                repository: repository,
+                chromeState: chromeState,
+                window: window
+            )
         }
 
         private func selectVisibleSidebarItem(number: Int) {

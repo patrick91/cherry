@@ -1,6 +1,11 @@
-//! `attach --status-file`: why the attachment ended, written atomically on
-//! every exit path so a supervising app can tell a session exit from a detach
-//! or a lost connection.
+//! `attach --status-file`: the attachment's live state while it runs, and
+//! why it ended, written atomically on every exit path so a supervising app
+//! can tell a session exit from a detach or a lost connection.
+//!
+//! While attached the file holds `{"outcome":"attached","viewport":…,
+//! "reconnecting":…,"exit_code":null,"signal":null,"message":null}`, rewritten
+//! whenever the viewport or reconnecting state changes. The final outcome
+//! replaces it when the command ends. A reader never sees a partial file.
 use serde::Serialize;
 use std::{
     io::Write,
@@ -11,6 +16,14 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Status {
     pub outcome: Outcome,
+    /// While attached: the window shows a viewport of a shared grid of
+    /// another size, rather than the session's stream as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<bool>,
+    /// While attached: the connection to the host was lost and the
+    /// attachment is connecting again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnecting: Option<bool>,
     pub exit_code: Option<u32>,
     pub signal: Option<i32>,
     pub message: Option<String>,
@@ -19,6 +32,8 @@ pub struct Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    /// Still attached (or connecting again); not a final outcome.
+    Attached,
     /// This client detached; the session keeps running.
     Detached,
     /// The hosted program ended.
@@ -35,6 +50,8 @@ impl Status {
     pub fn new(outcome: Outcome, message: Option<String>) -> Self {
         Self {
             outcome,
+            viewport: None,
+            reconnecting: None,
             exit_code: None,
             signal: None,
             message,
@@ -43,12 +60,27 @@ impl Status {
 
     pub fn exited(exit_code: u32, signal: Option<i32>) -> Self {
         Self {
-            outcome: Outcome::Exited,
             exit_code: Some(exit_code),
             signal,
-            message: None,
+            ..Self::new(Outcome::Exited, None)
         }
     }
+
+    /// The live state of a running attachment.
+    pub fn attached(live: Live) -> Self {
+        Self {
+            viewport: Some(live.viewport),
+            reconnecting: Some(live.reconnecting),
+            ..Self::new(Outcome::Attached, None)
+        }
+    }
+}
+
+/// What the status file says while the attachment runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Live {
+    pub viewport: bool,
+    pub reconnecting: bool,
 }
 
 pub struct StatusFile {
@@ -57,6 +89,9 @@ pub struct StatusFile {
     /// disconnections rather than failures to attach.
     pub attached: bool,
     status: Option<Status>,
+    /// The live state last written.
+    live: Option<Live>,
+    /// The final outcome was written; nothing is written after it.
     written: bool,
 }
 
@@ -66,7 +101,24 @@ impl StatusFile {
             path,
             attached: false,
             status: None,
+            live: None,
             written: false,
+        }
+    }
+
+    /// While attached: write the live state when it changed. A failure is
+    /// not reported here, in the middle of the session's screen; the final
+    /// write reports its own. The live state is not synced to disk, which
+    /// would hold up the attachment for nothing: it matters only while this
+    /// process runs.
+    pub fn live(&mut self, live: Live) {
+        self.attached = true;
+        if self.written || self.live == Some(live) {
+            return;
+        }
+        self.live = Some(live);
+        if let Some(path) = &self.path {
+            let _ = write(path, &Status::attached(live), false);
         }
     }
 
@@ -107,6 +159,11 @@ impl StatusFile {
 
 /// Write beside the target and rename, so a reader never sees a partial file.
 pub fn write_atomically(path: &Path, status: &Status) -> std::io::Result<()> {
+    write(path, status, true)
+}
+
+/// `write_atomically`, synced to disk before the rename when `durable`.
+fn write(path: &Path, status: &Status, durable: bool) -> std::io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("status file path has no file name"))?;
@@ -125,7 +182,9 @@ pub fn write_atomically(path: &Path, status: &Status) -> std::io::Result<()> {
         let mut json = serde_json::to_vec(status)?;
         json.push(b'\n');
         file.write_all(&json)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         std::fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -182,6 +241,58 @@ mod tests {
         );
         assert!(json(&Status::new(Outcome::Disconnected, None)).contains(r#""disconnected""#));
         assert!(json(&Status::new(Outcome::Failed, None)).contains(r#""failed""#));
+        assert_eq!(
+            json(&Status::attached(Live {
+                viewport: true,
+                reconnecting: false
+            })),
+            r#"{"outcome":"attached","viewport":true,"reconnecting":false,"exit_code":null,"signal":null,"message":null}"#
+        );
+    }
+
+    #[test]
+    fn the_live_state_is_rewritten_on_changes_until_the_final_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.json");
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let mut file = StatusFile::new(Some(path.clone()));
+        let live = |viewport, reconnecting| Live {
+            viewport,
+            reconnecting,
+        };
+        file.live(live(false, false));
+        assert!(file.attached);
+        assert_eq!(read()["outcome"], "attached");
+        assert_eq!(read()["reconnecting"], false);
+        // Unchanged: not written again.
+        std::fs::write(&path, b"{}").unwrap();
+        file.live(live(false, false));
+        assert_eq!(read(), serde_json::json!({}));
+        file.live(live(false, true));
+        assert_eq!(read()["reconnecting"], true);
+        assert_eq!(read()["viewport"], false);
+        file.live(live(true, false));
+        assert_eq!(read()["viewport"], true);
+        assert_eq!(read()["reconnecting"], false);
+        file.finish(Some("connection lost"));
+        let last = read();
+        assert_eq!(last["outcome"], "disconnected");
+        assert!(last.get("viewport").is_none() && last.get("reconnecting").is_none());
+        // Nothing after the final outcome.
+        file.live(live(false, true));
+        assert_eq!(read(), last);
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["status.json"], "temporary file left behind");
+
+        // Without a path nothing is written, but the attachment is known.
+        let mut file = StatusFile::new(None);
+        file.live(live(false, false));
+        assert!(file.attached);
     }
 
     #[test]

@@ -32,12 +32,14 @@ identifier ($bundle_id), icon, settings,
 and application data. Your existing Cherry installation is not replaced.
 
 1. Drag $app_name.app to Applications, then open it from Applications.
-2. Open File > Persistent Sessions (Command-Shift-R).
-3. Select This Mac, enter a name, and choose Create & Attach.
-   Leave the working directory empty to use your home directory.
-4. Start a shell command or editor. Close the tab or quit Cherry.
-5. Reopen Persistent Sessions, select the same session, and attach again.
-   The original process and terminal state are still there.
+   While it runs from the disk image, its local tabs are ordinary tabs.
+2. Open a project. Its terminal, command and agent tabs run as persistent
+   sessions (Settings > Sessions turns this off).
+3. Start a shell command or editor in a tab, then quit $app_name.
+4. Open it again: the tab comes back with the original process and terminal
+   state. Closing a tab ends its session unless Settings > Sessions keeps it.
+5. File > Persistent Sessions (Command-Shift-R) lists the sessions on This Mac
+   and on SSH hosts, and creates and attaches to more.
 
 You can attach to the same session on another device while this one stays
 connected. Both terminals can type and see the same output. The shared
@@ -56,19 +58,15 @@ on that machine's SSH command PATH. First verify ordinary SSH access and:
 Then add that SSH alias in Persistent Sessions on your laptop.
 The portable host can also be built for Linux from the source repository.
 
-Sessions survive app exit and SSH disconnection while the host daemon runs.
-They do not survive a host reboot or daemon restart. Existing regular local
-tabs are not converted into persistent sessions automatically.
+Sessions survive quitting or a crash of $app_name, SSH disconnection, and a
+crash or restart of the host daemon: each session's own holder process keeps
+it running. They end when that machine reboots.
 
-A running host daemon keeps running the cherry-host it was started with;
-replacing the app does not update it. Before installing a new build, finish
-or terminate your sessions, then stop the daemon here and on remote hosts:
-  cd "/Applications/$app_name.app/Contents/MacOS"
-  ./cherry shutdown
-  ./cherry --host your-host shutdown
-Shutdown is refused while a session is running. Update the app and each
-remote cherry-host together: a daemon that speaks another protocol version
-is refused, and is never stopped or replaced automatically.
+Updating the app does not end sessions. A host daemon that speaks an older
+protocol is replaced when the new version connects, and its sessions carry
+on. On a remote host, also put the new cherry-host on its SSH command PATH.
+A daemon that speaks a newer protocol than this app is reported, never
+replaced.
 
 This is a locally signed test build; it is not notarized for distribution.
 EOF

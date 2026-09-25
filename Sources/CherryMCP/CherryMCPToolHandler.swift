@@ -122,7 +122,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "wait_for_process_idle",
-            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
+            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval (a notification said so, or its screen shows a permission prompt) and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
             properties: idleWaitProperties()
         ),
         tool(
@@ -153,7 +153,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "spawn_process",
-            "Create a terminal, configured agent, or trusted project command process without selecting it. For agent/command, name must match configured Cherry settings.",
+            "Create a terminal, configured agent, or trusted project command process without selecting it. For agent/command, name must match configured Cherry settings. Initial text or raw bytes are delivered once the process has started (a persistent-session tab's session may take a moment to be created); the process is created either way, and sent_bytes is 0 when its first input did not reach it.",
             properties: [
                 "kind": string("Process kind: terminal, agent, or command."),
                 "name": string("Configured agent or command name. Not used for terminal."),
@@ -161,7 +161,7 @@ public enum CherryMCPTools {
                 "title": string("Optional custom title."),
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
-                "raw_base64": string("Optional exact raw bytes to send after launch, base64-encoded."),
+                "raw_base64": string("Optional raw bytes to send after launch, base64-encoded. Unlike text, they are not normalized for the session, though key sequences in them may be re-encoded for the program's key modes."),
                 "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
                 "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the bound caller agent when available; unbound sessions create top-level agents."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
@@ -171,7 +171,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "spawn_agent",
-            "Create a configured Cherry agent process without selecting it. This is the agent-specific wrapper around spawn_process.",
+            "Create a configured Cherry agent process without selecting it. This is the agent-specific wrapper around spawn_process. The agent is created either way; sent_bytes is 0 when its first message did not reach it.",
             properties: [
                 "name": string("Configured agent name."),
                 "model": string("Optional model override for supported agent CLIs."),
@@ -191,17 +191,17 @@ public enum CherryMCPTools {
         ),
         tool(
             "stop_process",
-            "Stop one process by process_id or process_name without selecting it. For a persistent-session tab this only disconnects the tab (state becomes disconnected); the hosted program keeps running on its host.",
+            "Stop one process by process_id or process_name without selecting it. Its program ends (a local persistent-session tab's session on the local host ends with it), and the process then reports state 'exit 0' with exit_code 0, whatever signal ended it; start_process starts it again. A tab attached to a hosted session it does not own (another machine's, another app's or the CLI's) only disconnects (state disconnected); that program keeps running on its host.",
             properties: processSelectorProperties(lifecycleProperties())
         ),
         tool(
             "restart_process",
-            "Restart one process by process_id or process_name without selecting it. For a persistent-session tab this reconnects its attach client; one whose session ended on its host is rejected with hosted_session_ended.",
+            "Restart one process by process_id or process_name without selecting it. A local persistent-session tab's session is ended and a new one is started in the same process (same process_id). A tab attached to a hosted session it does not own reconnects its attach client; one whose session ended on its host is rejected with hosted_session_ended.",
             properties: processSelectorProperties(lifecycleProperties())
         ),
         tool(
             "close_process",
-            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy. Closing a persistent-session tab disconnects it; the hosted program keeps running on its host.",
+            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy. Closing a local persistent-session tab ends its session, as its close button does, unless Cherry is set to keep local sessions running after closing a tab. Closing a tab attached to a hosted session it does not own only disconnects it; that program keeps running on its host.",
             properties: processSelectorProperties([
                 "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
             ])
@@ -218,10 +218,10 @@ public enum CherryMCPTools {
         ),
         tool(
             "send_process_input",
-            "Send terminal text or raw bytes to an existing process by process_id or process_name.",
+            "Send terminal text or raw bytes to an existing process by process_id or process_name. sent_bytes counts what reached the program. Input to an agent is checked against what the agent shows first (read from its session host when no terminal shows it, as for an agent restored after Cherry relaunched): it is never typed into a permission prompt, where Enter would approve the pending action. Errors: process_not_accepting_input (the process has ended, failed to start, or is a disconnected attached session; nothing was sent), agent_awaiting_permission (the agent shows a permission prompt; nothing was sent: let the user answer it, or send the answering keys deliberately as raw_base64 without submit), input_not_delivered (its host did not take the input, for example the session ended or the host could not be reached, or an agent's screen could not be read from its host; nothing was sent), input_partially_delivered (only a first part reached the program: an agent message whose text was typed but whose Enter did not reach the agent, or input longer than 64 KiB whose later part the host did not take; the message says how many bytes were typed, and which bytes after them may have been when the host's answer was lost, so do not resend all of it).",
             properties: processSelectorProperties([
                 "text": string("Text to type. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
-                "raw_base64": string("Exact raw bytes to send, base64-encoded."),
+                "raw_base64": string("Raw bytes to send, base64-encoded. Unlike text, they are not normalized for the session, though key sequences in them may be re-encoded for the program's key modes: unmodified arrow, Home and End keys (ESC [ A or ESC O A …) follow its cursor key mode."),
                 "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
@@ -229,7 +229,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "send_agent_message",
-            "Send a human-style message to a Cherry agent process and optionally wait for the agent to go idle.",
+            "Send a human-style message to a Cherry agent process and optionally wait for the agent to go idle. The message is never typed into a permission prompt the agent shows: it fails with agent_awaiting_permission and nothing is sent.",
             properties: processSelectorProperties([
                 "message": string("Message to submit to the agent. A final Enter is added automatically when omitted."),
                 "wait_for_idle": boolean("Whether to wait for new output and a quiet period after sending. Defaults to true."),
@@ -1382,14 +1382,39 @@ public enum CherryMCPTools {
         )
     }
 
-    private static func clientTimeout(for toolName: String, arguments: [String: Value]) -> TimeInterval? {
+    /// How long the MCP client waits for Cherry's answer to a tool call:
+    /// nil for the client's default (10 s).
+    static func clientTimeout(for toolName: String, arguments: [String: Value]) -> TimeInterval? {
         switch toolName {
-        case "spawn_agent":
+        case "spawn_agent", "spawn_process", "send_process_input":
+            // Input waits until it reached the program: a persistent-session
+            // tab's session may still be created (Cherry gives up after about
+            // 16 s), and an agent's input waits for it to be ready. A new
+            // agent's first message waits for its session (up to 8 s), then
+            // for the agent (up to 6 s), then for the host to take it, and
+            // the output is read from the host (up to 2 s) after `wait_ms`.
             let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
-            return TimeInterval(waitMilliseconds) / 1_000 + 12
-        case "wait_for_process_idle", "send_agent_message":
+            // A command first waits (at most 10 s) for a restore under way
+            // that may bring back its tab, as start_process does.
+            let spawnsCommand = toolName == "spawn_process"
+                && stringArgument("kind", in: arguments)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "command"
+            return TimeInterval(waitMilliseconds) / 1_000 + 20 + (spawnsCommand ? 10 : 0)
+        case "start_process", "start_all_commands", "restart_all_commands":
+            // A restore under way may bring back the command's tab: Cherry
+            // waits for it (at most 10 s) before it starts anything, then
+            // waits `wait_ms`.
+            let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
+            return TimeInterval(waitMilliseconds) / 1_000 + 10 + 10
+        case "wait_for_process_idle":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5
+        case "send_agent_message":
+            // One client for the message and the idle wait: the message
+            // needs what send_process_input does (20 s), the wait its
+            // timeout.
+            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
+            return max(TimeInterval(timeoutMilliseconds) / 1_000 + 5, 20)
         case "wait_for_bound_port":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 10_000, 1), 60_000)
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5

@@ -2,11 +2,20 @@
 //! lines the remote cherry-host prints about its own failure
 //! (`cherry-host: …`). Those are held so the CLI can report them once, in its
 //! own error message, or print them when the connection ends.
+//!
+//! A quiet relay passes nothing through and prints nothing: an attachment's
+//! connection once its screen shows the session, and every connection an
+//! attachment makes to reconnect, where ssh's complaints would land in the
+//! middle of the session's screen. The last lines are kept for messages.
 use crate::sys;
 use std::{
+    collections::VecDeque,
     io::{self, Read},
     process::ChildStderr,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -16,10 +25,14 @@ const REPORT_PREFIX: &[u8] = b"cherry-host: ";
 const MAX_REPORT_LINE: usize = 4096;
 /// Only the latest reports are kept.
 const MAX_REPORTS: usize = 16;
+/// While quiet, the latest lines kept, each at most `MAX_REPORT_LINE` bytes.
+const MAX_HELD: usize = 4;
 
 #[derive(Default)]
 struct State {
     reports: Vec<String>,
+    /// Lines that a quiet relay did not pass through, the latest last.
+    held: VecDeque<String>,
     /// ssh closed its standard error.
     closed: bool,
 }
@@ -28,16 +41,20 @@ type Shared = Arc<(Mutex<State>, Condvar)>;
 
 pub struct StderrRelay {
     shared: Shared,
+    quiet: Arc<AtomicBool>,
 }
 
 impl StderrRelay {
-    pub fn start(mut source: ChildStderr) -> io::Result<Self> {
+    pub fn start(mut source: ChildStderr, quiet: bool) -> io::Result<Self> {
         let shared: Shared = Arc::default();
+        let quiet = Arc::new(AtomicBool::new(quiet));
         let state = shared.clone();
+        let silenced = quiet.clone();
         thread::Builder::new()
             .name("cherry-ssh-stderr".into())
             .spawn(move || {
                 let mut filter = ReportFilter::default();
+                let mut line = Vec::new();
                 let mut buffer = [0u8; 4096];
                 loop {
                     let n = match source.read(&mut buffer) {
@@ -47,12 +64,24 @@ impl StderrRelay {
                         Err(_) => break,
                     };
                     let (passed, reports) = filter.feed(&buffer[..n]);
-                    publish(&state, &passed, reports, false);
+                    let quiet = silenced.load(Ordering::Relaxed);
+                    publish(&state, &passed, reports, quiet, &mut line, false);
                 }
                 let (passed, reports) = filter.finish();
-                publish(&state, &passed, reports, true);
+                let quiet = silenced.load(Ordering::Relaxed);
+                publish(&state, &passed, reports, quiet, &mut line, true);
             })?;
-        Ok(Self { shared })
+        Ok(Self { shared, quiet })
+    }
+
+    /// Pass nothing through from now on, and print nothing when the
+    /// connection ends.
+    pub fn silence(&self) {
+        self.quiet.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_quiet(&self) -> bool {
+        self.quiet.load(Ordering::Relaxed)
     }
 
     /// Take the reports held so far, first waiting up to `timeout` until
@@ -67,16 +96,49 @@ impl StderrRelay {
             .unwrap_or_else(|error| error.into_inner());
         std::mem::take(&mut state.reports)
     }
+
+    /// The last line a quiet relay held, or else the last report, first
+    /// waiting up to `timeout` until ssh closed its standard error: ssh may
+    /// explain why it ended just after its output ended.
+    pub fn last_line(&self, timeout: Duration) -> Option<String> {
+        let (lock, changed) = &*self.shared;
+        let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !state.closed)
+            .unwrap_or_else(|error| error.into_inner());
+        state.held.back().or(state.reports.last()).cloned()
+    }
 }
 
-fn publish(shared: &Shared, passed: &[u8], reports: Vec<String>, closed: bool) {
-    if !passed.is_empty() {
+/// Pass `passed` through, or hold its lines when `quiet`; record `reports`.
+/// `line` is the unfinished line held so far.
+fn publish(
+    shared: &Shared,
+    passed: &[u8],
+    reports: Vec<String>,
+    quiet: bool,
+    line: &mut Vec<u8>,
+    closed: bool,
+) {
+    let mut held = Vec::new();
+    if quiet {
+        for &byte in passed {
+            if byte == b'\n' {
+                held.extend(complete_line(line));
+            } else if line.len() < MAX_REPORT_LINE {
+                line.push(byte);
+            }
+        }
+        if closed {
+            held.extend(complete_line(line));
+        }
+    } else if !passed.is_empty() {
         // Our stderr may share a non-blocking file description with the
         // terminal. Bytes it does not accept within a second are dropped
         // rather than stalling ssh.
         let _ = sys::write_all(libc::STDERR_FILENO, passed, Duration::from_secs(1), false);
     }
-    if reports.is_empty() && !closed {
+    if reports.is_empty() && held.is_empty() && !closed {
         return;
     }
     let (lock, changed) = &**shared;
@@ -84,8 +146,18 @@ fn publish(shared: &Shared, passed: &[u8], reports: Vec<String>, closed: bool) {
     state.reports.extend(reports);
     let excess = state.reports.len().saturating_sub(MAX_REPORTS);
     state.reports.drain(..excess);
+    state.held.extend(held);
+    let excess = state.held.len().saturating_sub(MAX_HELD);
+    state.held.drain(..excess);
     state.closed |= closed;
     changed.notify_all();
+}
+
+/// The line held so far, trimmed, unless it is blank; the line starts over.
+fn complete_line(line: &mut Vec<u8>) -> Option<String> {
+    let text = String::from_utf8_lossy(line).trim().to_owned();
+    line.clear();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Splits a byte stream into bytes to pass on and complete report lines.
@@ -198,5 +270,60 @@ mod tests {
         let (passed, reports) = filter(&[&long, b"\n"]);
         assert_eq!(passed.len(), long.len() + 1);
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_quiet_relay_holds_the_latest_lines_instead_of_passing_them() {
+        let quiet_relay = |shared| StderrRelay {
+            shared,
+            quiet: Arc::new(AtomicBool::new(true)),
+        };
+        let shared: Shared = Arc::default();
+        let mut line = Vec::new();
+        let chunks: [&[u8]; 3] = [
+            b"\r\none\r\ntwo\nthree\n",
+            b"ssh: connect to host devbox",
+            b" port 22: Network is unreachable\r\n\n",
+        ];
+        for chunk in chunks {
+            publish(&shared, chunk, Vec::new(), true, &mut line, false);
+        }
+        let relay = quiet_relay(shared);
+        // ssh has not closed its standard error yet.
+        assert_eq!(
+            relay.last_line(Duration::from_millis(10)).as_deref(),
+            Some("ssh: connect to host devbox port 22: Network is unreachable")
+        );
+        publish(
+            &relay.shared,
+            b"last words",
+            Vec::new(),
+            true,
+            &mut line,
+            true,
+        );
+        assert_eq!(
+            Vec::from(relay.shared.0.lock().unwrap().held.clone()),
+            [
+                "two",
+                "three",
+                "ssh: connect to host devbox port 22: Network is unreachable",
+                "last words"
+            ]
+        );
+        assert_eq!(
+            relay.last_line(Duration::ZERO).as_deref(),
+            Some("last words")
+        );
+
+        // Without a held line, the last report; with neither, nothing.
+        let shared: Shared = Arc::default();
+        let report = vec!["cherry-host: host exited".to_owned()];
+        publish(&shared, b"", report, true, &mut Vec::new(), true);
+        assert_eq!(
+            quiet_relay(shared).last_line(Duration::ZERO).as_deref(),
+            Some("cherry-host: host exited")
+        );
+        assert_eq!(quiet_relay(Arc::default()).last_line(Duration::ZERO), None);
     }
 }

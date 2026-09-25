@@ -1,10 +1,15 @@
 # Cherry session host
 
-Cherry's opt-in persistent sessions run in a portable Rust daemon on macOS or
-Linux. The daemon owns the PTY and a headless Ghostty terminal; the `cherry`
-client reconnects locally through a Unix socket or remotely through system SSH.
-Closing Cherry, detaching, or losing SSH leaves the workload running while the
-host daemon remains alive. There is no public network listener or relay.
+Cherry runs its local terminal, command and agent tabs as persistent sessions
+by default, and can attach to sessions on other Macs and Linux machines over
+SSH. The sessions live in a portable Rust host on macOS or Linux: each session
+has its own holder process (`cherry-host hold`), which owns the PTY, the
+program and a headless Ghostty terminal, and a daemon (`cherry-host serve`)
+registers the holders and serves the clients. The `cherry` client connects
+locally through a Unix socket or remotely through system SSH. Closing Cherry,
+detaching, losing SSH, and a crash, restart or upgrade of the daemon leave the
+workload running; a reboot of the machine ends it. There is no public network
+listener or relay.
 
 ## Build and install
 
@@ -76,31 +81,71 @@ a particular program, append `-- PROGRAM ARG...`:
 
 ```sh
 cherry new --cwd /absolute/path/to/project --name Editor -- nvim README.md
+cherry new --cwd '~' --env EDITOR=nvim --owner my-script --tag role=build -- make watch
 cherry list --json
 ```
+
+`--env NAME=VALUE` sets a variable in the session's environment (a letter or
+underscore, then letters, digits or underscores; repeatable, the last value of
+a name wins; see
+[Session environment](#session-environment-and-working-directory)). `--owner`
+records who created the session (the Mac app records its app identity and
+restores only its own sessions), and `--tag KEY=VALUE` keeps metadata with it
+(repeatable; at most 64 tags, keys of 1 to 128 bytes, 16 KiB in all). Use the
+`--owner=VALUE` and `--tag=KEY=VALUE` forms for values that start with `-`.
 
 `--cwd` accepts an absolute path, `~`, or `~/…`; the host expands `~` with its
 own `HOME` and rejects relative paths. An empty value (`--cwd=`) means the home
 directory. Quote `~` so your local shell does not expand it:
 `--cwd '~/project'`. Use the `--name=VALUE` and `--cwd=VALUE` forms for values
 that start with `-`. A new session starts at 120×32; the first attachment sets
-its real size. `list --json` prints `{"host_id": …, "sessions": […]}`; each
-session has `id`, `name`, `cwd`, `command`, `cols`, `rows`, `state` (`running`
-or `exited`), `pid`, `exit_code`, `exit_signal`, and `attached`.
+its real size. `list --json` prints
+`{"host_id": …, "pending_holders": N, "sessions": […]}`. `pending_holders`
+counts the sessions that a daemon which just started still expects back from
+their holders (see [Lifetime](#lifetime-service-setup-and-updates)): a
+session missing from the list may still come back, so list again while it is
+not 0. Each session has `id`, `name`, `cwd`, `command`, `cols`, `rows`,
+`state` (`running` or `exited`), `pid`, `exit_code`, `exit_signal`,
+`attached`, `clients` (how many clients are attached), `title` and `pwd` (as
+the program last reported them), `foreground` (`{"pid", "name"}` of the
+terminal's foreground process group while it runs), `owner`, `tags`,
+`created_at` (milliseconds since the Unix epoch), `alternate_screen`,
+`kitty_keyboard_flags` (0 for legacy key encoding),
+`application_cursor_keys` (whether the program turned on application cursor
+keys, DECCKM `ESC[?1h`, so unmodified arrows, Home and End go as `ESC O x`
+in legacy key encoding; while `kitty_keyboard_flags` is not 0 the kitty
+encoding applies instead and never sends them as `ESC O x`; always false for
+a session whose holder predates holder link version 4, so false can also mean
+unknown) and `request_id` (the request ID of the `new` that created it).
 
 `kill` explicitly terminates the workload (see
 [Lifetime](#lifetime-service-setup-and-updates)). `remove` only removes an
 exited session's retained record; it refuses live sessions. Exited sessions
 remain listed until removed. Attaching to an exited session shows its final
 screen, then exits with its exit code. `shutdown` stops the daemon and is
-refused while any session is running. When it returns, the daemon has already
-removed its socket and released its lock, so a new daemon can start at once.
-`start` starts the local daemon without doing anything else.
+refused while any session is running; it also ends the holders of exited
+sessions. When it returns, the daemon has already removed its socket and
+released its lock, so a new daemon can start at once. `start` starts the local
+daemon without doing anything else.
+
+`cherry control` connects as `list` does (starting a host, or replacing one
+that speaks an older protocol, when needed) and then relays protocol frames
+between its standard input and output until either side closes: standard
+output starts with the host's `Welcome`, and the caller sends requests, not
+`Hello`. The Mac app keeps one such connection per host for listing,
+creating, ending, typing into and reading sessions, and for their events.
+With `--host`, `--ssh-control-path PATH` makes every ssh the command runs use
+the SSH master connection listening at `PATH` (`-o ControlPath=PATH`, next to
+`-o ControlMaster=no`), or connect directly when none is; the path is absolute,
+at most 100 bytes, without spaces, quotes, backslashes, `=`, `${` or control
+characters. The Mac app passes the master connection it keeps per SSH
+destination.
 
 Multiple terminals can attach to the same session and type into it. Each
-receives the same output; closing one leaves the others connected. Reconnect
-is explicit, and keyboard input is never automatically replayed after a lost
-connection. The shared terminal uses the smallest requested column count and
+receives the same output; closing one leaves the others connected. `attach`
+connects again by itself after a lost connection (see
+[Reconnecting](#attach-options)), and keyboard input is never replayed after a
+lost connection. The shared terminal uses the smallest requested column count and
 row count among its attached clients, so the application fits on every device.
 It grows again when the smaller client disconnects. The larger terminal
 displays the shared screen at its top left; see the scrollback limits below.
@@ -168,9 +213,63 @@ refused.
   would last, and then exits the same way; the message says the host stopped
   reading the connection without confirming the detach. Outcome `detached`
   with a `null` `message` always means the host confirmed.
-- **`--status-file PATH`.** On every exit path, including signals and a lost
-  connection, the CLI writes one JSON object to `PATH` (a temporary file in the
-  same directory, then a rename; mode 0600):
+- **Reconnecting.** When the connection is lost while the session may still
+  run (its end of file, a failed read or write, a host that accepted and sent
+  nothing for 45 seconds, a daemon that crashed, restarted or made way for a
+  newer version), `attach` keeps the terminal as it is (raw mode, the screen)
+  and connects again for 30 seconds from the loss: at once, then after 250 ms,
+  doubling up to 2 s. Once attached again it starts over from the host's new
+  snapshot. One attempt may take 5 seconds to connect locally, 15 over SSH,
+  and as long again for each answer. Attempts run beside the terminal, so the
+  detach key and end of input still act at once; detaching while reconnecting
+  exits 0 with outcome `detached` and a message that says so. A reattachment
+  that is lost again within 10 seconds continues the same reconnection: its
+  window still counts from the first loss. Reconnecting never takes over (even
+  when the first attach did), starts or replaces a local host as `attach`
+  does, and runs ssh in batch mode (`-o BatchMode=yes -o ConnectTimeout=10`),
+  so it cannot prompt. What ssh, or a host started to reconnect, prints never
+  reaches the screen once the session shows; its last line goes into the
+  message.
+
+  It never reconnects after the program exited, a takeover, a detach or a
+  host error, and it stops at once, with outcome `disconnected`, when
+  connecting again cannot help: another host identity answers, the host
+  speaks a protocol this `cherry` cannot use or replace (a newer one, one
+  older than protocol 4, or one that refused to make way), the remote
+  gateway is another version of cherry-host, or the host no longer has the
+  session. Otherwise it gives up when the window ends; the message then ends
+  with `could not reconnect within 30 s (<last error>)`.
+
+  Input is never sent twice, or sent blind. What the lost connection had not
+  delivered is dropped with it, since the host may or may not have queued it.
+  Terminal input typed while reconnecting is discarded, and
+  `cherry: reconnecting; input is discarded` is painted once over the top
+  line. After a reattach, the rest of a bracketed paste the terminal began
+  before the attachment was back (its start went over the lost connection,
+  or it began while reconnecting) is discarded too, until its end marker or
+  until the terminal sends nothing for 1 second, so that its lines are not
+  run as typed commands. Only then, and only when the paste's start marker
+  had been written to the lost connection and the session still has
+  bracketed paste (mode 2004) on, is an end marker (`ESC [201~`) sent first,
+  so the program does not take what is typed next as pasted. Input from a
+  pipe or a file is not read while reconnecting; once some of it went to the
+  lost connection, the attachment ends as `disconnected` instead, since a
+  part of it may be missing.
+- **`--status-file PATH`.** The CLI writes one JSON object to `PATH` (a
+  temporary file in the same directory, then a rename, so a reader never sees
+  a partial file; mode 0600). Once the first snapshot is painted, and again
+  whenever `viewport` or `reconnecting` changes, it holds the live state:
+
+  ```json
+  {"outcome":"attached","viewport":false,"reconnecting":false,"exit_code":null,"signal":null,"message":null}
+  ```
+
+  `viewport` is true while the window paints a viewport of a shared grid of
+  another size; `reconnecting` is true while the attachment connects again.
+  `attached` is not a final outcome, and a CLI killed with SIGKILL leaves it
+  in the file, so a supervisor should also watch the process. On every exit
+  path, including signals and a lost connection, the final outcome replaces
+  it:
 
   ```json
   {"outcome":"exited","exit_code":129,"signal":1,"message":null}
@@ -178,11 +277,12 @@ refused.
 
   `outcome` is `detached` (this client detached; the session keeps running),
   `exited` (the program ended; `exit_code` and `signal` are set),
-  `disconnected` (the connection was lost or the CLI was interrupted after
-  attaching; the session may still run), `taken_over` (another client used
-  `--takeover`), or `failed` (the CLI could not attach, or rejected its command
-  line). `message` explains every outcome except `exited` and a confirmed
-  detach, where it is `null`.
+  `disconnected` (the connection was lost and not reconnected, or the CLI was
+  interrupted after attaching; the session may still run), `taken_over`
+  (another client used `--takeover`), or `failed` (the CLI could not attach,
+  or rejected its command line). `message` explains every outcome except
+  `exited` and a confirmed detach, where it is `null`. A final outcome has no
+  `viewport` or `reconnecting` field.
 - **Exit status.** `attach` exits with the session's exit code when the program
   ended, 0 when it detached (also without the host's confirmation), 1 for
   errors (including `taken_over` and a lost connection), and 2 for usage
@@ -211,31 +311,54 @@ ssh -T -o ControlMaster=no -o RemoteCommand=none -o ClearAllForwardings=yes \
   -- my-server 'cherry-host gateway'
 ```
 
-It never becomes an SSH ControlMaster (it can still use an existing one) and
-ignores an alias's `RemoteCommand` and port forwards. `attach` keeps your
-agent forwarding settings (see [agent forwarding](#sockets-state-and-access)).
-`--socket` is passed on as `cherry-host gateway --socket 'PATH'`. Management
-commands (`list`, `new`, `kill`, `remove`, `shutdown`) add
+It never becomes an SSH ControlMaster (it can still use an existing one, and
+`--ssh-control-path` adds `-o ControlPath=PATH`) and ignores an alias's
+`RemoteCommand` and port forwards. `attach` keeps your agent forwarding
+settings (see [agent forwarding](#sockets-state-and-access)). `--socket` is
+passed on as `cherry-host gateway --socket 'PATH'`. Management commands
+(`list`, `new`, `kill`, `remove`, `shutdown`) add
 `-a -o BatchMode=yes -o ConnectTimeout=10`, so they never forward an agent,
 and must finish within 30 seconds; the desktop cannot answer password or
-host-key prompts in the background. `kill`, `remove`, and `shutdown` run
+host-key prompts in the background. `control`, and the connections an
+attachment makes to reconnect, add `-o BatchMode=yes -o ConnectTimeout=10`
+and keep your agent forwarding settings. `kill`, `remove`, and `shutdown` run
 `cherry-host gateway --no-start`. `attach` may prompt and allows 120 seconds
 for the handshake.
 
-The gateway prints `CHERRY-GATEWAY 3` on a line of its own before relaying
-protocol frames. The client skips up to 64 KiB of output that a remote shell
-prints before that line. Beyond that it fails with "the remote shell printed
-output before cherry-host gateway started; remove output from non-interactive
-shell startup files such as ~/.bashrc" and the first line printed. A gateway
-that cannot reach a usable daemon (none is running for a command that never
-starts one, it speaks another protocol version, its socket directory is not
-trusted, or it does not answer) prints `cherry-host: REASON` on stderr and
-exits 1 before its preamble. The client shows that line once, as its own
-error `cherry-host on my-server: REASON`; the rest of ssh's stderr reaches
-you as it arrives. `cherry-host gateway --no-start` never starts a daemon
-(when none is running it creates nothing and fails) and otherwise makes the
-same trust and version checks. With no daemon running,
-`cherry --host my-server kill ID` fails with
+When the client expects a particular host identity (`--expected-host-id`, or
+the host an attachment reconnects to), the remote command is
+`env CHERRY_EXPECTED_HOST_ID='ID' cherry-host gateway …`. The Mac app passes
+one for every tab it attaches, and for its control connection once it trusts
+the host's identity. The gateway never replaces or reports a daemon of
+another version whose identity differs: it relays it, and the client fails
+with
+`host identity changed (expected X, received Y)`, as it does locally. A
+cherry-host of another version ignores the variable and still reports its
+version through its preamble. If you restrict an SSH key to the command
+`cherry-host gateway` (`command=` in `authorized_keys`, or `ForceCommand`),
+the forced command drops the variable, and the gateway then replaces an
+older daemon without checking its identity.
+
+The gateway prints `CHERRY-GATEWAY <version>` (`CHERRY-GATEWAY 4` for this
+version) on a line of its own before relaying protocol frames. The client
+skips up to 64 KiB of output that a remote shell prints before that line.
+Beyond that it fails with "the remote shell printed output before cherry-host
+gateway started; remove output from non-interactive shell startup files such
+as ~/.bashrc" and the first line printed. A preamble of another version means
+the `cherry-host` on the remote `PATH` is another version:
+`protocol version mismatch: the remote cherry-host gateway speaks version N,
+this cherry speaks version M; install the same Cherry version on both
+machines`. A gateway that cannot reach a usable daemon (none is running for a
+command that never starts one, one of another protocol version that it does
+not replace, its socket directory is not trusted, or it does not answer)
+prints `cherry-host: REASON` on stderr and exits 1 before its preamble. The
+client shows that line once, as its own error `cherry-host on my-server:
+REASON`; the rest of ssh's stderr reaches you as it arrives. Without
+`--no-start`, the gateway starts a daemon when none is running and replaces
+one that speaks an older protocol (see [Updates](#updates)).
+`cherry-host gateway --no-start` never starts or replaces a daemon (when none
+is running it creates nothing and fails) and otherwise makes the same trust
+and version checks. With no daemon running, `cherry --host my-server kill ID` fails with
 `cherry-host on my-server: no cherry-host is running at PATH (this command
 never starts one)`. When the connection closes before the preamble for
 another reason, such as `cherry-host` missing from the remote `PATH`, the
@@ -244,11 +367,14 @@ own errors.
 
 ### Starting the daemon
 
-`list`, `new`, and `attach` start a daemon when none is running: locally through
-`cherry-host start`, remotely through `cherry-host gateway`. `kill`, `remove`,
-and `shutdown` never start one; they fail with `no cherry-host is running at
-PATH (this command never starts one)`. Remotely they run
-`cherry-host gateway --no-start`. `start` is local only.
+`list`, `new`, `attach`, and `control` start a daemon when none is running:
+locally through `cherry-host start`, remotely through `cherry-host gateway`.
+They also replace a daemon that speaks an older protocol (see
+[Updates](#updates)). `kill`, `remove`, and `shutdown` never start or replace
+one; they fail with `no cherry-host is
+running at PATH (this command never starts one)`, or report the other
+version. Remotely they run `cherry-host gateway --no-start`. `start` is local
+only, and neither `cherry start` nor `cherry-host start` replaces a daemon.
 
 `cherry-host start` starts a detached daemon, with its stderr in `host.log`
 (see [Sockets, state, and access](#sockets-state-and-access)), or the systemd
@@ -267,7 +393,8 @@ normally, so read-only system directories work.
 
 `--socket /absolute/private/path/host.sock` selects a separate host (its own
 daemon and state directory); with `--host`, that path is on the remote machine.
-`--expected-host-id UUID` rejects a different host identity before acting.
+`--expected-host-id UUID` rejects a different host identity before acting,
+and before replacing an older daemon.
 `new --request-id UUID` makes retries of the same creation idempotent: a retry
 with the same launch arguments returns the existing session, even from a
 differently sized terminal, and reusing the ID for different arguments is
@@ -275,6 +402,41 @@ rejected. The host keeps that receipt until the session is removed or 4096
 newer requests evict it; after that the same ID creates a new session.
 
 ## Use in the Mac app
+
+### Local tabs
+
+Local terminal, command and agent tabs run as persistent sessions on This
+Mac's daemon by default (**Settings › Sessions › Run local terminals as
+persistent sessions**, which applies to new tabs). Each tab's Ghostty surface
+runs `cherry attach … --detach-key none --status-file …` (the attach adapter),
+and the app keeps one `cherry control` connection per host. Quitting Cherry,
+a crash of Cherry or an update leaves the programs running, and each project
+window reopens its saved tabs attached to them. Closing a tab ends its
+session, unless **Keep running after closing a tab** is on; **End sessions
+when quitting** ends them when you quit or close a window. Removing a
+worktree ends its sessions. A running agent's tab asks before closing: **Close
+agent?** when that stops it, **Close agent tab?** when the agent keeps
+running. Sessions on SSH hosts, and sessions a tab only attached to, always
+keep running when you close a tab or quit.
+
+When the local host cannot run sessions, new tabs run as ordinary native tabs
+and Settings › Sessions says why: the app runs from a disk image or an App
+Translocation location, it has no `cherry` helper, the daemon did not start a
+session (Cherry tries again after 30 seconds), or another copy of the app
+with the same app data is running. Only one copy per app identity (its
+Application Support folder) owns This Mac's persistent sessions and saved
+tabs: the first takes `Application Support/<identity>/instance.lock`, and a
+second copy (for example `swift run Cherry` while Cherry.app runs, or
+`open -n`) neither restores, saves nor ends them. Such a copy says so once,
+in a sheet on its first project window (**Persistent sessions are off in this
+copy**).
+
+The settings are the user defaults `sessions.persistLocal`,
+`sessions.keepAfterTabClose` and `sessions.endOnQuit`. As a launch argument,
+give a plist boolean: `-sessions.persistLocal '<false/>'` (or `'<true/>'`);
+`-sessions.persistLocal NO` or `0` is ignored.
+
+### Persistent Sessions
 
 Open **File → Persistent Sessions…** (`Cmd-Shift-R`). Choose **This Mac** or add
 an SSH destination, create a session with its host-side directory, then attach.
@@ -321,21 +483,25 @@ removing use the environment of the last list or create.
 For a self-contained test build, run `Scripts/package-dmg`, open the resulting
 `dist/Cherry Sessions-<architecture>.dmg`, and drag **Cherry Sessions** into
 Applications. Its distinct icon, bundle identifier, settings, and Application
-Support folder let it run alongside Cherry. It does not have separate sessions:
-both apps use the same local daemon (`/tmp/cherry-host-<uid>/host.sock`), so
-**This Mac** lists the same sessions in each. The daemon keeps running the
-`cherry-host` of whichever app started it and serves both, so both apps must
-speak the same protocol version. The app includes both session helpers;
-**This Mac** needs no separate CLI installation. Choose **Create & Attach**,
-run a command, then close the tab or quit Cherry. Reopen Persistent Sessions
-and attach to the same session to continue it. This local build is ad-hoc
-signed by default and is not notarized. **This Mac** is unavailable while the
-app runs from the disk image or an App Translocation location; SSH hosts still
-work.
+Support folder let it run alongside Cherry. Both apps use the same local
+daemon (`/tmp/cherry-host-<uid>/host.sock`), so **This Mac** in Persistent
+Sessions lists the same sessions in each, but each app restores and owns only
+the tab sessions it created itself. The daemon runs the `cherry-host` of
+whichever app started it. An app whose helpers speak a newer protocol replaces
+a daemon that speaks an older one (its sessions carry on), after which the app
+of the older version cannot use it, so build both from the same version. The
+app includes both session helpers; **This Mac** needs no separate CLI
+installation. Open a project and run a command in a tab, or choose **Create &
+Attach** in Persistent Sessions and run one there, then quit the app and
+reopen it: the tab comes back with the same program. This local build is
+ad-hoc signed by default and is not notarized. While the app runs from the
+disk image or an App Translocation location, its local tabs are ordinary tabs
+and **This Mac** is unavailable in Persistent Sessions; SSH hosts still work.
 
 `Scripts/install-local-app` bundles `cherry` and `cherry-host` beside the Mac
 app executable. It needs Rust for that; `CHERRY_SKIP_HOST=1` installs the app
-without them, and Persistent Sessions is then unavailable in that copy.
+without them, and Persistent Sessions is then unavailable in that copy (its
+local tabs run natively).
 
 Cherry looks for the `cherry` client in this order:
 
@@ -358,13 +524,21 @@ and launchd's `PATH`. The client then finds `cherry-host` as described in
 through `CHERRY_HOST_PATH`, beside the client, or on your login `PATH`.
 
 For development, run `Scripts/build-host debug` before `swift run Cherry`.
+`swift run Cherry` has Cherry's own app identity: while Cherry.app runs it is a
+second copy (native tabs, no saved tabs), and otherwise it restores, saves and
+ends Cherry.app's tabs and sessions on the default daemon. To keep a
+development run apart, give it a private `HOME` and `CFFIXED_USER_HOME`
+(which Foundation's home directory, and so Application Support, follows) and
+private sockets (`CHERRY_HOST_SOCKET`, `CHERRY_CONTROL_SOCKET` in a 0700
+directory), as `Scripts/cherry_private_host.py` does for the test scripts
+(its `stop DIRECTORY` command tears such a run down), or use
+`CherryDev.app`, which has an identity of its own.
 `script/build_and_run.sh` builds the helpers and bundles them into
 `CherryDev.app`, unless `CHERRY_SKIP_HOST=1`.
 
-Existing local project terminals keep their native Ghostty process path.
-Persistent sessions are a separate, opt-in workflow. Remote project discovery,
-Git/worktree operations, previews/port forwarding, file transfer, and remote
-MCP integration are not implemented by this feature.
+SSH hosts get sessions only: remote project discovery, Git/worktree
+operations, cherry.toml commands, previews/port forwarding, file transfer, and
+remote MCP integration are not implemented.
 
 ## Sockets, state, and access
 
@@ -397,9 +571,14 @@ holds:
   same socket refuses to start.
 - `host.log`: the stderr of a daemon started by a client. Under systemd, stderr
   goes to the journal instead.
+- `sessions/<id>.json`: one manifest per holder (the session ID, the holder's
+  process ID and start time, when it was created, its link version), so that
+  a daemon that starts knows which holders to expect. A holder removes its
+  manifest when it exits.
 
-These directories are never removed automatically. Session state itself is in
-memory.
+These directories are never removed automatically. The sessions themselves,
+their screens and their pending input live in the holder processes, not on
+disk.
 
 Sessions get `SSH_AUTH_SOCK=<socket directory>/agent.sock`, a link that
 follows the clients that use sessions, as with tmux. Locally, `cherry new` and
@@ -435,17 +614,25 @@ and runs with working directory `/`. From its environment, sessions receive
 only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR`, `TZ`, `LANG`, `LC_*`,
 `XDG_RUNTIME_DIR`, and `XDG_*_HOME`, and a daemon started by a client keeps
 nothing else, so another tab's identity, `PWD`, or a stale agent socket never
-reaches later sessions. Sessions also get `TERM=xterm-256color`,
-`COLORTERM=truecolor`, `TERM_PROGRAM=Cherry`, `CHERRY_SESSION_ID`, and
-`SSH_AUTH_SOCK` as above. `PATH` defaults to
+reaches later sessions. `PATH` defaults to
 `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` when the daemon has none; a login
-shell re-reads your profile.
+shell re-reads your profile. The host's defaults `TERM=xterm-256color`,
+`COLORTERM=truecolor`, `TERM_PROGRAM=Cherry`, and `SSH_AUTH_SOCK` (as above)
+come next.
 
-`cherry new` sends the invoking terminal's `LANG`, `LC_ALL`, `LC_*` locale
-categories, and `TZ`; the host accepts no other variables from a client. When a
-client sends any locale variable, it replaces the daemon's locale variables as a
-whole. The daemon raises its own descriptor limit (up to 16384); sessions start
-with the limit it had before.
+Then come the variables the client sends with the session, which replace any
+of those: any variable with a non-empty name without `=` or NUL and a value
+without NUL, at most 1024 of them and 256 KiB in all (clients run as the
+daemon's user, so they may set whatever their own shell could). When a client
+sends any locale variable, it replaces the daemon's locale variables as a
+whole. `CHERRY_SESSION_ID` and `PWD` are always the host's: `PWD` is the
+working directory as the client named it when that names the same directory
+without `..`, and the resolved path otherwise. `cherry new` sends the
+invoking terminal's `LANG`, `LC_ALL` and `LC_*` locale categories and `TZ`,
+and the `--env` variables, which replace them (a locale variable given with
+`--env` replaces the terminal's whole locale). The Mac app sends a tab's
+whole environment, as a native tab would get it. The daemon raises its own
+descriptor limit (up to 16384); sessions start with the limit it had before.
 
 The working directory must be absolute, `~`, or `~/…`, expanded with the
 daemon's `HOME`, and must exist on the host. The descriptor reports the resolved
@@ -453,8 +640,29 @@ path. The host never resolves a relative path against its own working directory.
 
 ## Lifetime, service setup, and updates
 
-Processes survive app exit and SSH disconnection, not daemon crash, host
-reboot, or the operating system killing the user's processes at logout.
+Sessions survive app exit, SSH disconnection, and the daemon crashing, being
+stopped by a signal, restarting or being replaced by a newer version: each
+session's holder process keeps its program, PTY, terminal state and pending
+input, and registers with the next daemon. They do not survive a reboot of the
+host, the crash of their own holder (the session is then reported exited with
+code 1), or the operating system killing the user's processes at logout.
+
+While no daemon runs, holders keep their sessions running and keep answering
+the terminal queries the host answers. They keep bells, notifications,
+progress reports and exits, bounded, for the next daemon, which holds those
+that arrive while no client is subscribed for 30 seconds (at most 64) for the
+next subscriber. A holder dials the socket again at once when an entry
+appears in the socket's directory, and otherwise with backoff from 250 ms to
+2 s (up to 30 s while it watches the directory; at most 2 s apart when the
+directory cannot be watched, for example after it was removed). The next
+client that needs a daemon starts one (or systemd does). A daemon that starts
+reads the holders' manifests and, for up to 1 second, holds back `List` and
+requests that name a session until the holders it expects have registered;
+`pending_holders` in the list counts those still missing.
+
+A stopped program (`kill -STOP`, a debugger, a job-control stop) is not an
+exited one: its session keeps serving snapshots, screen text and input, and
+`kill` still ends it.
 
 `cherry kill` (Terminate in the app) signals every live process in the
 session's kernel session: SIGHUP, then SIGTERM after 2 seconds, then SIGKILL
@@ -463,7 +671,9 @@ signal except SIGKILL is followed by SIGCONT so stopped jobs act on it. The
 host acknowledges the request immediately; the session is listed as exited when
 its processes have gone, so a `list` right after `kill` may still show it
 running for up to about 4 seconds. Processes that moved into their own session
-(`setsid`, tmux or pm2 servers, daemons) are not signalled.
+(`setsid`, tmux or pm2 servers, daemons) are not signalled. An exited session
+keeps its holder, and its last screen, until `cherry remove`, or until
+`cherry shutdown` removes every exited session.
 
 When the session's program exits on its own, the host sends no signals. As in
 any terminal, the exit is a hangup: the kernel signals the foreground job and
@@ -473,10 +683,13 @@ the host closes the PTY. Jobs started with `nohup` or disowned keep running.
 128 plus the signal number, and `exit_signal` holds the signal. A shell ended by
 Terminate usually reports 129 (SIGHUP).
 
+### systemd
+
 On Linux with systemd, use the provided user service if logout policy would
-otherwise terminate the detached daemon. First finish existing sessions and
-run `cherry shutdown` so there is no already-running unmanaged daemon. With
-the binaries installed in `~/.local/bin`, from this checkout:
+otherwise terminate the detached daemon and its holders. First finish existing
+sessions and run `cherry shutdown`, so there is no already-running unmanaged
+daemon (the holders it started would stay outside the unit). With the
+binaries installed in `~/.local/bin`, from this checkout:
 
 ```sh
 mkdir -p "$HOME/.config/systemd/user"
@@ -502,60 +715,118 @@ none; a `CHERRY_HOST_SOCKET` set only in a login shell does not move the service
 and does not match it. Diagnostics are in
 `journalctl --user -u cherry-host.service`.
 
-The template uses `Restart=no`: restarting a dead daemon cannot recover its
-previous jobs. It uses `KillMode=process`: stopping the service signals only the
-daemon, whose sessions then end when it closes their PTYs. Processes that
-hosted sessions detached into their own session (tmux or pm2 servers,
-`emacs --daemon`, `setsid nohup job &`) stay in the unit's cgroup and survive;
-systemd reports them as left-over processes when the unit starts again. The
+The template uses `Restart=on-failure`: after a crash the restarted daemon
+adopts every running session, as their holders register with it again. It
+uses `KillMode=process`: stopping or restarting the service signals only the
+daemon. Holders, and so the sessions, carry on in the unit's cgroup and
+register with the next daemon; so do processes that hosted sessions detached
+into their own session (tmux or pm2 servers, `emacs --daemon`,
+`setsid nohup job &`). systemd reports them as left-over processes when the
+unit starts again. End the sessions themselves with `cherry kill`. The
 template uses the default socket and executable path; edit the unit if you
 installed elsewhere. No launchd agent is provided for macOS.
 
-There is no hot upgrade, and there is no compatibility across versions: client
-and host must speak the same protocol version. A client or gateway that finds
-a daemon speaking another version refuses to use it and never stops or
-replaces it. Installing a new binary leaves an existing daemon running its old
-code, and once a machine's binaries are replaced, nothing reaches that daemon
-any more: the new `cherry` and the new gateway both refuse it, so neither
-`cherry shutdown` there nor `cherry --host my-server shutdown` can stop it.
+### Updates
 
-So update in this order:
+Installing new binaries leaves a running daemon on its old code until a client
+of the new version replaces it. Nothing needs to be stopped first:
 
-1. Before installing new binaries on a machine, finish or terminate
-   (`cherry kill`) its sessions and stop its daemon with the old binaries still
-   installed: `cherry shutdown` locally, `cherry --host my-server shutdown`
-   while your client is still the old version too, or `cherry shutdown` run on
-   that host itself (for example `ssh my-server cherry shutdown`).
-2. Install the same new version on every machine: the client and each host.
-   The Mac app bundles its own `cherry` and `cherry-host`, so replacing the app
+1. Install the same new version on every machine: the client and each host
+   (on a remote host, the `cherry-host` on its SSH command `PATH`). The Mac
+   app bundles its own `cherry` and `cherry-host`, so replacing the app
    counts as installing new binaries on that Mac.
-3. The next `list`, `new`, or `attach` starts a daemon of the new version. For
-   the systemd installation, start the service again with
-   `systemctl --user start cherry-host.service`. Never restart the service
-   expecting its jobs to survive.
+2. The next `cherry list`, `new`, `attach` or `control` that finds a daemon
+   speaking an older protocol (4 or later) asks it to make way (`Replace`):
+   the old daemon stops listening, removes its socket, releases its lock,
+   answers and exits with status 0. The client then starts a daemon of its
+   own version, and the holders register with it, so every session carries
+   on; attachments reconnect by themselves. Remotely the gateway does the
+   same when it is started without `--no-start`, so `cherry --host my-server
+   list`, `new`, `attach` and `control`, and the Mac app's tabs and control
+   connection, upgrade a remote host once its `cherry-host` is updated.
 
-A daemon left running under replaced binaries can only be stopped on its host
-by a signal, for example `systemctl --user stop cherry-host.service` or
-`pkill -u "$USER" -f 'cherry-host serve'`. Its sessions end with it, as after
-a crash.
+Running sessions keep the holders, and so the code, of the build that created
+them until they are removed; new sessions run the new build. A daemon speaks
+every holder link version a live holder may use, and a session reports only
+what its holder knows (one whose holder predates `application_cursor_keys`
+lists it as false).
+
+A replacement only replaces the intended host: when the client expects an
+identity (`--expected-host-id`, or the host an attachment reconnects to), a
+daemon of another identity is neither replaced nor reported, locally or by
+the gateway, and the client fails with
+`host identity changed (expected X, received Y)`.
+
+What the other commands and versions do:
+
+- `cherry kill`, `remove` and `shutdown` (remotely `gateway --no-start`) and
+  `cherry start` / `cherry-host start` never replace a daemon. The host side
+  reports ``a cherry-host speaking protocol N is running at PATH (this is
+  protocol M); `cherry list`, `new`, `attach` and `control` replace it with
+  this version, and its sessions carry on``; locally `kill`, `remove` and
+  `shutdown` say `protocol version mismatch: cherry-host speaks version N,
+  this cherry speaks version M; this command never replaces a host (list,
+  new, attach and control replace an older one)`.
+- A daemon speaking a newer protocol is never replaced: `a cherry-host
+  speaking protocol N is running at PATH; it is newer than this cherry-host
+  (protocol M), which never replaces it: install the cherry-host (and Cherry)
+  that speaks protocol N` (locally, `protocol version mismatch: …; install the
+  same Cherry version on both machines`).
+- A daemon older than protocol 4 refuses a `Hello` of another version and
+  cannot make way; its sessions end with it. The gateway reports ``… it cannot
+  make way for this one: finish its sessions and stop it (`cherry shutdown`
+  from the matching version), then try again``; locally the CLI reports
+  `host rejected request (version_mismatch): …`. Finish its sessions and stop
+  it with the binaries of its own version, or by a signal (`pkill -u "$USER"
+  -f 'cherry-host serve'`).
+- A daemon that refuses to make way keeps running. The gateway reports `a
+  cherry-host speaking protocol N is running at PATH and refused to make way
+  for this one …`; locally the CLI says `could not replace the cherry-host
+  speaking protocol N (this cherry speaks protocol M): …`.
+
+Every report of a daemon of another version that the gateway did not replace
+starts with `a cherry-host speaking `; the CLI relies on that prefix, and an
+attachment that is reconnecting stops at once on it, as it does when the
+remote gateway's preamble shows another version.
+
+With `cherry-host.service` enabled, a replaced daemon exits with status 0, so
+`Restart=on-failure` does not start it again; the client then runs
+`systemctl --user start cherry-host.service` (the same applies to a local
+`cherry list`, `new`, `attach` or `control` on Linux). So the unit's
+`ExecStart` must run the updated `cherry-host`: install the new binary in
+its place, or point `ExecStart` at it. Otherwise systemd starts the old
+version again, and the client fails with ``a cherry-host speaking protocol N
+is running at PATH: the systemd user service cherry-host.service started it,
+and its ExecStart runs that older cherry-host (<path>); install this version
+(protocol M, <exe>) in its place, or point the unit's ExecStart at this one
+(`systemctl --user edit --full cherry-host.service`), then try again``. Until
+that is fixed, every connection of the new version replaces the old daemon
+and systemd starts it again (the gateway cannot tell which protocol the
+unit's binary speaks without running it). The sessions carry on in their
+holders meanwhile, and clients of the old version cannot reach the host
+either, since the `cherry-host` on `PATH` is the new one. After installing a
+new `cherry-host` at the unit's path, `systemctl --user restart
+cherry-host.service` also moves the daemon to it.
 
 ## Connections and flow control
 
 - **Heartbeat.** An attached client sends `Ping` every 15 seconds, also while
   a slow terminal is still taking its output, so a slow terminal does not get
-  the attachment evicted. The host drops an attachment that sends nothing for
-  45 seconds, so a vanished laptop stops constraining the shared grid; a
-  client whose input it holds back is exempt (see input backpressure). A
-  connection that is not attached must send its next request within 10
-  seconds. The CLI ends an attachment when its connection neither accepts nor
-  delivers anything for 45 seconds while it has input to send; over SSH,
-  `ServerAliveInterval` detects a dead network. It also gives up when its own
-  terminal accepts no output at all for 15 seconds (outcome `disconnected`;
-  the session keeps running). When the host stops reading the connection
-  without closing it, the CLI ends the attachment 5 seconds later as a lost
-  connection, unless what the host sent before (a takeover notice, the
+  the attachment evicted; so does a subscribed control connection. The host
+  drops an attached or subscribed connection that sends nothing for 45
+  seconds, so a vanished laptop stops constraining the shared grid; a client
+  whose input it holds back is exempt (see input backpressure). A connection
+  that is neither attached nor subscribed must send its next request within
+  10 seconds. The CLI takes an attachment's connection as lost when it
+  neither accepts nor delivers anything for 45 seconds while it has input to
+  send; over SSH, `ServerAliveInterval` detects a dead network. When the host
+  stops reading the connection without closing it, the CLI takes it as lost
+  5 seconds later, unless what the host sent before (a takeover notice, the
   program's exit) decides the outcome first; while detaching, see
-  [Host closing first](#attach-options).
+  [Host closing first](#attach-options). A lost connection is reconnected
+  (see [Reconnecting](#attach-options)). The CLI gives up at once when its
+  own terminal accepts no output at all for 15 seconds (outcome
+  `disconnected`; the session keeps running).
 - **Slow clients.** A client's queued output has a 4 MiB budget. Beyond that
   the host drops the client's queued output and, once what remains in its
   queue is at most 256 KiB, sends it a fresh snapshot (`Attached` with reason
@@ -611,8 +882,11 @@ a crash.
   for a resize. A newer replacement supersedes an older one still queued (one
   that supersedes a full snapshot is full too), so a slow client does not
   receive every intermediate size, and a lagging client gets the new size with
-  its resync. A resize that cannot be applied is reported as `resize_failed`
-  without ending the attachment.
+  its resync. An attach or resync snapshot that the holder answered after the
+  grid changed (so it still shows the old size) is followed at once by a
+  `resize` replacement at the current grid, so a client can see `attach` at
+  the old size and then `resize`. A resize that cannot be applied is reported
+  as `resize_failed` without ending the attachment.
 
 ## Bounds and terminal fidelity
 
@@ -708,14 +982,57 @@ OSC 133 prompt marks. See [cherry-vt](crates/cherry-vt/README.md) for details.
 ## Protocol
 
 Frames are a 4-byte big-endian length followed by a JSON message of at most
-16 MiB; terminal bytes are base64 strings. The client opens with `Hello` and the
-host answers `Welcome` with its identity. The current version is 3, and the
-host accepts only an exact match: any other version gets the error
-`version_mismatch` and nothing else happens on that connection. An attached
-client must accept a replacement `Attached` snapshot at any time (reasons
-`attach`, `resize`, `resync`) and resume output at its offset. A `resize`
-replacement may hold only the screens, without a reset or history, for a
-renderer that keeps its own history or paints a viewport. An `Attached`
+16 MiB; terminal bytes are base64 strings. Unknown fields are ignored, so a
+field can be added without breaking an older peer. The client opens with
+`Hello{version}`, and the host answers every `Hello`, whatever its version,
+with `Welcome{version, host_id}` carrying its own version and identity. The
+current version is 4. Normal operation needs the same version on both sides.
+When they differ, the client disconnects or, only when the host's version is
+lower, sends `Replace`, which the host answers `Ok` once it has stopped
+listening and released its socket and lock, and then exits (see
+[Updates](#updates)); any other request after a mismatch gets
+`version_mismatch`, and the connection closes. `Hello`, `Welcome`, `Replace`,
+`Ok`, `Error` and the gateway's `CHERRY-GATEWAY <version>` line keep their
+shapes in every version. Hosts before version 4 answer a `Hello` of another
+version with `version_mismatch` instead of a `Welcome`.
+
+Any request may carry `"req": <u64>`, which the host echoes on its reply, so
+one connection can have several requests in flight. The host answers every
+request with exactly one frame, except `Input` and `Resize`, which are
+answered only when they fail. Frames the host sends on its own (events, and
+attachment traffic: `Attached`, `Output`, `Query`, `Exit`, a paused
+attachment's `Pong`s) carry none. A connection carries at most one
+attachment (`Attach`, `Input`, `Resize`, `Detach`); a control connection
+never attaches. Besides `List` (answered `Sessions{host_id, sessions,
+pending_holders}`), `Create`, `Kill`, `Remove`, `Shutdown` and `Ping`, a
+control connection may send:
+
+- `Subscribe`, answered `Ok`; the host then pushes `Event{event}`: `added`,
+  `changed` (any session field), `removed`, `bell`, `notification`
+  (`title`, `body`), `progress` (`state`, `value`), `exited`, and `resync`
+  (the subscriber fell behind and should list again). A subscriber's queue
+  is bounded and keeps only the latest `changed` of each session. A
+  subscribed connection is exempt from the idle limit but pings like an
+  attached one.
+- `SendInput{id, data}`: input without attaching, at most 64 KiB; answered
+  `Ok`, or `not_running` once the session exited. While too much input waits
+  for the program, it waits up to 5 seconds for room and then fails.
+- `Screen{id, scrollback, max_lines}`: the screen as plain text, answered
+  `ScreenText{id, text, cursor_row, cursor_col, alternate_screen}`, with the
+  retained history first when `scrollback` is set and only the last
+  `max_lines` lines when that is given. A host that knows `max_lines` always
+  sends `pending_holders` in `Sessions`; an older one ignores `max_lines`.
+- `Update{id, name, tags}`: rename a session or replace its tags; answered
+  `Ok`.
+
+`Create` carries `request_id`, `name`, `cwd`, `command`, `env`, `cols`,
+`rows`, and optionally `owner` (at most 256 bytes) and `tags` (at most 64,
+keys of 1 to 128 bytes, 16 KiB in all).
+
+An attached client must accept a replacement `Attached` snapshot at any time
+(reasons `attach`, `resize`, `resync`) and resume output at its offset. A
+`resize` replacement may hold only the screens, without a reset or history,
+for a renderer that keeps its own history or paints a viewport. An `Attached`
 offset may be lower than the offset of the stream when carried output
 follows it (see [slow clients](#connections-and-flow-control)); that output
 starts at the `Attached` offset, so resuming there needs nothing more. An
@@ -726,11 +1043,12 @@ are, and the terminal's replies return as ordinary `Input`. `Attach` has a
 required `answers_queries` flag: true only when the client writes queries to
 a terminal whose replies it reads as input. The host sends no queries to a
 client that sets it false. Errors carry a code: `version_mismatch`,
-`request_failed`, `taken_over`, `resize_failed`, or `snapshot_failed`.
-`resize_failed`, and `snapshot_failed` for a replacement snapshot, do not end
-an attachment; `snapshot_failed` in reply to `Attach` means the attach
-failed. The definitions are in
-[cherry-protocol](crates/cherry-protocol/src/lib.rs).
+`request_failed`, `taken_over`, `resize_failed`, `snapshot_failed`,
+`unsupported_operation`, `unknown_session` (no session has that ID), or
+`not_running` (the session has exited). `resize_failed`, and
+`snapshot_failed` for a replacement snapshot, do not end an attachment;
+`snapshot_failed` in reply to `Attach` means the attach failed. The
+definitions are in [cherry-protocol](crates/cherry-protocol/src/lib.rs).
 
 Clients must ignore a `Pong` at any time, including before `Welcome` and
 between a request and its reply. Besides answering `Ping`, the host sends one
@@ -755,38 +1073,83 @@ cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_ho
 cargo test --manifest-path Host/Cargo.toml --locked -p cherry-host -p cherry-vt -- --ignored --test-threads=1
 ```
 
-After building the Rust debug binaries with `Scripts/build-host debug`, verify
-the snapshot through Cherry's actual native Ghostty renderer on macOS:
+After building the Rust debug binaries with `Scripts/build-host debug`, run the
+Mac app's session tests as CI does:
 
 ```sh
-CHERRY_TEST_HOST_INTEGRATION=1 swift test --no-parallel --filter HostedSessionRealHost
+Scripts/test-session-suites unit
+Scripts/test-session-suites real-host
 ```
 
-The seven ignored `real_host` tests run the `cherry` that `cargo test` builds
+`unit` runs each group of hosted and persistent session suites
+(`PersistentLocal`, `PersistentTab`, `WorkspacePersistence`,
+`WorkspaceRestore`, `HostControl`, `HostedSession`, `HostedLaunchSpec`,
+`NativeSurfaceRelaunch`, `MultiplexerSafety`, `AdapterAwayKeyInput`,
+`AgentInputSafety`, `SessionCloseFlow`, `AppIdentity`) on its own. Each group must pass at least
+one test; a session test file not named after a group, or a skipped test
+that is not a `RealHost` test, fails the run, so a new session suite must be
+added to the groups in `Scripts/test-session-suites`. Swift Testing's
+`--filter` matches source file names as well as test names, so a group
+selects every test in the files named after it. `real-host` sets
+`CHERRY_TEST_HOST_INTEGRATION=1` and runs every test whose ID contains
+`RealHost` (`HostedSessionRealHost`, `PersistentLocalRealHost`,
+`AgentInputRealHost`, …) against the helpers in `Host/target/debug` (or
+`CARGO_TARGET_DIR`), each with its own daemon on a private socket and a
+private `HOME`; a skipped test fails the run. Without `--skip-build` it builds
+the Swift tests first, and for `real-host` the Rust helpers too.
+
+The 13 ignored `real_host` tests run the `cherry` that `cargo test` builds
 and the `cherry-host` beside it (hence `cargo build --bins` first; set
 `CHERRY_TEST_HOST` to use another), each daemon with a private socket and a
 temporary `HOME`. They cover shared attachment and takeover, only the
 terminal that typed last answering the program's queries, process and
 screen survival across reconnects, piped input and detaching behind input the
-program never reads or reads slowly (about 5 seconds), and remote `kill`,
-`remove`, and `shutdown` through the real gateway behind a fake `ssh`. The
+program never reads or reads slowly (about 5 seconds), an attachment that
+reconnects by itself after its daemon is killed and restarted, `cherry
+control` relaying requests with IDs and starting a remote host, and, through
+the real gateway behind a fake `ssh`: remote `kill`, `remove`, and
+`shutdown` never starting a host, replacing an older remote daemon and
+reporting a newer one, leaving a host of another identity to the client, and
+a fake remote leaving nothing behind. The
 ignored Neovim tests in `cherry-host` and `cherry-vt` need `nvim` on PATH: they
 run real Neovim on a PTY, reconstruct its state in a second terminal (or
 reattach through the host at a new size), and check returning to the shell.
 The ignored test that checks the daemon drops other users' connections only
-runs as root. The Swift integration test opens two differently sized native
-Ghostty views, sends input from both, and checks screen restoration and
-disconnect survival. `Scripts/test-host-linux` runs the Rust tests above
-natively as root in a Debian 12 Docker image with a pinned Neovim.
-`Scripts/test-host-ssh` runs that suite, then exercises a local client against
-a Linux host in that image through actual SSH with disposable keys and pinned
-fixture host keys; it requires Docker and OpenSSH tools.
+runs as root. The ignored `ssh_host` test needs a disposable real SSH host
+(`CHERRY_TEST_SSH_HOST`, `CHERRY_TEST_SSH_CONFIG`). The Swift real-host tests
+open differently sized native Ghostty views and persistent tabs on a real
+daemon, and check screen restoration, reconnection after the daemon
+restarts, restore, and agent input. `Scripts/test-host-linux` runs the Rust
+tests above natively as root in a Debian 12 Docker image with a pinned
+Neovim. `Scripts/test-host-ssh` runs that suite, then exercises a local
+client against a Linux host in that image through actual SSH with disposable
+keys and pinned fixture host keys; it requires Docker and OpenSSH tools.
+
+Tests shorten the host's timing with `CHERRY_HOST_*_MS` variables read when
+`serve` starts (`HEARTBEAT_TIMEOUT`, `IDLE_TIMEOUT`, `INPUT_WAIT`,
+`KILL_GRACE`, `TOUCH_INTERVAL`, `AGENT_GRACE`, and `HOLDER_WAIT`, how long
+`List` and requests naming a session wait for the holders a restarted daemon
+expects, 1000 ms by default), and the CLI's with `CHERRY_CLI_*_MS`
+(`CONNECT_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`,
+`ESCAPE_WAIT`, `GRID_WAIT`, `DETACH_WAIT`, `REPORT_WAIT`, `CLOSED_WAIT`,
+`QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects), `RECONNECT_HEALTHY`,
+`RECONNECT_ATTEMPT` and `PASTE_TAIL_WAIT`) and `CHERRY_CLI_INPUT_HIGH_WATER`.
+In `cherry-host`'s tests, `tests/support` has `Host::adopted()` (waits until
+a respawned daemon has no pending holders), `children(pid)` and
+`kill_holder(pid)`, and `tests/holder.rs` guards its holders with `Held`. In
+`cherry-cli`'s `tests/real_host.rs`, dropping a `Host` or `FakeRemote` kills
+the holders left in the manifests under its private `HOME`; `FakeRemote`
+then shuts its daemon down and kills any `cherry-host serve` or `hold` still
+using its socket.
 
 Two GitHub workflows are configured. `host.yml` runs the Rust commands above on
 macOS 15 arm64, Ubuntu 22.04 x86_64, and Ubuntu 24.04 arm64, plus a job that
-runs `Scripts/test-host-ssh`. `app.yml` builds the helpers and the Swift
-package on macOS 26 and runs the hosted-session and app-identity tests and the
-native Ghostty integration test. Both cache the VT library keyed on
-`Scripts/build-host-vt`. Configuring a workflow does not establish that it has
-passed. Dependency notices are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)
-and [vendor/ghostty-vt](vendor/ghostty-vt/README.md).
+runs `Scripts/test-host-ssh`. `app.yml`, on macOS 26, builds the Rust helpers
+(`Scripts/build-host debug`), runs `python3 Scripts/test_cherry_private_host.py`
+(the teardown the GUI test scripts use), builds the Swift tests, and then
+runs `Scripts/test-session-suites --skip-build unit` and
+`Scripts/test-session-suites --skip-build real-host`. Both cache the VT
+library keyed on `Scripts/build-host-vt`. Configuring a workflow does not
+establish that it has passed. Dependency notices are in
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and
+[vendor/ghostty-vt](vendor/ghostty-vt/README.md).

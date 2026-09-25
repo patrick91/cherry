@@ -52,6 +52,8 @@ fn create_retries_are_idempotent_whatever_the_terminal_size() {
         env: BTreeMap::new(),
         cols,
         rows,
+        owner: None,
+        tags: BTreeMap::new(),
     };
     let a = match host.call(request(80, 24, "sleep 60")) {
         ServerMessage::Created { session } => session,
@@ -570,11 +572,6 @@ fn neovim_survives_reattach_at_a_new_size() {
 #[test]
 fn invalid_protocol_and_launch_do_not_create_sessions() {
     let host = Host::new();
-    let mut socket = UnixStream::connect(&host.socket).unwrap();
-    write_frame(&mut socket, &ClientMessage::Hello { version: 999 }).unwrap();
-    assert!(
-        matches!(receive(&mut socket),ServerMessage::Error {code,..} if code=="version_mismatch")
-    );
     let launch = |cwd: &str, env: BTreeMap<String, String>| ClientMessage::Create {
         request_id: Uuid::new_v4().to_string(),
         name: "bad".into(),
@@ -583,19 +580,52 @@ fn invalid_protocol_and_launch_do_not_create_sessions() {
         env,
         cols: 80,
         rows: 24,
+        owner: None,
+        tags: BTreeMap::new(),
     };
     let error = |message: ServerMessage| match message {
         ServerMessage::Error { message, .. } => message,
         other => panic!("{other:?}"),
     };
+    // Every Hello is welcomed with the host's own version; after a mismatch
+    // the host accepts nothing but Replace, and closes the connection.
+    let mut socket = UnixStream::connect(&host.socket).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_frame(&mut socket, &ClientMessage::Hello { version: 999 }).unwrap();
+    assert!(matches!(
+        receive(&mut socket),
+        ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            ..
+        }
+    ));
+    write_frame(&mut socket, &launch("/tmp", BTreeMap::new())).unwrap();
+    assert!(
+        matches!(receive(&mut socket), ServerMessage::Error { code, .. } if code == error_code::VERSION_MISMATCH)
+    );
+    assert!(read_frame::<_, ServerMessage>(&mut socket)
+        .unwrap()
+        .is_none());
+    // A first frame that is not a Hello is refused the same way.
+    let mut socket = UnixStream::connect(&host.socket).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_frame(&mut socket, &launch("/tmp", BTreeMap::new())).unwrap();
+    assert!(
+        matches!(receive(&mut socket), ServerMessage::Error { code, .. } if code == error_code::VERSION_MISMATCH)
+    );
     assert!(error(host.call(launch("/does/not/exist", BTreeMap::new()))).contains("does not exist"));
     assert!(error(host.call(launch(".", BTreeMap::new())))
         .contains("must be absolute or start with ~/"));
+    // Any variable a program can be given may be set; no other.
     assert!(error(host.call(launch(
         "/tmp",
-        BTreeMap::from([("CHERRY_PROCESS_ID".into(), "1".into())])
+        BTreeMap::from([("NOT=A NAME".into(), "1".into())])
     )))
-    .contains("only LANG, LC_* and TZ"));
+    .contains("invalid environment variable"));
     assert!(error(host.call(ClientMessage::Create {
         request_id: Uuid::new_v4().to_string(),
         name: "bad".into(),
@@ -604,9 +634,304 @@ fn invalid_protocol_and_launch_do_not_create_sessions() {
         env: BTreeMap::new(),
         cols: 80,
         rows: 24,
+        owner: None,
+        tags: BTreeMap::new(),
     }))
     .contains("/does/not/exist"));
     assert!(host.sessions().is_empty());
+}
+
+/// The next frame, with its request ID.
+fn response(socket: &mut UnixStream) -> (Option<u64>, ServerMessage) {
+    let Response { req, message } = read_frame(socket)
+        .unwrap()
+        .expect("unexpected connection EOF");
+    (req, message)
+}
+
+#[test]
+fn replies_echo_request_ids_and_several_requests_can_be_in_flight() {
+    let host = Host::new();
+    let session = host.create(shell("exec sleep 60"));
+    let mut socket = UnixStream::connect(&host.socket).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_frame(&mut socket, &Request::new(Some(41), ClientMessage::hello())).unwrap();
+    assert!(matches!(
+        response(&mut socket),
+        (
+            Some(41),
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                ..
+            }
+        )
+    ));
+    let requests = [
+        (1, ClientMessage::Ping),
+        (2, ClientMessage::List),
+        (
+            u64::MAX,
+            ClientMessage::Kill {
+                id: "missing".into(),
+            },
+        ),
+        (3, ClientMessage::Ping),
+    ];
+    for (req, message) in &requests {
+        write_frame(&mut socket, &Request::new(Some(*req), message.clone())).unwrap();
+    }
+    assert!(matches!(
+        response(&mut socket),
+        (Some(1), ServerMessage::Pong)
+    ));
+    assert!(matches!(
+        response(&mut socket),
+        (Some(2), ServerMessage::Sessions { sessions, .. }) if sessions.iter().any(|s| s.id == session.id)
+    ));
+    assert!(matches!(
+        response(&mut socket),
+        (Some(u64::MAX), ServerMessage::Error { code, .. }) if code == error_code::UNKNOWN_SESSION
+    ));
+    assert!(matches!(
+        response(&mut socket),
+        (Some(3), ServerMessage::Pong)
+    ));
+    // A request without an ID gets a reply without one.
+    write_frame(&mut socket, &ClientMessage::Ping).unwrap();
+    assert!(matches!(response(&mut socket), (None, ServerMessage::Pong)));
+    // Whatever answers an attachment's requests carries none.
+    write_frame(
+        &mut socket,
+        &Request::new(
+            Some(5),
+            ClientMessage::Input {
+                data: b"x".to_vec(),
+            },
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        response(&mut socket),
+        (None, ServerMessage::Error { .. })
+    ));
+    write_frame(
+        &mut socket,
+        &Request::new(
+            Some(6),
+            ClientMessage::Attach {
+                id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+                takeover: false,
+                answers_queries: false,
+            },
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        response(&mut socket),
+        (None, ServerMessage::Attached { .. })
+    ));
+    host.kill(&session.id);
+}
+
+#[test]
+fn protocol_4_control_requests_are_answered_on_one_connection() {
+    let host = Host::new();
+    let session = host.create(shell(
+        "stty -echo; while IFS= read -r line; do printf 'GOT:%s\\n' \"$line\"; done",
+    ));
+    let mut socket = host.connect();
+    let mut requests = vec![
+        (1, ClientMessage::Subscribe),
+        (
+            2,
+            ClientMessage::SendInput {
+                id: session.id.clone(),
+                data: b"typed\n".to_vec(),
+            },
+        ),
+        (
+            3,
+            ClientMessage::Update {
+                id: session.id.clone(),
+                name: Some("renamed".into()),
+                tags: None,
+            },
+        ),
+        (
+            4,
+            ClientMessage::Screen {
+                id: session.id.clone(),
+                scrollback: false,
+                max_lines: None,
+            },
+        ),
+    ];
+    // Requests naming a session that does not exist.
+    let missing = Uuid::new_v4().to_string();
+    for (req, message) in [
+        (
+            6,
+            ClientMessage::Kill {
+                id: missing.clone(),
+            },
+        ),
+        (
+            7,
+            ClientMessage::Remove {
+                id: missing.clone(),
+            },
+        ),
+        (
+            8,
+            ClientMessage::SendInput {
+                id: missing.clone(),
+                data: b"x".to_vec(),
+            },
+        ),
+        (
+            9,
+            ClientMessage::Screen {
+                id: missing.clone(),
+                scrollback: true,
+                max_lines: None,
+            },
+        ),
+        (
+            10,
+            ClientMessage::Update {
+                id: missing.clone(),
+                name: None,
+                tags: Some(BTreeMap::new()),
+            },
+        ),
+    ] {
+        requests.push((req, message));
+    }
+    for (req, message) in &requests {
+        write_frame(&mut socket, &Request::new(Some(*req), message.clone())).unwrap();
+    }
+    // Each reply echoes its request's ID, in order; events carry none.
+    let mut replies = Vec::new();
+    while replies.len() < requests.len() {
+        match response(&mut socket) {
+            (None, ServerMessage::Event { .. }) => {}
+            (req, reply) => replies.push((req.unwrap(), reply)),
+        }
+    }
+    assert!(matches!(&replies[0], (1, ServerMessage::Ok)), "{replies:?}");
+    assert!(matches!(&replies[1], (2, ServerMessage::Ok)), "{replies:?}");
+    assert!(matches!(&replies[2], (3, ServerMessage::Ok)), "{replies:?}");
+    assert!(
+        matches!(&replies[3], (4, ServerMessage::ScreenText { id, alternate_screen: false, .. }) if *id == session.id),
+        "{replies:?}"
+    );
+    for (req, reply) in &replies[4..] {
+        assert!(
+            matches!(reply, ServerMessage::Error { code, message } if code == error_code::UNKNOWN_SESSION && message.contains(&missing)),
+            "{req}: {reply:?}"
+        );
+    }
+    // An attach's answer is attachment traffic, which carries no ID. And
+    // Replace is only for a client that was told of a lower version.
+    for (message, expected) in [
+        (
+            ClientMessage::Attach {
+                id: missing.clone(),
+                cols: 80,
+                rows: 24,
+                takeover: false,
+                answers_queries: false,
+            },
+            error_code::UNKNOWN_SESSION,
+        ),
+        (ClientMessage::Replace, error_code::REQUEST_FAILED),
+    ] {
+        write_frame(&mut socket, &Request::new(Some(11), message)).unwrap();
+        loop {
+            match response(&mut socket) {
+                (None, ServerMessage::Event { .. }) => {}
+                (req, ServerMessage::Error { code, .. }) => {
+                    assert_eq!(code, expected);
+                    assert_eq!(req, (expected == error_code::REQUEST_FAILED).then_some(11));
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    let renamed = host.wait(&session.id, |s| s.name == "renamed");
+    assert_eq!(renamed.clients, 0);
+    let mut typed = false;
+    for _ in 0..250 {
+        if let ServerMessage::ScreenText { text, .. } = host.call(ClientMessage::Screen {
+            id: session.id.clone(),
+            scrollback: true,
+            max_lines: None,
+        }) {
+            typed = text.contains("GOT:typed");
+            if typed {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(typed);
+    host.kill(&session.id);
+}
+
+#[test]
+fn sessions_report_their_owner_tags_clients_and_creation_time() {
+    let host = Host::new();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let tags = BTreeMap::from([
+        ("tab".to_string(), "6d1f".to_string()),
+        ("kind".to_string(), "agent".to_string()),
+    ]);
+    let request = |owner: Option<&str>, tags: BTreeMap<String, String>| ClientMessage::Create {
+        request_id: Uuid::new_v4().to_string(),
+        name: "tagged".into(),
+        cwd: "/tmp".into(),
+        command: shell("exec sleep 60"),
+        env: BTreeMap::new(),
+        cols: 80,
+        rows: 24,
+        owner: owner.map(str::to_string),
+        tags,
+    };
+    let created = match host.call(request(Some("com.example.cherry"), tags.clone())) {
+        ServerMessage::Created { session } => session,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(created.owner.as_deref(), Some("com.example.cherry"));
+    assert_eq!(created.tags, tags);
+    assert_eq!(created.clients, 0);
+    assert!(created.created_at >= before, "{created:?}");
+    let (_first, attached, ..) = host.attach(&created.id, 80, 24);
+    assert_eq!(attached.created_at, created.created_at);
+    let (_second, ..) = host.attach(&created.id, 80, 24);
+    let listed = host.wait(&created.id, |s| s.clients == 2);
+    assert!(listed.attached);
+    assert_eq!((listed.owner, listed.tags), (created.owner, tags));
+    // Metadata is bounded.
+    let error = |message: ServerMessage| match message {
+        ServerMessage::Error { message, .. } => message,
+        other => panic!("{other:?}"),
+    };
+    let long_owner = "o".repeat(MAX_OWNER_BYTES + 1);
+    assert!(error(host.call(request(Some(&long_owner), BTreeMap::new()))).contains("owner"));
+    let too_many: BTreeMap<String, String> = (0..=MAX_TAGS)
+        .map(|n| (n.to_string(), String::new()))
+        .collect();
+    assert!(error(host.call(request(None, too_many))).contains("tags"));
+    assert_eq!(host.sessions().len(), 1);
+    host.kill(&created.id);
 }
 
 #[test]
@@ -628,6 +953,8 @@ fn working_directories_are_expanded_on_the_host() {
             env: BTreeMap::new(),
             cols: 80,
             rows: 24,
+            owner: None,
+            tags: BTreeMap::new(),
         }) {
             ServerMessage::Created { session } => session,
             other => panic!("{cwd}: {other:?}"),
@@ -1184,7 +1511,7 @@ fn stdio_gateway_flushes_binary_frames_without_newlines() {
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = thread::spawn(move || {
         use std::io::Read;
-        let mut preamble = [0u8; 17];
+        let mut preamble = vec![0u8; format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").len()];
         let result = stdout
             .read_exact(&mut preamble)
             .map(|_| preamble.to_vec())
@@ -1198,7 +1525,10 @@ fn stdio_gateway_flushes_binary_frames_without_newlines() {
     let _ = gateway.wait();
     reader.join().unwrap();
     let (preamble, welcome) = result.unwrap().unwrap();
-    assert_eq!(preamble, b"CHERRY-GATEWAY 3\n");
+    assert_eq!(
+        preamble,
+        format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").as_bytes()
+    );
     assert!(matches!(welcome, Some(ServerMessage::Welcome { .. })));
 }
 

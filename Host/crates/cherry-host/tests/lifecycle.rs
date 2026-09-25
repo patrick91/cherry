@@ -316,9 +316,12 @@ exit 19"#,
         host.dir().join("ready").exists()
     });
     assert_eq!(host.session(&session.id).state, SessionState::Running);
-    let before = cpu_seconds(host.child.id());
+    // The daemon, and the holder that reads the terminal.
+    let holder = holder_of(&host.sandbox, &session.id) as u32;
+    let cpu = || cpu_seconds(host.child.id()) + cpu_seconds(holder);
+    let before = cpu();
     thread::sleep(Duration::from_millis(1500));
-    let consumed = cpu_seconds(host.child.id()) - before;
+    let consumed = cpu() - before;
     assert!(
         consumed < 0.75,
         "host consumed {consumed:.2}s CPU after terminal EOF"
@@ -390,18 +393,25 @@ fn context_switches(pid: u32) -> u64 {
 }
 
 #[test]
-fn an_idle_daemon_does_not_keep_waking_up() {
+fn an_idle_daemon_and_its_holders_do_not_keep_waking_up() {
     let host = Host::new();
     let sessions: Vec<_> = (0..3)
         .map(|_| host.create(shell("exec sleep 60")))
         .collect();
     let (_attached, _, _, _) = host.attach(&sessions[0].id, 80, 24);
-    thread::sleep(Duration::from_millis(500));
-    let before = context_switches(host.child.id());
+    let holders: Vec<u32> = sessions
+        .iter()
+        .map(|session| holder_of(&host.sandbox, &session.id) as u32)
+        .collect();
+    // Past the foreground checks that follow a session's start.
+    thread::sleep(Duration::from_millis(1500));
+    let processes: Vec<u32> = [host.child.id()].into_iter().chain(holders).collect();
+    let total = || -> u64 { processes.iter().map(|&pid| context_switches(pid)).sum() };
+    let before = total();
     thread::sleep(Duration::from_secs(2));
-    let switches = context_switches(host.child.id()) - before;
-    // Polling every 10 ms (accept) and 100 ms (each session) would be about
-    // 260 wakeups here.
+    let switches = total() - before;
+    // Polling every 10 ms (accept) and 100 ms (each session, in the daemon
+    // or its holder) would be about 460 wakeups here.
     assert!(
         switches < 40,
         "{switches} context switches in 2 s while idle"

@@ -1,8 +1,9 @@
 //! Where a host keeps its socket and its durable state.
 //!
 //! The socket lives in its own private directory (by default under /tmp, so
-//! the path stays short enough for sockaddr_un). The host identity, lock and
-//! log live in a per-user state directory that tmp cleaners never touch:
+//! the path stays short enough for sockaddr_un). The host identity, lock,
+//! log and session manifests live in a per-user state directory that tmp
+//! cleaners never touch:
 //! `~/Library/Application Support/cherry-host/<key>` on macOS and
 //! `${XDG_STATE_HOME:-~/.local/state}/cherry-host/<key>` elsewhere. The key is
 //! `default` for the default socket and a stable hash of any other socket path.
@@ -210,11 +211,101 @@ fn passwd_field(field: impl Fn(&libc::passwd) -> *mut libc::c_char) -> Option<Os
     (!bytes.is_empty()).then(|| OsString::from_vec(bytes))
 }
 
+/// Sessions outlive the daemon in their holders, and each holder keeps a
+/// manifest here: `<state dir>/sessions/<id>.json`.
+pub const SESSIONS_DIR: &str = "sessions";
+
+/// What a starting daemon learns about a session held by a holder process
+/// (see `holder`): which holders to expect.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub id: String,
+    pub holder_pid: u32,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: u64,
+    pub link_version: u16,
+    /// When the holder process started (`processes::start_identity`): a
+    /// process that got its PID later, or after a reboot, is not it.
+    #[serde(default)]
+    pub holder_started: Option<String>,
+}
+
+/// Where the manifest of session `id` lives.
+pub fn manifest_path(state: &Path, id: &str) -> PathBuf {
+    state.join(SESSIONS_DIR).join(format!("{id}.json"))
+}
+
+/// Write a holder's manifest, whole: returns its path. It is not flushed
+/// to disk: it only matters while its holder runs, and no holder outlives a
+/// crash of the system.
+pub fn write_manifest(state: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    let dir = state.join(SESSIONS_DIR);
+    ensure_private_dir(&dir, false)
+        .with_context(|| format!("cannot use sessions directory {}", dir.display()))?;
+    let name = format!("{}.json", manifest.id);
+    write_atomic(&dir, &name, &serde_json::to_vec(manifest)?, false)?;
+    Ok(dir.join(name))
+}
+
+/// The manifests in the state directory, with their paths. Unreadable ones
+/// are skipped (and left alone).
+pub fn read_manifests(state: &Path) -> Vec<(PathBuf, Manifest)> {
+    let dir = state.join(SESSIONS_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            let bytes = fs::read(&path).ok()?;
+            let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
+            (path.file_stem()? == manifest.id.as_str()).then_some((path, manifest))
+        })
+        .collect()
+}
+
+/// Replace `dir/name` with `bytes`: readers see the old file or the new
+/// one, never a partial one. A `durable` file is on disk before it gets its
+/// name, so a crash of the system leaves one of them too.
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8], durable: bool) -> Result<()> {
+    use io::Write;
+    let path = dir.join(name);
+    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let written = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .and_then(|()| fs::rename(&temporary, &path));
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("writing {}", path.display()));
+    }
+    if durable {
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Read the host identity, creating it on first use. It survives daemon
 /// restarts, so clients can tell a restarted host from a different one.
 /// Called with the state directory's lock held, so nothing else writes it.
 pub fn host_id(state: &Path) -> Result<String> {
-    use io::{Read, Write};
+    use io::Read;
     let path = state.join("host-id");
     match fs::OpenOptions::new()
         .read(true)
@@ -232,8 +323,8 @@ pub fn host_id(state: &Path) -> Result<String> {
             {
                 return Ok(id.to_string());
             }
-            // Sessions never outlive the daemon, so a lost identity only
-            // makes the next host look new, which it is.
+            // Only an edit or a disk fault garbles it. The next host looks
+            // new to clients, although held sessions may carry over to it.
             crate::daemon::log(format_args!(
                 "replacing the unreadable host identity in {}",
                 path.display()
@@ -243,28 +334,7 @@ pub fn host_id(state: &Path) -> Result<String> {
         Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
     }
     let id = uuid::Uuid::new_v4().to_string();
-    // Complete and on disk before it gets its name: a crash leaves either
-    // the old file or the new identity, never a partial one.
-    let temporary = state.join(format!(".host-id.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let written = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.write_all(id.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&temporary, &path));
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("writing {}", path.display()));
-    }
-    if let Ok(dir) = fs::File::open(state) {
-        let _ = dir.sync_all();
-    }
+    write_atomic(state, "host-id", id.as_bytes(), true)?;
     Ok(id)
 }
 

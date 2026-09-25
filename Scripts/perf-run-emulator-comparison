@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""Run a matched Cherry app-soak and Ghostty workload, then compare their reports.
+
+Cherry runs apart from the user's own copy: a private HOME (saved workspaces,
+notes, todos) and private control and session-host sockets
+(CHERRY_CONTROL_SOCKET, CHERRY_HOST_SOCKET) in a private (0700) directory.
+With --sessions persistent (the app's default) its tabs are persistent sessions
+on a cherry-host of its own; with --sessions native they are native tabs.
+Either is passed to Cherry explicitly, so the user's own setting never decides
+what is measured. At the end every session there is killed and removed, the
+daemon is shut down and the directory is deleted (--keep-cherry-open prints the
+command that does this later).
+"""
 import argparse
 import json
 import os
@@ -14,7 +26,16 @@ import tempfile
 import time
 
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cherry_private_host  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Cherry's Settings > Sessions > "Run local terminals as persistent sessions",
+# as a launch argument (NSArgumentDomain). Cherry reads it as a Bool, which
+# only a plist boolean gives: "NO" or "0" would read as unset.
+SESSIONS_ARGUMENT = {"persistent": ["-sessions.persistLocal", "<true/>"],
+                     "native": ["-sessions.persistLocal", "<false/>"]}
 
 
 def parse_args():
@@ -43,7 +64,20 @@ def parse_args():
     parser.add_argument("--settle-after-complete", type=float, default=1.0)
     parser.add_argument("--launch-timeout", type=float, default=60.0)
     parser.add_argument("--log-dir", default=str(REPO_ROOT / ".build" / "perf"))
-    parser.add_argument("--cherry-command", default="swift run Cherry")
+    parser.add_argument(
+        "--cherry-command",
+        help="Command that launches Cherry, run with the private HOME and sockets, with the --sessions "
+        "launch argument appended (for example 'swift run Cherry'). By default Cherry is built with "
+        "'swift build --product Cherry' under your own HOME and the built executable is run. For a "
+        "Cherry whose cherry helper is not this checkout's, set CHERRY_CLI_PATH so that teardown uses it.",
+    )
+    parser.add_argument(
+        "--sessions",
+        choices=tuple(SESSIONS_ARGUMENT),
+        default="persistent",
+        help="Run Cherry's tabs as persistent sessions on a private cherry-host (the app's default; needs "
+        "Scripts/build-host debug) or as native tabs.",
+    )
     parser.add_argument("--keep-cherry-open", action="store_true")
     parser.add_argument("--keep-project-roots", action="store_true")
     parser.add_argument(
@@ -81,10 +115,6 @@ def parse_written_json(output, label):
     if not matches:
         raise RuntimeError(f"could not find JSON report path in {label} output")
     return Path(matches[-1]).expanduser().resolve()
-
-
-def control_socket(namespace):
-    return Path(f"/tmp/cherry-{os.getuid()}") / namespace / "control.sock"
 
 
 def send(socket_path, request, timeout=10):
@@ -141,6 +171,26 @@ def terminate_process(process):
         process.wait(timeout=5)
 
 
+def cherry_launch_command(args, private_env):
+    """The command that runs Cherry, with the --sessions launch argument."""
+    if args.cherry_command:
+        command = shlex.split(args.cherry_command)
+    else:
+        # Built with the user's own environment and HOME, where SwiftPM keeps
+        # its caches; only Cherry itself runs with the private HOME. A debug
+        # build, as `swift run Cherry` made before.
+        print("[pair] running: swift build --product Cherry", flush=True)
+        subprocess.run(["swift", "build", "--product", "Cherry"], cwd=REPO_ROOT, check=True)
+        bin_path = subprocess.run(["swift", "build", "--show-bin-path"], cwd=REPO_ROOT, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        command = [str(Path(bin_path) / "Cherry")]
+        if (args.sessions == "persistent"
+                and cherry_private_host.development_cli(REPO_ROOT, private_env, cwd=REPO_ROOT) is None):
+            raise RuntimeError("persistent-session tabs need the cherry helpers: run Scripts/build-host debug, "
+                               "or pass --sessions native")
+    return command + SESSIONS_ARGUMENT[args.sessions]
+
+
 def make_project_roots(windows, log_dir):
     roots = [str(REPO_ROOT)]
     temp_roots = []
@@ -168,25 +218,30 @@ def main():
     log_dir = Path(args.log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     roots, temp_roots, root_file = make_project_roots(args.windows, log_dir)
-    namespace = f"perf-pair-{int(time.time())}-{os.getpid()}"
-    socket_path = control_socket(namespace)
+    private_dir = cherry_private_host.make_private_directory("cherry-perf-")
+    home, socket_path, host_socket = cherry_private_host.layout(private_dir)
     cherry_log_path = log_dir / f"paired-cherry-{time.strftime('%Y%m%d-%H%M%S')}.log"
     comparison_path = log_dir / f"emulator-comparison-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
 
-    env = os.environ.copy()
+    # Without a Cherry tab's own variables (its control socket, process id),
+    # which would point at the user's app.
+    env = cherry_private_host.isolated_environment(os.environ, home, socket_path, host_socket)
     env["CHERRY_TERMINAL_PERF"] = "1"
     env["CHERRY_PERF_PROJECT_ROOTS"] = ":".join(roots)
-    env["CHERRY_CONTROL_NAMESPACE"] = namespace
 
     print(f"[pair] project_roots={root_file}")
+    print(f"[pair] private_dir={private_dir}")
     print(f"[pair] cherry_socket={socket_path}")
     print(f"[pair] cherry_log={cherry_log_path}")
+    print(f"[pair] sessions={args.sessions}")
 
     cherry_process = None
     cherry_report = None
     ghostty_report = None
+    succeeded = False
+    cleanup_problems = []
     try:
-        cherry_command = shlex.split(args.cherry_command)
+        cherry_command = cherry_launch_command(args, env)
         with cherry_log_path.open("w", encoding="utf-8") as cherry_log:
             cherry_process = subprocess.Popen(
                 cherry_command,
@@ -237,6 +292,7 @@ def main():
                 "mode": args.mode,
                 "windows": args.windows,
                 "tabs": args.tabs,
+                "sessions": args.sessions,
                 "duration": args.duration,
                 "sleep_ms": args.sleep_ms,
                 "rate_mib_per_second": args.rate_mib_per_second,
@@ -250,6 +306,7 @@ def main():
             manifest_path = log_dir / f"cherry-app-soak-run-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             print(f"[pair] wrote {manifest_path}")
+            succeeded = True
             return
 
         ghostty_windows = args.windows * args.tabs
@@ -295,6 +352,7 @@ def main():
             "mode": args.mode,
             "windows": args.windows,
             "tabs": args.tabs,
+            "sessions": args.sessions,
             "duration": args.duration,
             "sleep_ms": args.sleep_ms,
             "rate_mib_per_second": args.rate_mib_per_second,
@@ -307,12 +365,27 @@ def main():
         manifest_path = log_dir / f"paired-emulator-run-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"[pair] wrote {manifest_path}")
+        succeeded = True
     finally:
-        if cherry_process is not None and not args.keep_cherry_open:
-            terminate_process(cherry_process)
+        if cherry_process is not None and args.keep_cherry_open and cherry_process.poll() is None:
+            print(f"[pair] Cherry keeps running from {private_dir}. When you are done, quit it and run: "
+                  f"python3 {shlex.quote(str(REPO_ROOT / 'Scripts/cherry_private_host.py'))} stop "
+                  f"{shlex.quote(str(private_dir))}")
+        else:
+            if cherry_process is not None:
+                terminate_process(cherry_process)
+            # Its tabs' sessions outlive it (as in the app); end them, the
+            # daemon, holders and attach adapters, then delete the directory.
+            cleanup_problems = cherry_private_host.stop_private_run(
+                private_dir, cherry_private_host.development_cli(REPO_ROOT, env, cwd=REPO_ROOT))
+            for problem in cleanup_problems:
+                print(f"[pair] private session host cleanup: {problem}", file=sys.stderr)
         if temp_roots and not args.keep_project_roots:
             for root in temp_roots:
                 shutil.rmtree(root, ignore_errors=True)
+        # An error the run raised already says it failed.
+        if cleanup_problems and succeeded:
+            raise RuntimeError("the private session host was not cleaned up (see above)")
 
 
 if __name__ == "__main__":

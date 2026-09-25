@@ -1,15 +1,19 @@
 import Foundation
 @testable import Cherry
 
-/// A stand-in for the Rust `cherry` CLI that parses arguments the way its clap
-/// definition does: an option takes the next argument only when that argument
-/// does not start with "-", or an inline `--option=value`. Swift callers are
-/// checked against the CLI contract instead of a script that accepts anything.
+/// A stand-in for the Rust `cherry` CLI's `attach` (the attach adapter) that
+/// parses arguments the way its clap definition does: an option takes the
+/// next argument only when that argument does not start with "-", or an
+/// inline `--option=value`. Swift callers are checked against the CLI
+/// contract instead of a script that accepts anything. Control actions use
+/// `cherry control`; see `FakeControlHelper`.
 ///
-/// Behaviour switches are files in `directory`: `host-id` (default host-a),
-/// `sessions` (comma-separated SessionInfo JSON), `list-fails` (printed to
-/// stderr by a `list` that then exits 255, as ssh does when it cannot
-/// connect), `new-rejects` and `new-transport-failures` (a count).
+/// Behaviour switches (files in `directory`): `host-id` (default host-a),
+/// which `--expected-host-id` must match; `attach-status`, whose contents an
+/// attach writes to its `--status-file` (atomically, as the CLI does) once
+/// it started, as the adapter's live state (`attachedStatus`). Without it,
+/// an attach reports nothing, like one still attaching; tests then write
+/// its status file themselves (`writeStatus`).
 struct HostedSessionFakeCLI {
     let directory: URL
     let executable: URL
@@ -41,9 +45,9 @@ struct HostedSessionFakeCLI {
         expected=
         while [ $# -gt 0 ]; do
           case "$1" in
-            --host=*|--socket=*) ;;
+            --host=*|--socket=*|--ssh-control-path=*) ;;
             --expected-host-id=*) expected=${1#*=} ;;
-            --host|--socket) takes_value "$1" "$2"; shift ;;
+            --host|--socket|--ssh-control-path) takes_value "$1" "$2"; shift ;;
             --expected-host-id) takes_value "$1" "$2"; expected=$2; shift ;;
             -*) fail "unexpected argument '$1' found" ;;
             *) break ;;
@@ -58,72 +62,27 @@ struct HostedSessionFakeCLI {
           exit 1
         fi
         case "$command" in
-          list)
-            for argument in "$@"; do
-              [ "$argument" = --json ] || fail "unexpected argument '$argument' found"
-            done
-            if [ -f "$dir/list-fails" ]; then cat "$dir/list-fails" >&2; exit 255; fi
-            printf '{"host_id":"%s","sessions":[%s]}\n' "$host_id" "$(cat "$dir/sessions" 2>/dev/null)"
-            ;;
-          new)
-            name=Terminal
-            cwd=
-            request=
-            while [ $# -gt 0 ]; do
-              case "$1" in
-                --name=*) name=${1#--name=} ;;
-                --cwd=*) cwd=${1#--cwd=} ;;
-                --request-id=*) request=${1#--request-id=} ;;
-                --name|--cwd|--request-id)
-                  takes_value "$1" "$2"
-                  case "$1" in
-                    --name) name=$2 ;;
-                    --cwd) cwd=$2 ;;
-                    *) request=$2 ;;
-                  esac
-                  shift ;;
-                --json) ;;
-                --) shift; break ;;
-                *) fail "unexpected argument '$1' found" ;;
-              esac
-              shift
-            done
-            [ -n "$cwd" ] || fail "the following required arguments were not provided: --cwd <CWD>"
-            printf '%s\n' "$name" > "$dir/created-name"
-            printf '%s\n' "$cwd" > "$dir/created-cwd"
-            printf '%s\n' "$request" >> "$dir/request-ids"
-            if [ -f "$dir/new-rejects" ]; then
-              printf 'cherry: host rejected request (request_failed): working directory does not exist\n' >&2
-              exit 1
-            fi
-            if [ -f "$dir/new-transport-failures" ]; then
-              read -r remaining < "$dir/new-transport-failures"
-              if [ "$remaining" -gt 0 ]; then
-                printf '%s\n' $((remaining - 1)) > "$dir/new-transport-failures"
-                printf 'cherry: connection to the host was lost\n' >&2
-                exit 1
-              fi
-            fi
-            printf '{"id":"session-%s","name":"Created","cwd":"/remote","command":["/bin/sh"],"cols":80,"rows":24,"state":"running","pid":42,"exit_code":null,"attached":false,"exit_signal":null}\n' "$request"
-            ;;
           attach)
             [ $# -gt 0 ] || fail "the following required arguments were not provided: <ID>"
             id=$1
             shift
+            status_file=
             while [ $# -gt 0 ]; do
               case "$1" in
                 --takeover) ;;
-                --detach-key=*|--status-file=*) ;;
-                --detach-key|--status-file) takes_value "$1" "$2"; shift ;;
+                --detach-key=*) ;;
+                --status-file=*) status_file=${1#*=} ;;
+                --detach-key) takes_value "$1" "$2"; shift ;;
+                --status-file) takes_value "$1" "$2"; status_file=$2; shift ;;
                 *) fail "unexpected argument '$1' found" ;;
               esac
               shift
             done
             printf 'Attached %s\r\n' "$id"
+            if [ -n "$status_file" ] && [ -f "$dir/attach-status" ]; then
+              cat "$dir/attach-status" > "$status_file.$$" && mv -f "$status_file.$$" "$status_file"
+            fi
             exec /bin/sleep 30
-            ;;
-          kill|remove)
-            [ $# -eq 1 ] || fail "expected exactly one session id"
             ;;
           *) fail "unrecognized subcommand '$command'" ;;
         esac
@@ -132,11 +91,8 @@ struct HostedSessionFakeCLI {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
     }
 
-    func client(timeout: TimeInterval = 5, loginEnvironment: [String: String] = [:]) -> HostedSessionClient {
-        HostedSessionClient(
-            executableURL: executable, timeout: timeout,
-            loginEnvironment: { _ in .init(environment: loginEnvironment) }
-        )
+    func client(loginEnvironment: [String: String] = [:]) -> HostedSessionClient {
+        HostedSessionClient(executableURL: executable, loginEnvironment: { _ in .init(environment: loginEnvironment) })
     }
 
     func write(_ name: String, _ contents: String) throws {
@@ -153,6 +109,30 @@ struct HostedSessionFakeCLI {
     }
 
     var calls: [String] { lines("calls") }
+
+    /// A running adapter's live state, as `cherry attach` writes it.
+    static func attachedStatus(viewport: Bool = false, reconnecting: Bool = false) -> String {
+        #"{"outcome":"attached","viewport":\#(viewport),"reconnecting":\#(reconnecting),"exit_code":null,"signal":null,"message":null}"#
+    }
+
+    /// Makes every attach from now on report itself attached with this
+    /// state (nil: report nothing).
+    func reportAttach(viewport: Bool = false, reconnecting: Bool = false) throws {
+        try write("attach-status", Self.attachedStatus(viewport: viewport, reconnecting: reconnecting))
+    }
+
+    /// The `--status-file` of an attach call (a line of `calls`).
+    static func statusFile(of call: String) -> URL? {
+        let parts = call.split(separator: " ").map(String.init)
+        guard let index = parts.firstIndex(of: "--status-file"), parts.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: parts[index + 1])
+    }
+
+    /// Replaces a status file atomically, as the CLI does (the app follows
+    /// renames in its directory).
+    static func writeStatus(_ json: String, to file: URL) throws {
+        try Data(json.utf8).write(to: file, options: .atomic)
+    }
     var lastArguments: [String] { lines("last-arguments") }
 
     func cleanUp() { try? FileManager.default.removeItem(at: directory) }

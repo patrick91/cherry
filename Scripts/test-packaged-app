@@ -13,6 +13,14 @@ can conceal. The temporary test window is closed when the check finishes.
 The bundled cherry and cherry-host helpers run under the same sandbox against a
 private socket: they must start a daemon, create, list, kill and remove a
 session, and shut the daemon down without the checkout's Host/target builds.
+
+Local tabs are persistent sessions by default, so the GUI gets its own session
+host too: CHERRY_HOST_SOCKET and CHERRY_CONTROL_SOCKET name sockets in a
+private (0700) directory of the fixture, never the user's daemon or app, and
+its tabs must run on that host. When the check finishes, every session there
+is killed and removed, the daemon is shut down, anything else still running
+from the fixture (holders, attach adapters) is killed, and the fixture,
+including the host's state directory under its HOME, is deleted.
 """
 
 import argparse
@@ -28,6 +36,10 @@ import sys
 import tempfile
 import time
 import uuid
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cherry_private_host  # noqa: E402
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -222,10 +234,21 @@ def main():
     process = None
     log = fixture / "app.log"
     terminal_ids = []
-    socket_path = fixture / "control.sock"
+    # The GUI's control server and session host listen here, private to this
+    # run (the host refuses a socket directory that is not 0700).
+    sockets = fixture / "sockets"
+    socket_path = sockets / "control.sock"
+    host_socket = sockets / "host.sock"
     project = fixture / "project"
+    home = fixture / "home"
+    cli = None
+    sandbox = None
+    environment = None
+    bundle_id = None
     success = False
     try:
+        sockets.mkdir(mode=0o700)
+        sockets.chmod(0o700)
         app = fixture / original.name
         shutil.copytree(original, app, symlinks=True)
         info_path = app / "Contents/Info.plist"
@@ -242,6 +265,7 @@ def main():
         info.pop("CFBundleIconName", None)
         with info_path.open("wb") as file:
             plistlib.dump(info, file)
+        bundle_id = info["CFBundleIdentifier"]
         run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
         executable = app / "Contents/MacOS" / info["CFBundleExecutable"]
 
@@ -275,7 +299,6 @@ def main():
                     raise RuntimeError(f"Sandbox did not conceal checkout: {path}")
         print("Verified source/build reads are denied to the test process.", flush=True)
 
-        home = fixture / "home"
         home.mkdir()
         project.mkdir()
         # An empty repository avoids developer config, hooks, and project commands.
@@ -300,9 +323,12 @@ def main():
         })
         if not args.skip_helpers:
             exercise_helpers(app, sandbox, environment, fixture)
+            cli = app / "Contents/MacOS/cherry"
+        # Only the GUI gets the host socket; exercise_helpers passes --socket.
+        gui_environment = dict(environment, CHERRY_HOST_SOCKET=str(host_socket))
         with log.open("wb") as output:
             process = subprocess.Popen(sandbox + [str(executable)], cwd=fixture,
-                                       env=environment, stdout=output, stderr=subprocess.STDOUT,
+                                       env=gui_environment, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
         deadline = time.monotonic() + args.timeout
         while True:
@@ -352,7 +378,27 @@ def main():
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"Shell marker did not appear in rendered Ghostty screen: {output}")
             time.sleep(0.1)
-        print("PASS: packaged GUI opened a native Ghostty terminal and rendered shell output with checkout hidden.",
+        if cli is not None:
+            # New local tabs are persistent sessions on the bundled host, the
+            # one on the private socket; without the helpers they are native.
+            owner = info["CherryApplicationSupportName"]
+            listed = None
+            hosted = []
+            deadline = time.monotonic() + 15
+            while not hosted:
+                check_running(process)
+                listed = cherry_private_host.sessions(cli, host_socket, environment, fixture, sandbox)
+                hosted = [item for item in listed or []
+                          if item.get("owner") == owner and item.get("state") == "running"]
+                if hosted:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("The packaged GUI's tabs are not running as persistent sessions on its "
+                                       f"bundled host at {host_socket}; the host lists {listed}")
+                time.sleep(0.2)
+            print(f"Verified the packaged GUI runs its tabs as persistent sessions ({len(hosted)}) "
+                  "on its bundled host at a private socket.", flush=True)
+        print("PASS: packaged GUI opened a Ghostty terminal and rendered shell output with checkout hidden.",
               flush=True)
         success = True
     finally:
@@ -371,12 +417,32 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        # End the GUI's sessions and daemon, and stop its holders and attach
+        # adapters: the fixture's unique name is in all their command lines.
+        try:
+            leftover = cherry_private_host.stop(cli, host_socket, environment or {}, cwd=fixture,
+                                                prefix=sandbox or (), markers=[fixture.name])
+        except (OSError, subprocess.SubprocessError) as error:
+            leftover = [f"cleanup failed: {error}"]
+        if bundle_id:
+            # cfprefsd keeps the smoke copy's preferences in the user's own
+            # ~/Library/Preferences, whatever CFFIXED_USER_HOME says.
+            subprocess.run(["/usr/bin/defaults", "delete", bundle_id], capture_output=True)
+            (Path.home() / "Library/Preferences" / f"{bundle_id}.plist").unlink(missing_ok=True)
         if not success and log.exists():
             print("Packaged GUI log (last 8 KB):\n" + log.read_text(errors="replace")[-8192:], file=sys.stderr)
+        host_log = cherry_private_host.state_dir(home, host_socket) / "host.log"
+        if not success and host_log.exists():
+            print("GUI session host log (last 8 KB):\n" + host_log.read_text(errors="replace")[-8192:],
+                  file=sys.stderr)
         if args.keep_fixture:
             print(f"Fixture retained at {fixture}", flush=True)
         else:
             shutil.rmtree(fixture)
+        if leftover:
+            print("Packaged GUI session host cleanup: " + "; ".join(leftover), file=sys.stderr)
+            if success:
+                raise RuntimeError("The packaged GUI left processes or state behind: " + "; ".join(leftover))
 
 
 if __name__ == "__main__":

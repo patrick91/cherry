@@ -1,14 +1,20 @@
-//! The long-lived daemon: owns the socket, the state directory's lock and
-//! every session, and never exits because of a transient error.
+//! The long-lived daemon: owns the socket, the state directory's lock, the
+//! registry of sessions and every client connection, and never exits
+//! because of a transient error. Sessions themselves live in holder
+//! processes (see `holder`), which register with whichever daemon serves
+//! the socket, so a daemon can crash or be replaced without ending them.
 use crate::{
     connection::{self, Receipts},
-    environment, paths,
-    session::Session,
-    signals,
+    environment,
+    link::{self, kind, Frame},
+    outbox::{EventKey, Outbox},
+    paths, processes,
+    session::{self, Session},
 };
 use anyhow::{bail, Context, Result};
+use cherry_protocol::{encode_frame, ServerMessage, SessionEvent};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::{
@@ -38,6 +44,20 @@ const MAX_FD_LIMIT: libc::rlim_t = 16384;
 const AGENT_RELEASE_GRACE: Duration = Duration::from_secs(2);
 /// How often lent agents are checked while clients may be lending them.
 const AGENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long `List` (and a request naming a session) waits for the holders a
+/// starting daemon expects to register again.
+const HOLDER_WAIT: Duration = Duration::from_secs(1);
+/// How long telling a holder why it is turned away may take.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bells, notifications and progress reports published while nobody is
+/// subscribed wait this long for the next subscriber, at most this many:
+/// the ones a holder kept while no daemon ran reach the app that
+/// reconnects after the daemon it used went away.
+const UNOBSERVED_FOR: Duration = Duration::from_secs(30);
+const UNOBSERVED_EVENTS: usize = 64;
+/// How long a `SendInput` waits for its session's program to take earlier
+/// input when too much of it waits already.
+const INPUT_WAIT: Duration = Duration::from_secs(5);
 
 /// Write one line to the daemon's log (its stderr). A failed write, such as
 /// a full disk or a closed journal stream, is ignored: unlike `eprintln!`,
@@ -49,14 +69,22 @@ pub fn log(message: impl std::fmt::Display) {
 /// Tunables read once when `serve` starts. The environment overrides exist
 /// for tests.
 pub struct Config {
-    /// An attached client that sends nothing for this long is dropped.
+    /// An attached or subscribed client that sends nothing for this long is
+    /// dropped.
     pub heartbeat_timeout: Duration,
+    /// Any other client that sends nothing for this long is dropped.
+    pub idle_timeout: Duration,
+    /// How long a `SendInput` waits for room (see `INPUT_WAIT`).
+    pub input_wait: Duration,
     /// Delay between SIGHUP, SIGTERM and SIGKILL when killing a session.
     pub kill_grace: Duration,
     /// How often the socket's timestamps are refreshed.
     pub touch_interval: Duration,
     /// How long a client keeps lending its agent after its last connection.
     pub agent_grace: Duration,
+    /// How long requests wait for the holders a starting daemon expects
+    /// (see `HOLDER_WAIT`).
+    pub holder_wait: Duration,
 }
 
 pub fn config() -> &'static Config {
@@ -71,9 +99,13 @@ pub fn config() -> &'static Config {
         Config {
             heartbeat_timeout: millis("CHERRY_HOST_HEARTBEAT_TIMEOUT_MS")
                 .unwrap_or(cherry_protocol::HEARTBEAT_TIMEOUT),
+            idle_timeout: millis("CHERRY_HOST_IDLE_TIMEOUT_MS")
+                .unwrap_or(cherry_protocol::IDLE_TIMEOUT),
+            input_wait: millis("CHERRY_HOST_INPUT_WAIT_MS").unwrap_or(INPUT_WAIT),
             kill_grace: millis("CHERRY_HOST_KILL_GRACE_MS").unwrap_or(Duration::from_secs(2)),
             touch_interval: millis("CHERRY_HOST_TOUCH_INTERVAL_MS").unwrap_or(TOUCH_INTERVAL),
             agent_grace: millis("CHERRY_HOST_AGENT_GRACE_MS").unwrap_or(AGENT_RELEASE_GRACE),
+            holder_wait: millis("CHERRY_HOST_HOLDER_WAIT_MS").unwrap_or(HOLDER_WAIT),
         }
     })
 }
@@ -142,9 +174,21 @@ pub struct Registry {
 
 pub struct Host {
     pub id: String,
+    /// The socket this daemon serves, which holders dial.
+    pub socket: PathBuf,
     /// Holds the socket and the agent link given to sessions.
     pub socket_dir: PathBuf,
+    /// The state directory: identity, lock, log and session manifests.
+    pub state: PathBuf,
     pub registry: Mutex<Registry>,
+    /// Sessions whose holders have manifests but have not registered with
+    /// this daemon yet, and are still waited for.
+    expected: Mutex<HashSet<String>>,
+    expected_changed: Condvar,
+    /// The same holders, with their manifests, until they register, are
+    /// turned away, or are gone: those a `List` reports as pending, however
+    /// long they take.
+    awaited: Mutex<HashMap<String, paths::Manifest>>,
     /// Serializes launches with each other and with shutdown.
     pub launches: Mutex<()>,
     pub stopping: AtomicBool,
@@ -158,6 +202,20 @@ pub struct Host {
     clients: Mutex<HashMap<u32, Client>>,
     /// Wakes `watch_agents` when a connection arrives.
     agents_wake: mpsc::SyncSender<()>,
+    /// Holders turned away, for the log.
+    refusals: Mutex<Diagnostics>,
+    /// Subscribed connections, and what they have not heard yet.
+    subscribers: Mutex<Subscribers>,
+}
+
+/// Connections that asked for events (`Subscribe`).
+#[derive(Default)]
+struct Subscribers {
+    /// Each one's lease (which names its connection) and outbox.
+    connections: Vec<(u64, Arc<Outbox>)>,
+    /// Bells, notifications and progress reports published while there
+    /// were none, and when (see `UNOBSERVED_FOR`).
+    unobserved: VecDeque<(Instant, Arc<Vec<u8>>)>,
 }
 
 #[derive(Default)]
@@ -171,6 +229,240 @@ impl Host {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let _ = (&self.stop).write(&[1]);
+    }
+
+    /// Tell every subscribed connection (see `Outbox::push_event`). Events
+    /// are pushed to all of them in the order they are published. What only
+    /// an event reports (bells, notifications, progress) waits for the next
+    /// subscriber while there is none, briefly (`UNOBSERVED_FOR`); the rest
+    /// a subscriber learns by listing the sessions.
+    pub fn publish(&self, event: SessionEvent) {
+        let (key, seals) = EventKey::of(&event);
+        let kept = matches!(
+            event,
+            SessionEvent::Bell { .. }
+                | SessionEvent::Notification { .. }
+                | SessionEvent::Progress { .. }
+        );
+        if !kept && self.subscribers().connections.is_empty() {
+            return;
+        }
+        let Ok(frame) = encode_frame(&ServerMessage::Event { event }) else {
+            return;
+        };
+        let frame = Arc::new(frame);
+        let mut subscribers = self.subscribers();
+        subscribers
+            .connections
+            .retain(|(_, outbox)| outbox.push_event(frame.clone(), key.clone(), &seals));
+        if subscribers.connections.is_empty() && kept {
+            let now = Instant::now();
+            let unobserved = &mut subscribers.unobserved;
+            while unobserved.len() >= UNOBSERVED_EVENTS
+                || unobserved
+                    .front()
+                    .is_some_and(|(at, _)| now.duration_since(*at) >= UNOBSERVED_FOR)
+            {
+                unobserved.pop_front();
+            }
+            unobserved.push_back((now, frame));
+        }
+    }
+
+    /// Push events to `outbox` from now on, starting with those nobody has
+    /// heard yet (see `publish`).
+    pub fn subscribe(&self, lease: u64, outbox: &Arc<Outbox>) {
+        let mut subscribers = self.subscribers();
+        let now = Instant::now();
+        for (at, frame) in std::mem::take(&mut subscribers.unobserved) {
+            if now.duration_since(at) < UNOBSERVED_FOR {
+                outbox.push_event(frame, None, &[]);
+            }
+        }
+        subscribers.connections.push((lease, outbox.clone()));
+    }
+
+    pub fn unsubscribe(&self, lease: u64) {
+        self.subscribers()
+            .connections
+            .retain(|(subscriber, _)| *subscriber != lease);
+    }
+
+    fn subscribers(&self) -> std::sync::MutexGuard<'_, Subscribers> {
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait up to `HOLDER_WAIT` (`Config::holder_wait`) for the holders
+    /// this daemon expects to register again: every one of them, or only
+    /// `id`'s. Those still missing then are not waited for again.
+    pub fn wait_for_holders(&self, id: Option<&str>) {
+        let mut expected = self.expected.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = |expected: &HashSet<String>| match id {
+            Some(id) => expected.contains(id),
+            None => !expected.is_empty(),
+        };
+        if !pending(&expected) {
+            return;
+        }
+        let deadline = Instant::now() + config().holder_wait;
+        while pending(&expected) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            expected = self
+                .expected_changed
+                .wait_timeout(expected, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        match id {
+            Some(id) => {
+                expected.remove(id);
+            }
+            None => expected.clear(),
+        }
+    }
+
+    /// A holder dialed the socket and said `HolderHello` (`frame`): serve its
+    /// session. A holder this daemon can never serve is told so (see
+    /// `link::Refused`). A holder whose session is already served over
+    /// another link is turned away for now, as is every holder while the
+    /// daemon stops: the next daemon adopts them.
+    pub fn register(self: &Arc<Self>, stream: UnixStream, frame: Frame) {
+        #[derive(serde::Deserialize)]
+        struct Named {
+            id: String,
+        }
+        let named = frame.meta::<Named>().ok().map(|named| named.id);
+        if frame.version < link::MIN_LINK_VERSION {
+            let reason = format!(
+                "this host serves holders of link version {} or later, not {}",
+                link::MIN_LINK_VERSION,
+                frame.version
+            );
+            return self.refuse(stream, named.as_deref(), reason, false, true);
+        }
+        let hello: link::HolderHello = match frame.meta() {
+            Ok(hello) => hello,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                return self.refuse(stream, named.as_deref(), reason, false, true);
+            }
+        };
+        if uuid::Uuid::parse_str(&hello.id).is_err() {
+            let reason = "its session ID is not a UUID".to_string();
+            return self.refuse(stream, None, reason, false, true);
+        }
+        let id = hello.id.clone();
+        let receipt = hello.receipt.clone();
+        // After any launch in progress, and never once stopping.
+        let launch = self.launches.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopping.load(Ordering::SeqCst) {
+            drop(launch);
+            let reason = "this host is stopping".to_string();
+            return self.refuse(stream, Some(&id), reason, true, false);
+        }
+        let replaced = self.registry().sessions.get(&id).cloned();
+        if replaced.as_ref().is_some_and(|session| session.is_linked()) {
+            drop(launch);
+            let reason = "another holder of this session is connected".to_string();
+            return self.refuse(stream, Some(&id), reason, true, true);
+        }
+        let (session, held) = match Session::adopt(self, stream, hello, frame.version) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                // Out of resources: to the holder it is a lost link, and it
+                // dials again with backoff.
+                self.refusals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .report(format_args!("session {id}: cannot serve it: {error:#}"));
+                return;
+            }
+        };
+        let info = session.snapshot_info();
+        {
+            let mut registry = self.registry();
+            if let Some(receipt) = receipt {
+                registry
+                    .receipts
+                    .insert(receipt.request_id, receipt.fingerprint, id.clone());
+            }
+            registry.sessions.insert(id.clone(), session.clone());
+        }
+        {
+            let mut expected = self.expected.lock().unwrap_or_else(|e| e.into_inner());
+            expected.remove(&id);
+        }
+        self.expected_changed.notify_all();
+        self.awaited().remove(&id);
+        drop(launch);
+        self.publish(match replaced {
+            Some(_) => SessionEvent::Changed { session: info },
+            None => SessionEvent::Added { session: info },
+        });
+        // What happened while it had no daemon, once the session is known.
+        for event in held {
+            self.publish(event);
+        }
+        session.start();
+    }
+
+    /// Turn a holder away, telling it why and whether to dial again, and
+    /// stop waiting for it.
+    fn refuse(
+        &self,
+        mut stream: UnixStream,
+        id: Option<&str>,
+        reason: String,
+        retry: bool,
+        report: bool,
+    ) {
+        if let Some(id) = id {
+            self.expected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
+            self.expected_changed.notify_all();
+            self.awaited().remove(id);
+        }
+        if report {
+            let holder = id.map_or_else(
+                || "a session holder".to_string(),
+                |id| format!("the holder of session {id}"),
+            );
+            self.refusals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .report(format_args!("refusing {holder}: {reason}"));
+        }
+        let _ = stream.set_write_timeout(Some(REFUSAL_TIMEOUT));
+        let _ = link::write_blocking(
+            &mut stream,
+            &link::encode(kind::REFUSED, &link::Refused { reason, retry }, &[]),
+        );
+    }
+
+    pub fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn awaited(&self) -> std::sync::MutexGuard<'_, HashMap<String, paths::Manifest>> {
+        self.awaited.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many holders this daemon found manifests of when it started and
+    /// still waits to hear from (`ServerMessage::Sessions::pending_holders`):
+    /// they have not registered, and their processes still run (a stopped
+    /// one registers once it is continued). One that is gone is forgotten;
+    /// its session is not coming back.
+    pub fn pending_holders(&self) -> u32 {
+        let mut awaited = self.awaited();
+        awaited.retain(|_, manifest| {
+            holder_exists(manifest) && !processes::is_zombie(manifest.holder_pid as libc::pid_t)
+        });
+        u32::try_from(awaited.len()).unwrap_or(u32::MAX)
     }
 
     /// After `stop`, wait up to `timeout` until the daemon no longer holds
@@ -279,6 +571,21 @@ fn process_exists(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
 }
 
+/// Whether the holder a manifest names still runs: its PID exists, and was
+/// not given to another process since (unless that cannot be told).
+fn holder_exists(manifest: &paths::Manifest) -> bool {
+    if !process_exists(manifest.holder_pid) {
+        return false;
+    }
+    match (
+        &manifest.holder_started,
+        processes::start_identity(manifest.holder_pid as libc::pid_t),
+    ) {
+        (Some(recorded), Some(current)) => *recorded == current,
+        _ => true,
+    }
+}
+
 /// Check lent agents every `AGENT_CHECK_INTERVAL` while clients are
 /// connected or an agent is linked. A client can stay connected after its
 /// agent is gone (`ssh-agent -k`, or the agent's owner exited), and the link
@@ -365,6 +672,7 @@ pub fn serve(path: &Path) -> Result<()> {
     let _ = std::env::set_current_dir("/");
     let _ = config();
     raise_fd_limit();
+    session::note_executable();
     let socket_dir = paths::socket_dir(path)?;
     let state = paths::open_state_dir(path)?;
     let lock_path = state.join("host.lock");
@@ -386,7 +694,19 @@ pub fn serve(path: &Path) -> Result<()> {
     }
     remove_stale_socket(path)?;
     let id = paths::host_id(&state)?;
-    signals::install().context("installing the child-exit handler")?;
+    // Holders that outlived the last daemon register again; wait for them
+    // before answering who has which sessions. A holder that is gone left
+    // its manifest behind, and its PID may belong to another process now.
+    let mut expected = HashSet::new();
+    let mut awaited = HashMap::new();
+    for (manifest_path, manifest) in paths::read_manifests(&state) {
+        if !holder_exists(&manifest) {
+            let _ = fs::remove_file(manifest_path);
+        } else if manifest.link_version >= link::MIN_LINK_VERSION {
+            expected.insert(manifest.id.clone());
+            awaited.insert(manifest.id.clone(), manifest);
+        }
+    }
     let listener =
         UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -400,11 +720,16 @@ pub fn serve(path: &Path) -> Result<()> {
     let (agents_wake, agents_woken) = mpsc::sync_channel(1);
     let host = Arc::new(Host {
         id,
+        socket: path.to_path_buf(),
         socket_dir,
+        state,
         registry: Mutex::new(Registry {
             sessions: HashMap::new(),
             receipts: Receipts::default(),
         }),
+        expected: Mutex::new(expected),
+        expected_changed: Condvar::new(),
+        awaited: Mutex::new(awaited),
         launches: Mutex::new(()),
         stopping: AtomicBool::new(false),
         next_lease: AtomicU64::new(1),
@@ -414,6 +739,8 @@ pub fn serve(path: &Path) -> Result<()> {
         released_changed: Condvar::new(),
         clients: Mutex::new(HashMap::new()),
         agents_wake,
+        refusals: Mutex::new(Diagnostics::default()),
+        subscribers: Mutex::new(Subscribers::default()),
     });
     let watched = host.clone();
     if let Err(error) = thread::Builder::new()
@@ -423,10 +750,12 @@ pub fn serve(path: &Path) -> Result<()> {
         log(format_args!("cannot watch lent agents: {error}"));
     }
     accept_loop(&listener, &stopped, &host, path);
-    // Give up the socket and the lock before Shutdown is acknowledged, so a
-    // client can start a new host right away instead of reaching a listener
-    // that no longer accepts. A successor that takes the lock must never
-    // find our socket and have it deleted afterwards: remove it first.
+    // Give up the socket and the lock before Shutdown or Replace is
+    // acknowledged, so a client can start a new host right away instead of
+    // reaching a listener that no longer accepts. A successor that takes
+    // the lock must never find our socket and have it deleted afterwards:
+    // remove it first. Holders keep their sessions when this process exits
+    // and register with the successor.
     drop(listener);
     drop(socket);
     drop(lock);
@@ -473,6 +802,7 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
 }
 
 /// Rate-limited diagnostics for the host log.
+#[derive(Default)]
 struct Diagnostics {
     last: Option<Instant>,
     suppressed: usize,
@@ -506,10 +836,7 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
     // Held in reserve so that, out of descriptors, a pending connection can
     // still be accepted and closed instead of waking poll() forever.
     let mut reserve = File::open("/dev/null").ok();
-    let mut diagnostics = Diagnostics {
-        last: None,
-        suppressed: 0,
-    };
+    let mut diagnostics = Diagnostics::default();
     let interval = config().touch_interval;
     let mut next_touch = Instant::now() + interval;
     while !host.stopping.load(Ordering::SeqCst) {

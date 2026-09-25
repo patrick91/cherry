@@ -1004,10 +1004,35 @@ private struct AgentCloseAlertPresenter: NSViewRepresentable {
 }
 
 @MainActor
-private final class AgentCloseAlertPresenterView: NSView {
+final class AgentCloseAlertPresenterView: NSView {
     weak var workspace: TerminalWorkspace?
     weak var chromeState: ProjectWindowChromeState?
     private var presentedSessionID: UUID?
+
+    /// What closing a running agent's tab does
+    /// (`SessionCloseCoordinator.closeEndsProgram`): a persistent agent's
+    /// tab that keeps its session running (Settings › Sessions), or a tab
+    /// attached to a session it does not own, does not stop the agent.
+    static func makeAlert(for session: TerminalSession, policy: SessionBackendPolicy) -> NSAlert {
+        makeAlert(stopsAgent: SessionCloseCoordinator.closeEndsProgram(of: session, policy: policy))
+    }
+
+    static func makeAlert(stopsAgent: Bool) -> NSAlert {
+        let alert = NSAlert()
+        if stopsAgent {
+            alert.messageText = "Close agent?"
+            alert.informativeText = "This agent is running. It will be stopped and removed."
+            alert.addButton(withTitle: "Stop and close")
+        } else {
+            alert.messageText = "Close agent tab?"
+            alert.informativeText = "This agent keeps running in the background after its tab closes. "
+                + "Attach to it again from File › Persistent Sessions."
+            alert.addButton(withTitle: "Close Tab")
+        }
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
 
     func presentIfNeeded() {
         guard let workspace,
@@ -1021,6 +1046,7 @@ private final class AgentCloseAlertPresenterView: NSView {
         guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else {
             chromeState.pendingAgentCloseSessionID = nil
             chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
+            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: false, workspace: workspace)
             return
         }
 
@@ -1031,16 +1057,12 @@ private final class AgentCloseAlertPresenterView: NSView {
             )
             chromeState.pendingAgentCloseSessionID = nil
             chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
+            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: true, workspace: workspace)
             return
         }
 
         presentedSessionID = sessionID
-        let alert = NSAlert()
-        alert.messageText = "Close agent?"
-        alert.informativeText = "This agent is running. It will be stopped and removed."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Stop and close")
-        alert.addButton(withTitle: "Cancel")
+        let alert = Self.makeAlert(for: session, policy: workspace.backendPolicy)
 
         if let window {
             // ViewBridge loads lazily, so retry the compatibility hook at the exact
@@ -1049,6 +1071,7 @@ private final class AgentCloseAlertPresenterView: NSView {
             alert.beginSheetModal(for: window) { [weak self, weak workspace, weak chromeState] response in
                 Task { @MainActor in
                     guard let self else { return }
+                    var closed = false
                     if response == .alertFirstButtonReturn,
                        let workspace,
                        let session = workspace.sessions.first(where: { $0.id == sessionID }) {
@@ -1056,17 +1079,20 @@ private final class AgentCloseAlertPresenterView: NSView {
                             session,
                             allowEmptyWorkspace: chromeState?.pendingAgentCloseAllowsEmptyWorkspace == true
                         )
+                        closed = true
                     }
                     if chromeState?.pendingAgentCloseSessionID == sessionID {
                         chromeState?.pendingAgentCloseSessionID = nil
                         chromeState?.pendingAgentCloseAllowsEmptyWorkspace = false
                     }
                     self.presentedSessionID = nil
+                    SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: closed, workspace: workspace)
                 }
             }
         } else {
             let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
+            let closed = response == .alertFirstButtonReturn
+            if closed {
                 workspace.close(
                     session,
                     allowEmptyWorkspace: chromeState.pendingAgentCloseAllowsEmptyWorkspace
@@ -1077,6 +1103,7 @@ private final class AgentCloseAlertPresenterView: NSView {
                 chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
             }
             presentedSessionID = nil
+            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: closed, workspace: workspace)
         }
     }
 }
@@ -1163,10 +1190,21 @@ private struct DetailPaneView: View {
             .first { $0.name == name }
     }
 
-    private func startIdleCommand(_ command: ProjectCommandDefinition) {
+    private func startIdleCommand(_ command: ProjectCommandDefinition, waitingForRestore: Bool = true) {
         guard command.isLaunchable,
               let root = agentSettings.resolvedProject(for: projectRoot).validProjectRoot
         else { return }
+        if waitingForRestore, workspace.commandSession(named: command.name) == nil,
+           workspace.isRestoringCommand(named: command.name) {
+            // Its saved tab may still come back: start (or show) it once
+            // the restore answered, never as a second copy.
+            let workspace = workspace
+            Task { @MainActor in
+                await workspace.waitUntilRestored(commandNamed: command.name)
+                startIdleCommand(command, waitingForRestore: false)
+            }
+            return
+        }
         chromeState.selectTerminal()
         if let existingSession = workspace.commandSession(named: command.name) {
             existingSession.restartManagedCommandIfNeeded()
@@ -7628,8 +7666,22 @@ private struct SidebarCommandSection: View {
         editingOriginalName = nil
     }
 
-    private func start(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {
+    private func start(
+        _ command: ProjectCommandDefinition,
+        existingSession: TerminalSession?,
+        waitingForRestore: Bool = true
+    ) {
         guard command.isLaunchable, let root = settings.resolvedProject(for: projectRoot).validProjectRoot else { return }
+        if waitingForRestore, existingSession == nil, workspace.isRestoringCommand(named: command.name) {
+            // Its saved tab may still come back: start (or show) it once
+            // the restore answered, never as a second copy.
+            let workspace = workspace
+            Task { @MainActor in
+                await workspace.waitUntilRestored(commandNamed: command.name)
+                start(command, existingSession: workspace.commandSession(named: command.name), waitingForRestore: false)
+            }
+            return
+        }
         if let existingSession {
             if existingSession.isRunningCommand {
                 chromeState.selectTerminal()
@@ -7667,7 +7719,7 @@ private struct SidebarCommandSection: View {
         if let existingSession, workspace.sessions.count > 1 {
             workspace.close(existingSession)
         } else {
-            existingSession?.stop()
+            existingSession?.stopProgram()
         }
         if let projectRoot {
             settings.removeCommand(named: command.name, for: projectRoot)
@@ -8037,7 +8089,11 @@ private extension TerminalSession {
         switch state {
         case .launching, .live:
             true
-        case .exited, .failed, .disconnected:
+        case .disconnected:
+            // A persistent tab's program keeps running on its host while
+            // its adapter reconnects: Start would end it.
+            isPersistentLocalSession && isRunning
+        case .exited, .failed:
             false
         }
     }
@@ -12039,6 +12095,14 @@ private struct TerminalSceneView: View {
                     .padding(.bottom, 14)
             }
 
+            PersistentSessionReconnectBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
+            PersistentSessionEndedBar(session: session, close: closeHostedSession.map { close in { close(session) } })
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
             if isActivePane, chromeState.isTerminalSearchPresented {
                 TerminalSearchOverlay(
                     session: session,
@@ -12073,16 +12137,19 @@ private struct TerminalSceneView: View {
 
     @ViewBuilder
     private var paneContent: some View {
-        if showsTerminalContextBar {
+        if session.hostedAttachment != nil {
+            // Any kind: a restored command or agent attached to its session
+            // reconnects, or is removed, from here too.
             VStack(spacing: 0) {
-                if session.hostedAttachment != nil {
-                    HostedSessionConnectionBar(
-                        session: session,
-                        close: closeHostedSession.map { close in { close(session) } }
-                    )
-                } else {
-                    TerminalContextBar(session: session, isActivePane: isActivePane)
-                }
+                HostedSessionConnectionBar(
+                    session: session,
+                    close: closeHostedSession.map { close in { close(session) } }
+                )
+                terminalSurface
+            }
+        } else if showsTerminalContextBar {
+            VStack(spacing: 0) {
+                TerminalContextBar(session: session, isActivePane: isActivePane)
                 terminalSurface
             }
         } else {
@@ -12279,7 +12346,8 @@ private struct CommandExitStatusBar: View {
         case .failed(let message):
             Status(text: "Launch failed: \(message)", isFailure: true)
         case .disconnected:
-            // Only hosted tabs disconnect; their connection bar reports it.
+            // Attached tabs report it in their connection bar, persistent
+            // ones in PersistentSessionReconnectBar.
             nil
         }
     }
@@ -12300,6 +12368,91 @@ private struct CommandExitStatusBar: View {
                     session.restartManagedCommandIfNeeded()
                 }
                 .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+            .frame(maxWidth: 460)
+        }
+    }
+}
+
+// A local persistent tab whose attach adapter keeps failing to reattach, or
+// has been reconnecting by itself for a while (the session host is down or
+// restarting). Its program may still run on the host; the adapter or the tab
+// keeps retrying, and this offers to try now (a new adapter).
+private struct PersistentSessionReconnectBar: View {
+    @ObservedObject var session: TerminalSession
+
+    var body: some View {
+        if session.isPersistentLocalSession, session.state == .disconnected {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.orange)
+
+                Text("Reconnecting to its session…")
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Button("Reconnect Now") {
+                    session.reconnectHostedSession()
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+            .frame(maxWidth: 460)
+        }
+    }
+}
+
+// A local persistent terminal or agent tab whose program ended (while Cherry
+// was closed, or since): its session stays on the host with the final screen
+// until the tab closes (which removes it) or restarts. Commands show
+// CommandExitStatusBar instead.
+private struct PersistentSessionEndedBar: View {
+    @ObservedObject var session: TerminalSession
+    /// nil when the tab cannot be closed (the workspace's last tab).
+    let close: (() -> Void)?
+
+    var body: some View {
+        if let message = session.persistentSessionEndedMessage {
+            HStack(spacing: 10) {
+                Image(systemName: "stop.circle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Text(message)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Button("Restart") {
+                    session.restart()
+                }
+                .controlSize(.small)
+
+                Button("Close") {
+                    close?()
+                }
+                .controlSize(.small)
+                .disabled(close == nil)
+                .help(close == nil
+                    ? "The last tab in a workspace stays open. Open another tab to close this one."
+                    : "Close this tab and remove its ended session from This Mac's session host")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

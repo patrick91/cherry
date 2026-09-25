@@ -28,11 +28,23 @@
 //! the replies is not read from while they exceed a bound on the order of
 //! what a working client can have queued at most (an attach snapshot, or a
 //! resync snapshot with its carried output, one replacement, and queries).
+//!
+//! Events for a subscribed connection (`push_event`) are queued in order
+//! with its replies, and bounded on their own (`EVENT_LIMIT`,
+//! `EVENT_BYTES`): the latest `changed` or `progress` of a session replaces
+//! one still queued, in its place (but never moves ahead of the session's
+//! `added` or `removed`, nor a `changed` ahead of its `exited`), and a
+//! subscriber that falls behind all the same has its queued events dropped
+//! for one `resync`, which tells it to list the sessions again; each
+//! session's latest progress still queued, which a listing does not tell,
+//! follows it. Events never hold back the session workers that publish
+//! them, nor count against the replies' bound.
 use crate::{signals::Wake, stream::MAX_CLIPBOARD};
+use cherry_protocol::{encode_frame, ServerMessage, SessionEvent, SessionInfo};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::Write,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -57,6 +69,62 @@ pub const REPLY_LOW_WATER: usize = 16 * 1024 * 1024;
 /// a large snapshot reaches a slow client.
 const WRITE_CHUNK: usize = 64 * 1024;
 const CLIPBOARD: &[u8] = b"\x1b]52;";
+/// A subscriber with more events than this queued, or more bytes of them,
+/// has fallen behind (see `Outbox::push_event`).
+pub const EVENT_LIMIT: usize = 1024;
+pub const EVENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// What an event reports the latest of: a newer one replaces it while it is
+/// still queued.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum EventKey {
+    /// A session's `changed`, which carries all of its `SessionInfo`.
+    Changed(String),
+    /// A session's `progress`.
+    Progress(String),
+}
+
+impl EventKey {
+    /// `event`'s key, if a newer event replaces it, and the keys of the
+    /// events it seals (see `Outbox::push_event`): a later change of the
+    /// session never passes its addition, its removal or its exit (the
+    /// change that follows an exit says so).
+    pub fn of(event: &SessionEvent) -> (Option<Self>, Vec<Self>) {
+        match event {
+            SessionEvent::Changed { session } => {
+                (Some(Self::Changed(session.id.clone())), Vec::new())
+            }
+            SessionEvent::Progress { id, .. } => (Some(Self::Progress(id.clone())), Vec::new()),
+            SessionEvent::Added {
+                session: SessionInfo { id, .. },
+            }
+            | SessionEvent::Removed { id } => (
+                None,
+                vec![Self::Changed(id.clone()), Self::Progress(id.clone())],
+            ),
+            SessionEvent::Exited { id, .. } => (None, vec![Self::Changed(id.clone())]),
+            SessionEvent::Bell { .. }
+            | SessionEvent::Notification { .. }
+            | SessionEvent::Resync => (None, Vec::new()),
+        }
+    }
+}
+
+/// The `resync` event, which replaces the events a subscriber fell behind
+/// on.
+fn resync_frame() -> Arc<Vec<u8>> {
+    static FRAME: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    FRAME
+        .get_or_init(|| {
+            Arc::new(
+                encode_frame(&ServerMessage::Event {
+                    event: SessionEvent::Resync,
+                })
+                .expect("the resync event encodes"),
+            )
+        })
+        .clone()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -76,6 +144,18 @@ enum Kind {
     Query,
     /// The last frame; the writer stops after it.
     Final,
+    /// An event for a subscriber (see `Outbox::push_event`).
+    Event,
+    /// The place of an event that a newer one of its key replaces; its
+    /// frame is the latest in `State::latest`, until it is sealed.
+    Latest,
+}
+
+impl Kind {
+    /// Events are counted apart from the other frames.
+    fn is_event(self) -> bool {
+        matches!(self, Kind::Event | Kind::Latest)
+    }
 }
 
 /// An `Output` frame and the renderer bytes it carries.
@@ -89,13 +169,24 @@ struct Item {
     kind: Kind,
     /// Output's renderer bytes, scanned for live-only tokens if dropped.
     data: Option<Arc<Vec<u8>>>,
+    /// A `Latest` event's key, and which of its key's events it is.
+    key: Option<EventKey>,
+    seq: u64,
 }
 
 #[derive(Default)]
 struct State {
     items: VecDeque<Item>,
+    /// Bytes queued, events aside.
     bytes: usize,
     output_bytes: usize,
+    /// Events queued, and their bytes.
+    events: usize,
+    event_bytes: usize,
+    /// The latest frame of each key with an event queued (`Kind::Latest`),
+    /// and that item's `seq`.
+    latest: HashMap<EventKey, (u64, Arc<Vec<u8>>)>,
+    next_seq: u64,
     /// Live-only tokens of output dropped since the last resync.
     carry: Carry,
     /// Queries held while the client lags, for after its resync.
@@ -121,7 +212,52 @@ impl State {
         if kind == Kind::Output {
             self.output_bytes += frame.len();
         }
-        self.items.push_back(Item { frame, kind, data });
+        self.items.push_back(Item {
+            frame,
+            kind,
+            data,
+            key: None,
+            seq: 0,
+        });
+    }
+
+    /// Queue an event; a keyed one keeps its frame in `latest`.
+    fn push_event(&mut self, frame: Arc<Vec<u8>>, key: Option<EventKey>) {
+        self.events += 1;
+        self.event_bytes += frame.len();
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let (frame, kind) = match &key {
+            Some(key) => {
+                self.latest.insert(key.clone(), (seq, frame));
+                (Arc::default(), Kind::Latest)
+            }
+            None => (frame, Kind::Event),
+        };
+        self.items.push_back(Item {
+            frame,
+            kind,
+            data: None,
+            key,
+            seq,
+        });
+    }
+
+    /// Nothing newer replaces the queued event of `key` any more: it keeps
+    /// the frame it has, and the next one of its key is queued anew.
+    fn seal(&mut self, key: &EventKey) {
+        let Some((seq, frame)) = self.latest.remove(key) else {
+            return;
+        };
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|item| item.kind == Kind::Latest && item.seq == seq)
+        {
+            item.frame = frame;
+            item.kind = Kind::Event;
+        }
     }
 
     /// Drop queued items of the stale kinds, keeping the live-only tokens of
@@ -137,7 +273,9 @@ impl State {
                 }
                 return false;
             }
-            bytes += item.frame.len();
+            if !item.kind.is_event() {
+                bytes += item.frame.len();
+            }
             if item.kind == Kind::Output {
                 output_bytes += item.frame.len();
             }
@@ -145,6 +283,26 @@ impl State {
         });
         self.bytes = bytes;
         self.output_bytes = output_bytes;
+    }
+
+    /// The subscriber fell behind: its queued events give way to one
+    /// `resync`, followed by each session's latest `progress` still queued,
+    /// which listing the sessions cannot tell (at most one per session).
+    fn resync_events(&mut self) {
+        let mut progress: Vec<(u64, EventKey, Arc<Vec<u8>>)> = self
+            .latest
+            .drain()
+            .filter(|(key, _)| matches!(key, EventKey::Progress(_)))
+            .map(|(key, (seq, frame))| (seq, key, frame))
+            .collect();
+        progress.sort_by_key(|(seq, ..)| *seq);
+        self.items.retain(|item| !item.kind.is_event());
+        self.events = 0;
+        self.event_bytes = 0;
+        self.push_event(resync_frame(), None);
+        for (_, key, frame) in progress {
+            self.push_event(frame, Some(key));
+        }
     }
 
     /// Hold the queued queries that follow an item of the kinds about to be
@@ -520,6 +678,60 @@ impl Outbox {
         true
     }
 
+    /// An event for this subscribed connection, in order with its replies.
+    /// One with a `key` replaces the frame of an event with that key still
+    /// queued, which keeps its place. Events of the keys in `seals` never
+    /// pass this one (a session's `added`, `removed` or `exited`): the next
+    /// of each is queued behind it. Beyond `EVENT_LIMIT` events or
+    /// `EVENT_BYTES` (a queue with no other event takes one of any size),
+    /// the subscriber has fallen behind: its queued events give way to one
+    /// `resync` (see `State::resync_events`), and this event follows it.
+    /// False once the connection is gone or closing.
+    pub fn push_event(
+        &self,
+        frame: Arc<Vec<u8>>,
+        key: Option<EventKey>,
+        seals: &[EventKey],
+    ) -> bool {
+        let mut state = self.lock();
+        if state.dead || state.closed {
+            return false;
+        }
+        for sealed in seals {
+            state.seal(sealed);
+        }
+        let replaced = key
+            .as_ref()
+            .and_then(|key| state.latest.get(key))
+            .map(|(_, queued)| queued.len());
+        let behind = match replaced {
+            Some(replaced) => {
+                state.events > 1 && state.event_bytes - replaced + frame.len() > EVENT_BYTES
+            }
+            None => {
+                state.events > 0
+                    && (state.events >= EVENT_LIMIT
+                        || state.event_bytes + frame.len() > EVENT_BYTES)
+            }
+        };
+        if behind {
+            // This event supersedes the one of its key a resync would keep.
+            if let Some(key) = &key {
+                state.latest.remove(key);
+            }
+            state.resync_events();
+        } else if let Some(replaced) = replaced {
+            state.event_bytes = state.event_bytes - replaced + frame.len();
+            if let Some((_, queued)) = key.as_ref().and_then(|key| state.latest.get_mut(key)) {
+                *queued = frame;
+            }
+            return true;
+        }
+        state.push_event(frame, key);
+        self.ready.notify_one();
+        true
+    }
+
     /// The last frame of the connection.
     pub fn push_final(&self, frame: Arc<Vec<u8>>) {
         let mut state = self.lock();
@@ -586,8 +798,21 @@ impl Outbox {
             if state.dead {
                 return None;
             }
-            if let Some(item) = state.items.pop_front() {
-                state.bytes -= item.frame.len();
+            if let Some(mut item) = state.items.pop_front() {
+                if item.kind == Kind::Latest {
+                    // Unsealed, it is its key's latest.
+                    if let Some((_, frame)) =
+                        item.key.as_ref().and_then(|key| state.latest.remove(key))
+                    {
+                        item.frame = frame;
+                    }
+                }
+                if item.kind.is_event() {
+                    state.events -= 1;
+                    state.event_bytes -= item.frame.len();
+                } else {
+                    state.bytes -= item.frame.len();
+                }
                 if item.kind == Kind::Output {
                     state.output_bytes -= item.frame.len();
                 }
@@ -623,6 +848,9 @@ impl Outbox {
             state.carry = Carry::default();
             state.held.clear();
             state.query_bytes = 0;
+            state.events = 0;
+            state.event_bytes = 0;
+            state.latest.clear();
             state.waker.clone()
         };
         self.ready.notify_all();
@@ -1129,6 +1357,198 @@ mod tests {
         outbox.write_all_to(&mut peer);
         assert_eq!(peer.len(), 3 * WRITE_CHUNK + 6);
         assert_eq!(outbox.written(), peer.len() as u64);
+    }
+
+    fn bytes(text: &str) -> Arc<Vec<u8>> {
+        Arc::new(text.as_bytes().to_vec())
+    }
+
+    /// Everything the writer sends until the outbox closes.
+    fn written(outbox: &Outbox) -> Vec<u8> {
+        let mut written = Vec::new();
+        outbox.close();
+        outbox.write_all_to(&mut written);
+        written
+    }
+
+    #[test]
+    fn a_sessions_latest_change_replaces_the_one_queued_in_its_place() {
+        let outbox = Outbox::default();
+        let changed = |id: &str| Some(EventKey::Changed(id.into()));
+        assert!(outbox.push_control(bytes("ok|")));
+        assert!(outbox.push_event(bytes("a1|"), changed("a"), &[]));
+        assert!(outbox.push_event(bytes("bell|"), None, &[]));
+        assert!(outbox.push_event(bytes("b1|"), changed("b"), &[]));
+        assert!(outbox.push_control(bytes("pong|")));
+        assert!(outbox.push_event(bytes("a2|"), changed("a"), &[]));
+        assert!(outbox.push_event(bytes("p1|"), Some(EventKey::Progress("a".into())), &[]));
+        assert!(outbox.push_event(bytes("p2|"), Some(EventKey::Progress("a".into())), &[]));
+        let counted = |outbox: &Outbox| {
+            let state = outbox.lock();
+            (state.events, state.event_bytes)
+        };
+        assert_eq!(counted(&outbox), (4, "a2|bell|b1|p2|".len()));
+        // Once written, a change is queued anew.
+        assert_eq!(outbox.next().unwrap().frame.as_slice(), b"ok|");
+        assert_eq!(outbox.next().unwrap().frame.as_slice(), b"a2|");
+        assert!(outbox.push_event(bytes("a3|"), changed("a"), &[]));
+        assert_eq!(written(&outbox), b"bell|b1|pong|p2|a3|");
+        assert_eq!(counted(&outbox), (0, 0));
+    }
+
+    #[test]
+    fn a_change_never_passes_its_sessions_addition_or_removal() {
+        let outbox = Outbox::default();
+        let changed = || Some(EventKey::Changed("a".into()));
+        let seals = [
+            EventKey::Changed("a".into()),
+            EventKey::Progress("a".into()),
+        ];
+        assert!(outbox.push_event(bytes("changed 1|"), changed(), &[]));
+        assert!(outbox.push_event(bytes("changed 2|"), changed(), &[]));
+        assert!(outbox.push_event(bytes("removed|"), None, &seals));
+        assert!(outbox.push_event(bytes("added|"), None, &seals));
+        assert!(outbox.push_event(bytes("changed 3|"), changed(), &[]));
+        assert!(outbox.push_event(bytes("changed 4|"), changed(), &[]));
+        // Another session's are not held back.
+        assert!(outbox.push_event(bytes("b 1|"), Some(EventKey::Changed("b".into())), &[]));
+        assert!(outbox.push_event(bytes("removed b|"), None, &seals));
+        assert!(outbox.push_event(bytes("b 2|"), Some(EventKey::Changed("b".into())), &[]));
+        assert_eq!(
+            written(&outbox),
+            b"changed 2|removed|added|changed 4|b 2|removed b|"
+        );
+    }
+
+    #[test]
+    fn a_sessions_exit_comes_before_the_change_that_says_so() {
+        let outbox = Outbox::default();
+        let session = |state, exit_code| SessionInfo {
+            id: "a".into(),
+            name: "a".into(),
+            cwd: "/".into(),
+            command: vec!["sh".into()],
+            cols: 80,
+            rows: 24,
+            state,
+            pid: None,
+            exit_code,
+            attached: false,
+            exit_signal: None,
+            title: None,
+            pwd: None,
+            foreground: None,
+            clients: 0,
+            owner: None,
+            tags: Default::default(),
+            created_at: 0,
+            alternate_screen: false,
+            kitty_keyboard_flags: 0,
+            application_cursor_keys: false,
+            request_id: None,
+        };
+        let running = SessionEvent::Changed {
+            session: session(cherry_protocol::SessionState::Running, None),
+        };
+        let exited = SessionEvent::Exited {
+            id: "a".into(),
+            exit_code: 3,
+            signal: None,
+        };
+        let ended = SessionEvent::Changed {
+            session: session(cherry_protocol::SessionState::Exited, Some(3)),
+        };
+        // All queued before the writer takes any of them.
+        for event in [&running, &exited, &ended] {
+            let (key, seals) = EventKey::of(event);
+            let frame = encode_frame(&ServerMessage::Event {
+                event: event.clone(),
+            })
+            .unwrap();
+            assert!(outbox.push_event(Arc::new(frame), key, &seals));
+        }
+        let written = written(&outbox);
+        let mut frames = written.as_slice();
+        let mut events = Vec::new();
+        while let Some(ServerMessage::Event { event }) =
+            cherry_protocol::read_frame(&mut frames).unwrap()
+        {
+            events.push(event);
+        }
+        assert_eq!(events, [running, exited, ended]);
+    }
+
+    #[test]
+    fn a_subscriber_that_falls_behind_gets_one_resync_instead_of_its_events() {
+        let resync = resync_frame();
+        let outbox = Outbox::default();
+        assert!(outbox.push_control(bytes("ok|")));
+        assert!(outbox.push_event(bytes("changed|"), Some(EventKey::Changed("a".into())), &[]));
+        for _ in 1..EVENT_LIMIT {
+            assert!(outbox.push_event(bytes("bell|"), None, &[]));
+        }
+        assert_eq!(outbox.lock().events, EVENT_LIMIT);
+        // Replies and events are bounded apart.
+        assert!(!outbox.backlogged());
+        assert!(outbox.push_event(bytes("late|"), None, &[]));
+        assert!(outbox.push_control(bytes("pong|")));
+        // Nothing of the dropped events is left: a change is queued anew.
+        assert!(outbox.push_event(
+            bytes("changed again|"),
+            Some(EventKey::Changed("a".into())),
+            &[]
+        ));
+        assert_eq!(
+            written(&outbox),
+            [&b"ok|"[..], &resync, b"late|pong|changed again|"].concat()
+        );
+        // By bytes too, and an empty queue takes one event of any size.
+        let outbox = Outbox::default();
+        let big = Arc::new(vec![b'x'; EVENT_BYTES + 1]);
+        assert!(outbox.push_event(big.clone(), None, &[]));
+        assert!(outbox.push_event(bytes("next|"), None, &[]));
+        assert_eq!(written(&outbox), [&resync[..], b"next|"].concat());
+        // A replacement that grows past the bound as well, which follows the
+        // resync.
+        let outbox = Outbox::default();
+        assert!(outbox.push_event(bytes("small|"), Some(EventKey::Changed("a".into())), &[]));
+        assert!(outbox.push_event(big.clone(), Some(EventKey::Changed("a".into())), &[]));
+        assert!(outbox.push_event(bytes("bell|"), None, &[]));
+        assert!(outbox.push_event(bytes("large|"), Some(EventKey::Changed("a".into())), &[]));
+        assert!(outbox.push_event(big.clone(), Some(EventKey::Changed("a".into())), &[]));
+        assert_eq!(written(&outbox), [&resync[..], &big[..]].concat());
+        // A closed or failed connection takes no more.
+        assert!(!outbox.push_event(bytes("gone|"), None, &[]));
+    }
+
+    #[test]
+    fn a_resync_is_followed_by_each_sessions_latest_progress() {
+        let resync = resync_frame();
+        let progress = |id: &str| Some(EventKey::Progress(id.into()));
+        let seals = |id: &str| [EventKey::Changed(id.into()), EventKey::Progress(id.into())];
+        let outbox = Outbox::default();
+        assert!(outbox.push_event(bytes("a 1|"), progress("a"), &[]));
+        assert!(outbox.push_event(bytes("b 1|"), progress("b"), &[]));
+        assert!(outbox.push_event(bytes("a 2|"), progress("a"), &[]));
+        assert!(outbox.push_event(bytes("changed|"), Some(EventKey::Changed("a".into())), &[]));
+        // A removed session's is not.
+        assert!(outbox.push_event(bytes("c 1|"), progress("c"), &[]));
+        assert!(outbox.push_event(bytes("removed c|"), None, &seals("c")));
+        while outbox.lock().events < EVENT_LIMIT {
+            assert!(outbox.push_event(bytes("bell|"), None, &[]));
+        }
+        assert!(outbox.push_event(bytes("late|"), None, &[]));
+        // Kept in their order, and replaced in their place.
+        assert!(outbox.push_event(bytes("b 2|"), progress("b"), &[]));
+        assert_eq!(written(&outbox), [&resync[..], b"a 2|b 2|late|"].concat());
+        // A report that puts the subscriber behind replaces its session's.
+        let outbox = Outbox::default();
+        let big = Arc::new(vec![b'x'; EVENT_BYTES]);
+        assert!(outbox.push_event(bytes("a 1|"), progress("a"), &[]));
+        assert!(outbox.push_event(bytes("b 1|"), progress("b"), &[]));
+        assert!(outbox.push_event(bytes("bell|"), None, &[]));
+        assert!(outbox.push_event(big.clone(), progress("a"), &[]));
+        assert_eq!(written(&outbox), [&resync[..], b"b 1|", &big[..]].concat());
     }
 
     #[test]

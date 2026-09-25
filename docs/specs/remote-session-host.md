@@ -1,36 +1,54 @@
 # Portable Cherry Session Host
 
-Status: initial implementation available; the remaining architecture below is
-the design reference, not a claim that every proposed feature has shipped.
+Status: implemented, and extended by
+[multiplexer-default.md](multiplexer-default.md) (protocol 4, holder
+processes, events, hosted-by-default local tabs). The architecture below is
+the original design reference, not a claim that every proposed feature has
+shipped; where it differs from the implementation, the implementation status
+and [Host/README.md](../../Host/README.md) describe current behaviour.
 
 ## Implementation status
 
-The Rust workspace in `Host/` implements the daemon (`cherry-host`), persistent
-PTYs, pinned headless Ghostty state (`cherry-vt`, built as ReleaseSafe from a
+The Rust workspace in `Host/` implements the daemon (`cherry-host serve`), one
+holder process per session (`cherry-host hold`, which owns the PTY, the child
+and pinned headless Ghostty state from `cherry-vt`, built as ReleaseSafe from a
 pinned revision), a framed Unix-socket transport with an SSH stdio gateway, and
-the `cherry` start/list/new/attach/kill/remove/shutdown CLI. The Mac app exposes
-these through **Persistent Sessions…** with saved SSH destinations, pinned host
-identities, explicit disconnect/reconnect, and takeover. Existing native local
-project terminals are unchanged. Build, install, service setup, commands, and
-current bounds are documented in [Host/README.md](../../Host/README.md); where it
-differs from the design below, it describes current behaviour.
+the `cherry` start/list/new/attach/kill/remove/shutdown/control CLI. Local
+terminal, command and agent tabs in the Mac app run as persistent sessions by
+default (see [multiplexer-default.md](multiplexer-default.md)). The app also
+exposes every host's sessions through **Persistent Sessions…** with saved SSH
+destinations, pinned host identities, disconnect/reconnect, and takeover.
+Build, install, service setup, updates, commands, and current bounds are
+documented in [Host/README.md](../../Host/README.md).
 
 What exists, relative to the design:
 
-- **Protocol.** Version 3, exact match only. There is no capability negotiation
-  and no compatibility with earlier versions: a client or gateway that finds a
-  daemon speaking another version refuses it and never stops or replaces it.
-  Frames are length-prefixed JSON with base64 terminal bytes.
+- **Protocol.** Version 4. Every `Hello` is answered with a `Welcome` carrying
+  the host's version, and normal operation needs the same version on both
+  sides. A client whose host speaks an older version (4 or later) asks it to
+  make way (`Replace`) and starts its own, and the sessions carry on; a newer
+  host is reported, never replaced. There is no finer capability
+  negotiation; fields are additive. Requests carry optional IDs, and a
+  subscribed control connection receives session events (added, changed,
+  removed, bell, notification, progress, exited, resync). Frames are
+  length-prefixed JSON with base64 terminal bytes.
 - **Ownership.** Clients trust a socket only in a private directory owned by the
   user, served by a process of the same user; the daemon drops other users'
-  connections. Host identity, lock, and log live in a durable per-user state
-  directory, so the identity survives daemon restarts, reboots, and `/tmp`
-  cleanup.
+  connections. Host identity, lock, log, and holder manifests live in a
+  durable per-user state directory, so the identity survives daemon restarts,
+  reboots, and `/tmp` cleanup.
+- **Crash recovery and upgrades.** Sessions live in their holders, which
+  survive the daemon: after a crash, a restart or a `Replace`, the holders
+  register with the next daemon, which waits briefly for them before listing.
+  The holder link between them is versioned, and a daemon speaks every link
+  version a live holder may use. Sessions do not survive a reboot.
 - **Environment.** The daemon runs with an allowlisted environment and working
-  directory `/`. Clients pass only locale and time zone. Sessions get a stable
-  `SSH_AUTH_SOCK` link that `new` and `attach` repoint at the caller's agent
-  while the caller is connected, plus a 2-second grace period; over SSH only
-  `attach` forwards one (other commands run `ssh -a`).
+  directory `/`. A client may set any session variable (at most 1024, 256 KiB
+  in all); `cherry new` passes the terminal's locale and time zone plus
+  `--env`, and the Mac app passes a tab's whole environment. Sessions get a
+  stable `SSH_AUTH_SOCK` link that `new`, `attach` and `control` repoint at the
+  caller's agent while the caller is connected, plus a 2-second grace period;
+  over SSH, `list`, `new`, `kill`, `remove` and `shutdown` run `ssh -a`.
   Working directories are absolute, `~`, or `~/…`, resolved on the host.
 - **Shared attachment.** Several terminals attach to one session and type
   concurrently (the delivery plan below had deferred multi-writer sessions). The
@@ -38,39 +56,45 @@ What exists, relative to the design:
   requested size settles; larger views paint the shared active screen at the
   top left without native scrollback. `attach --takeover` (Attach & Take Over
   in the app) disconnects the others.
-- **Liveness and flow control.** Attached clients send heartbeats and silent
-  ones are evicted, except while the host holds back their input. A lagging
-  client's queued output is dropped and replaced by a fresh snapshot, followed
-  by the live-only output it missed (titles, clipboard writes, notifications),
-  rather than disconnecting it; forwarded queries wait for the resync and
-  follow it once. Input backpressure paces large pastes, and Detach is ordered
-  after earlier input. Snapshots are limited to 8 MiB by dropping the oldest
-  history.
+- **Liveness and flow control.** Attached and subscribed clients send
+  heartbeats and silent ones are evicted, except while the host holds back
+  their input. A lagging client's queued output is dropped and replaced by a
+  fresh snapshot, followed by the live-only output it missed (titles,
+  clipboard writes, notifications), rather than disconnecting it; forwarded
+  queries wait for the resync and follow it once. Input backpressure paces
+  large pastes, and Detach is ordered after earlier input. Snapshots are
+  limited to 8 MiB by dropping the oldest history. `cherry attach`
+  reconnects by itself for 30 seconds after a lost connection, never
+  resending input.
 - **Termination.** Kill escalates from SIGHUP to SIGTERM to SIGKILL across the
   session's processes. A natural exit is a hangup, so `nohup`'d jobs survive.
   Signal deaths report 128 plus the signal, with the signal itself.
 - **Queries.** The host answers a fixed set of terminal queries, also while
-  detached, and sends the rest to one attached client whose terminal answers
-  queries (the one that typed last, or else the most recently attached), so
-  a query gets one reply, not one from each client. Clients without a
-  terminal (scripted input, redirected output) are never asked. With no such
-  client attached, queries get no reply.
+  detached (and while no daemon runs), and sends the rest to one attached
+  client whose terminal answers queries (the one that typed last, or else the
+  most recently attached), so a query gets one reply, not one from each
+  client. Clients without a terminal (scripted input, redirected output) are
+  never asked. With no such client attached, queries get no reply.
 - **SSH.** The gateway prints a preamble line, so output from remote shell
-  startup files is skipped or reported clearly. Management commands use batch
-  authentication, and the client never becomes an SSH ControlMaster. Kill,
-  remove, and shutdown never start a daemon.
-- **Service setup.** A systemd user unit (`Restart=no`, `KillMode=process`) is
-  provided; while it is enabled, clients start it instead of a daemon of their
-  own. No launchd agent is provided for macOS.
+  startup files is skipped or reported clearly. It starts a daemon when none
+  runs and replaces one of an older protocol, but never one whose identity is
+  not the one the client expects (`CHERRY_EXPECTED_HOST_ID`). Management
+  commands use batch authentication, and the client never becomes an SSH
+  ControlMaster; the Mac app keeps one master connection per destination and
+  passes it with `--ssh-control-path`. Kill, remove, and shutdown never start
+  or replace a daemon.
+- **Service setup.** A systemd user unit (`Restart=on-failure`,
+  `KillMode=process`) is provided; while it is enabled, clients start it
+  instead of a daemon of their own. No launchd agent is provided for macOS.
 
 Remote project/Git/worktree integration, previews, port forwarding, file
-transfer, automatic reconnect, remote MCP support, daemon-crash and reboot
-recovery, and hot upgrades remain deferred. There is no event channel: each
-attached tab runs its own `cherry` process, and its own SSH connection unless
-the user's SSH configuration multiplexes them. Linux logout policies may require
-the systemd user service and lingering. Updating requires finishing running jobs
-and shutting down the old daemon with the old binaries, before installing the
-new ones.
+transfer, remote MCP support, and host-reboot recovery remain deferred. The app
+keeps one control connection (`cherry control`) per host, and each attached tab
+runs its own `cherry attach`, sharing the app's SSH master connection when
+there is one. Linux logout policies may require the systemd user service and
+lingering. Updating replaces the daemon without ending sessions (see
+[Host/README.md](../../Host/README.md#updates)); only a daemon older than
+protocol 4 has to be stopped with its own version first.
 
 `Scripts/package-dmg` builds a self-contained Mac test app and disk image with
 both helpers, and `Scripts/install-local-app` bundles them too (it needs Rust
@@ -79,13 +103,14 @@ installation.
 
 VT tests cover terminal queries while detached, UTF-8, resizing, snapshots with
 exact row positions and styles, and a real Neovim alternate-screen round trip;
-host tests reattach Neovim at a new size. The snapshot has documented limits for
-graphics, palette/theme state, cursor shape, OSC 7, an inactive alternate
-screen, hyperlink ids, and prompt marks. CI is configured for native macOS
-arm64 and GNU Linux x86_64/arm64, a real SSH client-to-Linux test, and the Mac
-app's hosted-session tests on macOS 26; its configuration is not a completed
-CI run. The Ghostty library targets glibc 2.31, while complete Linux binaries
-have been exercised on Debian 12 rather than validated against that minimum.
+host tests reattach Neovim at a new size and cover holders outliving the
+daemon. The snapshot has documented limits for graphics, palette/theme state,
+cursor shape, OSC 7, an inactive alternate screen, hyperlink ids, and prompt
+marks. CI is configured for native macOS arm64 and GNU Linux x86_64/arm64, a
+real SSH client-to-Linux test, and the Mac app's hosted and persistent session
+tests on macOS 26; its configuration is not a completed CI run. The Ghostty
+library targets glibc 2.31, while complete Linux binaries have been exercised
+on Debian 12 rather than validated against that minimum.
 
 ## User outcome
 
@@ -126,7 +151,8 @@ Proposed components:
 
 Use the same host implementation locally and remotely. Initially introduce it
 for opt-in managed sessions; existing local sessions keep their current lifecycle
-until explicitly recreated under the host.
+until explicitly recreated under the host. (Since then local tabs run in the
+host by default; see [multiplexer-default.md](multiplexer-default.md).)
 
 ## Transport and ownership
 
@@ -254,7 +280,10 @@ bracketed paste, alternate screen, colors, Unicode, scrollback, and resize.
 Defer hot daemon upgrades, daemon-crash recovery, host-reboot process restoration,
 multi-writer sessions, mobile/web clients, a managed relay, and a Linux desktop UI.
 Host upgrades must leave an active daemon running or require an explicit session
-shutdown; do not silently restart it while it owns jobs.
+shutdown; do not silently restart it while it owns jobs. (Multi-writer sessions,
+daemon-crash recovery and upgrades that keep sessions have since shipped: sessions
+live in holder processes, and a newer client replaces an older daemon; see
+[multiplexer-default.md](multiplexer-default.md).)
 
 Budget: several days for the first portability/snapshot proof, then approximately
 6–10+ engineering weeks for a dependable custom host and usable Cherry integration.

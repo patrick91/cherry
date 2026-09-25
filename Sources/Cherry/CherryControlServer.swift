@@ -318,11 +318,18 @@ final class CherryControlServer: @unchecked Sendable {
         guard let peerPID else { return nil }
         let ancestry = Set(Self.processAncestry(of: peerPID))
         guard !ancestry.isEmpty else { return nil }
-        for projectRoot in openProjectRootsProvider() {
-            guard let workspace = workspaceForProjectRootProvider(projectRoot) else { continue }
-            for session in workspace.sessions {
-                if let pid = session.childProcessID, ancestry.contains(pid) {
-                    return workspace
+        let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
+        // The tab that runs the caller's program first: a tab attached to
+        // the same session of This Mac (another window's view of it)
+        // routes only when no window runs it. A persistent tab's program
+        // pid comes from This Mac's host; a tab attached to another
+        // machine's session has none.
+        for attached in [false, true] {
+            for workspace in workspaces {
+                for session in workspace.sessions where (session.hostedAttachment != nil) == attached {
+                    if let pid = session.programProcessID, ancestry.contains(pid) {
+                        return workspace
+                    }
                 }
             }
         }
@@ -394,16 +401,20 @@ final class CherryControlServer: @unchecked Sendable {
             // A targeted status query is expected to be current. Process lists
             // deliberately use the cached count, but this path can afford one
             // throttled native-surface refresh.
+            await session.refreshContentFromHostIfNeeded()
             _ = session.lineCount
             return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .getProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .getProcessOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
         case .getProcessRawOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .getProcessRawOutput(rawOutput(for: session, maxBytes: request.maxBytes)))
         case .searchProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .searchProcessOutput(searchOutput(
                 for: session,
                 query: request.query,
@@ -443,7 +454,7 @@ final class CherryControlServer: @unchecked Sendable {
                 output: output
             )))
         case .startProcess(let request):
-            let session = try startProcess(request, workspace: workspace)
+            let session = try await startProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .startProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
         case .stopProcess(let request):
@@ -452,13 +463,15 @@ final class CherryControlServer: @unchecked Sendable {
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
         case .restartProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            try restartProcess(session)
+            // Restart and close act on the window that owns the process, which
+            // an id can name from any window.
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
+            try restartProcess(session, in: sessionWorkspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .restartProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+            return .init(result: .restartProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace), output: output)))
         case .closeProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            try closeFromControl(session, workspace: workspace, agentClosePolicy: request.agentClosePolicy)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
+            try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeProcess(.init(processID: session.id.uuidString, closed: true)))
         case .renameProcess(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
@@ -508,7 +521,7 @@ final class CherryControlServer: @unchecked Sendable {
                 outputPath: capture.outputURL.path
             )))
         case .startAllCommands(let request):
-            _ = try startAllCommands(workspace: workspace)
+            _ = try await startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
             }
@@ -520,7 +533,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .stopAllCommands(try listProcesses(workspace: workspace, kind: nil)))
         case .restartAllCommands(let request):
-            try restartAllCommands(workspace: workspace)
+            try await restartAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
             }
@@ -571,7 +584,9 @@ final class CherryControlServer: @unchecked Sendable {
             let sentBytes: Int
             if let initialInput, !initialInput.isEmpty {
                 await waitForAgentInitialInputReadiness(session: session, agent: agent)
-                sentBytes = await sendInitialAgentInput(initialInput, to: session, agent: agent)
+                // The agent exists either way: sentBytes says whether its
+                // first input reached it.
+                sentBytes = (try? await sendInitialAgentInput(initialInput, to: session, agent: agent)) ?? 0
             } else {
                 sentBytes = 0
             }
@@ -579,6 +594,7 @@ final class CherryControlServer: @unchecked Sendable {
             let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
             if waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(waitMilliseconds))
+                await session.refreshContentFromHostIfNeeded()
             }
             let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
             return .init(result: .runAgent(.init(
@@ -784,22 +800,29 @@ final class CherryControlServer: @unchecked Sendable {
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             let input = try terminalInputPayload(from: request, for: session)
-            sendTerminalInput(input, to: session)
+            if session.kind == .agent {
+                try await refuseInputIntoPermissionPrompt(of: session, keysOnly: input.isRaw)
+            }
+            try await sendTerminalInput(input, to: session)
             let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
             let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
             if waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(waitMilliseconds))
+                await session.refreshContentFromHostIfNeeded()
             }
             let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
             return .init(result: .sendInput(.init(terminalID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
         case .getTerminalOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .getTerminalOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
         case .getTerminalRawOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .getTerminalRawOutput(rawOutput(for: session, maxBytes: request.maxBytes)))
         case .searchOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
+            await session.refreshContentFromHostIfNeeded()
             return .init(result: .searchOutput(searchOutput(for: session, request: request)))
         case .clearOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
@@ -807,7 +830,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(terminalID: session.id.uuidString, cleared: true)))
         case .restartTerminal(let request):
             let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            try restartProcess(session)
+            try restartProcess(session, in: sessionWorkspace)
             return .init(result: .restartTerminal(summary(for: session, workspace: sessionWorkspace)))
         case .closeTerminal(let request):
             let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
@@ -1167,12 +1190,12 @@ final class CherryControlServer: @unchecked Sendable {
             link: link(for: session, workspace: workspace),
             name: processName(for: session),
             kind: session.kind.rawValue,
-            state: session.state.label,
-            pid: session.childProcessID,
+            state: session.programStateLabel,
+            pid: session.programProcessID,
             startedAt: session.startedAt,
             exitedAt: session.exitedAt,
             lastOutputAt: session.lastOutputAt,
-            acceptsInput: session.acceptsInput,
+            acceptsInput: session.acceptsControlInput,
             exitCode: session.exitCode,
             restartPolicy: session.restartPolicy,
             workingDirectory: session.workingDirectory,
@@ -1188,12 +1211,26 @@ final class CherryControlServer: @unchecked Sendable {
             commandName: session.commandName,
             parentAgentID: session.parentAgentID?.uuidString,
             childAgentCount: workspace.childAgentCount(of: session),
-            agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
+            agentActivityState: reportedAgentActivityState(of: session),
             usesAlternateScreen: session.usesAlternateScreen,
             lastContentChangeAt: session.lastContentChangeAt,
             contentVersion: session.contentVersion,
             failureMessage: session.state.failureMessage
         )
+    }
+
+    /// An agent's activity state as MCP reports it: `permission` also
+    /// while its screen shows a permission prompt the tab heard no
+    /// notification for (a restored agent: the notification came before
+    /// Cherry quit), so it is never reported idle while it waits for one.
+    @MainActor
+    private func reportedAgentActivityState(of session: TerminalSession) -> String? {
+        guard session.kind == .agent else { return nil }
+        if session.isRunning, session.agentActivityState != .error, session.agentActivityState != .permission,
+           AgentPermissionPrompt.isShowing(in: session.cachedScreenTailLines) {
+            return AgentActivityState.permission.rawValue
+        }
+        return session.agentActivityState.rawValue
     }
 
     @MainActor
@@ -1282,6 +1319,9 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
             let command = try findProjectCommand(named: request.name ?? "", projectRoot: projectRoot)
+            // A restore under way may bring back this command's tab: use it
+            // rather than start a second copy.
+            await workspace.waitUntilRestored(commandNamed: command.name)
             session = workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
             agent = nil
         }
@@ -1301,16 +1341,30 @@ final class CherryControlServer: @unchecked Sendable {
                 keyboardProtocolFlags: session.keyboardProtocolFlags
             )
             if let input, !input.isEmpty {
-                sentBytes = await sendInitialAgentInput(input, to: session, agent: agent)
+                // The process exists either way: sentBytes says whether its
+                // first input reached it.
+                do {
+                    sentBytes = try await sendInitialAgentInput(input, to: session, agent: agent)
+                } catch {
+                    mcpControlDebugLog("agent initial input not delivered session=\(session.id.uuidString): \(error)")
+                    sentBytes = 0
+                }
             } else {
                 sentBytes = 0
             }
         } else {
             let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
             if let input, !input.payload.isEmpty {
-                sendTerminalInput(input, to: session)
+                do {
+                    try await sendTerminalInput(input, to: session)
+                    sentBytes = input.payload.count
+                } catch {
+                    mcpControlDebugLog("initial input not delivered session=\(session.id.uuidString): \(error)")
+                    sentBytes = 0
+                }
+            } else {
+                sentBytes = 0
             }
-            sentBytes = input?.payload.count ?? 0
         }
         return (session, sentBytes)
     }
@@ -1338,7 +1392,13 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func startProcess(_ request: ProcessLifecycleRequest, workspace: TerminalWorkspace) throws -> TerminalSession {
+    private func startProcess(_ request: ProcessLifecycleRequest, workspace: TerminalWorkspace) async throws -> TerminalSession {
+        // A restore under way may bring back the named command's tab: wait
+        // for it instead of starting a second copy.
+        if let name = request.processName, workspace.isRestoringCommand(named: name),
+           (try? resolveProcess(workspace: workspace, processID: request.processID, processName: name)) == nil {
+            await workspace.waitUntilRestored(commandNamed: name)
+        }
         if let session = try? resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName) {
             try rejectEndedHostedSession(session)
             switch session.state {
@@ -1408,7 +1468,7 @@ final class CherryControlServer: @unchecked Sendable {
                 id: session.id.uuidString,
                 name: processName(for: session),
                 kind: session.kind.rawValue,
-                rootPID: session.childProcessID,
+                rootPID: session.programProcessID,
                 commandName: session.commandName,
                 agentName: session.agentName
             )
@@ -1484,7 +1544,10 @@ final class CherryControlServer: @unchecked Sendable {
             ?? session.outputVersion
         // Headless native surfaces do not necessarily emit render callbacks, so
         // pull their text before and during the wait. `lineCount` is the
-        // throttled data-layer refresh point for a single selected process.
+        // throttled data-layer refresh point for a single selected process
+        // (the host's screen, for a persistent tab whose surface does not
+        // show its program now).
+        await session.refreshContentFromHostIfNeeded()
         _ = session.lineCount
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMilliseconds) / 1_000)
         let startedAt = Date()
@@ -1493,7 +1556,10 @@ final class CherryControlServer: @unchecked Sendable {
             sinceOutputVersion: sinceOutputVersion
         )
 
-        func result(reason: ProcessIdleWaitReason) -> WaitForProcessIdleResult {
+        func result(reason: ProcessIdleWaitReason) async -> WaitForProcessIdleResult {
+            // The loop read only the host's last lines: the output (and its
+            // line numbers) comes from the whole history.
+            await session.refreshContentFromHostIfNeeded()
             let output = terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
             return WaitForProcessIdleResult(
                 process: processInfo(for: session, workspace: sessionWorkspace),
@@ -1502,12 +1568,15 @@ final class CherryControlServer: @unchecked Sendable {
                 sinceOutputVersion: sinceOutputVersion,
                 outputVersion: session.outputVersion,
                 lastOutputAt: session.lastOutputAt,
-                agentActivityState: session.kind == .agent ? session.agentActivityState.rawValue : nil,
+                agentActivityState: reportedAgentActivityState(of: session),
                 output: output
             )
         }
 
         while true {
+            // Polls every 50 ms; the host's screen (its last lines only) is
+            // read at most once per `hostContentPollInterval`.
+            await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
             _ = session.lineCount
             observedNewOutput = observedNewOutput || ProcessIdleDetector.observedNewOutput(
                 currentOutputVersion: session.outputVersion,
@@ -1516,14 +1585,24 @@ final class CherryControlServer: @unchecked Sendable {
 
             switch session.state {
             case .exited, .failed:
-                return result(reason: .exited)
+                return await result(reason: .exited)
+            case .disconnected where session.isPersistentLocalSession && session.isRunning:
+                // Only the attach adapter reconnects: the program runs, and
+                // its screen comes from the host meanwhile.
+                break
             case .disconnected:
-                return result(reason: .disconnected)
+                return await result(reason: .disconnected)
             case .launching, .live:
                 break
             }
 
             let now = Date()
+            if session.kind == .agent, session.isRunning, session.agentActivityState != .error,
+               AgentPermissionPrompt.isShowing(in: session.cachedScreenTailLines) {
+                // Its screen asks for permission (a restored agent's state
+                // never heard the notification that said so).
+                return await result(reason: .permission)
+            }
             if session.kind == .agent, session.agentActivityState != .unknown {
                 let quietInterval = TimeInterval(quietMilliseconds) / 1_000
                 let contentQuietSince = session.lastContentChangeAt ?? startedAt
@@ -1532,19 +1611,19 @@ final class CherryControlServer: @unchecked Sendable {
 
                 switch session.agentActivityState {
                 case .permission:
-                    return result(reason: .permission)
+                    return await result(reason: .permission)
                 case .error:
-                    return result(reason: .agentError)
+                    return await result(reason: .agentError)
                 case .idle:
                     if contentIsQuiet {
-                        return result(reason: .idle)
+                        return await result(reason: .idle)
                     }
                 case .working, .unknown:
                     // Agents without recognizable prompt/working UI never reach
                     // .idle on their own; fall back to the content-quiet window
                     // unless a provider-specific working signal is active.
                     if !session.agentActivityEvidenceIsStrong, contentIsQuiet {
-                        return result(reason: .idle)
+                        return await result(reason: .idle)
                     }
                 }
             } else if let commandFinishedAt = session.lastNativeCommandFinishedAt,
@@ -1552,7 +1631,7 @@ final class CherryControlServer: @unchecked Sendable {
                       !requireNewOutput || observedNewOutput {
                 // Native OSC 133: a command boundary is a precise "back at prompt"
                 // signal for plain scripts/commands — no quiet-period guessing.
-                return result(reason: .idle)
+                return await result(reason: .idle)
             } else if ProcessIdleDetector.isQuiet(
                 now: now,
                 lastOutputAt: session.lastOutputAt,
@@ -1561,11 +1640,11 @@ final class CherryControlServer: @unchecked Sendable {
                 requireNewOutput: requireNewOutput,
                 observedNewOutput: observedNewOutput
             ) {
-                return result(reason: .idle)
+                return await result(reason: .idle)
             }
 
             if now >= deadline {
-                return result(reason: .timedOut)
+                return await result(reason: .timedOut)
             }
 
             let remainingMilliseconds = max(1, Int(deadline.timeIntervalSince(now) * 1_000))
@@ -1599,12 +1678,14 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func stopProcess(_ session: TerminalSession) {
-        // A hosted tab is a terminal: stopping it ends only the local attach
-        // client, so it reports `disconnected` and its program keeps running.
+        // A tab attached from Persistent Sessions is a terminal: stopping it
+        // ends only the local attach client, so it reports `disconnected`
+        // and its program keeps running. A persistent local tab's session
+        // ends on its host, as a native tab's process does.
         if session.kind == .command {
             session.stopManagedCommand()
         } else {
-            session.stop()
+            session.stopProgram()
         }
     }
 
@@ -1630,7 +1711,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard workspace.sessions.count > 1 else {
                 throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
             }
-            workspace.close(session)
+            workspace.close(session, intent: .mcpClose)
             return
         }
 
@@ -1644,19 +1725,19 @@ final class CherryControlServer: @unchecked Sendable {
             guard workspace.sessions.count > descendants.count + 1 else {
                 throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
             }
-            workspace.closeAgentGroup(session)
+            workspace.closeAgentGroup(session, intent: .mcpClose)
         case .promoteSubAgents:
-            workspace.closeAgentPromotingChildren(session)
+            workspace.closeAgentPromotingChildren(session, intent: .mcpClose)
         }
     }
 
     @MainActor
-    private func restartProcess(_ session: TerminalSession) throws {
+    private func restartProcess(_ session: TerminalSession, in workspace: TerminalWorkspace) throws {
         // Restarting a hosted tab reconnects its attach client. A connected
         // tab may learn that its session ended only when restart() stops the
         // adapter and reads the outcome it wrote.
         try rejectEndedHostedSession(session)
-        if !session.restart() {
+        if !workspace.restart(session) {
             try rejectEndedHostedSession(session)
         }
     }
@@ -1713,18 +1794,20 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func startAllCommands(workspace: TerminalWorkspace) throws -> [TerminalSession] {
+    private func startAllCommands(workspace: TerminalWorkspace) async throws -> [TerminalSession] {
         guard let projectRoot = workspace.projectRoot else {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
+        // Restored command tabs first: none of their commands starts twice.
+        await workspace.waitUntilRestored(commandNamed: nil)
         return agentSettings.launchableProjectCommands(for: projectRoot).map {
             workspace.addCommandSession(command: $0, projectRoot: projectRoot, select: false)
         }
     }
 
     @MainActor
-    private func restartAllCommands(workspace: TerminalWorkspace) throws {
-        let sessions = try startAllCommands(workspace: workspace)
+    private func restartAllCommands(workspace: TerminalWorkspace) async throws {
+        let sessions = try await startAllCommands(workspace: workspace)
         for session in sessions {
             session.restart()
         }
@@ -2168,13 +2251,87 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// Sends input and says whether it reached the program: throws, having
+    /// sent nothing, when the process takes no input (it ended, or an
+    /// attached session is disconnected) or its host did not take it. Input
+    /// for a persistent tab whose session is being created is queued, and
+    /// counts as sent.
     @MainActor
-    private func sendTerminalInput(_ input: TerminalControlInput, to session: TerminalSession) {
-        if input.isRaw {
-            session.sendRaw(data: input.payload)
-        } else {
-            session.send(data: input.payload)
+    private func sendTerminalInput(_ input: TerminalControlInput, to session: TerminalSession) async throws {
+        try await deliver(input.payload, raw: input.isRaw, to: session)
+    }
+
+    /// `alreadySent`: bytes of the same input delivered before this part
+    /// (an agent message whose Enter is sent after its text). When this
+    /// part fails, the error then says the text was typed but not
+    /// submitted (`input_partially_delivered`) instead of "nothing was sent".
+    /// Input the host typed only a first part of (longer than one host
+    /// request, 64 KiB, and a later request failed) is
+    /// `input_partially_delivered` too, with the bytes that were typed.
+    @MainActor
+    private func deliver(_ data: Data, raw: Bool, to session: TerminalSession, alreadySent: Int = 0) async throws {
+        do {
+            try await session.sendControlInput(data, raw: raw)
+        } catch let error as TerminalSession.ControlInputError {
+            throw Self.inputError(
+                for: error, processName: processName(for: session), totalBytes: data.count, alreadySent: alreadySent
+            )
         }
+    }
+
+    /// The MCP error for input `sendControlInput` did not (all) deliver.
+    /// `totalBytes`: what this part sent; `alreadySent`: bytes of the same
+    /// input delivered before it (an agent message's text, before its Enter).
+    static func inputError(
+        for error: TerminalSession.ControlInputError,
+        processName name: String,
+        totalBytes: Int,
+        alreadySent: Int = 0
+    ) -> CherryControlError {
+        switch error {
+        case .partiallyDelivered(let deliveredBytes, let reason, let unconfirmedBytes):
+            let delivered = alreadySent + deliveredBytes
+            let total = alreadySent + totalBytes
+            let advice = "Check its output before sending what is missing: "
+                + "sending all of it again would type the first \(delivered) bytes twice."
+            guard unconfirmedBytes > 0 else {
+                return CherryControlError(
+                    code: "input_partially_delivered",
+                    message: "Only the first \(delivered) of \(total) bytes of the input reached the program of process '\(name)'; "
+                        + "the rest was not sent: \(reason). " + advice
+                )
+            }
+            // The part that failed was sent, but its answer was lost.
+            let rest = total - delivered - unconfirmedBytes
+            return CherryControlError(
+                code: "input_partially_delivered",
+                message: "Only the first \(delivered) of \(total) bytes of the input are known to have reached the program of process '\(name)': \(reason). "
+                    + "The \(unconfirmedBytes) bytes after them were sent, but the host's answer was lost, so they may or may not have been typed"
+                    + (rest > 0 ? "; the last \(rest) bytes were not sent. " : ". ")
+                    + advice
+            )
+        case .notAccepting(let state) where alreadySent > 0:
+            return typedButNotSubmitted(processName: name, alreadySent: alreadySent, reason: "it is \(state) and takes no input")
+        case .notDelivered(let reason) where alreadySent > 0:
+            return typedButNotSubmitted(processName: name, alreadySent: alreadySent, reason: reason)
+        case .notAccepting(let state):
+            return CherryControlError(
+                code: "process_not_accepting_input",
+                message: "Process '\(name)' is \(state) and takes no input; nothing was sent."
+            )
+        case .notDelivered(let reason):
+            return CherryControlError(
+                code: "input_not_delivered",
+                message: "Input for process '\(name)' did not reach its program; nothing was sent: \(reason)"
+            )
+        }
+    }
+
+    private static func typedButNotSubmitted(processName name: String, alreadySent: Int, reason: String) -> CherryControlError {
+        CherryControlError(
+            code: "input_partially_delivered",
+            message: "The text (\(alreadySent) bytes) was typed into process '\(name)', but the Enter that submits it did not reach its program: \(reason)"
+        )
     }
 
     @MainActor
@@ -2187,6 +2344,10 @@ final class CherryControlServer: @unchecked Sendable {
         mcpControlDebugLog("send input session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) textBytes=\(text?.utf8.count ?? 0) raw=\(rawBase64 != nil) submit=\(String(describing: submit))")
         if session.kind == .agent {
             await waitForAgentSubmittedInputReadinessIfNeeded(to: session)
+            try await refuseInputIntoPermissionPrompt(
+                of: session,
+                keysOnly: rawBase64 != nil && submit != true
+            )
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: rawBase64,
@@ -2194,7 +2355,7 @@ final class CherryControlServer: @unchecked Sendable {
                 keyboardProtocolFlags: session.keyboardProtocolFlags
             )
             guard let input, !input.isEmpty else { return 0 }
-            return await sendAgentInput(
+            return try await sendAgentInput(
                 input,
                 to: session,
                 shouldDeferSubmit: shouldDeferSubmittedInput(for: session),
@@ -2203,7 +2364,7 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
-        sendTerminalInput(input, to: session)
+        try await sendTerminalInput(input, to: session)
         return input.payload.count
     }
 
@@ -2216,6 +2377,7 @@ final class CherryControlServer: @unchecked Sendable {
         let waitMilliseconds = min(max(requestedWaitMilliseconds ?? 0, 0), 5_000)
         guard waitMilliseconds > 0 else { return nil }
         try? await Task.sleep(for: .milliseconds(waitMilliseconds))
+        await session.refreshContentFromHostIfNeeded()
         return terminalOutput(for: session, startLine: nil, lineLimit: lineLimit)
     }
 
@@ -2233,8 +2395,9 @@ final class CherryControlServer: @unchecked Sendable {
         _ input: AgentInitialInput,
         to session: TerminalSession,
         agent: AgentToolDefinition
-    ) async -> Int {
-        await sendAgentInput(
+    ) async throws -> Int {
+        try await refuseInputIntoPermissionPrompt(of: session, keysOnly: false)
+        return try await sendAgentInput(
             input,
             to: session,
             shouldDeferSubmit: shouldDeferInitialInput(for: agent),
@@ -2248,18 +2411,18 @@ final class CherryControlServer: @unchecked Sendable {
         to session: TerminalSession,
         shouldDeferSubmit: Bool,
         source: String
-    ) async -> Int {
+    ) async throws -> Int {
         if shouldDeferSubmit, input.submit {
             if !input.payload.isEmpty {
                 mcpControlDebugLog("agent \(source) input type session=\(session.id.uuidString) bytes=\(input.payload.count)")
-                session.send(data: input.payload)
+                try await deliver(input.payload, raw: false, to: session)
                 try? await Task.sleep(for: .milliseconds(150))
             }
             let enterSequence = TerminalInputEncoder.enterSequence(
                 keyboardProtocolFlags: session.keyboardProtocolFlags
             )
             mcpControlDebugLog("agent \(source) input submit session=\(session.id.uuidString) bytes=\(enterSequence.count)")
-            session.send(data: enterSequence)
+            try await deliver(enterSequence, raw: false, to: session, alreadySent: input.payload.count)
             return input.payload.count + enterSequence.count
         }
 
@@ -2271,7 +2434,7 @@ final class CherryControlServer: @unchecked Sendable {
         }
         guard !payload.isEmpty else { return 0 }
         mcpControlDebugLog("agent \(source) input combined session=\(session.id.uuidString) bytes=\(payload.count) submit=\(input.submit)")
-        session.send(data: payload)
+        try await deliver(payload, raw: false, to: session)
         return payload.count
     }
 
@@ -2284,16 +2447,52 @@ final class CherryControlServer: @unchecked Sendable {
         await waitForDeferredAgentInputReadiness(session: session)
     }
 
+    /// The first input to an agent this tab just started waits until the
+    /// agent is ready (and gets past its startup prompt). An agent the tab
+    /// only follows (restored after a relaunch, adopted, or attached) has
+    /// been running for a while: its screen is checked before the input
+    /// goes (`refuseInputIntoPermissionPrompt`), and no prompt of it is
+    /// ever acknowledged.
     @MainActor
     private func waitForAgentSubmittedInputReadinessIfNeeded(to session: TerminalSession) async {
         guard session.lastInputOutputVersion == nil else { return }
+        guard session.startedCurrentProgram else { return }
         guard shouldDeferSubmittedInput(for: session) else { return }
         await waitForDeferredAgentInputReadiness(session: session)
     }
 
+    /// MCP input never answers an agent's permission prompt: Enter (or a
+    /// letter such as `y`) typed into one approves the pending command. The
+    /// agent's screen is read as it is now (from its host when no surface
+    /// shows it, as for a restored agent whose adapter waits), and input
+    /// is refused, with nothing sent, while it shows a permission prompt.
+    /// Raw keys sent without submit (`keysOnly`) are the caller's own
+    /// answer and go through. When the screen cannot be read (its host
+    /// does not answer), nothing is sent either.
+    @MainActor
+    private func refuseInputIntoPermissionPrompt(of session: TerminalSession, keysOnly: Bool) async throws {
+        // A tab that takes no input says so when the input is sent.
+        guard session.acceptsControlInput else { return }
+        let name = processName(for: session)
+        guard let lines = await session.programScreenLinesForInput() else {
+            throw CherryControlError(
+                code: "input_not_delivered",
+                message: "Input for agent '\(name)' was not sent: its screen could not be read from its host, so Cherry cannot tell whether it is waiting for a permission answer. Nothing was sent."
+            )
+        }
+        guard !keysOnly, AgentPermissionPrompt.isShowing(in: lines) else { return }
+        mcpControlDebugLog("agent input refused at permission prompt session=\(session.id.uuidString)")
+        throw CherryControlError(
+            code: "agent_awaiting_permission",
+            message: "Agent '\(name)' is waiting for an answer to a permission prompt; nothing was sent, so the prompt was not answered. Let the user answer it in Cherry, or send the answering keys deliberately with raw_base64 (without submit)."
+        )
+    }
+
     @MainActor
     private func waitForDeferredAgentInputReadiness(session: TerminalSession) async {
-        let startedAt = Date()
+        var startedAt = Date()
+        // A session being created holds the wait no longer than this.
+        let creationDeadline = startedAt.addingTimeInterval(30)
         let maximumWait: TimeInterval = 6
         let quietInterval: TimeInterval = 0.75
         let noOutputFallback: TimeInterval = 2.5
@@ -2304,11 +2503,23 @@ final class CherryControlServer: @unchecked Sendable {
 
         while true {
             switch session.state {
+            case .disconnected where session.isPersistentLocalSession && session.isRunning:
+                // The agent runs; only its attach adapter reconnects.
+                break
             case .exited, .failed, .disconnected:
                 return
             case .launching, .live:
                 break
             }
+            if session.isStartingPersistentSession, Date() < creationDeadline {
+                // Its host session is still being created (bounded by the
+                // tab's creation deadline): the agent has not started, and
+                // input sent now is queued until it has.
+                startedAt = Date()
+                try? await Task.sleep(for: .milliseconds(50))
+                continue
+            }
+            await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
 
             if let outputVersion = awaitingOutputAfterAcknowledgementVersion,
                session.outputVersion > outputVersion {
@@ -2329,7 +2540,9 @@ final class CherryControlServer: @unchecked Sendable {
                             keyboardProtocolFlags: session.keyboardProtocolFlags
                         )
                         mcpControlDebugLog("agent startup prompt acknowledged session=\(session.id.uuidString) bytes=\(enterSequence.count)")
-                        session.send(data: enterSequence)
+                        // As MCP's other input: through the host while the
+                        // attach adapter is not known to be attached.
+                        try? await session.sendControlInput(enterSequence, raw: false)
                         try? await Task.sleep(for: .milliseconds(150))
                         continue
                     }
@@ -2347,14 +2560,22 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// Only an agent this tab just started can be at its startup prompt;
+    /// one it follows may be at a permission prompt that reads alike ("Do
+    /// you want to proceed?"), and Enter would approve it. Never a screen
+    /// that shows a permission menu either.
     @MainActor
     private func shouldAcknowledgeAgentStartupPrompt(in session: TerminalSession, startLine requestedStartLine: Int) -> Bool {
+        guard session.startedCurrentProgram else { return false }
         let lineCount = session.lineCount
         guard lineCount > 0 else { return false }
         let startLine = max(min(max(requestedStartLine, 0), lineCount), lineCount - 20)
         guard startLine < lineCount else { return false }
-        let output = session.snapshot(range: startLine..<lineCount).joined(separator: "\n")
-        return isAgentStartupConfirmationPrompt(output)
+        let lines = session.snapshot(range: startLine..<lineCount)
+        guard !AgentPermissionPrompt.isShowing(in: session.snapshot(range: max(0, lineCount - 60)..<lineCount)) else {
+            return false
+        }
+        return isAgentStartupConfirmationPrompt(lines.joined(separator: "\n"))
     }
 
     private func isAgentStartupConfirmationPrompt(_ output: String) -> Bool {

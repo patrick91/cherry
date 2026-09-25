@@ -47,6 +47,7 @@ let package = Package(
             dependencies: [
                 "CherryControl",
                 "CherryCrashGuard",
+                .product(name: "GhosttyKit", package: "libghostty-spm"),
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
             ],

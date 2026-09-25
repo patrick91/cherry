@@ -70,28 +70,72 @@ Every process summary has a `state`:
 
 - `launching`, `live`, or `exit N` (the process ended with status `N`, also
   reported as `exit_code`).
-- `failed`: the launch failed, or a persistent-session tab could not attach to
-  its hosted session. `failure_message` says why.
-- `disconnected`: a persistent-session tab whose attach client stopped (after
-  `stop_process` or Disconnect, a lost connection, or another client taking the
-  session over). The hosted program may still be running on its host, so there
-  is no `exit_code`.
+- `failed`: the launch failed, or a tab attached to a hosted session could not
+  attach. `failure_message` says why.
+- `disconnected`: a tab attached to a hosted session it does not own (from
+  File › Persistent Sessions, or an SSH host's) whose attach client stopped
+  (after `stop_process` or Disconnect, a lost connection, or another client
+  taking the session over). The hosted program may still be running on its
+  host, so there is no `exit_code`.
 
-A persistent-session tab reports `exit N` only when its hosted program ended.
-`stop_process` on such a tab disconnects it and leaves the program running;
-`close_process` disconnects it and closes the tab, and the program also keeps
-running. `start_process` reconnects a tab that is `disconnected` or `failed`,
-and `restart_process` reconnects its attach client. Both fail with the error
-code `hosted_session_ended` when the session has ended on its host; create a
-new session in Cherry instead.
+## Persistent Sessions
 
-A persistent-session tab reports no `pid`: the hosted program is not a local
-child of Cherry. `get_process_ports`, `services_list`, and `wait_for_bound_port`
-therefore never attribute ports to it. On This Mac, a hosted program's
-localhost listeners can appear only among unattributed services
-(`include_unattributed: true`); on a remote host they are not visible. Programs
-inside a persistent session do not receive `CHERRY_PROCESS_ID`, so a CherryMCP
-helper started there cannot identify its tab.
+Local terminal, command and agent tabs are persistent sessions by default
+(Settings › Sessions): their programs run in Cherry's local session host, so
+they keep running when Cherry quits and come back with their tabs when it
+opens again. MCP treats them like native tabs:
+
+- `stop_process` ends the program (its session on the local host ends with
+  it); the process then reports `exit 0` with `exit_code` 0, whatever signal
+  ended it, and `start_process` starts it again in a new session.
+- `restart_process` ends the session and starts a new one in the same process
+  (same `process_id`).
+- `close_process` ends the session, as the tab's close button does, unless
+  Cherry is set to keep local sessions running after closing a tab.
+- The process reports the program's `pid` (the host's child, never
+  signalled by Cherry), port tools attribute its listeners to it, and its
+  program gets `CHERRY_PROCESS_ID`, so a CherryMCP helper started inside it
+  identifies its tab. A tab restored after Cherry relaunched keeps its
+  `process_id`.
+- While the tab's terminal is not attached yet (a restored tab in a worktree
+  that is not shown, or one whose attach adapter is being launched or is
+  reconnecting), output is read from the host and input is sent through the
+  host. `line_count` is then the host's line count. The process stays
+  `live` while its program runs.
+- Input sent while the tab's session is still being created or restarted is
+  queued, in order with typed keys, and the call waits until it reached the
+  program. Input still queued after 16 s is dropped and reported as
+  `input_not_delivered`.
+- Input the host types is encoded for the program's cursor key mode, as a
+  terminal would type it: unmodified arrow, Home and End sequences
+  (`ESC [ A` or `ESC O A` …), `raw_base64` included, go as `ESC O x` while
+  the program has application cursor keys (DECCKM) on and does not use the
+  kitty keyboard protocol (its kitty flags are 0), and as `ESC [ x`
+  otherwise. The session host reports the mode, so such input goes through
+  it at once, without waiting for an attach adapter. A session whose
+  program was started by an older build (its holder process predates
+  holder link version 4) reports the mode as off for its whole life, so
+  its cursor keys go as `ESC [ x` even under `less` or `vim`. With an
+  older session host, which reports no mode at all, these
+  sequences to a tab without a live attach adapter (a restored tab in a
+  hidden worktree, or one whose adapter just launched) launch or wait for
+  the adapter, up to 3 s, and go through the terminal; if no adapter
+  attaches in time, the host types them as they were sent.
+
+When persistent sessions are off or the local host cannot run them, new local
+tabs run natively; MCP treats them the same way.
+
+A tab attached to a hosted session it does not own (another machine's,
+another app's, or one created with the `cherry` CLI) behaves differently.
+`stop_process` only disconnects it (state `disconnected`), and `close_process`
+disconnects and closes the tab; the program keeps running on its host.
+`start_process` and `restart_process` reconnect its attach client, and both
+fail with the error code `hosted_session_ended` when the session has ended on
+its host; create a new session instead. Such a tab reports a `pid` only for a
+session on This Mac while it is attached. A session on another machine never
+has one, so port tools never attribute ports to it; on a remote host its
+listeners are not visible. Its program did not get this tab's
+`CHERRY_PROCESS_ID`.
 
 ## Process Activity Fields
 
@@ -99,7 +143,8 @@ Process summaries from `list_processes`, `get_process_status`, and the other
 process tools include activity metadata:
 
 - `agent_activity_state` (agent processes only): `working`, `idle`,
-  `permission` (the agent is blocked waiting for an approval), `error`, or
+  `permission` (the agent is blocked waiting for an approval: its screen shows
+  a permission prompt, or it sent a permission notification), `error`, or
   `unknown` when Cherry has not classified the agent yet.
 - `uses_alternate_screen`: whether the process is currently showing a
   fullscreen TUI on the terminal's alternate screen.
@@ -136,15 +181,18 @@ after a prompt is submitted. The result includes `reason` (`idle`, `exited`,
 return a normal result with partial output rather than a tool error.
 
 `exited` covers a process that ended and one whose state is `failed`, including
-a persistent-session tab that could not attach. `disconnected` means a
-persistent-session tab lost its attach client: the hosted program may still be
-running and there is no `exit_code`. Reconnect it with `start_process` before
-waiting again.
+an attached hosted-session tab that could not attach. `disconnected` means a
+tab attached to a hosted session it does not own lost its attach client: the
+hosted program may still be running and there is no `exit_code`. Reconnect it
+with `start_process` before waiting again. A local persistent tab whose
+terminal reconnects to the session host stays `live`, and the wait reads its
+output from the host meanwhile.
 
 For agent processes with a known activity state, the wait is state-aware:
 
 - `permission` returns immediately when the agent becomes blocked on an
-  approval prompt, so orchestrators can react instead of timing out.
+  approval prompt (its screen shows one), so orchestrators can react instead
+  of timing out.
 - `agent_error` returns when the agent enters an error state.
 - `idle` requires `agent_activity_state == idle` plus the usual new-output
   baseline, and the quiet window is measured against real content changes
@@ -179,8 +227,69 @@ control:
 
 For `send_process_input` and `spawn_process`, `text` is typed as terminal
 input. CR/LF line endings are encoded as carriage-return Enter, matching the
-plain Enter key path. Use `raw_base64` when you need exact PTY bytes instead;
-raw bytes are not auto-submitted unless `submit: true` is provided.
+plain Enter key path. Use `raw_base64` for bytes without that normalization;
+raw bytes are not auto-submitted unless `submit: true` is provided. Key
+sequences in them may still be re-encoded for the program's key modes:
+unmodified arrow, Home and End keys follow its cursor key mode, whether its
+terminal or its session host types them.
+
+## Input To Agents
+
+Input to an agent (`send_process_input`, `send_agent_message`, the first input
+of `spawn_process` and `spawn_agent`) is checked against the agent's current
+screen first. The screen is read from its session host when no terminal shows
+it, for example for a restored agent in a worktree that is not shown. While
+the screen shows a tool-permission prompt, where Enter (or a letter such as
+`y`) would approve the pending action, the input is refused with
+`agent_awaiting_permission` and nothing is sent: let the user answer it, or
+send the answering keys deliberately as `raw_base64` without `submit`, which
+goes through. When the agent's screen cannot be read from its host, the input
+fails with `input_not_delivered` and nothing is sent.
+
+Cherry presses Enter on an agent's startup or trust prompt only for an agent
+its tab just launched, never for a restored, adopted or attached agent, and
+never on a permission menu. A restored agent has been running for a while;
+input to it is checked as above.
+
+## Input Errors
+
+- `process_not_accepting_input`: the process has ended, failed to start, or
+  is a disconnected attached session. Nothing was sent.
+- `agent_awaiting_permission`: see above. Nothing was sent.
+- `input_not_delivered`: the session host did not take the input (the
+  session ended, the host could not be reached, input queued for a session
+  being created was not sent within 16 s), or an agent's screen could not be
+  read from its host. Nothing was sent, with one exception: when the host's
+  answer to the input (at most 64 KiB, or the first 64 KiB part of longer
+  input) was lost (the connection failed or timed out after it was sent),
+  the error is also `input_not_delivered`, although the host may have typed
+  that part. Check the program's output before sending it again.
+- `input_partially_delivered`: only a first part of the input reached the
+  program. Either an agent message's text was typed but the Enter that
+  submits it did not reach the agent, or input longer than 64 KiB went to
+  the session host in several parts and a part after the first failed. The
+  message says how many bytes were typed ("Only the first N of M bytes …").
+  When the host refused the part that failed, the rest was not sent. When
+  that part was sent but the host's answer was lost (the connection failed
+  or timed out), the message says so: those bytes, up to 64 KiB, may or may
+  not have been typed, and only the bytes after them were not sent. Do not
+  send all of the input again, which would type that first part twice:
+  check the program's output, then send what is missing.
+
+## Client Timeouts
+
+The CherryMCP helper waits 10 s for Cherry's answer by default, longer for
+tools that wait on purpose:
+
+- `spawn_process`, `spawn_agent` and `send_process_input`: `wait_ms` + 20 s,
+  since a persistent tab's session may still be created and an agent's first
+  input waits for it to be ready. `spawn_process` with kind `command` waits
+  `wait_ms` + 30 s, because it first waits up to 10 s for a restore under way
+  that may bring back the command's tab.
+- `start_process`, `start_all_commands` and `restart_all_commands`:
+  `wait_ms` + 20 s, as they also wait up to 10 s for such a restore.
+- `send_agent_message`: `timeout_ms` + 5 s, at least 20 s.
+- `wait_for_process_idle` and `wait_for_bound_port`: `timeout_ms` + 5 s.
 
 ## Dev Server Readiness
 
@@ -203,3 +312,14 @@ For local services, use `services_list` or `get_process_ports` for discovery and
 Cherry also exposes project notes and todos through MCP. These tools are
 project-scoped and do not change visible UI selection unless the tool name starts
 with `select_`.
+
+## Testing The Control Server
+
+`Scripts/test-mcp-concurrency` checks that the control server stays responsive
+while service detection runs. It builds Cherry with
+`swift build -c release --product Cherry` and runs the binary apart from your
+own Cherry: a private `HOME` and `CFFIXED_USER_HOME`, and private control and
+session-host sockets (`CHERRY_CONTROL_SOCKET`, `CHERRY_HOST_SOCKET`) in a 0700
+directory. Its tabs are persistent sessions on a daemon of its own, which it
+tears down at the end (`Scripts/cherry_private_host.py`); it never touches your
+daemon or saved workspaces. Its log is `/tmp/mcp-conc.log`.

@@ -92,7 +92,8 @@ fn command(sandbox: &Sandbox, action: &str, socket: &Path) -> Command {
         .arg(socket)
         .env("HOME", &sandbox.home)
         .env_remove("XDG_STATE_HOME")
-        .env_remove("CHERRY_HOST_SOCKET");
+        .env_remove("CHERRY_HOST_SOCKET")
+        .env_remove(EXPECTED_HOST_ID_VAR);
     command
 }
 
@@ -359,6 +360,8 @@ fn auto_started_daemons_give_sessions_a_clean_environment() {
             ]),
             cols: 80,
             rows: 24,
+            owner: None,
+            tags: BTreeMap::new(),
         },
     );
     let session = match receive(&mut socket) {
@@ -545,7 +548,7 @@ impl LendingGateway {
         child.stdin.as_mut().unwrap().write_all(&hello()).unwrap();
         // The link is updated before the preamble is written.
         let stdout = child.stdout.as_mut().unwrap();
-        let preamble = b"CHERRY-GATEWAY 3\n";
+        let preamble = format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes();
         let mut announced = vec![0; preamble.len()];
         std::io::Read::read_exact(stdout, &mut announced).unwrap();
         assert_eq!(announced, preamble);
@@ -792,6 +795,28 @@ fn a_new_host_can_start_as_soon_as_shutdown_is_acknowledged() {
     }
 }
 
+/// The daemon's answer to `request`, asked again while it closes
+/// connections unanswered: short of descriptors, it can accept a connection
+/// and then have none to serve it with. Gives up after 20 s.
+fn call_while_short(host: &Host, request: &ClientMessage) -> ServerMessage {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let answer = quiet_connect(&host.socket).and_then(|mut socket| {
+            socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            write_frame(&mut socket, request).ok()?;
+            read_frame::<_, ServerMessage>(&mut socket).ok()?
+        });
+        if let Some(answer) = answer {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never answered {request:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn a_log_that_cannot_be_written_never_stops_the_daemon() {
     // Every write to stderr fails (EPIPE), where `eprintln!` would panic.
@@ -829,12 +854,30 @@ fn a_log_that_cannot_be_written_never_stops_the_daemon() {
         "the daemon exited"
     );
     drop(burst);
+    // Descriptors come free as the daemon closes those connections; until
+    // then it may still accept a connection and close it unanswered.
     for session in &sessions {
-        host.kill(&session.id);
+        let killed = call_while_short(
+            &host,
+            &ClientMessage::Kill {
+                id: session.id.clone(),
+            },
+        );
+        assert_eq!(killed, ServerMessage::Ok);
     }
-    for session in &sessions {
-        host.wait(&session.id, |s| s.state == SessionState::Exited);
-    }
+    wait_until("the sessions to exit", || {
+        let ServerMessage::Sessions {
+            sessions: listed, ..
+        } = call_while_short(&host, &ClientMessage::List)
+        else {
+            panic!("the daemon did not list its sessions");
+        };
+        sessions.iter().all(|session| {
+            listed
+                .iter()
+                .any(|s| s.id == session.id && s.state == SessionState::Exited)
+        })
+    });
     // A diagnostic while starting: the host identity is replaced.
     let id = host.host_id();
     fs::write(host.sandbox.state_dir().join("host-id"), b"garbage").unwrap();
@@ -843,22 +886,103 @@ fn a_log_that_cannot_be_written_never_stops_the_daemon() {
 }
 
 #[test]
+fn only_a_client_speaking_a_newer_protocol_replaces_the_daemon() {
+    let mut host = Host::new();
+    let id = host.host_id();
+    let hello = |version: u32| {
+        let mut socket = UnixStream::connect(&host.socket).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write_frame(
+            &mut socket,
+            &Request::new(Some(1), ClientMessage::Hello { version }),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut socket).unwrap(),
+            Some(Response {
+                req: Some(1),
+                message: ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    host_id,
+                },
+            }) if host_id == id
+        ));
+        socket
+    };
+    // A client speaking an older protocol is refused.
+    let mut older = hello(PROTOCOL_VERSION - 1);
+    write_frame(&mut older, &Request::new(Some(2), ClientMessage::Replace)).unwrap();
+    assert!(matches!(
+        read_frame(&mut older).unwrap(),
+        Some(Response {
+            req: Some(2),
+            message: ServerMessage::Error { code, .. },
+        }) if code == error_code::VERSION_MISMATCH
+    ));
+    assert!(read_frame::<_, Response>(&mut older).unwrap().is_none());
+    assert_eq!(host.host_id(), id);
+    // A newer one replaces it even while sessions run: they carry on in
+    // their holders. It is answered once the socket is gone and the lock is
+    // free.
+    let session = host.create(shell(
+        "stty -echo; printf 'BEFORE_%s\\n' REPLACE; while IFS= read -r line; do printf 'INPUT:%s\\n' \"$line\"; done",
+    ));
+    let (mut attached, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut attached, "BEFORE_REPLACE");
+    let mut newer = hello(PROTOCOL_VERSION + 1);
+    write_frame(&mut newer, &Request::new(Some(3), ClientMessage::Replace)).unwrap();
+    assert_eq!(
+        read_frame::<_, Response>(&mut newer).unwrap(),
+        Some(Response::new(Some(3), ServerMessage::Ok))
+    );
+    assert!(!host.socket.exists());
+    let status = wait_child(&mut host.child, Duration::from_secs(5));
+    assert!(status.success(), "host exited with {status}");
+    // Its clients are disconnected.
+    while let Ok(Some(_)) = read_frame::<_, ServerMessage>(&mut attached) {}
+    // Its successor starts on the same socket, with the same identity, and
+    // lists the session at once: the same program, the same screen.
+    host.child = spawn_serve(&host.sandbox, &[], None);
+    host.wait_ready();
+    assert_eq!(host.host_id(), id);
+    let adopted = host.session(&session.id);
+    assert_eq!(adopted.state, SessionState::Running);
+    assert_eq!(adopted.pid, session.pid);
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    assert!(
+        screen.text().contains("BEFORE_REPLACE"),
+        "{}",
+        screen.text()
+    );
+    input(&mut socket, b"AFTER\n");
+    screen.wait_text(&mut socket, "INPUT:AFTER");
+}
+
+#[test]
 fn start_and_gateway_never_start_a_second_daemon_beside_another_version() {
     let sandbox = Sandbox::new();
-    for (reply, version) in [
+    // One too old to make way (it refuses a Hello of another version), and
+    // a newer one, which is never replaced.
+    for (reply, version, advice) in [
         (
             ServerMessage::error(
                 "version_mismatch",
                 "expected Cherry host protocol version 2",
             ),
-            "protocol 2",
+            "protocol 2".to_string(),
+            "stop it",
         ),
         (
             ServerMessage::Welcome {
-                version: 4,
+                version: PROTOCOL_VERSION + 1,
                 host_id: Uuid::new_v4().to_string(),
             },
-            "protocol 4",
+            format!("protocol {}", PROTOCOL_VERSION + 1),
+            "newer than this cherry-host",
         ),
     ] {
         let dir = sandbox.path().join(version.replace(' ', "-"));
@@ -871,10 +995,10 @@ fn start_and_gateway_never_start_a_second_daemon_beside_another_version() {
             assert!(!output.status.success());
             let message = stderr(&output);
             assert!(
-                message.contains(&format!("speaking {version} is running")),
+                message.contains(&format!("a cherry-host speaking {version} is running")),
                 "{message}"
             );
-            assert!(message.contains("stop it"), "{message}");
+            assert!(message.contains(advice), "{message}");
             assert!(output.stdout.is_empty(), "{action:?} relayed");
         }
         assert!(fake.accepted.load(Ordering::SeqCst) >= CLIENT_ACTIONS.len());
@@ -883,6 +1007,298 @@ fn start_and_gateway_never_start_a_second_daemon_beside_another_version() {
         assert!(!sandbox.home.join("Library").exists());
         assert!(!sandbox.home.join(".local").exists());
         assert!(socket.exists());
+    }
+}
+
+/// A host speaking the protocol before this one, as it answers: every
+/// Hello with a Welcome of its own version, and a `Replace` from a newer
+/// client by removing its socket, answering Ok and listening no more. What
+/// it was sent, in order.
+fn older_host(path: &Path) -> Arc<std::sync::Mutex<Vec<ClientMessage>>> {
+    host_speaking(path, PROTOCOL_VERSION - 1, "older-host")
+}
+
+/// A host speaking `version` as `host_id`, as `older_host` describes.
+fn host_speaking(
+    path: &Path,
+    version: u32,
+    host_id: &str,
+) -> Arc<std::sync::Mutex<Vec<ClientMessage>>> {
+    let listener = UnixListener::bind(path).unwrap();
+    let host_id = host_id.to_owned();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = requests.clone();
+    let path = path.to_path_buf();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut replaced = false;
+            while let Ok(Some(request)) = read_frame::<_, ClientMessage>(&mut stream) {
+                heard.lock().unwrap().push(request.clone());
+                let reply = match request {
+                    ClientMessage::Hello { .. } => ServerMessage::Welcome {
+                        version,
+                        host_id: host_id.clone(),
+                    },
+                    ClientMessage::Replace => {
+                        fs::remove_file(&path).unwrap();
+                        replaced = true;
+                        ServerMessage::Ok
+                    }
+                    _ => ServerMessage::error("version_mismatch", "only replace"),
+                };
+                let _ = write_frame(&mut stream, &reply);
+                if replaced {
+                    break;
+                }
+            }
+            if replaced {
+                return;
+            }
+        }
+    });
+    requests
+}
+
+#[test]
+fn only_the_gateway_replaces_a_daemon_speaking_an_older_protocol_and_starts_its_own() {
+    let sandbox = Sandbox::new();
+    let requests = older_host(&sandbox.socket);
+    // Neither `start` nor a gateway that may not start a host replaces
+    // it: they say what does.
+    for action in [&["start"][..], &["gateway", "--no-start"]] {
+        let output = run(client_command(&sandbox, action, &sandbox.socket), &hello());
+        assert!(!output.status.success(), "{action:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains(&format!(
+                "a cherry-host speaking protocol {} is running",
+                PROTOCOL_VERSION - 1
+            )),
+            "{message}"
+        );
+        assert!(message.contains("replace it"), "{message}");
+        assert!(output.stdout.is_empty(), "{action:?} relayed");
+    }
+    assert!(!requests.lock().unwrap().contains(&ClientMessage::Replace));
+    assert!(!sandbox.home.join("Library").exists());
+    assert!(!sandbox.home.join(".local").exists());
+    // The gateway asks it to make way, as a client of this version does,
+    // starts a daemon of its own and relays to it.
+    let _started = Started(sandbox.socket.clone());
+    let output = run(
+        client_command(&sandbox, &["gateway"], &sandbox.socket),
+        &hello(),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let preamble = format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n");
+    assert!(
+        output.stdout.starts_with(preamble.as_bytes()),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let mut relayed = &output.stdout[preamble.len()..];
+    match read_frame::<_, ServerMessage>(&mut relayed).unwrap() {
+        Some(ServerMessage::Welcome { version, host_id }) => {
+            assert_eq!(version, PROTOCOL_VERSION);
+            assert_ne!(host_id, "older-host");
+        }
+        other => panic!("expected the new daemon's welcome, not {other:?}"),
+    }
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| **r == ClientMessage::Replace)
+            .count(),
+        1,
+        "{requests:?}"
+    );
+    assert_eq!(requests.last(), Some(&ClientMessage::Replace));
+    // The new daemon serves the socket now.
+    let mut socket = quiet_connect(&sandbox.socket).expect("the new daemon");
+    write_frame(&mut socket, &ClientMessage::List).unwrap();
+    assert!(matches!(
+        read_frame::<_, ServerMessage>(&mut socket).unwrap(),
+        Some(ServerMessage::Sessions { .. })
+    ));
+}
+
+/// On Linux a client starts the enabled systemd user service rather than a
+/// daemon of its own. When the unit's ExecStart runs an older cherry-host,
+/// replacing the host it started only starts that one again: the report
+/// says so, names the program, and starts like every report of another
+/// version (which the CLI relies on).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_service_that_starts_an_older_host_is_reported_with_its_program() {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let started = sandbox.path().join("unit-started");
+    // A user manager whose enabled unit serves this socket, with the
+    // previous cherry-host as its ExecStart.
+    let systemctl = bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --user ] || exit 1\ncase \"$2\" in\n  is-enabled) exit 0 ;;\n  show-environment) printf 'LANG=C.UTF-8\\nCHERRY_HOST_SOCKET=%s\\n' '{}' ;;\n  show) echo 'ExecStart={{ path=/opt/previous/cherry-host ; argv[]=/opt/previous/cherry-host serve ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}' ;;\n  start) : > '{}' ;;\n  *) exit 1 ;;\nesac\n",
+            sandbox.socket.display(),
+            started.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    // Each start of the unit runs the previous cherry-host (a fake here).
+    let (sender, runs) = std::sync::mpsc::channel();
+    let socket = sandbox.socket.clone();
+    thread::spawn(move || {
+        for _ in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !started.exists() {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            fs::remove_file(&started).unwrap();
+            if sender.send(older_host(&socket)).is_err() {
+                return;
+            }
+        }
+    });
+    let command = |action: &[&str]| {
+        let mut command = client_command(&sandbox, action, &sandbox.socket);
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", bin.display()));
+        command
+    };
+    let expected = format!(
+        "cherry-host: a cherry-host speaking protocol {} is running at {}: the systemd user service cherry-host.service started it, and its ExecStart runs that older cherry-host (/opt/previous/cherry-host); install this version (protocol {PROTOCOL_VERSION}, ",
+        PROTOCOL_VERSION - 1,
+        sandbox.socket.display()
+    );
+    // Nothing runs: starting the unit starts the previous version.
+    let output = run(command(&["start"]), b"");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).starts_with(&expected),
+        "{}",
+        stderr(&output)
+    );
+    let first = runs.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The gateway replaces it, and the unit brings it back.
+    let output = run(command(&["gateway"]), &hello());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "relayed");
+    assert!(
+        stderr(&output).starts_with(&expected),
+        "{}",
+        stderr(&output)
+    );
+    let replaced = first.lock().unwrap().clone();
+    assert_eq!(
+        replaced.last(),
+        Some(&ClientMessage::Replace),
+        "{replaced:?}"
+    );
+    let second = runs.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!second.lock().unwrap().contains(&ClientMessage::Replace));
+    // No daemon of this version was started beside the unit.
+    assert!(!sandbox.home.join(".local").exists());
+}
+
+/// Stops a daemon of this version serving the socket when dropped, if one
+/// does; a fake host of another version is left alone.
+struct StartedIfAny(PathBuf);
+
+impl Drop for StartedIfAny {
+    fn drop(&mut self) {
+        let Ok(mut connection) = UnixStream::connect(&self.0) else {
+            return;
+        };
+        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+        let ours = write_frame(&mut connection, &ClientMessage::hello()).is_ok()
+            && matches!(
+                read_frame::<_, ServerMessage>(&mut connection),
+                Ok(Some(ServerMessage::Welcome { version, .. })) if version == PROTOCOL_VERSION
+            );
+        drop(connection);
+        if ours {
+            stop_daemon(&self.0);
+        }
+    }
+}
+
+#[test]
+fn a_gateway_neither_replaces_nor_reports_a_host_of_another_identity() {
+    // A local client checks a host's identity before its version: a host
+    // that is not the intended one is neither used nor replaced. A gateway
+    // told the identity its client expects relays such a host untouched,
+    // for the client to refuse its Welcome.
+    let preamble = format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n");
+    let welcome_of = |output: &Output| {
+        assert!(output.status.success(), "{}", stderr(output));
+        assert!(
+            output.stdout.starts_with(preamble.as_bytes()),
+            "{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let mut relayed = &output.stdout[preamble.len()..];
+        match read_frame::<_, ServerMessage>(&mut relayed).unwrap() {
+            Some(ServerMessage::Welcome { version, host_id }) => (version, host_id),
+            other => panic!("expected a welcome, not {other:?}"),
+        }
+    };
+    let gateway = |sandbox: &Sandbox, action: &[&str], expected: &str| {
+        let mut command = client_command(sandbox, action, &sandbox.socket);
+        command.env(EXPECTED_HOST_ID_VAR, expected);
+        run(command, &hello())
+    };
+    for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        let sandbox = Sandbox::new();
+        // Should a gateway start a daemon, it is stopped however this ends.
+        let _started = StartedIfAny(sandbox.socket.clone());
+        let requests = host_speaking(&sandbox.socket, version, "another-host");
+        for action in [&["gateway"][..], &["gateway", "--no-start"]] {
+            let output = gateway(&sandbox, action, "intended-host");
+            assert_eq!(
+                welcome_of(&output),
+                (version, "another-host".to_string()),
+                "{action:?}"
+            );
+            assert_eq!(stderr(&output), "", "{action:?}");
+        }
+        assert!(!requests.lock().unwrap().contains(&ClientMessage::Replace));
+        assert!(!sandbox.home.join("Library").exists());
+        assert!(!sandbox.home.join(".local").exists());
+        assert!(sandbox.socket.exists());
+        if version > PROTOCOL_VERSION {
+            // The intended one: reported, as without an expected identity.
+            let output = gateway(&sandbox, &["gateway"], "another-host");
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(
+                stderr(&output).contains("newer than this cherry-host"),
+                "{}",
+                stderr(&output)
+            );
+            continue;
+        }
+        // The intended one: replaced, as without an expected identity.
+        let output = gateway(&sandbox, &["gateway"], "another-host");
+        let (version, host_id) = welcome_of(&output);
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_ne!(host_id, "another-host");
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.last(),
+            Some(&ClientMessage::Replace),
+            "{requests:?}"
+        );
     }
 }
 
@@ -961,8 +1377,8 @@ fn a_gateway_that_may_not_start_a_host_reports_that_none_is_running() {
     request.extend(encode_frame(&ClientMessage::List).unwrap());
     let output = run(gateway, &request);
     assert!(output.status.success(), "{}", stderr(&output));
-    let preamble = b"CHERRY-GATEWAY 3\n";
-    assert!(output.stdout.starts_with(preamble));
+    let preamble = format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes();
+    assert!(output.stdout.starts_with(&preamble));
     let mut frames = &output.stdout[preamble.len()..];
     assert!(matches!(
         read_frame::<_, ServerMessage>(&mut frames).unwrap(),

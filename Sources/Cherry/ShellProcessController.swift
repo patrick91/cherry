@@ -11,7 +11,7 @@ struct TerminalViewportSize: Equatable {
     let rows: Int
 }
 
-struct ShellIntegrationBootstrap {
+struct ShellIntegrationBootstrap: Equatable, Sendable {
     let zdotdir: String
 
     static func prepare(
@@ -412,18 +412,39 @@ final class ShellProcessController: @unchecked Sendable {
     /// uses the forkpty path; native-PTY uses this. ghostty word-splits `command`
     /// like a shell, so the common shell-integration path returns `"<shell> -l"`
     /// and delivers the startup/agent command via `CHERRY_STARTUP_COMMAND`.
+    /// Hosted local sessions build on the explicit overload below
+    /// (`HostedLaunchSpec`); HostedLaunchSpecTests pin the two together.
     static func nativeExecLaunch(
         for configuration: Configuration
     ) -> (command: String, environment: [String: String]) {
-        let shellPath = configuration.shellPath
-        let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
+        nativeExecLaunch(
+            for: configuration,
+            shellIntegration: try? ShellIntegrationBootstrap.prepare(shellPath: configuration.shellPath),
+            inheritedEnvironment: ProcessInfo.processInfo.environment,
+            terminfoDirectories: Self.preferredTerminfo.additionalDirs
+        )
+    }
 
-        let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
-        let inheritedBootstrapZDOTDIR = ProcessInfo.processInfo.environment["CHERRY_BOOTSTRAP_ZDOTDIR"]
+    /// `nativeExecLaunch(for:)` with its inputs explicit and no file I/O:
+    /// the zsh bootstrap (nil for other shells, or when it could not be
+    /// written), Cherry's own environment (read for ZDOTDIR,
+    /// CHERRY_BOOTSTRAP_ZDOTDIR and TERMINFO_DIRS) and the terminfo
+    /// directories to put first in TERMINFO_DIRS. `HostedLaunchSpec` builds
+    /// hosted sessions on it, so both launches share one set of rules.
+    static func nativeExecLaunch(
+        for configuration: Configuration,
+        shellIntegration: ShellIntegrationBootstrap?,
+        inheritedEnvironment: [String: String],
+        terminfoDirectories: String?
+    ) -> (command: String, environment: [String: String]) {
+        let shellPath = configuration.shellPath
+
+        let inheritedZDOTDIR = inheritedEnvironment["ZDOTDIR"]
+        let inheritedBootstrapZDOTDIR = inheritedEnvironment["CHERRY_BOOTSTRAP_ZDOTDIR"]
         let originalZDOTDIR: String? = inheritedZDOTDIR == inheritedBootstrapZDOTDIR ? nil : inheritedZDOTDIR
 
-        let extraTerminfoDirs = Self.preferredTerminfo.additionalDirs
-        let inheritedTerminfoDirs = ProcessInfo.processInfo.environment["TERMINFO_DIRS"]
+        let extraTerminfoDirs = terminfoDirectories
+        let inheritedTerminfoDirs = inheritedEnvironment["TERMINFO_DIRS"]
         let mergedTerminfoDirs: String? = {
             guard let extraTerminfoDirs, !extraTerminfoDirs.isEmpty else { return nil }
             guard let inheritedTerminfoDirs, !inheritedTerminfoDirs.isEmpty else { return extraTerminfoDirs }

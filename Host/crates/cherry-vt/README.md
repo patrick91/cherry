@@ -4,7 +4,9 @@ Safe ownership wrapper around a pinned upstream libghostty-vt, using a small C
 shim compiled against the matching upstream headers rather than duplicating
 complex C struct layouts in Rust. A terminal can move between threads (`Send`)
 but cannot be accessed concurrently (`!Sync`). Ghostty callbacks run
-synchronously and append PTY replies into a stable owned allocation.
+synchronously and append PTY replies and events into a stable owned
+allocation; they copy what Ghostty lends them and never call back into the
+terminal.
 
 `feed` consumes workload output and returns terminal-query replies for the
 host to write to the PTY. `resize` may also return size-report bytes. The host
@@ -21,11 +23,57 @@ XTGETTCAP `TN` (the terminfo name) is answered only after
 `set_terminfo_name`, with the name given (the program's TERM).
 
 The library is built with `-Doptimize=ReleaseSafe` (`Scripts/build-host-vt`):
-the daemon parses untrusted output from every session, so Zig's runtime
-safety checks stay on. The script records the Ghostty revision and the
+the host parses untrusted output from every session, so Zig's runtime safety
+checks stay on. Each session's terminal lives in its own holder process
+(`cherry-host hold`), so a safety abort ends only that session. The script records the Ghostty revision and the
 optimize mode next to the archive (`SOURCE_REVISION`, `OPTIMIZE`); the build
 script refuses an archive whose stamps do not match, including one built
 before the stamps existed, and asks for `Scripts/build-host-vt` to be run.
+
+## Events
+
+Besides replies, output makes the terminal report what programs ask of it
+beyond drawing. `take_events` returns them in order, as `VtEvent`s:
+
+- `Title` (OSC 0 or 2; OSC 1 sets the icon name and is ignored) and `Pwd`,
+  the working directory exactly as reported: a `file://host/path` URI (OSC 7,
+  percent-encoded) or a plain path (OSC 9;9, OSC 1337 CurrentDir). An empty
+  value means cleared, by the program or by a reset (RIS, which Ghostty does
+  without a callback: `feed` compares the terminal's values afterwards). A
+  value set again unchanged is not reported again. Titles are cut to 1024
+  bytes; a title that is not UTF-8, or an OSC longer than Ghostty's parser
+  keeps (2 KiB for these), changes nothing.
+- `Bell` (BEL).
+- `Notification { title, body }` for OSC 9 (body only) and OSC 777
+  (`notify;title;body`).
+- `Progress { state, value }` for OSC 9;4. `value` is a percentage, clamped to
+  100, absent when the program gave none; a reset reports `Remove`. Ghostty
+  takes an OSC 9;4 with an unknown state for an OSC 9 notification.
+
+Events never produce replies, and nothing but `feed` produces them:
+snapshots, `refresh`, `viewport`, `modes`, `inspect` and `resize` work on
+copies or report nothing. Sequences split across reads are reported once
+they end. Pending events are bounded (`MAX_PENDING_EVENTS`,
+`MAX_PENDING_EVENT_BYTES`), so a terminal whose events nobody takes stays
+small: a title, working directory or progress report replaces the one before
+it when nothing came between, a bell right after a bell adds nothing, and
+beyond the bounds the oldest are dropped. A title, working directory or
+progress report is state, not news: when the bounds drop the latest of its
+kind, it is kept apart and taken first, so a taker never misses the current
+value (which, set again unchanged, would not be reported again). `title()`
+and `pwd()` always read the current values, and `mode(value, ansi)` reads one
+mode as the terminal holds it (DECCKM, application cursor keys, is
+`mode(1, false)`).
+
+libghostty-vt parses kitty notifications (OSC 99) but drops them, so they
+never come from `take_events`. `Osc99` (one per session) takes each complete
+`ESC ] 99 ; metadata ; payload` sequence, as a reader of the output stream
+that keeps whole control strings sees it, and assembles notifications sent in
+chunks (`i` identifier, `d=0` more to come, `p=title|body`, `e=1` base64);
+`parse_osc99` handles a single sequence. Icons, buttons and payload types it
+does not know are parts of a notification that are not reported: their
+chunks still end it (without `d=0`). Queries (`p=?`), close requests and
+liveness checks are not notifications and give nothing.
 
 ## Snapshots
 
@@ -114,7 +162,10 @@ For a physical terminal whose size differs from the canonical grid:
 - `modes()` makes the physical terminal's modes match: it resets every mode it
   manages to its default, then sets the non-default ones. It manages the
   alternate screen, input and display modes, modifyOtherKeys and the current
-  kitty keyboard flags. Modes whose default comes from the user's terminal
+  kitty keyboard flags. cherry-host reads whether the alternate screen shows,
+  and the kitty flags, from this output (`screen::terminal_state`, for
+  `SessionInfo`); a test there pins its shape, so a change here needs that
+  reader updated. Modes whose default comes from the user's terminal
   settings rather than the VT standard (DECARM 8, which libghostty defaults
   to off and does not implement, alternate scroll 1007, the Meta and Alt key
   modes 1035, 1036 and 1039, grapheme clustering 2027) are never reset: they
@@ -155,7 +206,8 @@ For a physical terminal whose size differs from the canonical grid:
 
 - Terminal graphics (kitty images) are not restored.
 - Palette and dynamic colour changes (OSC 4/10/11/12), the working directory
-  (OSC 7) and the title are not exported.
+  (OSC 7) and the title are not exported; `title()` and `pwd()` give the
+  last two.
 - Cursor shape (DECSCUSR block, underline or bar) is not restored; its blink
   setting is (mode 12). The pinned API exposes the shape only through the
   render state, which cannot tell a program's choice from the default.

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Run the Swift tests for hosted and persistent sessions, as CI does.
+#
+#   Scripts/test-session-suites [--skip-build] unit
+#   Scripts/test-session-suites [--skip-build] real-host
+#
+# unit: runs each group below on its own. Swift Testing matches --filter
+# against a test's ID, which includes its source file name, so a group selects
+# every test in the files named after it (WorkspaceRestore selects all of
+# WorkspaceRestoreTests.swift) as well as the tests named after it. Each group
+# must pass at least one test, so a filter that stops matching fails instead
+# of passing with nothing run. Real-host tests in these files are skipped.
+# Two guards keep a new suite from being left out of CI unnoticed: every test
+# file under Tests that uses the session types or fakes (see session_markers)
+# must be named after a group, and every test skipped here must be one that
+# real-host mode runs (RealHost in its name or its file's name).
+#
+# real-host: sets CHERRY_TEST_HOST_INTEGRATION=1 and runs every test whose ID
+# contains RealHost (HostedSessionRealHost*, PersistentLocalRealHost*,
+# AgentInputRealHost* and any other) against the Rust helpers in
+# Host/target/debug (or CARGO_TARGET_DIR). Each of those tests starts its own
+# daemon on a private socket with a private HOME. Every selected test must run
+# and pass: a skipped one fails the run, and so does a run in which
+# HostedSessionRealHost* or PersistentLocalRealHost* passes nothing.
+#
+# Without --skip-build, the Swift tests are built first, and for real-host
+# the Rust helpers too (Scripts/build-host debug). CI builds them in earlier
+# steps and passes --skip-build.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+usage() {
+  echo "Usage: Scripts/test-session-suites [--skip-build] unit|real-host" >&2
+  exit 2
+}
+
+build=1
+mode=
+for argument in "$@"; do
+  case "$argument" in
+    --skip-build) build=0 ;;
+    unit|real-host) [ -z "$mode" ] || usage; mode=$argument ;;
+    *) usage ;;
+  esac
+done
+[ -n "$mode" ] || usage
+cd "$root"
+
+# The first Cargo output directory with both debug helpers, in the order the
+# real-host tests look (HostedSessionClient.developmentTargetDirectories).
+helpers_built() {
+  local configured=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-}} directory
+  for directory in ${configured:+"$configured"} "$root/Host/target"; do
+    if [ -x "$directory/debug/cherry" ] && [ -x "$directory/debug/cherry-host" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "$build" = 1 ]; then
+  if [ "$mode" = real-host ]; then
+    "$root/Scripts/build-host" debug
+  fi
+  swift build --build-tests
+fi
+if [ "$mode" = real-host ] && ! helpers_built; then
+  echo "error: the real-host tests need Host/target/debug/cherry and cherry-host; run Scripts/build-host debug first" >&2
+  exit 1
+fi
+
+logs=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cherry-session-tests.XXXXXX")
+failures=()
+# GitHub Actions folds each run's output and shows failures as annotations.
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  fold_start='::group::' fold_end='::endgroup::' error='::error::'
+else
+  fold_start='==> ' fold_end='' error='error: '
+fi
+
+# How many tests whose name matches $2 reached outcome $3 in log $1.
+count() {
+  grep -E "Test $2 $3" "$1" | grep -cv 'Test run with' || true
+}
+
+# Run the tests `filter` selects, logging to $logs/<label>.log. Swift Testing
+# exits non-zero when any selected test fails.
+run_filter() {
+  local label=$1 filter=$2
+  shift 2
+  local log="$logs/$label.log"
+  echo "${fold_start}swift test --filter '$filter'"
+  if ! "$@" swift test --skip-build --no-parallel --filter "$filter" 2>&1 | tee "$log"; then
+    failures+=("$label: a selected test failed (see $log)")
+  fi
+  [ -z "$fold_end" ] || echo "$fold_end"
+}
+
+# The unit groups. Each stem is also the start of the test files it covers.
+groups=(
+  PersistentLocal       # PersistentLocalSession{,Parity,RealHost}Tests
+  PersistentTab         # PersistentTabLaunchAndSignalTests
+  WorkspacePersistence  # WorkspacePersistenceTests
+  WorkspaceRestore      # WorkspaceRestoreTests
+  HostControl           # HostControl{,Protocol,SSHMaster}Tests
+  HostedSession         # HostedSession{,Installation,Termination}Tests
+  HostedLaunchSpec      # HostedLaunchSpecTests
+  NativeSurfaceRelaunch # NativeSurfaceRelaunchTests
+  MultiplexerSafety     # MultiplexerSafety{,Launch}Tests
+  AdapterAwayKeyInput   # AdapterAwayKeyInputTests
+  AgentInputSafety      # AgentInputSafetyTests
+  SessionCloseFlow      # SessionCloseFlowTests
+  '[Aa]ppIdentity'      # AppIdentityTests
+)
+
+# What marks a test file as a session suite: the hosted and persistent session
+# types, the session fakes (FakeControlHelper, HostedSessionFakeCLI,
+# PersistentHarness), the saved-state store, the instance lock, the host
+# helpers or the real-host gate.
+session_markers='HostedSession|PersistentLocalSessions|PersistentHarness|FakeControlHelper|HostControl|WorkspaceStateStore|AppInstanceLock|cherry-host|CHERRY_TEST_HOST_INTEGRATION'
+
+# Each test file under Tests that is a session suite (it declares tests and
+# mentions a session marker) and whose name no group selects.
+uncovered_session_files() {
+  local file name group
+  while IFS= read -r file; do
+    grep -qE '@Test|XCTestCase' "$file" || continue
+    grep -qE "$session_markers" "$file" || continue
+    name=${file##*/}
+    for group in "${groups[@]}"; do
+      if printf '%s\n' "$name" | grep -qE -- "$group"; then
+        continue 2
+      fi
+    done
+    printf '%s\n' "${file#"$root"/}"
+  done < <(find "$root/Tests" -name '*.swift' | LC_ALL=C sort)
+}
+
+# Each test the logs show skipped that real-host mode does not run: neither
+# its name nor the name of the file that declares it contains RealHost.
+unselected_skips() {
+  local name file
+  sed -nE '/Test run with/d; s/^.*Test (.+) skipped([.:].*)?$/\1/p' "$@" | LC_ALL=C sort -u | while IFS= read -r name; do
+    case $name in *RealHost*) continue ;; esac
+    # A display name ("…") has no function to look up.
+    if [[ $name =~ ^([A-Za-z_][A-Za-z0-9_]*)\( ]]; then
+      file=$(grep -rlE "func ${BASH_REMATCH[1]}\(" "$root/Tests" | head -n 1 || true)
+      case ${file##*/} in *RealHost*) continue ;; esac
+    fi
+    printf '%s\n' "$name"
+  done
+}
+
+case "$mode" in
+  unit)
+    uncovered=$(uncovered_session_files)
+    if [ -n "$uncovered" ]; then
+      while IFS= read -r file; do
+        failures+=("$file: a session test file no group selects; add a group for it in Scripts/test-session-suites")
+      done <<< "$uncovered"
+    fi
+    for group in "${groups[@]}"; do
+      label=${group//[^A-Za-z]/}
+      # Real-host tests are gated on this variable; they run in real-host mode.
+      run_filter "$label" "$group" env -u CHERRY_TEST_HOST_INTEGRATION
+      passed=$(count "$logs/$label.log" '.+' 'passed after')
+      if [ "$passed" -eq 0 ]; then
+        failures+=("$group: no test passed; the filter no longer selects its tests")
+      fi
+      printf '%s: %s passed, %s skipped\n' "$group" "$passed" "$(count "$logs/$label.log" '.+' 'skipped')"
+    done
+    unselected=$(unselected_skips "$logs"/*.log)
+    if [ -n "$unselected" ]; then
+      while IFS= read -r name; do
+        failures+=("$name: skipped here and not run by real-host mode; name it or its file *RealHost*")
+      done <<< "$unselected"
+    fi
+    ;;
+  real-host)
+    run_filter RealHost RealHost env CHERRY_TEST_HOST_INTEGRATION=1
+    log="$logs/RealHost.log"
+    skipped=$(count "$log" '.+' 'skipped')
+    if [ "$skipped" -ne 0 ]; then
+      failures+=("RealHost: $skipped selected test(s) skipped instead of running")
+    fi
+    for name in HostedSessionRealHost PersistentLocalRealHost; do
+      passed=$(count "$log" "${name}[^ ]*" 'passed after')
+      if [ "$passed" -eq 0 ]; then
+        failures+=("$name: no test passed; the filter no longer selects its tests")
+      fi
+      printf '%s: %s passed\n' "$name" "$passed"
+    done
+    ;;
+esac
+
+if [ "${#failures[@]}" -ne 0 ]; then
+  for failure in "${failures[@]}"; do
+    echo "$error$failure" >&2
+  done
+  echo "Logs kept in $logs" >&2
+  exit 1
+fi
+rm -rf "$logs"

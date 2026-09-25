@@ -1,18 +1,28 @@
-//! One client connection: a reader (this thread) and a writer thread that
-//! drains the connection's outbox.
+//! One connection to the daemon socket. A client's is served here: a reader
+//! (this thread) and a writer thread that drains the connection's outbox. A
+//! holder's (its first frame is a `HolderHello`, see `link`) is handed to
+//! the session it holds.
+//!
+//! A client connection may attach to one session (`Attach`), and may
+//! subscribe to events (`Subscribe`, see `Host::publish`); either way it
+//! must then send a frame every heartbeat timeout rather than every idle
+//! timeout. Requests are answered in order, one at a time; a request that
+//! waits for a session (an attach, a screen, input its program has no room
+//! for yet) holds back the ones after it.
 use crate::{
     daemon::{self, Host},
-    environment,
+    environment, link,
     outbox::Outbox,
     session::{Command, Launch, Session},
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, read_frame, write_frame, ClientMessage, ServerMessage, SessionState,
-    PROTOCOL_VERSION,
+    encode_frame, error_code, read_frame, write_frame, ClientMessage, Request, Response,
+    ServerMessage, SessionEvent, SessionState, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use std::{
     collections::{BTreeMap, HashMap},
+    io::{self, Read},
     os::unix::{io::AsRawFd, net::UnixStream},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -23,14 +33,42 @@ use std::{
 };
 use uuid::Uuid;
 
-/// A connection that is not attached must send its next request within this.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a closing connection's writer may take to flush final replies.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a paused connection re-checks the reasons to end it.
 const PAUSE_POLL: Duration = Duration::from_millis(100);
+/// How long an attach or a detach waits for the session's holder.
+const HOLDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a `Screen` or an `Update` waits for the session.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_SESSIONS: usize = 128;
 const MAX_RECEIPTS: usize = 4096;
+/// A session's name is at most this long.
+const MAX_NAME_BYTES: usize = 256;
+
+/// A failed request with an error code of its own (`error_code`) rather
+/// than `request_failed`.
+#[derive(Debug)]
+pub struct Refused {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    Refused {
+        code,
+        message: message.into(),
+    }
+    .into()
+}
 
 /// Idempotency receipts for `Create`, keyed by request ID. Bounded: the least
 /// recently used receipt is evicted first. Receipts of removed sessions are
@@ -75,7 +113,7 @@ impl Receipts {
         Some((&receipt.fingerprint, &receipt.session))
     }
 
-    fn insert(&mut self, request: String, fingerprint: String, session: String) {
+    pub fn insert(&mut self, request: String, fingerprint: String, session: String) {
         if let Some(previous) = self.entries.remove(&request) {
             self.order.remove(&previous.stamp);
         }
@@ -115,14 +153,128 @@ pub fn serve(stream: UnixStream, host: &Arc<Host>) {
     let _ = run(stream, host);
 }
 
+/// After a `Hello` of another version, the one request a client may make:
+/// `Replace`, when it speaks a higher version. This host then stops
+/// accepting connections and releases its socket and lock before answering
+/// `Ok`, so the client can start its own host at once, and exits. Sessions
+/// carry on in their holders, which register with the new host. Anything
+/// else is refused and the connection ends.
+fn mismatched(mut stream: UnixStream, host: &Arc<Host>, version: u32) -> Result<()> {
+    let Some(Request { message, req }) = read_frame(&mut stream)? else {
+        return Ok(());
+    };
+    let reply = match message {
+        ClientMessage::Replace if version > PROTOCOL_VERSION => {
+            {
+                // After any launch in progress, and before any other.
+                let _launch = host.launches.lock().unwrap_or_else(|e| e.into_inner());
+                host.stop();
+            }
+            daemon::log(format_args!(
+                "replaced by a client speaking protocol {version}; exiting, and leaving the sessions to the next host"
+            ));
+            host.wait_until_released(FLUSH_TIMEOUT);
+            ServerMessage::Ok
+        }
+        ClientMessage::Replace => ServerMessage::error(
+            error_code::VERSION_MISMATCH,
+            format!("this host speaks protocol {PROTOCOL_VERSION}, which a client speaking protocol {version} does not replace"),
+        ),
+        _ => ServerMessage::error(
+            error_code::VERSION_MISMATCH,
+            format!("this host speaks protocol {PROTOCOL_VERSION}, not {version}; after a version mismatch only replace is accepted"),
+        ),
+    };
+    write_frame(&mut stream, &Response::new(req, reply))?;
+    Ok(())
+}
+
+/// Stop accepting connections and release the socket and lock, unless
+/// sessions are running: `Shutdown` stops the host, and those who ask for it
+/// expect their programs to have ended. It ends everything: exited sessions
+/// are removed, so their holders exit rather than wait for the next host.
+fn stop_without_sessions(host: &Host) -> Result<()> {
+    // A daemon that just started sees every session first, as `List` does.
+    host.wait_for_holders(None);
+    // After any launch or registration in progress, and before any other.
+    let _launch = host.launches.lock().unwrap_or_else(|e| e.into_inner());
+    let removed: Vec<(String, Arc<Session>)> = {
+        let mut registry = host.registry();
+        if registry
+            .sessions
+            .values()
+            .any(|s| s.snapshot_info().state == SessionState::Running)
+        {
+            bail!("host still owns running sessions");
+        }
+        registry.receipts = Receipts::default();
+        registry.sessions.drain().collect()
+    };
+    // Their holders exit once told, while this host still runs.
+    for (id, session) in removed {
+        session.remove();
+        host.publish(SessionEvent::Removed { id });
+    }
+    host.stop();
+    Ok(())
+}
+
+/// A connection's first frame.
+enum First {
+    Client(Request),
+    /// A holder registering its session.
+    Holder(link::Frame),
+}
+
+/// Read the first frame: a client's `Request`, or a holder's `HolderHello`,
+/// whose kind byte can never start a JSON body. None at end of file; an
+/// error for anything else.
+fn read_first(stream: &mut UnixStream) -> io::Result<Option<First>> {
+    let mut header = [0u8; 4];
+    loop {
+        match stream.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    stream.read_exact(&mut header[1..])?;
+    let len = u32::from_be_bytes(header) as usize;
+    if len == 0 || len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame length",
+        ));
+    }
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body)?;
+    if body[0] == link::kind::HOLDER_HELLO {
+        return link::decode(&body)
+            .map(|frame| Some(First::Holder(frame)))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+    }
+    serde_json::from_slice(&body)
+        .map(|request| Some(First::Client(request)))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
     // Darwin inherits O_NONBLOCK from the listener; framed reads use timeouts.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+    stream.set_read_timeout(Some(daemon::config().idle_timeout))?;
     stream.set_write_timeout(Some(FLUSH_TIMEOUT))?;
-    match read_frame(&mut stream)? {
-        Some(ClientMessage::Hello { version }) if version == PROTOCOL_VERSION => {}
-        _ => {
+    let (version, req) = match read_first(&mut stream)? {
+        None => return Ok(()),
+        Some(First::Holder(frame)) => {
+            host.register(stream, frame);
+            return Ok(());
+        }
+        Some(First::Client(Request {
+            message: ClientMessage::Hello { version },
+            req,
+        })) => (version, req),
+        Some(First::Client(_)) => {
             write_frame(
                 &mut stream,
                 &ServerMessage::error(
@@ -132,14 +284,22 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
             )?;
             return Ok(());
         }
-    }
+    };
+    // Every Hello is welcomed, whatever its version: the client learns which
+    // version this host speaks.
     write_frame(
         &mut stream,
-        &ServerMessage::Welcome {
-            version: PROTOCOL_VERSION,
-            host_id: host.id.clone(),
-        },
+        &Response::new(
+            req,
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                host_id: host.id.clone(),
+            },
+        ),
     )?;
+    if version != PROTOCOL_VERSION {
+        return mismatched(stream, host, version);
+    }
     // The writer blocks as long as the peer is alive; a vanished peer is
     // detected by the reader's timeouts and the socket is then shut down.
     stream.set_write_timeout(None)?;
@@ -158,12 +318,16 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
         lease: host.next_lease.fetch_add(1, Ordering::Relaxed),
         cancelled: Arc::new(AtomicBool::new(false)),
         attached: None,
+        subscribed: false,
         stream,
         host: host.clone(),
         outbox,
         last_probe: None,
     };
     connection.serve();
+    if connection.subscribed {
+        host.unsubscribe(connection.lease);
+    }
     // An attachment still held here ended abnormally: its unsent input is
     // discarded. A voluntary detach already went through the worker.
     connection.cancelled.store(true, Ordering::SeqCst);
@@ -179,9 +343,12 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
 }
 
 struct Connection {
+    /// Names this connection: its attachment, its subscription.
     lease: u64,
     cancelled: Arc<AtomicBool>,
     attached: Option<Arc<Session>>,
+    /// Whether it asked for events.
+    subscribed: bool,
     stream: UnixStream,
     host: Arc<Host>,
     outbox: Arc<Outbox>,
@@ -194,8 +361,9 @@ enum Flow {
 }
 
 impl Connection {
-    fn reply(&self, message: &ServerMessage) {
-        if let Ok(frame) = encode_frame(message) {
+    /// Queue a frame: the reply to the request `req` identified, if any.
+    fn reply(&self, req: Option<u64>, message: ServerMessage) {
+        if let Ok(frame) = encode_frame(&Response::new(req, message)) {
             self.outbox.push_control(Arc::new(frame));
         }
     }
@@ -210,10 +378,12 @@ impl Connection {
             }
             // Any frame counts as a heartbeat; an attached client that sends
             // nothing for the heartbeat timeout is treated as gone.
-            let message = match read_frame::<_, ClientMessage>(&mut self.stream) {
-                Ok(Some(message)) => message,
+            let (message, req) = match read_frame::<_, Request>(&mut self.stream) {
+                Ok(Some(Request { message, req })) => (message, req),
                 Ok(None) | Err(_) => return,
             };
+            // Whatever answers an attachment's requests is attachment traffic.
+            let req = req.filter(|_| !message.belongs_to_attachment());
             if self.cancelled.load(Ordering::SeqCst) {
                 return;
             }
@@ -222,18 +392,18 @@ impl Connection {
             if matches!(message, ClientMessage::Input { .. }) && !self.wait_for_input_room() {
                 return;
             }
-            let flow = match self.dispatch(message) {
+            let flow = match self.dispatch(message, req) {
                 Ok((reply, flow)) => {
                     if let Some(reply) = reply {
-                        self.reply(&reply);
+                        self.reply(req, reply);
                     }
                     flow
                 }
                 Err(error) => {
-                    self.reply(&ServerMessage::error(
-                        error_code::REQUEST_FAILED,
-                        format!("{error:#}"),
-                    ));
+                    let code = error
+                        .downcast_ref::<Refused>()
+                        .map_or(error_code::REQUEST_FAILED, |refused| refused.code);
+                    self.reply(req, ServerMessage::error(code, format!("{error:#}")));
                     Flow::Continue
                 }
             };
@@ -244,12 +414,12 @@ impl Connection {
     }
 
     /// How long this connection may go without sending a frame: the
-    /// heartbeat timeout once attached.
+    /// heartbeat timeout once attached or subscribed.
     fn silence_limit(&self) -> Duration {
-        if self.attached.is_some() {
+        if self.attached.is_some() || self.subscribed {
             daemon::config().heartbeat_timeout
         } else {
-            IDLE_TIMEOUT
+            daemon::config().idle_timeout
         }
     }
 
@@ -321,17 +491,97 @@ impl Connection {
             if progress || quiet_since.elapsed() >= keepalive {
                 reported = released;
                 self.last_probe = Some(Instant::now());
-                self.reply(&ServerMessage::Pong);
+                self.reply(None, ServerMessage::Pong);
             }
         }
     }
 
-    fn dispatch(&mut self, message: ClientMessage) -> Result<(Option<ServerMessage>, Flow)> {
+    /// Serve one request (`req` identifies it); returns the reply, if the
+    /// request did not send one itself.
+    fn dispatch(
+        &mut self,
+        message: ClientMessage,
+        req: Option<u64>,
+    ) -> Result<(Option<ServerMessage>, Flow)> {
         let reply = match message {
             ClientMessage::Hello { .. } => bail!("connection already negotiated"),
+            ClientMessage::Replace => {
+                bail!("replace is accepted only from a client speaking a newer protocol")
+            }
+            ClientMessage::Subscribe => {
+                if !self.subscribed {
+                    // Every event follows the Ok. One published before the
+                    // subscription is in what the client lists next.
+                    self.reply(req, ServerMessage::Ok);
+                    self.host.subscribe(self.lease, &self.outbox);
+                    self.subscribed = true;
+                    // Fails only once the peer is gone, which the next read
+                    // reports.
+                    let _ = self
+                        .stream
+                        .set_read_timeout(Some(daemon::config().heartbeat_timeout));
+                    return Ok((None, Flow::Continue));
+                }
+                ServerMessage::Ok
+            }
+            ClientMessage::SendInput { id, data } => {
+                if data.len() > cherry_protocol::MAX_INPUT_BYTES {
+                    bail!("input frame exceeds limit");
+                }
+                self.send_input(&id, data)?;
+                ServerMessage::Ok
+            }
+            ClientMessage::Screen {
+                id,
+                scrollback,
+                max_lines,
+            } => {
+                let session = self.session(&id)?;
+                let (reply, replied) = mpsc::sync_channel(1);
+                session
+                    .send(Command::Screen {
+                        scrollback,
+                        max_lines,
+                        reply,
+                    })
+                    .map_err(|_| self.gone(&id))?;
+                match replied.recv_timeout(REQUEST_TIMEOUT) {
+                    Ok(reply) => reply,
+                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
+                }
+            }
+            ClientMessage::Update { id, name, tags } => {
+                if name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > MAX_NAME_BYTES)
+                {
+                    bail!("a session name is at most {MAX_NAME_BYTES} bytes");
+                }
+                if let Some(tags) = &tags {
+                    cherry_protocol::check_tags(tags).map_err(anyhow::Error::msg)?;
+                }
+                let session = self.session(&id)?;
+                let (ack, acknowledged) = mpsc::sync_channel(1);
+                session
+                    .send(Command::Update { name, tags, ack })
+                    .map_err(|_| self.gone(&id))?;
+                match acknowledged.recv_timeout(REQUEST_TIMEOUT) {
+                    Ok(true) => ServerMessage::Ok,
+                    Ok(false) => return Err(unknown_session(&id)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
+                }
+            }
             ClientMessage::Ping => ServerMessage::Pong,
             ClientMessage::List => {
-                let registry = self.host.registry.lock().unwrap();
+                // A daemon that just started lists the sessions of holders
+                // still registering again, as it would a moment later.
+                self.host.wait_for_holders(None);
+                // Counted before the sessions are: a holder that registers
+                // in between is listed, counted, or both, never neither.
+                let pending_holders = self.host.pending_holders();
+                let registry = self.host.registry();
                 let mut sessions: Vec<_> = registry
                     .sessions
                     .values()
@@ -341,6 +591,7 @@ impl Connection {
                 ServerMessage::Sessions {
                     host_id: self.host.id.clone(),
                     sessions,
+                    pending_holders,
                 }
             }
             ClientMessage::Create {
@@ -351,7 +602,9 @@ impl Connection {
                 env,
                 cols,
                 rows,
-            } => self.create(request_id, name, cwd, command, env, cols, rows)?,
+                owner,
+                tags,
+            } => self.create(request_id, name, cwd, command, env, cols, rows, owner, tags)?,
             ClientMessage::Attach {
                 id,
                 cols,
@@ -367,7 +620,7 @@ impl Connection {
                 }
                 let session = self.session(&id)?;
                 let (ack, acknowledged) = mpsc::sync_channel(1);
-                session.send(Command::Attach {
+                let attach = session.send(Command::Attach {
                     lease: self.lease,
                     cols,
                     rows,
@@ -377,16 +630,24 @@ impl Connection {
                     abort: self.stream.try_clone()?,
                     cancelled: self.cancelled.clone(),
                     ack,
-                })?;
+                });
+                attach.map_err(|_| self.gone(&id))?;
                 // The worker replies itself: the snapshot, or why it failed.
-                match acknowledged.recv() {
+                match acknowledged.recv_timeout(HOLDER_TIMEOUT) {
                     Ok(true) => {
                         self.attached = Some(session);
                         self.stream
                             .set_read_timeout(Some(daemon::config().heartbeat_timeout))?;
                     }
                     Ok(false) => {}
-                    Err(_) => bail!("session is unavailable"),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // A stopped holder: give up, and end the connection
+                        // rather than attach it later.
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        session.wake();
+                        bail!("the session did not answer");
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
                 }
                 return Ok((None, Flow::Continue));
             }
@@ -432,7 +693,9 @@ impl Connection {
                         })
                         .is_ok()
                     {
-                        let _ = acknowledged.recv();
+                        // The input is delivered whenever a stopped holder
+                        // resumes; the detach need not wait for it.
+                        let _ = acknowledged.recv_timeout(HOLDER_TIMEOUT);
                     }
                 }
                 return Ok((Some(ServerMessage::Ok), Flow::Close));
@@ -442,31 +705,28 @@ impl Connection {
                 ServerMessage::Ok
             }
             ClientMessage::Remove { id } => {
-                let mut registry = self.host.registry.lock().unwrap();
-                let session = registry.sessions.get(&id).context("unknown session")?;
-                if session.snapshot_info().state == SessionState::Running {
-                    bail!("terminate the running session before removing it");
-                }
-                registry.sessions.remove(&id);
-                registry.receipts.remove_session(&id);
+                self.host.wait_for_holders(Some(&id));
+                let session = {
+                    let mut registry = self.host.registry();
+                    let session = registry
+                        .sessions
+                        .get(&id)
+                        .ok_or_else(|| unknown_session(&id))?
+                        .clone();
+                    if session.snapshot_info().state == SessionState::Running {
+                        bail!("terminate the running session before removing it");
+                    }
+                    registry.sessions.remove(&id);
+                    registry.receipts.remove_session(&id);
+                    session
+                };
+                // Its holder exits once told.
+                session.remove();
+                self.host.publish(SessionEvent::Removed { id });
                 ServerMessage::Ok
             }
             ClientMessage::Shutdown => {
-                {
-                    let _launch = self.host.launches.lock().unwrap();
-                    if self
-                        .host
-                        .registry
-                        .lock()
-                        .unwrap()
-                        .sessions
-                        .values()
-                        .any(|s| s.snapshot_info().state == SessionState::Running)
-                    {
-                        bail!("host still owns running sessions");
-                    }
-                    self.host.stop();
-                }
+                stop_without_sessions(&self.host)?;
                 // Acknowledge once the socket is gone and the lock is free:
                 // the client may start a new host right away.
                 self.host.wait_until_released(FLUSH_TIMEOUT);
@@ -477,19 +737,54 @@ impl Connection {
     }
 
     fn session(&self, id: &str) -> Result<Arc<Session>> {
+        self.host.wait_for_holders(Some(id));
         self.host
-            .registry
-            .lock()
-            .unwrap()
+            .registry()
             .sessions
             .get(id)
             .cloned()
-            .context("unknown session")
+            .ok_or_else(|| unknown_session(id))
+    }
+
+    /// Why the worker of a session found a moment ago is gone: the session
+    /// was removed meanwhile, unless it is still listed.
+    fn gone(&self, id: &str) -> anyhow::Error {
+        if self.host.registry().sessions.contains_key(id) {
+            anyhow::anyhow!("session is unavailable")
+        } else {
+            unknown_session(id)
+        }
+    }
+
+    /// Write to a session's terminal without attaching. Like an attached
+    /// client's input it counts against the session's input waiting for
+    /// its program (`InputGate`); while too much waits, this waits for room,
+    /// up to `Config::input_wait`, and then fails, rather than hold back
+    /// this connection's other requests for good.
+    fn send_input(&self, id: &str, data: Vec<u8>) -> Result<()> {
+        let session = self.session(id)?;
+        let not_running = || refused(error_code::NOT_RUNNING, "the session has exited");
+        if !session.is_running() {
+            return Err(not_running());
+        }
+        if session.input.full() && !session.input.wait_for_room(daemon::config().input_wait) {
+            bail!("the session's program is not reading its input");
+        }
+        if !session.is_running() {
+            return Err(not_running());
+        }
+        let len = data.len();
+        session.input.reserve(len);
+        if session.send(Command::Send { data }).is_err() {
+            session.input.release(len);
+            return Err(self.gone(id));
+        }
+        Ok(())
     }
 
     /// The existing session for a retried request, if any.
     fn receipt(&self, request_id: &str, fingerprint: &str) -> Result<Option<ServerMessage>> {
-        let mut registry = self.host.registry.lock().unwrap();
+        let mut registry = self.host.registry();
         let Some((previous, id)) = registry.receipts.get(request_id) else {
             return Ok(None);
         };
@@ -515,14 +810,23 @@ impl Connection {
         env: BTreeMap<String, String>,
         cols: u16,
         rows: u16,
+        owner: Option<String>,
+        tags: BTreeMap<String, String>,
     ) -> Result<ServerMessage> {
         Uuid::parse_str(&request_id).context("request_id must be a UUID")?;
         if name.len() > 256 || cwd.len() > 4096 {
             bail!("launch description exceeds limit");
         }
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.len() > cherry_protocol::MAX_OWNER_BYTES)
+        {
+            bail!("owner exceeds {} bytes", cherry_protocol::MAX_OWNER_BYTES);
+        }
+        cherry_protocol::check_tags(&tags).map_err(anyhow::Error::msg)?;
         // The size is attachment state, not part of what was launched: a
         // retry from a resized terminal is still the same request.
-        let fingerprint = serde_json::to_string(&(&name, &cwd, &command, &env))?;
+        let fingerprint = serde_json::to_string(&(&name, &cwd, &command, &env, &owner, &tags))?;
         if let Some(created) = self.receipt(&request_id, &fingerprint)? {
             return Ok(created);
         }
@@ -530,35 +834,59 @@ impl Connection {
         // Resolving the directory can block on a hung filesystem; do it
         // before taking any lock shared with other clients.
         let resolved = environment::resolve_cwd(&cwd)?;
+        let pwd = environment::logical_cwd(&cwd, &resolved);
         // The session must not start with an agent whose client is gone.
         self.host.prune_agent_link();
-        let _launch = self.host.launches.lock().unwrap();
+        // A retry of a request whose session a restarted daemon has not
+        // seen again yet must find it.
+        self.host.wait_for_holders(None);
+        let _launch = self.host.launches.lock().unwrap_or_else(|e| e.into_inner());
         if self.host.stopping.load(Ordering::SeqCst) {
             bail!("host is shutting down");
         }
         if let Some(created) = self.receipt(&request_id, &fingerprint)? {
             return Ok(created);
         }
-        if self.host.registry.lock().unwrap().sessions.len() >= MAX_SESSIONS {
+        if self.host.registry().sessions.len() >= MAX_SESSIONS {
             bail!("host session limit reached ({MAX_SESSIONS} including exited sessions; remove finished sessions)");
         }
-        let session = Session::spawn(Launch {
-            name,
-            cwd: resolved,
-            command,
-            env,
-            cols,
-            rows,
-            agent_link: self.host.agent_link(),
-        })?;
+        let session = Session::spawn(
+            Launch {
+                name,
+                cwd: resolved,
+                pwd,
+                command,
+                env,
+                cols,
+                rows,
+                owner,
+                tags,
+                agent_link: self.host.agent_link(),
+                receipt: link::Receipt {
+                    request_id: request_id.clone(),
+                    fingerprint: fingerprint.clone(),
+                },
+            },
+            &self.host,
+        )?;
         let info = session.snapshot_info();
-        let mut registry = self.host.registry.lock().unwrap();
-        registry
-            .receipts
-            .insert(request_id, fingerprint, info.id.clone());
-        registry.sessions.insert(info.id.clone(), session);
+        {
+            let mut registry = self.host.registry();
+            registry
+                .receipts
+                .insert(request_id, fingerprint, info.id.clone());
+            registry.sessions.insert(info.id.clone(), session.clone());
+        }
+        self.host.publish(SessionEvent::Added {
+            session: info.clone(),
+        });
+        session.start();
         Ok(ServerMessage::Created { session: info })
     }
+}
+
+fn unknown_session(id: &str) -> anyhow::Error {
+    refused(error_code::UNKNOWN_SESSION, format!("unknown session {id}"))
 }
 
 /// How long a paused connection has gone without a frame or any progress.

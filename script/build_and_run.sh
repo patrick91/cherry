@@ -100,6 +100,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$DISPLAY_NAME</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CherryApplicationSupportName</key>
+  <string>$APP_NAME</string>
+  <key>CherryURLScheme</key>
+  <string>cherry-dev</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>

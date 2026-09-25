@@ -1404,3 +1404,446 @@ fn oldest_history_row_is_replayed_as_a_line_start() {
     expected.history[0] = expected.history[0].trim_start_matches('↪').to_owned();
     assert_eq!(copy, expected);
 }
+
+fn notification(title: &str, body: &str) -> VtEvent {
+    VtEvent::Notification {
+        title: title.into(),
+        body: body.into(),
+    }
+}
+
+/// Output that makes a program's terminal report one of each event.
+const EVENTFUL: &[u8] = b"\x1b]2;building\x07\
+    \x1b]7;file://studio/Users/me/My%20Code\x1b\\\
+    ready\x07\
+    \x1b]9;tests passed\x07\
+    \x1b]777;notify;Build;finished in 3s\x1b\\\
+    \x1b]9;4;1;42\x07\
+    \x1b]9;4;3\x07";
+
+fn eventful() -> Vec<VtEvent> {
+    vec![
+        VtEvent::Title("building".into()),
+        VtEvent::Pwd("file://studio/Users/me/My%20Code".into()),
+        VtEvent::Bell,
+        notification("", "tests passed"),
+        notification("Build", "finished in 3s"),
+        VtEvent::Progress {
+            state: ProgressState::Set,
+            value: Some(42),
+        },
+        VtEvent::Progress {
+            state: ProgressState::Indeterminate,
+            value: None,
+        },
+    ]
+}
+
+#[test]
+fn titles_directories_bells_notifications_and_progress_are_events() {
+    let mut terminal = term(40, 5);
+    assert!(terminal.take_events().is_empty());
+    // Events never make the terminal reply.
+    assert!(terminal.feed(EVENTFUL).is_empty());
+    let mut expected = eventful();
+    // The second progress report replaced the first: nothing came between.
+    expected.remove(5);
+    assert_eq!(terminal.take_events(), expected);
+    assert!(terminal.take_events().is_empty());
+    assert_eq!(terminal.inspect().unwrap().active[0], "ready");
+    // Replies still flow beside them.
+    assert_eq!(terminal.feed(b"\x07\x1b[5n"), b"\x1b[0n");
+    assert_eq!(terminal.take_events(), [VtEvent::Bell]);
+}
+
+#[test]
+fn events_split_across_reads_are_reported_once_complete() {
+    let mut whole = term(40, 5);
+    whole.feed(EVENTFUL);
+    let expected = whole.take_events();
+    let mut collapsed = eventful();
+    collapsed.remove(5);
+    assert_eq!(expected, collapsed);
+    for size in [1, 2, 3, 7] {
+        let mut terminal = term(40, 5);
+        let mut events = Vec::new();
+        for chunk in EVENTFUL.chunks(size) {
+            assert!(terminal.feed(chunk).is_empty(), "{size}: {chunk:?}");
+            events.extend(terminal.take_events());
+        }
+        // Taken between reads, both progress reports are seen.
+        assert_eq!(events, eventful(), "{size}");
+    }
+    // Nothing is reported for a sequence that has not ended.
+    let mut terminal = term(40, 5);
+    terminal.feed(b"\x1b]2;half");
+    assert!(terminal.take_events().is_empty());
+    terminal.feed(b" done");
+    assert!(terminal.take_events().is_empty());
+    assert_eq!(terminal.title(), None);
+    terminal.feed(b"\x1b\\");
+    assert_eq!(terminal.take_events(), [VtEvent::Title("half done".into())]);
+}
+
+#[test]
+fn title_and_working_directory_follow_the_program() {
+    let mut terminal = term(40, 5);
+    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
+    terminal.feed(b"\x1b]0;vim \xe2\x80\x94 main.rs\x07");
+    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
+    terminal.feed(b"\x1b]7;file://studio/tmp\x07");
+    assert_eq!(terminal.pwd().as_deref(), Some("file://studio/tmp"));
+    terminal.feed(b"\x1b]1337;CurrentDir=/Users/me\x07");
+    assert_eq!(terminal.pwd().as_deref(), Some("/Users/me"));
+    terminal.feed(b"\x1b]9;9;/opt/work\x07");
+    assert_eq!(terminal.pwd().as_deref(), Some("/opt/work"));
+    assert_eq!(
+        terminal.take_events(),
+        [
+            VtEvent::Title("vim \u{2014} main.rs".into()),
+            VtEvent::Pwd("/opt/work".into()),
+        ]
+    );
+    // The icon name is not the title, and a title that is not UTF-8 is
+    // ignored.
+    terminal.feed(b"\x1b]1;icon\x07\x1b]2;bad \xff\x07");
+    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
+    assert!(terminal.take_events().is_empty());
+    // Clearing them.
+    terminal.feed(b"\x1b]2;\x07\x1b]7;\x07");
+    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
+    assert_eq!(
+        terminal.take_events(),
+        [VtEvent::Title(String::new()), VtEvent::Pwd(String::new())]
+    );
+    // A value set again unchanged is not reported again.
+    terminal.feed(b"\x1b]2;prompt\x07\x1b]7;file://studio/tmp\x07");
+    terminal.take_events();
+    terminal.feed(b"\x1b]2;prompt\x07\x1b]7;file://studio/tmp\x07\x1b]2;prompt\x07");
+    assert!(terminal.take_events().is_empty());
+    // Titles are cut to 1024 bytes.
+    terminal.feed(format!("\x1b]2;{}\x07", "t".repeat(1500)).as_bytes());
+    assert_eq!(terminal.title().unwrap().len(), 1024);
+    assert!(matches!(&terminal.take_events()[..], [VtEvent::Title(title)] if title.len() == 1024));
+    // A reset clears both without a callback; that is reported too, after
+    // the progress report a reset makes.
+    terminal.feed(b"\x1b]7;file://studio/tmp\x07");
+    terminal.take_events();
+    terminal.feed(b"\x1bc");
+    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
+    assert_eq!(
+        terminal.take_events(),
+        [
+            VtEvent::Progress {
+                state: ProgressState::Remove,
+                value: None
+            },
+            VtEvent::Title(String::new()),
+            VtEvent::Pwd(String::new()),
+        ]
+    );
+    terminal.feed(b"\x1b]2;tt\x07");
+    assert_eq!(terminal.take_events(), [VtEvent::Title("tt".into())]);
+}
+
+#[test]
+fn progress_reports_carry_their_state_and_percentage() {
+    let mut terminal = term(40, 5);
+    let mut report = |sequence: &[u8]| {
+        terminal.feed(sequence);
+        terminal.take_events()
+    };
+    for (sequence, state, value) in [
+        (&b"\x1b]9;4;1;50\x07"[..], ProgressState::Set, Some(50)),
+        (b"\x1b]9;4;1\x07", ProgressState::Set, Some(0)),
+        (b"\x1b]9;4;1;250\x07", ProgressState::Set, Some(100)),
+        (b"\x1b]9;4;2;75\x1b\\", ProgressState::Error, Some(75)),
+        (b"\x1b]9;4;2\x07", ProgressState::Error, None),
+        (b"\x1b]9;4;3\x07", ProgressState::Indeterminate, None),
+        (b"\x1b]9;4;4;10\x07", ProgressState::Pause, Some(10)),
+        (b"\x1b]9;4;0\x07", ProgressState::Remove, None),
+    ] {
+        assert_eq!(
+            report(sequence),
+            [VtEvent::Progress { state, value }],
+            "{sequence:?}"
+        );
+    }
+    // Upstream takes an unknown state for a plain OSC 9 notification.
+    assert_eq!(report(b"\x1b]9;4;9;1\x07"), [notification("", "4;9;1")]);
+}
+
+#[test]
+fn bursts_collapse_and_pending_events_are_bounded() {
+    let mut terminal = term(40, 5);
+    terminal.feed(&[0x07; 10_000]);
+    terminal.feed(b"\x1b]2;a\x07\x1b]2;b\x07\x1b]2;c\x07");
+    assert_eq!(
+        terminal.take_events(),
+        [VtEvent::Bell, VtEvent::Title("c".into())]
+    );
+    // Notifications are each kept, up to the bound; the oldest go first.
+    let count = MAX_PENDING_EVENTS + 44;
+    for n in 0..count {
+        terminal.feed(format!("\x1b]9;note {n}\x07").as_bytes());
+    }
+    let events = terminal.take_events();
+    assert_eq!(events.len(), MAX_PENDING_EVENTS);
+    assert_eq!(events[0], notification("", "note 44"));
+    assert_eq!(
+        events.last(),
+        Some(&notification("", &format!("note {}", count - 1)))
+    );
+    // So is their text.
+    let body = "x".repeat(2000);
+    for _ in 0..MAX_PENDING_EVENTS {
+        terminal.feed(format!("\x1b]777;notify;t;{body}\x07").as_bytes());
+    }
+    let events = terminal.take_events();
+    assert_eq!(events.len(), MAX_PENDING_EVENT_BYTES / 2001);
+    // A terminal whose events nobody takes stays bounded (besides the
+    // state kept apart, below).
+    for _ in 0..4 {
+        terminal.feed(&EVENTFUL.repeat(500));
+    }
+    assert!(terminal.take_events().len() <= MAX_PENDING_EVENTS + 3);
+}
+
+#[test]
+fn the_bound_never_loses_the_current_title_directory_or_progress() {
+    let flood = |terminal: &mut Terminal, from: usize| {
+        for n in from..from + MAX_PENDING_EVENTS + 44 {
+            terminal.feed(format!("\x1b]9;note {n}\x07").as_bytes());
+        }
+    };
+    let mut terminal = term(40, 5);
+    terminal.feed(b"\x1b]2;keep\x07\x1b]9;4;1;30\x07\x1b]7;file://studio/tmp\x07");
+    flood(&mut terminal, 0);
+    let events = terminal.take_events();
+    // Kept apart in order, ahead of what the bound left.
+    assert_eq!(
+        events[..4],
+        [
+            VtEvent::Title("keep".into()),
+            VtEvent::Progress {
+                state: ProgressState::Set,
+                value: Some(30)
+            },
+            VtEvent::Pwd("file://studio/tmp".into()),
+            notification("", "note 44"),
+        ]
+    );
+    assert_eq!(events.len(), MAX_PENDING_EVENTS + 3);
+    // Taken, they are known: set again unchanged, they are not reported.
+    terminal.feed(b"\x1b]2;keep\x07\x1b]7;file://studio/tmp\x07");
+    assert!(terminal.take_events().is_empty());
+    // Only the latest of a kind is kept, and one still waiting in its
+    // place supersedes nothing kept apart before it.
+    terminal.feed(b"\x1b]2;one\x07");
+    flood(&mut terminal, 0);
+    terminal.feed(b"\x1b]2;two\x07");
+    flood(&mut terminal, 1000);
+    terminal.feed(b"\x1b]2;three\x07");
+    let events = terminal.take_events();
+    let titles: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, VtEvent::Title(_)))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            &VtEvent::Title("two".into()),
+            &VtEvent::Title("three".into())
+        ]
+    );
+    assert_eq!(events[0], VtEvent::Title("two".into()));
+    assert_eq!(events.last(), Some(&VtEvent::Title("three".into())));
+    // A reset after a flood reports the cleared values; nothing stale.
+    terminal.feed(b"\x1b]2;four\x07");
+    flood(&mut terminal, 0);
+    terminal.feed(b"\x1bc");
+    let events = terminal.take_events();
+    assert_eq!(events[0], VtEvent::Title("four".into()));
+    assert_eq!(
+        events[events.len() - 3..],
+        [
+            VtEvent::Progress {
+                state: ProgressState::Remove,
+                value: None
+            },
+            VtEvent::Title(String::new()),
+            VtEvent::Pwd(String::new()),
+        ]
+    );
+}
+
+#[test]
+fn snapshots_resizes_and_inspection_report_no_events() {
+    let mut terminal = term(40, 5);
+    terminal.feed(EVENTFUL);
+    terminal.feed(b"\x1b[?1049h\x1b]2;vim\x07\x07");
+    terminal.take_events();
+    let snapshot = terminal.snapshot().unwrap();
+    terminal.refresh().unwrap();
+    terminal.snapshot_limited(1024 * 1024).unwrap();
+    terminal.viewport(20, 3).unwrap();
+    terminal.modes().unwrap();
+    terminal.inspect().unwrap();
+    terminal.screen_text().unwrap();
+    assert!(terminal.resize(30, 4).unwrap().is_empty());
+    assert!(terminal.take_events().is_empty());
+    assert_eq!(terminal.title().as_deref(), Some("vim"));
+    // A snapshot carries neither title nor working directory: its replay
+    // reports only what its reset does.
+    let mut copy = replay(&terminal, &snapshot);
+    assert_eq!(
+        copy.take_events(),
+        [VtEvent::Progress {
+            state: ProgressState::Remove,
+            value: None
+        }]
+    );
+    assert_eq!((copy.title(), copy.pwd()), (None, None));
+}
+
+#[test]
+fn kitty_notifications_are_left_to_osc99() {
+    // libghostty-vt drops OSC 99.
+    let sequence = b"\x1b]99;;Hello world\x1b\\";
+    let mut terminal = term(40, 5);
+    assert!(terminal.feed(sequence).is_empty());
+    assert!(terminal.take_events().is_empty());
+    assert_eq!(parse_osc99(sequence), Some(notification("Hello world", "")));
+    assert_eq!(
+        parse_osc99(b"\x1b]99;i=1:p=body;done; really\x07"),
+        Some(notification("", "done; really"))
+    );
+    assert_eq!(
+        parse_osc99(b"\x1b]99;e=1;SGVsbG8g4pyT\x07"),
+        Some(notification("Hello \u{2713}", ""))
+    );
+    for sequence in [
+        &b"\x1b]99;p=?;\x1b\\"[..],
+        b"\x1b]99;i=1:p=close;\x1b\\",
+        b"\x1b]99;i=1:p=icon;abc\x1b\\",
+        b"\x1b]99;i=1:d=0;chunk\x1b\\",
+        b"\x1b]99;;\x1b\\",
+        b"\x1b]99;e=1;not base64!\x07",
+        b"\x1b]99;no payload\x07",
+        b"\x1b]99;;unterminated",
+        b"\x1b]9;not kitty\x07",
+        b"99;;bare\x07",
+    ] {
+        assert_eq!(parse_osc99(sequence), None, "{sequence:?}");
+    }
+}
+
+#[test]
+fn osc99_assembles_notifications_sent_in_chunks() {
+    let mut osc99 = Osc99::default();
+    let mut feed = |sequence: &str| osc99.feed(sequence.as_bytes());
+    assert_eq!(feed("\x1b]99;i=1:d=0;Hello \x1b\\"), None);
+    // Another notification is assembled meanwhile.
+    assert_eq!(feed("\x1b]99;i=two:d=0:p=body;second body\x1b\\"), None);
+    assert_eq!(feed("\x1b]99;i=1:d=0;world\x1b\\"), None);
+    assert_eq!(
+        feed("\x1b]99;i=1:p=body:u=2;This is cool\x1b\\"),
+        Some(notification("Hello world", "This is cool"))
+    );
+    // Base64 chunks join as bytes, so a character may span them.
+    assert_eq!(feed("\x1b]99;i=two:d=0:e=1:p=body;4g==\x1b\\"), None);
+    assert_eq!(
+        feed("\x1b]99;i=two:e=1:p=body;nJM\x1b\\"),
+        Some(notification("", "second body\u{2713}"))
+    );
+    // A finished notification is forgotten.
+    assert_eq!(
+        feed("\x1b]99;i=1;again\x07"),
+        Some(notification("again", ""))
+    );
+    // Without an identifier, chunks join too.
+    assert_eq!(feed("\x1b]99;d=0;one \x07"), None);
+    assert_eq!(feed("\x1b]99;;two\x07"), Some(notification("one two", "")));
+    // A chunk whose payload is not reported (an icon, buttons, a type this
+    // does not know) may end the notification.
+    assert_eq!(feed("\x1b]99;i=1:d=0;Title\x1b\\"), None);
+    assert_eq!(feed("\x1b]99;i=1:d=0:p=body;Body\x1b\\"), None);
+    assert_eq!(
+        feed("\x1b]99;i=1:p=icon:e=1;aWNvbg==\x1b\\"),
+        Some(notification("Title", "Body"))
+    );
+    // So the next one with that identifier starts afresh.
+    assert_eq!(feed("\x1b]99;i=1;New\x07"), Some(notification("New", "")));
+    assert_eq!(feed("\x1b]99;i=2:d=0;T2\x07"), None);
+    // Its payload is never decoded, so it cannot be malformed.
+    assert_eq!(feed("\x1b]99;i=2:d=0:p=icon:e=1;not base64!\x07"), None);
+    assert_eq!(
+        feed("\x1b]99;i=2:p=later;what\x07"),
+        Some(notification("T2", ""))
+    );
+    assert_eq!(feed("\x1b]99;i=3:d=0;T3\x07"), None);
+    assert_eq!(
+        feed("\x1b]99;i=3:p=buttons;Yes\u{2028}No\x07"),
+        Some(notification("T3", ""))
+    );
+    // Requests about notifications leave one being assembled alone.
+    assert_eq!(feed("\x1b]99;i=4:d=0;T4\x07"), None);
+    for request in ["?", "close", "alive"] {
+        assert_eq!(feed(&format!("\x1b]99;i=4:p={request};\x07")), None);
+    }
+    assert_eq!(
+        feed("\x1b]99;i=4:p=body;B4\x07"),
+        Some(notification("T4", "B4"))
+    );
+    // Bounded: forgotten oldest first, and cut at 64 KiB.
+    for n in 0..20 {
+        assert_eq!(feed(&format!("\x1b]99;i=n{n}:d=0;{n}\x07")), None);
+    }
+    assert_eq!(feed("\x1b]99;i=n0;!\x07"), Some(notification("!", "")));
+    assert_eq!(feed("\x1b]99;i=n19;!\x07"), Some(notification("19!", "")));
+    let chunk = "y".repeat(2048);
+    for _ in 0..40 {
+        feed(&format!("\x1b]99;i=big:d=0;{chunk}\x07"));
+    }
+    match feed("\x1b]99;i=big:p=body;end\x07") {
+        Some(VtEvent::Notification { title, body }) => {
+            assert_eq!((title.len(), body.as_str()), (64 * 1024, ""));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn modes_read_as_the_terminal_holds_them() {
+    let mut terminal = term(20, 5);
+    assert!(!terminal.mode(1, false).unwrap());
+    assert!(
+        terminal.mode(7, false).unwrap(),
+        "autowrap is on by default"
+    );
+    terminal.feed(b"\x1b[?1h\x1b[4h");
+    assert!(terminal.mode(1, false).unwrap());
+    assert!(terminal.mode(4, true).unwrap());
+    assert!(!terminal.mode(4, false).unwrap(), "?4 is not ANSI 4");
+    // Terminal-wide: switching screens keeps it.
+    terminal.feed(b"\x1b[?1049h");
+    assert!(terminal.mode(1, false).unwrap());
+    terminal.feed(b"\x1b[?1049l");
+    assert!(terminal.mode(1, false).unwrap());
+    // Split across reads, it applies once it ends.
+    terminal.feed(b"\x1b[?");
+    assert!(terminal.mode(1, false).unwrap());
+    terminal.feed(b"1l");
+    assert!(!terminal.mode(1, false).unwrap());
+    // A reset clears it.
+    terminal.feed(b"\x1b[?1h\x1bc");
+    assert!(!terminal.mode(1, false).unwrap());
+    // It agrees with what snapshots carry.
+    terminal.feed(b"\x1b[?1h");
+    assert!(terminal
+        .inspect()
+        .unwrap()
+        .modes
+        .contains(&"?1h".to_string()));
+    assert!(restored(&terminal).mode(1, false).unwrap());
+}

@@ -3436,11 +3436,13 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let scriptURL = harness.projectRoot.appendingPathComponent("pi-newline-agent.sh")
+    // `ready` only once the tty is raw and perl reads it: input that
+    // arrives while the tty is still in line mode has its CR turned into
+    // LF (ICRNL), so the test sends only after it saw `ready`.
     let script = #"""
     #!/bin/bash
-    printf 'ready\n'
     stty raw -echo
-    /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /\r/) { $chunk =~ s/\r.*//s; $buf .= $chunk; print "submitted-cr:$buf\r\n"; last; } if ($chunk =~ /\n/) { $chunk =~ s/\n.*//s; $buf .= $chunk; print "lf-only:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
+    /usr/bin/perl -e 'use strict; use warnings; $| = 1; print "ready\r\n"; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /\r/) { $chunk =~ s/\r.*//s; $buf .= $chunk; print "submitted-cr:$buf\r\n"; last; } if ($chunk =~ /\n/) { $chunk =~ s/\n.*//s; $buf .= $chunk; print "lf-only:$buf\r\n"; last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
     """#
     try script.write(to: scriptURL, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
@@ -3459,7 +3461,29 @@ private struct MCPWhoamiPayload: Decodable {
         ],
         context: context
     )
-    _ = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+    let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
+    // Waits, up to 30 s, until the agent's output has a line `condition`
+    // accepts, and returns its output then (a slow start or answer under
+    // load takes longer than any wait_ms).
+    func output(where condition: (String) -> Bool) async throws -> String {
+        let deadline = Date(timeIntervalSinceNow: 30)
+        var lines: [String] = []
+        repeat {
+            let result = await CherryMCPTools.call(
+                name: "get_process_output",
+                arguments: ["process_id": .string(spawned.process.id), "line_limit": .int(20)],
+                context: context
+            )
+            lines = (try? decodeMCPToolResult(MCPAgentOutput.self, from: result))?.lines ?? []
+            if lines.contains(where: condition) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        } while Date() < deadline
+        return lines.joined(separator: "\n")
+    }
+    // The agent does not wait for readiness before input: wait for the
+    // script to say its tty is raw.
+    let started = try await output { $0.trimmingCharacters(in: .whitespaces) == "ready" }
+    try #require(started.contains("ready"), Comment(rawValue: started))
 
     let sendResult = await CherryMCPTools.call(
         name: "send_process_input",
@@ -3471,11 +3495,10 @@ private struct MCPWhoamiPayload: Decodable {
         context: context
     )
     let sent = try decodeMCPToolResult(MCPSendProcessInputPayload.self, from: sendResult)
-    let output = sent.output?.lines.joined(separator: "\n") ?? ""
-
     #expect(sent.sentBytes == Data("newline prompt\r".utf8).count)
-    #expect(output.contains("submitted-cr:newline prompt"), Comment(rawValue: output))
-    #expect(!output.contains("lf-only"), Comment(rawValue: output))
+    let answer = try await output { $0.contains("submitted-cr:") || $0.contains("lf-only:") }
+    #expect(answer.contains("submitted-cr:newline prompt"), Comment(rawValue: answer))
+    #expect(!answer.contains("lf-only"), Comment(rawValue: answer))
 }
 
 @MainActor

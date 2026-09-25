@@ -22,17 +22,97 @@ struct HostedSessionHost: Codable, Hashable, Identifiable, Sendable {
         return HostedSessionHost(sshDestination: destination)
     }
 
+    /// The CLI's global options for this host. While the app's SSH master for
+    /// the destination is up, `--ssh-control-path` makes the CLI's ssh share
+    /// it. A process started with these arguments must hold a master lease
+    /// (`HostSSHMasterManager`) for as long as it runs, or the master may
+    /// stop under it.
     var arguments: [String] {
-        sshDestination.map { ["--host", $0] } ?? []
+        arguments(sshControlPath: sshDestination.flatMap { HostSSHMasterManager.shared.controlPathIfUp(for: $0) })
+    }
+
+    /// `sshControlPath` is ignored for This Mac.
+    func arguments(sshControlPath: String?) -> [String] {
+        guard let sshDestination else { return [] }
+        return ["--host", sshDestination] + (sshControlPath.map { ["--ssh-control-path", $0] } ?? [])
     }
 }
 
-enum HostedSessionState: String, Decodable, Sendable {
+enum HostedSessionState: String, Codable, Sendable {
     case running
     case exited
 }
 
-struct HostedSessionInfo: Decodable, Equatable, Identifiable, Sendable {
+/// The terminal's foreground process group while a session runs.
+struct HostedSessionForeground: Codable, Equatable, Sendable {
+    /// The process group ID, which is its leader's process ID.
+    let pid: UInt32
+    /// The leader's name; empty when the host could not read it.
+    let name: String
+}
+
+/// A working directory a program reported: an OSC 7 `file://host/path` URI
+/// (percent-encoded), kitty's `kitty-shell-cwd://host/path` (not encoded) or
+/// a plain absolute path (OSC 9;9, OSC 1337).
+struct HostedReportedDirectory: Equatable, Sendable {
+    /// The machine the report names, lowercased; nil when it names none
+    /// (a plain path, `file:///path`) or `localhost`.
+    let machine: String?
+    let path: String
+
+    init(machine: String?, path: String) {
+        self.machine = machine
+        self.path = path
+    }
+
+    /// Nil for anything but an absolute path or one of the URIs above.
+    init?(reported: String) {
+        if reported.hasPrefix("/") {
+            self.init(machine: nil, path: reported)
+            return
+        }
+        // Parsed by hand: shells emit unencoded spaces, which URL parsers refuse.
+        let lowercased = reported.lowercased()
+        for (scheme, isEncoded) in [("file://", true), ("kitty-shell-cwd://", false)] where lowercased.hasPrefix(scheme) {
+            let afterScheme = reported.dropFirst(scheme.count)
+            guard let slash = afterScheme.firstIndex(of: "/") else { return nil }
+            let rawPath = String(afterScheme[slash...])
+            let rawMachine = String(afterScheme[..<slash])
+            let path = isEncoded ? rawPath.removingPercentEncoding ?? rawPath : rawPath
+            let machine = (rawMachine.removingPercentEncoding ?? rawMachine).lowercased()
+            self.init(machine: machine.isEmpty || machine == "localhost" ? nil : machine, path: path)
+            return
+        }
+        return nil
+    }
+
+    /// Whether this is on the machine that goes by one of `names`, or names
+    /// no machine. A trailing `.local` (macOS's Bonjour name) is ignored.
+    func isOnMachine(namedAnyOf names: Set<String>) -> Bool {
+        guard let machine else { return true }
+        return names.contains { Self.canonical($0) == Self.canonical(machine) }
+    }
+
+    /// This Mac's host name, as shells report it (`$HOST`, `$HOSTNAME`).
+    /// Read each time: it changes with the network.
+    static func thisMacNames() -> Set<String> {
+        var buffer = [CChar](repeating: 0, count: Int(MAXHOSTNAMELEN) + 1)
+        guard gethostname(&buffer, buffer.count - 1) == 0 else { return [] }
+        let name = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return name.isEmpty ? [] : [name]
+    }
+
+    private static func canonical(_ name: String) -> String {
+        var name = name.lowercased()
+        if name.hasSuffix(".") { name.removeLast() }
+        if name.hasSuffix(".local") { name.removeLast(".local".count) }
+        return name
+    }
+}
+
+/// The host's `SessionInfo`. Fields added in protocol 4 decode with defaults
+/// when absent.
+struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String
     let cwd: String
@@ -44,15 +124,186 @@ struct HostedSessionInfo: Decodable, Equatable, Identifiable, Sendable {
     let exitCode: UInt32?
     let exitSignal: Int32?
     let attached: Bool
+    /// The title the program set (OSC 0 or 2), when it set a non-empty one.
+    let title: String?
+    /// The working directory exactly as the program reported it: a
+    /// percent-encoded `file://host/path` URI (OSC 7) or a plain path. See
+    /// `reportedWorkingDirectory`.
+    let pwd: String?
+    let foreground: HostedSessionForeground?
+    /// How many clients are attached.
+    let clients: Int
+    /// The app variant that created the session.
+    let owner: String?
+    let tags: [String: String]
+    /// Milliseconds since the Unix epoch; 0 when the host did not say.
+    let createdAt: UInt64
+    /// Whether the program shows its alternate screen (a full-screen TUI);
+    /// nil when the host does not report it (an older host).
+    let alternateScreen: Bool?
+    /// The kitty keyboard protocol flags the program enabled (0 for none);
+    /// nil when the host does not report them (an older host).
+    let kittyKeyboardFlags: UInt32?
+    /// Whether the program turned on application cursor keys (DECCKM,
+    /// `ESC [ ? 1 h`, as `less` and `vim` do) on the screen it shows: in
+    /// legacy key encoding (`kittyKeyboardFlags` 0), its unmodified arrow,
+    /// Home and End keys are then `ESC O x`, not `ESC [ x`. Nil when the
+    /// host does not report it (an older host); false also from a session
+    /// whose holder does not report it.
+    let applicationCursorKeys: Bool?
+    /// The `request_id` of the Create that started the session; nil when
+    /// the host does not report it (an older host).
+    let requestID: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, cwd, command, cols, rows, state, pid, attached
+        case id, name, cwd, command, cols, rows, state, pid, attached, title, pwd, foreground, clients, owner, tags
         case exitCode = "exit_code"
         case exitSignal = "exit_signal"
+        case createdAt = "created_at"
+        case alternateScreen = "alternate_screen"
+        case kittyKeyboardFlags = "kitty_keyboard_flags"
+        case applicationCursorKeys = "application_cursor_keys"
+        case requestID = "request_id"
+    }
+
+    init(
+        id: String,
+        name: String,
+        cwd: String,
+        command: [String] = [],
+        cols: Int = HostProtocol.defaultCols,
+        rows: Int = HostProtocol.defaultRows,
+        state: HostedSessionState = .running,
+        pid: UInt32? = nil,
+        exitCode: UInt32? = nil,
+        exitSignal: Int32? = nil,
+        attached: Bool? = nil,
+        title: String? = nil,
+        pwd: String? = nil,
+        foreground: HostedSessionForeground? = nil,
+        clients: Int = 0,
+        owner: String? = nil,
+        tags: [String: String] = [:],
+        createdAt: UInt64 = 0,
+        alternateScreen: Bool? = nil,
+        kittyKeyboardFlags: UInt32? = nil,
+        applicationCursorKeys: Bool? = nil,
+        requestID: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.cwd = cwd
+        self.command = command
+        self.cols = cols
+        self.rows = rows
+        self.state = state
+        self.pid = pid
+        self.exitCode = exitCode
+        self.exitSignal = exitSignal
+        self.attached = attached ?? (clients > 0)
+        self.title = title
+        self.pwd = pwd
+        self.foreground = foreground
+        self.clients = clients
+        self.owner = owner
+        self.tags = tags
+        self.createdAt = createdAt
+        self.alternateScreen = alternateScreen
+        self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.applicationCursorKeys = applicationCursorKeys
+        self.requestID = requestID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let clients = try container.decodeIfPresent(Int.self, forKey: .clients) ?? 0
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            name: try container.decode(String.self, forKey: .name),
+            cwd: try container.decode(String.self, forKey: .cwd),
+            command: try container.decode([String].self, forKey: .command),
+            cols: try container.decode(Int.self, forKey: .cols),
+            rows: try container.decode(Int.self, forKey: .rows),
+            state: try container.decode(HostedSessionState.self, forKey: .state),
+            pid: try container.decodeIfPresent(UInt32.self, forKey: .pid),
+            exitCode: try container.decodeIfPresent(UInt32.self, forKey: .exitCode),
+            exitSignal: try container.decodeIfPresent(Int32.self, forKey: .exitSignal),
+            attached: try container.decodeIfPresent(Bool.self, forKey: .attached) ?? (clients > 0),
+            title: try container.decodeIfPresent(String.self, forKey: .title),
+            pwd: try container.decodeIfPresent(String.self, forKey: .pwd),
+            foreground: try container.decodeIfPresent(HostedSessionForeground.self, forKey: .foreground),
+            clients: clients,
+            owner: try container.decodeIfPresent(String.self, forKey: .owner),
+            tags: try container.decodeIfPresent([String: String].self, forKey: .tags) ?? [:],
+            createdAt: try container.decodeIfPresent(UInt64.self, forKey: .createdAt) ?? 0,
+            alternateScreen: try container.decodeIfPresent(Bool.self, forKey: .alternateScreen),
+            kittyKeyboardFlags: try container.decodeIfPresent(UInt32.self, forKey: .kittyKeyboardFlags),
+            applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys),
+            requestID: try container.decodeIfPresent(String.self, forKey: .requestID)
+        )
+    }
+
+    /// The protocol's shape: every field, `null` for an absent value. The
+    /// fields an older host leaves out are left out when unknown.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(cwd, forKey: .cwd)
+        try container.encode(command, forKey: .command)
+        try container.encode(cols, forKey: .cols)
+        try container.encode(rows, forKey: .rows)
+        try container.encode(state, forKey: .state)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(exitCode, forKey: .exitCode)
+        try container.encode(attached, forKey: .attached)
+        try container.encode(exitSignal, forKey: .exitSignal)
+        try container.encode(title, forKey: .title)
+        try container.encode(pwd, forKey: .pwd)
+        try container.encode(foreground, forKey: .foreground)
+        try container.encode(clients, forKey: .clients)
+        try container.encode(owner, forKey: .owner)
+        try container.encode(tags, forKey: .tags)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(alternateScreen, forKey: .alternateScreen)
+        try container.encodeIfPresent(kittyKeyboardFlags, forKey: .kittyKeyboardFlags)
+        try container.encodeIfPresent(applicationCursorKeys, forKey: .applicationCursorKeys)
+        try container.encodeIfPresent(requestID, forKey: .requestID)
     }
 
     var isRunning: Bool { state == .running }
     var displayName: String { name.isEmpty ? String(id.prefix(8)) : name }
+
+    /// A program other than the session's own leader is in the foreground
+    /// (a command runs in the shell).
+    var isBusy: Bool {
+        guard isRunning, let pid, let foreground else { return false }
+        return foreground.pid != pid
+    }
+
+    var createdDate: Date? {
+        createdAt > 0 ? Date(timeIntervalSince1970: TimeInterval(createdAt) / 1_000) : nil
+    }
+
+    /// Where the program says it is (`pwd` decoded), on whichever machine it
+    /// names. A shell reached with ssh from inside the session reports its
+    /// own machine's directory: see `workingDirectory(onMachineNamed:)`.
+    var reportedDirectory: HostedReportedDirectory? {
+        pwd.flatMap(HostedReportedDirectory.init(reported:))
+    }
+
+    /// The reported path when it is on the machine that goes by one of
+    /// `names`, or when the report names no machine.
+    func workingDirectory(onMachineNamed names: Set<String>) -> String? {
+        guard let reported = reportedDirectory, reported.isOnMachine(namedAnyOf: names) else { return nil }
+        return reported.path
+    }
+
+    /// The reported path for a session on This Mac; nil when it is another
+    /// machine's (as Ghostty ignores such an OSC 7).
+    var localWorkingDirectory: String? {
+        workingDirectory(onMachineNamed: HostedReportedDirectory.thisMacNames())
+    }
 
     var statusText: String {
         if isRunning { return attached ? "Attached" : "Running" }
@@ -60,15 +311,60 @@ struct HostedSessionInfo: Decodable, Equatable, Identifiable, Sendable {
         if let exitCode { return "Exited (\(exitCode))" }
         return "Exited"
     }
+
+    /// This session after the host reported it exited.
+    func exited(code: UInt32, signal: Int32?) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: id, name: name, cwd: cwd, command: command, cols: cols, rows: rows,
+            state: .exited, pid: pid, exitCode: code, exitSignal: signal, attached: attached,
+            title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
+            createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
+            applicationCursorKeys: applicationCursorKeys, requestID: requestID
+        )
+    }
 }
 
-struct HostedSessionList: Decodable, Sendable {
+struct HostedSessionList: Codable, Equatable, Sendable {
     let hostID: String
     let sessions: [HostedSessionInfo]
+    /// Session holders a daemon that just restarted still expects to
+    /// register again: their sessions may be missing from `sessions` for
+    /// now. 0 when the list is complete; nil when the host does not say (an
+    /// older host), so a missing session may still be a late holder's.
+    let pendingHolders: Int?
+
+    init(hostID: String, sessions: [HostedSessionInfo], pendingHolders: Int? = nil) {
+        self.hostID = hostID
+        self.sessions = sessions
+        self.pendingHolders = pendingHolders
+    }
+
+    /// Every session the host has is listed.
+    var isComplete: Bool { pendingHolders == 0 }
+
+    /// Holders are still expected: sessions missing now may come back.
+    var awaitsHolders: Bool { (pendingHolders ?? 0) > 0 }
 
     enum CodingKeys: String, CodingKey {
         case hostID = "host_id"
         case sessions
+        case pendingHolders = "pending_holders"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            hostID: try container.decode(String.self, forKey: .hostID),
+            sessions: try container.decode([HostedSessionInfo].self, forKey: .sessions),
+            pendingHolders: try container.decodeIfPresent(UInt32.self, forKey: .pendingHolders).map(Int.init)
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(hostID, forKey: .hostID)
+        try container.encode(sessions, forKey: .sessions)
+        try container.encodeIfPresent(pendingHolders.map { UInt32(clamping: max($0, 0)) }, forKey: .pendingHolders)
     }
 }
 
@@ -86,8 +382,47 @@ struct HostedSessionAttachment: Equatable, Sendable {
 
     /// The embedded adapter has no in-band detach key: Ctrl-] belongs to the
     /// program (Vim tag jumps), and the tab's Disconnect button detaches.
-    func arguments(statusFile: URL?, takeover: Bool = false) -> [String] {
-        var arguments = host.arguments + ["--expected-host-id", hostID, "attach", sessionID]
+    ///
+    /// While the app's SSH master for the host is up, a launch (named by its
+    /// status file's private directory) shares it: the launch keeps the
+    /// master running until `HostedAttachmentStatusFile.removeLaunchDirectory`
+    /// removes that directory. Otherwise the adapter runs its own ssh, which
+    /// can still prompt in the tab.
+    ///
+    /// Compute this only to launch the adapter: the result depends on the
+    /// master's state at that moment. Once the launch directory is gone the
+    /// launch has ended, and computing it again keeps no master running.
+    func arguments(
+        statusFile: URL?,
+        takeover: Bool = false,
+        masters: HostSSHMasterManager = .shared
+    ) -> [String] {
+        arguments(
+            statusFile: statusFile,
+            takeover: takeover,
+            sshControlPath: statusFile.flatMap { registerAdapterLaunch(statusFile: $0, masters: masters) }
+        )
+    }
+
+    /// Registers one adapter launch (named by its status file's private
+    /// directory) with the host's SSH master while the master is up, and
+    /// returns the ControlPath the launch shares; nil for This Mac or when
+    /// the adapter runs its own ssh. The launch keeps the master running
+    /// until `HostedAttachmentStatusFile.removeLaunchDirectory` removes that
+    /// directory. Call it once per launch, when it starts.
+    func registerAdapterLaunch(statusFile: URL, masters: HostSSHMasterManager = .shared) -> String? {
+        guard let destination = host.sshDestination else { return nil }
+        let launch = HostedAttachmentStatusFile.launchKey(ofStatusFile: statusFile)
+        return masters.controlPath(forLaunch: launch, destination: destination) {
+            FileManager.default.fileExists(atPath: launch)
+        }
+    }
+
+    /// The adapter's arguments for a launch registered with
+    /// `registerAdapterLaunch` (`sshControlPath` is what it returned). Pure.
+    func arguments(statusFile: URL?, takeover: Bool, sshControlPath: String?) -> [String] {
+        var arguments = host.arguments(sshControlPath: sshControlPath)
+            + ["--expected-host-id", hostID, "attach", sessionID]
         if takeover { arguments.append("--takeover") }
         arguments += ["--detach-key", "none"]
         if let statusFile { arguments += ["--status-file", statusFile.path] }
@@ -99,18 +434,15 @@ struct HostedSessionAttachment: Equatable, Sendable {
             .map(Self.shellQuote).joined(separator: " ")
     }
 
-    var adapterEnvironment: [String: String] {
-        environment.merging(["TERM": "xterm-256color", "COLORTERM": "truecolor"]) { _, adapter in adapter }
+    /// `execCommand` for a launch registered with `registerAdapterLaunch`.
+    /// Pure: computing it again gives the same command.
+    func execCommand(statusFile: URL?, takeover: Bool, sshControlPath: String?) -> String {
+        ([executablePath] + arguments(statusFile: statusFile, takeover: takeover, sshControlPath: sshControlPath))
+            .map(Self.shellQuote).joined(separator: " ")
     }
 
-    /// A client for one-off operations on this session's host, pinned to the
-    /// identity the tab attached to.
-    var client: HostedSessionClient {
-        let environment = environment
-        return HostedSessionClient(
-            executableURL: URL(fileURLWithPath: executablePath),
-            loginEnvironment: { _ in .init(environment: environment) }
-        )
+    var adapterEnvironment: [String: String] {
+        environment.merging(["TERM": "xterm-256color", "COLORTERM": "truecolor"]) { _, adapter in adapter }
     }
 
     private static func shellQuote(_ value: String) -> String {
@@ -170,10 +502,37 @@ enum HostedAttachmentStatus: Equatable, Sendable {
     }
 }
 
-/// `cherry attach --status-file` reports why the adapter exited. Each adapter
-/// launch gets a fresh private directory: the CLI writes the file atomically
-/// (temporary file + rename) beside it, and the app deletes the directory
-/// once the outcome is read.
+/// What a running attach adapter reports in its status file (`outcome`
+/// "attached"): it rewrites the file whenever one of these changes.
+struct HostedAdapterLiveStatus: Equatable, Sendable {
+    /// The adapter shows only a viewport of the session's screen (another
+    /// client made it larger than this terminal), so its surface is not
+    /// the whole screen.
+    var viewport: Bool
+    /// The adapter lost the host (its daemon restarted or was replaced) and
+    /// reconnects by itself; its surface keeps what it last showed, and
+    /// the program's output does not reach it meanwhile.
+    var reconnecting: Bool
+
+    init(viewport: Bool = false, reconnecting: Bool = false) {
+        self.viewport = viewport
+        self.reconnecting = reconnecting
+    }
+
+    /// Attached and following the program: its surface shows the program
+    /// and passes its bells, notifications, title and directory through.
+    var followsProgram: Bool { !reconnecting }
+
+    /// Its surface shows the program's whole screen.
+    var showsWholeScreen: Bool { !reconnecting && !viewport }
+}
+
+/// `cherry attach --status-file` reports the adapter's live state while it
+/// runs (`outcome` "attached", with `viewport` and `reconnecting`), and why
+/// it exited (any other outcome) when it ends. Each adapter launch gets a
+/// fresh private directory: the CLI writes the file atomically (temporary
+/// file + rename) beside it, and the app deletes the directory once the
+/// final outcome is read.
 ///
 /// Directory names carry the owning app's PID. An app that quits with hosted
 /// tabs attached never reads their outcomes (the adapters write them after
@@ -186,14 +545,19 @@ enum HostedAttachmentStatusFile {
         in: FileManager.default.temporaryDirectory
     )
 
+    /// The outcome a running adapter writes; any other one is final.
+    static let liveOutcome = "attached"
+
     private struct Record: Decodable {
         let outcome: String
         let exitCode: UInt32?
         let signal: Int32?
         let message: String?
+        let viewport: Bool?
+        let reconnecting: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case outcome, signal, message
+            case outcome, signal, message, viewport, reconnecting
             case exitCode = "exit_code"
         }
     }
@@ -233,13 +597,40 @@ enum HostedAttachmentStatusFile {
         directory.appendingPathComponent(fileName)
     }
 
-    /// nil when the adapter has not written a status yet.
+    /// Names one adapter launch: its private directory.
+    static func launchKey(ofDirectory directory: URL) -> String {
+        directory.standardizedFileURL.path
+    }
+
+    static func launchKey(ofStatusFile statusFile: URL) -> String {
+        launchKey(ofDirectory: statusFile.deletingLastPathComponent())
+    }
+
+    /// The adapter's final outcome; nil when it has not written one yet
+    /// (nothing, or its live "attached" state: it still runs).
     static func read(from directory: URL) -> HostedAttachmentStatus? {
         guard let data = try? Data(contentsOf: statusFileURL(in: directory)) else { return nil }
+        if liveStatus(from: data) != nil { return nil }
         return status(from: data)
     }
 
-    /// An unreadable status is only evidence that the attachment ended.
+    /// The adapter's live state, when the file holds it (`outcome`
+    /// "attached"); nil for nothing yet, a final outcome or an unreadable file.
+    static func readLive(from directory: URL) -> HostedAdapterLiveStatus? {
+        guard let data = try? Data(contentsOf: statusFileURL(in: directory)) else { return nil }
+        return liveStatus(from: data)
+    }
+
+    static func liveStatus(from data: Data) -> HostedAdapterLiveStatus? {
+        guard let record = try? JSONDecoder().decode(Record.self, from: data), record.outcome == liveOutcome else {
+            return nil
+        }
+        return HostedAdapterLiveStatus(viewport: record.viewport ?? false, reconnecting: record.reconnecting ?? false)
+    }
+
+    /// The outcome of an adapter that ended. An unreadable status is only
+    /// evidence that the attachment ended, and so is a live one the adapter
+    /// never replaced (it was killed).
     static func status(from data: Data) -> HostedAttachmentStatus {
         guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return .disconnected(nil) }
         let message = record.message?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -251,37 +642,109 @@ enum HostedAttachmentStatusFile {
         case "failed":
             return .failed(message ?? "The session could not be attached.")
         default:
-            // "detached", "disconnected" and outcomes this app does not know.
-            // A confirmed detach has no message; a detach the host never
-            // confirmed, or a lost connection, says what happened.
+            // "detached", "disconnected", a live "attached" left behind and
+            // outcomes this app does not know. A confirmed detach has no
+            // message; a detach the host never confirmed, or a lost
+            // connection, says what happened.
             return .disconnected(message)
         }
     }
 
     /// An adapter that is being stopped may still write its status while it
-    /// handles the hangup, so a stopped launch is removed after a delay.
-    static func removeLaunchDirectory(_ directory: URL, after delay: TimeInterval) {
+    /// handles the hangup, so a stopped launch is removed after a delay. The
+    /// launch then stops keeping its host's SSH master running.
+    static func removeLaunchDirectory(
+        _ directory: URL,
+        after delay: TimeInterval,
+        masters: HostSSHMasterManager = .shared
+    ) {
+        let launch = launchKey(ofDirectory: directory)
         guard delay > 0 else {
             try? FileManager.default.removeItem(at: directory)
+            masters.endLaunch(launch)
             return
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
             try? FileManager.default.removeItem(at: directory)
+            masters.endLaunch(launch)
         }
     }
 }
 
+/// Follows one adapter launch's status file while the adapter runs, and
+/// reports each new live state (`HostedAdapterLiveStatus`) on the main
+/// actor. The adapter replaces the file atomically (a rename in the launch's
+/// private directory), which the directory's vnode reports; final outcomes
+/// are left to whoever handles the adapter's exit.
+@MainActor
+final class HostedAdapterStatusWatcher {
+    private let directory: URL
+    private let onChange: @MainActor (HostedAdapterLiveStatus) -> Void
+    private var source: DispatchSourceFileSystemObject?
+    private(set) var latest: HostedAdapterLiveStatus?
+
+    /// Starts watching `directory` (a launch's private directory); nil when
+    /// it cannot be opened.
+    init?(directory: URL, onChange: @escaping @MainActor (HostedAdapterLiveStatus) -> Void) {
+        self.directory = directory
+        self.onChange = onChange
+        let descriptor = open(directory.path, O_EVTONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor, eventMask: [.write, .extend, .attrib, .link], queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.check() }
+        }
+        source.setCancelHandler { Darwin.close(descriptor) }
+        self.source = source
+        source.resume()
+        check()
+    }
+
+    isolated deinit {
+        source?.cancel()
+    }
+
+    /// Stops watching; nothing is reported afterwards.
+    func cancel() {
+        source?.cancel()
+        source = nil
+    }
+
+    /// Reads the file now (the vnode event, or a caller that wants the
+    /// latest state at once).
+    func check() {
+        guard source != nil, let status = HostedAttachmentStatusFile.readLive(from: directory), status != latest else {
+            return
+        }
+        latest = status
+        onChange(status)
+    }
+}
+
 enum HostedSessionError: LocalizedError, Equatable {
+    /// A definite failure decided in the app, such as invalid input or a
+    /// missing helper. Nothing reached the host.
     case message(String)
-    /// The helper got no definite answer: the connection failed, timed out or
-    /// was interrupted. A requested change may or may not have happened.
+    /// The host answered the request with an error (`code` is the protocol's
+    /// error code, such as `unknown_session` or `not_running`). Definite.
+    case rejected(code: String, message: String)
+    /// The request was sent, but no definite answer came back: the
+    /// connection failed, timed out or was interrupted. A requested change
+    /// may or may not have happened.
     case transport(String)
     /// The host answered with an identity other than the one this Mac trusts.
+    /// Nothing was sent to it.
     case identityMismatch(String)
+    /// No connection to the host could be made (or it is not allowed, as from
+    /// a disk image). Nothing was sent.
+    case unavailable(String)
 
     var errorDescription: String? {
         switch self {
-        case .message(let message), .transport(let message), .identityMismatch(let message):
+        case .message(let message), .rejected(_, let message), .transport(let message),
+             .identityMismatch(let message), .unavailable(let message):
             message
         }
     }
@@ -294,6 +757,17 @@ enum HostedSessionError: LocalizedError, Equatable {
     var isIdentityMismatch: Bool {
         if case .identityMismatch = self { return true }
         return false
+    }
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+
+    /// The host's error code for a rejected request.
+    var hostErrorCode: String? {
+        if case .rejected(let code, _) = self { return code }
+        return nil
     }
 }
 
@@ -359,9 +833,11 @@ final class HostedSessionHostStore: ObservableObject {
     }
 }
 
+/// The installed `cherry` helper and the environment it runs with. Control
+/// actions go through the host's `HostControl`; attach adapters run the
+/// executable directly.
 struct HostedSessionClient: Sendable {
     let executableURL: URL
-    var timeout: TimeInterval = 35
     /// Login-shell variables layered over Cherry's own environment for every
     /// helper process, and handed to attach adapters. Nil when none could be
     /// captured. `retryingNow` skips the wait after a failed capture. Can run
@@ -480,10 +956,17 @@ struct HostedSessionClient: Sendable {
         return firstStatus.st_dev == secondStatus.st_dev && firstStatus.st_ino == secondStatus.st_ino
     }
 
+    /// A working directory a person typed (the Persistent Sessions sheet):
+    /// trimmed, then checked as `validatedHostWorkingDirectory` checks it.
+    static func hostWorkingDirectory(_ input: String) throws -> String {
+        try validatedHostWorkingDirectory(input.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// The host expands `~` and `~/…` with its own HOME and rejects relative
     /// paths. Checking here names the field instead of showing a host error.
-    static func hostWorkingDirectory(_ input: String) throws -> String {
-        let path = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// The path is kept exactly as given (a directory name may end in a
+    /// space); empty means `~`.
+    static func validatedHostWorkingDirectory(_ path: String) throws -> String {
         if path.isEmpty { return "~" }
         guard path == "~" || path.hasPrefix("~/") || path.hasPrefix("/") else {
             throw HostedSessionError.message("Enter the working directory as an absolute path or as ~/path on the selected host.")
@@ -491,69 +974,10 @@ struct HostedSessionClient: Sendable {
         return path
     }
 
-    func list(on host: HostedSessionHost, expectedHostID: String? = nil) async throws -> HostedSessionList {
-        let identityArguments = expectedHostID.map { ["--expected-host-id", $0] } ?? []
-        return try Self.decode(HostedSessionList.self, from: await run(host.arguments + identityArguments + ["list", "--json"]))
-    }
-
-    /// The host creates at most one session per `requestID`, so a retry after
-    /// a lost response returns the session the first attempt created.
-    func create(
-        on host: HostedSessionHost,
-        expectedHostID: String,
-        name: String,
-        cwd: String,
-        requestID: UUID
-    ) async throws -> HostedSessionInfo {
-        let arguments = host.arguments + [
-            "--expected-host-id", expectedHostID, "new",
-            // `=` keeps values that start with "-" from parsing as options.
-            "--name=\(name)", "--cwd=\(try Self.hostWorkingDirectory(cwd))",
-            "--request-id", requestID.uuidString.lowercased()
-        ]
-        return try Self.decode(HostedSessionInfo.self, from: await run(arguments))
-    }
-
-    func terminate(_ sessionID: String, on host: HostedSessionHost, expectedHostID: String) async throws {
-        _ = try await run(host.arguments + ["--expected-host-id", expectedHostID, "kill", sessionID])
-    }
-
-    func remove(_ sessionID: String, on host: HostedSessionHost, expectedHostID: String) async throws {
-        _ = try await run(host.arguments + ["--expected-host-id", expectedHostID, "remove", sessionID])
-    }
-
-    private static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
-        do {
-            return try JSONDecoder().decode(type, from: data)
-        } catch {
-            throw HostedSessionError.message("The cherry session client returned a response this version of Cherry cannot read. Make sure the app and its cherry helper come from the same build.")
-        }
-    }
-
     /// `loginEnvironment` resolved off the main actor.
     func resolvedLoginEnvironment(retryingNow: Bool = false) async -> HostedSessionLoginEnvironment.Capture? {
         let loginEnvironment = loginEnvironment
         return await Task.detached(priority: .userInitiated) { loginEnvironment(retryingNow) }.value
-    }
-
-    private func run(_ arguments: [String]) async throws -> Data {
-        let executableURL = executableURL
-        let timeout = timeout
-        let loginEnvironment = loginEnvironment
-        return try await Task.detached(priority: .userInitiated) {
-            // Resolving the login environment can run the user's shell, so it
-            // stays off the main actor.
-            let environment = HostedSessionLoginEnvironment.helperEnvironment(
-                base: ProcessInfo.processInfo.environment,
-                login: loginEnvironment(false)?.environment
-            )
-            return try HostedSessionCommand.run(
-                executableURL: executableURL,
-                arguments: arguments,
-                environment: environment,
-                timeout: timeout
-            )
-        }.value
     }
 }
 
@@ -738,13 +1162,9 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
 
     /// Identity of the Cherry tab (or hosted session) Cherry itself may have
     /// been started from, plus its shell-integration plumbing. Helpers must
-    /// not pass these on as if they described the new session.
-    private static let cherryTabKeys: Set<String> = [
-        CherryControl.projectRootEnvironmentKey, CherryControl.processIDEnvironmentKey,
-        CherryControl.agentIDEnvironmentKey, "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
-        "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
-        "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
-    ]
+    /// not pass these on as if they described the new session. The same set
+    /// `HostedLaunchSpec` drops.
+    private static let cherryTabKeys = CherryTabEnvironment.keys
 
     /// Values that describe one terminal or one Cherry tab, never the user.
     private static func isTabSpecific(_ key: String) -> Bool {
@@ -925,119 +1345,11 @@ enum HostedSessionInstallation {
         return "Move \(name) to Applications first; sessions started from the disk image stop working when it is ejected."
     }
 
-    /// Every local `cherry list`, `new` and `attach` starts the session daemon
+    /// Every local `cherry control` and `attach` starts the session daemon
     /// from this app's bundle when none is running, so "This Mac" stays
     /// unavailable while that bundle is on a disk image. SSH hosts run their
     /// own daemon and are unaffected.
     static func localHostUnavailableReason(bundleURL: URL = Bundle.main.bundleURL) -> String? {
         runsFromDiskImage(bundleURL: bundleURL) ? diskImageWarning(bundleURL: bundleURL) : nil
-    }
-}
-
-private enum HostedSessionCommand {
-    private final class Capture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage = Data()
-        private var overflow = false
-
-        func drain(_ handle: FileHandle) {
-            while true {
-                let chunk = handle.readData(ofLength: 16_384)
-                if chunk.isEmpty { break }
-                lock.withLock {
-                    if storage.count + chunk.count <= 4 * 1_024 * 1_024 {
-                        storage.append(chunk)
-                    } else {
-                        overflow = true
-                    }
-                }
-            }
-        }
-
-        var result: (data: Data, overflow: Bool) { lock.withLock { (storage, overflow) } }
-    }
-
-    private final class Flag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage = false
-        func set() { lock.withLock { storage = true } }
-        var value: Bool { lock.withLock { storage } }
-    }
-
-    static func run(
-        executableURL: URL,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval
-    ) throws -> Data {
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.environment = environment
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-
-        let timedOut = Flag()
-        let watchdog = DispatchWorkItem {
-            guard process.isRunning else { return }
-            timedOut.set()
-            // The adapter handles TERM by closing its SSH transport and reaping
-            // the child. Allow that cleanup before the final fallback.
-            process.terminate()
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-        let stdout = Capture()
-        let stderr = Capture()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            stderr.drain(errors.fileHandleForReading)
-            group.leave()
-        }
-        stdout.drain(output.fileHandleForReading)
-        process.waitUntilExit()
-        group.wait()
-        watchdog.cancel()
-
-        if timedOut.value {
-            // The helper's own interruption message describes its view of the
-            // signal, not whether the host acted on the request.
-            let seconds = max(1, Int(timeout.rounded(.up)))
-            throw HostedSessionError.transport("The session host did not answer within \(seconds) second\(seconds == 1 ? "" : "s"). Check the host and your SSH connection.")
-        }
-        let result = stdout.result
-        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-            let message = String(String(decoding: stderr.result.data, as: UTF8.self).prefix(2_000))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            throw failure(
-                status: process.terminationStatus,
-                signaled: process.terminationReason != .exit,
-                message: message
-            )
-        }
-        guard !result.overflow else {
-            throw HostedSessionError.message("The session host returned a response larger than the client limit.")
-        }
-        return result.data
-    }
-
-    /// A reply from the host (or a usage error) is definite; anything else
-    /// means the request may or may not have reached the host.
-    static func failure(status: Int32, signaled: Bool, message: String) -> HostedSessionError {
-        let text = message.isEmpty
-            ? "The session host could not be reached. Check the host installation and your SSH connection, then refresh the session list."
-            : message
-        if signaled { return .transport(text) }
-        let lowered = message.lowercased()
-        if lowered.contains("host identity") { return .identityMismatch(text) }
-        if lowered.contains("host rejected request") || status == 2 { return .message(text) }
-        return .transport(text)
     }
 }

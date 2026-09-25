@@ -783,8 +783,29 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         scrollContainer?.synchronizeScrollState()
     }
 
+    /// Replaces the EXEC surface with an in-memory one, which runs no
+    /// process: a persistent tab restarting shows it while its next session
+    /// is created, and the keys typed into it go to the tab
+    /// (`TerminalSession.hostInputWriter`), which queues them for that
+    /// session's program, instead of to the ended adapter's PTY.
+    /// `relaunchNativeSurface` then launches the new session's adapter.
+    func relaunchInMemorySurface() {
+        guard !isReleased, isNativePTYBacked, let session = proxy.session else { return }
+        isNativePTYBacked = false
+        terminalView.freeSurface()
+        terminalView.controller?.tick()
+        terminalView.relaunchSurface(
+            configuration: Self.makeOptions(
+                for: session,
+                inMemorySession: inMemorySession,
+                useNativePTY: false
+            )
+        )
+        scrollContainer?.synchronizeScrollState()
+    }
+
     func terminalDidClose(processAlive _: Bool) {
-        proxy.session?.stop()
+        proxy.session?.nativeSurfaceDidClose()
     }
 
     func terminalDidRequestClipboardConfirmation(
@@ -894,7 +915,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     func terminalDidRingBell() {
-        NSSound.beep()
+        guard let session = proxy.session else {
+            NSSound.beep()
+            return
+        }
+        // A persistent tab's host may have rung this bell already.
+        session.ingestNativeBell()
     }
 
     func terminalDidResize(_ size: TerminalGridMetrics) {
@@ -2285,7 +2311,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         let native = useNativePTY ? session.nativeExecLaunch : nil
         return TerminalSurfaceOptions(
             backend: useNativePTY ? .exec : .inMemory(inMemorySession),
-            workingDirectory: session.workingDirectory,
+            workingDirectory: session.nativeSurfaceWorkingDirectory,
             context: .window,
             execCommand: native?.command,
             execEnvironment: native?.environment ?? [:]
@@ -3132,8 +3158,17 @@ final class GhosttyTerminalContainerView: NSView {
         // mode — exactly like standalone ghostty. This monitor exists only because
         // the host-managed surface is a pure renderer that doesn't own input; under
         // EXEC it would double-encode (e.g. arrows would arrive at the shell as
-        // literal escape text via the text path). Let the event fall through.
-        if activeBridge?.isNativePTYBacked == true { return false }
+        // literal escape text via the text path). Let the event fall through,
+        // unless the surface's process takes no keys now (a persistent tab
+        // whose attach adapter is away): then the host types them.
+        if activeBridge?.isNativePTYBacked == true {
+            guard event.window === window,
+                  window?.firstResponder === activeBridge?.terminalView
+            else {
+                return false
+            }
+            return sendKeyThroughHostWhileAdapterIsAway(event)
+        }
         guard event.window === window,
               let activeSession,
               activeSession.acceptsInput,
@@ -3215,6 +3250,56 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         return false
+    }
+
+    /// A key typed into a persistent tab's EXEC surface while its attach
+    /// adapter is away (`TerminalSession.keyboardInputGoesThroughHost`: it
+    /// ended and is launched again, or reconnects by itself): no process
+    /// takes it there, so it goes through the host (`send(data:)`), and
+    /// the surface keeps showing the last screen. Cursor keys are encoded
+    /// for the program's cursor key mode as its host reports it
+    /// (`TerminalSession.usesApplicationCursorKeys`). True when it was
+    /// sent; false leaves the event to the surface (Command shortcuts,
+    /// which the menu handles; keys `HostRoutedKeyEncoder` has no encoding
+    /// for; text being composed with an input method).
+    func sendKeyThroughHostWhileAdapterIsAway(_ event: NSEvent) -> Bool {
+        guard let activeSession, let activeBridge,
+              activeBridge.isNativePTYBacked,
+              activeSession.acceptsInput,
+              activeSession.keyboardInputGoesThroughHost,
+              !activeBridge.terminalView.hasMarkedText()
+        else {
+            return false
+        }
+        let data: Data
+        if isPasteShortcut(event) {
+            guard let pasteData = TerminalPasteboardContent.pasteData(
+                from: .general,
+                bracketedPasteMode: activeSession.usesBracketedPasteMode
+            ) else { return false }
+            data = pasteData
+        } else if let encoded = HostRoutedKeyEncoder.data(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            characters: event.characters,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            // Only the kitty keyboard protocol's codes use it.
+            unshiftedCharacters: activeSession.isEnhancedKeyboardProtocolActive
+                ? event.characters(byApplyingModifiers: []) : nil,
+            usesApplicationCursorKeys: activeSession.usesApplicationCursorKeys,
+            isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive,
+            keyboardProtocolFlags: activeSession.keyboardProtocolFlags,
+            sendsModifiedArrowKeys: activeSession.usesAlternateScreen
+                || activeSession.isEnhancedKeyboardProtocolActive,
+            optionAsAlt: .nativeSurfaces
+        ) {
+            data = encoded
+        } else {
+            return false
+        }
+        activeSession.noteNativeHostInput(event: event)
+        activeSession.send(data: data)
+        return true
     }
 
     private func isPasteShortcut(_ event: NSEvent) -> Bool {
@@ -3461,5 +3546,284 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return body()
+    }
+}
+
+/// Encodes a key typed into a persistent tab whose attach adapter is away
+/// (`GhosttyTerminalContainerView.sendKeyThroughHostWhileAdapterIsAway`),
+/// for its host to type: Ghostty's surface would encode it, but its
+/// process takes nothing then. It types what a terminal in legacy (xterm)
+/// mode types, with the arrow, Home and End keys in the form the program's
+/// cursor key mode (DECCKM, as its host reports it) takes:
+/// - text; with Option, its composed characters, unless Option acts as Alt
+///   (`OptionAsAlt`, Ghostty's `macos-option-as-alt`): then ESC and the
+///   key without Option;
+/// - Return, Tab, Backspace, Escape, Forward Delete, arrows, Home, End,
+///   Page Up/Down and F1–F12, with Shift, Control and Option as xterm's
+///   modifier parameter (`ESC [ 1 ; 5 C`, `ESC [ 15 ; 2 ~`);
+/// - Control letters and symbols as their C0 byte (Control+Option as Alt:
+///   ESC first); Control with a key that has none types the key;
+/// - Cherry's own Shift+Return, Shift+Tab and Option encodings, as the
+///   host-managed surface uses them.
+///
+/// While the program uses the kitty keyboard protocol (its flags are not
+/// 0), the keys that protocol encodes differently when it disambiguates
+/// (flag 1) go as Ghostty's surface types them: Escape as `CSI 27 u`;
+/// Control or Alt (Option as Alt) with a key that types a character as
+/// `CSI code ; m u`, its code the key's unshifted character; modified
+/// Return, Tab and Backspace as `CSI 13 ; m u`…; F1, F2 and F4 as
+/// `CSI P`… and F3 as `CSI 13 ~`. What the protocol's other flags add is
+/// not: plain text keys as `CSI … u` (report all keys, flag 8; the host
+/// path only turns a lone Tab into `CSI 9 u` then, `normalizedInputData`),
+/// alternate keys (flag 4) and associated text (flag 16).
+///
+/// Nil for Command shortcuts (the menu's) and keys it has no encoding for
+/// (F13 and above, keys with no character).
+enum HostRoutedKeyEncoder {
+    private enum KeyCode {
+        static let returnKey: UInt16 = 36
+        static let keypadEnter: UInt16 = 76
+        static let tab: UInt16 = 48
+        static let backspace: UInt16 = 51
+        static let escape: UInt16 = 53
+        static let forwardDelete: UInt16 = 117
+        static let home: UInt16 = 115
+        static let end: UInt16 = 119
+        static let pageUp: UInt16 = 116
+        static let pageDown: UInt16 = 121
+        static let left: UInt16 = 123
+        static let right: UInt16 = 124
+        static let down: UInt16 = 125
+        static let up: UInt16 = 126
+        static let f3: UInt16 = 99
+    }
+
+    /// F1–F12 (`kVK_F1`…) as xterm types them: F1–F4 as `ESC O P`…`S`
+    /// (`ESC [ 1 ; m P` with modifiers), the others as `ESC [ n ~`
+    /// (`ESC [ n ; m ~`).
+    private static let functionKeys: [UInt16: (number: Int, final: String)] = [
+        122: (1, "P"), 120: (1, "Q"), 99: (1, "R"), 118: (1, "S"),
+        96: (15, "~"), 97: (17, "~"), 98: (18, "~"), 100: (19, "~"),
+        101: (20, "~"), 109: (21, "~"), 103: (23, "~"), 111: (24, "~"),
+    ]
+
+    /// The letter keys (`kVK_ANSI_A`…), for Control with a layout whose
+    /// letters are not Latin: Control+the key where A is on a US layout is
+    /// still Control+A.
+    private static let letterKeys: [UInt16: UInt8] = [
+        0: 0x61, 11: 0x62, 8: 0x63, 2: 0x64, 14: 0x65, 3: 0x66, 5: 0x67, 4: 0x68, 34: 0x69,
+        38: 0x6A, 40: 0x6B, 37: 0x6C, 46: 0x6D, 45: 0x6E, 31: 0x6F, 35: 0x70, 12: 0x71,
+        15: 0x72, 1: 0x73, 17: 0x74, 32: 0x75, 9: 0x76, 13: 0x77, 7: 0x78, 16: 0x79, 6: 0x7A,
+    ]
+
+    /// Which Option keys act as Alt (Meta), sending ESC and the key without
+    /// Option rather than the character Option composes: Ghostty's
+    /// `macos-option-as-alt`, which Cherry's surfaces default to `true`
+    /// (`TerminalSettings.nativeUserKeyboardConfig`).
+    enum OptionAsAlt: Equatable, Sendable {
+        case neither
+        case both
+        case left
+        case right
+
+        /// From the setting's value; unset or unknown is Cherry's default,
+        /// both.
+        init(configValue: String?) {
+            switch configValue?.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "false": self = .neither
+            case "left": self = .left
+            case "right": self = .right
+            default: self = .both
+            }
+        }
+
+        /// What Cherry's native surfaces use.
+        @MainActor static var nativeSurfaces: OptionAsAlt {
+            OptionAsAlt(configValue: TerminalSettings.nativeUserKeyboardConfig.last { $0.0 == "macos-option-as-alt" }?.1)
+        }
+
+        /// Whether the Option key held in `modifiers` (an event's own
+        /// flags, which say which side) acts as Alt.
+        func applies(to modifiers: NSEvent.ModifierFlags) -> Bool {
+            guard modifiers.contains(.option) else { return false }
+            switch self {
+            case .neither: return false
+            case .both: return true
+            // NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK
+            case .left: return modifiers.rawValue & 0x20 != 0
+            case .right: return modifiers.rawValue & 0x40 != 0
+            }
+        }
+    }
+
+    /// `unshiftedCharacters`: what the key types with no modifiers at all
+    /// (`NSEvent.characters(byApplyingModifiers: [])`), the code of a
+    /// Control or Alt key under the kitty keyboard protocol; nil uses
+    /// `charactersIgnoringModifiers` in lowercase.
+    static func data(
+        keyCode: UInt16,
+        modifiers eventModifiers: NSEvent.ModifierFlags,
+        characters: String?,
+        charactersIgnoringModifiers: String?,
+        unshiftedCharacters: String? = nil,
+        usesApplicationCursorKeys: Bool,
+        isEnhancedKeyboardProtocolActive: Bool,
+        keyboardProtocolFlags: Int,
+        sendsModifiedArrowKeys: Bool,
+        optionAsAlt: OptionAsAlt = .both
+    ) -> Data? {
+        let modifiers = eventModifiers.intersection(.deviceIndependentFlagsMask)
+        guard !modifiers.contains(.command) else { return nil }
+        if let sequence = TerminalInputEncoder.shiftEnterSequence(
+            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
+        ) ?? TerminalInputEncoder.shiftTabSequence(
+            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
+        ) ?? TerminalInputEncoder.appKitOptionBackspaceSequence(
+            keyCode: keyCode, modifiers: modifiers
+        ) ?? TerminalInputEncoder.appKitOptionArrowSequence(
+            keyCode: keyCode, modifiers: modifiers, sendsModifiedArrowKeys: sendsModifiedArrowKeys
+        ) ?? TerminalInputEncoder.appKitOptionDigitTextData(
+            keyCode: keyCode, characters: characters, charactersIgnoringModifiers: charactersIgnoringModifiers,
+            modifiers: modifiers, keyboardProtocolFlags: keyboardProtocolFlags
+        ) ?? TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+            keyCode: keyCode, modifiers: modifiers, usesApplicationCursorKeys: usesApplicationCursorKeys
+        ) {
+            return sequence
+        }
+        let held = modifiers.intersection([.shift, .control, .option])
+        let alt = optionAsAlt.applies(to: eventModifiers)
+        // xterm's modifier parameter: 1, plus 1 for Shift, 2 for Option
+        // (Alt), 4 for Control.
+        let parameter = 1 + (held.contains(.shift) ? 1 : 0) + (held.contains(.option) ? 2 : 0)
+            + (held.contains(.control) ? 4 : 0)
+
+        /// Return, Tab or Backspace (`byte`, kitty's `code`) with modifiers.
+        func modifiedKey(_ byte: UInt8, code: Int) -> Data {
+            if held.isEmpty { return Data([byte]) }
+            if isEnhancedKeyboardProtocolActive { return csi("\(code);\(parameter)u") }
+            return alt ? Data([0x1B, byte]) : Data([byte])
+        }
+
+        if let key = functionKeys[keyCode] {
+            if isEnhancedKeyboardProtocolActive, key.final != "~" {
+                // The kitty keyboard protocol: `CSI P`, `CSI Q`, `CSI S`
+                // (`CSI 1 ; m P`…), and F3 as `CSI 13 ~`, as `CSI R` is a
+                // cursor position report.
+                if keyCode == KeyCode.f3 { return csi(held.isEmpty ? "13~" : "13;\(parameter)~") }
+                return csi(held.isEmpty ? key.final : "1;\(parameter)\(key.final)")
+            }
+            if key.final == "~" {
+                return csi(held.isEmpty ? "\(key.number)~" : "\(key.number);\(parameter)~")
+            }
+            return held.isEmpty ? Data("\u{1B}O\(key.final)".utf8) : csi("1;\(parameter)\(key.final)")
+        }
+        switch keyCode {
+        case KeyCode.up, KeyCode.down, KeyCode.right, KeyCode.left:
+            // Without modifiers, or with Option alone: encoded above.
+            let final = [KeyCode.up: "A", KeyCode.down: "B", KeyCode.right: "C", KeyCode.left: "D"][keyCode] ?? "A"
+            return csi("1;\(parameter)\(final)")
+        case KeyCode.home, KeyCode.end:
+            let final = keyCode == KeyCode.home ? "H" : "F"
+            guard held.isEmpty else { return csi("1;\(parameter)\(final)") }
+            return Data(((usesApplicationCursorKeys ? "\u{1B}O" : "\u{1B}[") + final).utf8)
+        case KeyCode.pageUp:
+            return csi(held.isEmpty ? "5~" : "5;\(parameter)~")
+        case KeyCode.pageDown:
+            return csi(held.isEmpty ? "6~" : "6;\(parameter)~")
+        case KeyCode.forwardDelete:
+            return csi(held.isEmpty ? "3~" : "3;\(parameter)~")
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            // Shift alone: encoded above.
+            return modifiedKey(0x0D, code: 13)
+        case KeyCode.tab:
+            // Shift alone: encoded above.
+            return modifiedKey(0x09, code: 9)
+        case KeyCode.backspace:
+            // Option alone: encoded above. Control+Backspace is ^H.
+            return modifiedKey(held.contains(.control) ? 0x08 : 0x7F, code: 127)
+        case KeyCode.escape:
+            if isEnhancedKeyboardProtocolActive { return csi(held.isEmpty ? "27u" : "27;\(parameter)u") }
+            return Data([0x1B])
+        default:
+            break
+        }
+        if isEnhancedKeyboardProtocolActive, held.contains(.control) || alt {
+            // The kitty keyboard protocol: `CSI code ; m u`, the code being
+            // the key's unshifted character (Control+Shift+A is `CSI 97 ; 6 u`).
+            guard let code = kittyKeyCode(
+                unshiftedCharacters: unshiftedCharacters, charactersIgnoringModifiers: charactersIgnoringModifiers
+            ) else { return nil }
+            return csi("\(code);\(parameter)u")
+        }
+        if held.contains(.control) {
+            guard let control = controlData(charactersIgnoringModifiers: charactersIgnoringModifiers, keyCode: keyCode)
+            else { return nil }
+            return alt ? Data([0x1B]) + control : control
+        }
+        if alt {
+            // Option as Alt: ESC, then the key as typed without Option.
+            guard let base = printableText(charactersIgnoringModifiers) else { return nil }
+            return Data([0x1B]) + Data(base.utf8)
+        }
+        // Text, as the key composed it (Option's characters included).
+        guard let text = printableText(characters) else { return nil }
+        return Data(text.utf8)
+    }
+
+    /// What Control and a key type: its C0 byte (Control+A is 0x01,
+    /// Control+[ is ESC, Control+/ is 0x1F, Control+? is DEL), or the key
+    /// itself when Control changes nothing about it in a legacy terminal
+    /// (Control+1). Nil when the key types no character.
+    private static func controlData(charactersIgnoringModifiers: String?, keyCode: UInt16) -> Data? {
+        guard let typed = charactersIgnoringModifiers, typed.unicodeScalars.count == 1,
+              let scalar = typed.lowercased().unicodeScalars.first
+        else { return nil }
+        guard scalar.isASCII else {
+            // A letter of a non-Latin layout: the key's Latin letter.
+            return letterKeys[keyCode].map { Data([$0 - 0x60]) }
+        }
+        switch scalar {
+        case "a"..."z":
+            return Data([UInt8(scalar.value - 0x60)])
+        case "@", " ", "2":
+            return Data([0x00])
+        case "[", "3":
+            return Data([0x1B])
+        case "\\", "4":
+            return Data([0x1C])
+        case "]", "5":
+            return Data([0x1D])
+        case "^", "6":
+            return Data([0x1E])
+        case "_", "-", "7", "/":
+            return Data([0x1F])
+        case "?", "8":
+            return Data([0x7F])
+        case "!"..."~":
+            return Data([UInt8(scalar.value)])
+        default:
+            return nil
+        }
+    }
+
+    /// The kitty keyboard protocol's code for a key that types a
+    /// character: that character without modifiers, as one code point.
+    private static func kittyKeyCode(unshiftedCharacters: String?, charactersIgnoringModifiers: String?) -> UInt32? {
+        let key = printableText(unshiftedCharacters) ?? printableText(charactersIgnoringModifiers)?.lowercased()
+        guard let scalars = key?.unicodeScalars, scalars.count == 1, let scalar = scalars.first else { return nil }
+        return scalar.value
+    }
+
+    /// `text` when it is something to type: no control characters, and
+    /// none of AppKit's function-key characters (U+F700…).
+    private static func printableText(_ text: String?) -> String? {
+        guard let text, !text.isEmpty,
+              !text.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F || (0xF700...0xF8FF).contains($0.value) })
+        else { return nil }
+        return text
+    }
+
+    private static func csi(_ body: String) -> Data {
+        Data(("\u{1B}[" + body).utf8)
     }
 }

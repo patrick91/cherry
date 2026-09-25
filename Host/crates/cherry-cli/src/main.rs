@@ -1,4 +1,5 @@
 mod attach;
+mod control;
 mod input;
 mod passthrough;
 mod status;
@@ -9,20 +10,29 @@ mod transport;
 
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
-    error_code, ClientMessage, ServerMessage, SessionList, DEFAULT_COLS, DEFAULT_ROWS,
-    PROTOCOL_VERSION,
+    error_code, ClientMessage, ServerMessage, SessionInfo, DEFAULT_COLS, DEFAULT_ROWS,
+    MAX_OWNER_BYTES, MAX_TAG_KEY_BYTES, PROTOCOL_VERSION,
 };
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use input::DetachKey;
 use status::{Outcome, Status, StatusFile};
 use std::{
-    collections::BTreeMap, ffi::OsString, io::Write, path::PathBuf, process::ExitCode,
-    time::Duration,
+    cmp::Ordering,
+    collections::BTreeMap,
+    ffi::OsString,
+    io::Write,
+    path::PathBuf,
+    process::ExitCode,
+    time::{Duration, Instant},
 };
-use transport::{Transport, RPC_TIMEOUT};
+use timing::timing;
+use transport::{Mode, Target, Transport, RPC_TIMEOUT};
 
 /// Interactive SSH may wait for a password or a host key confirmation.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+/// `--ssh-control-path` is at most this long, so that it fits a Unix socket
+/// address (104 bytes on macOS) with room to spare.
+const MAX_SSH_CONTROL_PATH_BYTES: usize = 100;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,13 +50,19 @@ struct Cli {
     /// Require the saved host identity before reading or changing its sessions.
     #[arg(long, global = true)]
     expected_host_id: Option<uuid::Uuid>,
+    /// With --host: every ssh this command runs uses the SSH master connection
+    /// listening at this ControlPath, or connects directly when none is. An
+    /// absolute path of at most 100 bytes.
+    #[arg(long, global = true, value_parser = validate_ssh_control_path)]
+    ssh_control_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Action,
 }
 
 #[derive(Subcommand, Debug)]
 enum Action {
-    /// Start the local host daemon. list, new and attach also start it when needed.
+    /// Start the local host daemon. list, new, attach and control also start it
+    /// when needed.
     Start,
     /// Stop the host daemon; refused while it owns any running sessions.
     Shutdown,
@@ -65,6 +81,20 @@ enum Action {
         /// Reusing this UUID makes retries of session creation idempotent.
         #[arg(long)]
         request_id: Option<uuid::Uuid>,
+        /// Set a variable in the session's environment; repeatable, the last
+        /// value of a name wins. This terminal's locale (LANG, LC_*) and TZ
+        /// are passed too, unless a locale variable, or TZ, is set here.
+        #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
+        env: Vec<(String, String)>,
+        /// Who creates the session, such as the app that restores it later.
+        /// A value starting with `-` needs the `--owner=VALUE` form, so that
+        /// a missing value is an error rather than the next option's name.
+        #[arg(long, value_parser = validate_owner)]
+        owner: Option<String>,
+        /// Metadata kept with the session; repeatable, the last value of a key
+        /// wins. A key starting with `-` needs the `--tag=KEY=VALUE` form.
+        #[arg(long = "tag", value_name = "KEY=VALUE", value_parser = parse_tag)]
+        tags: Vec<(String, String)>,
         /// Program and arguments, after --. Defaults to the host's login shell.
         #[arg(last = true)]
         command: Vec<String>,
@@ -87,6 +117,10 @@ enum Action {
     Kill { id: String },
     /// Remove an exited session from the host's retained session list.
     Remove { id: String },
+    /// Connect to the host and relay protocol frames between standard input
+    /// and output until either side closes, for Cherry. Standard output
+    /// starts with the host's Welcome; send requests, not Hello.
+    Control,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +129,7 @@ enum Kind {
     Query,
     Mutation,
     Attach,
+    Control,
 }
 
 impl Action {
@@ -103,16 +138,49 @@ impl Action {
             Action::Start => Kind::Start,
             Action::List { .. } => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
+            Action::Control => Kind::Control,
             Action::Shutdown | Action::New { .. } | Action::Kill { .. } | Action::Remove { .. } => {
                 Kind::Mutation
             }
         }
     }
+
+    /// Only commands that need a session start a host, and only they replace
+    /// one speaking an older protocol; kill, remove and shutdown report that
+    /// none is running (or that it speaks another version) instead.
+    fn starts_host(&self) -> bool {
+        matches!(
+            self,
+            Action::List { .. } | Action::New { .. } | Action::Attach { .. } | Action::Control
+        )
+    }
+}
+
+impl Cli {
+    /// What clap cannot check one value at a time. A failure is a usage
+    /// error like clap's own (exit status 2).
+    fn validate(self) -> std::result::Result<Self, clap::Error> {
+        // Here rather than as a clap requirement, which misses a --host given
+        // after the command.
+        if self.ssh_control_path.is_some() && self.host.is_none() {
+            return Err(Cli::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "--ssh-control-path needs --host",
+            ));
+        }
+        if let Action::New { tags, .. } = &self.command {
+            let tags: BTreeMap<_, _> = tags.iter().cloned().collect();
+            if let Err(message) = cherry_protocol::check_tags(&tags) {
+                return Err(Cli::command().error(ErrorKind::ValueValidation, message));
+            }
+        }
+        Ok(self)
+    }
 }
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = std::env::args_os().collect();
-    let cli = match Cli::try_parse_from(&arguments) {
+    let cli = match Cli::try_parse_from(&arguments).and_then(Cli::validate) {
         Ok(cli) => cli,
         Err(error) => {
             if error.use_stderr() {
@@ -158,6 +226,7 @@ fn interruption_message(kind: Kind, signal: i32) -> String {
             "; the request may already have reached the host. Run `cherry list` to check its outcome"
         }
         Kind::Attach => "; the host session was not terminated",
+        Kind::Control => "",
     };
     format!("interrupted by signal {signal}{outcome}")
 }
@@ -176,9 +245,13 @@ fn run(cli: Cli, status: &mut StatusFile) -> Result<u32> {
 fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> Result<u32> {
     if let Action::Start = cli.command {
         if cli.host.is_some() {
-            bail!("start is local only; list, new and attach start the remote host when needed");
+            bail!("start is local only; list, new, attach and control start the remote host when needed");
         }
-        transport::start_local_host(&transport::local_socket_path(cli.socket.as_deref())?)?;
+        transport::start_local_host(
+            &transport::local_socket_path(cli.socket.as_deref())?,
+            None,
+            false,
+        )?;
         return Ok(0);
     }
     if let Action::Attach { id, .. } = &cli.command {
@@ -186,21 +259,34 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             bail!("refusing to attach session {id} from inside itself: its output would feed back into its own input");
         }
     }
-    let kind = cli.command.kind();
-    // Only commands that need a session start a daemon; kill, remove and
-    // shutdown report that none is running instead.
-    let auto_start =
-        matches!(kind, Kind::Query | Kind::Attach) || matches!(cli.command, Action::New { .. });
-    let interactive = kind == Kind::Attach;
-    let links_agent = interactive || matches!(cli.command, Action::New { .. });
-    let transport = slot.insert(Transport::connect(
-        cli.host.as_deref(),
-        cli.socket.as_deref(),
-        interactive,
-        auto_start,
+    let mode = match cli.command.kind() {
+        Kind::Attach => Mode::Attach,
+        Kind::Control => Mode::Control,
+        _ => Mode::Command,
+    };
+    // A client using sessions lends its agent to them while connected.
+    let links_agent = matches!(
+        cli.command,
+        Action::New { .. } | Action::Attach { .. } | Action::Control
+    );
+    let target = Target {
+        host: cli.host.as_deref(),
+        socket: cli.socket.as_deref(),
+        ssh_control_path: cli.ssh_control_path.as_deref(),
+    };
+    // One limit for all of it, replacing a host and connecting again
+    // included; an attachment may wait for ssh to prompt instead.
+    let deadline = (mode != Mode::Attach).then(|| Instant::now() + timing().connect_timeout);
+    let host_id = connect(
+        slot,
+        &target,
+        mode,
+        cli.command.starts_host(),
         links_agent,
-    )?);
-    handshake(transport, cli.expected_host_id, interactive)?;
+        cli.expected_host_id.map(|id| id.to_string()).as_deref(),
+        deadline,
+    )?;
+    let transport = slot.as_mut().expect("connected");
 
     match cli.command {
         Action::Start => unreachable!(),
@@ -211,10 +297,18 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         Action::List { json } => {
             transport.send(&ClientMessage::List)?;
             match transport.receive(RPC_TIMEOUT)? {
-                ServerMessage::Sessions { host_id, sessions } => {
+                ServerMessage::Sessions {
+                    host_id,
+                    sessions,
+                    pending_holders,
+                } => {
                     let mut text = String::new();
                     if json {
-                        text = serde_json::to_string(&SessionList { host_id, sessions })?;
+                        text = serde_json::to_string(&ListJson {
+                            host_id: &host_id,
+                            pending_holders,
+                            sessions: &sessions,
+                        })?;
                         text.push('\n');
                     } else {
                         for session in sessions {
@@ -237,6 +331,9 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             cwd,
             name,
             request_id,
+            env,
+            owner,
+            tags,
             command,
         } => {
             // A fixed size keeps a retried request identical; the first
@@ -246,9 +343,11 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                 name,
                 cwd,
                 command,
-                env: session_environment(std::env::vars_os()),
+                env: session_environment(std::env::vars_os(), env),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
+                owner,
+                tags: tags.into_iter().collect(),
             })?;
             match transport.receive(RPC_TIMEOUT)? {
                 ServerMessage::Created { session } => {
@@ -274,55 +373,235 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             takeover,
             detach_key,
             ..
-        } => match attach::attach(transport, &id, takeover, detach_key, &mut status.attached)? {
-            attach::Outcome::Detached => {
-                status.set(Status::new(Outcome::Detached, None));
-                Ok(0)
-            }
-            attach::Outcome::DetachedUnconfirmed(message) => {
-                // The terminal is restored by now.
-                eprintln!("cherry: {message}");
-                status.set(Status::new(Outcome::Detached, Some(message)));
-                Ok(0)
-            }
-            attach::Outcome::Exited { code, signal } => {
-                status.set(Status::exited(code, signal));
-                Ok(code)
-            }
-            attach::Outcome::TakenOver(message) => {
-                status.set(Status::new(Outcome::TakenOver, Some(message.clone())));
-                Err(anyhow!(message))
-            }
-        },
+        } => {
+            // Connecting again finds the same host (the identity it welcomed
+            // this attachment with), or gives up at once.
+            let mut connect_again = |slot: &mut Option<Transport>, deadline: Instant| {
+                connect(
+                    slot,
+                    &target,
+                    Mode::Reattach,
+                    true,
+                    links_agent,
+                    Some(&host_id),
+                    Some(deadline),
+                )
+                .map(drop)
+            };
+            let mut reconnect = attach::Reconnect {
+                connect: &mut connect_again,
+                attempt: if target.host.is_some() {
+                    timing().reconnect_attempt_ssh
+                } else {
+                    timing().reconnect_attempt
+                },
+            };
+            let outcome = attach::attach(slot, &id, takeover, detach_key, status, &mut reconnect)?;
+            attached(status, outcome)
+        }
+        Action::Control => {
+            transport.clear_deadline();
+            control::relay(transport, host_id)
+        }
     }
+}
+
+/// What an attachment's outcome means for the status file and the exit code.
+fn attached(status: &mut StatusFile, outcome: attach::Outcome) -> Result<u32> {
+    match outcome {
+        attach::Outcome::Detached => {
+            status.set(Status::new(Outcome::Detached, None));
+            Ok(0)
+        }
+        attach::Outcome::DetachedUnconfirmed(message) => {
+            // The terminal is restored by now.
+            eprintln!("cherry: {message}");
+            status.set(Status::new(Outcome::Detached, Some(message)));
+            Ok(0)
+        }
+        attach::Outcome::Exited { code, signal } => {
+            status.set(Status::exited(code, signal));
+            Ok(code)
+        }
+        attach::Outcome::TakenOver(message) => {
+            status.set(Status::new(Outcome::TakenOver, Some(message.clone())));
+            Err(anyhow!(message))
+        }
+    }
+}
+
+/// `list --json`: the host's identity, how many sessions a host that just
+/// restarted still expects back, and the sessions.
+#[derive(serde::Serialize)]
+struct ListJson<'a> {
+    host_id: &'a str,
+    pending_holders: u32,
+    sessions: &'a [SessionInfo],
+}
+
+/// A connection failure that connecting again cannot resolve: another host
+/// answers, or one speaking a protocol version this cherry cannot use or
+/// replace. An attachment that lost its connection stops reconnecting.
+#[derive(Debug)]
+pub(crate) struct Unresolvable(pub String);
+
+impl std::fmt::Display for Unresolvable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unresolvable {}
+
+pub(crate) fn unresolvable(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Unresolvable(message.into()))
+}
+
+pub(crate) fn is_unresolvable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Unresolvable>().is_some()
+}
+
+/// Connect and say Hello, returning the host's identity. A command that may
+/// start a host (`starts_host`) also replaces one speaking an older
+/// protocol: it asks that host to make way (`Replace`), then goes on with the
+/// host that connecting again starts. Remotely the gateway (the remote
+/// machine's cherry-host) does both itself before it relays anything, as
+/// this does locally; should a gateway relay an older host's Welcome, it is
+/// answered the same way, and the next gateway starts the new host. A host
+/// speaking a newer protocol is reported, never replaced.
+///
+/// A host that is not `expected_host_id` is neither used nor replaced: its
+/// identity is checked before its version. The remote gateway is told the
+/// expected identity, and relays such a host untouched for this to refuse.
+///
+/// `deadline` limits all of it, replacing a host and connecting again
+/// included. Failures that connecting again cannot resolve are
+/// `Unresolvable`.
+fn connect(
+    slot: &mut Option<Transport>,
+    target: &Target,
+    mode: Mode,
+    starts_host: bool,
+    links_agent: bool,
+    expected_host_id: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let mut replaced = None;
+    let made_way = |version: u32| {
+        format!(
+            "the cherry-host speaking protocol {version} was asked to make way, but no cherry-host speaking protocol {PROTOCOL_VERSION} could be reached"
+        )
+    };
+    loop {
+        let connected = Transport::connect(
+            target,
+            mode,
+            starts_host,
+            links_agent,
+            expected_host_id,
+            deadline,
+        );
+        let transport = match (connected, replaced) {
+            (Ok(transport), _) => slot.insert(transport),
+            (Err(error), None) => return Err(error),
+            (Err(error), Some(version)) => return Err(error.context(made_way(version))),
+        };
+        let version = match (handshake(transport, expected_host_id, mode), replaced) {
+            (Ok(Greeting::Ready { host_id }), _) => return Ok(host_id),
+            (Ok(Greeting::Older { version }), _) => version,
+            (Err(error), None) => return Err(error),
+            (Err(error), Some(previous)) => return Err(error.context(made_way(previous))),
+        };
+        if let Some(previous) = replaced {
+            return Err(unresolvable(format!(
+                "the cherry-host speaking protocol {previous} was asked to make way, but the host answering now speaks protocol {version}, not {PROTOCOL_VERSION}; install the cherry-host that comes with this cherry"
+            )));
+        }
+        if !starts_host {
+            return Err(unresolvable(format!(
+                "protocol version mismatch: cherry-host speaks version {version}, this cherry speaks version {PROTOCOL_VERSION}; this command never replaces a host (list, new, attach and control replace an older one)"
+            )));
+        }
+        replace(transport, version)?;
+        replaced = Some(version);
+        // The old host is gone; so is this connection (and its ssh).
+        *slot = None;
+    }
+}
+
+enum Greeting {
+    /// The host speaks this protocol.
+    Ready { host_id: String },
+    /// The host speaks an older protocol; nothing but `Replace` may follow.
+    Older { version: u32 },
 }
 
 fn handshake(
     transport: &mut Transport,
-    expected_host_id: Option<uuid::Uuid>,
-    interactive: bool,
-) -> Result<()> {
+    expected_host_id: Option<&str>,
+    mode: Mode,
+) -> Result<Greeting> {
     transport.send(&ClientMessage::hello())?;
-    match transport.receive(if interactive {
+    // Other modes' connection deadline bounds this too.
+    match transport.receive(if mode == Mode::Attach {
         HANDSHAKE_TIMEOUT
     } else {
-        Duration::from_secs(30)
+        timing().connect_timeout
     })? {
-        ServerMessage::Welcome { version, host_id } if version == PROTOCOL_VERSION => {
+        ServerMessage::Welcome { version, host_id } => {
+            // Before anything else: a host that is not the intended one is
+            // neither used nor replaced.
             if let Some(expected) = expected_host_id {
-                if host_id != expected.to_string() {
-                    bail!("host identity changed (expected {expected}, received {host_id}); reconnect to the intended host before using this session");
+                if host_id != expected {
+                    return Err(unresolvable(format!("host identity changed (expected {expected}, received {host_id}); reconnect to the intended host before using this session")));
                 }
             }
-            Ok(())
+            match version.cmp(&PROTOCOL_VERSION) {
+                Ordering::Equal => Ok(Greeting::Ready { host_id }),
+                Ordering::Less => Ok(Greeting::Older { version }),
+                Ordering::Greater => Err(unresolvable(format!(
+                    "protocol version mismatch: cherry-host speaks version {version}, this cherry speaks version {PROTOCOL_VERSION}; install the same Cherry version on both machines"
+                ))),
+            }
         }
-        ServerMessage::Welcome { version, .. } => bail!(
-            "protocol version mismatch: cherry-host speaks version {version}, this cherry speaks version {PROTOCOL_VERSION}; install the same Cherry version on both machines"
-        ),
-        ServerMessage::Error { code, message } if code == error_code::VERSION_MISMATCH => bail!(
-            "host rejected request ({code}): {message}; this cherry speaks protocol version {PROTOCOL_VERSION}. Install the same Cherry version on both machines"
-        ),
-        message => unexpected("welcome", message),
+        // A host older than protocol 4 refuses a Hello of another version
+        // outright; it cannot be replaced.
+        ServerMessage::Error { code, message } if code == error_code::VERSION_MISMATCH => {
+            Err(unresolvable(format!(
+                "host rejected request ({code}): {message}; this cherry speaks protocol version {PROTOCOL_VERSION}. Install the same Cherry version on both machines"
+            )))
+        }
+        message => {
+            unexpected("welcome", message)?;
+            unreachable!()
+        }
+    }
+}
+
+/// Ask a host that welcomed us with an older `version` to make way. On its
+/// Ok it no longer listens and has released its lock: a new host may start.
+/// A host answers the first Replace and exits, so when several clients ask
+/// at once (as an updated app's tabs reconnect), the others may see it end
+/// the connection instead; connecting again finds whichever host follows.
+/// An Error is a refusal, and the host keeps running.
+fn replace(transport: &mut Transport, version: u32) -> Result<()> {
+    let context = || {
+        format!("could not replace the cherry-host speaking protocol {version} (this cherry speaks protocol {PROTOCOL_VERSION})")
+    };
+    transport
+        .send(&ClientMessage::Replace)
+        .with_context(context)?;
+    match transport
+        .receive_unless_closed(RPC_TIMEOUT)
+        .with_context(context)?
+    {
+        Some(ServerMessage::Ok) | None => Ok(()),
+        // A refusal: the host keeps running, and asking again changes nothing.
+        Some(message) => Err(unresolvable(format!(
+            "{}: {:#}",
+            context(),
+            unexpected("replace acknowledgement", message).unwrap_err()
+        ))),
     }
 }
 
@@ -364,16 +643,28 @@ const LOCALE_VARIABLES: &[&str] = &[
     "LC_TIME",
 ];
 
-/// The locale and time zone of the invoking terminal; everything else comes
-/// from the host.
+/// The variables given with `--env` (the last value of a name wins), and
+/// the locale and time zone of the invoking terminal; everything else comes
+/// from the host. A locale variable given explicitly replaces the terminal's
+/// locale as a whole, as a client's locale replaces the host's: an inherited
+/// LC_ALL would otherwise override the LANG asked for.
 fn session_environment(
     variables: impl IntoIterator<Item = (OsString, OsString)>,
+    explicit: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
-    variables
+    let explicit: BTreeMap<String, String> = explicit.into_iter().collect();
+    let sets_locale = explicit
+        .keys()
+        .any(|key| LOCALE_VARIABLES.contains(&key.as_str()));
+    let mut environment: BTreeMap<String, String> = variables
         .into_iter()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, _)| key == "TZ" || LOCALE_VARIABLES.contains(&key.as_str()))
-        .collect()
+        .filter(|(key, _)| {
+            key == "TZ" || (!sets_locale && LOCALE_VARIABLES.contains(&key.as_str()))
+        })
+        .collect();
+    environment.extend(explicit);
+    environment
 }
 
 pub(crate) fn unexpected(expected: &str, message: ServerMessage) -> Result<()> {
@@ -397,7 +688,67 @@ pub(crate) fn message_kind(message: &ServerMessage) -> &'static str {
         ServerMessage::Pong => "pong",
         ServerMessage::Ok => "ok",
         ServerMessage::Error { .. } => "error",
+        ServerMessage::Event { .. } => "event",
+        ServerMessage::ScreenText { .. } => "screen text",
     }
+}
+
+/// `NAME=VALUE`, where NAME is a portable environment variable name: a
+/// letter or underscore, then letters, digits and underscores.
+fn parse_env(value: &str) -> std::result::Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or("expected NAME=VALUE".to_string())?;
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(format!(
+            "invalid variable name {name:?}: use a letter or underscore, then letters, digits or underscores"
+        ));
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+/// `KEY=VALUE`, with a key of 1 to `MAX_TAG_KEY_BYTES` bytes.
+fn parse_tag(value: &str) -> std::result::Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or("expected KEY=VALUE".to_string())?;
+    if key.is_empty() || key.len() > MAX_TAG_KEY_BYTES {
+        return Err(format!(
+            "tag keys must be 1 to {MAX_TAG_KEY_BYTES} bytes long"
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+fn validate_owner(value: &str) -> std::result::Result<String, String> {
+    if value.len() > MAX_OWNER_BYTES {
+        return Err(format!("the owner is at most {MAX_OWNER_BYTES} bytes long"));
+    }
+    Ok(value.to_owned())
+}
+
+/// An absolute path of at most `MAX_SSH_CONTROL_PATH_BYTES` that ssh reads
+/// back unchanged once `%` is doubled: ssh's option parser splits at spaces,
+/// removes quotes and backslashes and (before OpenSSH 8.7) stops at `=`, and
+/// expands `${NAME}` with no way to escape it.
+pub(crate) fn validate_ssh_control_path(value: &str) -> std::result::Result<PathBuf, String> {
+    if !value.starts_with('/')
+        || value.len() > MAX_SSH_CONTROL_PATH_BYTES
+        || value.contains("${")
+        || value
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "\"'\\=".contains(c))
+    {
+        return Err(format!(
+            "expected an absolute path of at most {MAX_SSH_CONTROL_PATH_BYTES} bytes, without spaces, quotes, backslashes, '=', '${{' or control characters"
+        ));
+    }
+    Ok(PathBuf::from(value))
 }
 
 pub(crate) fn validate_host(value: &str) -> std::result::Result<String, String> {
@@ -448,22 +799,43 @@ mod tests {
     #[test]
     fn remote_command_quotes_socket_as_one_shell_argument() {
         assert_eq!(
-            remote_gateway_command(None, true).unwrap(),
+            remote_gateway_command(None, true, None).unwrap(),
             "cherry-host gateway"
         );
         assert_eq!(
-            remote_gateway_command(None, false).unwrap(),
+            remote_gateway_command(None, false, None).unwrap(),
             "cherry-host gateway --no-start"
         );
         let socket = Path::new("/tmp/it's $HOME; $(oops)");
         assert_eq!(
-            remote_gateway_command(Some(socket), true).unwrap(),
+            remote_gateway_command(Some(socket), true, None).unwrap(),
             "cherry-host gateway --socket '/tmp/it'\\''s $HOME; $(oops)'"
         );
         assert_eq!(
-            remote_gateway_command(Some(socket), false).unwrap(),
+            remote_gateway_command(Some(socket), false, None).unwrap(),
             "cherry-host gateway --no-start --socket '/tmp/it'\\''s $HOME; $(oops)'"
         );
+    }
+
+    #[test]
+    fn remote_command_passes_the_expected_host_identity_in_the_environment() {
+        let id = "0f0e8a52-0b5c-4d4b-9f8e-0c1d2e3f4a5b";
+        assert_eq!(
+            remote_gateway_command(None, true, Some(id)).unwrap(),
+            format!("env CHERRY_EXPECTED_HOST_ID='{id}' cherry-host gateway")
+        );
+        assert_eq!(
+            remote_gateway_command(Some(Path::new("/tmp/h.sock")), false, Some(id)).unwrap(),
+            format!(
+                "env CHERRY_EXPECTED_HOST_ID='{id}' cherry-host gateway --no-start --socket '/tmp/h.sock'"
+            )
+        );
+        // Whatever identity a host welcomed an attachment with stays one word.
+        assert_eq!(
+            remote_gateway_command(None, true, Some("it's $(odd)")).unwrap(),
+            "env CHERRY_EXPECTED_HOST_ID='it'\\''s $(odd)' cherry-host gateway"
+        );
+        assert!(remote_gateway_command(None, true, Some("a\0b")).is_err());
     }
 
     fn frame(message: &ServerMessage) -> Vec<u8> {
@@ -494,7 +866,11 @@ mod tests {
     #[test]
     fn gateway_preamble_skips_shell_output_split_across_reads() {
         let stream = b"Welcome to devbox\r\nlast login: never\nCHERRY-GATEWAY ";
-        let tail = [b"3\n".as_slice(), &frame(&ServerMessage::Ok)].concat();
+        let tail = [
+            format!("{PROTOCOL_VERSION}\n").as_bytes(),
+            &frame(&ServerMessage::Ok),
+        ]
+        .concat();
         for split in 0..stream.len() {
             let mut decoder = FrameDecoder::with_bytes(&stream[..split], true);
             assert!(decoder.next().unwrap().is_none());
@@ -506,7 +882,7 @@ mod tests {
         // Without junk the preamble is the first line.
         let mut decoder = FrameDecoder::with_bytes(
             &[
-                b"CHERRY-GATEWAY 3\n".as_slice(),
+                format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").as_bytes(),
                 &frame(&ServerMessage::Pong),
             ]
             .concat(),
@@ -517,10 +893,13 @@ mod tests {
 
     #[test]
     fn gateway_preamble_errors_name_the_cause() {
-        let mut decoder = FrameDecoder::with_bytes(b"CHERRY-GATEWAY 4\n", true);
+        let other = PROTOCOL_VERSION + 1;
+        let mut decoder =
+            FrameDecoder::with_bytes(format!("CHERRY-GATEWAY {other}\n").as_bytes(), true);
         let error = decoder.next().unwrap_err().to_string();
         assert!(
-            error.contains("version 4") && error.contains("version 3"),
+            error.contains(&format!("version {other}"))
+                && error.contains(&format!("version {PROTOCOL_VERSION}")),
             "{error}"
         );
 
@@ -544,7 +923,9 @@ mod tests {
         // Harmless shell output, then the connection closed or went quiet.
         let mut decoder = FrameDecoder::with_bytes(b"Welcome to devbox\nLast login\n", true);
         assert!(decoder.next().unwrap().is_none());
-        let closed = decoder.closed_error(true).to_string();
+        let closed = decoder
+            .closed_error(transport::SSH_ERRORS_SHOWN)
+            .to_string();
         assert!(
             closed.contains("closed before cherry-host gateway started"),
             "{closed}"
@@ -568,10 +949,13 @@ mod tests {
             quiet.timeout_error().to_string(),
             "timed out waiting for cherry-host gateway to start"
         );
-        assert!(!quiet.closed_error(true).to_string().contains("printed"));
+        assert!(!quiet
+            .closed_error(transport::SSH_ERRORS_SHOWN)
+            .to_string()
+            .contains("printed"));
         let local = FrameDecoder::with_bytes(b"", false);
         assert_eq!(
-            local.closed_error(false).to_string(),
+            local.closed_error("").to_string(),
             "host connection closed unexpectedly"
         );
         assert_eq!(
@@ -583,6 +967,9 @@ mod tests {
     #[test]
     fn attachment_timing_defaults_to_the_protocol() {
         let timing = timing::timing();
+        assert_eq!(timing.connect_timeout, transport::CONNECT_TIMEOUT);
+        assert_eq!(timing.quiet_wait, control::QUIET_WAIT);
+        assert_eq!(control::QUIET_WAIT, RPC_TIMEOUT);
         assert_eq!(
             timing.heartbeat_interval,
             cherry_protocol::HEARTBEAT_INTERVAL
@@ -662,27 +1049,292 @@ mod tests {
         assert_eq!(error.exit_code(), 2);
     }
 
+    fn terminal_environment() -> impl Iterator<Item = (OsString, OsString)> {
+        [
+            ("LANG", "en_GB.UTF-8"),
+            ("LC_CTYPE", "UTF-8"),
+            ("LC_ALL", "C"),
+            ("LC_TIME", "en_DK.UTF-8"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("LC_TERMINAL_VERSION", "3.5.0"),
+            ("TZ", "Europe/Rome"),
+            ("PATH", "/bin"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("CHERRY_PROCESS_ID", "7"),
+            ("LANGUAGE", "it"),
+        ]
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .into_iter()
+    }
+
+    fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
     #[test]
     fn sessions_receive_only_locale_and_time_zone() {
-        let environment = session_environment(
-            [
-                ("LANG", "en_GB.UTF-8"),
-                ("LC_CTYPE", "UTF-8"),
-                ("LC_ALL", "C"),
-                ("LC_TIME", "en_DK.UTF-8"),
-                ("LC_TERMINAL", "iTerm2"),
-                ("LC_TERMINAL_VERSION", "3.5.0"),
-                ("TZ", "Europe/Rome"),
-                ("PATH", "/bin"),
-                ("SSH_AUTH_SOCK", "/tmp/agent"),
-                ("CHERRY_PROCESS_ID", "7"),
-                ("LANGUAGE", "it"),
-            ]
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-        );
+        let environment = session_environment(terminal_environment(), []);
         assert_eq!(
             environment.keys().collect::<Vec<_>>(),
             ["LANG", "LC_ALL", "LC_CTYPE", "LC_TIME", "TZ"]
+        );
+    }
+
+    #[test]
+    fn explicit_variables_win_and_an_explicit_locale_replaces_the_terminals() {
+        // Anything with a valid name, the last value of a name winning.
+        let environment = session_environment(
+            terminal_environment(),
+            pairs(&[
+                ("CHERRY_PROCESS_ID", "1"),
+                ("TERM", "xterm-ghostty"),
+                ("CHERRY_PROCESS_ID", "2"),
+                ("TZ", "UTC"),
+                ("EMPTY", ""),
+            ]),
+        );
+        let expected = pairs(&[
+            ("CHERRY_PROCESS_ID", "2"),
+            ("EMPTY", ""),
+            ("LANG", "en_GB.UTF-8"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "UTF-8"),
+            ("LC_TIME", "en_DK.UTF-8"),
+            ("TERM", "xterm-ghostty"),
+            ("TZ", "UTC"),
+        ]);
+        assert_eq!(environment.into_iter().collect::<Vec<_>>(), expected);
+
+        // The terminal's LC_ALL would override the LANG asked for.
+        let environment = session_environment(
+            terminal_environment(),
+            pairs(&[("LANG", "it_IT.UTF-8"), ("LC_TERMINAL", "Cherry")]),
+        );
+        let expected = pairs(&[
+            ("LANG", "it_IT.UTF-8"),
+            ("LC_TERMINAL", "Cherry"),
+            ("TZ", "Europe/Rome"),
+        ]);
+        assert_eq!(environment.into_iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn new_options_parse_repeatedly_and_reject_invalid_names() {
+        let cli = Cli::try_parse_from([
+            "cherry",
+            "new",
+            "--cwd=/work",
+            "--env",
+            "A=1=2",
+            "--env=_B9=",
+            "--owner=-dev.cherry",
+            "--tag",
+            "cherry.tab=T",
+            "--tag=-odd=",
+            "--",
+            "sh",
+        ])
+        .unwrap()
+        .validate()
+        .unwrap();
+        let Action::New {
+            env,
+            owner,
+            tags,
+            command,
+            ..
+        } = cli.command
+        else {
+            panic!("not new");
+        };
+        assert_eq!(env, pairs(&[("A", "1=2"), ("_B9", "")]));
+        assert_eq!(owner.as_deref(), Some("-dev.cherry"));
+        assert_eq!(tags, pairs(&[("cherry.tab", "T"), ("-odd", "")]));
+        assert_eq!(command, ["sh"]);
+
+        for bad in ["NOVALUE", "=x", "1A=x", "A-B=x", "A B=x", "É=x"] {
+            let error =
+                Cli::try_parse_from(["cherry", "new", "--cwd=/", "--env", bad]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{bad:?}");
+        }
+        let long_key = format!("{}=v", "k".repeat(MAX_TAG_KEY_BYTES + 1));
+        for bad in ["novalue", "=v", long_key.as_str()] {
+            let error =
+                Cli::try_parse_from(["cherry", "new", "--cwd=/", "--tag", bad]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{bad:?}");
+        }
+        // A missing value is an error, never the next option taken as one;
+        // a value starting with `-` needs the `--option=value` form.
+        for arguments in [
+            &["--owner", "--name", "x"][..],
+            &["--owner", "-dev.cherry"],
+            &["--tag", "--x=1"],
+            &["--tag", "-odd=v"],
+            &["--env", "--name"],
+            &["--owner"],
+            &["--tag"],
+            &["--env"],
+        ] {
+            let error = Cli::try_parse_from(["cherry", "new", "--cwd=/"].iter().chain(arguments))
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{arguments:?}");
+        }
+        let max_key = format!("{}=v", "k".repeat(MAX_TAG_KEY_BYTES));
+        assert!(Cli::try_parse_from(["cherry", "new", "--cwd=/", "--tag", &max_key]).is_ok());
+        let owner = "o".repeat(MAX_OWNER_BYTES);
+        assert!(Cli::try_parse_from(["cherry", "new", "--cwd=/", "--owner", &owner]).is_ok());
+        let owner = "o".repeat(MAX_OWNER_BYTES + 1);
+        let error =
+            Cli::try_parse_from(["cherry", "new", "--cwd=/", "--owner", &owner]).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+
+        // The protocol's limits on all tags together are usage errors too.
+        let mut arguments = vec!["cherry".to_string(), "new".into(), "--cwd=/".into()];
+        arguments.extend((0..=cherry_protocol::MAX_TAGS).map(|n| format!("--tag=k{n}=v")));
+        let error = Cli::try_parse_from(&arguments)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("at most"), "{error}");
+        // A key given twice counts once.
+        let arguments: Vec<String> = ["cherry", "new", "--cwd=/"]
+            .into_iter()
+            .map(String::from)
+            .chain((0..=cherry_protocol::MAX_TAGS).map(|_| "--tag=k=v".to_string()))
+            .collect();
+        assert!(Cli::try_parse_from(&arguments).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn control_parses_with_global_options_and_takes_no_arguments() {
+        let cli = Cli::try_parse_from([
+            "cherry",
+            "--host",
+            "studio",
+            "--ssh-control-path",
+            "/tmp/cherry-501/%h",
+            "--expected-host-id",
+            "12345678-1234-4234-8234-123456789abc",
+            "control",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Action::Control));
+        assert_eq!(
+            cli.ssh_control_path.as_deref(),
+            Some(Path::new("/tmp/cherry-501/%h"))
+        );
+        assert!(Cli::try_parse_from(["cherry", "control", "--host", "studio"]).is_ok());
+        let error = Cli::try_parse_from(["cherry", "control", "extra"]).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn ssh_control_path_needs_host_and_a_path_ssh_reads_back_unchanged() {
+        let parse = |arguments: &[&str]| {
+            Cli::try_parse_from(std::iter::once(&"cherry").chain(arguments)).and_then(Cli::validate)
+        };
+        for arguments in [
+            &["--ssh-control-path", "/tmp/cp", "list"][..],
+            &["list", "--ssh-control-path", "/tmp/cp"],
+            &["start", "--ssh-control-path", "/tmp/cp"],
+        ] {
+            let error = parse(arguments).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{arguments:?}");
+            assert!(error.to_string().contains("needs --host"), "{error}");
+        }
+        // Global options go anywhere.
+        for arguments in [
+            &["--ssh-control-path", "/tmp/cp", "list", "--host", "h"][..],
+            &["list", "--host", "h", "--ssh-control-path", "/tmp/cp"],
+            &["--host", "h", "control", "--ssh-control-path", "/tmp/cp"],
+        ] {
+            let cli = parse(arguments).unwrap();
+            assert_eq!(cli.host.as_deref(), Some("h"), "{arguments:?}");
+            assert_eq!(
+                cli.ssh_control_path.as_deref(),
+                Some(Path::new("/tmp/cp")),
+                "{arguments:?}"
+            );
+        }
+        let longest = format!("/{}", "x".repeat(MAX_SSH_CONTROL_PATH_BYTES - 1));
+        let too_long = format!("{longest}x");
+        for good in [
+            "/tmp/cp",
+            "/tmp/cherry-501/%h-%p.%C",
+            "/var/folders/x/T/cherry~ssh/ä#1,+@:",
+            "/tmp/$HOME",
+            longest.as_str(),
+        ] {
+            assert_eq!(
+                validate_ssh_control_path(good).map(PathBuf::into_os_string),
+                Ok(OsString::from(good)),
+                "{good:?}"
+            );
+            let cli = Cli::try_parse_from([
+                "cherry",
+                "--host",
+                "studio",
+                "--ssh-control-path",
+                good,
+                "list",
+            ]);
+            assert!(cli.is_ok(), "{good:?}");
+        }
+        for bad in [
+            "",
+            "relative/cp",
+            "~/cp",
+            too_long.as_str(),
+            "/tmp/a b",
+            "/tmp/a\tb",
+            "/tmp/a\nb",
+            "/tmp/a\0b",
+            "/tmp/\"cp\"",
+            "/tmp/'cp'",
+            "/tmp/a\\b",
+            "/tmp/a=b",
+            "/tmp/${HOME}",
+            "/tmp/\u{a0}",
+        ] {
+            assert!(validate_ssh_control_path(bad).is_err(), "{bad:?}");
+        }
+        let error = Cli::try_parse_from([
+            "cherry",
+            "--host",
+            "studio",
+            "--ssh-control-path",
+            "relative",
+            "list",
+        ])
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        // Not UTF-8.
+        use std::os::unix::ffi::OsStrExt;
+        let error = Cli::try_parse_from([
+            OsString::from("cherry"),
+            "--host".into(),
+            "studio".into(),
+            "--ssh-control-path".into(),
+            std::ffi::OsStr::from_bytes(b"/tmp/\xff").into(),
+            "list".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn ssh_control_path_option_doubles_percent_signs() {
+        assert_eq!(
+            transport::ssh_control_path_option(Path::new("/tmp/cp")).unwrap(),
+            "ControlPath=/tmp/cp"
+        );
+        assert_eq!(
+            transport::ssh_control_path_option(Path::new("/tmp/%h/%%x%")).unwrap(),
+            "ControlPath=/tmp/%%h/%%%%x%%"
         );
     }
 

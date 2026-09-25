@@ -11,8 +11,10 @@ description: Build, launch, and observe Cherry changes end-to-end on this machin
 ./script/build_and_run.sh verify   # builds, packages dist/CherryDev.app, opens it, pgrep-checks
 ```
 
-CherryDev.app has its own bundle ID (`app.cherry.CherryDev`) and UserDefaults domain, so it
-coexists with the user's production Cherry.app. The script pkills only prior CherryDev instances.
+CherryDev.app has its own bundle ID (`app.cherry.CherryDev`), UserDefaults domain, Application
+Support folder (`~/Library/Application Support/CherryDev`: saved tabs, notes, shell integration)
+and URL scheme (`cherry-dev`), so it coexists with the user's production Cherry.app. Its
+persistent sessions are owned by `CherryDev`. The script pkills only prior CherryDev instances.
 
 The script first runs `Scripts/build-host debug` and copies `cherry` and `cherry-host` into
 `CherryDev.app/Contents/MacOS/`, so it needs Rust (`cargo`, `rustc`); the first build also
@@ -25,15 +27,21 @@ directly (or with `open --env`).
 
 ## Persistent sessions in CherryDev
 
-- **This Mac** uses the default socket `/tmp/cherry-host-$UID/host.sock`, the same daemon as the
-  user's installed Cherry. Never `shutdown`, `kill` or remove sessions there, and never touch that
-  directory. A running daemon keeps its old code after a rebuild, so host changes need a fresh one.
+- CherryDev's local tabs are persistent sessions by default (Settings › Sessions). **This Mac**
+  uses the default socket `/tmp/cherry-host-$UID/host.sock`, the same daemon as the user's
+  installed Cherry. Never `shutdown`, `kill` or remove sessions there, and never touch that
+  directory. A rebuilt CherryDev whose helpers speak a newer protocol replaces that daemon (the
+  user's sessions carry on, but the user's older Cherry can then no longer use it), and one of the
+  same protocol keeps the old daemon's code, so test host changes on a private daemon.
 - For an isolated daemon, launch the binary directly (`open` drops exported variables) with a
-  socket in a private directory:
-  `dir=$(mktemp -d); chmod 700 "$dir"; CHERRY_HOST_SOCKET="$dir/host.sock" dist/CherryDev.app/Contents/MacOS/CherryDev &`
-  Its state goes to `~/Library/Application Support/cherry-host/<hash>/`. When done, run
-  `dist/CherryDev.app/Contents/MacOS/cherry --socket "$dir/host.sock" shutdown` after killing
-  its sessions, then delete that state directory.
+  private `HOME` and sockets in a private directory:
+  `dir=$(mktemp -d); chmod 700 "$dir"; mkdir "$dir/home"; HOME="$dir/home" CFFIXED_USER_HOME="$dir/home" CHERRY_HOST_SOCKET="$dir/host.sock" CHERRY_CONTROL_SOCKET="$dir/control.sock" dist/CherryDev.app/Contents/MacOS/CherryDev &`
+  The daemon's state then goes under that `HOME`, and so do CherryDev's saved tabs. When done,
+  quit CherryDev and run
+  `python3 Scripts/cherry_private_host.py stop "$dir" --cli dist/CherryDev.app/Contents/MacOS/cherry`,
+  which kills and
+  removes every session there, shuts the daemon down, kills leftover holders and adapters, and
+  deletes the directory. Its sessions' holders outlive a killed daemon, so never just kill it.
 - The CLI can be driven headlessly the same way (`cherry --socket "$dir/host.sock" new|list|attach|kill`);
   `attach --status-file PATH` records how an attachment ended. Also give a headless daemon a private
   `HOME` (`mkdir "$dir/home"; HOME="$dir/home" cherry --socket "$dir/host.sock" …`): the daemon keeps
@@ -61,7 +69,12 @@ directly (or with `open --env`).
 `swift test --filter <prefix>` only — full suite has ~94 PTY-environment noise failures.
 Prefer `--no-parallel` for full-suite runs (AGENTS.md).
 
-Hosted sessions: `swift test --no-parallel --filter HostedSession`. The real-host test needs
-`Scripts/build-host debug` first:
-`CHERRY_TEST_HOST_INTEGRATION=1 swift test --no-parallel --filter HostedSessionRealHost`.
-Rust host checks are listed under Validation in `Host/README.md`.
+Hosted and persistent sessions, as CI runs them: `Scripts/test-session-suites unit` (each
+group — PersistentLocal, PersistentTab, WorkspacePersistence, WorkspaceRestore, HostControl,
+HostedSession, HostedLaunchSpec, NativeSurfaceRelaunch, MultiplexerSafety, AgentInputSafety,
+SessionCloseFlow, AppIdentity — on its own) and `Scripts/test-session-suites real-host` (every
+`*RealHost*` test, each on its own daemon with a private socket and `HOME`; needs
+`Scripts/build-host debug`, sets `CHERRY_TEST_HOST_INTEGRATION=1`, fails on any skip). A new
+session suite must be named after a group in that script. Swift Testing's `--filter` matches
+source file names as well as test names. Rust host checks are listed under Validation in
+`Host/README.md`.

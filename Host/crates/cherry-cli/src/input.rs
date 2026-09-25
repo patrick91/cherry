@@ -9,8 +9,8 @@ pub const ESCAPE_WAIT: Duration = Duration::from_millis(25);
 /// After the detach key, wait this long for a second press. Pressing it twice
 /// in a row sends the key itself (Vim's Ctrl-], or a nested attach) instead.
 pub const REPEAT_WAIT: Duration = Duration::from_millis(400);
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_SEQUENCE: usize = 64;
 /// Kitty keyboard protocol lock modifiers: Caps Lock and Num Lock.
 const LOCK_MODIFIERS: u32 = 64 | 128;

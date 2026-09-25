@@ -1,26 +1,35 @@
+//! A session as the daemon serves it. The session itself (its PTY, program,
+//! terminal state and output offset) lives in a holder process (see
+//! `holder`); here, one worker thread per session owns the holder link and
+//! every attachment: their outboxes, lag and resync, the shared grid and its
+//! replacements, the choice of who answers queries, and input backpressure.
+//! What the worker needs from the terminal (snapshots) it asks the holder
+//! for, and replies come in order with the output, each at exactly the
+//! offset its bytes show.
 use crate::{
-    daemon, environment,
+    daemon::{self, Host},
+    environment,
+    holder::LINK_FD,
+    link::{self, kind, Frame},
     outbox::{Outbox, Output, Push},
-    processes,
+    paths, screen,
     signals::{self, Wake},
-    stream::{Batch, DisplayStream},
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, valid_size, AttachReason, ServerMessage, SessionInfo, SessionState,
+    encode_frame, error_code, valid_size, AttachReason, ForegroundProcess, ProgressState,
+    ServerMessage, SessionEvent, SessionInfo, SessionState, MAX_SCREEN_TEXT_BYTES,
     MAX_SNAPSHOT_BYTES,
 };
-use cherry_vt::Terminal;
-use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::OpenOptions,
-    os::unix::{fs::OpenOptionsExt, io::AsRawFd, net::UnixStream, process::CommandExt},
-    path::PathBuf,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, io::AsRawFd, net::UnixStream, process::CommandExt},
+    path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender},
-        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -32,28 +41,45 @@ use uuid::Uuid;
 /// resumes below the low mark.
 pub const INPUT_HIGH_WATER: usize = 1024 * 1024;
 pub const INPUT_LOW_WATER: usize = 256 * 1024;
-/// Terminal replies waiting for a child that never reads stdin are bounded.
-const MAX_PENDING_REPLIES: usize = 1024 * 1024;
 /// Grid changes requested by clients apply once the size has settled.
 const GRID_SETTLE: Duration = Duration::from_millis(75);
 /// Workers are woken by events; this only bounds a missed wakeup.
 const IDLE_WAIT: Duration = Duration::from_secs(60);
-/// Session members are not our children, so their exits are polled while a
-/// termination is in progress.
-const TERMINATION_POLL: Duration = Duration::from_millis(50);
 const RESYNC_RETRY: Duration = Duration::from_secs(1);
+/// How long a new holder may take to start its session.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes taken from the holder link per pass, so commands keep a turn.
+const LINK_READ: usize = 4 * 1024 * 1024;
+/// How long a removed session's holder gets to take its last frame.
+const REMOVE_FLUSH: Duration = Duration::from_secs(1);
+/// Callers sharing one screen request, at most: beyond them the holder is
+/// not answering, and more are turned away rather than kept waiting.
+const SCREEN_WAITERS: usize = 64;
+/// Screen requests (each of its own kind: with or without the history, and
+/// its `max_lines`) a holder has at most: beyond them it is not answering,
+/// and callers of another kind are turned away rather than asking it more.
+const SCREEN_REQUESTS: usize = 8;
 
 /// A validated request for a new session.
 pub struct Launch {
     pub name: String,
     pub cwd: PathBuf,
+    /// The session's `PWD`: `cwd` as the client named it, when it could
+    /// (see `environment::logical_cwd`).
+    pub pwd: PathBuf,
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+    /// Who created the session, and the metadata they keep with it.
+    pub owner: Option<String>,
+    pub tags: BTreeMap<String, String>,
     /// `SSH_AUTH_SOCK` for the session: the link clients keep pointed at
     /// their current agent.
     pub agent_link: PathBuf,
+    /// The `Create` it answers, kept by the holder so that a daemon adopting
+    /// the session keeps retries idempotent.
+    pub receipt: link::Receipt,
 }
 
 pub struct Session {
@@ -62,6 +88,10 @@ pub struct Session {
     wake: Arc<Wake>,
     kill_requested: Arc<AtomicBool>,
     pub input: Arc<InputGate>,
+    /// Whether a holder is connected.
+    linked: Arc<AtomicBool>,
+    /// Lets the worker begin (see `start`).
+    start: Mutex<Option<SyncSender<()>>>,
 }
 
 pub enum Command {
@@ -82,21 +112,46 @@ pub enum Command {
         lease: u64,
         data: Vec<u8>,
     },
+    /// Input without an attachment (`SendInput`): delivered whatever
+    /// becomes of the connection that sent it.
+    Send {
+        data: Vec<u8>,
+    },
+    /// Read the screen as text; the reply is a `ScreenText` or an `Error`.
+    Screen {
+        scrollback: bool,
+        max_lines: Option<u32>,
+        reply: SyncSender<ServerMessage>,
+    },
+    /// Rename or retag the session; acknowledged once applied (true), or
+    /// once found removed (false).
+    Update {
+        name: Option<String>,
+        tags: Option<BTreeMap<String, String>>,
+        ack: SyncSender<bool>,
+    },
     Resize {
         lease: u64,
         cols: u16,
         rows: u16,
     },
     /// A voluntary detach. It follows the lease's earlier input through the
-    /// command queue, and that input is still delivered.
+    /// command queue and the holder link, and that input is still
+    /// delivered.
     Detach {
         lease: u64,
         ack: SyncSender<()>,
     },
+    /// Forget the exited session: its holder exits, and so does the
+    /// worker, before the acknowledgement.
+    Remove {
+        ack: SyncSender<()>,
+    },
 }
 
-/// Input accepted from connections but not yet written to the PTY, shared so
-/// connections can stop reading while the child is not consuming it.
+/// Input accepted from connections but not yet written to the PTY (the
+/// holder acknowledges what it wrote), shared so connections can stop
+/// reading while the child is not consuming it.
 #[derive(Default)]
 pub struct InputGate {
     pending: Mutex<usize>,
@@ -173,115 +228,211 @@ impl Attachment {
     }
 }
 
-/// Bytes waiting for the PTY. Terminal replies (no lease) outlive controller
-/// leases. User input from a lease is discarded when that controller is
-/// taken over or disconnects abnormally, but delivered after a detach.
-#[derive(Default)]
-struct PendingInput {
-    chunks: VecDeque<InputChunk>,
-    len: usize,
-    user_len: usize,
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
-struct InputChunk {
-    lease: Option<u64>,
-    user: bool,
-    bytes: VecDeque<u8>,
+/// The file this daemon was started from, when it started: its device and
+/// inode.
+static EXECUTABLE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+
+/// Note which file this daemon runs from, so that a replacement (an update
+/// installed over it) can be told apart later.
+pub fn note_executable() {
+    let _ = EXECUTABLE.set(
+        installed_executable()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| (meta.dev(), meta.ino())),
+    );
 }
 
-impl PendingInput {
-    fn push(&mut self, lease: Option<u64>, user: bool, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.len += bytes.len();
-        if user {
-            self.user_len += bytes.len();
-        }
-        if let Some(last) = self
-            .chunks
-            .back_mut()
-            .filter(|chunk| chunk.lease == lease && chunk.user == user)
-        {
-            last.bytes.extend(bytes);
-        } else {
-            self.chunks.push_back(InputChunk {
-                lease,
-                user,
-                bytes: bytes.iter().copied().collect(),
-            });
+/// Where this daemon's executable is now. macOS follows it when it (or the
+/// app bundle holding it) moves; elsewhere it is the path it was started
+/// from.
+fn installed_executable() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = crate::processes::own_executable() {
+        return Ok(path);
+    }
+    let path = std::env::current_exe().context("locating cherry-host")?;
+    if std::fs::metadata(&path).is_err() {
+        bail!(
+            "this host's executable {} was removed; restart the host to start new sessions (running ones carry on)",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// The program a new holder runs. On Linux it is this daemon's own image
+/// (`/proc/self/exe`), even after the installed file was replaced or
+/// removed, as package upgrades do. Elsewhere it is the executable at
+/// `installed_executable`, which, if another build was installed over this
+/// one, is that build: the link allows it (see `link`, `Launch`).
+fn holder_command() -> Result<std::process::Command> {
+    #[cfg(target_os = "linux")]
+    {
+        let image = Path::new("/proc/self/exe");
+        if std::fs::symlink_metadata(image).is_ok() {
+            let mut command = std::process::Command::new(image);
+            // What ps shows: the installed path rather than the alias.
+            if let Ok(path) = std::env::current_exe() {
+                let path = path.as_os_str().as_bytes();
+                let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+                command.arg0(std::ffi::OsStr::from_bytes(path));
+            }
+            return Ok(command);
         }
     }
+    let path = installed_executable()?;
+    let identity = std::fs::metadata(&path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()));
+    if let Some(Some(started)) = EXECUTABLE.get() {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if identity != Some(*started) && !REPORTED.swap(true, Ordering::SeqCst) {
+            daemon::log(format_args!(
+                "{} now holds another build than this host's; new sessions run that build",
+                path.display()
+            ));
+        }
+    }
+    Ok(std::process::Command::new(path))
+}
 
-    /// Drop a lease's unsent input; returns the user bytes removed.
-    fn discard_lease(&mut self, lease: u64) -> usize {
-        let mut removed = 0;
-        self.chunks.retain(|chunk| {
-            if chunk.lease == Some(lease) {
-                removed += chunk.bytes.len();
-                false
-            } else {
-                true
+/// Start a holder for a new session and hand it the launch: returns the
+/// link, and the holder's first frame (`HolderHello`).
+fn start_holder(
+    socket: &Path,
+    launch: &link::Launch,
+    cwd: &Path,
+    env: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(UnixStream, Frame)> {
+    let (ours, theirs) = UnixStream::pair().context("creating the session's link")?;
+    let mut command = holder_command()?;
+    command
+        .arg("hold")
+        .arg("--socket")
+        .arg(socket)
+        // Like the daemon: neutral variables only, and no directory pinned.
+        .env_clear()
+        .envs(environment::inherited_vars())
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let fd = theirs.as_raw_fd();
+    let limit = daemon::child_fd_limit();
+    unsafe {
+        command.pre_exec(move || {
+            // Never the daemon's child, so that it outlives the daemon and a
+            // daemon crash cannot take it along: a session of its own, and a
+            // grandchild that init adopts.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
             }
+            match libc::fork() {
+                -1 => return Err(std::io::Error::last_os_error()),
+                0 => {}
+                _ => libc::_exit(0),
+            }
+            // Only the link is inherited, as descriptor 3. Without accept4,
+            // macOS sets close-on-exec on an accepted connection only after
+            // accept returns, so another thread's client could otherwise
+            // leak in.
+            environment::cloexec_from_3();
+            if fd == LINK_FD {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+            } else if libc::dup2(fd, LINK_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The daemon raises its own descriptor limit; holders, and the
+            // sessions they start, get the limit the user had.
+            if let Some(limit) = limit {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+            Ok(())
         });
-        self.len -= removed;
-        self.user_len -= removed;
-        removed
     }
-
-    /// Keep a detached lease's input for delivery.
-    fn keep_lease(&mut self, lease: u64) {
-        for chunk in &mut self.chunks {
-            if chunk.lease == Some(lease) {
-                chunk.lease = None;
-            }
+    let mut intermediate = command.spawn().context("starting the session's holder")?;
+    drop(theirs);
+    let _ = intermediate.wait();
+    let mut stream = ours;
+    stream.set_read_timeout(Some(LAUNCH_TIMEOUT))?;
+    stream.set_write_timeout(Some(LAUNCH_TIMEOUT))?;
+    link::write_blocking(
+        &mut stream,
+        &link::encode(
+            kind::LAUNCH,
+            launch,
+            &link::launch_data(cwd.as_os_str().as_bytes(), env),
+        ),
+    )
+    .context("handing the session to its holder")?;
+    match link::read_blocking(&mut stream).context("waiting for the session's holder")? {
+        Some(frame) if frame.kind == kind::HOLDER_HELLO => Ok((stream, frame)),
+        Some(frame) if frame.kind == kind::FAILED => {
+            bail!("{}", frame.meta::<link::Failed>()?.message)
         }
+        Some(frame) => bail!("the session's holder sent a frame of kind {}", frame.kind),
+        None => bail!("the session's holder exited before starting the session"),
     }
+}
 
-    /// Drop everything; returns the user bytes removed.
-    fn clear(&mut self) -> usize {
-        let user = self.user_len;
-        self.chunks.clear();
-        self.len = 0;
-        self.user_len = 0;
-        user
+fn foreground(foreground: link::Foreground) -> ForegroundProcess {
+    ForegroundProcess {
+        pid: foreground.pid,
+        name: foreground.name,
     }
+}
 
-    /// Write as much as the PTY accepts; returns the user bytes written.
-    fn write_to(&mut self, fd: libc::c_int) -> usize {
-        let mut written = 0;
-        while let Some(chunk) = self.chunks.front_mut() {
-            let bytes = chunk.bytes.make_contiguous();
-            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-            if n <= 0 {
-                break;
-            }
-            let n = n as usize;
-            chunk.bytes.drain(..n);
-            self.len -= n;
-            if chunk.user {
-                self.user_len -= n;
-                written += n;
-            }
-            if !chunk.bytes.is_empty() {
-                break;
-            }
-            self.chunks.pop_front();
-        }
-        written
-    }
+fn progress_state(state: &str) -> Option<ProgressState> {
+    Some(match state {
+        "remove" => ProgressState::Remove,
+        "set" => ProgressState::Set,
+        "error" => ProgressState::Error,
+        "indeterminate" => ProgressState::Indeterminate,
+        "pause" => ProgressState::Pause,
+        _ => return None,
+    })
+}
+
+/// A client event for a holder's `Event`.
+fn session_event(id: &str, event: link::Event) -> Option<SessionEvent> {
+    let id = id.to_string();
+    Some(match event {
+        link::Event::Bell => SessionEvent::Bell { id },
+        link::Event::Notification { title, body } => SessionEvent::Notification { id, title, body },
+        link::Event::Progress { state, value } => SessionEvent::Progress {
+            id,
+            state: progress_state(&state)?,
+            value: value.map(|value| value.min(100)),
+        },
+        link::Event::Exited { exit_code, signal } => SessionEvent::Exited {
+            id,
+            exit_code,
+            signal,
+        },
+    })
 }
 
 impl Session {
-    pub fn spawn(launch: Launch) -> Result<Arc<Self>> {
+    /// Start a new session in a holder of its own.
+    pub fn spawn(launch: Launch, host: &Arc<Host>) -> Result<Arc<Self>> {
         let Launch {
             name,
             cwd,
+            pwd,
             mut command,
             env,
             cols,
             rows,
+            owner,
+            tags,
             agent_link,
+            receipt,
         } = launch;
         if !valid_size(cols, rows) {
             bail!("terminal size must be 2–500 columns and 1–200 rows");
@@ -300,136 +451,155 @@ impl Session {
                 .unwrap_or_else(|| "/bin/sh".into());
             command = vec![shell.to_string_lossy().into_owned(), "-l".into()];
         }
-        let terminal = Terminal::new(cols, rows, 1024 * 1024)?;
-        let pair = native_pty_system().openpty(size(cols, rows))?;
-        let fd = pair
-            .master
-            .as_raw_fd()
-            .context("PTY implementation has no Unix descriptor")?;
-        // The one session worker owns all I/O. Nonblocking writes prevent a child
-        // which stops reading input from wedging termination or other sessions.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        let tty = pair.master.tty_name().context("PTY has no terminal name")?;
-        let slave = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(&tty)
-            .with_context(|| format!("opening {}", tty.display()))?;
-        drop(pair.slave);
         let id = Uuid::new_v4().to_string();
-        let (wake, wake_rx) = Wake::pair()?;
-        // Registered before the child exists, so its exit always wakes us.
-        signals::register(&wake);
-        let mut child = std::process::Command::new(&command[0]);
-        child
-            .args(&command[1..])
-            .env_clear()
-            .envs(environment::session_env(&id, &agent_link, &env))
-            .current_dir(&cwd)
-            .stdin(slave.try_clone()?)
-            .stdout(slave.try_clone()?)
-            .stderr(slave);
-        let limit = daemon::child_fd_limit();
-        unsafe {
-            child.pre_exec(move || {
-                // Start from the dispositions a login would have, whatever
-                // the daemon inherited (a nohup'd starter ignores SIGHUP).
-                for signal in [
-                    libc::SIGCHLD,
-                    libc::SIGHUP,
-                    libc::SIGINT,
-                    libc::SIGQUIT,
-                    libc::SIGTERM,
-                    libc::SIGALRM,
-                    libc::SIGTSTP,
-                    libc::SIGTTIN,
-                    libc::SIGTTOU,
-                ] {
-                    libc::signal(signal, libc::SIG_DFL);
-                }
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Only the terminal is inherited. Without accept4, macOS sets
-                // close-on-exec on an accepted connection only after accept
-                // returns, so another thread's client could otherwise leak in.
-                // Done before the limit drops: the sweep stops at the limit.
-                environment::cloexec_from_3();
-                // The daemon raises its own descriptor limit; sessions get the
-                // limit the user had.
-                if let Some(limit) = limit {
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-                }
-                Ok(())
-            });
-        }
-        let child = child
-            .spawn()
-            .with_context(|| format!("launching {}", command[0]))?;
-        let pid = child.id();
-        let info = Arc::new(Mutex::new(SessionInfo {
+        let env: Vec<(Vec<u8>, Vec<u8>)> = environment::session_env(&id, &agent_link, &env, &pwd)
+            .into_iter()
+            .map(|(key, value)| (key.into_encoded_bytes(), value.into_encoded_bytes()))
+            .collect();
+        let launch = link::Launch {
             id,
             name,
-            cwd: cwd.to_string_lossy().into(),
             command,
             cols,
             rows,
-            state: SessionState::Running,
-            pid: Some(pid),
-            exit_code: None,
+            owner,
+            tags,
+            created_at: now_millis(),
+            state_dir: host.state.to_string_lossy().into_owned(),
+            kill_grace_ms: daemon::config().kill_grace.as_millis() as u64,
+            receipt: Some(receipt),
+        };
+        let (stream, hello) = start_holder(&host.socket, &launch, &cwd, &env)?;
+        let version = hello.version;
+        // A new holder has kept nothing to report.
+        let (session, _) = Self::adopt(host, stream, hello.meta()?, version)?;
+        Ok(session)
+    }
+
+    /// Serve the session a holder registered (`HolderHello`) on `stream`.
+    /// Returns it, and what its holder kept while no daemon was connected,
+    /// to publish once the session is known. Its worker waits for `start`,
+    /// so that subscribers hear of the session before anything about it.
+    pub fn adopt(
+        host: &Arc<Host>,
+        stream: UnixStream,
+        hello: link::HolderHello,
+        version: u16,
+    ) -> Result<(Arc<Self>, Vec<SessionEvent>)> {
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        let link::HolderHello {
+            id,
+            session,
+            offset,
+            events,
+            receipt,
+            ..
+        } = hello;
+        let exit =
+            (!session.running).then(|| (session.exit_code.unwrap_or(1), session.exit_signal));
+        let info = Arc::new(Mutex::new(SessionInfo {
+            id: id.clone(),
+            name: session.name,
+            cwd: session.cwd,
+            command: session.command,
+            cols: session.cols,
+            rows: session.rows,
+            state: if session.running {
+                SessionState::Running
+            } else {
+                SessionState::Exited
+            },
+            pid: session.pid,
+            exit_code: session.exit_code.filter(|_| !session.running),
             attached: false,
-            exit_signal: None,
+            exit_signal: session.exit_signal.filter(|_| !session.running),
+            title: session.title,
+            pwd: session.pwd,
+            foreground: session.foreground.map(foreground),
+            clients: 0,
+            owner: session.owner,
+            tags: session.tags,
+            created_at: session.created_at,
+            alternate_screen: session.alternate_screen,
+            kitty_keyboard_flags: session.kitty_keyboard_flags,
+            // Off from a holder older than link version 4, which never
+            // reports it.
+            application_cursor_keys: session.application_cursor_keys,
+            // The holder keeps the Create's receipt for the next daemon.
+            request_id: receipt.map(|receipt| receipt.request_id),
         }));
+        let (wake, wake_rx) = Wake::pair()?;
         let (tx, rx) = mpsc::sync_channel(64);
         let kill_requested = Arc::new(AtomicBool::new(false));
         let input = Arc::new(InputGate::default());
+        let linked = Arc::new(AtomicBool::new(true));
+        let (start, started) = mpsc::sync_channel(1);
         let session = Arc::new(Self {
             info: info.clone(),
             tx,
             wake: wake.clone(),
             kill_requested: kill_requested.clone(),
             input: input.clone(),
+            linked: linked.clone(),
+            start: Mutex::new(Some(start)),
         });
         let worker = Worker {
+            id: id.clone(),
+            host: host.clone(),
             info,
-            master: pair.master,
-            _child: child,
-            pid: pid as libc::pid_t,
-            terminal,
             rx,
             wake,
             wake_rx,
-            attached: Vec::new(),
-            offset: 0,
-            pending_input: PendingInput::default(),
-            input,
-            display: DisplayStream::default(),
-            eof: false,
             kill_requested,
-            termination: None,
+            linked,
+            link: Some(HolderLink {
+                stream,
+                reader: link::Reader::default(),
+                writer: link::Writer::default(),
+                version,
+            }),
+            attached: Vec::new(),
+            input,
+            unacknowledged: 0,
+            offset,
             grid_due: None,
             typist: None,
+            next_req: 1,
+            requests: BTreeMap::new(),
+            waiting: VecDeque::new(),
+            resyncing: false,
+            exit,
+            removed: false,
+            removed_ack: None,
         };
-        if let Err(error) = thread::Builder::new()
+        let exited = exit.is_some();
+        let events = events
+            .into_iter()
+            .filter_map(|event| serde_json::from_value(event).ok())
+            .filter_map(|event| session_event(&id, event))
+            // An exit the hello does not report is not believed.
+            .filter(|event| exited || !matches!(event, SessionEvent::Exited { .. }))
+            .collect();
+        thread::Builder::new()
             .name("cherry-session".into())
-            .spawn(move || worker.run())
-        {
-            // The worker owns the child; without it nobody would reap or
-            // hang up the session, so end it now.
-            processes::kill_session(pid as libc::pid_t);
-            let _ = processes::reap(pid as libc::pid_t);
-            return Err(error).context("starting session worker");
+            .spawn(move || {
+                // Until started, or until the session is dropped unstarted.
+                let _ = started.recv();
+                worker.run()
+            })
+            .context("starting session worker")?;
+        Ok((session, events))
+    }
+
+    /// Let the worker serve the session, once it is registered and
+    /// announced.
+    pub fn start(&self) {
+        let start = self.start.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(start) = start {
+            let _ = start.send(());
         }
-        Ok(session)
     }
 
     /// Queue a command for the worker, waiting while its queue is full.
@@ -450,41 +620,38 @@ impl Session {
         self.wake();
     }
 
+    /// Whether its holder is connected.
+    pub fn is_linked(&self) -> bool {
+        self.linked.load(Ordering::SeqCst)
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.snapshot_info().state == SessionState::Running
+    }
+
+    /// Forget the exited session: its holder removes its manifest and
+    /// exits. Returns once the link is closed.
+    pub fn remove(&self) {
+        let (ack, acknowledged) = mpsc::sync_channel(1);
+        if self.send(Command::Remove { ack }).is_ok() {
+            let _ = acknowledged.recv();
+        }
+    }
+
     pub fn snapshot_info(&self) -> SessionInfo {
-        self.info.lock().unwrap().clone()
+        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
-fn size(cols: u16, rows: u16) -> PtySize {
-    PtySize {
-        cols,
-        rows,
-        pixel_width: 0,
-        pixel_height: 0,
+impl Drop for Session {
+    fn drop(&mut self) {
+        // The worker ends once every handle is gone.
+        self.wake();
     }
 }
 
 fn frame(message: &ServerMessage) -> Option<Arc<Vec<u8>>> {
     encode_frame(message).ok().map(Arc::new)
-}
-
-/// The terminal as a renderer stream, oldest history dropped to fit a frame.
-fn snapshot_bytes(terminal: &Terminal) -> Result<Vec<u8>> {
-    let raw = terminal.snapshot_limited(MAX_SNAPSHOT_BYTES)?;
-    Ok(DisplayStream::default().feed(&raw).display)
-}
-
-/// The terminal's screens without history (`Terminal::refresh`) as a
-/// renderer stream.
-fn refresh_bytes(terminal: &Terminal) -> Result<Vec<u8>> {
-    let raw = terminal.refresh()?;
-    if raw.len() > MAX_SNAPSHOT_BYTES {
-        bail!(
-            "the screen needs a {}-byte refresh; the limit is {MAX_SNAPSHOT_BYTES} bytes",
-            raw.len()
-        );
-    }
-    Ok(DisplayStream::default().feed(&raw).display)
 }
 
 fn attached_frame(
@@ -577,46 +744,157 @@ impl Replacement {
     }
 }
 
-/// An explicit kill in progress: SIGHUP, then SIGTERM after the grace period,
-/// then SIGKILL after another.
-struct Termination {
-    started: Instant,
-    stage: u8,
+/// A snapshot from the holder: the renderer stream that shows the output
+/// up to `offset`, for a grid of `size`.
+struct Snapshot {
+    bytes: Vec<u8>,
+    offset: u64,
+    size: (u16, u16),
+}
+
+/// An attach waiting for its snapshot.
+struct PendingAttach {
+    lease: u64,
+    cols: u16,
+    rows: u16,
+    takeover: bool,
+    answers_queries: bool,
+    outbox: Arc<Outbox>,
+    abort: UnixStream,
+    cancelled: Arc<AtomicBool>,
+    ack: SyncSender<bool>,
+    /// Whether its size changed the grid.
+    resized: bool,
+    /// Other attachments whose replacement for the new grid is full: they
+    /// get the same snapshot.
+    full_others: Vec<u64>,
+}
+
+/// What a request to the holder is for.
+enum Request {
+    Attach(PendingAttach),
+    /// Replacements for a new grid size (`full` or the screens only), for
+    /// these attachments.
+    Replace {
+        full: bool,
+        leases: Vec<u64>,
+    },
+    /// Resync snapshots for lagging attachments.
+    Resync {
+        leases: Vec<u64>,
+    },
+    /// The final screen for attachments lagging when the session exited;
+    /// the exit follows it.
+    Final {
+        leases: Vec<u64>,
+    },
+    Detach {
+        ack: SyncSender<()>,
+    },
+    /// The screen with or without its history, limited to `max_lines` or
+    /// not, for every caller that asked the same while it was pending.
+    /// `whole`: the holder is too old to limit the text itself.
+    Screen {
+        scrollback: bool,
+        max_lines: Option<u32>,
+        whole: bool,
+        replies: Vec<SyncSender<ServerMessage>>,
+    },
+}
+
+struct HolderLink {
+    stream: UnixStream,
+    reader: link::Reader,
+    writer: link::Writer,
+    /// The link version the holder registered with.
+    version: u16,
 }
 
 struct Worker {
+    id: String,
+    host: Arc<Host>,
     info: Arc<Mutex<SessionInfo>>,
-    master: Box<dyn MasterPty + Send>,
-    /// Kept for its handle; the worker reaps the leader itself.
-    _child: std::process::Child,
-    pid: libc::pid_t,
-    terminal: Terminal,
     rx: Receiver<Command>,
     wake: Arc<Wake>,
     wake_rx: UnixStream,
-    attached: Vec<Attachment>,
-    offset: u64,
-    pending_input: PendingInput,
-    input: Arc<InputGate>,
-    display: DisplayStream,
-    eof: bool,
     kill_requested: Arc<AtomicBool>,
-    termination: Option<Termination>,
+    linked: Arc<AtomicBool>,
+    link: Option<HolderLink>,
+    attached: Vec<Attachment>,
+    input: Arc<InputGate>,
+    /// Input bytes sent to the holder and not yet acknowledged.
+    unacknowledged: usize,
+    /// The output offset: where the holder's next output starts.
+    offset: u64,
     /// When to apply a settled grid change, and its target.
     grid_due: Option<(Instant, (u16, u16))>,
     /// Of the attachments whose terminal answers queries, the one that most
     /// recently sent input: it answers them (see `send_query`).
     typist: Option<u64>,
+    next_req: u64,
+    requests: BTreeMap<u64, Request>,
+    /// Attaches waiting for the one in progress: one at a time, so each
+    /// sees the grid the previous one left.
+    waiting: VecDeque<Command>,
+    /// A resync snapshot has been asked for.
+    resyncing: bool,
+    /// How the session ended, once it has.
+    exit: Option<(u32, Option<i32>)>,
+    removed: bool,
+    /// Acknowledges a `Remove` once the worker is gone.
+    removed_ack: Option<SyncSender<()>>,
 }
 
 impl Worker {
-    fn master_fd(&self) -> libc::c_int {
-        self.master.as_raw_fd().unwrap_or(-1)
+    fn info(&self) -> std::sync::MutexGuard<'_, SessionInfo> {
+        self.info.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn size(&self) -> (u16, u16) {
-        let info = self.info.lock().unwrap();
+        let info = self.info();
         (info.cols, info.rows)
+    }
+
+    fn running(&self) -> bool {
+        self.exit.is_none()
+    }
+
+    fn changed(&self) {
+        let session = self.info().clone();
+        self.host.publish(SessionEvent::Changed { session });
+    }
+
+    /// Queue a frame for the holder, if one is connected and its link
+    /// version knows the frame's kind.
+    fn tell(&mut self, frame: Vec<u8>) -> bool {
+        match &mut self.link {
+            Some(link) if kind::since(frame[4]) <= link.version => {
+                link.writer.push(frame);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ask the holder for a snapshot; returns the request's ID.
+    fn request_snapshot(&mut self, kind: &str, request: Request) -> Option<u64> {
+        let req = self.next_req;
+        let max = (kind == "limited").then_some(MAX_SNAPSHOT_BYTES);
+        let sent = self.tell(link::encode(
+            kind::SNAPSHOT,
+            &link::SnapshotRequest {
+                req,
+                kind: kind.into(),
+                max,
+            },
+            &[],
+        ));
+        if !sent {
+            return None;
+        }
+        self.next_req += 1;
+        self.requests.insert(req, request);
+        Some(req)
     }
 
     /// The shared grid: the smallest size any attachment asked for.
@@ -628,7 +906,16 @@ impl Worker {
     }
 
     fn update_attached_flag(&self) {
-        self.info.lock().unwrap().attached = !self.attached.is_empty();
+        {
+            let mut info = self.info();
+            let clients = u32::try_from(self.attached.len()).unwrap_or(u32::MAX);
+            if info.clients == clients {
+                return;
+            }
+            info.attached = !self.attached.is_empty();
+            info.clients = clients;
+        }
+        self.changed();
     }
 
     /// Apply a changed grid once it has been stable for GRID_SETTLE, so a
@@ -658,17 +945,25 @@ impl Worker {
     }
 
     fn change_size(&mut self, cols: u16, rows: u16) {
-        if self.size() == (cols, rows) {
+        if self.size() == (cols, rows) || !self.running() {
             return;
         }
-        if let Err(error) = self.resize(cols, rows) {
-            self.broadcast(&ServerMessage::error(
-                error_code::RESIZE_FAILED,
-                error.to_string(),
-            ));
+        self.resize(cols, rows);
+        self.send_resized(|_| true);
+    }
+
+    /// Resize the terminal. The holder applies it before any request that
+    /// follows, so the snapshots asked for next have the new size.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        if !self.tell(link::encode(kind::RESIZE, &link::Size { cols, rows }, &[])) {
             return;
         }
-        self.send_resized(None, |_| true);
+        {
+            let mut info = self.info();
+            info.cols = cols;
+            info.rows = rows;
+        }
+        self.changed();
     }
 
     /// Send the attachments `due` selects an `Attached{Resize}` for the
@@ -679,44 +974,70 @@ impl Worker {
     /// showed the stream directly, such as one whose own resize the grid
     /// followed, keeps its own scrollback. Only a window that rendered a
     /// viewport and now matches the grid gets a full snapshot, since its
-    /// scrollback lacks the history since it left the stream (`snapshot`,
-    /// the session's snapshot bytes when made already). Either is queued
-    /// behind the client's output, and supersedes an older replacement
-    /// still queued, which is why one that supersedes a full one is full. A
-    /// lagging client gets the new size with its resync.
-    fn send_resized(&mut self, snapshot: Option<Vec<u8>>, due: impl Fn(&Attachment) -> bool) {
-        let size = self.size();
-        let session = self.info.lock().unwrap().clone();
-        let (terminal, offset) = (&self.terminal, self.offset);
-        let make = |bytes: Result<Vec<u8>>| {
-            bytes
-                .and_then(|snapshot| {
-                    attached_frame(session.clone(), offset, snapshot, AttachReason::Resize)
-                })
-                .map_err(|error| error.to_string())
-        };
-        let mut snapshot = snapshot;
-        let mut full = None;
-        let mut refresh = None;
-        for attachment in &mut self.attached {
+    /// scrollback lacks the history since it left the stream. Either is
+    /// queued behind the client's output, and supersedes an older
+    /// replacement still queued, which is why one that supersedes a full one
+    /// is full. A lagging client gets the new size with its resync.
+    fn send_resized(&mut self, due: impl Fn(&Attachment) -> bool) {
+        let (full, refresh) = self.replacements_for(self.size(), due);
+        if !full.is_empty() {
+            self.request_snapshot(
+                "limited",
+                Request::Replace {
+                    full: true,
+                    leases: full,
+                },
+            );
+        }
+        if !refresh.is_empty() {
+            self.request_snapshot(
+                "refresh",
+                Request::Replace {
+                    full: false,
+                    leases: refresh,
+                },
+            );
+        }
+    }
+
+    /// The attachments `due` selects that need a full replacement for a grid
+    /// of `size`, and those that need the screens only.
+    fn replacements_for(
+        &self,
+        size: (u16, u16),
+        due: impl Fn(&Attachment) -> bool,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let mut full = Vec::new();
+        let mut refresh = Vec::new();
+        for attachment in &self.attached {
             if attachment.outbox.is_lagging() || !due(attachment) {
                 continue;
             }
-            let matches = (attachment.cols, attachment.rows) == size;
-            let needs_full = attachment.needs_full(size);
-            let replacement = if needs_full {
-                full.get_or_insert_with(|| {
-                    make(snapshot.take().map_or_else(|| snapshot_bytes(terminal), Ok))
-                })
+            if attachment.needs_full(size) {
+                full.push(attachment.lease);
             } else {
-                refresh.get_or_insert_with(|| make(refresh_bytes(terminal)))
-            };
-            match replacement {
+                refresh.push(attachment.lease);
+            }
+        }
+        (full, refresh)
+    }
+
+    /// Replacements have arrived for a grid of `size`.
+    fn replace(
+        &mut self,
+        full: bool,
+        leases: &[u64],
+        reply: Result<Arc<Vec<u8>>, String>,
+        size: (u16, u16),
+    ) {
+        for attachment in &mut self.attached {
+            if !leases.contains(&attachment.lease) || attachment.outbox.is_lagging() {
+                continue;
+            }
+            match &reply {
                 Ok(frame) => {
-                    attachment
-                        .outbox
-                        .push_replacement(frame.clone(), needs_full);
-                    attachment.direct = matches;
+                    attachment.outbox.push_replacement(frame.clone(), full);
+                    attachment.direct = (attachment.cols, attachment.rows) == size;
                 }
                 Err(error) => {
                     if let Some(frame) = frame(&ServerMessage::error(
@@ -730,29 +1051,6 @@ impl Worker {
                     attachment.direct = false;
                 }
             }
-        }
-    }
-
-    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        if !valid_size(cols, rows) {
-            bail!("invalid terminal size");
-        }
-        if self.size() == (cols, rows) {
-            return Ok(());
-        }
-        let replies = self.terminal.resize(cols, rows)?;
-        self.master.resize(size(cols, rows))?;
-        self.queue_replies(&replies);
-        let mut info = self.info.lock().unwrap();
-        info.cols = cols;
-        info.rows = rows;
-        Ok(())
-    }
-
-    fn queue_replies(&mut self, replies: &[u8]) {
-        let queued = self.pending_input.len - self.pending_input.user_len;
-        if queued + replies.len() <= MAX_PENDING_REPLIES {
-            self.pending_input.push(None, false, replies);
         }
     }
 
@@ -773,15 +1071,26 @@ impl Worker {
         }
     }
 
+    /// Drop the lease's input still waiting in the holder; the holder
+    /// acknowledges it.
+    fn discard_lease(&mut self, lease: u64) {
+        if self.running() {
+            self.tell(link::encode(
+                kind::DISCARD_LEASE,
+                &link::Lease { lease },
+                &[],
+            ));
+        }
+    }
+
     /// Drop attachments whose connection ended or whose peer is gone.
     fn release_gone(&mut self) {
         let before = self.attached.len();
-        let mut released = 0;
-        let pending = &mut self.pending_input;
+        let mut gone = Vec::new();
         self.attached.retain(|attachment| {
             let dead = attachment.outbox.is_dead();
             if attachment.cancelled.load(Ordering::SeqCst) || dead {
-                released += pending.discard_lease(attachment.lease);
+                gone.push(attachment.lease);
                 if dead {
                     // Unblock the connection's reader.
                     let _ = attachment.abort.shutdown(std::net::Shutdown::Both);
@@ -791,39 +1100,50 @@ impl Worker {
                 true
             }
         });
-        self.input.release(released);
+        for lease in gone {
+            self.discard_lease(lease);
+        }
         if self.attached.len() != before {
             self.update_attached_flag();
             self.schedule_grid();
         }
     }
 
-    /// Send a fresh snapshot to lagging clients whose queues have drained.
+    /// Ask for a fresh snapshot for lagging clients whose queues have
+    /// drained, one request at a time.
     fn resync_lagging(&mut self) {
-        let now = Instant::now();
-        self.resync_where(|attachment| {
-            attachment.resync_after.is_none_or(|after| now >= after)
-                && attachment.outbox.resync_due()
-        });
-    }
-
-    /// Send a fresh `Attached{Resync}` to the attachments `due` selects. It
-    /// replaces their queued output and any older snapshot.
-    fn resync_where(&mut self, due: impl Fn(&Attachment) -> bool) {
-        let now = Instant::now();
-        if !self.attached.iter().any(&due) {
+        // After the exit, a lagging client gets the final screen instead.
+        if self.resyncing || !self.running() {
             return;
         }
-        let size = self.size();
-        let session = self.info.lock().unwrap().clone();
-        let replacement = snapshot_bytes(&self.terminal).and_then(|snapshot| {
-            Replacement::new(session, self.offset, snapshot, AttachReason::Resync)
-        });
+        let now = Instant::now();
+        let leases: Vec<u64> = self
+            .attached
+            .iter()
+            .filter(|attachment| {
+                attachment.resync_after.is_none_or(|after| now >= after)
+                    && attachment.outbox.resync_due()
+            })
+            .map(|attachment| attachment.lease)
+            .collect();
+        if !leases.is_empty()
+            && self
+                .request_snapshot("limited", Request::Resync { leases })
+                .is_some()
+        {
+            self.resyncing = true;
+        }
+    }
+
+    /// Send the attachments in `leases` a fresh `Attached{Resync}`. It
+    /// replaces their queued output and any older snapshot.
+    fn resync(&mut self, leases: &[u64], reply: Result<Replacement, String>, size: (u16, u16)) {
+        let now = Instant::now();
         for attachment in &mut self.attached {
-            if !due(attachment) {
+            if !leases.contains(&attachment.lease) {
                 continue;
             }
-            match &replacement {
+            match &reply {
                 Ok(replacement) => {
                     replacement.push_to(&attachment.outbox);
                     attachment.resync_after = None;
@@ -832,36 +1152,13 @@ impl Worker {
                 Err(error) => {
                     if let Some(frame) = self::frame(&ServerMessage::error(
                         error_code::SNAPSHOT_FAILED,
-                        error.to_string(),
+                        error.clone(),
                     )) {
                         attachment.outbox.push_control(frame);
                     }
                     attachment.resync_after = Some(now + RESYNC_RETRY);
                 }
             }
-        }
-    }
-
-    /// Send renderer output, and the queries in it to the responder, in
-    /// order.
-    fn emit(&mut self, output: Batch) {
-        let Batch {
-            display, queries, ..
-        } = output;
-        if queries.is_empty() {
-            self.emit_output(display);
-            return;
-        }
-        let mut at = 0;
-        for (position, query) in queries {
-            if position > at {
-                self.emit_output(display[at..position].to_vec());
-                at = position;
-            }
-            self.send_query(query);
-        }
-        if at < display.len() {
-            self.emit_output(display[at..].to_vec());
         }
     }
 
@@ -895,10 +1192,11 @@ impl Worker {
         }
     }
 
-    fn emit_output(&mut self, data: Vec<u8>) {
-        let offset = self.offset;
-        self.offset += data.len() as u64;
-        if self.attached.is_empty() {
+    fn emit_output(&mut self, offset: u64, data: Vec<u8>) {
+        // The holder counts the stream; the two agree unless a frame was
+        // lost, and then the holder's count is the truth.
+        self.offset = offset + data.len() as u64;
+        if self.attached.is_empty() || data.is_empty() {
             return;
         }
         let Ok(output) = output_frame(offset, data) else {
@@ -925,19 +1223,19 @@ impl Worker {
                 abort,
                 cancelled,
                 ack,
-            } => {
-                let attached = self.attach(
-                    lease,
-                    cols,
-                    rows,
-                    takeover,
-                    answers_queries,
-                    outbox,
-                    abort,
-                    cancelled,
-                );
-                let _ = ack.send(attached);
-            }
+            } => self.attach(PendingAttach {
+                lease,
+                cols,
+                rows,
+                takeover,
+                answers_queries,
+                outbox,
+                abort,
+                cancelled,
+                ack,
+                resized: false,
+                full_others: Vec::new(),
+            }),
             Command::Input { lease, data } => {
                 let attachment = self
                     .attached
@@ -947,11 +1245,45 @@ impl Worker {
                 if attachment.is_some_and(|a| a.answers_queries) {
                     self.typist = Some(lease);
                 }
-                if attached && !self.eof {
-                    self.pending_input.push(Some(lease), true, &data);
+                let len = data.len();
+                if attached
+                    && self.running()
+                    && self.tell(link::encode(
+                        kind::INPUT,
+                        &link::InputMeta { lease: Some(lease) },
+                        &data,
+                    ))
+                {
+                    self.unacknowledged += len;
                 } else {
-                    self.input.release(data.len());
+                    self.input.release(len);
                 }
+            }
+            Command::Send { data } => {
+                let len = data.len();
+                if self.running()
+                    && self.tell(link::encode(
+                        kind::INPUT,
+                        &link::InputMeta { lease: None },
+                        &data,
+                    ))
+                {
+                    self.unacknowledged += len;
+                } else {
+                    self.input.release(len);
+                }
+            }
+            Command::Screen {
+                scrollback,
+                max_lines,
+                reply,
+            } => self.screen(scrollback, max_lines, reply),
+            Command::Update { name, tags, ack } => {
+                let applied = !self.removed;
+                if applied {
+                    self.update(name, tags);
+                }
+                let _ = ack.send(applied);
             }
             Command::Resize { lease, cols, rows } => {
                 if !valid_size(cols, rows) {
@@ -983,7 +1315,7 @@ impl Worker {
                     // The grid keeps its size (another client set it, or
                     // this one went back to it), and this window now
                     // matches it: repainted, it shows the session's stream.
-                    self.send_resized(None, |a| a.lease == lease);
+                    self.send_resized(|a| a.lease == lease);
                 }
                 // Otherwise the grid follows this window, and the client
                 // waits for it on what it shows.
@@ -991,88 +1323,388 @@ impl Worker {
             Command::Detach { lease, ack } => {
                 if let Some(index) = self.attached.iter().position(|a| a.lease == lease) {
                     self.attached.remove(index);
-                    self.pending_input.keep_lease(lease);
                     self.update_attached_flag();
                     self.schedule_grid();
+                    // The holder keeps the lease's input for delivery, and
+                    // says so in order with it.
+                    let req = self.next_req;
+                    if self.running()
+                        && self.tell(link::encode(
+                            kind::DETACH,
+                            &link::DetachMeta { req, lease },
+                            &[],
+                        ))
+                    {
+                        self.next_req += 1;
+                        self.requests.insert(req, Request::Detach { ack });
+                        return;
+                    }
                 }
                 let _ = ack.send(());
+            }
+            Command::Remove { ack } => {
+                self.remove();
+                self.removed_ack = Some(ack);
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn attach(
+    /// Ask the holder for the screen as text: `reply` gets it (see
+    /// `screen_text`), or why it cannot. A caller that asks while the same
+    /// request is pending shares its answer, so a holder that does not
+    /// answer (a stopped one) is asked once, not once per caller, and at
+    /// most `SCREEN_REQUESTS` requests wait for it.
+    fn screen(
         &mut self,
-        lease: u64,
-        cols: u16,
-        rows: u16,
-        takeover: bool,
-        answers_queries: bool,
-        outbox: Arc<Outbox>,
-        abort: UnixStream,
-        cancelled: Arc<AtomicBool>,
-    ) -> bool {
-        if cancelled.load(Ordering::SeqCst) {
-            return false;
+        scrollback: bool,
+        max_lines: Option<u32>,
+        reply: SyncSender<ServerMessage>,
+    ) {
+        let refusal = match &self.link {
+            _ if self.removed => Some((error_code::UNKNOWN_SESSION, "the session was removed")),
+            None => Some((
+                error_code::REQUEST_FAILED,
+                "the session's holder is gone, and its screen with it",
+            )),
+            Some(link) if link.version < kind::since(kind::SCREEN) => Some((
+                error_code::UNSUPPORTED_OPERATION,
+                "this session's holder is too old to read its screen",
+            )),
+            Some(_) => None,
+        };
+        if let Some((code, message)) = refusal {
+            let _ = reply.send(ServerMessage::error(code, message));
+            return;
+        }
+        let not_answering = |reply: SyncSender<ServerMessage>| {
+            let _ = reply.send(ServerMessage::error(
+                error_code::REQUEST_FAILED,
+                "the session's holder is not answering",
+            ));
+        };
+        let mut screens = 0;
+        let mut pending = None;
+        for request in self.requests.values_mut() {
+            if let Request::Screen {
+                scrollback: of,
+                max_lines: limit,
+                replies,
+                ..
+            } = request
+            {
+                screens += 1;
+                if (*of, *limit) == (scrollback, max_lines) {
+                    pending = Some(replies);
+                }
+            }
+        }
+        if let Some(replies) = pending {
+            if replies.len() < SCREEN_WAITERS {
+                replies.push(reply);
+            } else {
+                not_answering(reply);
+            }
+            return;
+        }
+        if screens >= SCREEN_REQUESTS {
+            not_answering(reply);
+            return;
+        }
+        // An older holder would ignore the limit: it is sent the request
+        // without one, and its whole text is limited here.
+        let whole = self
+            .link
+            .as_ref()
+            .is_some_and(|link| link.version < link::SCREEN_LINES_VERSION);
+        let req = self.next_req;
+        self.next_req += 1;
+        self.tell(link::encode(
+            kind::SCREEN,
+            &link::ScreenRequest {
+                req,
+                scrollback,
+                max_lines: max_lines.filter(|_| !whole),
+            },
+            &[],
+        ));
+        self.requests.insert(
+            req,
+            Request::Screen {
+                scrollback,
+                max_lines,
+                whole,
+                replies: vec![reply],
+            },
+        );
+    }
+
+    /// The answer to `Screen` (with `scrollback` and `max_lines`), from the
+    /// holder's; `whole` when the holder did not limit its text.
+    fn screen_text(
+        &self,
+        reply: link::ScreenReply,
+        text: Vec<u8>,
+        (scrollback, max_lines, whole): (bool, Option<u32>, bool),
+    ) -> ServerMessage {
+        if let Some(error) = reply.error {
+            return ServerMessage::error(error_code::REQUEST_FAILED, error);
+        }
+        let mut text = String::from_utf8(text)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        let cursor_row = match max_lines {
+            Some(max_lines) if whole => screen::limit_whole(
+                &mut text,
+                reply.cursor_row,
+                self.size().1,
+                scrollback && !reply.alternate_screen,
+                max_lines,
+            ),
+            // Counted from the first line: the lines dropped here (none
+            // from a holder that keeps to the limit) move it up.
+            Some(_) => {
+                let dropped = screen::keep_last(&mut text, MAX_SCREEN_TEXT_BYTES);
+                u16::try_from(usize::from(reply.cursor_row).saturating_sub(dropped)).unwrap_or(0)
+            }
+            None => {
+                screen::keep_last(&mut text, MAX_SCREEN_TEXT_BYTES);
+                reply.cursor_row
+            }
+        };
+        ServerMessage::ScreenText {
+            id: self.id.clone(),
+            text,
+            cursor_row,
+            cursor_col: reply.cursor_col,
+            alternate_screen: reply.alternate_screen,
+        }
+    }
+
+    /// A new name or tags. The holder keeps them for the next daemon.
+    fn update(&mut self, name: Option<String>, tags: Option<BTreeMap<String, String>>) {
+        let changed = {
+            let mut info = self.info();
+            let before = (info.name.clone(), info.tags.clone());
+            if let Some(name) = &name {
+                info.name.clone_from(name);
+            }
+            if let Some(tags) = &tags {
+                info.tags.clone_from(tags);
+            }
+            before != (info.name.clone(), info.tags.clone())
+        };
+        if changed {
+            self.tell(link::encode(
+                kind::UPDATE,
+                &link::Update { name, tags },
+                &[],
+            ));
+            self.changed();
+        }
+    }
+
+    fn attach(&mut self, mut pending: PendingAttach) {
+        if pending.cancelled.load(Ordering::SeqCst) {
+            let _ = pending.ack.send(false);
+            return;
+        }
+        if self
+            .requests
+            .values()
+            .any(|request| matches!(request, Request::Attach(_)))
+        {
+            self.waiting.push_back(Command::Attach {
+                lease: pending.lease,
+                cols: pending.cols,
+                rows: pending.rows,
+                takeover: pending.takeover,
+                answers_queries: pending.answers_queries,
+                outbox: pending.outbox,
+                abort: pending.abort,
+                cancelled: pending.cancelled,
+                ack: pending.ack,
+            });
+            return;
+        }
+        if self.removed {
+            if let Some(frame) = frame(&ServerMessage::error(
+                error_code::REQUEST_FAILED,
+                "the session was removed",
+            )) {
+                pending.outbox.push_control(frame);
+            }
+            let _ = pending.ack.send(false);
+            return;
+        }
+        if !self.running() {
+            // The final screen and the exit; the grid stays as it was.
+            if self.link.is_none() {
+                self.attach_exited(
+                    pending,
+                    Ok(Snapshot {
+                        bytes: Vec::new(),
+                        offset: self.offset,
+                        size: self.size(),
+                    }),
+                );
+            } else {
+                self.request_snapshot("limited", Request::Attach(pending));
+            }
+            return;
         }
         self.release_gone();
-        let dimensions = match (takeover, self.desired_size()) {
+        let (cols, rows) = (pending.cols, pending.rows);
+        let dimensions = match (pending.takeover, self.desired_size()) {
             (false, Some((c, r))) => (cols.min(c), rows.min(r)),
             _ => (cols, rows),
         };
         let resized = dimensions != self.size();
+        pending.resized = resized;
+        let mut refresh = Vec::new();
         if resized {
-            if let Err(error) = self.resize(dimensions.0, dimensions.1) {
-                if let Some(frame) = frame(&ServerMessage::error(
-                    error_code::RESIZE_FAILED,
-                    error.to_string(),
-                )) {
-                    outbox.push_control(frame);
-                }
-                return false;
+            self.resize(dimensions.0, dimensions.1);
+            if !pending.takeover {
+                // The other windows get replacements for the new size;
+                // those that need a full snapshot get this one's.
+                let (full, screens) = self.replacements_for(dimensions, |_| true);
+                pending.full_others = full;
+                refresh = screens;
             }
         }
-        // Snapshot failure must not revoke the previous controllers.
-        let session = self.info.lock().unwrap().clone();
-        let frames = snapshot_bytes(&self.terminal).and_then(|snapshot| {
-            // The other windows get replacements for the new size; those
-            // that need a full snapshot get the same one.
-            let others = (resized
-                && !takeover
-                && self
-                    .attached
-                    .iter()
-                    .any(|a| !a.outbox.is_lagging() && a.needs_full(dimensions)))
-            .then(|| snapshot.clone());
-            Ok((
-                attached_frame(session, self.offset, snapshot, AttachReason::Attach)?,
-                others,
-            ))
-        });
+        self.request_snapshot("limited", Request::Attach(pending));
+        if !refresh.is_empty() {
+            self.request_snapshot(
+                "refresh",
+                Request::Replace {
+                    full: false,
+                    leases: refresh,
+                },
+            );
+        }
+    }
+
+    /// Answer an attach to an exited session: its final screen, then the
+    /// exit.
+    fn attach_exited(&mut self, pending: PendingAttach, snapshot: Result<Snapshot, String>) {
+        let mut session = self.info().clone();
+        let (exit_code, signal) = self.exit.unwrap_or((1, None));
+        let exit = ServerMessage::Exit {
+            id: session.id.clone(),
+            exit_code,
+            signal,
+        };
+        let attached = snapshot.and_then(
+            |Snapshot {
+                 bytes,
+                 offset,
+                 size: (cols, rows),
+             }| {
+                session.cols = cols;
+                session.rows = rows;
+                attached_frame(session, offset, bytes, AttachReason::Attach)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        match attached {
+            Ok(attached) => {
+                pending.outbox.push_control(attached);
+                if let Some(exit) = frame(&exit) {
+                    pending.outbox.push_control(exit);
+                }
+                let _ = pending.ack.send(true);
+            }
+            Err(error) => {
+                if let Some(frame) =
+                    frame(&ServerMessage::error(error_code::SNAPSHOT_FAILED, error))
+                {
+                    pending.outbox.push_control(frame);
+                }
+                let _ = pending.ack.send(false);
+            }
+        }
+    }
+
+    /// The snapshot for an attach has arrived.
+    fn attached(&mut self, pending: PendingAttach, snapshot: Result<Snapshot, String>) {
+        if !self.running() {
+            return self.attach_exited(pending, snapshot);
+        }
+        // The grid the snapshot shows: the grid may have changed since it
+        // was asked for.
+        let shown = snapshot
+            .as_ref()
+            .map_or(self.size(), |snapshot| snapshot.size);
+        let PendingAttach {
+            lease,
+            cols,
+            rows,
+            takeover,
+            answers_queries,
+            outbox,
+            abort,
+            cancelled,
+            ack,
+            resized,
+            full_others,
+        } = pending;
+        let mut session = self.info().clone();
+        let frames = snapshot.and_then(
+            |Snapshot {
+                 bytes,
+                 offset,
+                 size: (grid_cols, grid_rows),
+             }| {
+                session.cols = grid_cols;
+                session.rows = grid_rows;
+                let frames = || -> Result<_> {
+                    let others = (!full_others.is_empty())
+                        .then(|| {
+                            attached_frame(
+                                session.clone(),
+                                offset,
+                                bytes.clone(),
+                                AttachReason::Resize,
+                            )
+                        })
+                        .transpose()?;
+                    Ok((
+                        attached_frame(
+                            session.clone(),
+                            offset,
+                            bytes.clone(),
+                            AttachReason::Attach,
+                        )?,
+                        others,
+                    ))
+                };
+                frames().map_err(|error| error.to_string())
+            },
+        );
         let (own, others) = match frames {
             Ok(frames) => frames,
             Err(error) => {
-                if let Some(frame) = frame(&ServerMessage::error(
-                    error_code::SNAPSHOT_FAILED,
-                    error.to_string(),
-                )) {
+                if let Some(frame) =
+                    frame(&ServerMessage::error(error_code::SNAPSHOT_FAILED, error))
+                {
                     outbox.push_control(frame);
                 }
                 if resized {
                     // Return to the size the remaining clients asked for.
                     self.schedule_grid();
                 }
-                return false;
+                let _ = ack.send(false);
+                return;
             }
         };
-        if takeover {
+        // Its connection may have ended (or given up) while it waited: it
+        // takes nothing over then.
+        let gone = cancelled.load(Ordering::SeqCst);
+        if takeover && !gone {
             let taken_over = frame(&ServerMessage::error(
                 error_code::TAKEN_OVER,
                 "session was taken over by another attachment; its programs are still running",
             ));
-            let mut released = 0;
             for previous in std::mem::take(&mut self.attached) {
-                released += self.pending_input.discard_lease(previous.lease);
+                self.discard_lease(previous.lease);
                 previous.cancelled.store(true, Ordering::SeqCst);
                 if let Some(frame) = &taken_over {
                     previous.outbox.push_final(frame.clone());
@@ -1080,9 +1712,14 @@ impl Worker {
                 // The old writer delivers the diagnostic, then closes.
                 let _ = previous.abort.shutdown(std::net::Shutdown::Read);
             }
-            self.input.release(released);
-        } else if resized {
-            self.send_resized(others, |_| true);
+        } else if let Some(others) = others {
+            self.replace(true, &full_others, Ok(others), shown);
+        }
+        if gone {
+            self.update_attached_flag();
+            self.schedule_grid();
+            let _ = ack.send(false);
+            return;
         }
         outbox.set_waker(self.wake.clone());
         outbox.push_control(own);
@@ -1090,7 +1727,7 @@ impl Worker {
             lease,
             cols,
             rows,
-            direct: (cols, rows) == dimensions,
+            direct: (cols, rows) == shown,
             outbox,
             abort,
             cancelled,
@@ -1099,119 +1736,388 @@ impl Worker {
         });
         self.update_attached_flag();
         self.schedule_grid();
-        true
+        // Another window changed the grid while this snapshot was pending:
+        // the replacements for the new grid went to the windows attached
+        // then, so this one gets its own. The holder answers in order, so
+        // it follows the snapshot already queued.
+        if shown != self.size() {
+            self.send_resized(|attachment| attachment.lease == lease);
+        }
+        let _ = ack.send(true);
     }
 
-    /// Read available output; false once the PTY reports end of file.
-    fn read_output(&mut self) -> bool {
-        let fd = self.master_fd();
-        let mut buf = [0u8; 16384];
-        let mut output = Batch::default();
-        let mut open = true;
-        // Bounded work per wake gives input and termination a turn under
-        // output floods. One frame carries the whole burst.
-        let mut reads = 0;
-        while reads < 16 {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                open = error.kind() == std::io::ErrorKind::WouldBlock;
-                break;
-            }
-            if n == 0 {
-                open = false;
-                break;
-            }
-            reads += 1;
-            let mut batch = self.display.feed(&buf[..n as usize]);
-            let replies = self.terminal.feed(&std::mem::take(&mut batch.terminal));
-            self.queue_replies(&replies);
-            output.append(batch);
-        }
-        if !output.display.is_empty() || !output.queries.is_empty() {
-            self.emit(output);
-        }
-        open
-    }
-
-    fn begin_termination(&mut self) {
-        processes::signal_session(self.pid, libc::SIGHUP);
-        self.termination = Some(Termination {
-            started: Instant::now(),
-            stage: 0,
-        });
-    }
-
-    /// Advance an explicit kill, or notice a natural exit. True once the
-    /// session has ended and its leader has been reaped.
-    fn check_exit(&mut self) -> bool {
-        let leader_exited = processes::exited(self.pid);
-        if let Some(termination) = &mut self.termination {
-            // The exited leader stays unreaped until the sweep is over, so its
-            // session ID cannot be reused by an unrelated process meanwhile.
-            let survivors = processes::live_members(self.pid);
-            if leader_exited && (survivors.is_empty() || termination.stage >= 2) {
-                self.finish();
-                return true;
-            }
-            let grace = daemon::config().kill_grace;
-            let elapsed = termination.started.elapsed();
-            if termination.stage >= 2 {
-                // SIGKILL cannot be ignored, but a sweep can miss a member
-                // (one forked meanwhile, a listing that failed): repeat it
-                // until the leader is gone.
-                processes::kill_session(self.pid);
-            } else if elapsed >= grace * 2 {
-                termination.stage = 2;
-                processes::kill_session(self.pid);
-            } else if termination.stage < 1 && elapsed >= grace {
-                termination.stage = 1;
-                processes::signal_session(self.pid, libc::SIGTERM);
-            }
-            return false;
-        }
-        // A natural exit is a hangup, as in any terminal: the master closes
-        // and the kernel signals the foreground job. Jobs that ignore SIGHUP
-        // (nohup, disown) keep running.
-        if leader_exited {
-            self.finish();
-        }
-        leader_exited
-    }
-
-    fn finish(&mut self) {
-        // Bytes written before exit are part of the transcript.
-        if !self.eof {
-            self.read_output();
-        }
-        let status = processes::reap(self.pid);
-        let id = {
-            let mut info = self.info.lock().unwrap();
-            info.state = SessionState::Exited;
-            info.exit_code = Some(status.code);
-            info.exit_signal = status.signal;
-            info.id.clone()
+    fn on_snapshot(&mut self, reply: link::SnapshotReply, bytes: Vec<u8>) {
+        let Some(request) = self.requests.remove(&reply.req) else {
+            return;
         };
+        let size = (reply.cols, reply.rows);
+        let snapshot = match reply.error {
+            Some(error) => Err(error),
+            None => Ok(Snapshot {
+                bytes,
+                offset: reply.offset,
+                size,
+            }),
+        };
+        match request {
+            Request::Attach(pending) => {
+                self.attached(pending, snapshot);
+                // The next attach, now that this one's grid is known.
+                while let Some(command) = self.waiting.pop_front() {
+                    self.handle(command);
+                    if self
+                        .requests
+                        .values()
+                        .any(|request| matches!(request, Request::Attach(_)))
+                    {
+                        break;
+                    }
+                }
+            }
+            Request::Replace { full, leases } => {
+                let mut session = self.info().clone();
+                session.cols = size.0;
+                session.rows = size.1;
+                let frame = snapshot.and_then(|Snapshot { bytes, offset, .. }| {
+                    attached_frame(session, offset, bytes, AttachReason::Resize)
+                        .map_err(|error| error.to_string())
+                });
+                self.replace(full, &leases, frame, size);
+            }
+            Request::Resync { leases } => {
+                self.resyncing = false;
+                let replacement = self.replacement(snapshot, size);
+                let caught_up = replacement.is_ok();
+                self.resync(&leases, replacement, size);
+                // The grid changed while the resync was pending, and its
+                // replacements skipped these clients, which were lagging:
+                // caught up now, they get one for the new grid too.
+                if caught_up && size != self.size() && self.running() {
+                    self.send_resized(|attachment| leases.contains(&attachment.lease));
+                }
+            }
+            Request::Final { leases } => {
+                let replacement = self.replacement(snapshot, size);
+                self.resync(&leases, replacement, size);
+                self.announce_exit();
+            }
+            Request::Detach { ack } => {
+                let _ = ack.send(());
+            }
+            // Not a snapshot's: answered on its own (`screen_text`).
+            Request::Screen { replies, .. } => {
+                let error = ServerMessage::error(
+                    error_code::REQUEST_FAILED,
+                    "the session's holder answered with a snapshot",
+                );
+                for reply in replies {
+                    let _ = reply.send(error.clone());
+                }
+            }
+        }
+    }
+
+    fn replacement(
+        &self,
+        snapshot: Result<Snapshot, String>,
+        size: (u16, u16),
+    ) -> Result<Replacement, String> {
+        let mut session = self.info().clone();
+        session.cols = size.0;
+        session.rows = size.1;
+        snapshot.and_then(|Snapshot { bytes, offset, .. }| {
+            Replacement::new(session, offset, bytes, AttachReason::Resync)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// The session has exited (or its holder is gone).
+    fn exited(&mut self, exit_code: u32, signal: Option<i32>) {
+        if self.exit.is_some() {
+            return;
+        }
+        self.exit = Some((exit_code, signal));
+        {
+            let mut info = self.info();
+            info.state = SessionState::Exited;
+            info.exit_code = Some(exit_code);
+            info.exit_signal = signal;
+            info.foreground = None;
+        }
+        self.host.publish(SessionEvent::Exited {
+            id: self.id.clone(),
+            exit_code,
+            signal,
+        });
+        self.changed();
         // No later resync can reach a client that is lagging now (its queue
         // may still hold an older snapshot), so it gets the final screen
         // before the exit instead of ending on a stale one.
-        self.resync_where(|attachment| attachment.outbox.is_lagging());
+        let lagging: Vec<u64> = self
+            .attached
+            .iter()
+            .filter(|attachment| attachment.outbox.is_lagging())
+            .map(|attachment| attachment.lease)
+            .collect();
+        if lagging.is_empty()
+            || self
+                .request_snapshot("limited", Request::Final { leases: lagging })
+                .is_none()
+        {
+            self.announce_exit();
+        }
+    }
+
+    /// Tell every attachment how the session ended, and let them go. Queued
+    /// frames stay with the connection writers.
+    fn announce_exit(&mut self) {
+        let (exit_code, signal) = self.exit.unwrap_or((1, None));
         self.broadcast(&ServerMessage::Exit {
-            id,
-            exit_code: status.code,
-            signal: status.signal,
+            id: self.id.clone(),
+            exit_code,
+            signal,
         });
+        self.attached.clear();
+        self.typist = None;
+        self.grid_due = None;
+        self.update_attached_flag();
+    }
+
+    /// What the holder reports about the session. Its size is not taken:
+    /// the grid is this worker's to set, and a report of an older resize
+    /// can arrive after a newer one was asked for.
+    fn apply_info(&mut self, update: link::Info) {
+        let changed = {
+            let mut info = self.info();
+            let before = info.clone();
+            if let Some(title) = update.title {
+                info.title = title.filter(|title| !title.is_empty());
+            }
+            if let Some(pwd) = update.pwd {
+                info.pwd = pwd.filter(|pwd| !pwd.is_empty());
+            }
+            if let Some(foreground) = update.foreground {
+                info.foreground = foreground.map(self::foreground);
+            }
+            if let Some(alternate) = update.alternate_screen {
+                info.alternate_screen = alternate;
+            }
+            if let Some(flags) = update.kitty_keyboard_flags {
+                info.kitty_keyboard_flags = flags;
+            }
+            if let Some(application) = update.application_cursor_keys {
+                info.application_cursor_keys = application;
+            }
+            *info != before
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
+    fn on_frame(&mut self, frame: Frame) {
+        match frame.kind {
+            kind::OUTPUT => {
+                if let Ok(meta) = frame.meta::<link::OutputMeta>() {
+                    self.emit_output(meta.offset, frame.data);
+                }
+            }
+            kind::QUERY => self.send_query(frame.data),
+            kind::SNAPSHOT_REPLY => {
+                if let Ok(reply) = frame.meta::<link::SnapshotReply>() {
+                    self.on_snapshot(reply, frame.data);
+                }
+            }
+            kind::INPUT_ACK => {
+                if let Ok(ack) = frame.meta::<link::InputAck>() {
+                    let bytes = usize::try_from(ack.bytes)
+                        .unwrap_or(usize::MAX)
+                        .min(self.unacknowledged);
+                    self.unacknowledged -= bytes;
+                    self.input.release(bytes);
+                }
+            }
+            kind::DETACH_DONE => {
+                if let Ok(done) = frame.meta::<link::Req>() {
+                    if let Some(Request::Detach { ack }) = self.requests.remove(&done.req) {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+            kind::EXITED => {
+                if let Ok(exited) = frame.meta::<link::Exited>() {
+                    self.exited(exited.exit_code, exited.signal);
+                }
+            }
+            kind::INFO => {
+                if let Ok(info) = frame.meta::<link::Info>() {
+                    self.apply_info(info);
+                }
+            }
+            kind::EVENT => match frame.meta::<link::Event>() {
+                Ok(link::Event::Exited { exit_code, signal }) => self.exited(exit_code, signal),
+                Ok(event) => {
+                    if let Some(event) = session_event(&self.id, event) {
+                        self.host.publish(event);
+                    }
+                }
+                Err(_) => {}
+            },
+            kind::SCREEN_REPLY => {
+                if let Ok(reply) = frame.meta::<link::ScreenReply>() {
+                    if let Some(Request::Screen {
+                        scrollback,
+                        max_lines,
+                        whole,
+                        replies,
+                    }) = self.requests.remove(&reply.req)
+                    {
+                        let text =
+                            self.screen_text(reply, frame.data, (scrollback, max_lines, whole));
+                        for to in replies {
+                            let _ = to.send(text.clone());
+                        }
+                    }
+                }
+            }
+            // A newer holder's: ignored.
+            _ => {}
+        }
+    }
+
+    /// Take what the holder sent.
+    fn pump_link(&mut self) {
+        let Some(link) = &mut self.link else {
+            return;
+        };
+        let open = link.reader.fill(link.stream.as_raw_fd(), LINK_READ);
+        loop {
+            let Some(link) = &mut self.link else {
+                return;
+            };
+            match link.reader.next() {
+                Ok(Some(frame)) => self.on_frame(frame),
+                Ok(None) => break,
+                Err(error) => {
+                    daemon::log(format_args!("session {}: {error:#}", self.id));
+                    return self.lost();
+                }
+            }
+        }
+        if !open {
+            self.lost();
+        }
+    }
+
+    fn flush_link(&mut self) {
+        let Some(link) = &mut self.link else {
+            return;
+        };
+        if !link.writer.flush(link.stream.as_raw_fd()) {
+            self.lost();
+        }
+    }
+
+    /// The holder is gone: it crashed, or closed its link. The session is
+    /// over unless it registers again.
+    fn lost(&mut self) {
+        if self.link.take().is_none() {
+            return;
+        }
+        self.linked.store(false, Ordering::SeqCst);
+        // Nothing sent to it will be acknowledged now.
+        self.input.release(std::mem::take(&mut self.unacknowledged));
+        if self.removed {
+            return;
+        }
+        if self.running() {
+            daemon::log(format_args!("session {}: its holder is gone", self.id));
+        }
+        let requests = std::mem::take(&mut self.requests);
+        self.resyncing = false;
+        let mut final_screen = false;
+        for request in requests.into_values() {
+            match request {
+                Request::Attach(pending) => self.waiting.push_front(Command::Attach {
+                    lease: pending.lease,
+                    cols: pending.cols,
+                    rows: pending.rows,
+                    takeover: pending.takeover,
+                    answers_queries: pending.answers_queries,
+                    outbox: pending.outbox,
+                    abort: pending.abort,
+                    cancelled: pending.cancelled,
+                    ack: pending.ack,
+                }),
+                Request::Detach { ack } => {
+                    let _ = ack.send(());
+                }
+                Request::Screen { replies, .. } => {
+                    let error = ServerMessage::error(
+                        error_code::REQUEST_FAILED,
+                        "the session's holder is gone, and its screen with it",
+                    );
+                    for reply in replies {
+                        let _ = reply.send(error.clone());
+                    }
+                }
+                Request::Final { .. } => final_screen = true,
+                Request::Replace { .. } | Request::Resync { .. } => {}
+            }
+        }
+        // It ended as a hangup would have ended it; how is unknown.
+        self.exited(1, None);
+        if final_screen {
+            self.announce_exit();
+        }
+        // Attaches get what is left: an empty screen and the exit.
+        while let Some(command) = self.waiting.pop_front() {
+            self.handle(command);
+        }
+    }
+
+    /// Forget the session: tell its holder, which exits, or remove the
+    /// manifest of one that is gone.
+    fn remove(&mut self) {
+        if self.removed {
+            return;
+        }
+        self.removed = true;
+        match self.link.take() {
+            Some(mut link) => {
+                link.writer.push(link::bare(kind::REMOVE));
+                link.writer.flush_all(link.stream.as_raw_fd(), REMOVE_FLUSH);
+            }
+            None => {
+                let _ = std::fs::remove_file(paths::manifest_path(&self.host.state, &self.id));
+            }
+        }
+        self.linked.store(false, Ordering::SeqCst);
+        self.input.release(std::mem::take(&mut self.unacknowledged));
+        for request in std::mem::take(&mut self.requests).into_values() {
+            match request {
+                Request::Detach { ack } => {
+                    let _ = ack.send(());
+                }
+                Request::Screen { replies, .. } => {
+                    let error = ServerMessage::error(
+                        error_code::UNKNOWN_SESSION,
+                        "the session was removed",
+                    );
+                    for reply in replies {
+                        let _ = reply.send(error.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.attached.clear();
+        self.update_attached_flag();
     }
 
     fn next_wait(&self) -> Duration {
         let now = Instant::now();
         let mut wait = IDLE_WAIT;
-        if self.termination.is_some() {
-            wait = wait.min(TERMINATION_POLL);
-        }
         if let Some((due, _)) = self.grid_due {
             wait = wait.min(due.saturating_duration_since(now));
         }
@@ -1225,52 +2131,65 @@ impl Worker {
 
     fn run(mut self) {
         loop {
-            if self.kill_requested.swap(false, Ordering::SeqCst) && self.termination.is_none() {
-                self.begin_termination();
+            if self.kill_requested.swap(false, Ordering::SeqCst) && self.running() {
+                self.tell(link::bare(kind::KILL));
             }
             // Bounded per pass so output keeps flowing under a command flood.
             // Their wakeups are drained below, so a full batch means more
             // may be queued: look again without sleeping.
             let mut handled = 0;
+            let mut abandoned = false;
             while handled < 64 {
                 match self.rx.try_recv() {
                     Ok(command) => self.handle(command),
-                    Err(_) => break,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        abandoned = true;
+                        break;
+                    }
                 }
                 handled += 1;
             }
+            if let Some(ack) = self.removed_ack.take() {
+                // Its descriptors are closed once the remover hears back.
+                // Later commands find the session unavailable.
+                drop(self);
+                let _ = ack.send(());
+                return;
+            }
+            if abandoned {
+                // Every handle is gone: replaced by the session its holder
+                // registered again. The holder link, if any, closes with
+                // this thread.
+                return;
+            }
             self.release_gone();
+            self.pump_link();
+            // Output may have left a client lagging with nothing queued.
             self.resync_lagging();
             self.apply_due_grid();
-            if !self.eof {
-                self.eof = !self.read_output();
-                // Output may have left a client lagging with nothing queued.
-                self.resync_lagging();
-            }
-            if self.check_exit() {
-                break;
-            }
-            if self.eof {
-                let dropped = self.pending_input.clear();
-                self.input.release(dropped);
-            } else {
-                let written = self.pending_input.write_to(self.master_fd());
-                self.input.release(written);
-            }
+            self.flush_link();
             let wait = if handled == 64 {
                 Duration::ZERO
             } else {
                 self.next_wait()
             };
-            let mut poll = [
-                libc::pollfd {
-                    fd: if self.eof { -1 } else { self.master_fd() },
-                    events: libc::POLLIN
-                        | if self.pending_input.len == 0 {
+            let (fd, events) = match &self.link {
+                Some(link) => (
+                    link.stream.as_raw_fd(),
+                    libc::POLLIN
+                        | if link.writer.is_empty() {
                             0
                         } else {
                             libc::POLLOUT
                         },
+                ),
+                None => (-1, 0),
+            };
+            let mut poll = [
+                libc::pollfd {
+                    fd,
+                    events,
                     revents: 0,
                 },
                 libc::pollfd {
@@ -1285,103 +2204,12 @@ impl Worker {
             }
             signals::drain(&self.wake_rx);
         }
-        self.serve_exited();
-    }
-
-    /// Keep an exited session's screen for inspection and re-attachment,
-    /// without its PTY or a polling loop.
-    fn serve_exited(self) {
-        let Self {
-            info,
-            terminal,
-            rx,
-            offset,
-            master,
-            attached,
-            mut pending_input,
-            input,
-            ..
-        } = self;
-        input.release(pending_input.clear());
-        // Closing the master hangs up the terminal. Queued Exit frames stay
-        // with the connection writers.
-        drop(attached);
-        drop(master);
-        info.lock().unwrap().attached = false;
-        while let Ok(command) = rx.recv() {
-            match command {
-                Command::Attach { outbox, ack, .. } => {
-                    let session = info.lock().unwrap().clone();
-                    let exit = ServerMessage::Exit {
-                        id: session.id.clone(),
-                        exit_code: session.exit_code.unwrap_or(1),
-                        signal: session.exit_signal,
-                    };
-                    match snapshot_bytes(&terminal).and_then(|snapshot| {
-                        attached_frame(session, offset, snapshot, AttachReason::Attach)
-                    }) {
-                        Ok(attached) => {
-                            outbox.push_control(attached);
-                            if let Some(exit) = frame(&exit) {
-                                outbox.push_control(exit);
-                            }
-                            let _ = ack.send(true);
-                        }
-                        Err(error) => {
-                            if let Some(frame) = frame(&ServerMessage::error(
-                                error_code::SNAPSHOT_FAILED,
-                                error.to_string(),
-                            )) {
-                                outbox.push_control(frame);
-                            }
-                            let _ = ack.send(false);
-                        }
-                    }
-                }
-                Command::Input { data, .. } => input.release(data.len()),
-                Command::Detach { ack, .. } => {
-                    let _ = ack.send(());
-                }
-                Command::Resize { .. } => {}
-            }
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn bytes(pending: &PendingInput) -> Vec<u8> {
-        pending
-            .chunks
-            .iter()
-            .flat_map(|chunk| chunk.bytes.iter().copied())
-            .collect()
-    }
-
-    #[test]
-    fn replacing_controller_discards_only_its_unsent_input() {
-        let mut pending = PendingInput::default();
-        pending.push(Some(1), true, b"old command");
-        pending.push(None, false, b"\x1b[1;1R");
-        pending.push(Some(1), true, b"old remainder");
-        pending.push(Some(2), true, b"new command");
-        assert_eq!(pending.discard_lease(1), 24);
-        assert_eq!(bytes(&pending), b"\x1b[1;1Rnew command");
-        assert_eq!(pending.len, bytes(&pending).len());
-        assert_eq!(pending.user_len, 11);
-    }
-
-    #[test]
-    fn detached_input_is_kept_for_delivery() {
-        let mut pending = PendingInput::default();
-        pending.push(Some(1), true, b"echo marker\r");
-        pending.keep_lease(1);
-        assert_eq!(pending.discard_lease(1), 0);
-        assert_eq!(bytes(&pending), b"echo marker\r");
-        assert_eq!(pending.clear(), 12);
-    }
 
     #[test]
     fn the_input_gate_has_hysteresis() {
@@ -1394,5 +2222,38 @@ mod tests {
         assert!(!gate.wait_for_room(Duration::from_millis(1)));
         gate.release(2);
         assert!(gate.wait_for_room(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn holder_events_become_client_events() {
+        assert_eq!(
+            session_event("s", link::Event::Bell),
+            Some(SessionEvent::Bell { id: "s".into() })
+        );
+        assert_eq!(
+            session_event(
+                "s",
+                link::Event::Progress {
+                    state: "set".into(),
+                    value: Some(250)
+                }
+            ),
+            Some(SessionEvent::Progress {
+                id: "s".into(),
+                state: ProgressState::Set,
+                value: Some(100)
+            })
+        );
+        // A state from a newer holder is dropped.
+        assert_eq!(
+            session_event(
+                "s",
+                link::Event::Progress {
+                    state: "sparkle".into(),
+                    value: None
+                }
+            ),
+            None
+        );
     }
 }

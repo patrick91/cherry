@@ -275,6 +275,23 @@ Scripts/perf-run-emulator-comparison \
 This writes a paired-run manifest plus the Cherry, Ghostty, and comparison
 reports under `.build/perf/`.
 
+The launcher runs Cherry apart from your own copy: a private `HOME` (saved
+workspaces, notes, todos) and private control and session-host sockets
+(`CHERRY_CONTROL_SOCKET`, `CHERRY_HOST_SOCKET`) in a private 0700 directory,
+with a `cherry-host` of its own. By default it builds with
+`swift build --product Cherry` and runs the built executable; `--cherry-command`
+runs another command with the same environment. `--sessions persistent` (the
+default, like the app's; it needs `Scripts/build-host debug`) runs Cherry's tabs
+as persistent sessions on that private host, and `--sessions native` as native
+tabs. The choice is passed to Cherry as a launch argument, whatever your own
+setting, and recorded in the manifest. At the end every session there is
+killed and removed, the daemon is shut down and the directory is deleted;
+`--keep-cherry-open` instead prints
+`python3 Scripts/cherry_private_host.py stop <dir>` for later teardown.
+`Scripts/perf-app-soak` driving a Cherry you started yourself measures that
+Cherry's own tabs, which are persistent sessions unless Settings › Sessions
+turns them off.
+
 For long leak-focused soaks where a Ghostty control would double the wall time,
 use the same launcher in Cherry-only mode:
 

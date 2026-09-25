@@ -73,6 +73,12 @@ private struct SettingsNativeTabView: View {
                             }
                         }
 
+                        if pages.contains(.sessions) {
+                            Tab("Sessions", systemImage: SettingsPage.sessions.systemImage, value: SettingsSelection.page(.sessions)) {
+                                SessionsSettingsPane(settings: terminalSettings)
+                            }
+                        }
+
                         if pages.contains(.projects) {
                             Tab("Projects", systemImage: SettingsPage.projects.systemImage, value: SettingsSelection.page(.projects)) {
                                 ProjectSettingsPane(settings: agentSettings)
@@ -269,6 +275,7 @@ private extension CherryProject {
 enum SettingsPage: String, CaseIterable, Identifiable {
     case general
     case terminal
+    case sessions
     case projects
     case agents
     case mcp
@@ -279,6 +286,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: "General"
         case .terminal: "Terminal"
+        case .sessions: "Sessions"
         case .projects: "Projects"
         case .agents: "Agents"
         case .mcp: "MCP"
@@ -289,6 +297,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: "App chrome, sidebar, worktrees, and theme behavior"
         case .terminal: "Terminal themes, text, cursor, and contrast"
+        case .sessions: "Persistent sessions, closing tabs, and quitting"
         case .projects: "Workspaces, local features, and identity colors"
         case .agents: "Agent tools and automatic summaries"
         case .mcp: "Install commands and connection status"
@@ -299,6 +308,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: "gearshape.fill"
         case .terminal: "terminal.fill"
+        case .sessions: "rectangle.stack.fill"
         case .projects: "folder.fill"
         case .agents: "sparkles"
         case .mcp: "point.3.connected.trianglepath.dotted"

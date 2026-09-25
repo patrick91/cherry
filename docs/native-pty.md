@@ -1,10 +1,16 @@
 # Native-PTY migration (eliminating terminal replay)
 
-Status: **running sessions always use native PTY**. Ghostty owns the PTY through
-its EXEC backend; Attention Study no longer changes the terminal architecture.
+Status: **running sessions always use Ghostty's EXEC backend**. Ghostty owns the
+surface's PTY; Attention Study no longer changes the terminal architecture.
 Shell-less previews and renderer tests retain the in-memory backend. The
 remaining cleanup is deleting replay-only implementation that those tests still
 exercise.
+
+Since [multiplexer-default.md](specs/multiplexer-default.md), local tabs are
+persistent sessions by default: the EXEC child is the `cherry attach` adapter,
+and the program itself runs in a `cherry-host` holder with its own PTY. A tab
+runs its program directly on the EXEC PTY, as this document describes, when
+persistent sessions are off or the local host cannot run them.
 
 ## Why
 

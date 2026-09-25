@@ -5,21 +5,23 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
 ## Why this shape
 
 - Uses SwiftUI for the window chrome and tab rail.
-- Uses an AppKit-backed terminal canvas for the scrollable surface so it only draws visible rows.
-- Each tab now owns a live PTY-backed shell.
-- Defaults to 50,000 lines of scrollback while still rendering only visible rows.
-
-## Current State
-
-- Works with a real login shell and real command output.
-- Supports direct typing after clicking the terminal surface.
-- Does not yet implement a full VT renderer, so TUIs such as `vim`, `top`, or `less` will still render imperfectly until `libghostty` is wired in.
+- Renders every terminal with an embedded Ghostty surface (`libghostty`), so
+  TUIs such as `vim`, `top`, or `less` render as they do in Ghostty.
+- Each local tab runs its program as a persistent session in `cherry-host`
+  (see [Persistent Sessions](#persistent-sessions)), or on a native PTY when
+  that is turned off or unavailable.
 
 ## Run
 
 ```bash
 swift run Cherry
 ```
+
+Run `Scripts/build-host debug` first so its tabs can be persistent sessions;
+without the helpers they run natively. `swift run Cherry` shares the installed
+Cherry's app data: while Cherry.app runs it is a second copy with native tabs
+and no saved tabs, and otherwise it restores and saves Cherry.app's tabs. See
+[Host/README.md](Host/README.md#use-in-the-mac-app) for running it apart.
 
 Enable worktree spaces in **Cherry > Settings > General**. Cherry then discovers
 every Git worktree for a project and keeps them
@@ -32,20 +34,33 @@ distance threshold based on their velocity.
 
 ## Persistent Sessions
 
-Persistent sessions are an opt-in alternative to ordinary tabs. A Rust daemon,
-`cherry-host`, owns each session's PTY and a headless Ghostty terminal, on this
-Mac or on a Mac or Linux machine reached over SSH; the `cherry` client attaches
-to it. Closing the tab, quitting Cherry, or losing SSH leaves the program
-running, and attaching again restores its screen. Several terminals can attach
-to one session and type into it; the shared terminal fits the smallest one.
-Sessions do not survive a daemon crash or restart, or a reboot of the host.
-Existing local tabs are unchanged.
+Local terminal, command and agent tabs run as persistent sessions by default.
+A Rust host, `cherry-host`, keeps each session's program, PTY and a headless
+Ghostty terminal in a holder process of its own, on this Mac or on a Mac or
+Linux machine reached over SSH; the `cherry` client attaches to it, and each
+tab's Ghostty surface runs that client. Quitting Cherry, a crash of Cherry, an
+update, losing SSH, and a crash or restart of the host's daemon leave the
+program running; each project window reopens its tabs attached to them, with
+their screens. Sessions end when the machine reboots. Several terminals can
+attach to one session and type into it; the shared terminal fits the smallest
+one.
 
-Open **File → Persistent Sessions…** (`Cmd-Shift-R`), choose **This Mac** or add
-an SSH destination, then create or attach to a session. A remote machine needs
-`cherry-host` on its SSH command `PATH`. Building the host, the `cherry` CLI,
-service setup, the protocol, and current limits are documented in
-[Host/README.md](Host/README.md).
+**Settings › Sessions** decides what closing does. By default, closing a tab
+ends its session and quitting keeps the sessions for next time; **Keep running
+after closing a tab** leaves a closed tab's session running (attach to it
+again from Persistent Sessions), and **End sessions when quitting** ends them
+when you quit or close a window. Removing a worktree ends its sessions. Turn
+off **Run local terminals as persistent sessions** to run new tabs as ordinary
+native tabs. Tabs are ordinary tabs anyway while the app runs from a disk
+image, has no `cherry` helper, or cannot start a session, and in a second copy
+of the app that shares the first one's app data (Settings › Sessions says
+why). Sessions on SSH hosts always keep running when you close a tab or quit.
+
+Open **File → Persistent Sessions…** (`Cmd-Shift-R`) to see every session on
+**This Mac** or an SSH destination, and to create, attach to, or terminate
+one. A remote machine needs `cherry-host` on its SSH command `PATH`. Building
+the host, the `cherry` CLI, service setup, updates, the protocol, and current
+limits are documented in [Host/README.md](Host/README.md).
 
 To build a disk image for testing on this Mac:
 
@@ -54,32 +69,42 @@ Scripts/package-dmg
 open "dist/Cherry Sessions-$(uname -m).dmg"
 ```
 
-Drag **Cherry Sessions** into Applications and open it from there; **This Mac**
-sessions are unavailable while the app runs from the disk image. This test build
-has a distinct icon, bundle identifier (`dev.patrick.cherry.sessions`), settings,
-and Application Support folder, so it can run alongside Cherry. Its sessions
-are not separate: both apps use the same local session daemon
-(`/tmp/cherry-host-<uid>/host.sock`), so **This Mac** shows the same sessions
-in each. The daemon runs the `cherry-host` of whichever app started it and
-serves both, so build both from the same version. The app includes its
-persistent-session helpers; no separate CLI installation is needed for
-**This Mac**. Create a persistent session, close Cherry Sessions, then reopen and
-attach to the same running session. Multiple devices can stay attached and type
-into one session. This is a local test build, signed ad-hoc by default and not
-notarized. The disk image always includes the helpers, so building it needs the
-same tools as the installer below. Replacing the app does not replace a session
-daemon that is already running, and the new version can neither use nor stop
-it. Before updating, finish or terminate your sessions and stop the daemon with
-the app you still have, for example
-`"/Applications/Cherry Sessions.app/Contents/MacOS/cherry" shutdown` (and
-`… --host your-host shutdown` for each remote host); see the host guide.
+Drag **Cherry Sessions** into Applications and open it from there; while it
+runs from the disk image, its local tabs are ordinary tabs and **This Mac** is
+unavailable in Persistent Sessions. This test build has a distinct icon,
+bundle identifier (`dev.patrick.cherry.sessions`), settings, and Application
+Support folder, so it can run alongside Cherry and restores only its own tabs.
+Both apps use the same local session daemon
+(`/tmp/cherry-host-<uid>/host.sock`), so Persistent Sessions shows the same
+sessions on **This Mac** in each. The app includes its persistent-session
+helpers; no separate CLI installation is needed for **This Mac**. Open a
+project, start a command or an editor in a tab, quit Cherry Sessions, and
+reopen it: the tab comes back with the same process and screen. Multiple
+devices can stay attached and type into one session. This is a local test
+build, signed ad-hoc by default and not notarized. The disk image always
+includes the helpers, so building it needs the same tools as the installer
+below.
+
+Updating the app does not end sessions. The first `cherry` of the new version
+that connects replaces a daemon speaking an older protocol, and the sessions
+carry on in their holders. On a remote host, put the new `cherry-host` on its
+SSH command `PATH`; the next connection upgrades it the same way. A daemon
+that speaks a newer protocol than the app is reported, never replaced, so
+build Cherry and Cherry Sessions from the same version. A daemon from before
+this protocol (4) cannot make way: finish its sessions and stop it with the
+version that started it. See [the host guide](Host/README.md#updates).
 
 Packaging verifies the copied app can open a terminal and render shell output
 with access to the source checkout blocked, and that its bundled `cherry` and
 `cherry-host` can start a daemon on a private socket and create, list, kill, and
-remove a session. This requires a logged-in macOS GUI session. To repeat the
-standalone check, run `Scripts/test-packaged-app "/path/to/Cherry Sessions.app"`
-(add `--skip-helpers` for an app built with `CHERRY_SKIP_HOST=1`).
+remove a session. The packaged app runs with its own `CHERRY_HOST_SOCKET` and
+`CHERRY_CONTROL_SOCKET` in a private (0700) fixture directory, never your
+daemon, and its tabs must be persistent sessions on the bundled `cherry-host`.
+Afterwards every session, the daemon, the holders and attach adapters, the
+host's state directory and the smoke copy's preferences domain are removed.
+This requires a logged-in macOS GUI session. To repeat the standalone check,
+run `Scripts/test-packaged-app "/path/to/Cherry Sessions.app"` (add
+`--skip-helpers` for an app built with `CHERRY_SKIP_HOST=1`).
 
 ## Local Install
 
@@ -91,7 +116,7 @@ open ~/Applications/Cherry.app
 ```
 
 The installer also builds the `cherry` and `cherry-host` helpers that
-Persistent Sessions uses and bundles them inside the app. That needs Rust
+persistent sessions use and bundles them inside the app. That needs Rust
 (`cargo` and `rustc`, from [rustup.rs](https://rustup.rs)) and the Xcode
 command-line tools. The first build also needs network access:
 `Scripts/build-host-vt` downloads a checksum-pinned Zig 0.16.0 and fetches a
@@ -104,8 +129,9 @@ Rust:
 CHERRY_SKIP_HOST=1 Scripts/install-local-app
 ```
 
-Persistent Sessions is then unavailable in that copy: the default release build
-uses only the `cherry` bundled beside it, never one on `PATH`. To use helpers
+Persistent sessions are then unavailable in that copy, and its local tabs run
+natively: the default release build uses only the `cherry` bundled beside it,
+never one on `PATH`. To use helpers
 built elsewhere, quit the app and relaunch it with
 `open --env CHERRY_CLI_PATH=/absolute/path/to/cherry ~/Applications/Cherry.app`.
 That `cherry` starts the daemon from `CHERRY_HOST_PATH`, else the `cherry-host`

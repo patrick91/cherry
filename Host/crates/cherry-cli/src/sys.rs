@@ -1,14 +1,31 @@
 //! Signals, polling and non-blocking descriptor helpers.
 use anyhow::{bail, Context, Result};
 use std::{
+    cell::RefCell,
     io,
     os::fd::RawFd,
-    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Set on a thread whose work another thread may abandon (an
+    /// attachment's attempt to connect again): see `abandon_when`.
+    static ABANDONED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// From now on, `interrupted` on this thread fails once `flag` is set, as
+/// it does after a termination signal: every wait checks it at least every
+/// 100 ms.
+pub fn abandon_when(flag: Arc<AtomicBool>) {
+    ABANDONED.with(|abandoned| *abandoned.borrow_mut() = Some(flag));
+}
 
 extern "C" fn handle_signal(signal: libc::c_int) {
     if signal == libc::SIGWINCH {
@@ -34,6 +51,15 @@ pub fn take_resize() -> bool {
 pub fn interrupted() -> Result<()> {
     if let Some(signal) = termination_signal() {
         bail!("interrupted by signal {signal}");
+    }
+    let abandoned = ABANDONED.with(|abandoned| {
+        abandoned
+            .borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    });
+    if abandoned {
+        bail!("abandoned");
     }
     Ok(())
 }
@@ -90,6 +116,26 @@ pub fn set_nonblocking(fd: RawFd) -> Result<()> {
         return Err(io::Error::last_os_error()).context("could not configure host transport");
     }
     Ok(())
+}
+
+/// A regular file or /dev/null: reading and writing never wait. Darwin's
+/// poll rejects both even though read and write work; a file has bytes or
+/// its end available at once, and null is always at its end.
+pub fn never_waits(fd: RawFd) -> bool {
+    let mut info = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut info) } != 0 {
+        return false;
+    }
+    if info.st_mode & libc::S_IFMT == libc::S_IFREG {
+        return true;
+    }
+    if info.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return false;
+    }
+    let mut null_info = unsafe { std::mem::zeroed::<libc::stat>() };
+    unsafe {
+        libc::stat(c"/dev/null".as_ptr(), &mut null_info) == 0 && info.st_rdev == null_info.st_rdev
+    }
 }
 
 pub fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {

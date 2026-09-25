@@ -279,7 +279,7 @@ final class HostControlLease: @unchecked Sendable {
 }
 
 /// The app's one control connection to a session host (`cherry control`,
-/// protocol 4). It verifies the host's identity, subscribes to events, keeps
+/// protocol 5). It verifies the host's identity, subscribes to events, keeps
 /// `sessions` current from them, pings every heartbeat interval, and — while
 /// leased — reconnects with backoff, re-listing after every reconnect or
 /// host resync.

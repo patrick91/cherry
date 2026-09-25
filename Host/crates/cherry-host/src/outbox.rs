@@ -29,6 +29,14 @@
 //! what a working client can have queued at most (an attach snapshot, or a
 //! resync snapshot with its carried output, one replacement, and queries).
 //!
+//! Frames are written by the connection's writer thread, or, while nothing
+//! is queued ahead of them and the writer is idle, right away by whoever
+//! pushes them (`set_socket`): the session worker writes output straight to
+//! the client's socket without blocking, so the writer thread wakes only for
+//! what the socket does not take at once. The rest of a frame written in
+//! part is queued first (`Kind::Rest`) and never dropped, so frames never
+//! interleave and nothing reaches the peer out of order.
+//!
 //! Events for a subscribed connection (`push_event`) are queued in order
 //! with its replies, and bounded on their own (`EVENT_LIMIT`,
 //! `EVENT_BYTES`): the latest `changed` or `progress` of a session replaces
@@ -40,11 +48,15 @@
 //! follows it. Events never hold back the session workers that publish
 //! them, nor count against the replies' bound.
 use crate::{signals::Wake, stream::MAX_CLIPBOARD};
-use cherry_protocol::{encode_frame, ServerMessage, SessionEvent, SessionInfo};
+use cherry_protocol::{encode_frame, priority, ServerMessage, SessionEvent, SessionInfo};
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    io::{self, Write},
+    os::unix::{io::AsRawFd, net::UnixStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -139,6 +151,13 @@ enum Kind {
     Replacement {
         full: bool,
     },
+    /// A new shared size without a snapshot (`ServerMessage::Resized`):
+    /// superseded like a replacement, and supersedes nothing, since it
+    /// carries no screen.
+    Resized,
+    /// The rest of a frame written in part: it goes first, and is never
+    /// dropped or superseded.
+    Rest,
     Control,
     /// Queries for the client's terminal (see `Outbox::push_query`).
     Query,
@@ -166,12 +185,22 @@ pub struct Output {
 
 struct Item {
     frame: Arc<Vec<u8>>,
+    /// Bytes of `frame` written already: the part of a `Rest` that went out
+    /// at once (the rest shares the frame, uncopied).
+    start: usize,
     kind: Kind,
     /// Output's renderer bytes, scanned for live-only tokens if dropped.
     data: Option<Arc<Vec<u8>>>,
     /// A `Latest` event's key, and which of its key's events it is.
     key: Option<EventKey>,
     seq: u64,
+}
+
+impl Item {
+    /// What is left to write.
+    fn bytes(&self) -> &[u8] {
+        &self.frame[self.start..]
+    }
 }
 
 #[derive(Default)]
@@ -199,9 +228,29 @@ struct State {
     closed: bool,
     dead: bool,
     waker: Option<Arc<Wake>>,
+    /// The writer thread is writing an item it took from the queue.
+    writing: bool,
+    /// The connection's socket, for frames written without the writer
+    /// thread (see `Outbox::set_socket`).
+    socket: Option<UnixStream>,
 }
 
 impl State {
+    /// The peer is gone: nothing more is written or queued.
+    fn fail(&mut self) {
+        self.dead = true;
+        self.writing = false;
+        self.items.clear();
+        self.bytes = 0;
+        self.output_bytes = 0;
+        self.carry = Carry::default();
+        self.held.clear();
+        self.query_bytes = 0;
+        self.events = 0;
+        self.event_bytes = 0;
+        self.latest.clear();
+    }
+
     /// Queued bytes that are not terminal output.
     fn reply_bytes(&self) -> usize {
         self.bytes - self.output_bytes
@@ -214,6 +263,7 @@ impl State {
         }
         self.items.push_back(Item {
             frame,
+            start: 0,
             kind,
             data,
             key: None,
@@ -236,6 +286,7 @@ impl State {
         };
         self.items.push_back(Item {
             frame,
+            start: 0,
             kind,
             data: None,
             key,
@@ -274,7 +325,7 @@ impl State {
                 return false;
             }
             if !item.kind.is_event() {
-                bytes += item.frame.len();
+                bytes += item.bytes().len();
             }
             if item.kind == Kind::Output {
                 output_bytes += item.frame.len();
@@ -328,12 +379,72 @@ impl State {
     }
 }
 
-/// Queued items a resync snapshot supersedes: all but replies.
+/// Queued items a resync snapshot supersedes: all but replies (and the
+/// rest of a frame already written in part).
 fn superseded_by_resync(kind: Kind) -> bool {
     matches!(
         kind,
-        Kind::Output | Kind::Carried | Kind::Resync | Kind::Replacement { .. }
+        Kind::Output | Kind::Carried | Kind::Resync | Kind::Replacement { .. } | Kind::Resized
     )
+}
+
+/// Write as much of `bytes` to `socket`, which is nonblocking, as it takes
+/// now. None when the write failed: the peer is gone.
+fn send_now(socket: &UnixStream, bytes: &[u8]) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    const FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    const FLAGS: libc::c_int = 0;
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let rest = &bytes[sent..];
+        let n = unsafe { libc::send(socket.as_raw_fd(), rest.as_ptr().cast(), rest.len(), FLAGS) };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => break,
+                _ => return None,
+            }
+        }
+        sent += n as usize;
+    }
+    Some(sent)
+}
+
+impl State {
+    /// Write `frame` right away when nothing is queued ahead of it and the
+    /// writer is idle; what the socket does not take is queued as the rest
+    /// of the frame, first. Returns `Some(queued)` when it was written, in
+    /// whole or in part (`queued`: its rest waits for the writer), and None
+    /// when it was not written and still has to be queued. Marks the
+    /// connection dead when the write fails.
+    fn write_now(&mut self, frame: &Arc<Vec<u8>>) -> Option<Result<bool, ()>> {
+        if !self.items.is_empty() || self.writing {
+            return None;
+        }
+        let socket = self.socket.as_ref()?;
+        let Some(sent) = send_now(socket, frame) else {
+            return Some(Err(()));
+        };
+        if sent == 0 {
+            return None;
+        }
+        self.written += sent as u64;
+        if sent == frame.len() {
+            return Some(Ok(false));
+        }
+        self.bytes += frame.len() - sent;
+        self.items.push_back(Item {
+            frame: frame.clone(),
+            start: sent,
+            kind: Kind::Rest,
+            data: None,
+            key: None,
+            seq: 0,
+        });
+        Some(Ok(true))
+    }
 }
 
 /// Live-only tokens kept from output a lagging client missed, in order, for
@@ -539,11 +650,79 @@ pub struct Outbox {
     ready: Condvar,
     /// Signalled when queued replies drop to the low mark, or the writer ends.
     drained: Condvar,
+    /// The connection serves an attached renderer: its writer runs at
+    /// interactive priority.
+    interactive: AtomicBool,
 }
 
 impl Outbox {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write frames to `socket` (the connection's, nonblocking, which the
+    /// writer thread writes to as well) right away while nothing is queued
+    /// and the writer is idle.
+    pub fn set_socket(&self, socket: UnixStream) {
+        self.lock().socket = Some(socket);
+    }
+
+    /// Wait until the socket takes more (the writer's writes find it full).
+    /// False without a socket to wait for.
+    fn wait_writable(&self) -> bool {
+        let Some(fd) = self.lock().socket.as_ref().map(AsRawFd::as_raw_fd) else {
+            return false;
+        };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // Until there is room or the connection is shut down (a vanished
+        // peer is noticed by the reader, which shuts the socket down).
+        unsafe {
+            libc::poll(&mut poll, 1, -1);
+        }
+        true
+    }
+
+    /// Whether the writer serves an attached renderer, and so runs at
+    /// interactive priority.
+    pub fn set_interactive(&self, interactive: bool) {
+        self.interactive.store(interactive, Ordering::Relaxed);
+    }
+
+    /// Write `frame` now if nothing is ahead of it, or queue it as `kind`.
+    /// False when the connection turned out to be gone.
+    fn deliver(
+        &self,
+        state: &mut State,
+        frame: Arc<Vec<u8>>,
+        kind: Kind,
+        data: Option<Arc<Vec<u8>>>,
+    ) -> bool {
+        match state.write_now(&frame) {
+            Some(Ok(queued_rest)) => {
+                if queued_rest {
+                    self.ready.notify_one();
+                }
+                true
+            }
+            Some(Err(())) => {
+                state.fail();
+                self.ready.notify_all();
+                self.drained.notify_all();
+                if let Some(waker) = state.waker.clone() {
+                    waker.wake();
+                }
+                false
+            }
+            None => {
+                state.push(frame, kind, data);
+                self.ready.notify_one();
+                true
+            }
+        }
     }
 
     /// Terminal output. A client that cannot keep up stops receiving it;
@@ -566,13 +745,16 @@ impl Outbox {
             state.carry.scan(&output.data);
             return Push::Lagging;
         }
-        state.push(
+        if self.deliver(
+            &mut state,
             output.frame.clone(),
             Kind::Output,
             Some(output.data.clone()),
-        );
-        self.ready.notify_one();
-        Push::Queued
+        ) {
+            Push::Queued
+        } else {
+            Push::Gone
+        }
     }
 
     /// Drop everything queued that a resync snapshot supersedes (all but
@@ -627,14 +809,25 @@ impl Outbox {
         if state.dead || state.closed || state.query_bytes + frame.len() > QUERY_LIMIT {
             return false;
         }
-        state.query_bytes += frame.len();
         if state.lagging {
+            state.query_bytes += frame.len();
             state.held.push_back(frame);
-        } else {
-            state.push(frame, Kind::Query, None);
-            self.ready.notify_one();
+            return true;
         }
-        true
+        match state.write_now(&frame) {
+            Some(Ok(_)) => true,
+            Some(Err(())) => {
+                drop(state);
+                self.fail();
+                false
+            }
+            None => {
+                state.query_bytes += frame.len();
+                state.push(frame, Kind::Query, None);
+                self.ready.notify_one();
+                true
+            }
+        }
     }
 
     /// Whether a full replacement is queued, which a newer replacement
@@ -660,11 +853,23 @@ impl Outbox {
         }
         state.drop_where(|kind| match kind {
             Kind::Replacement { full: older } => full || !older,
+            Kind::Resized => true,
             _ => false,
         });
         state.push(frame, Kind::Replacement { full }, None);
         self.ready.notify_one();
         true
+    }
+
+    /// A new shared size without a snapshot (`ServerMessage::Resized`), in
+    /// order with the output: a later replacement or resync supersedes it
+    /// while it is queued, and it supersedes nothing.
+    pub fn push_resized(&self, frame: Arc<Vec<u8>>) -> bool {
+        let mut state = self.lock();
+        if state.dead || state.closed {
+            return false;
+        }
+        self.deliver(&mut state, frame, Kind::Resized, None)
     }
 
     /// A reply or notice that is never dropped.
@@ -673,9 +878,7 @@ impl Outbox {
         if state.dead || state.closed {
             return false;
         }
-        state.push(frame, Kind::Control, None);
-        self.ready.notify_one();
-        true
+        self.deliver(&mut state, frame, Kind::Control, None)
     }
 
     /// An event for this subscribed connection, in order with its replies.
@@ -811,7 +1014,7 @@ impl Outbox {
                     state.events -= 1;
                     state.event_bytes -= item.frame.len();
                 } else {
-                    state.bytes -= item.frame.len();
+                    state.bytes -= item.bytes().len();
                 }
                 if item.kind == Kind::Output {
                     state.output_bytes -= item.frame.len();
@@ -819,6 +1022,7 @@ impl Outbox {
                 if item.kind == Kind::Query {
                     state.query_bytes -= item.frame.len();
                 }
+                state.writing = true;
                 let waker = (state.lagging && state.bytes <= RESYNC_BELOW)
                     .then(|| state.waker.clone())
                     .flatten();
@@ -841,16 +1045,7 @@ impl Outbox {
     fn fail(&self) {
         let waker = {
             let mut state = self.lock();
-            state.dead = true;
-            state.items.clear();
-            state.bytes = 0;
-            state.output_bytes = 0;
-            state.carry = Carry::default();
-            state.held.clear();
-            state.query_bytes = 0;
-            state.events = 0;
-            state.event_bytes = 0;
-            state.latest.clear();
+            state.fail();
             state.waker.clone()
         };
         self.ready.notify_all();
@@ -861,15 +1056,33 @@ impl Outbox {
     }
 
     /// Write queued frames until the outbox closes or a write fails. Writes
-    /// block as long as the peer is alive; liveness is judged by the reader.
+    /// wait as long as the peer is alive (a nonblocking socket is waited
+    /// for, see `set_socket`); liveness is judged by the reader.
     pub fn write_all_to(&self, mut writer: impl Write) {
         while let Some(item) = self.next() {
-            for chunk in item.frame.chunks(WRITE_CHUNK) {
-                if writer.write_all(chunk).is_err() {
-                    self.fail();
-                    return;
+            priority::interactive(self.interactive.load(Ordering::Relaxed));
+            for chunk in item.bytes().chunks(WRITE_CHUNK) {
+                let mut rest = chunk;
+                while !rest.is_empty() {
+                    match writer.write(rest) {
+                        Ok(0) => {
+                            self.fail();
+                            return;
+                        }
+                        Ok(n) => {
+                            rest = &rest[n..];
+                            self.lock().written += n as u64;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && self.wait_writable() => {}
+                        Err(_) => {
+                            self.fail();
+                            return;
+                        }
+                    }
                 }
-                self.lock().written += chunk.len() as u64;
             }
             if writer.flush().is_err() {
                 self.fail();
@@ -878,6 +1091,7 @@ impl Outbox {
             if item.kind == Kind::Final {
                 return;
             }
+            self.lock().writing = false;
         }
     }
 }
@@ -906,7 +1120,7 @@ mod tests {
         let mut items = Vec::new();
         let state = outbox.lock();
         for item in &state.items {
-            items.push((item.kind, item.frame.len()));
+            items.push((item.kind, item.bytes().len()));
         }
         items
     }
@@ -1575,5 +1789,115 @@ mod tests {
         outbox.write_all_to(Broken);
         assert!(outbox.is_dead());
         assert_eq!(outbox.push_output(&output(1)), Push::Gone);
+    }
+
+    /// An outbox that writes to one end of a socket pair, nonblocking as a
+    /// connection's is; the other end.
+    fn connected() -> (Outbox, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let outbox = Outbox::default();
+        outbox.set_socket(ours);
+        theirs.set_nonblocking(true).unwrap();
+        (outbox, theirs)
+    }
+
+    /// What arrived at `peer` so far.
+    fn arrived(peer: &mut UnixStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            match std::io::Read::read(peer, &mut buffer) {
+                Ok(0) => return received,
+                Ok(n) => received.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return received,
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn frames_nothing_waits_ahead_of_go_out_without_the_writer() {
+        let (outbox, mut peer) = connected();
+        assert_eq!(outbox.push_output(&text(3, b"")), Push::Queued);
+        assert!(outbox.push_control(Arc::new(b"ctl".to_vec())));
+        assert!(outbox.push_query(Arc::new(b"qry".to_vec())));
+        assert!(outbox.push_resized(Arc::new(b"rsz".to_vec())));
+        // Written at once, in order; nothing is left for a writer thread.
+        assert_eq!(arrived(&mut peer), b"\0\0\0ctlqryrsz");
+        assert!(drain(&outbox).is_empty());
+        assert_eq!(outbox.written(), 12);
+        // While the writer holds an item, frames queue behind it.
+        outbox.lock().writing = true;
+        assert!(outbox.push_control(Arc::new(b"later".to_vec())));
+        assert_eq!(drain(&outbox), vec![(Kind::Control, 5)]);
+        assert!(arrived(&mut peer).is_empty());
+        outbox.lock().writing = false;
+        // And behind anything queued.
+        assert_eq!(outbox.push_output(&text(4, b"")), Push::Queued);
+        assert_eq!(drain(&outbox), vec![(Kind::Control, 5), (Kind::Output, 4)]);
+    }
+
+    #[test]
+    fn the_rest_of_a_frame_written_in_part_goes_first_and_is_never_dropped() {
+        let (outbox, mut peer) = connected();
+        // Far more than the socket takes at once.
+        let big: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let first = Output {
+            frame: Arc::new(big.clone()),
+            data: Arc::new(Vec::new()),
+        };
+        assert_eq!(outbox.push_output(&first), Push::Queued);
+        let queued = drain(&outbox);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, Kind::Rest);
+        let sent = big.len() - queued[0].1;
+        assert!(sent > 0, "part of it was written at once");
+        assert_eq!(outbox.written(), sent as u64);
+        assert_eq!(outbox.lock().bytes, big.len() - sent);
+        // The rest is not a copy: it shares the frame.
+        assert!(Arc::ptr_eq(&outbox.lock().items[0].frame, &first.frame));
+        // Output behind it that exceeds the budget is dropped, the rest is
+        // not; a resync keeps it ahead of its snapshot.
+        assert_eq!(
+            outbox.push_output(&output(OUTPUT_BUDGET - 10)),
+            Push::Queued
+        );
+        assert_eq!(outbox.push_output(&output(100)), Push::Lagging);
+        assert_eq!(drain(&outbox)[0].0, Kind::Rest);
+        assert!(outbox.push_snapshot(frame(7), None));
+        assert_eq!(
+            drain(&outbox)
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            vec![Kind::Rest, Kind::Resync]
+        );
+        // The writer sends the rest, then the snapshot: the peer gets whole
+        // frames in order.
+        // The writer waits for room in the nonblocking socket.
+        let writer = outbox.lock().socket.as_ref().unwrap().try_clone().unwrap();
+        outbox.close();
+        let reader = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            peer.set_nonblocking(false).unwrap();
+            std::io::Read::read_to_end(&mut peer, &mut all).unwrap();
+            all
+        });
+        outbox.write_all_to(&writer);
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        let all = reader.join().unwrap();
+        assert_eq!(all.len(), big.len() + 7);
+        assert!(all[..big.len()] == big[..], "the frame arrived whole");
+        assert_eq!(&all[big.len()..], &[0; 7]);
+    }
+
+    #[test]
+    fn a_failed_write_ends_the_connection() {
+        let (outbox, peer) = connected();
+        drop(peer);
+        assert_eq!(outbox.push_output(&output(3)), Push::Gone);
+        assert!(outbox.is_dead());
+        assert!(!outbox.push_control(frame(1)));
     }
 }

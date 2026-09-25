@@ -4644,12 +4644,19 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let output = sent.output?.lines.joined(separator: "\n") ?? ""
     let expectedPayload = TerminalInputEncoder.terminalTextData(
         prompt,
         keyboardProtocolFlags: 7
     )
     #expect(sent.sentBytes == expectedPayload.count)
+    // The response's own 500 ms wait can end before a busy machine runs the
+    // script's reply, so wait for the reply itself.
+    var output = sent.output?.lines.joined(separator: "\n") ?? ""
+    let replyDeadline = Date(timeIntervalSinceNow: 10)
+    while !output.contains("submitted-"), !output.contains("lf-only"), Date() < replyDeadline {
+        try await Task.sleep(for: .milliseconds(25))
+        output = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
+    }
     #expect(output.contains("submitted-cr:enhanced-submit"), Comment(rawValue: output))
     #expect(!output.contains("submitted-csi"), Comment(rawValue: output))
     #expect(!output.contains("lf-only"), Comment(rawValue: output))
@@ -4718,12 +4725,19 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let output = sent.output?.lines.joined(separator: "\n") ?? ""
     let expectedPayload = TerminalInputEncoder.terminalTextData(
         prompt,
         keyboardProtocolFlags: 8
     )
     #expect(sent.sentBytes == expectedPayload.count)
+    // The response's own 500 ms wait can end before a busy machine runs the
+    // script's reply, so wait for the reply itself.
+    var output = sent.output?.lines.joined(separator: "\n") ?? ""
+    let replyDeadline = Date(timeIntervalSinceNow: 10)
+    while !output.contains("submitted-"), !output.contains("lf-only"), Date() < replyDeadline {
+        try await Task.sleep(for: .milliseconds(25))
+        output = String(decoding: session.rawOutput(maxBytes: 16_384).data, as: UTF8.self)
+    }
     #expect(output.contains("submitted-cr:report-all-submit"), Comment(rawValue: output))
     #expect(!output.contains("submitted-csi"), Comment(rawValue: output))
     #expect(!output.contains("lf-only"), Comment(rawValue: output))

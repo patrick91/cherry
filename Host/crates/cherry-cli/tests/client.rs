@@ -6824,3 +6824,385 @@ fn a_gateway_that_stopped_reading_is_connected_to_again() {
     let output = output.all();
     assert!(contains(&output, b"FIRST") && contains(&output, b"SECOND"));
 }
+
+#[test]
+fn the_client_id_goes_with_every_attach_including_after_a_lost_connection() {
+    let (directory, listener, mut command) = listener();
+    let socket = directory.path().join("host.sock");
+    let status = directory.path().join("status.json");
+    let pty = Pty::open(120, 32);
+    let mut screen = Collected::new(pty.master.try_clone().unwrap());
+    let mut child = command
+        .args([
+            "attach",
+            "test-session",
+            "--client-id",
+            "tab-42",
+            "--status-file",
+        ])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let client_id = |message: Option<ClientMessage>| match message {
+        Some(ClientMessage::Attach { client_id, .. }) => client_id,
+        other => panic!("expected an Attach, received {other:?}"),
+    };
+    let mut first = accept(listener.try_clone().unwrap());
+    assert_eq!(
+        client_id(read_client(&mut first)).as_deref(),
+        Some("tab-42")
+    );
+    write_frame(
+        &mut first,
+        &ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: session(),
+            offset: 0,
+            snapshot: b"FIRST".to_vec(),
+        },
+    )
+    .unwrap();
+    screen.expect(b"FIRST");
+    wait_for_status(&status, live(false));
+    // The connection is lost; the attachment connects again as the same
+    // client, which replaces what is left of its lost attachment.
+    host_gone(first, &socket);
+    wait_for_status(&status, live(true));
+    let mut second = accept(host_back(&socket));
+    assert_eq!(
+        client_id(read_client(&mut second)).as_deref(),
+        Some("tab-42")
+    );
+    write_frame(
+        &mut second,
+        &ServerMessage::Attached {
+            reason: AttachReason::Attach,
+            session: session(),
+            offset: 0,
+            snapshot: b"SECOND".to_vec(),
+        },
+    )
+    .unwrap();
+    screen.expect(b"SECOND");
+    exit_session(&mut second, 0);
+    assert_eq!(wait(&mut child).code(), Some(0));
+
+    // Without the option, no client ID is sent.
+    drop(listener);
+    let (_directory, plain, mut command) = self::listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept(plain);
+        let id = client_id(read_client(&mut stream));
+        exit_session(&mut stream, 0);
+        id
+    });
+    let mut child = command
+        .args(["attach", "test-session"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(server.join().unwrap(), None);
+    wait(&mut child);
+}
+
+#[test]
+fn a_replaced_attachment_ends_and_does_not_connect_again() {
+    // Another run of this client (the same --client-id) attached, and the
+    // host dropped this attachment, saying so last. Connecting again would
+    // drop the other in turn, so the attachment ends, as a detach does.
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let spare = listener.try_clone().unwrap();
+    let (replace_tx, replace_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, session(), b"ready");
+        replace_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_frame(
+            &mut stream,
+            &ServerMessage::error(
+                "replaced",
+                "another attachment of this client replaced this one; the session keeps running",
+            ),
+        )
+        .unwrap();
+        // The host closes the connection after its notice.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
+    let pty = Pty::open(120, 32);
+    pty.read_in_background();
+    let original = pty.termios();
+    let mut child = command
+        .args([
+            "attach",
+            "test-session",
+            "--client-id",
+            "tab-7",
+            "--status-file",
+        ])
+        .arg(&status)
+        // A lost connection would be connected again at once.
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    replace_tx.send(()).unwrap();
+    assert_eq!(wait(&mut child).code(), Some(0));
+    assert_mode_restored(&original, &pty.termios());
+    let error = stderr_of(&mut child);
+    assert!(error.contains("replaced this one"), "{error}");
+    server.join().unwrap();
+    let status = read_status(&status);
+    assert_eq!(status["outcome"], "replaced", "{status}");
+    assert!(status["message"]
+        .as_str()
+        .unwrap()
+        .contains("keeps running"));
+    // It never connected again.
+    assert!(
+        matches!(spare.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the replaced attachment connected again"
+    );
+}
+
+/// Set the terminal's size, as a window drag does, and tell the client.
+fn resize_window(pty: &Pty, child: &Child, cols: u16, rows: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGWINCH) }, 0);
+}
+
+#[test]
+fn the_first_resize_goes_at_once_and_those_right_after_it_as_one() {
+    let (_directory, listener, mut command) = listener();
+    let (resized_tx, resized_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, sized_session(80, 24), b"READY");
+        let mut sizes = Vec::new();
+        loop {
+            match read_client(&mut stream) {
+                Some(ClientMessage::Resize { cols, rows }) => {
+                    sizes.push(((cols, rows), Instant::now()));
+                    resized_tx.send((cols, rows)).unwrap();
+                    if (cols, rows) == (110, 45) {
+                        break;
+                    }
+                }
+                Some(ClientMessage::Ping) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        exit_session(&mut stream, 0);
+        sizes
+    });
+    let pty = Pty::open(80, 24);
+    pty.read_in_background();
+    let mut child = command
+        .args(["attach", "test-session"])
+        // Long enough to tell the first resize from the coalesced ones on
+        // a busy machine.
+        .env("CHERRY_CLI_RESIZE_COALESCE_MS", "1500")
+        .env("CHERRY_CLI_GRID_WAIT_MS", "5000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    let signalled = Instant::now();
+    resize_window(&pty, &child, 100, 40);
+    assert_eq!(
+        resized_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (100, 40)
+    );
+    let first = signalled.elapsed();
+    assert!(
+        first < Duration::from_millis(1000),
+        "the first waited {first:?}"
+    );
+    // A drag goes on: its steps within the period go as one, the last.
+    resize_window(&pty, &child, 105, 42);
+    thread::sleep(Duration::from_millis(50));
+    resize_window(&pty, &child, 110, 45);
+    assert_eq!(
+        resized_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (110, 45)
+    );
+    // The period runs from when the client sent the first, which it did
+    // after the signal (less the moment its loop may have noted the time
+    // before it saw the signal): a bound however slowly this thread went.
+    let last = signalled.elapsed();
+    assert!(
+        last >= Duration::from_millis(1400),
+        "the drag's steps were not held for the period: {last:?}"
+    );
+    let sizes: Vec<_> = server
+        .join()
+        .unwrap()
+        .into_iter()
+        .map(|(size, _)| size)
+        .collect();
+    assert_eq!(sizes, [(100, 40), (110, 45)]);
+    assert!(wait(&mut child).success());
+}
+
+#[test]
+fn a_resized_grid_keeps_what_the_window_shows_while_the_program_repaints() {
+    // The window follows the grid: nothing is painted for the new size but
+    // what the program sends.
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, sized_session(80, 24), b"\x1b[?1049h\x1b[HEDITOR");
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Resize {
+                cols: 101,
+                rows: 41
+            })
+        ));
+        for frame in [
+            ServerMessage::Resized {
+                offset: 0,
+                cols: 101,
+                rows: 41,
+            },
+            ServerMessage::Output {
+                offset: 0,
+                data: b"\x1b[H\x1b[2JREPAINTED".to_vec(),
+            },
+            ServerMessage::Exit {
+                id: "test-session".into(),
+                exit_code: 0,
+                signal: None,
+            },
+        ] {
+            write_frame(&mut stream, &frame).unwrap();
+        }
+    });
+    let mut pty = Pty::open(80, 24);
+    let mut child = command
+        .args(["attach", "test-session"])
+        .env("CHERRY_CLI_GRID_WAIT_MS", "5000")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    resize_window(&pty, &child, 101, 41);
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        received.extend(pty.drain());
+        assert!(Instant::now() < deadline, "client did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    received.extend(pty.drain());
+    assert!(child.wait().unwrap().success(), "{}", stderr_of(&mut child));
+    server.join().unwrap();
+    let after = received
+        .windows(6)
+        .position(|window| window == b"EDITOR")
+        .expect("the snapshot");
+    let rest = &received[after..];
+    assert!(contains(rest, b"\x1b[H\x1b[2JREPAINTED"));
+    // No snapshot, and no viewport frame, for the new size.
+    assert!(
+        !contains(rest, b"\x1bc"),
+        "{:?}",
+        String::from_utf8_lossy(rest)
+    );
+    assert!(
+        !contains(rest, b"\x1b[?2026h"),
+        "{:?}",
+        String::from_utf8_lossy(rest)
+    );
+}
+
+#[test]
+fn a_resized_grid_out_of_step_with_the_output_is_refused() {
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, sized_session(80, 24), b"READY");
+        write_frame(
+            &mut stream,
+            &ServerMessage::Resized {
+                offset: 7,
+                cols: 90,
+                rows: 30,
+            },
+        )
+        .unwrap();
+        let _ = read_client(&mut stream);
+    });
+    let mut child = command
+        .args(["attach", "test-session"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let exit = wait(&mut child);
+    let error = stderr_of(&mut child);
+    assert_eq!(exit.code(), Some(1), "{error}");
+    assert!(error.contains("out of sequence"), "{error}");
+    server.join().unwrap();
+}
+
+#[test]
+fn keys_typed_while_the_terminal_takes_no_output_still_reach_the_host() {
+    // The window stopped reading (a stalled terminal, or a frame far larger
+    // than the terminal takes at once): the client waits to write, and
+    // what is typed meanwhile goes to the host at once, not after the
+    // output.
+    let (_directory, listener, mut command) = listener();
+    let (typed_tx, typed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, sized_session(80, 24), b"READY");
+        write_frame(
+            &mut stream,
+            &ServerMessage::Output {
+                offset: 0,
+                data: vec![b'x'; 2 * 1024 * 1024],
+            },
+        )
+        .unwrap();
+        assert_eq!(input_until(&mut stream, b"k"), b"k");
+        typed_tx.send(()).unwrap();
+        exit_session(&mut stream, 0);
+    });
+    let pty = Pty::open(80, 24);
+    let mut child = command
+        .args(["attach", "test-session", "--detach-key", "none"])
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    // The terminal is not read until the key has arrived.
+    thread::sleep(Duration::from_millis(300));
+    (&pty.master).write_all(b"k").unwrap();
+    typed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the key waited behind the output");
+    pty.read_in_background();
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    server.join().unwrap();
+}

@@ -31,9 +31,20 @@ final class ProjectWindowRegistry {
     /// it at launch (`installInstanceLockNotice`); tests leave it nil, so
     /// the app's real lock is never taken.
     private(set) var instanceLockNotice: InstanceLockNotice?
+    /// Where each project window's frame is saved. The app sets it
+    /// (`configureWindowFrames`); tests leave it nil unless they give their
+    /// own, so the app's defaults are never written.
+    private(set) var windowFrameStore: ProjectWindowFrameStore?
+    private var windowFrameSavers: [String: ProjectWindowFrameSaver] = [:]
 
     /// The app uses `shared`; tests make their own.
     init() {}
+
+    /// Project windows open at their project's last frame and save it as
+    /// they move or resize (`ProjectWindowFrameStore`).
+    func configureWindowFrames(_ store: ProjectWindowFrameStore?) {
+        windowFrameStore = store
+    }
 
     /// Reads the windows to reopen before any window registers (registering
     /// saves the list again), then saves window changes to `store`.
@@ -50,16 +61,18 @@ final class ProjectWindowRegistry {
         return projectWindowRootsToReopenAtLaunch
     }
 
-    /// At launch: opens each saved window to reopen that has no window yet
-    /// (SwiftUI may have restored it). Returns whether it opened any.
-    @discardableResult
-    func reopenSavedProjectWindows(_ openProjectWindow: @MainActor (String) -> Void) -> Bool {
-        var reopened = false
-        for projectRoot in takeProjectWindowRootsToReopen() where !hasWindow(for: projectRoot) {
-            openProjectWindow(projectRoot)
-            reopened = true
-        }
-        return reopened
+    /// Which project windows the app opens at launch, once (a later call
+    /// reopens nothing). AppKit restores no project window (they are not
+    /// restorable: `CherryApp`), so they come back from this list alone,
+    /// whether the app was quit and opened again or macOS relaunched it
+    /// after a restart or log out ("Reopen windows when logging back in").
+    /// `hasVisibleWindow`: a key-capable window is on screen already (one
+    /// a deep link opened).
+    func launchWindowPlan(hasVisibleWindow: Bool) -> LaunchWindowPlan {
+        let roots = takeProjectWindowRootsToReopen().filter { !hasWindow(for: $0) }
+        if !roots.isEmpty { return .reopen(roots) }
+        if hasRegisteredProjectWindow || hasVisibleWindow { return .nothing }
+        return .openDefault
     }
 
     /// Saves every project's tabs and the open windows now, synchronously.
@@ -322,6 +335,17 @@ final class ProjectWindowRegistry {
             // first and both windows fight for the same workspace state.
             return false
         }
+        // Cherry saves and reopens its windows, their tabs and frames
+        // itself (`ProjectWindowFrameStore`). AppKit's restorable state
+        // would only cost typing: while keys arrive it re-encodes and
+        // snapshots the window on the main thread (25–135 ms stalls, longer
+        // for bigger windows).
+        window.isRestorable = false
+        if windows[projectRoot]?.window !== window {
+            // Newly claimed (a window registers again on every update): it
+            // takes the frame its project's window last had.
+            adoptSavedFrame(of: window, projectRoot: projectRoot)
+        }
         windows[projectRoot] = WeakWindow(window)
         workspaces[projectRoot] = WeakWorkspace(workspace)
         if let repository {
@@ -352,11 +376,25 @@ final class ProjectWindowRegistry {
         return true
     }
 
+    /// Gives a newly claimed project window its project's saved frame, and
+    /// saves the frame from then on.
+    private func adoptSavedFrame(of window: NSWindow, projectRoot: String) {
+        windowFrameSavers.removeValue(forKey: projectRoot)
+        guard let windowFrameStore else { return }
+        windowFrameStore.restore(window, projectRoot: projectRoot)
+        windowFrameSavers[projectRoot] = ProjectWindowFrameSaver(
+            window: window,
+            projectRoot: projectRoot,
+            store: windowFrameStore
+        )
+    }
+
     func unregister(window: NSWindow, projectRoot: String?) {
         guard let requestedRoot = projectRoot else { return }
         let projectRoot = repositoryRoot(for: requestedRoot)
         guard windows[projectRoot]?.window === window else { return }
         repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter { $0.value != projectRoot }
+        windowFrameSavers.removeValue(forKey: projectRoot)?.saveNow()
         windows.removeValue(forKey: projectRoot)
         workspaces.removeValue(forKey: projectRoot)
         repositories.removeValue(forKey: projectRoot)
@@ -721,6 +759,7 @@ final class ProjectWindowRegistry {
             noteStores.removeValue(forKey: projectRoot)
             todoStores.removeValue(forKey: projectRoot)
             chromeStates.removeValue(forKey: projectRoot)
+            windowFrameSavers.removeValue(forKey: projectRoot)
             if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
                 activeProjectRoot = nil
                 activeWorkspace = nil
@@ -729,6 +768,41 @@ final class ProjectWindowRegistry {
                 activeChromeState = nil
             }
         }
+    }
+}
+
+/// Saves a project window's frame (`ProjectWindowFrameStore`) whenever it
+/// moves or resizes; a live resize once, when it ends.
+@MainActor
+private final class ProjectWindowFrameSaver: NSObject {
+    private weak var window: NSWindow?
+    private let projectRoot: String
+    private let store: ProjectWindowFrameStore
+
+    init(window: NSWindow, projectRoot: String, store: ProjectWindowFrameStore) {
+        self.window = window
+        self.projectRoot = projectRoot
+        self.store = store
+        super.init()
+        for name in [
+            NSWindow.didMoveNotification,
+            NSWindow.didResizeNotification,
+            NSWindow.didEndLiveResizeNotification,
+        ] {
+            // Removed when the saver goes (selector-based observation).
+            NotificationCenter.default.addObserver(self, selector: #selector(frameDidChange(_:)), name: name, object: window)
+        }
+    }
+
+    @objc private func frameDidChange(_ notification: Notification) {
+        guard let window else { return }
+        if notification.name == NSWindow.didResizeNotification, window.inLiveResize { return }
+        store.save(window, projectRoot: projectRoot)
+    }
+
+    func saveNow() {
+        guard let window else { return }
+        store.save(window, projectRoot: projectRoot)
     }
 }
 
@@ -1334,5 +1408,86 @@ extension FocusedValues {
     var projectWindowChromeState: ProjectWindowChromeState? {
         get { self[FocusedChromeStateKey.self] }
         set { self[FocusedChromeStateKey.self] = newValue }
+    }
+}
+
+/// What the app opens at launch (`ProjectWindowRegistry.launchWindowPlan`).
+enum LaunchWindowPlan: Equatable {
+    /// The saved windows to reopen: each had tabs and has no window yet.
+    case reopen([String])
+    /// Nothing to reopen and no window open: the default project's window.
+    case openDefault
+    /// Nothing: the saved windows are open, or another window is.
+    case nothing
+}
+
+/// A project window's frame, per project, in the app's defaults. Project
+/// windows are not restorable, which also turns off SwiftUI's frame
+/// autosave: without this, every window would open at the default size.
+/// Unlike that autosave (keyed by the order windows opened in), each project
+/// gets its own window's frame back, at launch and when it opens later.
+struct ProjectWindowFrameStore {
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    static func key(projectRoot: String) -> String {
+        "window.frame.\(projectRoot)"
+    }
+
+    func frameDescriptor(projectRoot: String) -> NSWindow.PersistableFrameDescriptor? {
+        defaults.string(forKey: Self.key(projectRoot: projectRoot))
+    }
+
+    /// Saves `window`'s frame, unless it is full screen: the frame it goes
+    /// back to when it leaves full screen stays saved.
+    @MainActor
+    func save(_ window: NSWindow, projectRoot: String) {
+        guard !window.styleMask.contains(.fullScreen) else { return }
+        let descriptor = window.frameDescriptor
+        guard frameDescriptor(projectRoot: projectRoot) != descriptor else { return }
+        defaults.set(descriptor, forKey: Self.key(projectRoot: projectRoot))
+    }
+
+    /// Gives `window` the frame saved for `projectRoot` (AppKit fits it to
+    /// the screens there are now). False when none was saved.
+    @MainActor
+    @discardableResult
+    func restore(_ window: NSWindow, projectRoot: String) -> Bool {
+        guard let descriptor = frameDescriptor(projectRoot: projectRoot) else { return false }
+        window.setFrame(from: descriptor)
+        return true
+    }
+}
+
+/// A project window's sidebar width, per project, in the app's defaults.
+/// Not scene storage: that ties the window to AppKit's state restoration,
+/// which project windows opt out of (`ProjectWindowRegistry.register`).
+struct ProjectSidebarWidthStore {
+    static let defaultWidth: Double = 320
+
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    static func key(projectRoot: String) -> String {
+        "sidebar.width.\(projectRoot)"
+    }
+
+    func width(projectRoot: String) -> Double {
+        let key = Self.key(projectRoot: projectRoot)
+        guard defaults.object(forKey: key) != nil else { return Self.defaultWidth }
+        let width = defaults.double(forKey: key)
+        return width.isFinite && width > 0 ? width : Self.defaultWidth
+    }
+
+    func setWidth(_ width: Double, projectRoot: String) {
+        let key = Self.key(projectRoot: projectRoot)
+        guard defaults.object(forKey: key) == nil || defaults.double(forKey: key) != width else { return }
+        defaults.set(width, forKey: key)
     }
 }

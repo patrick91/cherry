@@ -216,7 +216,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     // The surface runs the attach adapter for that session.
     #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
     let attach = try #require(harness.attachCalls.first)
-    #expect(attach.hasPrefix("--expected-host-id host-a attach \(sessionID) --detach-key none --status-file "))
+    #expect(attach.hasPrefix("--expected-host-id host-a attach \(sessionID) --detach-key none --client-id \(terminal.id.uuidString) --status-file "))
 
     // Agents and commands keep their kind, name and launch settings.
     let agent = workspace.addAgentSession(
@@ -433,6 +433,15 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(!session.isRunning)
     try await Task.sleep(for: .milliseconds(300))
     #expect(harness.attachCalls.count == 4)
+    // Every launch attached as the tab, so the host replaced the previous
+    // launch's attachment instead of keeping a stale client.
+    #expect(harness.attachCalls.map(HostedSessionFakeCLI.clientID(of:)) == Array(
+        repeating: session.id.uuidString, count: 4
+    ))
+    // Each launch started after the previous adapter was gone (its surface
+    // is freed first): two adapters of one tab would drop each other in
+    // turn, each reconnecting when the host drops it.
+    #expect(harness.cli.clientOverlaps.isEmpty)
 }
 
 @Test @MainActor func persistentTerminalsAreBusyWhileTheHostReportsAForegroundJob() async throws {

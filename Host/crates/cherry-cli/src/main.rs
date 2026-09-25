@@ -11,7 +11,7 @@ mod transport;
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
     error_code, ClientMessage, ServerMessage, SessionInfo, DEFAULT_COLS, DEFAULT_ROWS,
-    MAX_OWNER_BYTES, MAX_TAG_KEY_BYTES, PROTOCOL_VERSION,
+    MAX_CLIENT_ID_BYTES, MAX_OWNER_BYTES, MAX_TAG_KEY_BYTES, PROTOCOL_VERSION,
 };
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use input::DetachKey;
@@ -112,6 +112,11 @@ enum Action {
         /// Write why the attachment ended to this file as JSON.
         #[arg(long)]
         status_file: Option<PathBuf>,
+        /// Name this client (1 to 128 bytes; Cherry passes a tab's ID): an
+        /// attachment of the session with the same ID, left by an earlier
+        /// run or a lost connection, is dropped when this one attaches.
+        #[arg(long, value_parser = validate_client_id)]
+        client_id: Option<String>,
     },
     /// Terminate a session on the host.
     Kill { id: String },
@@ -372,6 +377,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             id,
             takeover,
             detach_key,
+            client_id,
             ..
         } => {
             // Connecting again finds the same host (the identity it welcomed
@@ -396,7 +402,17 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     timing().reconnect_attempt
                 },
             };
-            let outcome = attach::attach(slot, &id, takeover, detach_key, status, &mut reconnect)?;
+            let outcome = attach::attach(
+                slot,
+                &attach::Target {
+                    id: &id,
+                    takeover,
+                    client_id: client_id.as_deref(),
+                },
+                detach_key,
+                status,
+                &mut reconnect,
+            )?;
             attached(status, outcome)
         }
         Action::Control => {
@@ -426,6 +442,12 @@ fn attached(status: &mut StatusFile, outcome: attach::Outcome) -> Result<u32> {
         attach::Outcome::TakenOver(message) => {
             status.set(Status::new(Outcome::TakenOver, Some(message.clone())));
             Err(anyhow!(message))
+        }
+        attach::Outcome::Replaced(message) => {
+            // The terminal is restored by now.
+            eprintln!("cherry: {message}");
+            status.set(Status::new(Outcome::Replaced, Some(message)));
+            Ok(0)
         }
     }
 }
@@ -682,6 +704,7 @@ pub(crate) fn message_kind(message: &ServerMessage) -> &'static str {
         ServerMessage::Sessions { .. } => "sessions",
         ServerMessage::Created { .. } => "created",
         ServerMessage::Attached { .. } => "attached",
+        ServerMessage::Resized { .. } => "resized",
         ServerMessage::Output { .. } => "output",
         ServerMessage::Query { .. } => "query",
         ServerMessage::Exit { .. } => "exit",
@@ -723,6 +746,15 @@ fn parse_tag(value: &str) -> std::result::Result<(String, String), String> {
         ));
     }
     Ok((key.to_owned(), value.to_owned()))
+}
+
+fn validate_client_id(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty() || value.len() > MAX_CLIENT_ID_BYTES {
+        return Err(format!(
+            "a client ID is 1 to {MAX_CLIENT_ID_BYTES} bytes long"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_owner(value: &str) -> std::result::Result<String, String> {
@@ -977,6 +1009,7 @@ mod tests {
         assert_eq!(timing.heartbeat_timeout, cherry_protocol::HEARTBEAT_TIMEOUT);
         assert_eq!(timing.escape_wait, input::ESCAPE_WAIT);
         assert_eq!(timing.grid_wait, attach::GRID_WAIT);
+        assert_eq!(timing.resize_coalesce, attach::RESIZE_COALESCE);
         assert_eq!(timing.detach_wait, attach::DETACH_WAIT);
         assert_eq!(timing.report_wait, attach::REPORT_WAIT);
         assert_eq!(timing.closed_wait, transport::CLOSED_WAIT);
@@ -1047,6 +1080,18 @@ mod tests {
         let error =
             Cli::try_parse_from(["cherry", "attach", "S", "--detach-key", "ctrl-a"]).unwrap_err();
         assert_eq!(error.exit_code(), 2);
+        let cli = Cli::try_parse_from(["cherry", "attach", "S", "--client-id", "tab-7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Attach { client_id: Some(id), .. } if id == "tab-7"
+        ));
+        for bad in [String::new(), "x".repeat(MAX_CLIENT_ID_BYTES + 1)] {
+            let error =
+                Cli::try_parse_from(["cherry", "attach", "S", "--client-id", &bad]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{bad:?}");
+        }
+        let longest = "x".repeat(MAX_CLIENT_ID_BYTES);
+        assert!(Cli::try_parse_from(["cherry", "attach", "S", "--client-id", &longest]).is_ok());
     }
 
     fn terminal_environment() -> impl Iterator<Item = (OsString, OsString)> {

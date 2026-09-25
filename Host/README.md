@@ -151,8 +151,20 @@ It grows again when the smaller client disconnects. The larger terminal
 displays the shared screen at its top left; see the scrollback limits below.
 `cherry attach SESSION_ID --takeover` disconnects the other attachments and
 continues alone; they end with the outcome `taken_over`, and their unsent
-input is discarded. Attaching to a session from inside that same session is
-refused.
+input is discarded. `cherry attach SESSION_ID --client-id ID` names the client
+(1 to 128 bytes; the Mac app passes each tab's ID): when an attachment of the
+session with the same ID is still there (an earlier run of the same client,
+or its connection that the host has not noticed is lost), the host drops it
+as the new one attaches, as if its connection had ended: its unsent input is
+discarded, and nobody else is told anything. The dropped attachment itself
+is sent the error `replaced` (not `taken_over`) as its last message, and a
+`cherry attach` that still runs ends on it with the outcome `replaced`
+instead of connecting again, which would drop the newer attachment in turn.
+So a client that starts again never leaves a stale attachment behind that
+holds the shared grid at its old size, and two running copies of one client
+never take turns. An attachment that connects again (see
+[Reconnecting](#attach-options)) sends the same ID.
+Attaching to a session from inside that same session is refused.
 
 ### Attach options
 
@@ -279,12 +291,14 @@ refused.
   `exited` (the program ended; `exit_code` and `signal` are set),
   `disconnected` (the connection was lost and not reconnected, or the CLI was
   interrupted after attaching; the session may still run), `taken_over`
-  (another client used `--takeover`), or `failed` (the CLI could not attach,
-  or rejected its command line). `message` explains every outcome except
+  (another client used `--takeover`), `replaced` (a newer attachment with
+  the same `--client-id` replaced this one; the session keeps running), or
+  `failed` (the CLI could not attach, or rejected its command line). `message` explains every outcome except
   `exited` and a confirmed detach, where it is `null`. A final outcome has no
   `viewport` or `reconnecting` field.
 - **Exit status.** `attach` exits with the session's exit code when the program
-  ended, 0 when it detached (also without the host's confirmation), 1 for
+  ended, 0 when it detached (also without the host's confirmation) or was
+  replaced by another attachment of its client, 1 for
   errors (including `taken_over` and a lost connection), and 2 for usage
   errors. A `cherry` stopped by signal N exits with 128+N; stopping an attach
   client never terminates the hosted session.
@@ -339,7 +353,7 @@ version through its preamble. If you restrict an SSH key to the command
 the forced command drops the variable, and the gateway then replaces an
 older daemon without checking its identity.
 
-The gateway prints `CHERRY-GATEWAY <version>` (`CHERRY-GATEWAY 4` for this
+The gateway prints `CHERRY-GATEWAY <version>` (`CHERRY-GATEWAY 5` for this
 version) on a line of its own before relaying protocol frames. The client
 skips up to 64 KiB of output that a remote shell prints before that line.
 Beyond that it fails with "the remote shell printed output before cherry-host
@@ -408,7 +422,8 @@ newer requests evict it; after that the same ID creates a new session.
 Local terminal, command and agent tabs run as persistent sessions on This
 Mac's daemon by default (**Settings › Sessions › Run local terminals as
 persistent sessions**, which applies to new tabs). Each tab's Ghostty surface
-runs `cherry attach … --detach-key none --status-file …` (the attach adapter),
+runs `cherry attach … --detach-key none --status-file … --client-id <tab ID>`
+(the attach adapter),
 and the app keeps one `cherry control` connection per host. Quitting Cherry,
 a crash of Cherry or an update leaves the programs running, and each project
 window reopens its saved tabs attached to them. Closing a tab ends its
@@ -810,6 +825,32 @@ cherry-host.service` also moves the daemon to it.
 
 ## Connections and flow control
 
+- **Priority.** On macOS the threads that carry an attachment's traffic run at
+  the `USER_INTERACTIVE` quality of service while a client is attached: the
+  attach adapter's main thread, the daemon's connection threads of attached
+  clients and the session's worker, and the session's holder. When nothing is
+  attached they return to the default class, so the output of sessions nobody
+  watches never competes with the ones on screen. The programs in sessions
+  are not affected. On a busy machine each of those thread wakeups otherwise
+  waited 10–40 ms behind other work, while the program (Neovim raises its
+  own priority) and the terminal did not, which showed as stalls and jumps
+  while scrolling. macOS caps that class at the default
+  priority in a process without an application role, so `cherry-host` and
+  `cherry attach` take the role `TASK_DEFAULT_APPLICATION`, as Neovim does;
+  it changes nothing for their threads at the default class, and the
+  processes they start do not inherit it. The daemon tells a holder whether
+  a client is attached (holder link version 5; an older holder keeps the
+  default). On Linux raising a thread's priority takes
+  `CAP_SYS_NICE` or an `RLIMIT_NICE` allowance, and lowering it cannot be
+  undone without them, so nothing changes there. Output is sent through
+  1 MiB send buffers (or the most the system allows; macOS gives Unix
+  sockets 8 KiB otherwise), so a frame of a full-screen program travels in
+  one write: both ends of the holder link and the daemon's end of client
+  connections have them. What a Unix socket holds is its sender's send
+  buffer alone, on macOS and Linux alike, so receive buffers are left as
+  they are, and a client's end keeps the system's buffers: its input
+  backpressure below is unchanged. The daemon writes output to an attached
+  client's socket itself when nothing waits ahead of it.
 - **Heartbeat.** An attached client sends `Ping` every 15 seconds, also while
   a slow terminal is still taking its output, so a slow terminal does not get
   the attachment evicted; so does a subscribed control connection. The host
@@ -856,21 +897,38 @@ cherry-host.service` also moves the daemon to it.
   disconnected for being silent, since its heartbeats wait behind the held
   input: the host sends it a `Pong` every 15 seconds while nothing moves, and
   at most one a second while the program consumes the input. Only a hangup, a
-  failed write, a takeover, or the session's end stops the wait. The CLI keeps
-  displaying output meanwhile and stops queueing terminal input while 1 MiB
-  of it is unsent. With a detach key, it then reads at most 64 KiB more, in
-  order, so a detach key typed behind that input is still seen (pressing it
-  twice still sends Ctrl-]). Such a detach discards unsent input, as
-  described in [Input order](#attach-options). Input beyond that waits in the
-  terminal. So after pasting well over 2 MiB into a program that is not
-  reading, the detach key is not seen until the program reads or the
-  `cherry` process ends (for example because its terminal window was
-  closed). With `--detach-key none`, the terminal is not read beyond the
-  1 MiB.
-- **Resizing.** The CLI sends at most one resize per 50 ms during a window drag.
-  The host applies a change to the shared grid once the requested size has been
-  stable for 75 ms, so a drag produces one replacement rather than one per
-  step. A replacement is `Attached` with reason `resize`. For most windows it
+  failed write, a takeover, or the session's end stops the wait. The CLI
+  sends terminal input as soon as it reads it, also while it waits for its
+  terminal to take output. It keeps displaying output meanwhile and stops
+  queueing terminal input while 1 MiB of it is unsent. With a detach key, it
+  then reads at most 64 KiB more, in order, so a detach key typed behind that
+  input is still seen (pressing it twice still sends Ctrl-]). Such a detach
+  discards unsent input, as described in [Input order](#attach-options).
+  Input beyond that waits in the terminal. So after pasting well over 2 MiB
+  into a program that is not reading, the detach key is not seen until the
+  program reads or the `cherry` process ends (for example because its
+  terminal window was closed). With `--detach-key none`, the terminal is not
+  read beyond the 1 MiB.
+- **Resizing.** The CLI sends a resize at once, and during a window drag at
+  most one per 50 ms: the steps that follow within 50 ms of the last one sent
+  go as one, once the 50 ms have passed. The host changes the shared grid at
+  once when the resizing window alone sets it (no other window is smaller in
+  either dimension): every time when it is the only window, and with other
+  windows only for the first step of a drag (when the grid has not changed
+  for 75 ms); every other change applies once the requested size has been
+  stable for 75 ms, so the other windows get at most two replacements for a
+  drag rather than one per step. A replacement is `Attached` with reason
+  `resize`. While the program shows the alternate screen (a full-screen
+  program, which repaints itself when resized), a window that keeps a copy of
+  the stream gets `Resized` instead, which carries no snapshot: the window is
+  painted once, by the program, rather than by a replacement and then the
+  program's own repaint (the windows of a session whose holder predates
+  holder link version 5 always get replacements). `Resized` marks where in
+  the stream the new size took effect, so the holder answers with it only
+  while nothing was output since the resize (it does so before it reads the
+  program's repaint, in the normal case); otherwise, and for a window whose
+  copy came from an attach or resync snapshot of an older grid, the window
+  gets a replacement. For most windows it
   holds only the screens, with no reset and no history (usually a few KB): a
   window of another size paints a viewport from them, and a window whose own
   resize the grid followed keeps its native scrollback, as does a window that
@@ -921,7 +979,12 @@ shared grid grows to it when the smaller client disconnects, or the window
 shrinks to the grid) gets a full snapshot with retained history. A window that
 stayed on the stream while the grid followed its own resize keeps its own
 scrollback. This is a limit of simultaneous differently sized views, not
-a separate process or terminal session.
+a separate process or terminal session. A viewport is not repainted while
+the program is inside a synchronized update (mode 2026: between the start
+and the end of drawing a frame), for at most 150 ms, so it never shows a
+half-drawn screen; one that the window must show before a query it answers
+is painted at once, inside a synchronized update of the window's own that
+the complete frame ends.
 
 A window that renders a viewport still receives the output that acts on the
 terminal rather than on its screen: OSC 52 clipboard writes, titles (OSC 0–2)
@@ -986,7 +1049,7 @@ Frames are a 4-byte big-endian length followed by a JSON message of at most
 field can be added without breaking an older peer. The client opens with
 `Hello{version}`, and the host answers every `Hello`, whatever its version,
 with `Welcome{version, host_id}` carrying its own version and identity. The
-current version is 4. Normal operation needs the same version on both sides.
+current version is 5. Normal operation needs the same version on both sides.
 When they differ, the client disconnects or, only when the host's version is
 lower, sends `Replace`, which the host answers `Ok` once it has stopped
 listening and released its socket and lock, and then exits (see
@@ -1032,7 +1095,15 @@ keys of 1 to 128 bytes, 16 KiB in all).
 An attached client must accept a replacement `Attached` snapshot at any time
 (reasons `attach`, `resize`, `resync`) and resume output at its offset. A
 `resize` replacement may hold only the screens, without a reset or history,
-for a renderer that keeps its own history or paints a viewport. An `Attached`
+for a renderer that keeps its own history or paints a viewport. It must also
+accept `Resized{offset, cols, rows}` (protocol 5): the shared grid took that
+size at that point of the stream without a snapshot, since the program on
+the alternate screen repaints itself; the output before `offset` was made
+for the old size, the output from it on for the new one, and a renderer
+resizes its copy of the screens there and keeps what its window shows. Like
+a `resize` replacement it is superseded by a newer replacement still queued,
+and it never replaces one. `Attach` may carry `client_id` (protocol 5; see
+[Use from the command line](#use-from-the-command-line)). An `Attached`
 offset may be lower than the offset of the stream when carried output
 follows it (see [slow clients](#connections-and-flow-control)); that output
 starts at the `Attached` offset, so resuming there needs nothing more. An
@@ -1043,7 +1114,8 @@ are, and the terminal's replies return as ordinary `Input`. `Attach` has a
 required `answers_queries` flag: true only when the client writes queries to
 a terminal whose replies it reads as input. The host sends no queries to a
 client that sets it false. Errors carry a code: `version_mismatch`,
-`request_failed`, `taken_over`, `resize_failed`, `snapshot_failed`,
+`request_failed`, `taken_over`, `replaced` (protocol 5: a newer attachment
+of the same `client_id` replaced this one), `resize_failed`, `snapshot_failed`,
 `unsupported_operation`, `unknown_session` (no session has that ID), or
 `not_running` (the session has exited). `resize_failed`, and
 `snapshot_failed` for a replacement snapshot, do not end an attachment;
@@ -1131,8 +1203,9 @@ Tests shorten the host's timing with `CHERRY_HOST_*_MS` variables read when
 `List` and requests naming a session wait for the holders a restarted daemon
 expects, 1000 ms by default), and the CLI's with `CHERRY_CLI_*_MS`
 (`CONNECT_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`,
-`ESCAPE_WAIT`, `GRID_WAIT`, `DETACH_WAIT`, `REPORT_WAIT`, `CLOSED_WAIT`,
-`QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects), `RECONNECT_HEALTHY`,
+`ESCAPE_WAIT`, `GRID_WAIT`, `RESIZE_COALESCE`, `DETACH_WAIT`, `REPORT_WAIT`,
+`CLOSED_WAIT`, `QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects),
+`RECONNECT_HEALTHY`,
 `RECONNECT_ATTEMPT` and `PASTE_TAIL_WAIT`) and `CHERRY_CLI_INPUT_HIGH_WATER`.
 In `cherry-host`'s tests, `tests/support` has `Host::adopted()` (waits until
 a respawned daemon has no pending holders), `children(pid)` and

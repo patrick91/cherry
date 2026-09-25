@@ -150,7 +150,9 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
 }
 
 // Plain text of the active screen including its history (diagnostics).
-int cherry_vt_plain(GhosttyTerminal term, uint8_t **out, size_t *len) {
+// Plain text of the active screen, or of `selection` on it: soft-wrapped
+// rows joined while wraparound is on, trailing blanks trimmed.
+static int plain(GhosttyTerminal term, const GhosttySelection *selection, uint8_t **out, size_t *len) {
     GhosttyFormatterTerminalOptions opts;
     memset(&opts, 0, sizeof(opts));
     opts.size = sizeof(opts);
@@ -162,11 +164,40 @@ int cherry_vt_plain(GhosttyTerminal term, uint8_t **out, size_t *len) {
     opts.trim = true;
     opts.extra.size = sizeof(opts.extra);
     opts.extra.screen.size = sizeof(opts.extra.screen);
+    opts.selection = selection;
     GhosttyFormatter formatter = NULL;
     rc = ghostty_formatter_terminal_new(NULL, &formatter, term, opts);
     if (!rc) rc = ghostty_formatter_format_alloc(formatter, NULL, out, len);
     ghostty_formatter_free(formatter);
     return rc;
+}
+
+int cherry_vt_plain(GhosttyTerminal term, uint8_t **out, size_t *len) {
+    return plain(term, NULL, out, len);
+}
+
+// The active area alone, without the history above it: what a terminal of
+// the same size shows, read in place rather than from a copy.
+int cherry_vt_plain_active(GhosttyTerminal term, uint8_t **out, size_t *len) {
+    uint16_t cols = 0, rows = 0;
+    int rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLS, &cols);
+    if (!rc) rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ROWS, &rows);
+    if (rc) return rc;
+    if (!cols || !rows) return GHOSTTY_INVALID_VALUE;
+    GhosttySelection selection;
+    memset(&selection, 0, sizeof(selection));
+    selection.size = sizeof(selection);
+    selection.start.size = sizeof(selection.start);
+    selection.end.size = sizeof(selection.end);
+    GhosttyPoint first = { .tag = GHOSTTY_POINT_TAG_ACTIVE, .value.coordinate = { .x = 0, .y = 0 } };
+    GhosttyPoint last = {
+        .tag = GHOSTTY_POINT_TAG_ACTIVE,
+        .value.coordinate = { .x = (uint16_t)(cols - 1), .y = (uint32_t)(rows - 1) },
+    };
+    rc = ghostty_terminal_grid_ref(term, first, &selection.start);
+    if (!rc) rc = ghostty_terminal_grid_ref(term, last, &selection.end);
+    if (rc) return rc;
+    return plain(term, &selection, out, len);
 }
 
 typedef struct {
@@ -929,4 +960,40 @@ int cherry_vt_row_flags(GhosttyTerminal term, uint32_t y, bool *wrap, bool *cont
     int rc = row_at(term, GHOSTTY_POINT_TAG_SCREEN, y, &row);
     if (!rc) rc = row_flags(&row, wrap, continuation);
     return rc;
+}
+
+// How many lines of the plain text (cherry_vt_plain, cherry_vt_plain_active)
+// end on screen rows [first, last). As the formatter writes it, a row ends a
+// line unless it holds text and soft-wraps onto the next while wraparound is
+// on: a row without text is always one line (it may be trimmed if nothing
+// follows), whatever its wrap flag.
+int cherry_vt_lines_ending(GhosttyTerminal term, uint64_t first, uint64_t last, uint64_t *count) {
+    *count = 0;
+    uint16_t cols = 0;
+    int rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLS, &cols);
+    if (rc) return rc;
+    GhosttyTerminalModeConfig wraparound = { .mode = GHOSTTY_MODE_WRAPAROUND };
+    rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_MODE, &wraparound);
+    if (rc) return rc;
+    uint64_t lines = 0;
+    for (uint64_t y = first; y < last; y++) {
+        if (y > UINT32_MAX) return GHOSTTY_INVALID_VALUE;
+        GhosttyGridRef row;
+        rc = row_at(term, GHOSTTY_POINT_TAG_SCREEN, (uint32_t)y, &row);
+        bool wrap = false, continuation = false;
+        if (!rc) rc = row_flags(&row, &wrap, &continuation);
+        if (rc) return rc;
+        if (!(wraparound.value && wrap)) { lines++; continue; }
+        // A wrapped row almost always starts with text: the scan is short.
+        bool text = false;
+        for (uint16_t x = 0; x < cols && !text; x++) {
+            CellView v;
+            rc = cell_at(&row, x, &v);
+            if (rc) return rc;
+            text = v.has_text;
+        }
+        if (!text) lines++;
+    }
+    *count = lines;
+    return 0;
 }

@@ -503,6 +503,61 @@ fn shared_clients_type_resize_disconnect_and_explicitly_take_over_without_restar
 
 #[test]
 #[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn two_running_attachments_of_one_client_never_take_turns() {
+    // A client that starts again while its earlier run still goes (a tab
+    // whose adapter is started before the old one stops): the newer
+    // replaces the older, which ends rather than connecting again and
+    // replacing the newer in turn.
+    let host = Host::start();
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'ONE_CLIENT\\n'; exec sleep 600",
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let run = |cols, rows| {
+        let mut command = host.command();
+        command
+            .args(["attach", id, "--client-id", "tab-1"])
+            // A lost connection would be connected again at once.
+            .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "30000");
+        Attached::with_command(command, cols, rows)
+    };
+    let mut older = run(80, 24);
+    older.expect(b"ONE_CLIENT");
+    let mut newer = run(100, 30);
+    newer.expect(b"ONE_CLIENT");
+    assert!(
+        older.wait().success(),
+        "the older run ends, as a detach does"
+    );
+    // The newer one holds the session alone, at its size, from then on.
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        let listing = host.json(&["list", "--json"]);
+        let session = &listing["sessions"][0];
+        assert_eq!(
+            (&session["clients"], &session["cols"], &session["rows"]),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(100),
+                &serde_json::json!(30)
+            ),
+            "{listing}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    newer.master.write_all(&[0x1d]).unwrap();
+    assert!(newer.wait().success());
+    host.wait_for_detached_running(id, &created["pid"]);
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
 fn only_the_terminal_that_typed_last_answers_the_programs_queries() {
     const FIRST: &[u8] = b"\x1b[?11;1R";
     const SECOND: &[u8] = b"\x1b[?22;1R";

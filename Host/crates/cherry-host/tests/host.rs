@@ -220,9 +220,12 @@ fn shared_attachments_both_type_and_resize_to_smallest_client_until_detach() {
 }
 
 #[test]
-fn rapid_resizes_are_coalesced_into_one_snapshot() {
+fn rapid_resizes_are_coalesced_into_one_snapshot_while_other_windows_watch() {
     let host = Host::new();
     let session = host.create(shell("exec sleep 60"));
+    // A larger window elsewhere gets a replacement for every grid change.
+    let (mut other, _, offset, snapshot) = host.attach(&session.id, 120, 45);
+    let mut other_screen = Screen::new(120, 45, offset, &snapshot);
     let (mut socket, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut screen = Screen::new(100, 30, offset, &snapshot);
     // Like a window drag: one step every 10 ms.
@@ -237,21 +240,49 @@ fn rapid_resizes_are_coalesced_into_one_snapshot() {
         thread::sleep(Duration::from_millis(10));
     }
     screen.wait_size(&mut socket, 99, 39);
-    // Nothing else follows once the size has settled.
-    socket
-        .set_read_timeout(Some(Duration::from_millis(400)))
-        .unwrap();
-    while let Ok(Some(message)) = read_frame::<_, ServerMessage>(&mut socket) {
-        screen.apply(&message);
+    other_screen.wait_size(&mut other, 99, 39);
+    // Nothing else follows once the size has settled: the first step may
+    // change the grid at once, the rest once the size settled. (The other
+    // window also got one when this one attached.)
+    for (socket, screen) in [(&mut socket, &mut screen), (&mut other, &mut other_screen)] {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        while let Ok(Some(message)) = read_frame::<_, ServerMessage>(socket) {
+            screen.apply(&message);
+        }
+        assert!(
+            screen.attached.len() <= 3,
+            "{} snapshots for one drag",
+            screen.attached.len()
+        );
     }
-    assert!(
-        screen.attached.len() <= 2,
-        "{} snapshots for one drag",
-        screen.attached.len()
-    );
     assert_eq!((screen.cols, screen.rows), (99, 39));
     let info = host.session(&session.id);
     assert_eq!((info.cols, info.rows), (99, 39));
+}
+
+#[test]
+fn a_lone_windows_drag_changes_the_grid_at_every_step() {
+    // Nobody else would get a replacement per step: the grid follows the
+    // only window at once (its client sends at most one resize per 50 ms).
+    let host = Host::new();
+    let session = host.create(shell("exec sleep 60"));
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 100, 30);
+    let mut screen = Screen::new(100, 30, offset, &snapshot);
+    send(&mut socket, &ClientMessage::Resize { cols: 90, rows: 25 });
+    screen.wait_size(&mut socket, 90, 25);
+    let started = Instant::now();
+    send(&mut socket, &ClientMessage::Resize { cols: 91, rows: 26 });
+    screen.wait_size(&mut socket, 91, 26);
+    // Not held back for the size to settle, even on a busy machine.
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        screen.attached,
+        [AttachReason::Resize, AttachReason::Resize]
+    );
+    let info = host.session(&session.id);
+    assert_eq!((info.cols, info.rows), (91, 26));
 }
 
 #[test]
@@ -726,6 +757,7 @@ fn replies_echo_request_ids_and_several_requests_can_be_in_flight() {
                 rows: 24,
                 takeover: false,
                 answers_queries: false,
+                client_id: None,
             },
         ),
     )
@@ -845,6 +877,7 @@ fn protocol_4_control_requests_are_answered_on_one_connection() {
                 rows: 24,
                 takeover: false,
                 answers_queries: false,
+                client_id: None,
             },
             error_code::UNKNOWN_SESSION,
         ),

@@ -90,7 +90,9 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(session.projectRoot == nil)
     session.ingestNativeWorkingDirectory("/remote/changed")
     #expect(session.workingDirectory == NSHomeDirectory())
-    #expect(session.nativeExecLaunch.command == "'/tmp/cherry tools/cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'session-123' '--detach-key' 'none'")
+    // The adapter attaches as the tab (`--client-id`): the host replaces the
+    // tab's previous attachment when it launches again.
+    #expect(session.nativeExecLaunch.command == "'/tmp/cherry tools/cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'session-123' '--detach-key' 'none' '--client-id' '\(session.id.uuidString)'")
     #expect(session.nativeExecLaunch.environment["CHERRY_STARTUP_COMMAND"] == nil)
     // The adapter runs ssh with the login shell's agent socket.
     #expect(session.nativeExecLaunch.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
@@ -150,6 +152,59 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(attachment.arguments(statusFile: nil) == [
         "--host", "devbox", "--expected-host-id", "host-a", "attach", "id';$(touch bad)", "--detach-key", "none"
     ])
+    #expect(attachment.execCommand(statusFile: nil, clientID: "tab';$(touch bad)") == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--detach-key' 'none' '--client-id' 'tab'\\'';$(touch bad)'")
+}
+
+/// The fake CLI takes `--client-id` as the real one does (1 to 128 bytes),
+/// and records an adapter that starts while another of its client runs.
+@Test func HostedSessionFakeCLIChecksClientIDsAndOverlappingAdapters() async throws {
+    let cli = try HostedSessionFakeCLI()
+    var running: [Process] = []
+    defer {
+        running.forEach { $0.terminate() }
+        cli.cleanUp()
+    }
+    func start(_ clientArguments: [String]) throws -> Process {
+        let process = Process()
+        process.executableURL = cli.executable
+        process.arguments = ["attach", "session-1", "--detach-key", "none"] + clientArguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+    func waitForAdapters(_ count: Int) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while cli.lines("attach-clients").count < count, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(cli.lines("attach-clients").count == count)
+    }
+
+    // 128 bytes in 32 characters. (Not "é": `Process` passes arguments
+    // decomposed, as file names.)
+    let longest = String(repeating: "🍒", count: 32)
+    for bad in [
+        ["--client-id="],
+        ["--client-id", ""],
+        ["--client-id", longest + "x"], // 33 characters, 129 bytes
+        ["--client-id", String(repeating: "x", count: 129)],
+    ] {
+        let process = try start(bad)
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 2, "\(bad)")
+    }
+
+    running.append(try start(["--client-id", longest]))
+    try await waitForAdapters(1)
+    running.append(try start(["--client-id", "tab-2"]))
+    try await waitForAdapters(2)
+    #expect(cli.clientOverlaps.isEmpty)
+    // The same client again while the first still runs.
+    running.append(try start(["--client-id=" + longest]))
+    try await waitForAdapters(3)
+    #expect(cli.clientOverlaps.count == 1)
+    #expect(cli.clientOverlaps.first?.hasPrefix(longest + " \(running[0].processIdentifier) ") == true)
 }
 
 @Test func HostedSessionStatusFileMapsEveryOutcome() throws {
@@ -706,8 +761,11 @@ private func fixtureSession() throws -> HostedSessionInfo {
     }
     let prefix = "--host devbox --expected-host-id host-a attach session-123"
 
+    // Every launch attaches as the tab, so the host replaces the tab's
+    // previous attachment instead of keeping a stale one.
+    let client = "--client-id \(session.id.uuidString)"
     let first = try await waitForLaunches(1)[0]
-    #expect(first.hasPrefix("\(prefix) --detach-key none --status-file "))
+    #expect(first.hasPrefix("\(prefix) --detach-key none \(client) --status-file "))
     #expect(session.usesNativePTYBackend)
     #expect(!session.hasRunningProcess())
     #expect(session.childProcessID == nil)
@@ -734,6 +792,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     let second = try await waitForLaunches(2)[1]
     #expect(try statusFile(of: second) != firstStatus)
     #expect(!second.contains("--takeover"))
+    #expect(second.contains(" \(client) "))
     // Reconnecting the same selected tab must replace its mounted view, not
     // just start an adapter whose Ghostty surface renders offscreen.
     #expect(session.ghosttyBridge.terminalView.window === window)
@@ -756,7 +815,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     #expect(workspace.attachHostedSession(attachment, takeover: true) === session)
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
     let third = try await waitForLaunches(3)[2]
-    #expect(third.hasPrefix("\(prefix) --takeover --detach-key none --status-file "))
+    #expect(third.hasPrefix("\(prefix) --takeover --detach-key none \(client) --status-file "))
 
     // The hosted program exited: report it, and offer no reconnect.
     try writeStatus(#"{"outcome":"exited","exit_code":3,"signal":null,"message":null}"#, for: third)
@@ -777,6 +836,10 @@ private func fixtureSession() throws -> HostedSessionInfo {
     #expect(!session.isRunning)
     #expect(cli.calls.filter { $0.contains(" attach ") }.count == 3)
     #expect(session.hostedAttachment?.sessionID == "session-123")
+    // Each launch started once the previous adapter was gone, though it
+    // still ran when the tab reconnected (taken over, then disconnected):
+    // two adapters of one tab would drop each other's attachment in turn.
+    #expect(cli.clientOverlaps.isEmpty)
 }
 
 @Test @MainActor func HostedSessionTabShowsWhyItsAdapterDisconnected() async throws {

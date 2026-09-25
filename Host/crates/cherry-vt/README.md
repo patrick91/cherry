@@ -65,6 +65,15 @@ and `pwd()` always read the current values, and `mode(value, ansi)` reads one
 mode as the terminal holds it (DECCKM, application cursor keys, is
 `mode(1, false)`).
 
+The terminal can also be read as text in place, without a copy:
+`screen_text()` gives the whole of it with its history and `active_text()`
+the active screen alone (soft-wrapped rows joined while autowrap is on,
+trailing blanks and blank rows at the end trimmed). `cursor()` says where the
+cursor is, which screen shows and how many rows of history lie above, and
+`lines_ending(rows)` how many lines of that text end on those rows (a row
+ends one unless it holds text and soft-wraps onto the next, as the text is
+formatted), so the line that holds the cursor needs no marking of a copy.
+
 libghostty-vt parses kitty notifications (OSC 99) but drops them, so they
 never come from `take_events`. `Osc99` (one per session) takes each complete
 `ESC ] 99 ; metadata ; payload` sequence, as a reader of the output stream

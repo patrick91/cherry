@@ -16,6 +16,8 @@ pub struct Timing {
     pub escape_wait: Duration,
     /// See `attach::GRID_WAIT`.
     pub grid_wait: Duration,
+    /// See `attach::RESIZE_COALESCE`.
+    pub resize_coalesce: Duration,
     /// See `attach::DETACH_WAIT`.
     pub detach_wait: Duration,
     /// See `attach::REPORT_WAIT`.
@@ -63,6 +65,10 @@ pub fn timing() -> &'static Timing {
             ),
             escape_wait: millis("CHERRY_CLI_ESCAPE_WAIT_MS", crate::input::ESCAPE_WAIT),
             grid_wait: millis("CHERRY_CLI_GRID_WAIT_MS", crate::attach::GRID_WAIT),
+            resize_coalesce: millis(
+                "CHERRY_CLI_RESIZE_COALESCE_MS",
+                crate::attach::RESIZE_COALESCE,
+            ),
             detach_wait: millis("CHERRY_CLI_DETACH_WAIT_MS", crate::attach::DETACH_WAIT),
             report_wait: millis("CHERRY_CLI_REPORT_WAIT_MS", crate::attach::REPORT_WAIT),
             closed_wait: millis("CHERRY_CLI_CLOSED_WAIT_MS", crate::transport::CLOSED_WAIT),

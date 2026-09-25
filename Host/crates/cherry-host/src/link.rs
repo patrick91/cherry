@@ -52,6 +52,19 @@
 //! - Version 4 adds application cursor keys (DECCKM), as a field:
 //!   `application_cursor_keys` in `Info` and in the hello's session. A
 //!   daemon takes it as off for an older holder, which never reports it.
+//! - Version 5 adds, daemon to holder, `Attended` (whether any client is
+//!   attached, which the holder serves at interactive priority; see
+//!   `cherry_protocol::priority`), and the snapshot kind `resized`, which
+//!   a daemon sends right behind a `RESIZE`: the screens, as `refresh`
+//!   gives them, unless the alternate screen shows, whose program redraws
+//!   it itself when the terminal is resized, and nothing was output since
+//!   the last `RESIZE` took effect (the reply's offset is then where it
+//!   did, and the output after it was made for the new size); then the
+//!   reply's `kind` is `size` and it holds no bytes. The holder serves it
+//!   before it reads more output when it arrives with its `RESIZE`, and a
+//!   `size` reply takes no work, so the pass goes on. An older holder is
+//!   sent neither (it would answer an unknown snapshot kind with an
+//!   error).
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -65,10 +78,13 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 4;
+pub const LINK_VERSION: u16 = 5;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
+/// The oldest link version whose holders answer the snapshot kind
+/// `resized`.
+pub const RESIZED_SNAPSHOT_VERSION: u16 = 5;
 /// The oldest link version this daemon adopts holders of.
 pub const MIN_LINK_VERSION: u16 = 1;
 /// Frames are at most this long (an 8 MiB snapshot, and room to spare).
@@ -106,11 +122,14 @@ pub mod kind {
     /// Version 2.
     pub const UPDATE: u8 = 73;
     pub const REFUSED: u8 = 74;
+    /// Version 5.
+    pub const ATTENDED: u8 = 75;
 
     /// The link version that introduced a daemon-to-holder kind.
     pub fn since(kind: u8) -> u16 {
         match kind {
             SCREEN | UPDATE => 2,
+            ATTENDED => 5,
             _ => 1,
         }
     }
@@ -559,7 +578,10 @@ pub struct Size {
 }
 
 /// A snapshot request: `full`, `limited` (to `max` bytes, the oldest
-/// history dropped to fit) or `refresh` (the screens without history).
+/// history dropped to fit), `refresh` (the screens without history) or,
+/// from version 5, `resized` (`refresh`, or no bytes and the reply kind
+/// `size` while the alternate screen shows and nothing was output since
+/// the last resize; see the version notes).
 #[derive(Serialize, Deserialize)]
 pub struct SnapshotRequest {
     pub req: u64,
@@ -573,12 +595,21 @@ pub struct SnapshotRequest {
 #[derive(Serialize, Deserialize)]
 pub struct SnapshotReply {
     pub req: u64,
+    /// The request's kind, or what a `resized` request was answered with
+    /// (`refresh` or `size`).
     pub kind: String,
     pub offset: u64,
     pub cols: u16,
     pub rows: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Daemon to holder, version 5: whether any client is attached to the
+/// session. Sent when that changes; a holder without a daemon has none.
+#[derive(Serialize, Deserialize)]
+pub struct Attended {
+    pub attached: bool,
 }
 
 /// The screen as text, with its history when `scrollback`.
@@ -823,6 +854,18 @@ mod tests {
             serde_json::from_str(r#"{"reason":"old","retry":false,"later":1}"#).unwrap();
         assert!(!refused.retry);
         assert_eq!(kind::since(kind::REFUSED), 1);
+    }
+
+    #[test]
+    fn a_holder_is_told_whether_anyone_attached_only_from_version_5() {
+        assert_eq!(kind::since(kind::ATTENDED), 5);
+        assert!(LINK_VERSION >= kind::since(kind::ATTENDED));
+        assert_eq!(RESIZED_SNAPSHOT_VERSION, 5);
+        let frame = encode(kind::ATTENDED, &Attended { attached: true }, &[]);
+        let decoded = decode(&frame[4..]).unwrap();
+        assert!(decoded.meta::<Attended>().unwrap().attached);
+        let later: Attended = serde_json::from_str(r#"{"attached":false,"clients":2}"#).unwrap();
+        assert!(!later.attached);
     }
 
     #[test]

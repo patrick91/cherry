@@ -89,7 +89,9 @@ use std::{
     time::Duration,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub mod priority;
+
+pub const PROTOCOL_VERSION: u32 = 5;
 /// The environment variable in which the CLI tells a remote
 /// `cherry-host gateway` which host identity it expects
 /// (`--expected-host-id`, or the host an attachment reconnects to). The
@@ -126,6 +128,8 @@ pub const MAX_TAGS: usize = 64;
 pub const MAX_TAG_KEY_BYTES: usize = 128;
 /// and all keys and values together at most this long.
 pub const MAX_TAG_BYTES: usize = 16 * 1024;
+/// `ClientMessage::Attach::client_id` is at most this long.
+pub const MAX_CLIENT_ID_BYTES: usize = 128;
 
 /// Error codes in `ServerMessage::Error`.
 pub mod error_code {
@@ -136,6 +140,10 @@ pub mod error_code {
     pub const REQUEST_FAILED: &str = "request_failed";
     /// Another client attached with `takeover`; this attachment ended.
     pub const TAKEN_OVER: &str = "taken_over";
+    /// A newer attachment of the same client (`ClientMessage::Attach`'s
+    /// `client_id`) replaced this one, which ended; the client runs on
+    /// there, so this one does not connect again (protocol 5).
+    pub const REPLACED: &str = "replaced";
     /// Non-fatal while attached: the canonical size could not change.
     pub const RESIZE_FAILED: &str = "resize_failed";
     pub const SNAPSHOT_FAILED: &str = "snapshot_failed";
@@ -333,6 +341,19 @@ pub enum ClientMessage {
         /// whose replies it reads as input. A client whose input or output
         /// is not that terminal (a script, a pipe) is sent none.
         answers_queries: bool,
+        /// Names the client across its connections (Cherry passes a tab's
+        /// ID; at most `MAX_CLIENT_ID_BYTES`, empty is none). An attachment
+        /// of the session that carries the same ID is dropped when this one
+        /// is made, as if its connection had ended (its unsent input is
+        /// discarded, and nobody is told `taken_over`): a client that
+        /// starts again, or connects again before the host noticed the
+        /// lost connection, never leaves a stale attachment behind that
+        /// holds the shared grid at its size. The dropped attachment is
+        /// sent `error_code::REPLACED` last, so a copy of the client that
+        /// still runs ends rather than connecting again (which would drop
+        /// this one in turn).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     Input {
         #[serde(with = "base64_bytes")]
@@ -454,6 +475,24 @@ pub enum ServerMessage {
         #[serde(with = "base64_bytes")]
         snapshot: Vec<u8>,
         reason: AttachReason,
+    },
+    /// The shared grid changed to `cols` by `rows` at `offset` without a
+    /// replacement snapshot, because the program shows the alternate
+    /// screen and redraws it itself (full-screen programs repaint when
+    /// their terminal is resized). Sent instead of `Attached{Resize}` to a
+    /// client that renders the stream and keeps a copy of it: the output
+    /// before `offset` was made for the old size, the output from
+    /// `offset` on for the new one. The client resizes its copy there and
+    /// keeps what its window shows until the repaint arrives (a window of
+    /// another size then paints its viewport from the resized copy), and
+    /// continues with the output at `offset`, which follows in stream
+    /// order. Never sent in reply to
+    /// `Attach`, nor to a client that needs history (a window that painted
+    /// a viewport and now matches the grid gets a full `Attached{Resize}`).
+    Resized {
+        offset: u64,
+        cols: u16,
+        rows: u16,
     },
     /// offset is the first byte position of this chunk, not its end.
     Output {
@@ -1141,9 +1180,29 @@ mod tests {
             ),
             Ok(ClientMessage::Attach {
                 answers_queries: true,
+                client_id: None,
                 ..
             })
         ));
+        // A client ID is optional, and sent only when there is one.
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"op":"attach","id":"a","cols":80,"rows":24,"takeover":false,"answers_queries":true,"client_id":"tab-1"}"#
+            ),
+            Ok(ClientMessage::Attach {
+                client_id: Some(id),
+                ..
+            }) if id == "tab-1"
+        ));
+        assert!(!json(&ClientMessage::Attach {
+            id: "a".into(),
+            cols: 80,
+            rows: 24,
+            takeover: false,
+            answers_queries: true,
+            client_id: None,
+        })
+        .contains("client_id"));
     }
     fn json<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap()
@@ -1321,6 +1380,15 @@ mod tests {
                 rows: 24,
                 takeover: true,
                 answers_queries: false,
+                client_id: None,
+            },
+            ClientMessage::Attach {
+                id: "s".into(),
+                cols: 500,
+                rows: 200,
+                takeover: false,
+                answers_queries: true,
+                client_id: Some("6d1f0c2e-3b4a-4c5d-8e9f-0a1b2c3d4e5f".into()),
             },
             ClientMessage::Input {
                 data: bytes.clone(),
@@ -1440,6 +1508,11 @@ mod tests {
                 offset: u64::MAX,
                 snapshot: (0..=255).rev().collect(),
                 reason: AttachReason::Resync,
+            },
+            ServerMessage::Resized {
+                offset: u64::MAX,
+                cols: 500,
+                rows: 1,
             },
             ServerMessage::Output {
                 offset: 3,

@@ -299,6 +299,9 @@ struct FakeHolder {
     id: String,
     /// The kinds the daemon sent.
     received: Vec<u8>,
+    /// What the daemon said of attached clients (`Attended`), in order;
+    /// `next` passes over those frames.
+    attended: Vec<bool>,
 }
 
 impl FakeHolder {
@@ -312,15 +315,23 @@ impl FakeHolder {
             link,
             id,
             received: Vec::new(),
+            attended: Vec::new(),
         }
     }
 
     fn next(&mut self) -> link::Frame {
-        let frame = link::next(&mut self.link);
-        // Every frame carries the sender's link version.
-        assert_eq!(frame.version, link::VERSION, "{frame:?}");
-        self.received.push(frame.kind);
-        frame
+        loop {
+            let frame = link::next(&mut self.link);
+            // Every frame carries the sender's link version.
+            assert_eq!(frame.version, link::VERSION, "{frame:?}");
+            self.received.push(frame.kind);
+            if frame.kind == link::ATTENDED {
+                self.attended
+                    .push(frame.meta["attached"].as_bool().expect("attached"));
+                continue;
+            }
+            return frame;
+        }
     }
 
     fn expect(&mut self, kind: u8) -> link::Frame {
@@ -563,6 +574,58 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
     assert!(refused.meta["reason"].as_str().unwrap().contains("version"));
     assert!(link::read(&mut ancient.link).unwrap().is_none());
     assert!(!host.sessions().iter().any(|s| s.id == ancient.id));
+}
+
+/// Attach to a fake holder's session and detach, serving the holder's part.
+fn attach_and_detach(host: &Host, holder: &mut FakeHolder) {
+    let id = holder.id.clone();
+    thread::scope(|scope| {
+        let client = scope.spawn(|| {
+            let (mut socket, _, _, snapshot) = host.attach(&id, 80, 24);
+            assert_eq!(snapshot, b"SNAP");
+            send(&mut socket, &ClientMessage::Detach);
+            while !matches!(receive(&mut socket), ServerMessage::Ok) {}
+        });
+        let request = holder.expect(link::SNAPSHOT);
+        holder.send(
+            link::SNAPSHOT_REPLY,
+            link::VERSION,
+            json!({"req": request.meta["req"], "kind": "limited", "offset": 5, "cols": 80, "rows": 24}),
+            b"SNAP",
+        );
+        let detach = holder.expect(link::DETACH);
+        holder.send(
+            link::DETACH_DONE,
+            link::VERSION,
+            json!({"req": detach.meta["req"]}),
+            b"",
+        );
+        client.join().unwrap();
+    });
+}
+
+#[test]
+fn a_holder_is_told_while_a_client_is_attached() {
+    let host = Host::new();
+    let mut holder = FakeHolder::register(
+        &host,
+        link::VERSION,
+        hello(&Uuid::new_v4().to_string(), json!({})),
+    );
+    wait_until("the session", || {
+        host.sessions().iter().any(|s| s.id == holder.id)
+    });
+    // Once the client is attached, and before its detach is passed on.
+    attach_and_detach(&host, &mut holder);
+    assert_eq!(holder.attended, [true, false]);
+    // A holder of link version 4 does not know the frame, and is not sent
+    // it.
+    let mut older = FakeHolder::register(&host, 4, hello(&Uuid::new_v4().to_string(), json!({})));
+    wait_until("the older session", || {
+        host.sessions().iter().any(|s| s.id == older.id)
+    });
+    attach_and_detach(&host, &mut older);
+    assert!(older.attended.is_empty(), "{:?}", older.received);
 }
 
 #[test]

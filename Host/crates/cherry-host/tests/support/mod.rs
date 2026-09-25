@@ -383,6 +383,7 @@ impl Host {
                 rows,
                 takeover,
                 answers_queries,
+                client_id: None,
             },
         )
         .unwrap();
@@ -708,6 +709,8 @@ pub struct Screen {
     pub cols: u16,
     pub rows: u16,
     pub attached: Vec<AttachReason>,
+    /// The grid sizes the host announced without a snapshot (`Resized`).
+    pub resized: Vec<(u16, u16)>,
     pub exit: Option<(u32, Option<i32>)>,
     /// The queries this attachment was sent to answer, each with the output
     /// offset it came at.
@@ -724,6 +727,7 @@ impl Screen {
             cols,
             rows,
             attached: Vec::new(),
+            resized: Vec::new(),
             exit: None,
             queries: Vec::new(),
         }
@@ -759,9 +763,18 @@ impl Screen {
                 let mut replacement = Self::new(session.cols, session.rows, *offset, snapshot);
                 replacement.attached = std::mem::take(&mut self.attached);
                 replacement.attached.push(*reason);
+                replacement.resized = std::mem::take(&mut self.resized);
                 replacement.exit = self.exit;
                 replacement.queries = std::mem::take(&mut self.queries);
                 *self = replacement;
+            }
+            // The grid changed size here, and the program repaints: the
+            // copy follows, as a renderer's does.
+            ServerMessage::Resized { offset, cols, rows } => {
+                assert_eq!(*offset, self.offset, "a resize is placed in the stream");
+                self.terminal.resize(*cols, *rows).unwrap();
+                (self.cols, self.rows) = (*cols, *rows);
+                self.resized.push((*cols, *rows));
             }
             ServerMessage::Query { data } => self.queries.push((self.offset, data.clone())),
             ServerMessage::Exit {
@@ -908,8 +921,9 @@ pub mod link {
     pub const SCREEN: u8 = 72;
     pub const UPDATE: u8 = 73;
     pub const REFUSED: u8 = 74;
+    pub const ATTENDED: u8 = 75;
     /// What this build's daemon and holders speak.
-    pub const VERSION: u16 = 4;
+    pub const VERSION: u16 = 5;
 
     #[derive(Debug)]
     pub struct Frame {

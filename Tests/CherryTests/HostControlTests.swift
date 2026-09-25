@@ -338,10 +338,10 @@ private final class HeldRequests: @unchecked Sendable {
     fake.respond = nil
 
     // Another protocol version is reported, not spoken.
-    fake.version = 5
+    fake.version = HostProtocol.version + 1
     let newer = makeFakeHostControl(fake, hostStore: store)
     let versionFailure = await #expect(throws: HostedSessionError.self) { try await newer.list() }
-    #expect(versionFailure?.localizedDescription.contains("protocol 5") == true)
+    #expect(versionFailure?.localizedDescription.contains("protocol \(HostProtocol.version + 1)") == true)
     fake.version = HostProtocol.version
 
     let control = makeFakeHostControl(fake, hostStore: store)

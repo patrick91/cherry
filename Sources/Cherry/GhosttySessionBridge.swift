@@ -771,6 +771,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func relaunchNativeSurface() {
         guard !isReleased, let session = proxy.session else { return }
         isNativePTYBacked = true
+        // First: the previous adapter must be gone before the next one of
+        // this tab attaches with the same client id (`nativeExecLaunch`).
         terminalView.freeSurface()
         terminalView.controller?.tick()
         terminalView.relaunchSurface(
@@ -887,15 +889,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// Routes programmatic input to the surface-owned PTY under native mode (the
     /// host has no PTY fd to write to). `send(text:)`/`send(data:)` funnel here.
     ///
-    /// Printable runs go through the surface text path; control/escape sequences
-    /// (Enter, arrows, Tab, Esc, Ctrl-combos) become real key events, because
-    /// `ghostty_surface_text` filters control bytes — this is the path agents use
+    /// Printable runs of text input are pasted through the surface text path;
+    /// Enter, Tab, Backspace, Escape and arrow/navigation sequences become key
+    /// events Ghostty encodes for the program's modes; control characters (and
+    /// the printable bytes of `raw` input) are written to the PTY as they are,
+    /// with the kitty keyboard protocol on or off — this is the path agents use
     /// to drive other agents' TUIs. See `NativeInputTranslator`.
-    func sendNativeInput(_ data: Data) {
-        for op in NativeInputTranslator.translate(data) {
+    func sendNativeInput(_ data: Data, raw: Bool = false) {
+        for op in NativeInputTranslator.translate(data, raw: raw) {
             switch op {
             case .text(let text):
                 terminalView.sendText(text)
+            case .bytes(let bytes):
+                terminalView.performBindingAction(NativeInputTranslator.textBindingAction(for: bytes))
             case .key(let keycode, let shift, let control, let option):
                 terminalView.sendKeyPress(keycode: keycode, shift: shift, control: control, option: option)
             }

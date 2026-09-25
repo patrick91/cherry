@@ -395,12 +395,14 @@ struct HostedSessionAttachment: Equatable, Sendable {
     func arguments(
         statusFile: URL?,
         takeover: Bool = false,
+        clientID: String? = nil,
         masters: HostSSHMasterManager = .shared
     ) -> [String] {
         arguments(
             statusFile: statusFile,
             takeover: takeover,
-            sshControlPath: statusFile.flatMap { registerAdapterLaunch(statusFile: $0, masters: masters) }
+            sshControlPath: statusFile.flatMap { registerAdapterLaunch(statusFile: $0, masters: masters) },
+            clientID: clientID
         )
     }
 
@@ -420,24 +422,34 @@ struct HostedSessionAttachment: Equatable, Sendable {
 
     /// The adapter's arguments for a launch registered with
     /// `registerAdapterLaunch` (`sshControlPath` is what it returned). Pure.
-    func arguments(statusFile: URL?, takeover: Bool, sshControlPath: String?) -> [String] {
+    ///
+    /// `clientID` names the client the adapter attaches as (a tab passes
+    /// its id): when an adapter attaches a session with the id of one of
+    /// that session's attachments, the host drops the older attachment, so
+    /// an adapter launched again (a relaunched surface, a reconnect, an app
+    /// that quit without detaching) never leaves a stale client pinning the
+    /// session's grid.
+    func arguments(statusFile: URL?, takeover: Bool, sshControlPath: String?, clientID: String? = nil) -> [String] {
         var arguments = host.arguments(sshControlPath: sshControlPath)
             + ["--expected-host-id", hostID, "attach", sessionID]
         if takeover { arguments.append("--takeover") }
         arguments += ["--detach-key", "none"]
+        if let clientID { arguments += ["--client-id", clientID] }
         if let statusFile { arguments += ["--status-file", statusFile.path] }
         return arguments
     }
 
-    func execCommand(statusFile: URL?, takeover: Bool = false) -> String {
-        ([executablePath] + arguments(statusFile: statusFile, takeover: takeover))
+    func execCommand(statusFile: URL?, takeover: Bool = false, clientID: String? = nil) -> String {
+        ([executablePath] + arguments(statusFile: statusFile, takeover: takeover, clientID: clientID))
             .map(Self.shellQuote).joined(separator: " ")
     }
 
     /// `execCommand` for a launch registered with `registerAdapterLaunch`.
     /// Pure: computing it again gives the same command.
-    func execCommand(statusFile: URL?, takeover: Bool, sshControlPath: String?) -> String {
-        ([executablePath] + arguments(statusFile: statusFile, takeover: takeover, sshControlPath: sshControlPath))
+    func execCommand(statusFile: URL?, takeover: Bool, sshControlPath: String?, clientID: String? = nil) -> String {
+        ([executablePath] + arguments(
+            statusFile: statusFile, takeover: takeover, sshControlPath: sshControlPath, clientID: clientID
+        ))
             .map(Self.shellQuote).joined(separator: " ")
     }
 

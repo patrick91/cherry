@@ -17,7 +17,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, valid_size, AttachReason, ForegroundProcess, ProgressState,
+    encode_frame, error_code, priority, valid_size, AttachReason, ForegroundProcess, ProgressState,
     ServerMessage, SessionEvent, SessionInfo, SessionState, MAX_SCREEN_TEXT_BYTES,
     MAX_SNAPSHOT_BYTES,
 };
@@ -102,6 +102,9 @@ pub enum Command {
         takeover: bool,
         /// The client's terminal answers queries (see `Worker::send_query`).
         answers_queries: bool,
+        /// Names the client: an attachment with the same ID is dropped
+        /// (see `Worker::drop_stale`).
+        client_id: Option<String>,
         outbox: Arc<Outbox>,
         abort: UnixStream,
         cancelled: Arc<AtomicBool>,
@@ -217,6 +220,8 @@ struct Attachment {
     resync_after: Option<Instant>,
     /// Its terminal answers queries (see `Worker::send_query`).
     answers_queries: bool,
+    /// See `Command::Attach`.
+    client_id: Option<String>,
 }
 
 impl Attachment {
@@ -312,6 +317,9 @@ fn start_holder(
     env: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<(UnixStream, Frame)> {
     let (ours, theirs) = UnixStream::pair().context("creating the session's link")?;
+    for end in [&ours, &theirs] {
+        cherry_protocol::priority::grow_send_buffer(end.as_raw_fd());
+    }
     let mut command = holder_command()?;
     command
         .arg("hold")
@@ -565,6 +573,7 @@ impl Session {
             unacknowledged: 0,
             offset,
             grid_due: None,
+            grid_changed: None,
             typist: None,
             next_req: 1,
             requests: BTreeMap::new(),
@@ -573,6 +582,7 @@ impl Session {
             exit,
             removed: false,
             removed_ack: None,
+            attended: false,
         };
         let exited = exit.is_some();
         let events = events
@@ -585,6 +595,8 @@ impl Session {
         thread::Builder::new()
             .name("cherry-session".into())
             .spawn(move || {
+                // Interactive while a client is attached (`Worker::attend`).
+                priority::interactive(false);
                 // Until started, or until the session is dropped unstarted.
                 let _ = started.recv();
                 worker.run()
@@ -759,6 +771,7 @@ struct PendingAttach {
     rows: u16,
     takeover: bool,
     answers_queries: bool,
+    client_id: Option<String>,
     outbox: Arc<Outbox>,
     abort: UnixStream,
     cancelled: Arc<AtomicBool>,
@@ -768,6 +781,24 @@ struct PendingAttach {
     /// Other attachments whose replacement for the new grid is full: they
     /// get the same snapshot.
     full_others: Vec<u64>,
+}
+
+impl PendingAttach {
+    /// The command it came from, to handle again later.
+    fn into_command(self) -> Command {
+        Command::Attach {
+            lease: self.lease,
+            cols: self.cols,
+            rows: self.rows,
+            takeover: self.takeover,
+            answers_queries: self.answers_queries,
+            client_id: self.client_id,
+            outbox: self.outbox,
+            abort: self.abort,
+            cancelled: self.cancelled,
+            ack: self.ack,
+        }
+    }
 }
 
 /// What a request to the holder is for.
@@ -828,6 +859,8 @@ struct Worker {
     offset: u64,
     /// When to apply a settled grid change, and its target.
     grid_due: Option<(Instant, (u16, u16))>,
+    /// When the grid last changed size.
+    grid_changed: Option<Instant>,
     /// Of the attachments whose terminal answers queries, the one that most
     /// recently sent input: it answers them (see `send_query`).
     typist: Option<u64>,
@@ -843,6 +876,8 @@ struct Worker {
     removed: bool,
     /// Acknowledges a `Remove` once the worker is gone.
     removed_ack: Option<SyncSender<()>>,
+    /// What the holder was last told (`link::Attended`).
+    attended: bool,
 }
 
 impl Worker {
@@ -905,7 +940,8 @@ impl Worker {
             .reduce(|(cols, rows), (c, r)| (cols.min(c), rows.min(r)))
     }
 
-    fn update_attached_flag(&self) {
+    fn update_attached_flag(&mut self) {
+        self.attend();
         {
             let mut info = self.info();
             let clients = u32::try_from(self.attached.len()).unwrap_or(u32::MAX);
@@ -916,6 +952,24 @@ impl Worker {
             info.clients = clients;
         }
         self.changed();
+    }
+
+    /// While a client is attached, this worker and the holder serve a
+    /// renderer: they run at interactive priority (see
+    /// `cherry_protocol::priority`). A holder older than link version 5 is
+    /// not told.
+    fn attend(&mut self) {
+        let attached = !self.attached.is_empty();
+        priority::interactive(attached);
+        if self.attended != attached
+            && self.tell(link::encode(
+                kind::ATTENDED,
+                &link::Attended { attached },
+                &[],
+            ))
+        {
+            self.attended = attached;
+        }
     }
 
     /// Apply a changed grid once it has been stable for GRID_SETTLE, so a
@@ -929,6 +983,27 @@ impl Worker {
             }
             _ => self.grid_due = None,
         }
+    }
+
+    /// Whether a window that now asks for `cols` by `rows` changes the grid
+    /// at once rather than once the size settles (`GRID_SETTLE`): it alone
+    /// sets the grid (no other window is smaller in either dimension) and
+    /// the grid is not that size yet. The only window changes it every time
+    /// (the client sends at most one resize per 50 ms, and one at once after
+    /// a pause): nobody else gets a replacement per step. With other
+    /// windows, which get one for every grid change, only the first change
+    /// of a drag is at once (nothing is settling, and the grid has not
+    /// changed for `GRID_SETTLE`); the rest of the drag waits for the size
+    /// to settle, as before: a drag sends them two replacements at most.
+    fn leads_grid(&self, cols: u16, rows: u16) -> bool {
+        self.running()
+            && self.desired_size() == Some((cols, rows))
+            && self.size() != (cols, rows)
+            && (self.attached.len() == 1
+                || (self.grid_due.is_none()
+                    && self
+                        .grid_changed
+                        .is_none_or(|at| at.elapsed() >= GRID_SETTLE)))
     }
 
     fn apply_due_grid(&mut self) {
@@ -949,7 +1024,7 @@ impl Worker {
             return;
         }
         self.resize(cols, rows);
-        self.send_resized(|_| true);
+        self.send_resized(|_| true, true);
     }
 
     /// Resize the terminal. The holder applies it before any request that
@@ -958,6 +1033,7 @@ impl Worker {
         if !self.tell(link::encode(kind::RESIZE, &link::Size { cols, rows }, &[])) {
             return;
         }
+        self.grid_changed = Some(Instant::now());
         {
             let mut info = self.info();
             info.cols = cols;
@@ -978,8 +1054,12 @@ impl Worker {
     /// queued behind the client's output, and supersedes an older
     /// replacement still queued, which is why one that supersedes a full one
     /// is full. A lagging client gets the new size with its resync.
-    fn send_resized(&mut self, due: impl Fn(&Attachment) -> bool) {
+    /// `just_resized`: the grid took its size with the resize just sent (see
+    /// `request_screens`).
+    fn send_resized(&mut self, due: impl Fn(&Attachment) -> bool, just_resized: bool) {
         let (full, refresh) = self.replacements_for(self.size(), due);
+        // The screens first: right behind the resize (see `request_screens`).
+        self.request_screens(refresh, just_resized);
         if !full.is_empty() {
             self.request_snapshot(
                 "limited",
@@ -989,14 +1069,58 @@ impl Worker {
                 },
             );
         }
-        if !refresh.is_empty() {
-            self.request_snapshot(
-                "refresh",
-                Request::Replace {
-                    full: false,
-                    leases: refresh,
-                },
-            );
+    }
+
+    /// Ask for the screens without history for these attachments, which
+    /// keep a copy of the stream (see `send_resized`). A program on the
+    /// alternate screen repaints it itself once resized, so right after a
+    /// resize (`just_resized`: the `RESIZE` is the last frame sent to the
+    /// holder, and these copies followed the grid at its previous size), a
+    /// holder that can tell (link version 5) answers with where the new size
+    /// took effect alone, and the attachments get `Resized` instead of a
+    /// snapshot: the window is painted once, by the program. It does so
+    /// only while nothing was output since the resize (the program's repaint
+    /// must reach the copies after the new size), and answers with the
+    /// screens otherwise; the holder serves such a request without delay
+    /// (it takes no work), so it is sent before any other request that
+    /// follows the resize. A copy that took a snapshot of an older grid
+    /// (an attach or resync meanwhile) may have missed several sizes, and
+    /// gets the screens.
+    fn request_screens(&mut self, leases: Vec<u64>, just_resized: bool) {
+        if leases.is_empty() {
+            return;
+        }
+        let kind = match &self.link {
+            Some(link) if just_resized && link.version >= link::RESIZED_SNAPSHOT_VERSION => {
+                "resized"
+            }
+            _ => "refresh",
+        };
+        self.request_snapshot(
+            kind,
+            Request::Replace {
+                full: false,
+                leases,
+            },
+        );
+    }
+
+    /// The grid took the size `size` at `offset` in the output, which
+    /// the program repaints for (see `request_screens`).
+    fn resized(&mut self, leases: &[u64], offset: u64, size: (u16, u16)) {
+        let Some(frame) = frame(&ServerMessage::Resized {
+            offset,
+            cols: size.0,
+            rows: size.1,
+        }) else {
+            return;
+        };
+        for attachment in &mut self.attached {
+            if !leases.contains(&attachment.lease) || attachment.outbox.is_lagging() {
+                continue;
+            }
+            attachment.outbox.push_resized(frame.clone());
+            attachment.direct = (attachment.cols, attachment.rows) == size;
         }
     }
 
@@ -1081,6 +1205,49 @@ impl Worker {
                 &[],
             ));
         }
+    }
+
+    /// A new attachment names its client (`client_id`): an attachment of
+    /// the same client is a stale one (the client started again, or
+    /// connected again before this host noticed its connection was lost),
+    /// which would otherwise hold the shared grid at its size until its
+    /// connection times out. It is dropped at once, as if its connection
+    /// had ended: its unsent input is discarded, and nobody is told of a
+    /// takeover. Its connection is sent `replaced` last and closed, so a
+    /// copy of the client that still runs ends instead of connecting again
+    /// and dropping this one in turn.
+    fn drop_stale(&mut self, client: &str) {
+        let replaced = frame(&ServerMessage::error(
+            error_code::REPLACED,
+            "another attachment of this client replaced this one; the session keeps running",
+        ));
+        let mut stale = Vec::new();
+        self.attached.retain(|attachment| {
+            if attachment.client_id.as_deref() != Some(client) {
+                return true;
+            }
+            attachment.cancelled.store(true, Ordering::SeqCst);
+            if let Some(frame) = &replaced {
+                attachment.outbox.push_final(frame.clone());
+            }
+            // Ends its connection: the reader sees the end, and the writer
+            // delivers what was queued and the notice (for a while: a peer
+            // that is gone is not waited for), then stops.
+            let _ = attachment.abort.shutdown(std::net::Shutdown::Read);
+            stale.push(attachment.lease);
+            false
+        });
+        if stale.is_empty() {
+            return;
+        }
+        for lease in stale {
+            self.discard_lease(lease);
+            if self.typist == Some(lease) {
+                self.typist = None;
+            }
+        }
+        self.update_attached_flag();
+        self.schedule_grid();
     }
 
     /// Drop attachments whose connection ended or whose peer is gone.
@@ -1219,6 +1386,7 @@ impl Worker {
                 rows,
                 takeover,
                 answers_queries,
+                client_id,
                 outbox,
                 abort,
                 cancelled,
@@ -1229,6 +1397,7 @@ impl Worker {
                 rows,
                 takeover,
                 answers_queries,
+                client_id,
                 outbox,
                 abort,
                 cancelled,
@@ -1304,6 +1473,13 @@ impl Worker {
                 let changed = (attachment.cols, attachment.rows) != (cols, rows);
                 attachment.cols = cols;
                 attachment.rows = rows;
+                if self.leads_grid(cols, rows) {
+                    // The grid follows this window at once (see
+                    // `leads_grid`); it gets its replacement with the others.
+                    self.grid_due = None;
+                    self.change_size(cols, rows);
+                    return;
+                }
                 self.schedule_grid();
                 let size = self.size();
                 let target = self.grid_due.map_or(size, |(_, target)| target);
@@ -1315,7 +1491,7 @@ impl Worker {
                     // The grid keeps its size (another client set it, or
                     // this one went back to it), and this window now
                     // matches it: repainted, it shows the session's stream.
-                    self.send_resized(|a| a.lease == lease);
+                    self.send_resized(|a| a.lease == lease, false);
                 }
                 // Otherwise the grid follows this window, and the client
                 // waits for it on what it shows.
@@ -1512,17 +1688,7 @@ impl Worker {
             .values()
             .any(|request| matches!(request, Request::Attach(_)))
         {
-            self.waiting.push_back(Command::Attach {
-                lease: pending.lease,
-                cols: pending.cols,
-                rows: pending.rows,
-                takeover: pending.takeover,
-                answers_queries: pending.answers_queries,
-                outbox: pending.outbox,
-                abort: pending.abort,
-                cancelled: pending.cancelled,
-                ack: pending.ack,
-            });
+            self.waiting.push_back(pending.into_command());
             return;
         }
         if self.removed {
@@ -1551,6 +1717,9 @@ impl Worker {
             }
             return;
         }
+        if let Some(client) = pending.client_id.clone() {
+            self.drop_stale(&client);
+        }
         self.release_gone();
         let (cols, rows) = (pending.cols, pending.rows);
         let dimensions = match (pending.takeover, self.desired_size()) {
@@ -1559,27 +1728,18 @@ impl Worker {
         };
         let resized = dimensions != self.size();
         pending.resized = resized;
-        let mut refresh = Vec::new();
         if resized {
             self.resize(dimensions.0, dimensions.1);
             if !pending.takeover {
                 // The other windows get replacements for the new size;
-                // those that need a full snapshot get this one's.
+                // those that need a full snapshot get this one's. The
+                // screens right behind the resize (see `request_screens`).
                 let (full, screens) = self.replacements_for(dimensions, |_| true);
                 pending.full_others = full;
-                refresh = screens;
+                self.request_screens(screens, true);
             }
         }
         self.request_snapshot("limited", Request::Attach(pending));
-        if !refresh.is_empty() {
-            self.request_snapshot(
-                "refresh",
-                Request::Replace {
-                    full: false,
-                    leases: refresh,
-                },
-            );
-        }
     }
 
     /// Answer an attach to an exited session: its final screen, then the
@@ -1639,6 +1799,7 @@ impl Worker {
             rows,
             takeover,
             answers_queries,
+            client_id,
             outbox,
             abort,
             cancelled,
@@ -1722,6 +1883,8 @@ impl Worker {
             return;
         }
         outbox.set_waker(self.wake.clone());
+        // Its writer serves a renderer from now on.
+        outbox.set_interactive(true);
         outbox.push_control(own);
         self.attached.push(Attachment {
             lease,
@@ -1733,6 +1896,7 @@ impl Worker {
             cancelled,
             resync_after: None,
             answers_queries,
+            client_id,
         });
         self.update_attached_flag();
         self.schedule_grid();
@@ -1741,7 +1905,7 @@ impl Worker {
         // then, so this one gets its own. The holder answers in order, so
         // it follows the snapshot already queued.
         if shown != self.size() {
-            self.send_resized(|attachment| attachment.lease == lease);
+            self.send_resized(|attachment| attachment.lease == lease, false);
         }
         let _ = ack.send(true);
     }
@@ -1774,6 +1938,9 @@ impl Worker {
                     }
                 }
             }
+            Request::Replace { leases, .. } if reply.kind == "size" && snapshot.is_ok() => {
+                self.resized(&leases, reply.offset, size);
+            }
             Request::Replace { full, leases } => {
                 let mut session = self.info().clone();
                 session.cols = size.0;
@@ -1793,7 +1960,7 @@ impl Worker {
                 // replacements skipped these clients, which were lagging:
                 // caught up now, they get one for the new grid too.
                 if caught_up && size != self.size() && self.running() {
-                    self.send_resized(|attachment| leases.contains(&attachment.lease));
+                    self.send_resized(|attachment| leases.contains(&attachment.lease), false);
                 }
             }
             Request::Final { leases } => {
@@ -2038,17 +2205,7 @@ impl Worker {
         let mut final_screen = false;
         for request in requests.into_values() {
             match request {
-                Request::Attach(pending) => self.waiting.push_front(Command::Attach {
-                    lease: pending.lease,
-                    cols: pending.cols,
-                    rows: pending.rows,
-                    takeover: pending.takeover,
-                    answers_queries: pending.answers_queries,
-                    outbox: pending.outbox,
-                    abort: pending.abort,
-                    cancelled: pending.cancelled,
-                    ack: pending.ack,
-                }),
+                Request::Attach(pending) => self.waiting.push_front(pending.into_command()),
                 Request::Detach { ack } => {
                     let _ = ack.send(());
                 }

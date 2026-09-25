@@ -1315,13 +1315,222 @@ struct WorkspaceRegistryPersistenceTests {
             chromeState: nil
         ))
 
-        var opened: [String] = []
-        #expect(registry.reopenSavedProjectWindows { opened.append($0) })
         // The project without saved tabs does not come back.
-        #expect(opened == [projects[1].path])
-        #expect(!registry.reopenSavedProjectWindows { opened.append($0) })
-        #expect(opened == [projects[1].path])
+        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .reopen([projects[1].path]))
+        // Once: the open window is all there is to show now.
+        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .nothing)
         #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+    }
+
+    /// Project windows are not restorable by AppKit, so relaunching the app
+    /// (quit and open, or macOS reopening it after a restart) brings them
+    /// back from the app's own list alone: a new run reads what the last one
+    /// saved as its windows closed at quit.
+    @Test func windowsOpenAtQuitReopenAtTheNextLaunchWithoutAppKit() throws {
+        let directory = try makeCanonicalTemporaryDirectory("cherry-relaunch-windows")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
+        let projects = ["a", "b"].map { directory.appendingPathComponent($0, isDirectory: true) }
+        for project in projects {
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            store.saveSynchronously(RepositoryStateRecord(
+                repositoryRoot: project.path,
+                activeWorktreeRoot: project.path,
+                worktrees: [WorktreeStateRecord(root: project.path, sessions: [nativeRecord(title: "Shell 1")])]
+            ))
+        }
+
+        // The last run: both windows open, then the app quits.
+        let lastRun = ProjectWindowRegistry()
+        lastRun.setWorkspaceStateStoreForTesting(store)
+        var windows: [NSWindow] = []
+        // The registry holds its workspaces weakly, as their windows do.
+        var workspaces: [TerminalWorkspace] = []
+        for project in projects {
+            let window = makeTestWindow()
+            windows.append(window)
+            let workspace = TerminalWorkspace(projectRoot: project.path, createInitialSession: false)
+            workspaces.append(workspace)
+            #expect(window.isRestorable)
+            #expect(lastRun.register(
+                window: window,
+                projectRoot: project.path,
+                workspace: workspace,
+                noteStore: nil,
+                todoStore: nil,
+                chromeState: nil
+            ))
+            // AppKit neither saves nor restores it.
+            #expect(!window.isRestorable)
+        }
+        lastRun.prepareForTermination()
+        for (window, project) in zip(windows, projects) {
+            lastRun.unregister(window: window, projectRoot: project.path)
+            window.close()
+        }
+        store.flush()
+        workspaces.removeAll()
+
+        // The next run, however the app was launched: no window was restored.
+        let nextRun = ProjectWindowRegistry()
+        nextRun.configureWorkspacePersistence(store: store)
+        #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map(\.path)))
+    }
+
+    @Test func launchOpensTheDefaultWindowOnlyWhenNothingElseOpens() throws {
+        let directory = try makeCanonicalTemporaryDirectory("cherry-default-window")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
+
+        // Nothing saved, nothing open.
+        let registry = ProjectWindowRegistry()
+        registry.configureWorkspacePersistence(store: store)
+        #expect(registry.launchWindowPlan(hasVisibleWindow: false) == .openDefault)
+        // A deep link opened a window before the plan ran.
+        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .nothing)
+        let project = directory.appendingPathComponent("linked", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let window = makeTestWindow()
+        let workspace = TerminalWorkspace(projectRoot: project.path, createInitialSession: false)
+        defer {
+            registry.unregister(window: window, projectRoot: project.path)
+            window.close()
+        }
+        #expect(registry.register(
+            window: window,
+            projectRoot: project.path,
+            workspace: workspace,
+            noteStore: nil,
+            todoStore: nil,
+            chromeState: nil
+        ))
+        #expect(registry.launchWindowPlan(hasVisibleWindow: false) == .nothing)
+    }
+
+    /// A second copy of the app (another holds the instance lock) reopens
+    /// none of the first copy's windows: it opens the default one.
+    @Test func aSecondCopyOpensOnlyTheDefaultWindow() throws {
+        let directory = try makeCanonicalTemporaryDirectory("cherry-second-copy-windows")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let lockURL = directory.appendingPathComponent("instance.lock")
+        let owner = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
+        defer { owner.release() }
+        let other = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
+        let storeDirectory = directory.appendingPathComponent("Workspaces", isDirectory: true)
+        let project = directory.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let ownerStore = WorkspaceStateStore(directory: storeDirectory, instanceLock: owner)
+        ownerStore.saveSynchronously(RepositoryStateRecord(
+            repositoryRoot: project.path,
+            activeWorktreeRoot: project.path,
+            worktrees: [WorktreeStateRecord(root: project.path, sessions: [nativeRecord(title: "Shell 1")])]
+        ))
+        ownerStore.saveOpenProjectWindowRoots([project.path], synchronously: true)
+
+        let registry = ProjectWindowRegistry()
+        registry.configureWorkspacePersistence(store: WorkspaceStateStore(directory: storeDirectory, instanceLock: other))
+        #expect(registry.launchWindowPlan(hasVisibleWindow: false) == .openDefault)
+    }
+
+    @Test func sidebarWidthIsSavedPerProject() throws {
+        let suite = "CherryTests.SidebarWidth.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ProjectSidebarWidthStore(defaults: defaults)
+
+        #expect(store.width(projectRoot: "/a") == ProjectSidebarWidthStore.defaultWidth)
+        store.setWidth(412, projectRoot: "/a")
+        store.setWidth(280, projectRoot: "/b.with.dots")
+        #expect(store.width(projectRoot: "/a") == 412)
+        #expect(store.width(projectRoot: "/b.with.dots") == 280)
+        #expect(ProjectSidebarWidthStore(defaults: defaults).width(projectRoot: "/a") == 412)
+        #expect(store.width(projectRoot: "/c") == ProjectSidebarWidthStore.defaultWidth)
+        defaults.set(-1.0, forKey: ProjectSidebarWidthStore.key(projectRoot: "/c"))
+        #expect(store.width(projectRoot: "/c") == ProjectSidebarWidthStore.defaultWidth)
+    }
+
+    /// Not restorable, a project window gets no frame autosave from SwiftUI
+    /// either: each project's window comes back at its own last frame,
+    /// whatever order the windows open in.
+    @Test func eachProjectWindowOpensAtItsOwnLastFrame() throws {
+        let suite = "CherryTests.WindowFrames.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let frames = ProjectWindowFrameStore(defaults: defaults)
+        let directory = try makeCanonicalTemporaryDirectory("cherry-window-frames")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let roots = try ["a", "b", "c"].map { name in
+            let project = directory.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            return project.path
+        }
+        let saved = [
+            NSRect(x: 120, y: 140, width: 800, height: 500),
+            NSRect(x: 360, y: 200, width: 900, height: 560),
+        ]
+        // Resizable, as project windows are: AppKit restores only the
+        // origin of a window that is not.
+        func makeWindow() -> NSWindow {
+            let window = makeTestWindow()
+            window.styleMask.insert(.resizable)
+            return window
+        }
+        func register(_ window: NSWindow, _ root: String, in registry: ProjectWindowRegistry, _ workspace: TerminalWorkspace) -> Bool {
+            registry.register(
+                window: window,
+                projectRoot: root,
+                workspace: workspace,
+                noteStore: nil,
+                todoStore: nil,
+                chromeState: nil
+            )
+        }
+
+        // The last run: each window is moved and resized, then closed.
+        let lastRun = ProjectWindowRegistry()
+        lastRun.configureWindowFrames(frames)
+        for (root, frame) in zip(roots, saved) {
+            let window = makeWindow()
+            let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
+            #expect(register(window, root, in: lastRun, workspace))
+            window.setFrame(frame, display: false)
+            // Saved as it changed, not only when the window closes.
+            #expect(frames.frameDescriptor(projectRoot: root) == window.frameDescriptor)
+            // Registering again (every view update does) keeps its frame.
+            #expect(register(window, root, in: lastRun, workspace))
+            #expect(window.frame == frame)
+            lastRun.unregister(window: window, projectRoot: root)
+            window.close()
+        }
+
+        // The next run opens them the other way round.
+        let nextRun = ProjectWindowRegistry()
+        nextRun.configureWindowFrames(frames)
+        var workspaces: [TerminalWorkspace] = []
+        var windows: [(NSWindow, String)] = []
+        defer {
+            for (window, root) in windows {
+                nextRun.unregister(window: window, projectRoot: root)
+                window.close()
+            }
+        }
+        for (root, frame) in zip(roots, saved).reversed() {
+            let window = makeWindow()
+            windows.append((window, root))
+            let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
+            workspaces.append(workspace)
+            #expect(register(window, root, in: nextRun, workspace))
+            #expect(window.frame == frame)
+        }
+        // A project whose window never saved a frame keeps the window's own.
+        let window = makeWindow()
+        windows.append((window, roots[2]))
+        let original = window.frame
+        let workspace = TerminalWorkspace(projectRoot: roots[2], createInitialSession: false)
+        workspaces.append(workspace)
+        #expect(register(window, roots[2], in: nextRun, workspace))
+        #expect(window.frame == original)
+        #expect(frames.frameDescriptor(projectRoot: roots[2]) == nil)
     }
 
     @Test func controlServerClosesAndRestartsProcessesInTheirOwningWindow() async throws {

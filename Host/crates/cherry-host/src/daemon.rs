@@ -670,6 +670,10 @@ pub fn serve(path: &Path) -> Result<()> {
     // held for the daemon's lifetime, and its cwd must not pin a volume.
     environment::close_inherited_fds();
     let _ = std::env::set_current_dir("/");
+    // Connection threads and session workers run at interactive priority
+    // while they serve an attachment; every other thread, and the holders
+    // started from them, at the default class.
+    cherry_protocol::priority::prepare_process();
     let _ = config();
     raise_fd_limit();
     session::note_executable();
@@ -917,6 +921,8 @@ fn admit(stream: UnixStream, host: &Arc<Host>, diagnostics: &mut Diagnostics) {
     if cherry_protocol::verify_peer(&stream).is_err() {
         return;
     }
+    // A client's frames, or a holder's link (see `connection`).
+    cherry_protocol::priority::grow_send_buffer(stream.as_raw_fd());
     if host.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         host.connections.fetch_sub(1, Ordering::SeqCst);
         return;
@@ -932,6 +938,8 @@ fn admit(stream: UnixStream, host: &Arc<Host>, diagnostics: &mut Diagnostics) {
     let spawned = thread::Builder::new()
         .name("cherry-connection".into())
         .spawn(move || {
+            // Interactive once it attaches (see `connection`).
+            cherry_protocol::priority::interactive(false);
             connection::serve(stream, &connection_host);
             connection_host.connections.fetch_sub(1, Ordering::SeqCst);
             if let Some(pid) = client {

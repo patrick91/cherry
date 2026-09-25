@@ -42,6 +42,8 @@ pub enum Outcome {
     Disconnected,
     /// Another client attached with --takeover.
     TakenOver,
+    /// Another attachment of this client (--client-id) replaced this one.
+    Replaced,
     /// Could not attach.
     Failed,
 }
@@ -238,6 +240,10 @@ mod tests {
         assert_eq!(
             json(&Status::new(Outcome::TakenOver, Some("moved".into()))),
             r#"{"outcome":"taken_over","exit_code":null,"signal":null,"message":"moved"}"#
+        );
+        assert_eq!(
+            json(&Status::new(Outcome::Replaced, Some("again".into()))),
+            r#"{"outcome":"replaced","exit_code":null,"signal":null,"message":"again"}"#
         );
         assert!(json(&Status::new(Outcome::Disconnected, None)).contains(r#""disconnected""#));
         assert!(json(&Status::new(Outcome::Failed, None)).contains(r#""failed""#));

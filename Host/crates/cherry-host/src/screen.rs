@@ -2,7 +2,7 @@
 //! text (`Screen`), and the terminal state clients follow in `SessionInfo`
 //! (the alternate screen, the kitty keyboard flags and application cursor
 //! keys).
-use anyhow::{bail, Result};
+use anyhow::Result;
 use cherry_protocol::MAX_SCREEN_TEXT_BYTES;
 use cherry_vt::Terminal;
 
@@ -118,25 +118,19 @@ pub const SCROLLBACK_BYTES: usize = 1024 * 1024;
 
 /// `terminal`'s screen as text: its history first when `scrollback`, only
 /// the last `max_lines` lines when that is set, and at most
-/// `MAX_SCREEN_TEXT_BYTES` (the oldest lines dropped). `terminal` is
-/// `cols` by `rows` and keeps at most `SCROLLBACK_BYTES` of history. The
-/// cursor is on the active screen; with `max_lines` its row is the line of
-/// the text that holds it instead.
-pub fn read(
-    terminal: &Terminal,
-    cols: u16,
-    rows: u16,
-    scrollback: bool,
-    max_lines: Option<u32>,
-) -> Result<ScreenText> {
-    // A copy of the screens alone: its text is the screen's, and it shows
-    // where the cursor is.
-    let mut screens = Terminal::new(cols, rows, 64 * 1024)?;
-    screens.feed(&terminal.refresh()?);
-    let inspection = screens.inspect()?;
-    let (cursor_col, cursor_row) = inspection.cursor;
-    let alternate_screen = inspection.alternate;
-    let visible = screens.screen_text()?;
+/// `MAX_SCREEN_TEXT_BYTES` (the oldest lines dropped). The cursor is on the
+/// active screen; with `max_lines` its row is the line of the text that
+/// holds it instead.
+///
+/// Read in place: the terminal is the session's own, and its holder reads
+/// it between outputs, so nothing here copies it. The line that holds the
+/// cursor follows from the rows above it, as the text is formatted
+/// (`Terminal::lines_ending`).
+pub fn read(terminal: &Terminal, scrollback: bool, max_lines: Option<u32>) -> Result<ScreenText> {
+    let cursor = terminal.cursor()?;
+    let (cursor_col, cursor_row) = (cursor.x, cursor.y);
+    let alternate_screen = cursor.alternate;
+    let visible = terminal.active_text()?;
     let Some(max_lines) = max_lines else {
         let mut text = if scrollback {
             terminal.screen_text()?
@@ -162,20 +156,21 @@ pub fn read(
     }
     // The alternate screen has no history.
     let history = scrollback && !alternate_screen;
+    let lines_ending = |rows: std::ops::Range<u64>| -> Result<usize> {
+        Ok(usize::try_from(terminal.lines_ending(rows)?)?)
+    };
+    let first = cursor.history_rows;
+    let cursor_screen_row = first + u64::from(cursor_row);
     // The text, and the line of it that holds the cursor (at or after its
     // line count when blank rows after the text hold it).
     let (mut text, line) = if history && visible.is_empty() {
         // A blank screen adds no lines to the text with history, which
-        // ends at the last line of history that is not blank, so the
-        // cursor is found in a copy of the whole terminal. (Rare, and
-        // bounded by the history a session keeps.)
-        let mut copy = Terminal::new(cols, rows, 4 * SCROLLBACK_BYTES)?;
-        copy.feed(&terminal.snapshot()?);
-        let text = copy.screen_text()?;
-        let line = cursor_line(&mut copy, &text, cursor_col, cursor_row)?;
-        (text, line)
+        // ends at the last line of history that is not blank: the cursor's
+        // line counts every row above it. (Rare, and bounded by the
+        // history a session keeps.)
+        (terminal.screen_text()?, lines_ending(0..cursor_screen_row)?)
     } else {
-        let line = cursor_line(&mut screens, &visible, cursor_col, cursor_row)?;
+        let line = lines_ending(first..cursor_screen_row)?;
         let visible_lines = line_count(&visible);
         // The last lines of the text with history are the screen's, all
         // but its first line, which may continue a line of history: with
@@ -200,47 +195,6 @@ pub fn read(
         cursor_col,
         alternate_screen,
     })
-}
-
-/// The line of `text`, the screen text of `copy`, that holds the cursor at
-/// (`x`, `y`) on the active screen: `copy` gets a mark in the cursor's cell
-/// (so it changes), and the mark shows where that cell lands in the text,
-/// whatever soft wraps, trimmed blanks or wide characters come before it.
-/// Everything before the cursor's cell reads the same with the mark, so
-/// the texts differ first at the mark or at blanks that come before it
-/// (trimmed away without it, or the other half of a wide character it
-/// replaced): the mark is the first one from there.
-fn cursor_line(copy: &mut Terminal, text: &str, x: u16, y: u16) -> Result<usize> {
-    // Private-use characters, one cell wide, that no character set maps:
-    // the second in case the cell holds the first.
-    for mark in ['\u{e000}', '\u{e001}'] {
-        // Written in place, whatever the program set up: no insert mode,
-        // no origin mode or margins to position against, and the cursor
-        // placement clears a pending wrap, so the mark never wraps or
-        // scrolls. CAN ends anything unfinished.
-        let write = format!(
-            "\x18\x1b[4l\x1b[?69l\x1b[?6l\x1b[r\x1b[{};{}H{mark}",
-            u32::from(y) + 1,
-            u32::from(x) + 1
-        );
-        copy.feed(write.as_bytes());
-        let marked = copy.screen_text()?;
-        let mut same = text
-            .bytes()
-            .zip(marked.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        if same == text.len() && same == marked.len() {
-            continue;
-        }
-        while !marked.is_char_boundary(same) {
-            same -= 1;
-        }
-        if let Some(at) = marked[same..].find(mark) {
-            return Ok(line_count(&marked[..same + at]) - 1);
-        }
-    }
-    bail!("the cursor's cell could not be found in the screen text")
 }
 
 /// Limit a screen text that a holder older than link version 3 sent in full
@@ -388,7 +342,8 @@ mod tests {
         assert_eq!(text, "é");
     }
 
-    /// `read` of `output` on a `cols` by `rows` terminal.
+    /// `read` of `output` on a `cols` by `rows` terminal, checked against
+    /// `read_copied`.
     fn read_after(
         cols: u16,
         rows: u16,
@@ -396,14 +351,212 @@ mod tests {
         scrollback: bool,
         max_lines: Option<u32>,
     ) -> ScreenText {
-        read(
-            &terminal(cols, rows, output),
-            cols,
-            rows,
-            scrollback,
-            max_lines,
-        )
-        .unwrap()
+        let (screen, compared) = compare(cols, rows, output, scrollback, max_lines);
+        assert!(
+            compared,
+            "the copy differs: {:?}",
+            String::from_utf8_lossy(output)
+        );
+        screen
+    }
+
+    /// `read` of `output`, and whether it was compared with `read_copied`:
+    /// they must agree wherever the copy holds what the terminal holds. A
+    /// copy can lose a soft wrap: one onto a row cleared since, or before a
+    /// wide character that did not fit at the end of a row. The terminal
+    /// is the truth, and `read` reads it.
+    fn compare(
+        cols: u16,
+        rows: u16,
+        output: &[u8],
+        scrollback: bool,
+        max_lines: Option<u32>,
+    ) -> (ScreenText, bool) {
+        let terminal = terminal(cols, rows, output);
+        let screen = read(&terminal, scrollback, max_lines).unwrap();
+        let live = terminal.inspect().unwrap();
+        let mut screens = Terminal::new(cols, rows, 64 * 1024).unwrap();
+        screens.feed(&terminal.refresh().unwrap());
+        let mut faithful = screens.inspect().unwrap().active == live.active;
+        if scrollback && max_lines.is_some() && terminal.active_text().unwrap().is_empty() {
+            let mut copy = Terminal::new(cols, rows, 4 * SCROLLBACK_BYTES).unwrap();
+            copy.feed(&terminal.snapshot().unwrap());
+            faithful &= copy.inspect().unwrap().history == live.history;
+        }
+        if faithful {
+            assert_eq!(
+                screen,
+                read_copied(&terminal, cols, rows, scrollback, max_lines).unwrap(),
+                "{:?}",
+                String::from_utf8_lossy(output)
+            );
+        }
+        (screen, faithful)
+    }
+
+    /// How the text was read before `read` read the terminal in place:
+    /// from a copy of its screens (`Terminal::refresh`), with the cursor's
+    /// line found by marking the cursor's cell in the copy. The oracle for
+    /// `read`.
+    fn read_copied(
+        terminal: &Terminal,
+        cols: u16,
+        rows: u16,
+        scrollback: bool,
+        max_lines: Option<u32>,
+    ) -> Result<ScreenText> {
+        let mut screens = Terminal::new(cols, rows, 64 * 1024)?;
+        screens.feed(&terminal.refresh()?);
+        let inspection = screens.inspect()?;
+        let (cursor_col, cursor_row) = inspection.cursor;
+        let alternate_screen = inspection.alternate;
+        let visible = screens.screen_text()?;
+        let Some(max_lines) = max_lines else {
+            let mut text = if scrollback {
+                terminal.screen_text()?
+            } else {
+                visible
+            };
+            keep_last(&mut text, MAX_SCREEN_TEXT_BYTES);
+            return Ok(ScreenText {
+                text,
+                cursor_row,
+                cursor_col,
+                alternate_screen,
+            });
+        };
+        let max_lines = usize::try_from(max_lines).unwrap_or(usize::MAX);
+        if max_lines == 0 {
+            return Ok(ScreenText {
+                text: String::new(),
+                cursor_row: 0,
+                cursor_col,
+                alternate_screen,
+            });
+        }
+        let history = scrollback && !alternate_screen;
+        let (mut text, line) = if history && visible.is_empty() {
+            let mut copy = Terminal::new(cols, rows, 4 * SCROLLBACK_BYTES)?;
+            copy.feed(&terminal.snapshot()?);
+            let text = copy.screen_text()?;
+            let line = marked_line(&mut copy, &text, cursor_col, cursor_row)?;
+            (text, line)
+        } else {
+            let line = marked_line(&mut screens, &visible, cursor_col, cursor_row)?;
+            let visible_lines = line_count(&visible);
+            if history && max_lines >= visible_lines {
+                let text = terminal.screen_text()?;
+                let line = (line_count(&text) + line).saturating_sub(visible_lines);
+                (text, line)
+            } else {
+                (visible, line)
+            }
+        };
+        let dropped =
+            keep_last_lines(&mut text, max_lines) + keep_last(&mut text, MAX_SCREEN_TEXT_BYTES);
+        Ok(ScreenText {
+            text,
+            cursor_row: u16::try_from(line.saturating_sub(dropped)).unwrap_or(u16::MAX),
+            cursor_col,
+            alternate_screen,
+        })
+    }
+
+    /// The line of `text`, the screen text of `copy`, that holds the cursor
+    /// at (`x`, `y`): a mark in the cursor's cell shows where that cell
+    /// lands in the text.
+    fn marked_line(copy: &mut Terminal, text: &str, x: u16, y: u16) -> Result<usize> {
+        for mark in ['\u{e000}', '\u{e001}'] {
+            let write = format!(
+                "\x18\x1b[4l\x1b[?69l\x1b[?6l\x1b[r\x1b[{};{}H{mark}",
+                u32::from(y) + 1,
+                u32::from(x) + 1
+            );
+            copy.feed(write.as_bytes());
+            let marked = copy.screen_text()?;
+            let mut same = text
+                .bytes()
+                .zip(marked.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if same == text.len() && same == marked.len() {
+                continue;
+            }
+            while !marked.is_char_boundary(same) {
+                same -= 1;
+            }
+            if let Some(at) = marked[same..].find(mark) {
+                return Ok(line_count(&marked[..same + at]) - 1);
+            }
+        }
+        anyhow::bail!("the cursor's cell could not be found in the screen text")
+    }
+
+    /// Pseudo-random output that exercises wraps, blank rows, wide
+    /// characters, margins, scrolling, autowrap and the alternate screen.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pieces: [&[u8]; 24] = [
+            b"word ",
+            b"a longer run of text that wraps ",
+            "界界 ".as_bytes(),
+            "é".as_bytes(),
+            b"\r\n",
+            b"\r\n\r\n",
+            b"\n",
+            b"\r",
+            b"   ",
+            b"\x1b[2J",
+            b"\x1b[H",
+            b"\x1b[5;3H",
+            b"\x1b[K",
+            b"\x1b[3;6r",
+            b"\x1b[r",
+            b"\x1b[?7l",
+            b"\x1b[?7h",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[2A",
+            b"\x1b[3C",
+            b"\x1bM",
+            b"\x1b[L",
+            b"\x1b[4h\x1b[?69h\x1b[2;7s\x1b[?6hx\x1b[?6l\x1b[?69l\x1b[4l",
+        ];
+        let mut out = Vec::new();
+        while out.len() < len {
+            out.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+        }
+        out
+    }
+
+    #[test]
+    fn reading_in_place_matches_reading_a_copy() {
+        let (mut cases, mut compared) = (0, 0);
+        for seed in 1..=300u64 {
+            let output = noise(seed * 7919, 64 + (seed as usize * 37) % 1500);
+            for (cols, rows) in [(10, 4), (23, 7)] {
+                for (scrollback, max_lines) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some(3)),
+                    (true, Some(2)),
+                    (true, Some(6)),
+                    (true, Some(1000)),
+                    (false, Some(1000)),
+                ] {
+                    cases += 1;
+                    compared += usize::from(compare(cols, rows, &output, scrollback, max_lines).1);
+                }
+            }
+        }
+        // Most copies are faithful, so the comparison covers most cases.
+        assert!(compared * 10 >= cases * 8, "{compared} of {cases}");
     }
 
     /// The line the cursor is on, per `ScreenText`'s rule.

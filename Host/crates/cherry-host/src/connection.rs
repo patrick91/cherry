@@ -17,8 +17,9 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, read_frame, write_frame, ClientMessage, Request, Response,
-    ServerMessage, SessionEvent, SessionState, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    encode_frame, error_code, priority, read_frame, write_frame, ClientMessage, Request, Response,
+    ServerMessage, SessionEvent, SessionState, MAX_CLIENT_ID_BYTES, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -300,16 +301,26 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
     if version != PROTOCOL_VERSION {
         return mismatched(stream, host, version);
     }
-    // The writer blocks as long as the peer is alive; a vanished peer is
+    // The writer waits as long as the peer is alive; a vanished peer is
     // detected by the reader's timeouts and the socket is then shut down.
     stream.set_write_timeout(None)?;
+    // From here on the socket is nonblocking: frames nothing is queued ahead
+    // of are written by whoever sends them, without blocking (a flag such as
+    // MSG_DONTWAIT is not honoured for Unix sockets on macOS), and the
+    // writer thread takes the rest, waiting for room. Reads wait up to the
+    // connection's silence limit (`Timed`).
+    stream.set_nonblocking(true)?;
     let outbox = Arc::new(Outbox::default());
+    outbox.set_socket(stream.try_clone()?);
     let writer_stream = stream.try_clone()?;
     let writer_outbox = outbox.clone();
     let (done, finished) = mpsc::channel::<()>();
     let writer = thread::Builder::new()
         .name("cherry-writer".into())
         .spawn(move || {
+            // At interactive priority once the connection attaches (see
+            // `Outbox::set_interactive`).
+            priority::interactive(false);
             writer_outbox.write_all_to(&writer_stream);
             let _ = writer_stream.shutdown(std::net::Shutdown::Both);
             let _ = done.send(());
@@ -320,6 +331,7 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
         attached: None,
         subscribed: false,
         stream,
+        read_timeout: Some(daemon::config().idle_timeout),
         host: host.clone(),
         outbox,
         last_probe: None,
@@ -349,10 +361,51 @@ struct Connection {
     attached: Option<Arc<Session>>,
     /// Whether it asked for events.
     subscribed: bool,
+    /// Nonblocking (see `run`).
     stream: UnixStream,
+    /// How long a read waits for the peer: its silence limit.
+    read_timeout: Option<Duration>,
     host: Arc<Host>,
     outbox: Arc<Outbox>,
     last_probe: Option<Instant>,
+}
+
+/// Reads a nonblocking socket as a blocking one with a read timeout would:
+/// each read waits up to `timeout` for data, then fails.
+struct Timed<'a> {
+    stream: &'a UnixStream,
+    timeout: Option<Duration>,
+}
+
+impl Read for Timed<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            match (&*self.stream).read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                read => return read,
+            }
+            let millis = match deadline {
+                None => -1,
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+                }
+            };
+            let mut fd = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut fd, 1, millis);
+            }
+        }
+    }
 }
 
 enum Flow {
@@ -378,7 +431,11 @@ impl Connection {
             }
             // Any frame counts as a heartbeat; an attached client that sends
             // nothing for the heartbeat timeout is treated as gone.
-            let (message, req) = match read_frame::<_, Request>(&mut self.stream) {
+            let mut reader = Timed {
+                stream: &self.stream,
+                timeout: self.read_timeout,
+            };
+            let (message, req) = match read_frame::<_, Request>(&mut reader) {
                 Ok(Some(Request { message, req })) => (message, req),
                 Ok(None) | Err(_) => return,
             };
@@ -515,11 +572,7 @@ impl Connection {
                     self.reply(req, ServerMessage::Ok);
                     self.host.subscribe(self.lease, &self.outbox);
                     self.subscribed = true;
-                    // Fails only once the peer is gone, which the next read
-                    // reports.
-                    let _ = self
-                        .stream
-                        .set_read_timeout(Some(daemon::config().heartbeat_timeout));
+                    self.read_timeout = Some(daemon::config().heartbeat_timeout);
                     return Ok((None, Flow::Continue));
                 }
                 ServerMessage::Ok
@@ -611,6 +664,7 @@ impl Connection {
                 rows,
                 takeover,
                 answers_queries,
+                client_id,
             } => {
                 if self.attached.is_some() {
                     bail!("connection already attached");
@@ -618,6 +672,13 @@ impl Connection {
                 if !cherry_protocol::valid_size(cols, rows) {
                     bail!("invalid terminal size");
                 }
+                if client_id
+                    .as_ref()
+                    .is_some_and(|client| client.len() > MAX_CLIENT_ID_BYTES)
+                {
+                    bail!("a client ID is at most {MAX_CLIENT_ID_BYTES} bytes");
+                }
+                let client_id = client_id.filter(|client| !client.is_empty());
                 let session = self.session(&id)?;
                 let (ack, acknowledged) = mpsc::sync_channel(1);
                 let attach = session.send(Command::Attach {
@@ -626,6 +687,7 @@ impl Connection {
                     rows,
                     takeover,
                     answers_queries,
+                    client_id,
                     outbox: self.outbox.clone(),
                     abort: self.stream.try_clone()?,
                     cancelled: self.cancelled.clone(),
@@ -636,8 +698,10 @@ impl Connection {
                 match acknowledged.recv_timeout(HOLDER_TIMEOUT) {
                     Ok(true) => {
                         self.attached = Some(session);
-                        self.stream
-                            .set_read_timeout(Some(daemon::config().heartbeat_timeout))?;
+                        self.read_timeout = Some(daemon::config().heartbeat_timeout);
+                        // This thread now carries a renderer's keystrokes;
+                        // it ends with the attachment.
+                        priority::interactive(true);
                     }
                     Ok(false) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {

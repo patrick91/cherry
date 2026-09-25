@@ -3883,7 +3883,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if routePersistentInput(outboundData) { return }
         if toSurface {
-            ghosttyBridgeStorage?.sendNativeInput(outboundData)
+            // Raw input's printable bytes are typed as they are, not pasted.
+            ghosttyBridgeStorage?.sendNativeInput(outboundData, raw: !normalize)
             return
         }
         shellProcess?.write(outboundData)
@@ -4743,7 +4744,16 @@ final class TerminalSession: ObservableObject, Identifiable {
                 attachment.execCommand(
                     statusFile: hostedLaunchStatusFile,
                     takeover: hostedLaunchTakesOver,
-                    sshControlPath: hostedLaunchSSHControlPath
+                    sshControlPath: hostedLaunchSSHControlPath,
+                    // Every launch of this tab's adapter attaches as the same
+                    // client: the host replaces the tab's previous attachment,
+                    // and the replaced adapter exits with outcome "replaced"
+                    // instead of reconnecting. Only the active launch's exit
+                    // leads to a reconnect, so two adapters of one tab settle
+                    // after one swap. A surface is freed (its adapter killed
+                    // and waited for) before the next one launches
+                    // (`GhosttySessionBridge.relaunchNativeSurface`).
+                    clientID: id.uuidString
                 ),
                 attachment.adapterEnvironment
             )
@@ -5957,7 +5967,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Assigns only a changed value: every keystroke comes here, and
+    /// publishing an unchanged one would re-render every view observing
+    /// the tab once per key.
     private func noteInputOutputBaseline() {
+        guard lastInputOutputVersion != outputVersion else { return }
         lastInputOutputVersion = outputVersion
     }
 
@@ -6737,13 +6751,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             runID: nil
         )
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
-        attentionClassifierPrediction = prediction
+        // Published values change only when they differ: an observation
+        // follows typing (debounced), and republishing an unchanged value
+        // would re-render every view observing the tab.
+        if attentionClassifierPrediction != prediction {
+            attentionClassifierPrediction = prediction
+        }
         if agentTurnState == .userInterrupted {
             // The user is already handling this turn. Preserve interruption and
             // follow-up screen observations for training without surfacing a
             // new alert until the user submits another turn.
             isAttentionEpisodeActive = prediction.needsAttention
-            hasUnacknowledgedAttention = false
+            setHasUnacknowledgedAttention(false)
             attentionNotificationGate.acknowledge()
             attentionObservationRecorder?.record(observation)
             return
@@ -6756,9 +6775,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                 attentionAlertGeneration &+= 1
                 isAttentionEpisodeActive = true
             }
-            hasUnacknowledgedAttention =
+            setHasUnacknowledgedAttention(
                 isAttentionEpisodeActive
-                && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
+                    && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
+            )
         } else {
             // Preserve a consumed/completed episode through transient classifier
             // wobble. Native screen reflow can momentarily make an idle agent
@@ -6767,10 +6787,15 @@ final class TerminalSession: ObservableObject, Identifiable {
             if prediction.turnState != .completed {
                 isAttentionEpisodeActive = false
             }
-            hasUnacknowledgedAttention = false
+            setHasUnacknowledgedAttention(false)
         }
         updateAttentionNotification(for: prediction)
         attentionObservationRecorder?.record(observation)
+    }
+
+    private func setHasUnacknowledgedAttention(_ value: Bool) {
+        guard hasUnacknowledgedAttention != value else { return }
+        hasUnacknowledgedAttention = value
     }
 
     private func updateAttentionNotification(for prediction: TerminalAttentionPrediction) {
@@ -7586,8 +7611,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         scheduleAttentionObservation(event: .turnInterrupted)
     }
 
+    /// Every keystroke clears it: publishes only when there was one.
     private func clearCurrentAttentionScreenTag() {
-        currentAttentionScreenTag = nil
+        if currentAttentionScreenTag != nil {
+            currentAttentionScreenTag = nil
+        }
         currentAttentionScreenTagObservationID = nil
     }
 

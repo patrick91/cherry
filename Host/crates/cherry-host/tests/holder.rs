@@ -740,3 +740,147 @@ fn command_of(pid: i32) -> Option<String> {
     let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!command.is_empty()).then_some(command)
 }
+
+/// A holder of a fresh session running `script`, its hello taken.
+fn held_session(sandbox: &Sandbox, script: &str) -> (Held, UnixStream) {
+    let state = sandbox.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let (holder, mut daemon) = hold(sandbox, &state, &Uuid::new_v4().to_string(), script);
+    assert_eq!(link::next(&mut daemon).kind, link::HOLDER_HELLO);
+    (holder, daemon)
+}
+
+#[test]
+fn output_goes_out_between_the_requests_that_take_work() {
+    // Output first, and out before the holder serves a request that takes
+    // work (the screen as text, a snapshot): one of those per pass, so a
+    // burst of them never holds the program's output back.
+    let sandbox = Sandbox::new();
+    let (_holder, mut daemon) = held_session(&sandbox, "exec yes FLOOD");
+    link::until(&mut daemon, link::OUTPUT, |_| {});
+    let mut burst = Vec::new();
+    for req in 1..=6 {
+        burst.extend(link::encode(
+            link::SCREEN,
+            link::VERSION,
+            &json!({"req": req, "scrollback": true}),
+            b"",
+        ));
+    }
+    std::io::Write::write_all(&mut daemon, &burst).unwrap();
+    let mut replies = 0;
+    let mut between = 0;
+    while replies < 6 {
+        let frame = link::next(&mut daemon);
+        match frame.kind {
+            link::SCREEN_REPLY => {
+                replies += 1;
+                assert_eq!(frame.meta["req"], replies);
+            }
+            link::OUTPUT if replies > 0 => between += 1,
+            _ => {}
+        }
+    }
+    assert!(between > 0, "the replies went out back to back");
+}
+
+#[test]
+fn a_resized_snapshot_holds_the_screens_unless_the_program_repaints_them() {
+    let sandbox = Sandbox::new();
+    let request = |daemon: &mut UnixStream, req: u64| {
+        link::send(
+            daemon,
+            link::SNAPSHOT,
+            link::VERSION,
+            json!({"req": req, "kind": "resized"}),
+            b"",
+        );
+        until_matching(daemon, link::SNAPSHOT_REPLY, |frame| {
+            frame.meta["req"] == req
+        })
+    };
+    // On the primary screen: the screens, as a refresh gives them.
+    let (_shell, mut daemon) = held_session(&sandbox, "printf 'PROMPT$ '; exec sleep 60");
+    until_matching(&mut daemon, link::OUTPUT, |frame| {
+        String::from_utf8_lossy(&frame.data).contains("PROMPT")
+    });
+    let reply = request(&mut daemon, 1);
+    assert_eq!(reply.meta["kind"], "refresh");
+    assert!(String::from_utf8_lossy(&reply.data).contains("PROMPT$"));
+    // On the alternate screen: nothing but where the size took effect, and
+    // only right after a resize.
+    let (_editor, mut daemon) =
+        held_session(&sandbox, "printf '\\033[?1049hEDITOR'; exec sleep 60");
+    until_matching(&mut daemon, link::INFO, |frame| {
+        frame.meta["alternate_screen"] == true
+    });
+    let resize = |daemon: &mut UnixStream, cols: u16, rows: u16| {
+        link::send(
+            daemon,
+            link::RESIZE,
+            link::VERSION,
+            json!({"cols": cols, "rows": rows}),
+            b"",
+        );
+    };
+    assert_eq!(request(&mut daemon, 2).meta["kind"], "refresh");
+    resize(&mut daemon, 90, 30);
+    let reply = request(&mut daemon, 3);
+    assert_eq!(reply.meta["kind"], "size");
+    assert_eq!(
+        (reply.meta["cols"].clone(), reply.meta["rows"].clone()),
+        (json!(90), json!(30))
+    );
+    assert!(reply.data.is_empty());
+    assert!(reply.meta["offset"].as_u64().unwrap() > 0);
+    // A resize that changes nothing: the program repaints nothing.
+    resize(&mut daemon, 90, 30);
+    assert_eq!(request(&mut daemon, 4).meta["kind"], "refresh");
+
+    // A program that repaints on its own once resized: after its repaint,
+    // the screens, which a copy that took the repaint at its old size
+    // would lack.
+    let (_repainting, mut daemon) = held_session(
+        &sandbox,
+        "trap 'printf \"\\033[HSIZE:%s\" \"$(stty size)\"' WINCH; printf '\\033[?1049hEDITOR'; while :; do sleep 1 & wait $!; done",
+    );
+    until_matching(&mut daemon, link::INFO, |frame| {
+        frame.meta["alternate_screen"] == true
+    });
+    resize(&mut daemon, 100, 40);
+    until_matching(&mut daemon, link::OUTPUT, |frame| {
+        String::from_utf8_lossy(&frame.data).contains("SIZE:40 100")
+    });
+    let reply = request(&mut daemon, 5);
+    assert_eq!(reply.meta["kind"], "refresh");
+    assert!(String::from_utf8_lossy(&reply.data).contains("SIZE:40 100"));
+    // Asked for in the same pass as the resize, before the repaint is read:
+    // where the size took effect. That takes no work, so the pass goes on
+    // (as it would not after a snapshot) and answers the next one alike.
+    let mut burst = link::encode(
+        link::RESIZE,
+        link::VERSION,
+        &json!({"cols": 110, "rows": 45}),
+        b"",
+    );
+    for req in [6, 7] {
+        burst.extend(link::encode(
+            link::SNAPSHOT,
+            link::VERSION,
+            &json!({"req": req, "kind": "resized"}),
+            b"",
+        ));
+    }
+    std::io::Write::write_all(&mut daemon, &burst).unwrap();
+    let first = until_matching(&mut daemon, link::SNAPSHOT_REPLY, |frame| {
+        frame.meta["req"] == 6
+    });
+    let second = link::next(&mut daemon);
+    assert_eq!(second.kind, link::SNAPSHOT_REPLY, "{second:?}");
+    for reply in [&first, &second] {
+        assert_eq!(reply.meta["kind"], "size", "{reply:?}");
+        assert_eq!(reply.meta["cols"], 110);
+    }
+    assert_eq!(first.meta["offset"], second.meta["offset"]);
+}

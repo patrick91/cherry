@@ -67,17 +67,44 @@ struct HostedSessionFakeCLI {
             id=$1
             shift
             status_file=
+            client_id=
+            has_client_id=
             while [ $# -gt 0 ]; do
               case "$1" in
                 --takeover) ;;
                 --detach-key=*) ;;
                 --status-file=*) status_file=${1#*=} ;;
+                --client-id=*) client_id=${1#*=}; has_client_id=1 ;;
                 --detach-key) takes_value "$1" "$2"; shift ;;
                 --status-file) takes_value "$1" "$2"; status_file=$2; shift ;;
+                --client-id) takes_value "$1" "$2"; client_id=$2; has_client_id=1; shift ;;
                 *) fail "unexpected argument '$1' found" ;;
               esac
               shift
             done
+            if [ -n "$has_client_id" ]; then
+              # A client id is 1 to 128 bytes long (not characters).
+              client_id_bytes=$(printf '%s' "$client_id" | LC_ALL=C wc -c | tr -d ' ')
+              if [ "$client_id_bytes" -lt 1 ] || [ "$client_id_bytes" -gt 128 ]; then
+                fail "invalid value '$client_id' for '--client-id <CLIENT_ID>': a client ID is 1 to 128 bytes long"
+              fi
+              # An adapter of the same client still running (not a zombie)
+              # would take the attachment back from this one when the host
+              # drops it: record it in `client-overlaps`.
+              if [ -f "$dir/attach-clients" ]; then
+                while read -r other_pid other_client; do
+                  [ "$other_client" = "$client_id" ] || continue
+                  # This script, or the sleep it became (a reused pid is not).
+                  other=$(ps -o stat=,command= -p "$other_pid" 2>/dev/null)
+                  case "$other" in
+                    ''|Z*) ;;
+                    *"$dir"*|*"/bin/sleep 30"*)
+                      printf '%s %s %s\n' "$client_id" "$other_pid" "$$" >> "$dir/client-overlaps" ;;
+                  esac
+                done < "$dir/attach-clients"
+              fi
+              printf '%s %s\n' "$$" "$client_id" >> "$dir/attach-clients"
+            fi
             printf 'Attached %s\r\n' "$id"
             if [ -n "$status_file" ] && [ -f "$dir/attach-status" ]; then
               cat "$dir/attach-status" > "$status_file.$$" && mv -f "$status_file.$$" "$status_file"
@@ -126,6 +153,18 @@ struct HostedSessionFakeCLI {
         let parts = call.split(separator: " ").map(String.init)
         guard let index = parts.firstIndex(of: "--status-file"), parts.indices.contains(index + 1) else { return nil }
         return URL(fileURLWithPath: parts[index + 1])
+    }
+
+    /// Attaches that started while an earlier adapter with the same
+    /// `--client-id` still ran ("client earlier-pid pid"): the host would
+    /// drop the earlier attachment, which reconnects and drops this one.
+    var clientOverlaps: [String] { lines("client-overlaps") }
+
+    /// The `--client-id` of an attach call (a line of `calls`).
+    static func clientID(of call: String) -> String? {
+        let parts = call.split(separator: " ").map(String.init)
+        guard let index = parts.firstIndex(of: "--client-id"), parts.indices.contains(index + 1) else { return nil }
+        return parts[index + 1]
     }
 
     /// Replaces a status file atomically, as the CLI does (the app follows

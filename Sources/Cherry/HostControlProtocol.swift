@@ -1,6 +1,6 @@
 import Foundation
 
-/// Protocol v4 between Cherry and a session host (Host/crates/cherry-protocol),
+/// Protocol v5 between Cherry and a session host (Host/crates/cherry-protocol),
 /// as `cherry control` relays it on its standard input and output.
 ///
 /// A frame is a 4-byte big-endian length followed by that many bytes of JSON.
@@ -9,7 +9,10 @@ import Foundation
 /// requests can be in flight on one connection. Events carry none. Terminal
 /// bytes travel as standard padded base64. Unknown fields are ignored.
 enum HostProtocol {
-    static let version: UInt32 = 4
+    /// v5: an attach adapter names its client (`cherry attach --client-id`,
+    /// a tab's ID), and the host replaces that client's older attachment.
+    /// The app's control connection speaks the same messages as in v4.
+    static let version: UInt32 = 5
     static let maxFrameBytes = 16 * 1_024 * 1_024
     /// The most bytes one `SendInput` carries.
     static let maxInputBytes = 64 * 1_024

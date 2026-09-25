@@ -497,6 +497,9 @@ fn a_resync_delivers_the_clipboard_writes_of_output_the_client_missed() {
         .rposition(|window| window == b"\x1b]2;")
         .unwrap();
     assert!(all[last_title..].starts_with(b"\x1b]2;SECOND\x07"));
+    // The fast client stopped reading once the marker showed, which may be
+    // before the last bytes of the stream arrived.
+    drain(&mut fast_screen, &mut fast);
     assert_eq!(slow_screen.offset, fast_screen.offset);
     assert_eq!(active(&slow_screen), active(&fast_screen));
 }
@@ -569,6 +572,7 @@ fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             rows: 40,
             takeover: false,
             answers_queries: true,
+            client_id: None,
         },
     );
     thread::sleep(Duration::from_millis(300));

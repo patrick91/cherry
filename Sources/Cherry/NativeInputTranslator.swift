@@ -5,13 +5,32 @@ import Foundation
 ///
 /// Under EXEC the host has no PTY fd, so programmatic input (MCP/agent `send`,
 /// including agents driving other agents through TUIs) must go through the
-/// surface. `ghostty_surface_text` filters control bytes, so escape/control
-/// sequences (Enter, arrows, Tab, Esc, Ctrl-combos) have to become real key
-/// events — ghostty then re-encodes them for the child's *current* mode
-/// (normal vs application cursor keys, kitty protocol, …). Printable runs still
-/// go through the text path.
+/// surface, which offers three ways in:
+///
+/// - Keys (`ghostty_surface_key`): Ghostty encodes them for the child's
+///   *current* modes (normal vs application cursor keys, the kitty keyboard
+///   protocol, …). Enter, Tab, Backspace, Escape and the escape sequences of
+///   arrows, Home/End, Page Up/Down, Delete and Shift-Tab go this way.
+/// - Text (`ghostty_surface_text`): Ghostty pastes it, bracketed when the
+///   program turned bracketed paste on. Printable runs of text input go this
+///   way, so an agent's message arrives as one paste rather than as typed
+///   keys its TUI could take as shortcuts.
+/// - Bytes (Ghostty's `text:` binding action): written to the PTY as they
+///   are, neither encoded as keys nor pasted. Control characters (Ctrl-A …
+///   Ctrl-Z, Ctrl-@, Ctrl-\ … Ctrl-_) go this way, and so do every
+///   printable byte of raw input (`raw_base64`) and its Alt keys (`ESC x`):
+///   what a legacy terminal sends for those keys, which programs that use
+///   the kitty keyboard protocol read as the same keys (nvim, crossterm,
+///   Ink). A synthesized key cannot carry them: the surface's key API gives
+///   Ghostty no text and no unshifted code point, so its kitty encoder drops
+///   a Ctrl-letter and its legacy encoder types no printable key.
+///
+/// Raw input is otherwise re-encoded like text input: CR and LF are Enter,
+/// BS and DEL Backspace, a lone ESC (or one before a control character)
+/// Escape, and the arrow and navigation sequences their keys.
 enum NativeInputOp: Equatable {
     case text(String)
+    case bytes(Data)
     case key(keycode: UInt32, shift: Bool, control: Bool, option: Bool)
 }
 
@@ -34,21 +53,28 @@ enum NativeInputTranslator {
         static let up: UInt32 = 126
     }
 
-    /// a–z → AppKit virtual keycode, indexed by letter offset (a = 0).
-    private static let letterKeycodes: [UInt32] = [
-        0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46,
-        45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6,
-    ]
-
-    static func translate(_ data: Data) -> [NativeInputOp] {
+    /// `raw`: the input is raw bytes (`raw_base64`, `sendRaw`), whose
+    /// printable bytes reach the program as they are instead of as a paste.
+    static func translate(_ data: Data, raw: Bool = false) -> [NativeInputOp] {
         let bytes = [UInt8](data)
         var ops: [NativeInputOp] = []
-        var textBytes: [UInt8] = []
+        // The run being collected: pasted text, or bytes for the PTY.
+        var runBytes: [UInt8] = []
+        var runIsText = false
 
         func flush() {
-            guard !textBytes.isEmpty else { return }
-            ops.append(.text(String(decoding: textBytes, as: UTF8.self)))
-            textBytes.removeAll(keepingCapacity: true)
+            guard !runBytes.isEmpty else { return }
+            ops.append(runIsText
+                ? .text(String(decoding: runBytes, as: UTF8.self))
+                : .bytes(Data(runBytes)))
+            runBytes.removeAll(keepingCapacity: true)
+        }
+        func append(_ byte: UInt8, asText: Bool) {
+            if asText != runIsText {
+                flush()
+                runIsText = asText
+            }
+            runBytes.append(byte)
         }
         func key(_ keycode: UInt32, shift: Bool = false, control: Bool = false, option: Bool = false) {
             flush()
@@ -65,6 +91,21 @@ enum NativeInputTranslator {
                     flush()
                     ops.append(op)
                     i += length
+                } else if let length = completeSequenceLength(bytes, from: i) {
+                    // A whole sequence that is no key above (a kitty `CSI u`
+                    // key, bracketed paste markers): the program gets it as
+                    // it is, not an Escape key and its tail as text.
+                    for byte in bytes[i..<(i + length)] {
+                        append(byte, asText: false)
+                    }
+                    i += length
+                } else if raw, i + 1 < n, isAltKeyByte(bytes[i + 1]) {
+                    // Alt and a key (`ESC x`), as a legacy terminal sends
+                    // it: the key's bytes follow in the same run. An Escape
+                    // key would reach a program using the kitty keyboard
+                    // protocol as Escape (`CSI 27 u`), then x.
+                    append(b, asText: false)
+                    i += 1
                 } else {
                     key(KC.escape)
                     i += 1
@@ -82,18 +123,63 @@ enum NativeInputTranslator {
             case 0x08, 0x7F: // BS / DEL -> Backspace
                 key(KC.delete)
                 i += 1
-            case 0x00: // drop NUL
-                i += 1
-            case 0x01...0x1A: // Ctrl-A … Ctrl-Z (specials above already handled)
-                key(letterKeycodes[Int(b) - 1], control: true)
+            case 0x00...0x1F: // Ctrl-@, Ctrl-A … Ctrl-Z, Ctrl-\ … Ctrl-_ (specials above already handled)
+                append(b, asText: false)
                 i += 1
             default:
-                textBytes.append(b)
+                append(b, asText: !raw)
                 i += 1
             }
         }
         flush()
         return ops
+    }
+
+    /// A byte that, after ESC in raw input, makes the pair an Alt key rather
+    /// than Escape and a key: printable ASCII, or the start of a UTF-8
+    /// character. A control character or DEL after ESC stays two keys
+    /// (Escape, then Enter, Tab, Backspace, … as Ghostty encodes them).
+    private static func isAltKeyByte(_ byte: UInt8) -> Bool {
+        (0x20...0x7E).contains(byte) || byte >= 0x80
+    }
+
+    /// Ghostty's `text:` binding action that writes `bytes` to the PTY. Its
+    /// value is a Zig string literal, whose `\xNN` escape stands for a code
+    /// point rather than a byte: ASCII control characters and the backslash
+    /// go escaped, everything else as it is. A Swift string carries only
+    /// UTF-8, so an invalid sequence becomes U+FFFD.
+    static func textBindingAction(for bytes: Data) -> String {
+        var action = "text:"
+        for scalar in String(decoding: bytes, as: UTF8.self).unicodeScalars {
+            switch scalar.value {
+            case 0x5C:
+                action += "\\\\"
+            case 0x00...0x1F, 0x7F:
+                action += String(format: "\\x%02x", scalar.value)
+            default:
+                action.unicodeScalars.append(scalar)
+            }
+        }
+        return action
+    }
+
+    /// The length of the complete CSI (`ESC [`, parameter and intermediate
+    /// bytes, a final byte) or SS3 (`ESC O` and a final byte) sequence at
+    /// `start` (`bytes[start] == 0x1B`); nil when there is none.
+    private static func completeSequenceLength(_ bytes: [UInt8], from start: Int) -> Int? {
+        let n = bytes.count
+        guard start + 2 < n else { return nil }
+        switch bytes[start + 1] {
+        case 0x5B: // '['
+            var j = start + 2
+            while j < n, (0x20...0x3F).contains(bytes[j]) { j += 1 }
+            guard j < n, (0x40...0x7E).contains(bytes[j]) else { return nil }
+            return j - start + 1
+        case 0x4F: // 'O'
+            return (0x40...0x7E).contains(bytes[start + 2]) ? 3 : nil
+        default:
+            return nil
+        }
     }
 
     /// Parses a CSI (`ESC [`) or SS3 (`ESC O`) sequence beginning at `start`

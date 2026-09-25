@@ -10065,16 +10065,6 @@ private struct AgentToolIconDescriptor {
         self.rendersAsTemplate = rendersAsTemplate
     }
 
-    @MainActor
-    init?(session: TerminalSession) {
-        self.init(
-            kind: session.kind,
-            agentName: session.agentName,
-            title: session.title,
-            commandLine: session.subtitle
-        )
-    }
-
     init?(agent: AgentToolDefinition) {
         guard let brand = AgentToolBrand.detect(
             name: agent.name,
@@ -12149,7 +12139,8 @@ private struct TerminalSceneView: View {
             }
         } else if showsTerminalContextBar {
             VStack(spacing: 0) {
-                TerminalContextBar(session: session, isActivePane: isActivePane)
+                TerminalContextBar(content: TerminalContextBarContent(session: session), isActivePane: isActivePane)
+                    .equatable()
                 terminalSurface
             }
         } else {
@@ -12224,22 +12215,76 @@ private struct TerminalSceneView: View {
     }
 }
 
-private struct TerminalContextBar: View {
+/// What a tab's context bar shows: only these of the tab's values. The
+/// bar is given this instead of observing the tab, so the tab's other
+/// changes (a keystroke's bookkeeping, output counters, agent state)
+/// never re-render it or re-format its path.
+struct TerminalContextBarContent: Equatable {
+    let kind: TerminalSession.SessionKind
+    let agentName: String?
+    let title: String
+    let titleSource: TerminalSession.TitleSource
+    let subtitle: String
+    let workingDirectory: String
+
+    @MainActor
+    init(session: TerminalSession) {
+        kind = session.kind
+        agentName = session.agentName
+        title = session.title
+        titleSource = session.titleSource
+        subtitle = session.subtitle
+        workingDirectory = session.workingDirectory
+    }
+
+    var displayPath: String {
+        SidebarTerminalPathFormatter.displayPath(workingDirectory)
+    }
+
+    var sessionLabel: String {
+        if kind == .agent {
+            return SidebarAgentTitleFormatter.title(
+                title: title,
+                titleSource: titleSource,
+                agentName: agentName,
+                commandLine: subtitle
+            )
+        }
+
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if title.isEmpty || SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
+            title: title,
+            workingDirectory: workingDirectory
+        ) {
+            return subtitle.replacingOccurrences(of: " login shell", with: "")
+        }
+        return title
+    }
+}
+
+private struct TerminalContextBar: View, Equatable {
     private static let height: CGFloat = 36
 
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject var session: TerminalSession
+    let content: TerminalContextBarContent
     let isActivePane: Bool
 
+    nonisolated static func == (lhs: TerminalContextBar, rhs: TerminalContextBar) -> Bool {
+        lhs.content == rhs.content && lhs.isActivePane == rhs.isActivePane
+    }
+
     var body: some View {
+        // Formatted once per render: the path and label read the same values.
+        let displayPath = content.displayPath
+        let sessionLabel = content.sessionLabel
         HStack(spacing: 8) {
             leadingIcon
                 .frame(width: 15, height: 15)
                 .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.70 : 0.46))
                 .accessibilityHidden(true)
 
-            Text(contextLabel)
+            Text(verbatim: "\(displayPath)  ›  \(sessionLabel)")
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.68 : 0.46))
                 .lineLimit(1)
@@ -12256,12 +12301,17 @@ private struct TerminalContextBar: View {
                 .frame(height: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityLabel(Text(verbatim: "\(content.kind == .agent ? "Agent" : "Terminal"), \(displayPath), \(sessionLabel)"))
     }
 
     @ViewBuilder
     private var leadingIcon: some View {
-        if let descriptor = AgentToolIconDescriptor(session: session),
+        if let descriptor = AgentToolIconDescriptor(
+            kind: content.kind,
+            agentName: content.agentName,
+            title: content.title,
+            commandLine: content.subtitle
+        ),
            let logoResourceName = descriptor.logoResourceName {
             AgentLogoImage(
                 resourceName: logoResourceName,
@@ -12269,41 +12319,9 @@ private struct TerminalContextBar: View {
                 fallbackLabel: descriptor.label
             )
         } else {
-            Image(systemName: session.kind == .agent ? "sparkles" : "terminal")
+            Image(systemName: content.kind == .agent ? "sparkles" : "terminal")
                 .font(.system(size: 12, weight: .medium))
         }
-    }
-
-    private var contextLabel: String {
-        "\(displayPath)  ›  \(sessionLabel)"
-    }
-
-    private var displayPath: String {
-        SidebarTerminalPathFormatter.displayPath(session.workingDirectory)
-    }
-
-    private var sessionLabel: String {
-        if session.kind == .agent {
-            return SidebarAgentTitleFormatter.title(
-                title: session.title,
-                titleSource: session.titleSource,
-                agentName: session.agentName,
-                commandLine: session.subtitle
-            )
-        }
-
-        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        if title.isEmpty || SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
-            title: title,
-            workingDirectory: session.workingDirectory
-        ) {
-            return session.subtitle.replacingOccurrences(of: " login shell", with: "")
-        }
-        return title
-    }
-
-    private var accessibilityLabel: String {
-        "\(session.kind == .agent ? "Agent" : "Terminal"), \(displayPath), \(sessionLabel)"
     }
 
     private var themeColors: TerminalThemeColors {

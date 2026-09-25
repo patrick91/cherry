@@ -33,7 +33,7 @@ use crate::{
     watch::DirWatch,
 };
 use anyhow::{bail, Context, Result};
-use cherry_protocol::{valid_size, MAX_SNAPSHOT_BYTES};
+use cherry_protocol::{priority, valid_size, MAX_SNAPSHOT_BYTES};
 use cherry_vt::{Osc99, ProgressState, Terminal, VtEvent};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
@@ -78,6 +78,9 @@ const LINK_LOW_WATER: usize = 1024 * 1024;
 /// Bytes taken from the link per pass, so output keeps flowing under a
 /// flood of requests.
 const LINK_READ: usize = 1024 * 1024;
+/// Requests that take work (a snapshot, the screen as text) served per
+/// pass: output read meanwhile goes out before the next one.
+const COSTLY_PER_PASS: usize = 1;
 /// Output waits for the link to drain, up to this much, and then travels in
 /// one frame: bigger frames the busier the daemon, none delayed while it
 /// keeps up.
@@ -95,6 +98,10 @@ const FOREGROUND_CHECKS: [Duration; 3] = [
 /// `cherry-host hold`: take the `Launch` on descriptor 3, start the session
 /// and hold it until it has exited and been removed.
 pub fn hold(socket: &Path) -> Result<()> {
+    // Its one thread runs at interactive priority while a client is
+    // attached (`link::Attended`), and at the default class otherwise; the
+    // program it starts is not affected.
+    priority::prepare_process();
     // Started as /proc/self/exe (see `session::holder_command`), whose name
     // the kernel would give it otherwise.
     #[cfg(target_os = "linux")]
@@ -391,6 +398,8 @@ struct Link {
     offered: Vec<link::Event>,
     /// The daemon refused the hello, so it took none of them.
     turned_away: bool,
+    /// Frames were left in `reader` for the next pass (`pump_link`).
+    backlog: bool,
 }
 
 impl Link {
@@ -505,6 +514,11 @@ struct Holder {
     display: DisplayStream,
     osc99: Osc99,
     offset: u64,
+    /// Where in the output the daemon's last `RESIZE` took effect; None
+    /// when it changed nothing (or none came from this daemon). A `resized`
+    /// snapshot request is answered `size` only while nothing followed it
+    /// (see `snapshot`).
+    resized_at: Option<u64>,
     pending_input: PendingInput,
     eof: bool,
     termination: Option<Termination>,
@@ -612,6 +626,7 @@ impl Holder {
             display: DisplayStream::default(),
             osc99: Osc99::default(),
             offset: 0,
+            resized_at: None,
             pending_input: PendingInput::default(),
             eof: false,
             termination: None,
@@ -679,9 +694,12 @@ impl Holder {
             output_offset: self.offset,
             offered,
             turned_away: false,
+            backlog: false,
         });
         // The hello carries the whole state.
         self.info = link::Info::default();
+        // A daemon's `resized` requests follow its own resizes.
+        self.resized_at = None;
         self.watch = None;
         self.redial_at = None;
         self.quick_redial = false;
@@ -711,6 +729,8 @@ impl Holder {
         }
         untaken.extend(unwritten_events(unwritten));
         drop(link);
+        // Without a daemon nobody is attached.
+        priority::interactive(false);
         self.held.restore(untaken);
         self.info = link::Info::default();
         self.pending_input.forget_link();
@@ -981,12 +1001,13 @@ impl Holder {
         }
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) {
+    /// Resize the terminal; whether its size changed.
+    fn resize(&mut self, cols: u16, rows: u16) -> bool {
         if !self.state.running
             || !valid_size(cols, rows)
             || (self.state.cols, self.state.rows) == (cols, rows)
         {
-            return;
+            return false;
         }
         let replies = match self.terminal.resize(cols, rows) {
             Ok(replies) => replies,
@@ -995,7 +1016,7 @@ impl Holder {
                     "session {}: resize failed: {error:#}",
                     self.id
                 ));
-                return;
+                return false;
             }
         };
         if let Some(master) = &self.master {
@@ -1011,12 +1032,27 @@ impl Holder {
         self.state.rows = rows;
         self.info.cols = Some(cols);
         self.info.rows = Some(rows);
+        true
     }
 
     /// The terminal as a renderer stream: the whole of it, limited to `max`
-    /// bytes (oldest history dropped), or its screens without history.
-    fn snapshot(&self, request: &link::SnapshotRequest) -> Result<Vec<u8>> {
-        let raw = match request.kind.as_str() {
+    /// bytes (oldest history dropped), or its screens without history; and
+    /// the kind of snapshot that is (see `link::SnapshotRequest`).
+    fn snapshot(&self, request: &link::SnapshotRequest) -> Result<(String, Vec<u8>)> {
+        let mut kind = request.kind.clone();
+        if kind == "resized" {
+            // A full-screen program repaints when its terminal is resized:
+            // only where the new size took effect is needed, and the reply
+            // says that is here. So it may, only while nothing was output
+            // since the resize: a copy that followed the output at the old
+            // size would have taken the program's repaint for the new one
+            // (or whatever else came meanwhile) at the wrong size.
+            if self.resized_at == Some(self.offset) && self.terminal.cursor()?.alternate {
+                return Ok(("size".into(), Vec::new()));
+            }
+            kind = "refresh".into();
+        }
+        let raw = match kind.as_str() {
             "full" => self.terminal.snapshot()?,
             "limited" => self
                 .terminal
@@ -1037,21 +1073,17 @@ impl Holder {
         if display.len() > link::MAX_FRAME - 64 * 1024 {
             bail!("the snapshot exceeds the link's frame limit");
         }
-        Ok(display)
+        Ok((kind, display))
     }
 
     /// The screen as text (see `screen::read`).
     fn screen(&self, request: &link::ScreenRequest) -> Result<screen::ScreenText> {
-        screen::read(
-            &self.terminal,
-            self.state.cols,
-            self.state.rows,
-            request.scrollback,
-            request.max_lines,
-        )
+        screen::read(&self.terminal, request.scrollback, request.max_lines)
     }
 
-    fn handle(&mut self, frame: Frame) {
+    /// Serve one frame from the daemon; whether that took work (a
+    /// snapshot, the screen as text: see `pump_link`).
+    fn handle(&mut self, frame: Frame) -> bool {
         if frame.kind != kind::REFUSED {
             // Only a daemon that took the hello sends anything else.
             if let Some(link) = &mut self.link {
@@ -1061,7 +1093,7 @@ impl Holder {
         match frame.kind {
             kind::INPUT => {
                 let Ok(meta) = frame.meta::<link::InputMeta>() else {
-                    return;
+                    return false;
                 };
                 if self.eof {
                     self.send_acks(vec![(meta.lease, frame.data.len() as u64)]);
@@ -1087,30 +1119,34 @@ impl Holder {
             }
             kind::RESIZE => {
                 if let Ok(size) = frame.meta::<link::Size>() {
-                    self.resize(size.cols, size.rows);
+                    let resized = self.resize(size.cols, size.rows);
+                    self.resized_at = resized.then_some(self.offset);
                 }
             }
             kind::SNAPSHOT => {
                 let Ok(request) = frame.meta::<link::SnapshotRequest>() else {
-                    return;
+                    return false;
                 };
-                let (bytes, error) = match self.snapshot(&request) {
-                    Ok(bytes) => (bytes, None),
-                    Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                let (kind, bytes, error) = match self.snapshot(&request) {
+                    Ok((kind, bytes)) => (kind, bytes, None),
+                    Err(error) => (request.kind.clone(), Vec::new(), Some(format!("{error:#}"))),
                 };
+                // Where the size took effect alone is no work.
+                let costly = kind != "size";
                 let reply = link::SnapshotReply {
                     req: request.req,
-                    kind: request.kind,
+                    kind,
                     offset: self.offset,
                     cols: self.state.cols,
                     rows: self.state.rows,
                     error,
                 };
                 self.send(link::encode(kind::SNAPSHOT_REPLY, &reply, &bytes));
+                return costly;
             }
             kind::SCREEN => {
                 let Ok(request) = frame.meta::<link::ScreenRequest>() else {
-                    return;
+                    return false;
                 };
                 let frame = match self.screen(&request) {
                     Ok(screen) => link::encode(
@@ -1137,6 +1173,7 @@ impl Holder {
                     ),
                 };
                 self.send(frame);
+                return true;
             }
             kind::UPDATE => {
                 if let Ok(update) = frame.meta::<link::Update>() {
@@ -1152,6 +1189,11 @@ impl Holder {
                 self.begin_termination();
             }
             kind::REMOVE => self.removed = true,
+            kind::ATTENDED => {
+                if let Ok(attended) = frame.meta::<link::Attended>() {
+                    priority::interactive(attended.attached);
+                }
+            }
             kind::REFUSED => self.refused(frame.meta().unwrap_or(link::Refused {
                 reason: "no reason given".into(),
                 retry: true,
@@ -1160,20 +1202,36 @@ impl Holder {
             // from a newer daemon.
             _ => {}
         }
+        false
     }
 
-    /// Take what the daemon sent.
+    /// Take what the daemon sent. Requests that take work (`COSTLY_PER_PASS`)
+    /// are served one per pass, so the output read before the next one goes
+    /// out first; the frames after it wait in the reader (`Link::backlog`).
+    /// A `resized` request answered `size` takes none, so one that follows
+    /// its resize is answered in the same pass, before the program's
+    /// repaint is read. A link that ended is taken in whole first.
     fn pump_link(&mut self) {
         let Some(link) = &mut self.link else {
             return;
         };
         let open = link.reader.fill(link.stream.as_raw_fd(), LINK_READ);
+        link.backlog = false;
+        let mut costly = 0;
         loop {
             let Some(link) = &mut self.link else {
                 return;
             };
+            if open && costly >= COSTLY_PER_PASS {
+                link.backlog = true;
+                return;
+            }
             match link.reader.next() {
-                Ok(Some(frame)) => self.handle(frame),
+                Ok(Some(frame)) => {
+                    if self.handle(frame) {
+                        costly += 1;
+                    }
+                }
                 Ok(None) => break,
                 Err(error) => {
                     log(format_args!("session {}: {error:#}", self.id));
@@ -1334,6 +1392,9 @@ impl Holder {
     }
 
     fn next_wait(&self) -> Duration {
+        if self.link.as_ref().is_some_and(|link| link.backlog) {
+            return Duration::ZERO;
+        }
         let now = Instant::now();
         let mut wait = IDLE_WAIT;
         if self.termination.is_some() {
@@ -1347,14 +1408,18 @@ impl Holder {
 
     fn run(mut self) {
         loop {
-            self.pump_link();
+            // Output first, and out before any request is served, so that
+            // request work (a snapshot, the screen as text) never delays it.
             if !self.eof && !self.paused {
                 self.eof = !self.read_output();
+                self.flush_link();
             }
+            self.pump_link();
+            // Input the daemon just sent goes to the program at once.
+            self.write_input();
             if self.state.running {
                 self.check_exit();
             }
-            self.write_input();
             self.check_foreground();
             self.flush_link();
             if !self.state.running && self.removed {
@@ -1511,6 +1576,7 @@ fn dial(socket: &Path) -> io::Result<UnixStream> {
         return Err(io::Error::last_os_error());
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    priority::grow_send_buffer(fd);
     unsafe {
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         let flags = libc::fcntl(fd, libc::F_GETFL);

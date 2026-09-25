@@ -70,6 +70,7 @@ unsafe extern "C" {
         reply: extern "C" fn(Handle, *mut c_void, *const u8, usize),
     ) -> i32;
     fn cherry_vt_plain(term: Handle, out: *mut *mut u8, len: *mut usize) -> i32;
+    fn cherry_vt_plain_active(term: Handle, out: *mut *mut u8, len: *mut usize) -> i32;
     fn cherry_vt_string(term: Handle, which: i32, ptr: *mut *const u8, len: *mut usize) -> i32;
     fn cherry_vt_info(term: Handle, out: *mut Info) -> i32;
     fn cherry_vt_set_terminfo_name(term: Handle, name: *const u8, len: usize) -> i32;
@@ -104,6 +105,7 @@ unsafe extern "C" {
     fn cherry_vt_extras(term: Handle, kind: i32, sink: Sink, userdata: *mut c_void) -> i32;
     fn cherry_vt_debug_row(term: Handle, y: u32, sink: Sink, userdata: *mut c_void) -> i32;
     fn cherry_vt_row_flags(term: Handle, y: u32, wrap: *mut bool, continuation: *mut bool) -> i32;
+    fn cherry_vt_lines_ending(term: Handle, first: u64, last: u64, count: *mut u64) -> i32;
     fn ghostty_terminal_free(term: Handle);
     fn ghostty_terminal_vt_write(term: Handle, bytes: *const u8, len: usize);
     fn ghostty_terminal_resize(
@@ -295,6 +297,19 @@ pub struct Terminal {
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 unsafe impl Send for Terminal {}
+
+/// Where the cursor is, read in place (`Terminal::cursor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    /// Column and row on the active screen, zero-based.
+    pub x: u16,
+    pub y: u16,
+    /// Whether the alternate screen shows.
+    pub alternate: bool,
+    /// Rows of history above the active screen: screen row `history_rows`
+    /// is the active screen's first (see `Terminal::row_wraps`).
+    pub history_rows: u64,
+}
 
 /// Test support: a style-aware description of the active screen. Rows are
 /// in screen order with attribute runs in brackets; `↪` marks a soft-wrap
@@ -644,6 +659,66 @@ impl Terminal {
         let bytes =
             allocated(|ptr, len| unsafe { cherry_vt_plain(self.handle.as_ptr(), ptr, len) })?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The active screen's text without the history above it, as
+    /// `screen_text` formats text (soft-wrapped rows joined while
+    /// wraparound is on, trailing blanks and blank rows at the end
+    /// trimmed): what a terminal of the same size holding only these
+    /// screens would give, read in place.
+    pub fn active_text(&self) -> Result<String> {
+        let bytes = allocated(|ptr, len| unsafe {
+            cherry_vt_plain_active(self.handle.as_ptr(), ptr, len)
+        })?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The cursor, the screen that shows, and how much history lies above
+    /// it: cheap, and read in place.
+    pub fn cursor(&self) -> Result<Cursor> {
+        let state = info(self.handle.as_ptr())?;
+        Ok(Cursor {
+            x: state.cursor_x,
+            y: state.cursor_y,
+            alternate: state.alternate,
+            history_rows: state.history_rows,
+        })
+    }
+
+    /// How many lines of the text (`screen_text`, `active_text`) end on
+    /// screen `rows` (history first, then the active screen; see
+    /// `Cursor::history_rows`): each row ends one, except a row that holds
+    /// text and soft-wraps onto the next while autowrap is on. So the line
+    /// that holds a row's first cell is the count for the rows above it
+    /// (it may be past the end of a text whose last rows are blank).
+    pub fn lines_ending(&self, rows: std::ops::Range<u64>) -> Result<u64> {
+        let mut count = 0;
+        check(
+            unsafe {
+                cherry_vt_lines_ending(self.handle.as_ptr(), rows.start, rows.end, &mut count)
+            },
+            "lines",
+        )?;
+        Ok(count)
+    }
+
+    /// Whether screen row `y` (history first, then the active screen; see
+    /// `Cursor::history_rows`) is soft-wrapped: its text continues on the
+    /// next row.
+    pub fn row_wraps(&self, y: u64) -> Result<bool> {
+        let (mut wrap, mut continuation) = (false, false);
+        check(
+            unsafe {
+                cherry_vt_row_flags(
+                    self.handle.as_ptr(),
+                    u32::try_from(y)?,
+                    &mut wrap,
+                    &mut continuation,
+                )
+            },
+            "row",
+        )?;
+        Ok(wrap)
     }
 
     #[doc(hidden)]

@@ -266,21 +266,25 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 return
             }
 
-            // Windows that had tabs come back even when macOS window
-            // restoration is off. One SwiftUI already restored is skipped, and
-            // opening a scene value that has a window only focuses it.
-            let reopenedProjectWindow = openProjectWindow.map {
-                ProjectWindowRegistry.shared.reopenSavedProjectWindows($0)
-            } ?? false
-
-            guard !reopenedProjectWindow,
-                  !ProjectWindowRegistry.shared.hasRegisteredProjectWindow,
-                  !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
-            else {
-                return
+            // Windows that had tabs come back from the app's own list: AppKit
+            // restores no project window. One a deep link opened meanwhile
+            // is skipped, and opening a scene value that has a window only
+            // focuses it.
+            let plan = ProjectWindowRegistry.shared.launchWindowPlan(
+                hasVisibleWindow: NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
+            )
+            switch plan {
+            case .reopen(let projectRoots):
+                guard let openProjectWindow else {
+                    openDefaultProjectWindow?()
+                    return
+                }
+                projectRoots.forEach(openProjectWindow)
+            case .openDefault:
+                openDefaultProjectWindow?()
+            case .nothing:
+                break
             }
-
-            openDefaultProjectWindow?()
         }
     }
 
@@ -359,6 +363,7 @@ struct CherryApp: App {
     init() {
         RemoteViewCrashGuard.installIfNeeded()
         ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
+        ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
     }
 
     // Menu actions resolve their target from the key window, not the
@@ -429,7 +434,14 @@ struct CherryApp: App {
         }
         .defaultSize(width: 1_340, height: 840)
         .defaultLaunchBehavior(.suppressed)
-        .restorationBehavior(.automatic)
+        // Cherry reopens its windows, their tabs and their frames itself
+        // (`ProjectWindowRegistry.launchWindowPlan`, `WorkspaceStateStore`,
+        // `ProjectWindowFrameStore`). AppKit's window restoration would add
+        // nothing but main-thread stalls while typing: it re-encodes and
+        // snapshots restorable windows as their state changes. What only it
+        // brought back after a restart: a window's full screen state and
+        // Space, and windows without tabs.
+        .restorationBehavior(.disabled)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(after: .newItem) {
@@ -736,9 +748,14 @@ private struct ProjectWorkspaceView: View {
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
     @StateObject private var todoStore: ProjectTodoStore
-    @SceneStorage("sidebar.width") private var storedSidebarWidth: Double = 320
+    /// Saved per project (`ProjectSidebarWidthStore`), not as scene storage,
+    /// which needs AppKit's window restoration.
+    @State private var storedSidebarWidth: Double
+    private let sidebarWidthProjectRoot: String
 
     init(projectRoot: String) {
+        sidebarWidthProjectRoot = projectRoot
+        _storedSidebarWidth = State(initialValue: ProjectSidebarWidthStore().width(projectRoot: projectRoot))
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
             projectRoot: projectRoot,
             backendPolicy: .userSettings,
@@ -817,6 +834,9 @@ private struct ProjectWorkspaceView: View {
             Task {
                 await repository.refresh()
             }
+        }
+        .onChange(of: storedSidebarWidth) { _, width in
+            ProjectSidebarWidthStore().setWidth(width, projectRoot: sidebarWidthProjectRoot)
         }
         .onChange(of: repository.activeWorktreeRoot) { _, _ in
             // RepositoryWorkspace synchronously updates the window registry as

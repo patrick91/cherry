@@ -55,7 +55,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
-    error_code, valid_size, ClientMessage, ServerMessage, DEFAULT_COLS, DEFAULT_ROWS,
+    error_code, priority, valid_size, ClientMessage, ServerMessage, DEFAULT_COLS, DEFAULT_ROWS,
     MAX_INPUT_BYTES,
 };
 use std::{
@@ -78,8 +78,10 @@ use std::{
 pub const INPUT_HIGH_WATER: usize = 1024 * 1024;
 /// How much input read beyond that may wait to be queued (see `Overflow`).
 const INPUT_OVERFLOW: usize = 64 * 1024;
-/// Coalesce SIGWINCH bursts (window drags) into at most one resize per period.
-const RESIZE_COALESCE: Duration = Duration::from_millis(50);
+/// SIGWINCH bursts (window drags) send at most one resize per this period:
+/// the first after a pause at once, and those that follow within it as one,
+/// once it has passed.
+pub const RESIZE_COALESCE: Duration = Duration::from_millis(50);
 /// After requesting a new grid size, wait this long for the host's
 /// replacement snapshot before painting the new window size from the local
 /// copy. When this client sets the grid, the snapshot switches straight to the
@@ -146,6 +148,10 @@ pub enum Outcome {
         signal: Option<i32>,
     },
     TakenOver(String),
+    /// Another attachment of this client (`--client-id`) replaced this one;
+    /// the session keeps running. Not connected again: that would replace
+    /// the other in turn.
+    Replaced(String),
 }
 
 /// Connects again, for an attachment that lost its connection.
@@ -160,21 +166,35 @@ pub struct Reconnect<'a> {
     pub attempt: Duration,
 }
 
+/// What to attach to, and as whom.
+pub struct Target<'a> {
+    pub id: &'a str,
+    /// Disconnect the session's other attachments (the first attach only).
+    pub takeover: bool,
+    /// Names this client (`ClientMessage::Attach::client_id`), on every
+    /// connection.
+    pub client_id: Option<&'a str>,
+}
+
 pub fn attach(
     slot: &mut Option<Transport>,
-    id: &str,
-    takeover: bool,
+    target: &Target,
     detach_key: DetachKey,
     status: &mut StatusFile,
     reconnect: &mut Reconnect,
 ) -> Result<Outcome> {
+    // Interactive while attached (see `cherry_protocol::priority`); what
+    // this thread starts meanwhile (ssh, a host) starts at the default.
+    priority::prepare_process();
+    let id = target.id;
     let physical = physical_size();
     let sent_size = protocol_size(physical);
     let first = request_attach(
         slot.as_mut().expect("connected"),
         id,
         sent_size,
-        takeover,
+        target.takeover,
+        target.client_id,
         RPC_TIMEOUT,
     )?;
     status.attached = true;
@@ -186,6 +206,7 @@ pub fn attach(
     let mut renderer = Renderer::new(physical);
     let result = Attachment {
         id,
+        client_id: target.client_id,
         output: &mut output,
         renderer: &mut renderer,
         status,
@@ -240,6 +261,7 @@ fn request_attach(
     id: &str,
     size: (u16, u16),
     takeover: bool,
+    client_id: Option<&str>,
     idle: Duration,
 ) -> Result<Snapshot> {
     transport.send(&ClientMessage::Attach {
@@ -251,6 +273,7 @@ fn request_attach(
         // both are one terminal.
         answers_queries: unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1
             && same_terminal(libc::STDIN_FILENO, libc::STDOUT_FILENO),
+        client_id: client_id.map(str::to_owned),
     })?;
     // The host expects heartbeats from its acknowledgement on, which can be
     // long before a large snapshot has arrived.
@@ -277,6 +300,7 @@ fn request_attach(
 /// What lasts as long as the attachment, across connections.
 struct Attachment<'a> {
     id: &'a str,
+    client_id: Option<&'a str>,
     output: &'a mut TerminalOutput,
     /// Outlives the attachment, so the caller can derive the terminal reset
     /// from the final screen.
@@ -338,6 +362,9 @@ struct Connection {
     sent_size: (u16, u16),
     overflow: Overflow,
     resize_at: Option<Instant>,
+    /// When the last Resize was sent: the next waits for `RESIZE_COALESCE`
+    /// from it, and one after a pause goes at once.
+    resize_sent: Option<Instant>,
     awaiting_grid: Option<((u16, u16), Instant)>,
     detach: Option<Detaching>,
 }
@@ -455,11 +482,14 @@ impl Attachment<'_> {
         drop(snapshot.bytes);
         self.output.write_all(&write, transport)?;
         self.publish(false);
+        // The session shows: keystrokes and frames go through this thread.
+        priority::interactive(true);
         Ok(Connection {
             offset: snapshot.offset,
             sent_size,
             overflow: Overflow::default(),
             resize_at: None,
+            resize_sent: None,
             awaiting_grid: None,
             detach: None,
         })
@@ -481,170 +511,104 @@ impl Attachment<'_> {
         connection: &mut Connection,
     ) -> Result<Outcome> {
         let id = self.id;
-        let Connection {
-            offset,
-            sent_size,
-            overflow,
-            resize_at,
-            awaiting_grid,
-            detach,
-        } = connection;
         loop {
             interrupted()?;
             let now = Instant::now();
-            if detach.is_none() {
-                overflow.release(transport)?;
+            if connection.detach.is_none() {
+                connection.overflow.release(transport)?;
                 if self
                     .paste_tail
                     .is_some_and(|since| now >= since + timing().paste_tail_wait)
                 {
-                    self.end_paste_tail(transport, overflow)?;
+                    self.end_paste_tail(transport, &mut connection.overflow)?;
                 }
                 let expired = self.input.expire(now);
-                self.forward_input(transport, overflow, &expired.data)?;
+                self.forward_input(transport, &mut connection.overflow, &expired.data)?;
                 if expired.detach {
-                    *detach = Some(queue_detach(transport, overflow, KEY_DETACH_WAIT, false)?);
+                    connection.detach = Some(queue_detach(
+                        transport,
+                        &mut connection.overflow,
+                        KEY_DETACH_WAIT,
+                        false,
+                    )?);
                 }
             }
-            if sys::take_resize() && resize_at.is_none() {
-                *resize_at = Some(now + RESIZE_COALESCE);
+            if sys::take_resize() && connection.resize_at.is_none() {
+                // The first resize after a pause goes at once; those within
+                // RESIZE_COALESCE of the last one sent go as one, after it.
+                connection.resize_at = Some(
+                    connection
+                        .resize_sent
+                        .map_or(now, |sent| (sent + timing().resize_coalesce).max(now)),
+                );
             }
-            if resize_at.is_some_and(|at| now >= at) {
-                *resize_at = None;
+            if connection.resize_at.is_some_and(|at| now >= at) {
+                connection.resize_at = None;
                 let physical = physical_size();
                 let size = protocol_size(physical);
                 // The host reads nothing after Detach; the window is repainted
                 // from the local copy instead.
-                if size != *sent_size && detach.is_none() {
+                if size != connection.sent_size && connection.detach.is_none() {
                     transport.queue(&ClientMessage::Resize {
                         cols: size.0,
                         rows: size.1,
                     })?;
-                    *sent_size = size;
-                    *awaiting_grid = Some((physical, now + timing().grid_wait));
-                } else if let Some((awaited, _)) = awaiting_grid.as_mut() {
+                    // The host may change the grid at once.
+                    transport.write_ready()?;
+                    connection.sent_size = size;
+                    connection.resize_sent = Some(now);
+                    connection.awaiting_grid = Some((physical, now + timing().grid_wait));
+                } else if let Some((awaited, _)) = connection.awaiting_grid.as_mut() {
                     // The grid change requested before is still on its way (a
                     // terminal can signal one resize several times): the window
                     // follows its snapshot, or the copy once the wait ends.
                     *awaited = physical;
                 } else {
-                    self.output
-                        .write_all(&self.renderer.resize_physical(physical)?, transport)?;
+                    let write = self.renderer.resize_physical(physical)?;
+                    self.write_output(&write, transport, connection)?;
                 }
             }
-            if let Some((physical, at)) = *awaiting_grid {
+            if let Some((physical, at)) = connection.awaiting_grid {
                 if now >= at {
                     // The shared grid did not follow this window (another client
                     // is smaller, or it is beyond the protocol limit).
-                    *awaiting_grid = None;
-                    self.output
-                        .write_all(&self.renderer.resize_physical(physical)?, transport)?;
+                    connection.awaiting_grid = None;
+                    let write = self.renderer.resize_physical(physical)?;
+                    self.write_output(&write, transport, connection)?;
                 }
             }
             transport.heartbeat(now)?;
             // Drain buffered frames before polling so a snapshot and live output in
             // one read cannot leave the live bytes waiting for another network event.
             while let Some(message) = transport.next_message()? {
-                match message {
-                    ServerMessage::Output { offset: next, data } => {
-                        check_output_offset(offset, next, data.len())?;
-                        let write = self.renderer.output(&data)?;
-                        if !write.is_empty() {
-                            self.output.write_all(&write, transport)?;
-                        }
-                    }
-                    // Queries the host leaves to this client's terminal; its
-                    // replies arrive as input. Once detaching, that input belongs
-                    // to the local shell, so a reply could not reach the program.
-                    ServerMessage::Query { data } => {
-                        if detach.is_none() {
-                            let write = self.renderer.query(&data)?;
-                            self.output.write_all(&write, transport)?;
-                        }
-                    }
-                    // A replacement snapshot (shared size change or resync after
-                    // this client fell behind): output resumes at its offset.
-                    ServerMessage::Attached {
-                        session,
-                        offset: next,
-                        snapshot,
-                        ..
-                    } if session.id == id => {
-                        *offset = next;
-                        if let Some((physical, _)) = awaiting_grid.take() {
-                            self.renderer.physical = physical;
-                        }
-                        self.output.write_all(
-                            &self
-                                .renderer
-                                .replace((session.cols, session.rows), &snapshot)?,
-                            transport,
-                        )?;
-                    }
-                    ServerMessage::Exit {
-                        id: exited,
-                        exit_code,
-                        signal,
-                    } if exited == id => {
-                        paint(self.renderer, self.output, transport)?;
-                        return Ok(Outcome::Exited {
-                            code: exit_code,
-                            signal,
-                        });
-                    }
-                    // The host answered a Ping sent behind earlier input, or
-                    // noted that the program consumed input it held back.
-                    ServerMessage::Pong => {
-                        if let Some(detach) = detach.as_mut() {
-                            detach.progressed();
-                        }
-                    }
-                    ServerMessage::Ok if detach.is_some() => {
-                        paint(self.renderer, self.output, transport)?;
-                        return Ok(Outcome::Detached);
-                    }
-                    // Events go only to subscribed connections and screen text
-                    // only to whoever asked for it; an attachment does neither.
-                    ServerMessage::Event { .. } | ServerMessage::ScreenText { .. } => {}
-                    ServerMessage::Error { code, message } => match code.as_str() {
-                        // The shared size or a replacement snapshot could not be
-                        // produced; the attachment itself continues.
-                        error_code::RESIZE_FAILED | error_code::SNAPSHOT_FAILED => {}
-                        error_code::TAKEN_OVER => {
-                            paint(self.renderer, self.output, transport)?;
-                            return Ok(Outcome::TakenOver(message));
-                        }
-                        _ => {
-                            paint(self.renderer, self.output, transport)?;
-                            bail!("host rejected request ({code}): {message}");
-                        }
-                    },
-                    message => {
-                        paint(self.renderer, self.output, transport)?;
-                        bail!(
-                            "expected session output, received {}",
-                            message_kind(&message)
-                        );
-                    }
+                if let Some(outcome) = self.message(message, transport, connection)? {
+                    return Ok(outcome);
+                }
+                // Keys typed meanwhile go out between frames, not after all
+                // of them.
+                if self.input_waiting(transport, connection) {
+                    self.read_input(transport, connection)?;
                 }
             }
-            paint(self.renderer, self.output, transport)?;
+            if let Some(frame) = self.renderer.flush()? {
+                self.write_output(&frame, transport, connection)?;
+            }
             self.publish(false);
             // A host that stopped reading decides the outcome by what it sent
             // before closing: its Ok, a takeover notice, or nothing.
             transport.write_ready()?;
-            if detach.is_none() {
+            if connection.detach.is_none() {
                 // Those writes (and the ones made while terminal output waited)
                 // may have made room for the input waiting beyond the mark. Once
                 // queued it has the transport polled; left waiting, nothing but
                 // new input or a deadline would end the poll.
-                overflow.release(transport)?;
+                connection.overflow.release(transport)?;
             }
             let now = Instant::now();
             let stalled = transport.stalled_for(now);
             let heartbeat_timeout = timing().heartbeat_timeout;
             // While detaching, the detach wait is the limit.
-            if detach.is_none() && stalled >= heartbeat_timeout {
+            if connection.detach.is_none() && stalled >= heartbeat_timeout {
                 return Err(lost(format!(
                     "the host accepted and sent nothing for {} s; the connection appears to be dead{}. The session may still be running on the host",
                     stalled.as_secs(),
@@ -652,7 +616,7 @@ impl Attachment<'_> {
                 )));
             }
             if transport.closed_deadline().is_some_and(|at| now >= at) {
-                if detach.is_some() {
+                if connection.detach.is_some() {
                     return Ok(Outcome::DetachedUnconfirmed(
                         "detached, but the host stopped reading the connection without confirming the detach; input not yet delivered to the session may have been discarded".into(),
                     ));
@@ -661,24 +625,16 @@ impl Attachment<'_> {
             }
             // The host confirms with Ok once earlier input was queued for the
             // session; it cannot while the session is not consuming input.
-            if let Some(detach) = detach.as_ref() {
+            if let Some(detach) = connection.detach.as_ref() {
                 if now >= detach.deadline(transport) {
                     return Ok(Outcome::DetachedUnconfirmed(detach.gave_up()));
                 }
             }
-            // Once detaching, terminal input belongs to the local shell: it is
-            // set aside without the terminal's reports (see `Leftover`).
-            let read_limit = match detach.as_ref() {
-                _ if !self.stdin_open => 0,
-                None => overflow.room(transport, &self.input).min(self.buffer.len()),
-                Some(_) if self.output.sets_input_aside() => self.buffer.len(),
-                Some(_) => 0,
-            };
-            let read_stdin = read_limit > 0;
+            let read_stdin = self.read_limit(transport, connection) > 0;
             // Input waits beyond the mark only while the transport is polled.
             debug_assert!(
-                detach.is_some()
-                    || overflow.waiting.is_empty()
+                connection.detach.is_some()
+                    || connection.overflow.waiting.is_empty()
                     || transport.pending() >= timing().input_high_water
             );
             let mut fds = [
@@ -703,6 +659,7 @@ impl Attachment<'_> {
             let wait = if read_stdin && self.stdin_is_file {
                 Duration::ZERO
             } else {
+                let detach = connection.detach.as_ref();
                 let mut deadline = now + MAX_WAIT;
                 for candidate in [
                     detach
@@ -716,10 +673,13 @@ impl Attachment<'_> {
                                 .map(|since| since + timing().paste_tail_wait)
                         })
                         .flatten(),
-                    *resize_at,
-                    awaiting_grid.as_ref().map(|(_, at)| *at),
+                    connection.resize_at,
+                    connection.awaiting_grid.as_ref().map(|(_, at)| *at),
+                    // A viewport frame held for the session's synchronized
+                    // update is painted by then.
+                    self.renderer.paint_deadline(),
                     transport.next_ping(),
-                    detach.as_ref().map(|detach| detach.deadline(transport)),
+                    detach.map(|detach| detach.deadline(transport)),
                     (detach.is_none() && transport.pending() > 0)
                         .then(|| now + heartbeat_timeout.saturating_sub(stalled)),
                     transport.closed_deadline(),
@@ -737,7 +697,7 @@ impl Attachment<'_> {
                 transport.write_ready()?;
             }
             if fds[0].revents != 0 && !transport.read_ready()? {
-                if detach.is_some() {
+                if connection.detach.is_some() {
                     // The host closes the connection only after its Ok, which
                     // would have been handled before this end of file.
                     paint(self.renderer, self.output, transport)?;
@@ -748,38 +708,223 @@ impl Attachment<'_> {
                 return Err(lost(connection_lost(id, transport)));
             }
             if read_stdin && (self.stdin_is_file || fds[2].revents != 0) {
-                match read_some(libc::STDIN_FILENO, &mut self.buffer[..read_limit]) {
-                    Ok(None) => {}
-                    Ok(Some(0)) => {
-                        self.stdin_open = false;
-                        if detach.is_none() {
-                            // End of input detaches, after everything read before it.
-                            let rest = self.input.finish();
-                            self.forward_input(transport, overflow, &rest)?;
-                            *detach = Some(queue_detach(
-                                transport,
-                                overflow,
-                                timing().detach_wait,
-                                true,
-                            )?);
-                        }
-                    }
-                    Ok(Some(n)) if detach.is_some() => {
-                        self.output.set_input_aside(&self.buffer[..n])
-                    }
-                    Ok(Some(n)) => {
-                        let now = Instant::now();
-                        let parsed = self.input.feed(&self.buffer[..n], now);
-                        self.forward_input(transport, overflow, &parsed.data)?;
-                        if parsed.detach {
-                            *detach =
-                                Some(queue_detach(transport, overflow, KEY_DETACH_WAIT, false)?);
-                        }
-                    }
-                    Err(error) => return Err(error).context("could not read terminal input"),
-                }
+                self.read_input(transport, connection)?;
             }
         }
+    }
+
+    /// Handle one message from the host; the outcome when it ends the
+    /// attachment.
+    fn message(
+        &mut self,
+        message: ServerMessage,
+        transport: &mut Transport,
+        connection: &mut Connection,
+    ) -> Result<Option<Outcome>> {
+        let id = self.id;
+        match message {
+            ServerMessage::Output { offset: next, data } => {
+                check_output_offset(&mut connection.offset, next, data.len())?;
+                if self.renderer.direct() {
+                    // The window takes the stream as it is: written first,
+                    // then followed by the copy, so tracking it never delays
+                    // it.
+                    self.write_output(&data, transport, connection)?;
+                    self.renderer.track(&data);
+                } else {
+                    let write = self.renderer.output(&data)?.into_owned();
+                    if !write.is_empty() {
+                        self.write_output(&write, transport, connection)?;
+                    }
+                }
+            }
+            // Queries the host leaves to this client's terminal; its
+            // replies arrive as input. Once detaching, that input belongs
+            // to the local shell, so a reply could not reach the program.
+            ServerMessage::Query { data } => {
+                if connection.detach.is_none() {
+                    let write = self.renderer.query(&data)?;
+                    self.write_output(&write, transport, connection)?;
+                }
+            }
+            // A replacement snapshot (shared size change or resync after
+            // this client fell behind): output resumes at its offset.
+            ServerMessage::Attached {
+                session,
+                offset: next,
+                snapshot,
+                ..
+            } if session.id == id => {
+                connection.offset = next;
+                if let Some((physical, _)) = connection.awaiting_grid.take() {
+                    self.renderer.physical = physical;
+                }
+                let write = self
+                    .renderer
+                    .replace((session.cols, session.rows), &snapshot)?;
+                drop(snapshot);
+                self.write_output(&write, transport, connection)?;
+            }
+            // The shared grid changed size here in the stream, and the
+            // program repaints its screen for it: the copy follows, and the
+            // window keeps what it shows.
+            ServerMessage::Resized {
+                offset: next,
+                cols,
+                rows,
+            } => {
+                check_output_offset(&mut connection.offset, next, 0)?;
+                if let Some((physical, _)) = connection.awaiting_grid.take() {
+                    self.renderer.physical = physical;
+                }
+                let write = self.renderer.resize_grid((cols, rows))?;
+                if !write.is_empty() {
+                    self.write_output(&write, transport, connection)?;
+                }
+            }
+            ServerMessage::Exit {
+                id: exited,
+                exit_code,
+                signal,
+            } if exited == id => {
+                paint(self.renderer, self.output, transport)?;
+                return Ok(Some(Outcome::Exited {
+                    code: exit_code,
+                    signal,
+                }));
+            }
+            // The host answered a Ping sent behind earlier input, or
+            // noted that the program consumed input it held back.
+            ServerMessage::Pong => {
+                if let Some(detach) = connection.detach.as_mut() {
+                    detach.progressed();
+                }
+            }
+            ServerMessage::Ok if connection.detach.is_some() => {
+                paint(self.renderer, self.output, transport)?;
+                return Ok(Some(Outcome::Detached));
+            }
+            // Events go only to subscribed connections and screen text
+            // only to whoever asked for it; an attachment does neither.
+            ServerMessage::Event { .. } | ServerMessage::ScreenText { .. } => {}
+            ServerMessage::Error { code, message } => match code.as_str() {
+                // The shared size or a replacement snapshot could not be
+                // produced; the attachment itself continues.
+                error_code::RESIZE_FAILED | error_code::SNAPSHOT_FAILED => {}
+                error_code::TAKEN_OVER => {
+                    paint(self.renderer, self.output, transport)?;
+                    return Ok(Some(Outcome::TakenOver(message)));
+                }
+                error_code::REPLACED => {
+                    paint(self.renderer, self.output, transport)?;
+                    return Ok(Some(Outcome::Replaced(message)));
+                }
+                _ => {
+                    paint(self.renderer, self.output, transport)?;
+                    bail!("host rejected request ({code}): {message}");
+                }
+            },
+            message => {
+                paint(self.renderer, self.output, transport)?;
+                bail!(
+                    "expected session output, received {}",
+                    message_kind(&message)
+                );
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write to the terminal, taking in what is typed meanwhile: while the
+    /// terminal takes no more output (a large frame, a slow window), keys
+    /// that arrive go to the host at once rather than after the output.
+    fn write_output(
+        &mut self,
+        bytes: &[u8],
+        transport: &mut Transport,
+        connection: &mut Connection,
+    ) -> Result<()> {
+        let mut rest = bytes;
+        loop {
+            let input = (self.read_limit(transport, connection) > 0 && !self.stdin_is_file)
+                .then_some(libc::STDIN_FILENO);
+            let written = self.output.write_until_input(rest, transport, input)?;
+            rest = &rest[written..];
+            if rest.is_empty() {
+                return Ok(());
+            }
+            self.read_input(transport, connection)?;
+        }
+    }
+
+    /// How much terminal input may be read now. Once detaching, terminal
+    /// input belongs to the local shell: it is set aside without the
+    /// terminal's reports (see `Leftover`).
+    fn read_limit(&self, transport: &Transport, connection: &Connection) -> usize {
+        match connection.detach.as_ref() {
+            _ if !self.stdin_open => 0,
+            None => connection
+                .overflow
+                .room(transport, &self.input)
+                .min(self.buffer.len()),
+            Some(_) if self.output.sets_input_aside() => self.buffer.len(),
+            Some(_) => 0,
+        }
+    }
+
+    /// Whether terminal input waits to be read now (a terminal or a pipe
+    /// that has some; a file is read between polls instead).
+    fn input_waiting(&self, transport: &Transport, connection: &Connection) -> bool {
+        if self.stdin_is_file || self.read_limit(transport, connection) == 0 {
+            return false;
+        }
+        let mut fds = [pollfd(libc::STDIN_FILENO, libc::POLLIN)];
+        poll(&mut fds, Duration::ZERO).is_ok() && fds[0].revents != 0
+    }
+
+    /// Read terminal input that is ready (the caller knows it is, or it is
+    /// a file) and send it on at once.
+    fn read_input(&mut self, transport: &mut Transport, connection: &mut Connection) -> Result<()> {
+        let read_limit = self.read_limit(transport, connection);
+        if read_limit == 0 {
+            return Ok(());
+        }
+        match read_some(libc::STDIN_FILENO, &mut self.buffer[..read_limit]) {
+            Ok(None) => {}
+            Ok(Some(0)) => {
+                self.stdin_open = false;
+                if connection.detach.is_none() {
+                    // End of input detaches, after everything read before it.
+                    let rest = self.input.finish();
+                    self.forward_input(transport, &mut connection.overflow, &rest)?;
+                    connection.detach = Some(queue_detach(
+                        transport,
+                        &mut connection.overflow,
+                        timing().detach_wait,
+                        true,
+                    )?);
+                }
+            }
+            Ok(Some(n)) if connection.detach.is_some() => {
+                self.output.set_input_aside(&self.buffer[..n])
+            }
+            Ok(Some(n)) => {
+                let now = Instant::now();
+                let parsed = self.input.feed(&self.buffer[..n], now);
+                self.forward_input(transport, &mut connection.overflow, &parsed.data)?;
+                if parsed.detach {
+                    connection.detach = Some(queue_detach(
+                        transport,
+                        &mut connection.overflow,
+                        KEY_DETACH_WAIT,
+                        false,
+                    )?);
+                }
+            }
+            Err(error) => return Err(error).context("could not read terminal input"),
+        }
+        // Typed input goes before anything else is written.
+        transport.write_ready()
     }
 
     /// The connection in `slot` was lost (`lost` says how): connect again
@@ -793,6 +938,9 @@ impl Attachment<'_> {
         reconnect: &mut Reconnect,
         lost: anyhow::Error,
     ) -> Result<Reconnected> {
+        // Nothing to show until attached again; the attempts, and what they
+        // start (ssh, a host), run at the default class.
+        priority::interactive(false);
         self.publish(true);
         let now = Instant::now();
         let mut streak = match self.streak.take() {
@@ -877,6 +1025,7 @@ impl Attachment<'_> {
         noticed: &mut bool,
     ) -> Result<Attempted> {
         let id = self.id;
+        let client_id = self.client_id;
         let limit = reconnect.attempt;
         let connect = &mut *reconnect.connect;
         let old = slot.take();
@@ -887,10 +1036,11 @@ impl Attachment<'_> {
             let worker = scope.spawn({
                 let abandoned = abandoned.clone();
                 move || {
+                    priority::interactive(false);
                     sys::abandon_when(abandoned.clone());
                     drop(old);
                     let mut connected = None;
-                    let result = attempt(connect, &mut connected, id, deadline, limit);
+                    let result = attempt(connect, &mut connected, id, client_id, deadline, limit);
                     // A failed attempt's connection (and its ssh) is stopped
                     // here, unless the attachment is ending.
                     if !abandoned.load(Ordering::Relaxed) {
@@ -1024,6 +1174,7 @@ fn attempt(
     connect: &mut (dyn FnMut(&mut Option<Transport>, Instant) -> Result<()> + Send),
     slot: &mut Option<Transport>,
     id: &str,
+    client_id: Option<&str>,
     deadline: Instant,
     limit: Duration,
 ) -> Result<Box<Reattached>> {
@@ -1035,8 +1186,9 @@ fn attempt(
     let physical = physical_size();
     let size = protocol_size(physical);
     // Never a takeover: the others who lost their connection with this one
-    // attach again too.
-    match request_attach(transport, id, size, false, limit) {
+    // attach again too. The client ID replaces this client's own attachment
+    // of the lost connection, should the host not have noticed the loss.
+    match request_attach(transport, id, size, false, client_id, limit) {
         Ok(snapshot) => {
             transport.clear_deadline();
             Ok(Box::new(Reattached {
@@ -1104,13 +1256,15 @@ fn ssh_said(transport: &Transport) -> String {
         .unwrap_or_default()
 }
 
-/// Paint the frame for output received since the last one, in viewport mode.
+/// Paint the frame for output received since the last one, in viewport
+/// mode, before the attachment ends: at once, even inside the session's
+/// synchronized update.
 fn paint(
     renderer: &mut Renderer,
     output: &TerminalOutput,
     transport: &mut Transport,
 ) -> Result<()> {
-    if let Some(frame) = renderer.flush()? {
+    if let Some(frame) = renderer.flush_now()? {
         output.write_all(&frame, transport)?;
     }
     Ok(())
@@ -1347,7 +1501,16 @@ pub struct Renderer {
     passthrough: Passthrough,
     /// A query was written to the window, which may still answer it.
     queried: bool,
+    /// Viewport mode: since when a frame waits for the session's
+    /// synchronized update to end (see `SYNC_HOLD`).
+    held_since: Option<Instant>,
 }
+
+/// In viewport mode a frame is not painted while the copy is inside the
+/// session's synchronized update (mode 2026: the program is between the
+/// start and the end of drawing a frame), for at most this long, as
+/// terminals do: a half-drawn screen would show otherwise.
+pub const SYNC_HOLD: Duration = Duration::from_millis(150);
 
 /// What the window may still send once the attachment ends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1392,11 +1555,27 @@ impl Renderer {
             scratch: None,
             passthrough: Passthrough::default(),
             queried: false,
+            held_since: None,
         }
     }
 
+    /// The window shows the session's stream as it is (see `Renderer`).
     fn direct(&self) -> bool {
         self.canonical == self.physical
+    }
+
+    /// Follow output that was written to the window as it is, in direct
+    /// mode (`output` without the bytes to write).
+    fn track(&mut self, bytes: &[u8]) {
+        self.passthrough.feed(bytes);
+        self.feed(bytes);
+    }
+
+    /// The copy is inside the session's synchronized update.
+    fn in_synchronized_update(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.mode(2026, false).unwrap_or(false))
     }
 
     /// The window shows a viewport of the shared grid (see `Renderer`),
@@ -1432,6 +1611,7 @@ impl Renderer {
         self.terminal = Some(terminal);
         self.canonical = canonical;
         self.dirty = false;
+        self.held_since = None;
         // The host sends whole sequences: output resumes at a boundary.
         self.passthrough.reset();
         if self.direct() {
@@ -1464,7 +1644,7 @@ impl Renderer {
         let mut write = if self.direct() {
             Vec::new()
         } else {
-            self.flush()?.unwrap_or_default()
+            self.flush_now()?.unwrap_or_default()
         };
         write.extend_from_slice(bytes);
         Ok(write)
@@ -1478,13 +1658,84 @@ impl Renderer {
         }
     }
 
-    /// The frame for output received since the last one, in viewport mode.
+    /// The frame for output received since the last one, in viewport mode,
+    /// unless the copy is inside the session's synchronized update: that
+    /// frame waits for its end, for at most `SYNC_HOLD`
+    /// (`paint_deadline`).
     pub fn flush(&mut self) -> Result<Option<Vec<u8>>> {
+        if !self.dirty {
+            self.held_since = None;
+            return Ok(None);
+        }
+        if self.in_synchronized_update() {
+            let since = *self.held_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < SYNC_HOLD {
+                return Ok(None);
+            }
+        }
+        self.held_since = None;
+        self.dirty = false;
+        self.frame().map(Some)
+    }
+
+    /// The frame for output received since the last one, now: before a
+    /// query, whose answer can depend on the screen, or before the
+    /// attachment ends. Inside the session's synchronized update the
+    /// window's update is left open, so the window shows it only once
+    /// complete (the next frame, or the reset on leaving, ends it).
+    pub fn flush_now(&mut self) -> Result<Option<Vec<u8>>> {
         if !self.dirty {
             return Ok(None);
         }
+        self.held_since = None;
         self.dirty = false;
-        self.frame().map(Some)
+        let mut frame = self.frame()?;
+        if self.in_synchronized_update() && frame.ends_with(SYNC_END) {
+            frame.truncate(frame.len() - SYNC_END.len());
+        }
+        Ok(Some(frame))
+    }
+
+    /// When a frame held for the session's synchronized update is painted
+    /// at the latest.
+    pub fn paint_deadline(&self) -> Option<Instant> {
+        self.held_since
+            .filter(|_| self.dirty)
+            .map(|since| since + SYNC_HOLD)
+    }
+
+    /// The shared grid changed to `canonical` without a snapshot
+    /// (`ServerMessage::Resized`): the copy is resized, as the host's
+    /// terminal was, and the program repaints. Returns what to write: in
+    /// direct mode nothing (the window already has its size), unless the
+    /// window painted a viewport meanwhile and goes back to the stream (a
+    /// full snapshot of the copy then resets it). In viewport mode nothing
+    /// either: the frame of the program's repaint shows the new grid, so the
+    /// window is painted once for the resize, not also with the copy the
+    /// repaint is about to replace.
+    pub fn resize_grid(&mut self, canonical: (u16, u16)) -> Result<Vec<u8>> {
+        if !valid_size(canonical.0, canonical.1) {
+            bail!("host sent invalid terminal dimensions");
+        }
+        if self.terminal.is_none() {
+            bail!("host resized the grid before sending a snapshot");
+        }
+        if self.sent_modes.is_none() && canonical != self.physical {
+            // Leaving direct mode: the window shows the copy's screen.
+            self.window = self.followed_screen()?;
+        }
+        let terminal = self.terminal.as_mut().expect("checked above");
+        // Its replies are the host's to answer.
+        let _ = terminal.resize(canonical.0, canonical.1)?;
+        self.canonical = canonical;
+        if self.direct() {
+            self.dirty = false;
+            self.held_since = None;
+            if self.sent_modes.take().is_some() {
+                return self.terminal().snapshot();
+            }
+        }
+        Ok(Vec::new())
     }
 
     pub fn resize_physical(&mut self, physical: (u16, u16)) -> Result<Vec<u8>> {
@@ -1493,6 +1744,7 @@ impl Renderer {
         }
         self.physical = physical;
         self.dirty = false;
+        self.held_since = None;
         if self.direct() {
             // Back to the direct stream: a full snapshot resets the window.
             self.sent_modes = None;
@@ -1732,6 +1984,9 @@ impl Drop for RawTerminal {
     }
 }
 
+/// Ends a synchronized update; a viewport frame ends with it.
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
 /// Pen, character sets, the kitty keyboard stack and modifyOtherKeys are
 /// kept per screen.
 const SCREEN_RESET: &[u8] = b"\x1b[0m\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[<8u\x1b[=0u\x1b[>4m";
@@ -1856,18 +2111,31 @@ impl TerminalOutput {
     /// Write everything, failing only when the terminal accepts nothing for
     /// `RPC_TIMEOUT`. While a slow terminal catches up, the heartbeat keeps
     /// going, so the host does not take the attachment for a dead one.
-    pub fn write_all(&self, mut bytes: &[u8], transport: &mut Transport) -> Result<()> {
+    pub fn write_all(&self, bytes: &[u8], transport: &mut Transport) -> Result<()> {
+        self.write_until_input(bytes, transport, None).map(drop)
+    }
+
+    /// Like `write_all`, but while the terminal takes no more output, stop
+    /// once `input` (the terminal's input) is readable: returns how much was
+    /// written, all of it unless input interrupted.
+    pub fn write_until_input(
+        &self,
+        bytes: &[u8],
+        transport: &mut Transport,
+        input: Option<RawFd>,
+    ) -> Result<usize> {
+        let mut written = 0;
         let mut deadline = Instant::now() + RPC_TIMEOUT;
-        while !bytes.is_empty() {
+        while written < bytes.len() {
             interrupted()?;
             if transport.next_ping().is_some_and(|at| Instant::now() >= at) {
                 transport.heartbeat(Instant::now())?;
                 transport.write_ready()?;
             }
-            if let Some(n) =
-                sys::write_some(self.fd, bytes).context("could not write terminal output")?
+            if let Some(n) = sys::write_some(self.fd, &bytes[written..])
+                .context("could not write terminal output")?
             {
-                bytes = &bytes[n..];
+                written += n;
                 deadline = Instant::now() + RPC_TIMEOUT;
                 continue;
             }
@@ -1890,6 +2158,7 @@ impl TerminalOutput {
                     },
                     libc::POLLOUT,
                 ),
+                pollfd(input.unwrap_or(-1), libc::POLLIN),
             ];
             let wake = transport
                 .next_ping()
@@ -1898,8 +2167,11 @@ impl TerminalOutput {
                 &mut fds,
                 Duration::from_millis(100).min(wake.saturating_duration_since(now)),
             )?;
+            if fds[2].revents != 0 {
+                break;
+            }
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -2516,6 +2788,98 @@ mod tests {
         let mut renderer = Renderer::new((100, 40));
         renderer.replace((80, 24), b"\x1b[?2004h").unwrap();
         assert!(renderer.bracketed_paste());
+    }
+
+    #[test]
+    fn a_viewport_is_not_painted_inside_the_sessions_synchronized_update() {
+        let mut renderer = Renderer::new((100, 40));
+        renderer.replace((80, 24), b"FIRST").unwrap();
+        // The program starts a frame: the copy is mid-update, and the
+        // window waits for its end.
+        assert!(live(&mut renderer, b"\x1b[?2026h\x1b[HHALF").is_empty());
+        assert_eq!(renderer.flush().unwrap(), None);
+        let due = renderer.paint_deadline().expect("a frame is held");
+        assert!(due <= Instant::now() + SYNC_HOLD);
+        assert!(live(&mut renderer, b" DRAWN").is_empty());
+        assert_eq!(renderer.flush().unwrap(), None);
+        // Its end paints the whole frame at once.
+        assert!(live(&mut renderer, b"\x1b[?2026l").is_empty());
+        let frame = renderer.flush().unwrap().expect("the complete frame");
+        assert!(contains(&frame, b"HALF DRAWN"), "{frame:?}");
+        assert!(frame.ends_with(SYNC_END));
+        assert_eq!(renderer.paint_deadline(), None);
+        assert_eq!(renderer.flush().unwrap(), None);
+
+        // An update that never ends is painted once the hold is over.
+        assert!(live(&mut renderer, b"\x1b[?2026hSTUCK").is_empty());
+        assert_eq!(renderer.flush().unwrap(), None);
+        std::thread::sleep(SYNC_HOLD + Duration::from_millis(20));
+        assert!(Instant::now() >= renderer.paint_deadline().unwrap());
+        let frame = renderer.flush().unwrap().expect("painted after the hold");
+        assert!(contains(&frame, b"STUCK"));
+
+        // A query, whose answer can depend on the screen, is written after
+        // a frame at once; inside an update the window's own update stays
+        // open, so it shows only the complete frame.
+        assert!(live(&mut renderer, b" MORE").is_empty());
+        let written = renderer.query(b"\x1b[6n").unwrap();
+        assert!(contains(&written, b"MORE"), "{written:?}");
+        assert!(written.ends_with(b"\x1b[6n"));
+        assert!(!contains(&written, SYNC_END), "{written:?}");
+        assert!(live(&mut renderer, b"\x1b[?2026l").is_empty());
+        let frame = renderer.flush().unwrap().unwrap();
+        assert!(frame.ends_with(SYNC_END));
+
+        // Direct mode passes the stream through as it is, updates included.
+        let mut renderer = Renderer::new((80, 24));
+        renderer.replace((80, 24), b"").unwrap();
+        assert_eq!(live(&mut renderer, b"\x1b[?2026hX"), b"\x1b[?2026hX");
+        assert_eq!(renderer.flush().unwrap(), None);
+        assert_eq!(renderer.paint_deadline(), None);
+    }
+
+    #[test]
+    fn a_resized_grid_resizes_the_copy_and_keeps_the_window() {
+        // Direct: nothing to write; the copy has the new size, its screen
+        // and modes, for the program to repaint.
+        let mut renderer = Renderer::new((80, 24));
+        renderer
+            .replace((80, 24), b"\x1b[?1049h\x1b[?2004h\x1b[HEDIT")
+            .unwrap();
+        renderer.physical = (90, 30);
+        assert!(renderer.resize_grid((90, 30)).unwrap().is_empty());
+        assert!(renderer.direct() && !renderer.viewport());
+        let state = renderer.terminal().inspect().unwrap();
+        assert!(state.alternate);
+        assert_eq!(state.active.len(), 30);
+        assert!(state.active[0].contains("EDIT"));
+        assert!(renderer.bracketed_paste());
+        assert_eq!(live(&mut renderer, b"more"), b"more");
+
+        // A window of another size paints a viewport of the resized copy
+        // once, with the program's repaint.
+        let mut renderer = Renderer::new((100, 40));
+        renderer
+            .replace((80, 24), b"\x1b[?1049h\x1b[HEDIT")
+            .unwrap();
+        assert!(renderer.resize_grid((90, 30)).unwrap().is_empty());
+        assert_eq!(renderer.flush().unwrap(), None, "not before the repaint");
+        assert!(live(&mut renderer, b"\x1b[30;1HBOTTOM").is_empty());
+        let frame = renderer.flush().unwrap().expect("a viewport frame");
+        assert!(contains(&frame, b"EDIT") && contains(&frame, b"BOTTOM"));
+        assert!(renderer.viewport());
+
+        // A window that painted a viewport and matches the new grid goes
+        // back to the stream through a full snapshot of the copy.
+        let mut renderer = Renderer::new((90, 30));
+        let viewport = renderer.replace((80, 24), b"TEXT").unwrap();
+        assert!(viewport.starts_with(b"\x1b[?2026h"));
+        let snapshot = renderer.resize_grid((90, 30)).unwrap();
+        assert!(snapshot.starts_with(b"\x18\x1bc") || snapshot.starts_with(b"\x1bc"));
+        assert!(contains(&snapshot, b"TEXT"));
+        assert!(!renderer.viewport());
+
+        assert!(renderer.resize_grid((0, 30)).is_err());
     }
 
     #[test]

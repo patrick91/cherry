@@ -141,6 +141,7 @@ fn accept_attach(listener: UnixListener, info: SessionInfo, snapshot: &[u8]) -> 
             session: info,
             offset: 0,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         },
     )
     .unwrap();
@@ -797,11 +798,12 @@ const INPUT_OVERFLOW: usize = 64 * 1024;
 
 /// Paste into `pipe` a chunk at a time, each read by the client before the
 /// next, until the client holds more input than it could below its limit
-/// (queued input takes at least 4/3 of its size in frames), with a host that
-/// takes none. Returns how much was pasted.
+/// (queued input takes at least its size in frames, and a chunk read below
+/// the limit may take it past it), with a host that takes none. Returns how
+/// much was pasted.
 fn paste_past_the_limit(pipe: &mut InputPipe, host: &UnixStream) -> usize {
     const CHUNK: usize = 4096;
-    let beyond = SMALL_INPUT_HIGH_WATER * 3 / 4 + CHUNK + INPUT_OVERFLOW / 2;
+    let beyond = SMALL_INPUT_HIGH_WATER + CHUNK + INPUT_OVERFLOW / 2;
     let mut pasted = 0;
     let mut handed_over = 0;
     loop {
@@ -1160,6 +1162,7 @@ fn a_detach_ends_once_a_host_that_stopped_reading_sent_nothing_more() {
                     session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
                     offset: 0,
                     snapshot: b"ready".to_vec(),
+                    refreshes: false,
                 },
             ]),
         ]
@@ -1335,6 +1338,7 @@ fn unsolicited_pongs_are_ignored_at_any_time() {
                 session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
                 offset: 0,
                 snapshot: b"screen".to_vec(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -1392,6 +1396,7 @@ fn takeover_is_sent_only_when_requested() {
                 session: session(),
                 offset: 42,
                 snapshot: b"restored screen".to_vec(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -1431,6 +1436,7 @@ fn shared_resize_replaces_canonical_state_and_continues_at_the_new_offset() {
                     session: descriptor,
                     offset: 7,
                     snapshot: b"\x1bcRESIZED".to_vec(),
+                    refreshes: false,
                 },
                 ServerMessage::Output {
                     offset: 7,
@@ -1488,6 +1494,7 @@ fn resync_snapshot_replaces_the_screen_and_resumes_at_its_offset() {
                 session: session(),
                 offset: 500,
                 snapshot: b"\x1bcRESYNCED".to_vec(),
+                refreshes: false,
             },
             ServerMessage::Output {
                 offset: 500,
@@ -1993,6 +2000,7 @@ fn real_pty_forwards_resize_and_control_c_and_restores_mode_on_sigterm() {
                 session: sized_session(80, 24),
                 offset: 0,
                 snapshot: b"ready".to_vec(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -2068,6 +2076,7 @@ fn a_resize_that_sets_the_shared_grid_switches_straight_to_the_new_snapshot() {
                 session: sized_session(101, 41),
                 offset: 0,
                 snapshot: b"\x1bc\x1b[?1004hRESIZED".to_vec(),
+                refreshes: false,
             },
             ServerMessage::Exit {
                 id: "test-session".into(),
@@ -2143,6 +2152,7 @@ fn a_repeated_resize_signal_keeps_waiting_for_the_grid() {
                 session: sized_session(101, 41),
                 offset: 0,
                 snapshot: b"\x1bc\x1b[?1004hRESIZED".to_vec(),
+                refreshes: false,
             },
             ServerMessage::Exit {
                 id: "test-session".into(),
@@ -2226,6 +2236,7 @@ fn a_window_beyond_the_protocol_limit_gets_a_viewport_not_the_raw_stream() {
                 session: sized_session(500, 50),
                 offset: 0,
                 snapshot: b"\x1bc\x1b[?1004hWIDE-SNAPSHOT".to_vec(),
+                refreshes: false,
             },
             ServerMessage::Output {
                 offset: 0,
@@ -3217,6 +3228,7 @@ fn the_agent_link_follows_only_local_clients_that_create_or_attach_sessions() {
                             session: session(),
                             offset: 0,
                             snapshot: Vec::new(),
+                            refreshes: false,
                         },
                     )
                     .unwrap();
@@ -3428,6 +3440,7 @@ fn heartbeats_start_before_the_first_snapshot_and_continue_while_attached() {
                 session: session(),
                 offset: 0,
                 snapshot: Vec::new(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -3671,6 +3684,7 @@ fn stalled_stdout_still_handles_sigterm_and_restores_tty_and_pipe_flags() {
                 session: session(),
                 offset: 0,
                 snapshot: vec![b'x'; 262_144],
+                refreshes: false,
             },
         )
         .unwrap();
@@ -3752,6 +3766,7 @@ fn redirected_regular_file_preserves_append_mode_and_has_no_screen_cleanup() {
                 session: session(),
                 offset: 0,
                 snapshot: b"snapshot".to_vec(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -3805,6 +3820,7 @@ fn detaching_a_tui_resets_keyboard_cursor_scroll_region_and_charsets() {
                 session: session(),
                 offset: 0,
                 snapshot: enabled_modes.to_vec(),
+                refreshes: false,
             },
         )
         .unwrap();
@@ -4060,7 +4076,7 @@ fn detach_with_reports(snapshot: &[u8], while_detaching: &[u8], after_reset: &[u
 // Protocol 4: `cherry control`, replacing an older host, `new` metadata and
 // `--ssh-control-path`.
 
-fn encoded<T: serde::Serialize>(message: &T) -> Vec<u8> {
+fn encoded<T: cherry_protocol::Message>(message: &T) -> Vec<u8> {
     encode_frame(message).unwrap()
 }
 
@@ -4816,6 +4832,7 @@ fn an_older_host_makes_way_and_the_command_goes_on_with_the_host_it_starts() {
                                 session: session(),
                                 offset: 0,
                                 snapshot: Vec::new(),
+                                refreshes: false,
                             },
                         )
                         .unwrap();
@@ -5495,6 +5512,7 @@ fn reattach(stream: &mut UnixStream, size: (u16, u16), offset: u64, snapshot: &[
             session: sized_session(size.0, size.1),
             offset,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         },
     )
     .unwrap();
@@ -5984,6 +6002,7 @@ fn reconnecting_over_ssh_runs_ssh_in_batch_mode_so_it_never_prompts_in_the_sessi
             session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
             offset: 0,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         })
     };
     // The first connection ends right after attaching (the remote daemon
@@ -6092,6 +6111,7 @@ fn a_remote_host_of_another_version_ends_the_reconnection_at_once() {
                     session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
                     offset: 0,
                     snapshot: b"FIRST".to_vec(),
+                    refreshes: false,
                 },
             ]),
         ]
@@ -6175,6 +6195,7 @@ fn serve_attach(mut stream: UnixStream, snapshot: &[u8]) -> Option<UnixStream> {
             session: session(),
             offset: 0,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         },
     )
     .ok()?;
@@ -6382,6 +6403,7 @@ fn what_ssh_says_while_reconnecting_never_reaches_the_screen() {
             session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
             offset: 0,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         })
     };
     let exit = encoded(&ServerMessage::Exit {
@@ -6767,6 +6789,7 @@ fn a_gateway_that_stopped_reading_is_connected_to_again() {
             session: sized_session(DEFAULT_COLS, DEFAULT_ROWS),
             offset: 0,
             snapshot: snapshot.to_vec(),
+            refreshes: false,
         })
     };
     std::fs::write(
@@ -6863,6 +6886,7 @@ fn the_client_id_goes_with_every_attach_including_after_a_lost_connection() {
             session: session(),
             offset: 0,
             snapshot: b"FIRST".to_vec(),
+            refreshes: false,
         },
     )
     .unwrap();
@@ -6884,6 +6908,7 @@ fn the_client_id_goes_with_every_attach_including_after_a_lost_connection() {
             session: session(),
             offset: 0,
             snapshot: b"SECOND".to_vec(),
+            refreshes: false,
         },
     )
     .unwrap();
@@ -7175,16 +7200,22 @@ fn keys_typed_while_the_terminal_takes_no_output_still_reach_the_host() {
     let (typed_tx, typed_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut stream = accept_attach(listener, sized_session(80, 24), b"READY");
-        write_frame(
-            &mut stream,
-            &ServerMessage::Output {
-                offset: 0,
-                data: vec![b'x'; 2 * 1024 * 1024],
-            },
-        )
-        .unwrap();
+        // Written while the input is read, as the host does: the client
+        // takes the frame only as its terminal takes the output.
+        let mut writer = stream.try_clone().unwrap();
+        let output = thread::spawn(move || {
+            write_frame(
+                &mut writer,
+                &ServerMessage::Output {
+                    offset: 0,
+                    data: vec![b'x'; 2 * 1024 * 1024],
+                },
+            )
+            .unwrap();
+        });
         assert_eq!(input_until(&mut stream, b"k"), b"k");
         typed_tx.send(()).unwrap();
+        output.join().unwrap();
         exit_session(&mut stream, 0);
     });
     let pty = Pty::open(80, 24);
@@ -7204,5 +7235,177 @@ fn keys_typed_while_the_terminal_takes_no_output_still_reach_the_host() {
         .expect("the key waited behind the output");
     pty.read_in_background();
     assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    server.join().unwrap();
+}
+
+#[test]
+fn keys_typed_while_output_streams_reach_the_host_before_it_ends() {
+    // The terminal takes everything (the client never waits to write), and
+    // the host sends frames without a pause: terminal input is looked for
+    // between frames too, not only once none are left.
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_attach(listener, sized_session(80, 24), b"READY");
+        let typed = Arc::new(AtomicUsize::new(0));
+        let mut reader = stream.try_clone().unwrap();
+        let seen = typed.clone();
+        thread::spawn(move || {
+            assert_eq!(input_until(&mut reader, b"k"), b"k");
+            seen.store(1, Ordering::SeqCst);
+        });
+        let frame = [b"0123456789abcdef".as_slice(); 256].concat();
+        let (mut offset, deadline) = (0u64, Instant::now() + Duration::from_secs(10));
+        while typed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            write_frame(
+                &mut stream,
+                &ServerMessage::Output {
+                    offset,
+                    data: frame.clone(),
+                },
+            )
+            .unwrap();
+            offset += frame.len() as u64;
+        }
+        assert_eq!(
+            typed.load(Ordering::SeqCst),
+            1,
+            "the key waited behind {offset} bytes of output"
+        );
+        exit_session(&mut stream, 0);
+    });
+    let pty = Pty::open(80, 24);
+    let mut child = command
+        .args(["attach", "test-session", "--detach-key", "none"])
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    pty.read_in_background();
+    thread::sleep(Duration::from_millis(300));
+    (&pty.master).write_all(b"k").unwrap();
+    assert!(
+        wait_within(&mut child, Duration::from_secs(15)).success(),
+        "{}",
+        stderr_of(&mut child)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn without_a_copy_the_client_asks_the_host_for_one_to_paint_a_viewport() {
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Attach { .. })
+        ));
+        // A host that answers Refresh: the client keeps no copy.
+        write_frame(
+            &mut stream,
+            &ServerMessage::Attached {
+                reason: AttachReason::Attach,
+                session: sized_session(80, 24),
+                offset: 0,
+                snapshot: b"\x1bc\x1b[?1004hFIRST".to_vec(),
+                refreshes: true,
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &ServerMessage::Output {
+                offset: 0,
+                data: b" LIVE".to_vec(),
+            },
+        )
+        .unwrap();
+        // The window grows; the grid does not follow it. Once the client
+        // stops waiting for the grid, it asks for a copy of the screen.
+        let mut asked = Vec::new();
+        loop {
+            match read_client(&mut stream) {
+                Some(ClientMessage::Ping) => {}
+                Some(ClientMessage::Refresh) => break,
+                other => asked.push(format!("{other:?}")),
+            }
+        }
+        assert_eq!(asked, ["Some(Resize { cols: 101, rows: 41 })"]);
+        for frame in [
+            ServerMessage::Attached {
+                reason: AttachReason::Resize,
+                session: sized_session(80, 24),
+                offset: 5,
+                snapshot: b"\x1bc\x1b[?1004hFIRST LIVE".to_vec(),
+                refreshes: true,
+            },
+            ServerMessage::Output {
+                offset: 5,
+                data: b" MORE".to_vec(),
+            },
+            ServerMessage::Exit {
+                id: "test-session".into(),
+                exit_code: 0,
+                signal: None,
+            },
+        ] {
+            write_frame(&mut stream, &frame).unwrap();
+        }
+        // Asked once.
+        while let Ok(Some(message)) = read_frame::<_, ClientMessage>(&mut stream) {
+            assert!(matches!(message, ClientMessage::Ping), "{message:?}");
+        }
+    });
+    let mut pty = Pty::open(80, 24);
+    let mut child = command
+        .args(["attach", "test-session"])
+        .env("CHERRY_CLI_GRID_WAIT_MS", "100")
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    pty.wait_for_raw_mode();
+    let mut received = Vec::new();
+    let settled = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < settled {
+        received.extend(pty.drain());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let size = libc::winsize {
+        ws_row: 41,
+        ws_col: 101,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGWINCH) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        received.extend(pty.drain());
+        assert!(Instant::now() < deadline, "client did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    received.extend(pty.drain());
+    assert!(child.wait().unwrap().success(), "{}", stderr_of(&mut child));
+    // The stream, then a viewport of the copy with its modes, then frames.
+    let viewport = received
+        .windows(8)
+        .position(|bytes| bytes == b"\x1b[?2026h")
+        .expect("a viewport");
+    assert!(contains(&received[..viewport], b"FIRST LIVE"));
+    assert!(
+        !contains(&received[viewport..], b"\x1bc"),
+        "no RIS in viewport mode"
+    );
+    assert!(contains(&received[viewport..], b"\x1b[?1004h"));
+    let mut screen = cherry_vt::Terminal::new(101, 41, 0).unwrap();
+    screen.feed(&received);
+    assert!(screen.screen_text().unwrap().contains("FIRST LIVE MORE"));
     server.join().unwrap();
 }

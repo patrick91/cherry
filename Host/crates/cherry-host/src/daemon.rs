@@ -58,6 +58,13 @@ const UNOBSERVED_EVENTS: usize = 64;
 /// How long a `SendInput` waits for its session's program to take earlier
 /// input when too much of it waits already.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
+/// A session's output goes at the pace of its fastest client that takes
+/// some of it (see `session::Worker::pace`), so a flood reaches that client
+/// whole; one that takes none of it for this long holds nothing back any
+/// more, and lags instead, so that a stuck client never stops the program
+/// for good. While another client takes output, it holds nothing back after
+/// a much shorter while (see `outbox::IDLE_AFTER`).
+const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Write one line to the daemon's log (its stderr). A failed write, such as
 /// a full disk or a closed journal stream, is ignored: unlike `eprintln!`,
@@ -85,6 +92,9 @@ pub struct Config {
     /// How long requests wait for the holders a starting daemon expects
     /// (see `HOLDER_WAIT`).
     pub holder_wait: Duration,
+    /// How long a client that takes none of its output holds the session's
+    /// output back (see `STALL_TIMEOUT`).
+    pub stall_timeout: Duration,
 }
 
 pub fn config() -> &'static Config {
@@ -106,6 +116,7 @@ pub fn config() -> &'static Config {
             touch_interval: millis("CHERRY_HOST_TOUCH_INTERVAL_MS").unwrap_or(TOUCH_INTERVAL),
             agent_grace: millis("CHERRY_HOST_AGENT_GRACE_MS").unwrap_or(AGENT_RELEASE_GRACE),
             holder_wait: millis("CHERRY_HOST_HOLDER_WAIT_MS").unwrap_or(HOLDER_WAIT),
+            stall_timeout: millis("CHERRY_HOST_STALL_TIMEOUT_MS").unwrap_or(STALL_TIMEOUT),
         }
     })
 }

@@ -7,8 +7,8 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
-    default_socket_path, ClientMessage, ServerMessage, HEARTBEAT_INTERVAL, MAX_FRAME_BYTES,
-    MAX_INPUT_BYTES, PROTOCOL_VERSION,
+    binary_kind, default_socket_path, output_frame_parts, ClientMessage, Message, ServerMessage,
+    HEARTBEAT_INTERVAL, MAX_FRAME_BYTES, MAX_INPUT_BYTES, OUTPUT_HEADER, PROTOCOL_VERSION,
 };
 use std::{
     io,
@@ -50,6 +50,14 @@ const INPUT_MARK_BYTES: usize = 64 * 1024;
 /// before (a takeover notice, an exit, a detach confirmation) and its end of
 /// file may take to arrive.
 pub const CLOSED_WAIT: Duration = Duration::from_secs(5);
+/// Output frames that arrived together become one message of at most this
+/// much output (see `FrameDecoder::next`).
+const MERGED_OUTPUT: usize = 1024 * 1024;
+/// The host connection is read at most this much at a time.
+pub const READ_BYTES: usize = 64 * 1024;
+/// An `Output` frame still arriving gives its output so far once this much
+/// of it arrived (see `FrameDecoder::next`).
+const PARTIAL_OUTPUT: usize = 4 * 1024;
 
 /// Where the host is.
 #[derive(Clone, Copy)]
@@ -336,17 +344,8 @@ impl Transport {
     /// Append a frame to the outgoing buffer without writing it. Dropped
     /// once the host stopped reading.
     pub fn queue(&mut self, message: &ClientMessage) -> Result<()> {
-        if self.write_closed.is_some() {
-            return Ok(());
-        }
-        if self.pending() == 0 {
-            self.outgoing.clear();
-            self.written = 0;
-            self.progress = Instant::now();
-        }
         let frame = cherry_protocol::encode_frame(message).context("could not encode request")?;
-        self.outgoing.extend_from_slice(&frame);
-        self.queued_total += frame.len() as u64;
+        self.queue_bytes(&frame);
         Ok(())
     }
 
@@ -365,9 +364,9 @@ impl Transport {
 
     pub fn queue_input(&mut self, bytes: &[u8]) -> Result<()> {
         for data in bytes.chunks(MAX_INPUT_BYTES) {
-            self.queue(&ClientMessage::Input {
-                data: data.to_vec(),
-            })?;
+            let frame =
+                cherry_protocol::encode_input_frame(data).context("could not encode input")?;
+            self.queue_bytes(&frame);
             self.unmarked_input += data.len();
             if self.unmarked_input >= INPUT_MARK_BYTES {
                 self.queue(&ClientMessage::Ping)?;
@@ -500,9 +499,9 @@ impl Transport {
         }
     }
 
-    /// Read what is available. False at end of file.
-    pub fn read_ready(&mut self) -> Result<bool> {
-        match self.decoder.read_from(self.read_fd())? {
+    /// Read what is available, up to `max` bytes. False at end of file.
+    pub fn read_ready(&mut self, max: usize) -> Result<bool> {
+        match self.decoder.read_from(self.read_fd(), max)? {
             None => Ok(false),
             Some(0) => Ok(true),
             Some(_) => {
@@ -567,7 +566,7 @@ impl Transport {
                 self.write_ready()?;
             }
             if fds[0].revents != 0 {
-                if !self.read_ready()? {
+                if !self.read_ready(READ_BYTES)? {
                     return Ok(None);
                 }
                 progress = Instant::now();
@@ -1045,6 +1044,9 @@ pub struct FrameDecoder {
     awaiting_preamble: bool,
     /// Bytes that preceded the preamble, kept for the error message.
     junk: Vec<u8>,
+    /// An `Output` frame whose output was given in part: the offset of the
+    /// rest, and how long the rest is (see `next`).
+    partial: Option<(u64, usize)>,
 }
 
 impl FrameDecoder {
@@ -1060,38 +1062,111 @@ impl FrameDecoder {
         self.awaiting_preamble
     }
 
-    /// The bytes not decoded yet, leaving the decoder empty.
-    fn take_buffered(&mut self) -> Vec<u8> {
+    /// The bytes not decoded yet, leaving the decoder empty. The rest of an
+    /// `Output` frame given in part is a frame of its own again.
+    pub(crate) fn take_buffered(&mut self) -> Vec<u8> {
         debug_assert!(!self.awaiting_preamble);
-        let rest = self.bytes.split_off(self.consumed);
+        let mut rest = self.bytes.split_off(self.consumed);
         self.bytes.clear();
         self.consumed = 0;
+        if let Some((offset, left)) = self.partial.take() {
+            let mut frame = Vec::with_capacity(OUTPUT_HEADER + rest.len());
+            frame.extend_from_slice(&((1 + 8 + left) as u32).to_be_bytes());
+            frame.push(binary_kind::OUTPUT);
+            frame.extend_from_slice(&offset.to_be_bytes());
+            frame.append(&mut rest);
+            rest = frame;
+        }
         rest
     }
 
+    /// The next message. An `Output` frame is given as its output arrives,
+    /// in parts of at least `PARTIAL_OUTPUT` (and its last), rather than
+    /// once it arrived whole: a big frame for a terminal that takes it
+    /// slowly then never keeps the connection unread while the terminal
+    /// takes the whole of it (see `attach::TerminalOutput::read_size`).
     pub fn next(&mut self) -> Result<Option<ServerMessage>> {
         if self.awaiting_preamble && !self.take_preamble()? {
             return Ok(None);
+        }
+        if let Some((offset, left)) = self.partial {
+            let pending = &self.bytes[self.consumed..];
+            let n = pending.len().min(left);
+            if n == 0 || (n < left && n < PARTIAL_OUTPUT) {
+                return Ok(None);
+            }
+            let data = pending[..n].to_vec();
+            self.consumed += n;
+            self.partial = (n < left).then(|| (offset + n as u64, left - n));
+            self.compact_consumed();
+            return Ok(Some(ServerMessage::Output { offset, data }));
         }
         let pending = &self.bytes[self.consumed..];
         if pending.len() < 4 {
             return Ok(None);
         }
-        let len = u32::from_be_bytes(pending[..4].try_into().unwrap()) as usize;
-        if len == 0 || len > MAX_FRAME_BYTES {
-            bail!("host sent invalid frame length {len}");
-        }
+        let word = pending[..4].try_into().unwrap();
+        let Ok(len) = cherry_protocol::frame_length(word) else {
+            bail!(
+                "host sent invalid frame length {}",
+                u32::from_be_bytes(word)
+            );
+        };
         if pending.len() < 4 + len {
+            // An `Output` frame still arriving: its output so far.
+            if let Some((offset, data)) = output_frame_parts(pending)
+                .filter(|(_, data)| data.len() >= PARTIAL_OUTPUT && len > 1 + 8)
+            {
+                let data = data.to_vec();
+                self.partial = Some((offset + data.len() as u64, len - 1 - 8 - data.len()));
+                self.consumed = self.bytes.len();
+                self.compact_consumed();
+                return Ok(Some(ServerMessage::Output { offset, data }));
+            }
             return Ok(None);
         }
-        let message =
-            serde_json::from_slice(&pending[4..4 + len]).context("host sent invalid JSON frame")?;
+        let mut message = ServerMessage::decode_body(&pending[4..4 + len])
+            .context("host sent an invalid frame")?;
         self.consumed += 4 + len;
+        if let ServerMessage::Output { offset, data } = &mut message {
+            self.merge_output(*offset, data);
+        }
+        self.compact_consumed();
+        Ok(Some(message))
+    }
+
+    /// Once everything received was decoded, the buffer starts afresh.
+    fn compact_consumed(&mut self) {
         if self.consumed == self.bytes.len() {
             self.bytes.clear();
             self.consumed = 0;
         }
-        Ok(Some(message))
+    }
+
+    /// Take the output of the `Output` frames that follow at once and
+    /// continue `data` (at `offset`), up to `MERGED_OUTPUT` in all: one
+    /// message rather than one per frame.
+    fn merge_output(&mut self, offset: u64, data: &mut Vec<u8>) {
+        while data.len() < MERGED_OUTPUT {
+            let pending = &self.bytes[self.consumed..];
+            let Some(word) = pending.get(..4) else {
+                return;
+            };
+            let len = u32::from_be_bytes(word.try_into().unwrap()) as usize;
+            let Some(frame) = pending.get(..4 + len) else {
+                return;
+            };
+            match output_frame_parts(frame) {
+                Some((next, more))
+                    if Some(next) == offset.checked_add(data.len() as u64)
+                        && data.len() + more.len() <= MERGED_OUTPUT =>
+                {
+                    data.extend_from_slice(more);
+                    self.consumed += 4 + len;
+                }
+                _ => return,
+            }
+        }
     }
 
     /// Find `CHERRY-GATEWAY <version>\n`, skipping up to 64 KiB before it.
@@ -1185,13 +1260,13 @@ impl FrameDecoder {
     }
 
     /// Bytes read (0 when none are available), or None at end of file.
-    fn read_from(&mut self, fd: RawFd) -> Result<Option<usize>> {
+    fn read_from(&mut self, fd: RawFd, max: usize) -> Result<Option<usize>> {
         if self.consumed > 0 {
             self.bytes.drain(..self.consumed);
             self.consumed = 0;
         }
-        let mut buffer = [0u8; 65536];
-        let read = match read_some(fd, &mut buffer) {
+        let mut buffer = [0u8; READ_BYTES];
+        let read = match read_some(fd, &mut buffer[..max.clamp(1, READ_BYTES)]) {
             // A peer that closed with bytes of ours unread resets the
             // connection (Linux) once what it sent before is read.
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => Ok(Some(0)),
@@ -1271,7 +1346,7 @@ mod tests {
 
         // A read that fails other than by a reset.
         let mut transport = over(open("/"), open("/dev/null"));
-        let error = transport.read_ready().unwrap_err();
+        let error = transport.read_ready(READ_BYTES).unwrap_err();
         assert!(is_lost(&error), "{error:#}");
         assert!(
             format!("{error:#}").starts_with("could not read host connection: "),
@@ -1285,7 +1360,7 @@ mod tests {
         transport.queue(&ClientMessage::Ping).unwrap();
         transport.write_ready().unwrap();
         assert!(transport.closed_deadline().is_some());
-        assert!(!transport.read_ready().unwrap(), "end of file");
+        assert!(!transport.read_ready(READ_BYTES).unwrap(), "end of file");
 
         // Protocol errors are not lost connections.
         assert!(!is_lost(&anyhow!("host sent invalid JSON frame")));

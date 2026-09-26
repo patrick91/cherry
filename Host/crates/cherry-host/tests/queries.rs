@@ -416,8 +416,8 @@ exec sleep 60"#,
     let mut responder = Term::attach(&host, &session.id, REPLY);
     watcher.read();
     // The responder typed last and then stops reading. Output frames are at
-    // least 4/3 of what they carry, and the responder's socket holds what
-    // reached it, so the host holds at least the difference for it,
+    // least as long as what they carry, and the responder's socket holds
+    // what reached it, so the host holds at least the difference for it,
     // whatever the socket buffer sizes, less the frame it is writing.
     input(&mut responder.writer, b"go\n");
     let start = watcher.screen.offset;
@@ -430,7 +430,7 @@ exec sleep 60"#,
         }
     };
     const FRAME: u64 = 512 * 1024;
-    let held = |sent: u64, socket: usize| (sent * 4 / 3).saturating_sub(socket as u64 + FRAME);
+    let held = |sent: u64, socket: usize| sent.saturating_sub(socket as u64 + FRAME);
     let socket = responder.reader.as_ref().unwrap().try_clone().unwrap();
     // So the query is queued behind output the responder has not received.
     wait_for(&mut watcher, "output held for the responder", &|watcher| {

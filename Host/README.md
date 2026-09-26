@@ -353,7 +353,7 @@ version through its preamble. If you restrict an SSH key to the command
 the forced command drops the variable, and the gateway then replaces an
 older daemon without checking its identity.
 
-The gateway prints `CHERRY-GATEWAY <version>` (`CHERRY-GATEWAY 5` for this
+The gateway prints `CHERRY-GATEWAY <version>` (`CHERRY-GATEWAY 6` for this
 version) on a line of its own before relaying protocol frames. The client
 skips up to 64 KiB of output that a remote shell prints before that line.
 Beyond that it fails with "the remote shell printed output before cherry-host
@@ -827,8 +827,10 @@ cherry-host.service` also moves the daemon to it.
 
 - **Priority.** On macOS the threads that carry an attachment's traffic run at
   the `USER_INTERACTIVE` quality of service while a client is attached: the
-  attach adapter's main thread, the daemon's connection threads of attached
-  clients and the session's worker, and the session's holder. When nothing is
+  attach adapter's main thread and the thread that writes its terminal
+  output, the daemon's connection threads of attached
+  clients and the session's worker, and the session's holder (its loop and
+  the thread its headless terminal parses on). When nothing is
   attached they return to the default class, so the output of sessions nobody
   watches never competes with the ones on screen. The programs in sessions
   are not affected. On a busy machine each of those thread wakeups otherwise
@@ -868,10 +870,59 @@ cherry-host.service` also moves the daemon to it.
   (see [Reconnecting](#attach-options)). The CLI gives up at once when its
   own terminal accepts no output at all for 15 seconds (outcome
   `disconnected`; the session keeps running).
-- **Slow clients.** A client's queued output has a 4 MiB budget. Beyond that
-  the host drops the client's queued output and, once what remains in its
-  queue is at most 256 KiB, sends it a fresh snapshot (`Attached` with reason
-  `resync`). Output that a snapshot cannot rebuild is kept, within bounds, and
+- **Slow clients.** A session's program goes at the pace of its fastest
+  client, as the program in a native terminal goes at its terminal's pace.
+  While any attached client takes its output as fast as the program makes
+  it, nothing holds the program back. Once more than 512 KiB of output
+  waits in the host for every client (beyond what its socket holds: the
+  daemon asks for a 1 MiB send buffer, which Linux doubles; a client that
+  just attached counts as keeping up until then), the daemon tells the
+  session's holder how far it may read the program's output (holder link
+  version 6): as far as the client that can take the most more (the one
+  that took the most of its output) can take. It moves that limit on as
+  that client takes its output, until no more than 128 KiB waits for it.
+  The program's output meanwhile waits in the PTY, and the program with it.
+  Output already on its way when the client began to hold the program back
+  waits for it as well (up to 256 KiB more), so the program goes on at the
+  client's pace from there rather than stop until the client took it. So a
+  flood reaches the fastest client whole, at its pace, and the host's
+  memory stays bounded; the program gets its output evenly: the limit moves
+  on each time that client took at least 8 KiB more and takes no more for
+  now (and every 256 KiB it takes without a pause), and `cherry attach`
+  reads its connection only as its terminal takes output (see Throughput),
+  in steps of 16 KiB or more at a time. A session's only client gets every
+  byte at its own pace (unless it takes nothing for the stall below). The
+  session's slower clients fall behind and lag as described below: a slow
+  client (one over a slow SSH link, say) never holds the program, or the
+  session's other clients, back to its pace. A client that takes none of
+  its output holds nothing back once it took none of it for 2 seconds
+  (while output waits for it). While another client (a lagging one too)
+  takes output, it holds nothing back much sooner: once it took none for
+  250 ms, or for three times the longest it went between taking any in the
+  last second or two, if that is longer (a slow terminal behind `cherry
+  attach` takes its output 16 KiB at a time: every 320 ms at 50 KiB/s), and
+  the daemon looks every 50 ms from then on whether another client took
+  some. So a client that takes nothing holds the program back for at most
+  the 2-second stall when no other client takes output, and otherwise only
+  for about that short while, however slowly the others take it. When the
+  client the program went at the pace of detaches or stalls, the fastest of
+  the others takes over at once: the output that waits for it (up to
+  3 MiB) goes on waiting, rather than the program stopping until it took
+  all that, and the program goes at half its pace until no more than
+  768 KiB waits for it. (Of more than 3 MiB, it first takes what waits
+  beyond 3 MiB while the program waits: output already on its way to it
+  must still fit its 4 MiB budget.) A client that lagged starts afresh once
+  resynchronized: it keeps up until more than 512 KiB waits for it again.
+  The daemon reads the holder link all the while: replies (snapshots for
+  attaches and replacements, screen text, the confirmation of a detach) and
+  the session's other clients never wait behind output held back, apart
+  from what is queued behind that output for the slow client itself. A
+  session whose holder predates link version 6 is not held back: all its
+  slow clients lag. A client's queued output has a 4 MiB budget. Beyond
+  that the host drops the client's queued output (the client lags) and,
+  once what remains in its queue is at most 256 KiB, sends it a fresh
+  snapshot (`Attached` with reason `resync`).
+  Output that a snapshot cannot rebuild is kept, within bounds, and
   follows the resync snapshot as `Output`: the latest title of each kind, the
   working directory (OSC 7), pointer and cursor shape, one bell, the latest
   clipboard write for each selection (up to 4 selections and 8 MiB in total),
@@ -886,10 +937,40 @@ cherry-host.service` also moves the daemon to it.
   resync snapshot and carried output, once each. At most 1 MiB of queries
   waits for a client; a query beyond that is dropped. A failed resync
   snapshot is reported as `snapshot_failed` and retried after 1 second. A
-  slow client never slows the session or other clients and is not
-  disconnected for being slow; a failed write, meaning the peer is gone, ends
-  the attachment. A client that stops reading replies while sending requests
-  is no longer read from once more than 32 MiB of replies wait.
+  client that takes nothing never holds the session back for longer than
+  that stall, and no client is disconnected for being slow; a failed write,
+  meaning the peer is gone, ends the attachment (a connection that sends
+  nothing, heartbeats included, is dropped as above). A client that stops
+  reading replies while sending requests is no longer read from once more
+  than 32 MiB of replies wait.
+- **Throughput.** Terminal bytes travel as they are, in binary frames (see
+  [Protocol](#protocol)). The holder parses the program's output with its
+  headless terminal on a thread of its own, so reading the PTY and sending
+  the output never wait for the parse, and hands it each flood's output in
+  chunks of up to 64 KiB, or what came within 1 ms (at once when it
+  holds a query the host answers, as far as the output's tokens tell);
+  snapshots, screen text and resizes wait until the terminal has parsed
+  exactly the output sent before them, and input waits until it has parsed
+  the output read before it, so the replies to the program's queries reach
+  the program before input that arrives after them. During a flood (output
+  that came without a pause of 1 ms for 10 ms; a wait while the program is
+  held back for a slow client is no pause) the holder reads the PTY again
+  at once when it found it empty (a PTY holds a few KiB, and sleeping until
+  the program refilled it would cost a wakeup every few KiB), and gathers
+  output for up to 1 ms, or 64 KiB, before it sends it; output after a
+  pause (an echo, a prompt, a repaint) goes at once, and output that waits
+  for the daemon or a client joins what is queued ahead of it, so floods
+  travel in fewer, bigger frames. `cherry attach` writes its terminal
+  output on a thread of its own, through a queue of at most 256 KiB,
+  counting what the thread is writing (a viewport frame is painted only
+  once the terminal took the frame before), and reads its connection only
+  as the queue has room: as much as it has, 16 KiB at least and 64 KiB at
+  most at a time, taking the output of a large `Output` frame as it
+  arrives rather than once it arrived whole. So a terminal that takes its
+  output slowly has the connection read at its own pace, evenly (see slow
+  clients). In direct mode it follows only the session's modes rather than
+  a whole copy of its screen: a window of another size asks the host for a
+  replacement (`Refresh`) when it needs the screen.
 - **Input backpressure.** While more than 1 MiB of a session's input waits for
   the program, the host stops reading from any client that sends more input,
   and resumes below 256 KiB. A large paste into a slow program is delivered in
@@ -1044,12 +1125,25 @@ OSC 133 prompt marks. See [cherry-vt](crates/cherry-vt/README.md) for details.
 
 ## Protocol
 
-Frames are a 4-byte big-endian length followed by a JSON message of at most
-16 MiB; terminal bytes are base64 strings. Unknown fields are ignored, so a
-field can be added without breaking an older peer. The client opens with
+Frames are a 4-byte big-endian length followed by at most 16 MiB. A frame
+whose first byte is `{` holds a JSON message: the handshake and every
+control message. An attachment's terminal bytes travel as they are, in
+binary frames (protocol 6), whose first byte is their kind:
+
+| Kind | Message | Direction | After the kind |
+|---|---|---|---|
+| 1 | `Output` | host to client | the offset (8 bytes, big-endian), then the output |
+| 2 | `Input` | client to host | the input |
+| 3 | `Query` | host to client | the query |
+| 4 | `Attached` | host to client | the length of a JSON header (4 bytes, big-endian), the header (`session`, `offset`, `reason`, `refreshes`), then the snapshot |
+
+Those four have no JSON form, and a binary frame carries no `req`. The
+bytes of `SendInput` (a JSON request) are a base64 string. Unknown fields
+are ignored (the `Attached` header's too), so a field can be added without
+breaking an older peer. The client opens with
 `Hello{version}`, and the host answers every `Hello`, whatever its version,
 with `Welcome{version, host_id}` carrying its own version and identity. The
-current version is 5. Normal operation needs the same version on both sides.
+current version is 6. Normal operation needs the same version on both sides.
 When they differ, the client disconnects or, only when the host's version is
 lower, sends `Replace`, which the host answers `Ok` once it has stopped
 listening and released its socket and lock, and then exits (see
@@ -1062,7 +1156,8 @@ version with `version_mismatch` instead of a `Welcome`.
 Any request may carry `"req": <u64>`, which the host echoes on its reply, so
 one connection can have several requests in flight. The host answers every
 request with exactly one frame, except `Input` and `Resize`, which are
-answered only when they fail. Frames the host sends on its own (events, and
+answered only when they fail, and `Refresh`, which is answered with a
+replacement snapshot. Frames the host sends on its own (events, and
 attachment traffic: `Attached`, `Output`, `Query`, `Exit`, a paused
 attachment's `Pong`s) carry none. A connection carries at most one
 attachment (`Attach`, `Input`, `Resize`, `Detach`); a control connection
@@ -1103,7 +1198,15 @@ for the old size, the output from it on for the new one, and a renderer
 resizes its copy of the screens there and keeps what its window shows. Like
 a `resize` replacement it is superseded by a newer replacement still queued,
 and it never replaces one. `Attach` may carry `client_id` (protocol 5; see
-[Use from the command line](#use-from-the-command-line)). An `Attached`
+[Use from the command line](#use-from-the-command-line)). An attached
+client may send `Refresh` (protocol 6) to be sent an `Attached{resize}`
+replacement for the grid, queued behind its output like any replacement (or
+`snapshot_failed`); one already on its way answers it too, and a `Resized`
+on its way is followed by one. Every host of
+protocol 6 answers it, and says so in `Attached`'s `refreshes`: a client
+that shows the stream as it is (its window has the grid's size) then keeps
+only the session's modes, and asks for the screen when its window leaves
+the grid's size. An `Attached`
 offset may be lower than the offset of the stream when carried output
 follows it (see [slow clients](#connections-and-flow-control)); that output
 starts at the `Attached` offset, so resuming there needs nothing more. An
@@ -1199,9 +1302,11 @@ keys and pinned fixture host keys; it requires Docker and OpenSSH tools.
 
 Tests shorten the host's timing with `CHERRY_HOST_*_MS` variables read when
 `serve` starts (`HEARTBEAT_TIMEOUT`, `IDLE_TIMEOUT`, `INPUT_WAIT`,
-`KILL_GRACE`, `TOUCH_INTERVAL`, `AGENT_GRACE`, and `HOLDER_WAIT`, how long
+`KILL_GRACE`, `TOUCH_INTERVAL`, `AGENT_GRACE`, `HOLDER_WAIT`, how long
 `List` and requests naming a session wait for the holders a restarted daemon
-expects, 1000 ms by default), and the CLI's with `CHERRY_CLI_*_MS`
+expects, 1000 ms by default, and `STALL_TIMEOUT`, how long a client that
+takes none of its output holds a session's output back at most, 2000 ms by
+default), and the CLI's with `CHERRY_CLI_*_MS`
 (`CONNECT_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`,
 `ESCAPE_WAIT`, `GRID_WAIT`, `RESIZE_COALESCE`, `DETACH_WAIT`, `REPORT_WAIT`,
 `CLOSED_WAIT`, `QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects),

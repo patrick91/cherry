@@ -30,11 +30,12 @@ use crate::{
     link::{self, kind, Frame},
     paths, processes, screen, signals,
     stream::{Batch, DisplayStream},
+    terminal_thread::{Report, TerminalThread},
     watch::DirWatch,
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{priority, valid_size, MAX_SNAPSHOT_BYTES};
-use cherry_vt::{Osc99, ProgressState, Terminal, VtEvent};
+use cherry_vt::{ProgressState, Terminal, VtEvent};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
     collections::VecDeque,
@@ -72,12 +73,38 @@ const REDIAL_WATCHED_MAX: Duration = Duration::from_secs(30);
 /// the daemon may be between binding and listening.
 const REDIAL_SOON: Duration = Duration::from_millis(50);
 /// The terminal is not read while this much output waits for the daemon,
-/// until it drains to the low mark: a program cannot outrun the daemon.
-const LINK_HIGH_WATER: usize = 4 * 1024 * 1024;
-const LINK_LOW_WATER: usize = 1024 * 1024;
+/// until it drains to the low mark: a program cannot outrun the daemon. (The
+/// session's clients, when all of them take their output slowly, hold the
+/// program back to the fastest one's pace through `link::Pace`, see
+/// `session::Worker::pace`.)
+const LINK_HIGH_WATER: usize = 1024 * 1024;
+const LINK_LOW_WATER: usize = 256 * 1024;
 /// Bytes taken from the link per pass, so output keeps flowing under a
 /// flood of requests.
 const LINK_READ: usize = 1024 * 1024;
+/// PTY reads per pass, of at most this many bytes each (macOS returns at
+/// most 1 KiB per read, Linux up to the buffer's size).
+const READS_PER_PASS: usize = 16;
+const READ_BYTES: usize = 16 * 1024;
+
+/// What a poll found ready (see `Holder::run`).
+#[derive(Clone, Copy)]
+struct Ready {
+    /// The PTY's output (or its end).
+    master: bool,
+    /// Frames from the daemon (or the link's end).
+    link: bool,
+    /// A child exited (`child_exits`).
+    child: bool,
+}
+
+impl Ready {
+    const ALL: Self = Self {
+        master: true,
+        link: true,
+        child: true,
+    };
+}
 /// Requests that take work (a snapshot, the screen as text) served per
 /// pass: output read meanwhile goes out before the next one.
 const COSTLY_PER_PASS: usize = 1;
@@ -85,6 +112,18 @@ const COSTLY_PER_PASS: usize = 1;
 /// one frame: bigger frames the busier the daemon, none delayed while it
 /// keeps up.
 const OUTPUT_BATCH: usize = 256 * 1024;
+/// Output gathers up to this much while more of it is ready at once, or
+/// for up to `FLOOD_DELAY` during a flood (see `Holder::flush_link`).
+const GATHER_BYTES: usize = 64 * 1024;
+/// Output that has come without a pause of `FLOOD_PAUSE` for `FLOOD_AFTER`
+/// is a flood (see `Holder::flooding`).
+const FLOOD_AFTER: Duration = Duration::from_millis(10);
+const FLOOD_PAUSE: Duration = Duration::from_millis(1);
+const FLOOD_DELAY: Duration = Duration::from_millis(1);
+/// During a flood a read that finds nothing is tried again this many times
+/// at most, yielding in between, before the holder polls (see
+/// `Holder::read_output`).
+const FLOOD_RETRIES: usize = 64;
 /// Notifications kept for the next daemon, the latest ones.
 const HELD_NOTIFICATIONS: usize = 16;
 /// After output or input, the foreground process is looked at after each
@@ -98,9 +137,10 @@ const FOREGROUND_CHECKS: [Duration; 3] = [
 /// `cherry-host hold`: take the `Launch` on descriptor 3, start the session
 /// and hold it until it has exited and been removed.
 pub fn hold(socket: &Path) -> Result<()> {
-    // Its one thread runs at interactive priority while a client is
-    // attached (`link::Attended`), and at the default class otherwise; the
-    // program it starts is not affected.
+    // Its threads (its loop and its terminal's, see `terminal_thread`) run
+    // at interactive priority while a client is attached
+    // (`link::Attended`), and at the default class otherwise; the program it
+    // starts is not affected.
     priority::prepare_process();
     // Started as /proc/self/exe (see `session::holder_command`), whose name
     // the kernel would give it otherwise.
@@ -198,8 +238,8 @@ fn spawn(
         .stdin(slave.try_clone()?)
         .stdout(slave.try_clone()?)
         .stderr(slave);
-    // The holder has one thread: nothing opens a descriptor above this one
-    // before the fork.
+    // The holder has one thread until its terminal's starts, after the
+    // fork: nothing opens a descriptor above this one before it.
     let fd_end = environment::open_fd_end();
     unsafe {
         child.pre_exec(move || {
@@ -390,9 +430,11 @@ struct Link {
     reader: link::Reader,
     writer: link::Writer,
     since: Instant,
-    /// Output not yet in a frame, and the offset it starts at.
+    /// Output not yet in a frame, the offset it starts at, and since when
+    /// it waits.
     output: Vec<u8>,
     output_offset: u64,
+    output_since: Option<Instant>,
     /// The events the hello carried, until the daemon has them: it sent a
     /// frame other than `REFUSED`, or the link lasted (see `disconnect`).
     offered: Vec<link::Event>,
@@ -416,6 +458,7 @@ impl Link {
             &self.output,
         );
         self.output.clear();
+        self.output_since = None;
         self.writer.push(frame);
     }
 
@@ -491,6 +534,50 @@ fn unwritten_events(frames: Vec<Vec<u8>>) -> Vec<link::Event> {
         .collect()
 }
 
+/// `terminal` as a renderer stream: the whole of it, limited to `max`
+/// bytes (oldest history dropped), or its screens without history; and the
+/// kind of snapshot that is (see `link::SnapshotRequest`). `resized`: the
+/// last resize took effect where the output ends now.
+fn snapshot(
+    terminal: &mut Terminal,
+    mut kind: String,
+    max: Option<usize>,
+    resized: bool,
+) -> Result<(String, Vec<u8>)> {
+    if kind == "resized" {
+        // A full-screen program repaints when its terminal is resized:
+        // only where the new size took effect is needed, and the reply
+        // says that is here. So it may, only while nothing was output
+        // since the resize: a copy that followed the output at the old
+        // size would have taken the program's repaint for the new one
+        // (or whatever else came meanwhile) at the wrong size.
+        if resized && terminal.cursor()?.alternate {
+            return Ok(("size".into(), Vec::new()));
+        }
+        kind = "refresh".into();
+    }
+    let raw = match kind.as_str() {
+        "full" => terminal.snapshot()?,
+        "limited" => terminal.snapshot_limited(max.unwrap_or(MAX_SNAPSHOT_BYTES))?,
+        "refresh" => {
+            let raw = terminal.refresh()?;
+            if raw.len() > MAX_SNAPSHOT_BYTES {
+                bail!(
+                    "the screen needs a {}-byte refresh; the limit is {MAX_SNAPSHOT_BYTES} bytes",
+                    raw.len()
+                );
+            }
+            raw
+        }
+        other => bail!("unknown snapshot kind {other:?}"),
+    };
+    let display = DisplayStream::default().feed(&raw).display;
+    if display.len() > link::MAX_FRAME - 64 * 1024 {
+        bail!("the snapshot exceeds the link's frame limit");
+    }
+    Ok((kind, display))
+}
+
 fn progress_name(state: ProgressState) -> &'static str {
     match state {
         ProgressState::Remove => "remove",
@@ -510,9 +597,9 @@ struct Holder {
     /// Closed once the session has exited, which hangs up the terminal.
     master: Option<Box<dyn MasterPty + Send>>,
     pid: libc::pid_t,
-    terminal: Terminal,
+    /// The headless terminal, parsing on a thread of its own.
+    terminal: TerminalThread,
     display: DisplayStream,
-    osc99: Osc99,
     offset: u64,
     /// Where in the output the daemon's last `RESIZE` took effect; None
     /// when it changed nothing (or none came from this daemon). A `resized`
@@ -540,6 +627,28 @@ struct Holder {
     info: link::Info,
     /// Output waits for the daemon (`LINK_HIGH_WATER`).
     paused: bool,
+    /// How far the daemon lets the program's output be read, while the
+    /// session's clients take their output slowly (`link::Pace`).
+    limit: Option<u64>,
+    /// Since when it lets nothing more through (see `follow_pace`).
+    held_since: Option<Instant>,
+    /// Output waits for the terminal (`terminal_thread::HIGH_WATER`).
+    parsing: bool,
+    /// The last pass read as much as it may: more output is ready (see
+    /// `read_output`).
+    more_output: bool,
+    /// What the last poll found ready (all of it after a pass without a
+    /// poll): a pass skips the reads that would find nothing (see `run`).
+    ready: Ready,
+    /// The buffer PTY reads go to.
+    read_buffer: Vec<u8>,
+    /// Since when output has come without a pause of `FLOOD_PAUSE`, and
+    /// when it last came (see `flooding`).
+    run_since: Option<Instant>,
+    last_output: Option<Instant>,
+    /// Whether a drained read is retried at once during a flood (see
+    /// `read_output`).
+    spinning: bool,
     removed: bool,
     child_exits: UnixStream,
     /// The next look at the foreground process, and how many were due.
@@ -595,6 +704,8 @@ impl Holder {
             }
         };
         stream.set_nonblocking(true)?;
+        // After the fork: the child inherits none of its descriptors.
+        let terminal = TerminalThread::start(terminal)?;
         let mut holder = Self {
             id,
             socket: socket.to_path_buf(),
@@ -624,7 +735,6 @@ impl Holder {
             pid,
             terminal,
             display: DisplayStream::default(),
-            osc99: Osc99::default(),
             offset: 0,
             resized_at: None,
             pending_input: PendingInput::default(),
@@ -641,6 +751,15 @@ impl Holder {
             held: Held::default(),
             info: link::Info::default(),
             paused: false,
+            limit: None,
+            held_since: None,
+            parsing: false,
+            more_output: false,
+            ready: Ready::ALL,
+            read_buffer: vec![0; READ_BYTES],
+            run_since: None,
+            last_output: None,
+            spinning: true,
             removed: false,
             child_exits,
             foreground_due: None,
@@ -671,6 +790,8 @@ impl Holder {
 
     /// Register with the daemon at the other end of `stream`.
     fn connect(&mut self, stream: UnixStream) {
+        // The hello carries the state as the output read so far left it.
+        self.settle_terminal();
         let offered = self.held.take();
         let hello = link::HolderHello {
             id: self.id.clone(),
@@ -692,14 +813,17 @@ impl Holder {
             since: Instant::now(),
             output: Vec::new(),
             output_offset: self.offset,
+            output_since: None,
             offered,
             turned_away: false,
             backlog: false,
         });
         // The hello carries the whole state.
         self.info = link::Info::default();
-        // A daemon's `resized` requests follow its own resizes.
+        // A daemon's `resized` requests follow its own resizes, and it holds
+        // the program back itself.
         self.resized_at = None;
+        self.limit = None;
         self.watch = None;
         self.redial_at = None;
         self.quick_redial = false;
@@ -730,11 +854,12 @@ impl Holder {
         untaken.extend(unwritten_events(unwritten));
         drop(link);
         // Without a daemon nobody is attached.
-        priority::interactive(false);
+        self.interactive(false);
         self.held.restore(untaken);
         self.info = link::Info::default();
         self.pending_input.forget_link();
         self.paused = false;
+        self.limit = None;
         self.watch = self.socket.parent().and_then(DirWatch::new);
         if lasted && !self.refused {
             self.backoff = REDIAL_FIRST;
@@ -840,65 +965,189 @@ impl Holder {
         }
     }
 
-    /// Read available output; false once the PTY reports end of file.
-    fn read_output(&mut self) -> bool {
+    /// Read available output; false once the PTY reports end of file. At
+    /// most `READS_PER_PASS` reads: whether it read as much as that, so
+    /// that more output is ready, is `more_output`. As far as the daemon
+    /// lets it (`credit`) when `paced`; the output a program left when it
+    /// exited is read whatever the daemon said.
+    fn read_output(&mut self, paced: bool) -> bool {
         let fd = self.master_fd();
-        let mut buf = [0u8; 16384];
+        let mut credit = if paced { self.credit() } else { usize::MAX };
         let mut output = Batch::default();
         let mut open = true;
-        // Only an escape sequence can switch screens or change the kitty
-        // keyboard flags or DECCKM, and the terminal gets only whole ones.
-        let mut escaped = false;
         // Bounded work per wake gives input, requests and termination a
-        // turn under output floods. One frame carries the whole burst.
+        // turn under output floods. One frame carries the whole burst, and
+        // the terminal gets it in one hand-off, whole tokens only.
         let mut reads = 0;
-        while reads < 16 {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let mut drained = false;
+        // During a flood the program refills the PTY within microseconds
+        // of a read (a PTY holds a few KiB, so it writes a little at a
+        // time): the holder reads again at once, yielding in between,
+        // rather than sleep in poll and pay a wakeup for every few KiB,
+        // which is what limits a flood's rate once the holder is faster
+        // than the program. As long as that finds more output.
+        let mut retries = 0;
+        let mut found = false;
+        let spin = self.spinning && self.flooding();
+        while reads < READS_PER_PASS && credit > 0 {
+            let buffer = &mut self.read_buffer;
+            // No more than the daemon lets through: display output is no
+            // longer than what it is read from, but for a few bytes.
+            let want = buffer.len().min(credit);
+            let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), want) };
             if n < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                if error.kind() == io::ErrorKind::WouldBlock && spin && retries < FLOOD_RETRIES {
+                    retries += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
                 open = error.kind() == io::ErrorKind::WouldBlock;
+                drained = true;
                 break;
             }
             if n == 0 {
                 open = false;
+                drained = true;
                 break;
             }
+            found |= retries > 0;
             reads += 1;
-            let mut batch = self.display.feed(&buf[..n as usize]);
-            // Kitty notifications, which the terminal does not report, in
-            // order with what it does.
-            let terminal = std::mem::take(&mut batch.terminal);
-            escaped |= terminal.contains(&0x1b);
-            let mut at = 0;
-            for (position, sequence) in std::mem::take(&mut batch.notifications) {
-                self.feed_terminal(&terminal[at..position]);
-                at = position;
-                if let Some(VtEvent::Notification { title, body }) = self.osc99.feed(&sequence) {
-                    self.event(link::Event::Notification { title, body });
-                }
-            }
-            self.feed_terminal(&terminal[at..]);
-            output.append(batch);
+            credit = credit.saturating_sub(n as usize);
+            self.display
+                .feed_into(&self.read_buffer[..n as usize], &mut output);
         }
-        if escaped {
-            self.check_terminal_state();
+        // The last pass left output ready: the time since is no pause of the
+        // program's (see `flooding`).
+        let continued = std::mem::replace(&mut self.more_output, !drained);
+        // Reading again at once pays off while it finds output: after a
+        // pass that read all it may, or a retry that found some. It stops
+        // once the retries found none (a program that writes a little now
+        // and then), until a pass reads all it may again.
+        if !drained || found {
+            self.spinning = true;
+        } else if retries > 0 {
+            self.spinning = false;
         }
         if reads > 0 {
+            let now = Instant::now();
+            if !continued
+                && self
+                    .last_output
+                    .is_none_or(|last| now.saturating_duration_since(last) >= FLOOD_PAUSE)
+            {
+                self.run_since = Some(now);
+            }
+            self.last_output = Some(now);
+            // The terminal's share, with the kitty notifications in it,
+            // which the terminal does not report, where they came.
+            let terminal = std::mem::take(&mut output.terminal);
+            let notifications = std::mem::take(&mut output.notifications);
+            self.parsing = !self.terminal.feed(terminal, notifications);
+            // A query the host answers is parsed at once, so the program
+            // gets its reply without delay.
+            if output.answered {
+                self.parsing = !self.terminal.flush();
+            }
             self.emit(output);
             self.activity();
         }
         open
     }
 
+    /// Take what the terminal produced since last taken: replies for the
+    /// program, its events and changes in its state, in order.
+    fn collect_terminal(&mut self) {
+        let (parsed, accepting) = self.terminal.take();
+        self.parsing = !accepting;
+        self.queue_replies(&parsed.replies);
+        for report in parsed.reports {
+            match report {
+                Report::Event(event) => self.vt_event(event),
+                Report::State(state) => self.terminal_state(state),
+            }
+        }
+    }
+
+    /// Wait until the terminal has parsed the output read so far, and take
+    /// what that produced.
+    fn settle_terminal(&mut self) {
+        self.terminal.sync();
+        self.collect_terminal();
+    }
+
+    /// Whether the program floods: its output has come without a pause of
+    /// `FLOOD_PAUSE` for `FLOOD_AFTER`, and still does. Interactive output
+    /// (an echo, a prompt, an editor's repaint) comes in bursts shorter
+    /// than that, with pauses between them. A wait with output ready (for
+    /// the daemon to let more through, say) is no pause.
+    fn flooding(&self) -> bool {
+        match (self.run_since, self.last_output) {
+            (Some(since), Some(last)) => {
+                last.saturating_duration_since(since) >= FLOOD_AFTER && last.elapsed() < FLOOD_PAUSE
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the PTY is read: its output was not all read, neither the
+    /// daemon nor the terminal has too much of it waiting, and the daemon
+    /// lets more through (`credit`).
+    fn reading(&self) -> bool {
+        !self.eof && !self.paused && !self.parsing && self.master.is_some() && self.credit() > 0
+    }
+
+    /// The time the daemon let nothing more through does not count as a
+    /// pause of the program's output (see `flooding`): a flood held back
+    /// for a slow client goes on as one once the client takes more.
+    fn follow_pace(&mut self) {
+        let held = self.credit() == 0;
+        match self.held_since {
+            None if held => self.held_since = Some(Instant::now()),
+            Some(since) if !held => {
+                self.held_since = None;
+                let held_for = since.elapsed();
+                for at in [&mut self.run_since, &mut self.last_output]
+                    .into_iter()
+                    .flatten()
+                {
+                    *at += held_for;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How much more of the program's output the daemon lets through
+    /// (`link::Pace`): while the session's clients take their output
+    /// slowly, what the fastest of them can take.
+    fn credit(&self) -> usize {
+        self.limit.map_or(usize::MAX, |limit| {
+            usize::try_from(limit.saturating_sub(self.offset)).unwrap_or(usize::MAX)
+        })
+    }
+
+    /// The holder's priority, and its terminal thread's.
+    fn interactive(&self, on: bool) {
+        priority::interactive(on);
+        self.terminal.set_interactive(on);
+    }
+
+    /// Info not sent yet goes before a reply to a request, so the daemon
+    /// knows the state of the terminal the reply was taken from.
+    fn send_info(&mut self) {
+        if !self.info.is_empty() && self.link.is_some() {
+            let info = std::mem::take(&mut self.info);
+            self.send(link::encode(kind::INFO, &info, &[]));
+        }
+    }
+
     /// Whether the alternate screen shows, the kitty keyboard flags and
     /// application cursor keys: the daemon is told when they change.
-    fn check_terminal_state(&mut self) {
-        let Some(now) = screen::terminal_state(&self.terminal) else {
-            return;
-        };
+    fn terminal_state(&mut self, now: screen::TerminalState) {
         if self.state.alternate_screen != now.alternate_screen {
             self.state.alternate_screen = now.alternate_screen;
             self.info.alternate_screen = Some(now.alternate_screen);
@@ -910,19 +1159,6 @@ impl Holder {
         if self.state.application_cursor_keys != now.application_cursor_keys {
             self.state.application_cursor_keys = now.application_cursor_keys;
             self.info.application_cursor_keys = Some(now.application_cursor_keys);
-        }
-    }
-
-    /// Output for the terminal: its replies wait for the program, and what
-    /// it reports is taken as it comes.
-    fn feed_terminal(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let replies = self.terminal.feed(bytes);
-        self.queue_replies(&replies);
-        for event in self.terminal.take_events() {
-            self.vt_event(event);
         }
     }
 
@@ -952,6 +1188,7 @@ impl Holder {
         if let Some(link) = &mut self.link {
             if link.output.is_empty() {
                 link.output_offset = offset;
+                link.output_since = Some(Instant::now());
             }
             link.output.extend_from_slice(data);
             if link.output.len() >= OUTPUT_BATCH {
@@ -1009,7 +1246,14 @@ impl Holder {
         {
             return false;
         }
-        let replies = match self.terminal.resize(cols, rows) {
+        // Where the output read so far ends, as the program's own terminal
+        // is resized after it.
+        let resized = self
+            .terminal
+            .call(move |terminal| terminal.resize(cols, rows));
+        // The replies to that output go first.
+        self.collect_terminal();
+        let replies = match resized {
             Ok(replies) => replies,
             Err(error) => {
                 log(format_args!(
@@ -1035,50 +1279,31 @@ impl Holder {
         true
     }
 
-    /// The terminal as a renderer stream: the whole of it, limited to `max`
-    /// bytes (oldest history dropped), or its screens without history; and
-    /// the kind of snapshot that is (see `link::SnapshotRequest`).
-    fn snapshot(&self, request: &link::SnapshotRequest) -> Result<(String, Vec<u8>)> {
-        let mut kind = request.kind.clone();
-        if kind == "resized" {
-            // A full-screen program repaints when its terminal is resized:
-            // only where the new size took effect is needed, and the reply
-            // says that is here. So it may, only while nothing was output
-            // since the resize: a copy that followed the output at the old
-            // size would have taken the program's repaint for the new one
-            // (or whatever else came meanwhile) at the wrong size.
-            if self.resized_at == Some(self.offset) && self.terminal.cursor()?.alternate {
-                return Ok(("size".into(), Vec::new()));
-            }
-            kind = "refresh".into();
-        }
-        let raw = match kind.as_str() {
-            "full" => self.terminal.snapshot()?,
-            "limited" => self
-                .terminal
-                .snapshot_limited(request.max.unwrap_or(MAX_SNAPSHOT_BYTES))?,
-            "refresh" => {
-                let raw = self.terminal.refresh()?;
-                if raw.len() > MAX_SNAPSHOT_BYTES {
-                    bail!(
-                        "the screen needs a {}-byte refresh; the limit is {MAX_SNAPSHOT_BYTES} bytes",
-                        raw.len()
-                    );
-                }
-                raw
-            }
-            other => bail!("unknown snapshot kind {other:?}"),
-        };
-        let display = DisplayStream::default().feed(&raw).display;
-        if display.len() > link::MAX_FRAME - 64 * 1024 {
-            bail!("the snapshot exceeds the link's frame limit");
-        }
-        Ok((kind, display))
+    /// The terminal as a renderer stream, exactly as the output up to
+    /// `self.offset` left it (see `snapshot`). What the terminal reported
+    /// of that output is taken first, and goes before the reply.
+    fn take_snapshot(&mut self, request: &link::SnapshotRequest) -> Result<(String, Vec<u8>)> {
+        let kind = request.kind.clone();
+        let max = request.max;
+        let resized = self.resized_at == Some(self.offset);
+        let snapshot = self
+            .terminal
+            .call(move |terminal| snapshot(terminal, kind, max, resized));
+        self.collect_terminal();
+        self.send_info();
+        snapshot
     }
 
-    /// The screen as text (see `screen::read`).
-    fn screen(&self, request: &link::ScreenRequest) -> Result<screen::ScreenText> {
-        screen::read(&self.terminal, request.scrollback, request.max_lines)
+    /// The screen as text (see `screen::read`), exactly as the output up to
+    /// `self.offset` left it.
+    fn screen(&mut self, request: &link::ScreenRequest) -> Result<screen::ScreenText> {
+        let (scrollback, max_lines) = (request.scrollback, request.max_lines);
+        let screen = self
+            .terminal
+            .call(move |terminal| screen::read(terminal, scrollback, max_lines));
+        self.collect_terminal();
+        self.send_info();
+        screen
     }
 
     /// Serve one frame from the daemon; whether that took work (a
@@ -1098,6 +1323,15 @@ impl Holder {
                 if self.eof {
                     self.send_acks(vec![(meta.lease, frame.data.len() as u64)]);
                 } else {
+                    // Replies to the queries in the output read before
+                    // this input go to the program before it, as they
+                    // would if the holder parsed the output itself: the
+                    // terminal first parses what it has not yet. (A query
+                    // the display stream knows the host answers is handed
+                    // to it at once, see `read_output`, so this is quick.)
+                    if !self.terminal.settled() {
+                        self.settle_terminal();
+                    }
                     self.pending_input.push(meta.lease, true, true, &frame.data);
                 }
             }
@@ -1127,7 +1361,7 @@ impl Holder {
                 let Ok(request) = frame.meta::<link::SnapshotRequest>() else {
                     return false;
                 };
-                let (kind, bytes, error) = match self.snapshot(&request) {
+                let (kind, bytes, error) = match self.take_snapshot(&request) {
                     Ok((kind, bytes)) => (kind, bytes, None),
                     Err(error) => (request.kind.clone(), Vec::new(), Some(format!("{error:#}"))),
                 };
@@ -1191,7 +1425,12 @@ impl Holder {
             kind::REMOVE => self.removed = true,
             kind::ATTENDED => {
                 if let Ok(attended) = frame.meta::<link::Attended>() {
-                    priority::interactive(attended.attached);
+                    self.interactive(attended.attached);
+                }
+            }
+            kind::PACE => {
+                if let Ok(pace) = frame.meta::<link::Pace>() {
+                    self.limit = pace.limit;
                 }
             }
             kind::REFUSED => self.refused(frame.meta().unwrap_or(link::Refused {
@@ -1250,16 +1489,32 @@ impl Holder {
             let info = std::mem::take(&mut self.info);
             self.send(link::encode(kind::INFO, &info, &[]));
         }
+        // Output goes as soon as the link has room; until then it gathers.
+        // It also gathers, up to `GATHER_BYTES`, while the program's output
+        // keeps coming (the pass read as much as it may, so more is ready
+        // at once), and during a flood for up to `FLOOD_DELAY`: a flood
+        // travels in fewer, bigger frames, which cost the daemon and the
+        // clients less per byte. Output after a pause (an echo, a prompt,
+        // a repaint) goes at once.
+        // Nothing gathers once the daemon lets no more through.
+        let flooding = self.flooding() && self.credit() > 0;
+        let gather = self.link.as_ref().is_some_and(|link| {
+            link.output.len() < GATHER_BYTES
+                && ((self.more_output && self.reading())
+                    || (flooding
+                        && link
+                            .output_since
+                            .is_some_and(|since| since.elapsed() < FLOOD_DELAY)))
+        });
         let Some(link) = &mut self.link else {
             self.info = link::Info::default();
             return;
         };
-        // Output goes as soon as the link has room; until then it gathers.
-        if link.writer.is_empty() {
+        if link.writer.is_empty() && !gather {
             link.push_output();
         }
         let mut flushed = link.writer.flush(link.stream.as_raw_fd());
-        if flushed && link.writer.is_empty() && !link.output.is_empty() {
+        if flushed && link.writer.is_empty() && !link.output.is_empty() && !gather {
             link.push_output();
             flushed = link.writer.flush(link.stream.as_raw_fd());
         }
@@ -1319,15 +1574,16 @@ impl Holder {
     }
 
     fn finish(&mut self) {
-        // Never blocks this, the session's only thread: a leader that has
+        // Never blocks this, the session's I/O thread: a leader that has
         // not exited after all is looked at again at its next wakeup (its
         // exit sends SIGCHLD).
         let Some(status) = processes::reap(self.pid) else {
             return;
         };
-        // Bytes written before exit are part of the transcript.
+        // Bytes written before exit are part of the transcript, however far
+        // the daemon lets the output be read.
         if !self.eof {
-            self.read_output();
+            self.read_output(false);
         }
         self.termination = None;
         self.eof = true;
@@ -1341,11 +1597,11 @@ impl Holder {
         self.state.exit_signal = status.signal;
         self.sample_foreground();
         self.foreground_due = None;
-        // The last changes, then the exit, after the last output.
-        if !self.info.is_empty() && self.link.is_some() {
-            let info = std::mem::take(&mut self.info);
-            self.send(link::encode(kind::INFO, &info, &[]));
-        }
+        // The last changes, then the exit, after the last output and what
+        // the terminal made of it.
+        self.terminal.sync();
+        self.collect_terminal();
+        self.send_info();
         if self.link.is_some() {
             self.send(link::encode(
                 kind::EXITED,
@@ -1403,21 +1659,48 @@ impl Holder {
         for due in [self.redial_at, self.foreground_due].into_iter().flatten() {
             wait = wait.min(due.saturating_duration_since(now));
         }
+        // Output held for the terminal is handed over by `MAX_HOLD`.
+        if let Some(left) = self.terminal.hold_left() {
+            wait = wait.min(left);
+        }
+        // Output gathering during a flood goes by `FLOOD_DELAY` (output
+        // that waits for the link to drain goes when it does).
+        let gathering = self
+            .link
+            .as_ref()
+            .filter(|link| link.writer.is_empty() && self.flooding() && self.credit() > 0)
+            .and_then(|link| link.output_since);
+        if let Some(since) = gathering {
+            wait = wait.min(FLOOD_DELAY.saturating_sub(since.elapsed()));
+        }
         wait
     }
 
     fn run(mut self) {
         loop {
+            // What the terminal made of the output so far: its replies go
+            // to the program below.
+            self.collect_terminal();
+            self.follow_pace();
+            // Each read, and the exit check, only when the last poll found
+            // something for it (every one after a pass without a poll):
+            // under a flood a pass is a few reads, so a read that finds
+            // nothing costs as much as one that finds output.
+            let ready = std::mem::replace(&mut self.ready, Ready::ALL);
             // Output first, and out before any request is served, so that
             // request work (a snapshot, the screen as text) never delays it.
-            if !self.eof && !self.paused {
-                self.eof = !self.read_output();
+            if self.reading() && (ready.master || self.more_output) {
+                self.eof = !self.read_output(true);
                 self.flush_link();
             }
-            self.pump_link();
+            if ready.link || self.link.as_ref().is_some_and(|link| link.backlog) {
+                self.pump_link();
+            }
             // Input the daemon just sent goes to the program at once.
             self.write_input();
-            if self.state.running {
+            // A child's exit wakes the holder (`child_exits`); a kill in
+            // progress looks at the session's members every pass.
+            if self.state.running && (ready.child || self.termination.is_some()) {
                 self.check_exit();
             }
             self.check_foreground();
@@ -1457,13 +1740,25 @@ impl Holder {
     }
 
     fn wait(&mut self) {
+        // Output held for the terminal waits for more to join it (see
+        // `next_wait`) for at most `terminal_thread::MAX_HOLD`: during a
+        // flood the terminal takes it a chunk at a time, woken once per
+        // chunk rather than per pass.
+        self.poll(self.next_wait());
+        if self.terminal.has_pending() && self.terminal.due() {
+            self.parsing = !self.terminal.flush();
+        }
+    }
+
+    /// Wait up to `wait` for something to do, and note what is ready.
+    fn poll(&mut self, wait: Duration) {
         let master = if self.eof || self.master.is_none() {
             -1
         } else {
             self.master_fd()
         };
         let mut master_events = 0;
-        if !self.paused {
+        if !self.paused && !self.parsing && self.credit() > 0 {
             master_events |= libc::POLLIN;
         }
         if self.pending_input.len > 0 {
@@ -1503,13 +1798,35 @@ impl Holder {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: self.terminal.wakeup_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let wait = self.next_wait();
         let millis = wait.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
-        unsafe {
-            libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, millis);
+        let ready = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, millis) };
+        let readable = |fd: &libc::pollfd| {
+            fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        };
+        self.ready = if ready < 0 {
+            // Interrupted (a child's exit, say): look at everything.
+            Ready::ALL
+        } else {
+            Ready {
+                // Not asked about while it was not read: tried next pass.
+                master: master_events & libc::POLLIN == 0 || readable(&poll[0]),
+                link: readable(&poll[1]),
+                child: poll[2].revents != 0,
+            }
+        };
+        if self.ready.child {
+            signals::drain(&self.child_exits);
         }
-        signals::drain(&self.child_exits);
+        if poll[4].revents != 0 {
+            // Taken at the top of the loop.
+            signals::drain(self.terminal.wakeups());
+        }
         if poll[3].revents != 0 {
             // Watch afresh: the directory may have been replaced. Whatever
             // changed before the new watch, the dial below finds.

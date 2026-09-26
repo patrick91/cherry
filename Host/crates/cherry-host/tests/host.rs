@@ -6,8 +6,12 @@ use cherry_vt::Terminal;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::net::UnixStream,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -288,9 +292,10 @@ fn a_lone_windows_drag_changes_the_grid_at_every_step() {
 #[test]
 fn a_lagging_client_is_resynchronized_instead_of_disconnected() {
     let host = Host::new();
-    // About 6 MiB without pauses: far more than one client may have queued.
+    // About 12 MiB without pauses: far more than one client may have
+    // waiting for it (see `flood`).
     let session = host.create(shell(
-        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=96 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf 'LIVE:%s\\r\\n' \"$line\"; exec sleep 60",
+        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=192 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf 'LIVE:%s\\r\\n' \"$line\"; exec sleep 60",
     ));
     let (mut stalled, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut stalled_screen = Screen::new(80, 24, offset, &snapshot);
@@ -320,6 +325,662 @@ fn a_lagging_client_is_resynchronized_instead_of_disconnected() {
     let info = host.session(&session.id);
     assert_eq!(info.pid, session.pid);
     assert!(info.attached);
+}
+
+/// What one attachment received while it read `socket` until `done` said
+/// so: its output, in order, and the reasons of its replacements.
+struct Received {
+    output: Vec<u8>,
+    replacements: Vec<AttachReason>,
+}
+
+/// Read an attachment's frames, pausing `pause` after each, until the
+/// output holds `until`.
+fn read_until(socket: &mut UnixStream, mut offset: u64, until: &[u8], pause: Duration) -> Received {
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut received = Received {
+        output: Vec::new(),
+        replacements: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = false;
+    while !seen {
+        assert!(Instant::now() < deadline, "timed out waiting for {until:?}");
+        match receive(socket) {
+            ServerMessage::Output { offset: at, data } => {
+                assert_eq!(at, offset, "output out of order");
+                offset += data.len() as u64;
+                // Where it may end, only: the output is long.
+                let from = received.output.len().saturating_sub(until.len());
+                received.output.extend_from_slice(&data);
+                seen = received.output[from..]
+                    .windows(until.len())
+                    .any(|window| window == until);
+            }
+            ServerMessage::Attached {
+                offset: at, reason, ..
+            } => {
+                offset = at;
+                received.replacements.push(reason);
+            }
+            _ => {}
+        }
+        if !pause.is_zero() {
+            thread::sleep(pause);
+        }
+    }
+    received
+}
+
+/// A flood of `mib` MiB of `x`, then `FLOOD_COMPLETE`, the last of its
+/// output, once the session reads a line; the program then creates `done`
+/// and waits. A client that reads none of it falls behind only past what
+/// its socket holds (the daemon asks for a 1 MiB send buffer, which Linux
+/// doubles and a write may overshoot by half again), its 4 MiB output
+/// budget and the frame its writer is writing: 12 MiB is well past that
+/// everywhere.
+fn flood(mib: usize, done: &std::path::Path) -> Vec<String> {
+    shell(&format!(
+        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count={} 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s' COMPLETE; : > '{}'; exec sleep 60",
+        mib * 16,
+        done.display()
+    ))
+}
+
+#[test]
+fn a_flood_travels_in_big_frames_and_an_echo_after_it_at_once() {
+    let host = Host::new();
+    let session = host.create(shell(
+        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=128 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; while IFS= read -r line; do printf 'ECHO:%s\\r\\n' \"$line\"; done",
+    ));
+    let (mut socket, _, offset, _) = host.attach(&session.id, 80, 24);
+    input(&mut socket, b"start\n");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut offset = offset;
+    let (mut bytes, mut frames) = (0usize, 0usize);
+    let mut tail = Vec::new();
+    while !tail.windows(14).any(|window| window == b"FLOOD_COMPLETE") {
+        if let ServerMessage::Output { offset: at, data } = receive(&mut socket) {
+            assert_eq!(at, offset);
+            offset += data.len() as u64;
+            bytes += data.len();
+            frames += 1;
+            tail.extend_from_slice(&data);
+            tail.drain(..tail.len().saturating_sub(64));
+        }
+    }
+    // 8 MiB: in frames far bigger than a PTY read (1 KiB on macOS).
+    assert!(bytes >= 8 * 1024 * 1024);
+    assert!(
+        bytes / frames >= 8 * 1024,
+        "{frames} frames for {bytes} bytes"
+    );
+    // Output after the flood is not held back.
+    let sent = Instant::now();
+    input(&mut socket, b"typed\n");
+    let mut echoed = Vec::new();
+    while !echoed.windows(10).any(|window| window == b"ECHO:typed") {
+        if let ServerMessage::Output { data, .. } = receive(&mut socket) {
+            echoed.extend_from_slice(&data);
+        }
+    }
+    assert!(
+        sent.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        sent.elapsed()
+    );
+}
+
+#[test]
+fn a_slow_client_gets_all_of_a_flood_at_its_own_pace() {
+    // It never takes no output for the stall: it is held to, not dropped.
+    let host = Host::new();
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(10, &done));
+    let (mut slow, _, offset, _) = host.attach(&session.id, 80, 24);
+    input(&mut slow, b"start\n");
+    // Far slower than the program: the flood waits for this client.
+    let received = read_until(
+        &mut slow,
+        offset,
+        b"FLOOD_COMPLETE",
+        Duration::from_millis(2),
+    );
+    assert!(
+        received.replacements.is_empty(),
+        "resynchronized: {:?}",
+        received.replacements
+    );
+    let floods = received.output.iter().filter(|&&b| b == b'x').count();
+    assert_eq!(floods, 10 * 1024 * 1024, "every byte of the flood arrived");
+    assert!(done.exists());
+}
+
+#[test]
+fn a_client_that_pauses_holds_the_program_back_with_bounded_buffers() {
+    let host = Host::new();
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(32, &done));
+    let (mut slow, _, mut offset, _) = host.attach(&session.id, 80, 24);
+    input(&mut slow, b"start\n");
+    slow.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    // A little of the flood, then a pause shorter than the stall.
+    let mut taken = 0;
+    while taken < 2 * 1024 * 1024 {
+        match receive(&mut slow) {
+            ServerMessage::Output { offset: at, data } => {
+                assert_eq!(at, offset);
+                offset += data.len() as u64;
+                taken += data.iter().filter(|&&b| b == b'x').count();
+            }
+            ServerMessage::Attached { reason, .. } => panic!("replaced: {reason:?}"),
+            _ => {}
+        }
+    }
+    thread::sleep(Duration::from_millis(1200));
+    // What the program wrote meanwhile waits in bounded buffers (the
+    // client's socket and queue, the daemon's and the holder's link, the
+    // PTY): nowhere near the 30 MiB left of the flood.
+    assert!(!done.exists(), "the program was not held back");
+    let received = read_until(&mut slow, offset, b"FLOOD_COMPLETE", Duration::ZERO);
+    assert!(
+        received.replacements.is_empty(),
+        "resynchronized: {:?}",
+        received.replacements
+    );
+    let floods = received.output.iter().filter(|&&b| b == b'x').count();
+    assert_eq!(taken + floods, 32 * 1024 * 1024);
+}
+
+#[test]
+fn a_client_that_takes_nothing_holds_the_program_back_only_until_its_stall_ends() {
+    let stall = Duration::from_millis(1000);
+    let host = Host::with_env(&[("CHERRY_HOST_STALL_TIMEOUT_MS", "1000")]);
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(12, &done));
+    let (mut stuck, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    input(&mut stuck, b"start\n");
+    // Nothing reads the attachment, the only one: it holds the program back
+    // (a flood of this size is over in well under a second otherwise)...
+    let started = Instant::now();
+    thread::sleep(stall / 2);
+    assert!(!done.exists(), "the program was not held back");
+    // ...until its stall ends; then the program goes on.
+    while !done.exists() {
+        assert!(
+            started.elapsed() < stall + Duration::from_secs(5),
+            "the program is still held back"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Once it reads, it catches up through a fresh snapshot.
+    stuck
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    screen.wait_text(&mut stuck, "FLOOD_COMPLETE");
+    assert!(
+        screen.attached.contains(&AttachReason::Resync),
+        "{:?}",
+        screen.attached
+    );
+}
+
+#[test]
+fn only_clients_that_take_their_output_hold_the_program_back() {
+    let host = Host::with_env(&[("CHERRY_HOST_STALL_TIMEOUT_MS", "300")]);
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(12, &done));
+    let (mut stuck, _, stuck_offset, stuck_snapshot) = host.attach(&session.id, 80, 24);
+    let (mut slow, _, offset, _) = host.attach(&session.id, 80, 24);
+    input(&mut slow, b"start\n");
+    // The slow client gets every byte; the one that takes nothing does not
+    // hold it (or the program) back.
+    let received = read_until(
+        &mut slow,
+        offset,
+        b"FLOOD_COMPLETE",
+        Duration::from_millis(1),
+    );
+    assert!(
+        received.replacements.is_empty(),
+        "resynchronized: {:?}",
+        received.replacements
+    );
+    let floods = received.output.iter().filter(|&&b| b == b'x').count();
+    assert_eq!(floods, 12 * 1024 * 1024);
+    let mut screen = Screen::new(80, 24, stuck_offset, &stuck_snapshot);
+    stuck
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    screen.wait_text(&mut stuck, "FLOOD_COMPLETE");
+    assert!(
+        screen.attached.contains(&AttachReason::Resync),
+        "{:?}",
+        screen.attached
+    );
+}
+
+/// Read `socket` as a client that takes `rate` bytes a second, in reads of
+/// a few KiB, until `stop` is set; returns how much it read.
+fn read_slowly(
+    mut socket: UnixStream,
+    rate: usize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<usize> {
+    thread::spawn(move || {
+        use std::io::Read;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let started = Instant::now();
+        let mut total = 0;
+        let mut bytes = [0u8; 16 * 1024];
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let allowed = (rate as f64 * started.elapsed().as_secs_f64()) as usize;
+            let want = allowed.saturating_sub(total).min(bytes.len());
+            if want < 4096 {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            match socket.read(&mut bytes[..want]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => {}
+            }
+        }
+        total
+    })
+}
+
+#[test]
+fn a_slow_client_that_holds_a_flood_back_keeps_nobody_else_waiting() {
+    // A client that takes its output slowly holds the program back; what
+    // the session's other clients ask for meanwhile (the screen, an attach,
+    // a detach) is answered at once all the same, not behind the output
+    // held back for it.
+    let host = Host::new();
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(64, &done));
+    let (mut slow, _, _, _) = host.attach(&session.id, 80, 24);
+    input(&mut slow, b"start\n");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = read_slowly(slow, 200 * 1024, stop.clone());
+    // By now the program is held back for it.
+    thread::sleep(Duration::from_millis(1500));
+    let quick = |what: &str, started: Instant| {
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "{what} took {took:?}");
+    };
+    let started = Instant::now();
+    let screen = host.call(ClientMessage::Screen {
+        id: session.id.clone(),
+        scrollback: false,
+        max_lines: None,
+    });
+    assert!(
+        matches!(screen, ServerMessage::ScreenText { .. }),
+        "{screen:?}"
+    );
+    quick("the screen", started);
+    let started = Instant::now();
+    let (mut other, ..) = host.attach(&session.id, 80, 24);
+    quick("an attach", started);
+    let started = Instant::now();
+    send(&mut other, &ClientMessage::Detach);
+    other
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    while !matches!(receive(&mut other), ServerMessage::Ok) {}
+    quick("a detach", started);
+    // All the while the program was held back.
+    assert!(!done.exists(), "the program was not held back");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let read = reader.join().unwrap();
+    assert!(read > 200 * 1024, "the slow client took only {read} bytes");
+}
+
+/// A client's end of an attachment whose terminal takes at most `rate`
+/// bytes a second (0: as fast as they come), in reads of at most 16 KiB.
+struct Throttled {
+    socket: UnixStream,
+    rate: Arc<AtomicUsize>,
+    started: Instant,
+    taken: usize,
+}
+
+impl Read for Throttled {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let want = loop {
+            let rate = self.rate.load(Ordering::SeqCst);
+            if rate == 0 {
+                break buffer.len();
+            }
+            let allowed = (rate as f64 * self.started.elapsed().as_secs_f64()) as usize;
+            let want = allowed
+                .saturating_sub(self.taken)
+                .min(buffer.len())
+                .min(16 * 1024);
+            if want >= buffer.len().min(4096) {
+                break want;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        let read = self.socket.read(&mut buffer[..want])?;
+        self.taken += read;
+        Ok(read)
+    }
+}
+
+/// Follow an attachment's screen on a thread, taking its output at `rate`
+/// (see `Throttled`), until the screen shows `until`. `offset` tells how far
+/// it got; the thread returns the screen, and when output arrived.
+fn follow_slowly(
+    socket: UnixStream,
+    rate: Arc<AtomicUsize>,
+    mut screen: Screen,
+    until: &'static str,
+    offset: Arc<AtomicU64>,
+) -> thread::JoinHandle<(Screen, Vec<Instant>)> {
+    thread::spawn(move || {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut client = Throttled {
+            socket,
+            rate,
+            started: Instant::now(),
+            taken: 0,
+        };
+        let mut arrivals = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !screen.text().contains(until) {
+            assert!(Instant::now() < deadline, "timed out waiting for {until:?}");
+            let message = read_frame::<_, ServerMessage>(&mut client)
+                .unwrap()
+                .expect("the attachment ended");
+            screen.apply(&message);
+            if matches!(message, ServerMessage::Output { .. }) {
+                arrivals.push(Instant::now());
+            }
+            offset.store(screen.offset, Ordering::SeqCst);
+        }
+        (screen, arrivals)
+    })
+}
+
+/// The longest wait between `arrivals`, and from the last to `to`.
+fn longest_gap(arrivals: impl IntoIterator<Item = Instant>, to: Instant) -> Duration {
+    let mut arrivals = arrivals.into_iter();
+    let Some(mut last) = arrivals.next() else {
+        return Duration::MAX;
+    };
+    let mut longest = Duration::ZERO;
+    for at in arrivals.chain([to]) {
+        longest = longest.max(at.saturating_duration_since(last));
+        last = at;
+    }
+    longest
+}
+
+#[test]
+fn a_slow_client_does_not_hold_back_a_faster_one() {
+    // The program goes at the pace of its fastest client: a slower one falls
+    // behind, lags, and catches up through resyncs, ending on the final
+    // screen all the same.
+    let host = Host::new();
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(48, &done));
+    let (slow, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let slow = follow_slowly(
+        slow,
+        Arc::new(AtomicUsize::new(1024 * 1024)),
+        Screen::new(80, 24, offset, &snapshot),
+        "FLOOD_COMPLETE",
+        Arc::default(),
+    );
+    let (mut fast, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    let started = Instant::now();
+    input(&mut fast, b"start\n");
+    fast.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    screen.wait_text(&mut fast, "FLOOD_COMPLETE");
+    // At the slow client's pace it would have taken 48 seconds.
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(20), "the flood took {took:?}");
+    // The fast client got every byte of it.
+    assert!(screen.attached.is_empty(), "{:?}", screen.attached);
+    assert!(screen.offset - offset > 48 * 1024 * 1024);
+    let (slow, _) = slow.join().unwrap();
+    assert!(
+        slow.attached.contains(&AttachReason::Resync),
+        "{:?}",
+        slow.attached
+    );
+    assert_eq!(slow.offset, screen.offset);
+    assert_eq!(slow.text(), screen.text());
+    assert!(done.exists());
+}
+
+#[test]
+fn a_client_that_takes_nothing_holds_back_nobody_while_another_takes_its_output() {
+    // With the stall it has (2 seconds), it does not hold the program back
+    // at all: the client that takes its output gets it without a pause.
+    let host = Host::new();
+    let done = host.sandbox.home.join("flooded");
+    let session = host.create(flood(24, &done));
+    let (mut stuck, _, stuck_offset, stuck_snapshot) = host.attach(&session.id, 80, 24);
+    let (mut fast, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    input(&mut fast, b"start\n");
+    fast.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut arrivals = Vec::new();
+    while !screen.text().contains("FLOOD_COMPLETE") {
+        if let ServerMessage::Output { .. } = screen.receive(&mut fast) {
+            arrivals.push(Instant::now());
+        }
+    }
+    let longest = longest_gap(arrivals, Instant::now());
+    assert!(
+        longest < Duration::from_secs(1),
+        "the client that takes its output waited {longest:?} for it"
+    );
+    assert!(screen.attached.is_empty(), "{:?}", screen.attached);
+    assert!(screen.offset - offset > 24 * 1024 * 1024);
+    // The other catches up through a resync once it reads.
+    let mut stuck_screen = Screen::new(80, 24, stuck_offset, &stuck_snapshot);
+    stuck
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stuck_screen.wait_text(&mut stuck, "FLOOD_COMPLETE");
+    assert!(
+        stuck_screen.attached.contains(&AttachReason::Resync),
+        "{:?}",
+        stuck_screen.attached
+    );
+    assert_eq!(stuck_screen.offset, screen.offset);
+    assert_eq!(stuck_screen.text(), screen.text());
+}
+
+/// 200000 numbered lines of 80 bytes, once the session reads a line, then
+/// `FLOOD_COMPLETE`, the last of its output: the screen tells how far the
+/// program got (see `watch_program`).
+const NUMBERED_FLOOD: &str = "stty -echo; IFS= read -r start; awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"%09d %069d\\n\", i, 0 }'; printf 'FLOOD_%s' COMPLETE; exec sleep 60";
+
+/// Watch how far the program of `id` (`NUMBERED_FLOOD`) gets for `span`:
+/// the longest it went without a new line, and the first and last line it
+/// had written.
+fn watch_program(host: &Host, id: &str, span: Duration) -> (Duration, u64, u64) {
+    let line = || match host.call(ClientMessage::Screen {
+        id: id.into(),
+        scrollback: false,
+        max_lines: None,
+    }) {
+        ServerMessage::ScreenText { text, .. } => text
+            .lines()
+            .rev()
+            .find_map(|line| line.get(..9)?.parse::<u64>().ok())
+            .unwrap_or(0),
+        other => panic!("{other:?}"),
+    };
+    let started = Instant::now();
+    let first = line();
+    let (mut last, mut since, mut stopped) = (first, started, Duration::ZERO);
+    while started.elapsed() < span {
+        thread::sleep(Duration::from_millis(50));
+        let now = line();
+        if now != last {
+            (last, since) = (now, Instant::now());
+        }
+        stopped = stopped.max(since.elapsed());
+    }
+    (stopped, first, last)
+}
+
+/// A fast client and a slow one on a session of `NUMBERED_FLOOD`: the slow
+/// one takes its output at `rate` on a thread (see `follow_slowly`), and
+/// the fast one takes it until the slow one is `behind` bytes behind.
+struct Race {
+    fast: UnixStream,
+    fast_offset: u64,
+    slow: thread::JoinHandle<(Screen, Vec<Instant>)>,
+    rate: Arc<AtomicUsize>,
+}
+
+fn race(host: &Host, id: &str, rate: usize, behind: u64) -> Race {
+    let (slow, _, offset, snapshot) = host.attach(id, 80, 24);
+    let rate = Arc::new(AtomicUsize::new(rate));
+    let slow_offset = Arc::new(AtomicU64::new(offset));
+    let slow = follow_slowly(
+        slow,
+        rate.clone(),
+        Screen::new(80, 24, offset, &snapshot),
+        "FLOOD_COMPLETE",
+        slow_offset.clone(),
+    );
+    let (mut fast, _, mut offset, _) = host.attach(id, 80, 24);
+    input(&mut fast, b"start\n");
+    fast.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    while offset < slow_offset.load(Ordering::SeqCst) + behind {
+        match receive(&mut fast) {
+            ServerMessage::Output { offset: at, data } => {
+                assert_eq!(at, offset);
+                offset += data.len() as u64;
+            }
+            ServerMessage::Attached { reason, .. } => panic!("replaced: {reason:?}"),
+            _ => {}
+        }
+    }
+    Race {
+        fast,
+        fast_offset: offset,
+        slow,
+        rate,
+    }
+}
+
+/// The slow client of a `race` (`slow`, at `rate`) takes the rest of the
+/// flood as fast as it comes: every byte arrives, without a resync, and
+/// without a pause since `from`. Its screen.
+fn finish_race(
+    slow: thread::JoinHandle<(Screen, Vec<Instant>)>,
+    rate: &AtomicUsize,
+    from: Instant,
+) -> Screen {
+    rate.store(0, Ordering::SeqCst);
+    let (slow, arrivals) = slow.join().unwrap();
+    assert!(slow.attached.is_empty(), "{:?}", slow.attached);
+    assert!(slow.text().contains("000199999"), "{}", slow.text());
+    let since = arrivals.into_iter().filter(|&at| at >= from);
+    let longest = longest_gap(since, Instant::now());
+    assert!(
+        longest < Duration::from_secs(1),
+        "the slow client waited {longest:?} for output"
+    );
+    slow
+}
+
+#[test]
+fn a_client_that_becomes_the_fastest_takes_over_pacing_at_once() {
+    // A fast client and one that takes its output at 512 KiB/s: the program
+    // goes at the fast one's pace, and the slow one falls behind (3.5 MiB,
+    // well within its budget: it does not lag). Once the fast one detaches,
+    // the program goes on at once at the slow one's pace, rather than stop
+    // until it took what waits for it; it gets every byte all the same.
+    let host = Host::new();
+    let session = host.create(shell(NUMBERED_FLOOD));
+    let Race {
+        mut fast,
+        slow,
+        rate,
+        ..
+    } = race(&host, &session.id, 512 * 1024, 3584 * 1024);
+    send(&mut fast, &ClientMessage::Detach);
+    while !matches!(receive(&mut fast), ServerMessage::Ok) {}
+    let takeover = Instant::now();
+    let (stopped, first, last) = watch_program(&host, &session.id, Duration::from_secs(3));
+    assert!(
+        stopped < Duration::from_secs(1),
+        "the program stopped for {stopped:?} (lines {first} to {last})"
+    );
+    // At half its pace at least (while it catches up), and not beyond what
+    // it takes.
+    assert!(last - first > 3000, "lines {first} to {last}");
+    assert!(last < 150_000, "the program was not held back: line {last}");
+    finish_race(slow, &rate, takeover);
+}
+
+/// A fast client stops reading while the slow one, 2 MiB behind, reads on
+/// at `rate`: the program goes on at the slow one's pace once the fast one
+/// took nothing for a while (`outbox::IDLE_AFTER`), not only once its stall
+/// (2 seconds) ends. The fast one lags meanwhile, and catches up through a
+/// resync.
+fn a_client_stops_taking_its_output(rate: usize) {
+    let host = Host::new();
+    let session = host.create(shell(NUMBERED_FLOOD));
+    let Race {
+        mut fast,
+        fast_offset,
+        slow,
+        rate,
+    } = race(&host, &session.id, rate, 2048 * 1024);
+    let stopped_reading = Instant::now();
+    let (stopped, first, last) = watch_program(&host, &session.id, Duration::from_secs(3));
+    assert!(
+        stopped < Duration::from_millis(1000),
+        "the program stopped for {stopped:?} (lines {first} to {last})"
+    );
+    assert!(last < 150_000, "the program was not held back: line {last}");
+    let slow = finish_race(slow, &rate, stopped_reading);
+    let mut screen = Screen::new(80, 24, fast_offset, &[]);
+    screen.wait_text(&mut fast, "FLOOD_COMPLETE");
+    assert!(
+        screen.attached.contains(&AttachReason::Resync),
+        "{:?}",
+        screen.attached
+    );
+    assert_eq!(screen.offset, slow.offset);
+    assert_eq!(screen.text(), slow.text());
+}
+
+#[test]
+fn a_client_that_stops_taking_its_output_holds_back_nobody_while_another_takes_it() {
+    a_client_stops_taking_its_output(1024 * 1024);
+}
+
+#[test]
+fn a_client_that_stops_taking_its_output_holds_back_nobody_while_a_slow_one_takes_it() {
+    // Over a link as slow as 100 KiB/s: by the time the fast one's stall
+    // would end, the slow one took little more than 200 KiB.
+    a_client_stops_taking_its_output(100 * 1024);
 }
 
 /// Many lines where every cell has its own true colour: a large snapshot.
@@ -1429,10 +2090,19 @@ fn a_client_whose_input_is_held_hears_whether_the_program_consumes_it() {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         let started = Instant::now();
-        let mut pongs = 0;
+        let (mut pongs, mut settled_pongs) = (0, 0);
         while started.elapsed() < Duration::from_secs(3) {
             match read_frame::<_, ServerMessage>(&mut socket) {
-                Ok(Some(ServerMessage::Pong)) => pongs += 1,
+                Ok(Some(ServerMessage::Pong)) => {
+                    pongs += 1;
+                    // The PTY's own buffer may still take the first bytes
+                    // of the paste in its first moments, which the host
+                    // cannot tell from the program reading them: once it
+                    // is full, only the program makes progress.
+                    if started.elapsed() > Duration::from_secs(1) {
+                        settled_pongs += 1;
+                    }
+                }
                 Ok(Some(message)) => screen.apply(&message),
                 Ok(None) => panic!("the host closed the connection"),
                 Err(_) => {}
@@ -1441,7 +2111,7 @@ fn a_client_whose_input_is_held_hears_whether_the_program_consumes_it() {
         if reads {
             assert!(pongs >= 2, "{pongs} Pongs");
         } else {
-            assert_eq!(pongs, 0);
+            assert_eq!(settled_pongs, 0, "{pongs} Pongs");
         }
         assert!(host.session(&session.id).attached);
         host.kill(&session.id);

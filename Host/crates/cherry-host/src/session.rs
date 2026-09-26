@@ -11,15 +11,15 @@ use crate::{
     environment,
     holder::LINK_FD,
     link::{self, kind, Frame},
-    outbox::{Outbox, Output, Push},
+    outbox::{Outbox, Output, Pacing, Push, PACE_STEP},
     paths, screen,
     signals::{self, Wake},
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, priority, valid_size, AttachReason, ForegroundProcess, ProgressState,
-    ServerMessage, SessionEvent, SessionInfo, SessionState, MAX_SCREEN_TEXT_BYTES,
-    MAX_SNAPSHOT_BYTES,
+    encode_attached_frame, encode_frame, error_code, priority, valid_size, AttachReason,
+    ForegroundProcess, ProgressState, ServerMessage, SessionEvent, SessionInfo, SessionState,
+    MAX_SCREEN_TEXT_BYTES, MAX_SNAPSHOT_BYTES,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -50,6 +50,14 @@ const RESYNC_RETRY: Duration = Duration::from_secs(1);
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bytes taken from the holder link per pass, so commands keep a turn.
 const LINK_READ: usize = 4 * 1024 * 1024;
+/// While a client the program goes at the pace of took nothing for a while
+/// (see `outbox::IDLE_AFTER`), whether another client took output since is
+/// looked at this often: their writers do not wake the worker for all they
+/// take (see `Worker::next_wait`).
+const IDLE_RECHECK: Duration = Duration::from_millis(50);
+/// Output frames from the holder merge into client frames of at most this
+/// much output (see `Worker::pump_link`).
+const MERGED_OUTPUT: usize = 256 * 1024;
 /// How long a removed session's holder gets to take its last frame.
 const REMOVE_FLUSH: Duration = Duration::from_secs(1);
 /// Callers sharing one screen request, at most: beyond them the holder is
@@ -137,6 +145,11 @@ pub enum Command {
         lease: u64,
         cols: u16,
         rows: u16,
+    },
+    /// The attachment asks for a replacement of the grid
+    /// (`ClientMessage::Refresh`).
+    Refresh {
+        lease: u64,
     },
     /// A voluntary detach. It follows the lease's earlier input through the
     /// command queue and the holder link, and that input is still
@@ -407,6 +420,93 @@ fn progress_state(state: &str) -> Option<ProgressState> {
     })
 }
 
+/// A client's part in pacing the session's program (see `Worker::pace`).
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    lease: u64,
+    pacing: Pacing,
+}
+
+/// Whose pace the session's program goes at (see `Worker::pace`).
+#[derive(PartialEq, Eq, Debug)]
+enum Leader {
+    /// Nobody's: a client keeps up (the one named, if any), or none takes
+    /// its output.
+    Free(Option<u64>),
+    /// This client's, which can take `room` more now, and holds the program
+    /// back until `until` at most if it takes nothing more, and from `idle`
+    /// only until another client takes output (see `Pacing::Slow`).
+    Slow {
+        lease: u64,
+        room: usize,
+        until: Instant,
+        idle: Instant,
+    },
+}
+
+/// How the session's clients pace its program, given how each does (see
+/// `Outbox::pacing`) and when each last took anything: one that takes its
+/// output slowly and has taken none of it for a while (from its `idle`) paces
+/// nothing once another client took anything since its last progress. A
+/// stalled client holds the program back only while no other client makes
+/// progress (and then until its stall ends at most).
+fn stalled_out(clients: &[(Pacing, Option<Instant>)], now: Instant) -> Vec<Pacing> {
+    clients
+        .iter()
+        .enumerate()
+        .map(|(index, &(pacing, _))| match pacing {
+            Pacing::Slow { since, idle, .. }
+                if now >= idle
+                    && clients.iter().enumerate().any(|(other, &(_, took_at))| {
+                        other != index && took_at.is_some_and(|at| at > since)
+                    }) =>
+            {
+                Pacing::Out
+            }
+            pacing => pacing,
+        })
+        .collect()
+}
+
+/// The client the program goes at the pace of: none while one keeps up
+/// (`current`, the last one, if it still does), and otherwise, of those that
+/// take their output slowly, the one that can take the most more now. Of
+/// several that can take as much (nothing, say), the one that is furthest
+/// along the program's output (the least of it waits for it), then
+/// `current`.
+fn leader(candidates: &[Candidate], current: Option<u64>) -> Leader {
+    if let Some(keeps_up) = candidates
+        .iter()
+        .filter(|candidate| candidate.pacing == Pacing::KeepsUp)
+        .min_by_key(|candidate| Some(candidate.lease) != current)
+    {
+        return Leader::Free(Some(keeps_up.lease));
+    }
+    candidates
+        .iter()
+        .filter_map(|candidate| match candidate.pacing {
+            Pacing::Slow {
+                room,
+                until,
+                waiting,
+                idle,
+                ..
+            } => Some((candidate.lease, room, until, waiting, idle)),
+            Pacing::KeepsUp | Pacing::Out => None,
+        })
+        .max_by_key(|&(lease, room, _, waiting, _)| {
+            (room, std::cmp::Reverse(waiting), Some(lease) == current)
+        })
+        .map_or(Leader::Free(None), |(lease, room, until, _, idle)| {
+            Leader::Slow {
+                lease,
+                room,
+                until,
+                idle,
+            }
+        })
+}
+
 /// A client event for a holder's `Event`.
 fn session_event(id: &str, event: link::Event) -> Option<SessionEvent> {
     let id = id.to_string();
@@ -583,6 +683,10 @@ impl Session {
             removed: false,
             removed_ack: None,
             attended: false,
+            pace: None,
+            pacer: None,
+            pace_until: None,
+            pace_idle: None,
         };
         let exited = exit.is_some();
         let events = events
@@ -675,16 +779,8 @@ fn attached_frame(
     Ok(Replacement::new(session, offset, snapshot, reason)?.frame)
 }
 
-fn output_frame(offset: u64, data: Vec<u8>) -> Result<Output> {
-    let message = ServerMessage::Output { offset, data };
-    let frame = Arc::new(encode_frame(&message)?);
-    let ServerMessage::Output { data, .. } = message else {
-        unreachable!()
-    };
-    Ok(Output {
-        frame,
-        data: Arc::new(data),
-    })
+fn output_frame(offset: u64, data: &[u8]) -> Result<Output> {
+    Ok(Output::new(offset, data)?)
 }
 
 /// A resync `Attached` frame, with what it was made from.
@@ -703,19 +799,10 @@ impl Replacement {
         snapshot: Vec<u8>,
         reason: AttachReason,
     ) -> Result<Self> {
-        let message = ServerMessage::Attached {
-            session,
-            offset,
-            snapshot,
-            reason,
-        };
-        let frame = Arc::new(encode_frame(&message)?);
-        let ServerMessage::Attached {
-            session, snapshot, ..
-        } = message
-        else {
-            unreachable!()
-        };
+        // Every host of this version answers `Refresh`.
+        let frame = Arc::new(encode_attached_frame(
+            &session, offset, reason, true, &snapshot,
+        )?);
         Ok(Self {
             session,
             offset,
@@ -752,7 +839,7 @@ impl Replacement {
             self.snapshot.clone(),
             self.reason,
         )?;
-        Ok((attached.frame, output_frame(start, carried)?))
+        Ok((attached.frame, output_frame(start, &carried)?))
     }
 }
 
@@ -805,10 +892,16 @@ impl PendingAttach {
 enum Request {
     Attach(PendingAttach),
     /// Replacements for a new grid size (`full` or the screens only), for
-    /// these attachments.
+    /// these attachments. `resized`: asked for as `resized` (see
+    /// `request_screens`), so that it may be answered with where the size
+    /// took effect alone (`ServerMessage::Resized`), which answers no
+    /// `Refresh`: those that came meanwhile (`refreshes`) are served once
+    /// it is.
     Replace {
         full: bool,
         leases: Vec<u64>,
+        resized: bool,
+        refreshes: Vec<u64>,
     },
     /// Resync snapshots for lagging attachments.
     Resync {
@@ -878,6 +971,19 @@ struct Worker {
     removed_ack: Option<SyncSender<()>>,
     /// What the holder was last told (`link::Attended`).
     attended: bool,
+    /// How far the holder was last told it may read the program's output
+    /// (`link::Pace`); None: freely.
+    pace: Option<u64>,
+    /// The client the program last went at the pace of (see `pace`): one
+    /// that keeps up, or the fastest of those that take their output
+    /// slowly.
+    pacer: Option<u64>,
+    /// Until when the pacer holds the program back at most if it takes
+    /// nothing more.
+    pace_until: Option<Instant>,
+    /// From when the pacer counts as taking nothing, should another client
+    /// take output (see `stalled_out`), while the session has others.
+    pace_idle: Option<Instant>,
 }
 
 impl Worker {
@@ -1066,6 +1172,8 @@ impl Worker {
                 Request::Replace {
                     full: true,
                     leases: full,
+                    resized: false,
+                    refreshes: Vec::new(),
                 },
             );
         }
@@ -1101,6 +1209,8 @@ impl Worker {
             Request::Replace {
                 full: false,
                 leases,
+                resized: kind == "resized",
+                refreshes: Vec::new(),
             },
         );
     }
@@ -1366,7 +1476,7 @@ impl Worker {
         if self.attached.is_empty() || data.is_empty() {
             return;
         }
-        let Ok(output) = output_frame(offset, data) else {
+        let Ok(output) = output_frame(offset, &data) else {
             return;
         };
         let mut gone = false;
@@ -1495,6 +1605,50 @@ impl Worker {
                 }
                 // Otherwise the grid follows this window, and the client
                 // waits for it on what it shows.
+            }
+            Command::Refresh { lease } => {
+                // Like the replacement for a window that came to match the
+                // grid (see `send_resized`): the screens only, unless it
+                // renders a viewport and now matches the grid. A lagging
+                // attachment gets its resync instead, and one that is gone,
+                // or a session that exited, nothing. One already on its way
+                // answers it too, unless it may turn out to carry no screens
+                // (`Request::Replace::resized`): then it is asked for once
+                // that one is answered.
+                if !self.running()
+                    || !self
+                        .attached
+                        .iter()
+                        .any(|a| a.lease == lease && !a.cancelled.load(Ordering::SeqCst))
+                {
+                    return;
+                }
+                let mut waits_for = None;
+                for request in self.requests.values_mut() {
+                    if let Request::Replace {
+                        leases,
+                        resized,
+                        refreshes,
+                        ..
+                    } = request
+                    {
+                        if !leases.contains(&lease) {
+                            continue;
+                        }
+                        if !*resized {
+                            return;
+                        }
+                        waits_for = Some(refreshes);
+                    }
+                }
+                match waits_for {
+                    Some(refreshes) => {
+                        if !refreshes.contains(&lease) {
+                            refreshes.push(lease);
+                        }
+                    }
+                    None => self.send_resized(|a| a.lease == lease, false),
+                }
             }
             Command::Detach { lease, ack } => {
                 if let Some(index) = self.attached.iter().position(|a| a.lease == lease) {
@@ -1885,6 +2039,11 @@ impl Worker {
         outbox.set_waker(self.wake.clone());
         // Its writer serves a renderer from now on.
         outbox.set_interactive(true);
+        // A client that attaches alone takes over from nobody: whoever the
+        // program last went at the pace of left before it came.
+        if self.attached.is_empty() {
+            self.pacer = None;
+        }
         outbox.push_control(own);
         self.attached.push(Attachment {
             lease,
@@ -1938,10 +2097,16 @@ impl Worker {
                     }
                 }
             }
-            Request::Replace { leases, .. } if reply.kind == "size" && snapshot.is_ok() => {
+            Request::Replace {
+                leases, refreshes, ..
+            } if reply.kind == "size" && snapshot.is_ok() => {
                 self.resized(&leases, reply.offset, size);
+                // Those that asked for the screens meanwhile get them now.
+                if !refreshes.is_empty() && self.running() {
+                    self.send_resized(|attachment| refreshes.contains(&attachment.lease), false);
+                }
             }
-            Request::Replace { full, leases } => {
+            Request::Replace { full, leases, .. } => {
                 let mut session = self.info().clone();
                 session.cols = size.0;
                 session.rows = size.1;
@@ -2152,24 +2317,139 @@ impl Worker {
         }
     }
 
-    /// Take what the holder sent.
+    /// Hold the program back to the pace of the fastest client that takes
+    /// its output (see `leader`), as a slow terminal holds back the
+    /// program in a native one: the holder (of link version 6 or later)
+    /// reads the program's output only as far as that client can take more
+    /// (see `Outbox::pacing`: about `HOLD_HIGH_WATER` waits for it), so a
+    /// flood reaches it whole, at its pace, and the host's memory stays
+    /// bounded. While any client keeps up, nothing is held back. The
+    /// session's slower clients fall behind, and once more than their
+    /// budget waits for them they lag and are resynchronized; one that
+    /// takes nothing holds nothing back once its stall ends, or, while
+    /// another client takes output, once it took none for a while (see
+    /// `stalled_out`). The limit moves on as the pacing client takes its
+    /// output, in steps of `PACE_STEP` at least (its writer wakes this
+    /// worker for them), so the program, and the session's other clients,
+    /// get the output evenly at its pace. A client that takes over from
+    /// another (which left, or stalled) keeps the output that waits for it
+    /// waiting (`Outbox::lead`): the program goes on at its pace at once,
+    /// rather than stop until it took all of that. The link itself is
+    /// always read: replies, and what the other clients ask for, never wait
+    /// behind output held back. An older holder is never held back: a slow
+    /// client of its session lags and is resynchronized instead.
+    fn pace(&mut self) {
+        let paces = self
+            .link
+            .as_ref()
+            .is_some_and(|link| link.version >= link::PACE_VERSION);
+        if !paces || !self.running() {
+            return;
+        }
+        let stall = daemon::config().stall_timeout;
+        let clients: Vec<(Pacing, Option<Instant>)> = self
+            .attached
+            .iter()
+            .map(|attachment| attachment.outbox.pacing(stall))
+            .collect();
+        let candidates: Vec<Candidate> = self
+            .attached
+            .iter()
+            .zip(stalled_out(&clients, Instant::now()))
+            .map(|(attachment, pacing)| Candidate {
+                lease: attachment.lease,
+                pacing,
+            })
+            .collect();
+        let limit = match leader(&candidates, self.pacer) {
+            Leader::Free(pacer) => {
+                self.pacer = pacer;
+                self.pace_until = None;
+                self.pace_idle = None;
+                None
+            }
+            Leader::Slow {
+                lease,
+                room,
+                until,
+                idle,
+            } => {
+                // It takes over from another client: what waits for it goes
+                // on waiting, and the program goes on as it takes output.
+                // (That leaves its room as it is.)
+                if self.pacer.is_some_and(|pacer| pacer != lease) {
+                    if let Some(attachment) = self.attached.iter().find(|a| a.lease == lease) {
+                        attachment.outbox.lead();
+                    }
+                }
+                self.pacer = Some(lease);
+                self.pace_until = Some(until);
+                self.pace_idle = (self.attached.len() > 1).then_some(idle);
+                Some(self.offset + room as u64)
+            }
+        };
+        let due = match (self.pace, limit) {
+            (Some(told), Some(limit)) => told.abs_diff(limit) >= PACE_STEP as u64,
+            (told, limit) => told != limit,
+        };
+        if due && self.tell(link::encode(kind::PACE, &link::Pace { limit }, &[])) {
+            self.pace = limit;
+        }
+    }
+
+    /// Take what the holder sent. Output frames that arrived together
+    /// (the holder outran this worker, or the worker waited) go to the
+    /// clients as one, up to `MERGED_OUTPUT`: fewer, bigger frames cost
+    /// less per byte here and in every client.
     fn pump_link(&mut self) {
         let Some(link) = &mut self.link else {
             return;
         };
         let open = link.reader.fill(link.stream.as_raw_fd(), LINK_READ);
+        let mut merged: Option<(u64, Vec<u8>)> = None;
         loop {
             let Some(link) = &mut self.link else {
                 return;
             };
             match link.reader.next() {
-                Ok(Some(frame)) => self.on_frame(frame),
+                Ok(Some(frame)) if frame.kind == kind::OUTPUT => {
+                    let Ok(meta) = frame.meta::<link::OutputMeta>() else {
+                        continue;
+                    };
+                    match &mut merged {
+                        Some((offset, data))
+                            if offset.checked_add(data.len() as u64) == Some(meta.offset)
+                                && data.len() + frame.data.len() <= MERGED_OUTPUT =>
+                        {
+                            data.extend_from_slice(&frame.data);
+                        }
+                        _ => {
+                            if let Some((offset, data)) = merged.replace((meta.offset, frame.data))
+                            {
+                                self.emit_output(offset, data);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(frame)) => {
+                    // In order: the output before it goes first.
+                    if let Some((offset, data)) = merged.take() {
+                        self.emit_output(offset, data);
+                    }
+                    self.on_frame(frame);
+                }
                 Ok(None) => break,
                 Err(error) => {
+                    if let Some((offset, data)) = merged.take() {
+                        self.emit_output(offset, data);
+                    }
                     daemon::log(format_args!("session {}: {error:#}", self.id));
                     return self.lost();
                 }
             }
+        }
+        if let Some((offset, data)) = merged.take() {
+            self.emit_output(offset, data);
         }
         if !open {
             self.lost();
@@ -2192,6 +2472,10 @@ impl Worker {
             return;
         }
         self.linked.store(false, Ordering::SeqCst);
+        self.pace = None;
+        self.pacer = None;
+        self.pace_until = None;
+        self.pace_idle = None;
         // Nothing sent to it will be acknowledged now.
         self.input.release(std::mem::take(&mut self.unacknowledged));
         if self.removed {
@@ -2278,6 +2562,17 @@ impl Worker {
         if let Some((due, _)) = self.grid_due {
             wait = wait.min(due.saturating_duration_since(now));
         }
+        // A client that holds the program back and takes nothing more stops
+        // holding it back once its stall ends (see `pace`).
+        if let Some(until) = self.pace.and(self.pace_until) {
+            wait = wait.min(until.saturating_duration_since(now));
+        }
+        // Nor, once it took nothing for a while, while another client takes
+        // output: look again every `IDLE_RECHECK` from then on.
+        if let Some(idle) = self.pace.and(self.pace_idle) {
+            let at = if idle > now { idle } else { now + IDLE_RECHECK };
+            wait = wait.min(at.saturating_duration_since(now));
+        }
         for attachment in &self.attached {
             if let Some(after) = attachment.resync_after {
                 wait = wait.min(after.saturating_duration_since(now));
@@ -2325,6 +2620,7 @@ impl Worker {
             // Output may have left a client lagging with nothing queued.
             self.resync_lagging();
             self.apply_due_grid();
+            self.pace();
             self.flush_link();
             let wait = if handled == 64 {
                 Duration::ZERO
@@ -2412,5 +2708,126 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn at(seconds: u64) -> Instant {
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_secs(seconds)
+    }
+
+    /// How a client that takes its output slowly paces the program: `room`
+    /// and `waiting` as named, and its stall clock from `lease` seconds.
+    fn slowly(lease: u64, room: usize, waiting: usize) -> Pacing {
+        Pacing::Slow {
+            room,
+            until: at(lease + 10),
+            waiting,
+            since: at(lease),
+            idle: at(lease + 1),
+        }
+    }
+
+    fn slow(lease: u64, room: usize, waiting: usize) -> Candidate {
+        other(lease, slowly(lease, room, waiting))
+    }
+
+    fn paced(lease: u64, room: usize) -> Leader {
+        Leader::Slow {
+            lease,
+            room,
+            until: at(lease + 10),
+            idle: at(lease + 1),
+        }
+    }
+
+    fn other(lease: u64, pacing: Pacing) -> Candidate {
+        Candidate { lease, pacing }
+    }
+
+    #[test]
+    fn the_program_goes_at_the_pace_of_the_fastest_client_that_takes_its_output() {
+        const KIB: usize = 1024;
+        // One client: its pace, whatever it is.
+        assert_eq!(leader(&[slow(1, 0, 900 * KIB)], None), paced(1, 0));
+        assert_eq!(
+            leader(&[slow(1, 40 * KIB, 600 * KIB)], Some(1)),
+            paced(1, 40 * KIB)
+        );
+        assert_eq!(
+            leader(&[other(1, Pacing::KeepsUp)], None),
+            Leader::Free(Some(1))
+        );
+        assert_eq!(
+            leader(&[other(1, Pacing::Out)], Some(1)),
+            Leader::Free(None)
+        );
+        assert_eq!(leader(&[], None), Leader::Free(None));
+        // A client that keeps up holds nothing back, however slow the
+        // others; the last one of several goes on counting as the pacer.
+        let fast = other(1, Pacing::KeepsUp);
+        assert_eq!(
+            leader(&[slow(2, 0, 3000 * KIB), fast], Some(2)),
+            Leader::Free(Some(1))
+        );
+        assert_eq!(
+            leader(&[fast, other(3, Pacing::KeepsUp)], Some(3)),
+            Leader::Free(Some(3))
+        );
+        // Of clients that take their output slowly, the one that can take
+        // the most more; a slower one falls behind (and lags beyond its
+        // budget), and one that takes nothing (`Out`) paces nothing.
+        let others = [
+            slow(1, 0, 3000 * KIB),
+            slow(2, 64 * KIB, 700 * KIB),
+            other(3, Pacing::Out),
+        ];
+        assert_eq!(leader(&others, Some(1)), paced(2, 64 * KIB));
+        // None can take more now: the one furthest along (the least waits
+        // for it) is waited for, then the last pacer.
+        let held = [slow(1, 0, 3000 * KIB), slow(2, 0, 700 * KIB)];
+        assert_eq!(leader(&held, Some(1)), paced(2, 0));
+        let even = [slow(1, 0, 700 * KIB), slow(2, 0, 700 * KIB)];
+        assert_eq!(leader(&even, Some(1)), paced(1, 0));
+        assert_eq!(leader(&even, Some(2)), paced(2, 0));
+    }
+
+    #[test]
+    fn a_client_that_takes_nothing_paces_nothing_while_another_takes_output() {
+        const KIB: usize = 1024;
+        // It last took output at second 1, and counts as taking nothing
+        // from second 2 (its `idle`) until its stall ends (second 11).
+        let stuck = slowly(1, 0, 600 * KIB);
+        let clients = [
+            (stuck, Some(at(1))),
+            (Pacing::Out, Some(at(1) + Duration::from_millis(900))),
+        ];
+        // Until then it paces the program, whatever the others took...
+        assert_eq!(
+            stalled_out(&clients, at(1) + Duration::from_millis(999)),
+            [stuck, Pacing::Out]
+        );
+        // ...and from then on nothing, once another client (a lagging one
+        // too) took anything since its last progress.
+        assert_eq!(stalled_out(&clients, at(2)), [Pacing::Out, Pacing::Out]);
+        let slower = slowly(3, 0, 2000 * KIB);
+        assert_eq!(
+            stalled_out(&[(stuck, None), (slower, Some(at(3)))], at(5)),
+            [Pacing::Out, slower]
+        );
+        // While no other did, it holds the program back until its stall
+        // ends; of two that took nothing for a while, the one that took
+        // output last does.
+        let clients = [(stuck, None), (Pacing::KeepsUp, Some(at(1)))];
+        assert_eq!(stalled_out(&clients, at(5)), [stuck, Pacing::KeepsUp]);
+        let earlier = slowly(0, 0, 0);
+        let clients = [(stuck, Some(at(1))), (earlier, Some(at(0)))];
+        assert_eq!(stalled_out(&clients, at(5)), [stuck, Pacing::Out]);
+        assert_eq!(stalled_out(&[(stuck, Some(at(1)))], at(5)), [stuck]);
+        // So another client paces the program, though it can take less, and
+        // it took less; with no other, nobody does.
+        let candidates = [other(1, Pacing::Out), slow(3, 0, 2000 * KIB)];
+        assert_eq!(leader(&candidates, Some(1)), paced(3, 0));
+        let candidates = [other(1, Pacing::Out), other(2, Pacing::Out)];
+        assert_eq!(leader(&candidates, Some(1)), Leader::Free(None));
     }
 }

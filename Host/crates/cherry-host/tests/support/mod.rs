@@ -393,6 +393,7 @@ impl Host {
                 session,
                 offset,
                 snapshot,
+                ..
             } => {
                 assert_eq!(reason, AttachReason::Attach);
                 (socket, session, offset, snapshot)
@@ -759,6 +760,7 @@ impl Screen {
                 session,
                 offset,
                 snapshot,
+                ..
             } => {
                 let mut replacement = Self::new(session.cols, session.rows, *offset, snapshot);
                 replacement.attached = std::mem::take(&mut self.attached);
@@ -922,8 +924,9 @@ pub mod link {
     pub const UPDATE: u8 = 73;
     pub const REFUSED: u8 = 74;
     pub const ATTENDED: u8 = 75;
+    pub const PACE: u8 = 76;
     /// What this build's daemon and holders speak.
-    pub const VERSION: u16 = 5;
+    pub const VERSION: u16 = 6;
 
     #[derive(Debug)]
     pub struct Frame {

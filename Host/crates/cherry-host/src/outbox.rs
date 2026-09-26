@@ -1,9 +1,17 @@
 //! A connection's outgoing frames. The session worker never blocks on a slow
-//! client: when a client's queued output exceeds its budget, that output is
-//! dropped and the client is marked lagging. Once its writer has drained the
-//! queue, the worker sends it a fresh snapshot (`Attached{reason: Resync}`),
-//! which supersedes everything else it had queued. Only a failed write, which
-//! means the peer is gone, ends the attachment.
+//! client. A client that takes its output slowly but takes it can hold the
+//! session's program back instead (`Outbox::pacing`): once more than
+//! `HOLD_HIGH_WATER` of output waits for it (what its writer took and has
+//! not written counts), until no more than `HOLD_LOW_WATER` does, it can
+//! take only so much more now. The worker lets the program's output through
+//! as fast as the fastest of the session's clients takes it (see
+//! `session::Worker::pace`): not at all while one keeps up. The others fall
+//! behind, and so does one that takes nothing for a while: when a client's
+//! queued output exceeds its budget, that output is dropped and the client
+//! is marked lagging. Once its writer has drained the queue, the worker
+//! sends it a fresh snapshot (`Attached{reason: Resync}`), which supersedes
+//! everything else it had queued. Only a failed write, which means the peer
+//! is gone, ends the attachment.
 //!
 //! Output also carries bytes that no snapshot rebuilds because they are not
 //! screen state: clipboard writes, titles, the working directory, cursor and
@@ -48,7 +56,10 @@
 //! follows it. Events never hold back the session workers that publish
 //! them, nor count against the replies' bound.
 use crate::{signals::Wake, stream::MAX_CLIPBOARD};
-use cherry_protocol::{encode_frame, priority, ServerMessage, SessionEvent, SessionInfo};
+use cherry_protocol::{
+    encode_frame, encode_output_frame, output_frame_parts, priority, ServerMessage, SessionEvent,
+    SessionInfo, OUTPUT_HEADER,
+};
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
@@ -57,11 +68,52 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Queued output beyond this marks the client as lagging.
 pub const OUTPUT_BUDGET: usize = 4 * 1024 * 1024;
+/// Queued output frames merge up to this much output (see
+/// `State::merge_output`).
+pub const MERGED_OUTPUT: usize = 256 * 1024;
+/// While more than this much output waits for a client that takes some,
+/// it can hold the session's program back (`Outbox::pacing`), until no more
+/// than the low mark does. Its socket holds `priority::SOCKET_BUFFER_BYTES`
+/// more.
+pub const HOLD_HIGH_WATER: usize = 512 * 1024;
+pub const HOLD_LOW_WATER: usize = 128 * 1024;
+/// Output that reached the client after it began to hold the session back
+/// (the program's output already on its way) may wait for it too, up to
+/// this much more: the session then goes on at the client's pace from
+/// there, rather than stop until the client took it (see
+/// `Outbox::pacing`).
+pub const HOLD_SLACK: usize = 256 * 1024;
+/// The most output that waits for a client the session's program goes at
+/// the pace of, normally (see `Outbox::pacing`).
+pub const PACE_WINDOW: usize = HOLD_HIGH_WATER + HOLD_SLACK;
+/// A client that takes over pacing the program from another one (see
+/// `Outbox::lead`) may keep this much output waiting at most: less than
+/// `OUTPUT_BUDGET` by more than what may be on its way to it already.
+pub const LEAD_LIMIT: usize = OUTPUT_BUDGET - 1024 * 1024;
+/// While it may hold the session back, the session's worker is woken once
+/// the client took at least this much more and takes no more for now (its
+/// writer waits for its socket; see `session::Worker::pace`): the program
+/// gets the output in steps this small at a slow client's pace, and in the
+/// bursts it takes at a faster one.
+pub const PACE_STEP: usize = 8 * 1024;
+/// While its writer goes on writing, the worker is woken at least every this
+/// much it wrote.
+const PACE_BURST: usize = 256 * 1024;
+/// A client that takes its output slowly counts as taking none of it once
+/// it took none for this long, or for `IDLE_GAPS` times the longest it
+/// recently went without taking any while output waited for it, if that is
+/// longer (a slow reader takes its output in steps: `cherry attach` reads
+/// 16 KiB at a time as its terminal takes it). It then paces the program no
+/// more while another client takes output (see `Pacing::Slow`).
+pub const IDLE_AFTER: Duration = Duration::from_millis(250);
+const IDLE_GAPS: u32 = 3;
+/// How long the longest waits of a client are remembered (see `Gaps`).
+const GAP_WINDOW: Duration = Duration::from_secs(1);
 /// Carried tokens other than clipboard writes are kept up to this many
 /// bytes, the latest ones.
 pub const CARRY_LIMIT: usize = 1024 * 1024;
@@ -80,6 +132,9 @@ pub const REPLY_LOW_WATER: usize = 16 * 1024 * 1024;
 /// Frames are written in pieces of this size, so progress is visible while
 /// a large snapshot reaches a slow client.
 const WRITE_CHUNK: usize = 64 * 1024;
+/// The writer tries again this often while its socket is full (see
+/// `Outbox::wait_writable`).
+const WRITABLE_RECHECK: Duration = Duration::from_millis(10);
 const CLIPBOARD: &[u8] = b"\x1b]52;";
 /// A subscriber with more events than this queued, or more bytes of them,
 /// has fallen behind (see `Outbox::push_event`).
@@ -177,10 +232,29 @@ impl Kind {
     }
 }
 
-/// An `Output` frame and the renderer bytes it carries.
+/// An `Output` frame (see `cherry_protocol::encode_output_frame`), which
+/// carries the renderer bytes as they are.
+#[derive(Clone)]
 pub struct Output {
     pub frame: Arc<Vec<u8>>,
-    pub data: Arc<Vec<u8>>,
+}
+
+impl Output {
+    pub fn new(offset: u64, data: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            frame: Arc::new(encode_output_frame(offset, data)?),
+        })
+    }
+
+    /// The renderer bytes.
+    pub fn data(&self) -> &[u8] {
+        output_data(&self.frame)
+    }
+}
+
+/// The renderer bytes of an `Output` frame.
+fn output_data(frame: &[u8]) -> &[u8] {
+    frame.get(OUTPUT_HEADER..).unwrap_or_default()
 }
 
 struct Item {
@@ -189,8 +263,9 @@ struct Item {
     /// at once (the rest shares the frame, uncopied).
     start: usize,
     kind: Kind,
-    /// Output's renderer bytes, scanned for live-only tokens if dropped.
-    data: Option<Arc<Vec<u8>>>,
+    /// An `Output` frame (or its rest), whose renderer bytes are scanned
+    /// for live-only tokens if it is dropped.
+    output: bool,
     /// A `Latest` event's key, and which of its key's events it is.
     key: Option<EventKey>,
     seq: u64,
@@ -201,6 +276,57 @@ impl Item {
     fn bytes(&self) -> &[u8] {
         &self.frame[self.start..]
     }
+
+    /// The rest of an `Output` frame written in part.
+    fn output_rest(&self) -> bool {
+        self.kind == Kind::Rest && self.output
+    }
+
+    /// Whether it counts as output waiting for the client
+    /// (`State::waiting`): an `Output` frame, or the rest of one.
+    fn waiting_output(&self) -> bool {
+        self.kind == Kind::Output || self.output_rest()
+    }
+}
+
+/// The longest a client went without taking anything while output waited
+/// for it, in the `GAP_WINDOW` its latest wait fell in and the one before.
+#[derive(Default)]
+struct Gaps {
+    /// When the current window began.
+    window: Option<Instant>,
+    current: Duration,
+    previous: Duration,
+}
+
+impl Gaps {
+    /// It took output at `now`, after waiting `gap`.
+    fn note(&mut self, gap: Duration, now: Instant) {
+        let elapsed = now.saturating_duration_since(*self.window.get_or_insert(now));
+        if elapsed >= GAP_WINDOW {
+            self.previous = if elapsed < 2 * GAP_WINDOW {
+                self.current
+            } else {
+                Duration::ZERO
+            };
+            self.current = Duration::ZERO;
+            self.window = Some(now);
+        }
+        self.current = self.current.max(gap);
+    }
+
+    /// The longest wait up to `at` (its last progress): in the window it
+    /// fell in and the one before.
+    fn longest(&self, at: Instant) -> Duration {
+        let Some(window) = self.window else {
+            return Duration::ZERO;
+        };
+        match at.saturating_duration_since(window) {
+            elapsed if elapsed < GAP_WINDOW => self.current.max(self.previous),
+            elapsed if elapsed < 2 * GAP_WINDOW => self.current,
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -208,7 +334,16 @@ struct State {
     items: VecDeque<Item>,
     /// Bytes queued, events aside.
     bytes: usize,
+    /// Bytes of `Output` frames queued: the output budget's.
     output_bytes: usize,
+    /// Bytes of the rest of `Output` frames written in part, queued.
+    rest_bytes: usize,
+    /// Bytes of output the writer took from the queue and has not written
+    /// yet: output waits for the client until it is written.
+    writing_output: usize,
+    /// Bytes the peer took since the session's worker was last woken for
+    /// them (see `PACE_STEP`).
+    paced: usize,
     /// Events queued, and their bytes.
     events: usize,
     event_bytes: usize,
@@ -224,6 +359,24 @@ struct State {
     query_bytes: usize,
     /// Bytes written to the peer so far.
     written: u64,
+    /// Since when the peer has taken nothing while output waited: the
+    /// last write, or when output started to wait.
+    progress_at: Option<Instant>,
+    /// When the peer last took anything.
+    took_at: Option<Instant>,
+    /// How long it recently went without taking anything while output
+    /// waited for it.
+    gaps: Gaps,
+    /// More than `HOLD_HIGH_WATER` of output waits, and not yet no more
+    /// than `HOLD_LOW_WATER` again: the session may hold its output back
+    /// for this client while it takes some (see `Outbox::pacing`).
+    holding: bool,
+    /// How much output may wait for the client while it holds the session
+    /// back: the most that waited since it began to, from
+    /// `HOLD_HIGH_WATER` up to `PACE_WINDOW`, or more for a while after it
+    /// took over pacing the session from another client (see
+    /// `Outbox::lead`).
+    hold_limit: usize,
     lagging: bool,
     closed: bool,
     dead: bool,
@@ -240,9 +393,12 @@ impl State {
     fn fail(&mut self) {
         self.dead = true;
         self.writing = false;
+        self.holding = false;
         self.items.clear();
         self.bytes = 0;
         self.output_bytes = 0;
+        self.rest_bytes = 0;
+        self.writing_output = 0;
         self.carry = Carry::default();
         self.held.clear();
         self.query_bytes = 0;
@@ -256,7 +412,14 @@ impl State {
         self.bytes - self.output_bytes
     }
 
-    fn push(&mut self, frame: Arc<Vec<u8>>, kind: Kind, data: Option<Arc<Vec<u8>>>) {
+    /// Output that waits for the client: queued, or taken by the writer and
+    /// not written yet.
+    fn waiting(&self) -> usize {
+        self.output_bytes + self.rest_bytes + self.writing_output
+    }
+
+    fn push(&mut self, frame: Arc<Vec<u8>>, kind: Kind, output: bool) {
+        self.waiting_from_now();
         self.bytes += frame.len();
         if kind == Kind::Output {
             self.output_bytes += frame.len();
@@ -265,7 +428,7 @@ impl State {
             frame,
             start: 0,
             kind,
-            data,
+            output,
             key: None,
             seq: 0,
         });
@@ -288,7 +451,7 @@ impl State {
             frame,
             start: 0,
             kind,
-            data: None,
+            output: false,
             key,
             seq,
         });
@@ -316,11 +479,12 @@ impl State {
     fn drop_where(&mut self, stale: impl Fn(Kind) -> bool) {
         let mut bytes = 0;
         let mut output_bytes = 0;
+        let mut rest_bytes = 0;
         let carry = &mut self.carry;
         self.items.retain(|item| {
             if stale(item.kind) {
-                if let Some(data) = &item.data {
-                    carry.scan(data);
+                if item.output {
+                    carry.scan(output_data(&item.frame));
                 }
                 return false;
             }
@@ -330,10 +494,97 @@ impl State {
             if item.kind == Kind::Output {
                 output_bytes += item.frame.len();
             }
+            if item.output_rest() {
+                rest_bytes += item.bytes().len();
+            }
             true
         });
         self.bytes = bytes;
         self.output_bytes = output_bytes;
+        self.rest_bytes = rest_bytes;
+        self.release_hold();
+    }
+
+    /// Output starts to wait for the peer now, unless some waits already:
+    /// its stall clock starts.
+    fn waiting_from_now(&mut self) {
+        if self.bytes == 0 && !self.writing {
+            self.progress_at = Some(Instant::now());
+        }
+    }
+
+    /// The peer took `bytes`.
+    fn took(&mut self, bytes: usize) {
+        self.took_by(bytes, Instant::now());
+    }
+
+    /// The peer took `bytes` at `now`.
+    fn took_by(&mut self, bytes: usize, now: Instant) {
+        self.written += bytes as u64;
+        self.progress_at = Some(now);
+        self.took_at = Some(now);
+    }
+
+    /// The writer wrote `bytes` of the item it took from the queue, which
+    /// is output when `output`. Whether the session's worker is to be woken:
+    /// the client no longer holds the session back, or, while it does, it
+    /// took `PACE_BURST` since the worker last heard.
+    fn wrote(&mut self, bytes: usize, output: bool) -> bool {
+        let now = Instant::now();
+        // Output waited for the peer since its last write, or since output
+        // started to wait.
+        if let Some(since) = self.progress_at.filter(|_| output) {
+            self.gaps.note(now.saturating_duration_since(since), now);
+        }
+        self.took_by(bytes, now);
+        if output {
+            let excess = self.waiting().saturating_sub(self.hold_limit);
+            self.writing_output = self.writing_output.saturating_sub(bytes);
+            // What a client that took over pacing lets wait beyond the
+            // window shrinks by half of what it takes (see `Outbox::lead`),
+            // once what waited beyond that (more than `LEAD_LIMIT`) is
+            // taken.
+            if self.hold_limit > PACE_WINDOW {
+                let counted = bytes.saturating_sub(excess);
+                self.hold_limit = self
+                    .hold_limit
+                    .saturating_sub(counted.div_ceil(2))
+                    .max(PACE_WINDOW);
+            }
+        }
+        if self.release_hold() {
+            return true;
+        }
+        if self.holding {
+            self.paced += bytes;
+        }
+        self.paced_at(PACE_BURST)
+    }
+
+    /// The writer waits for the client to take more: whether the session's
+    /// worker is to be woken for what it took since it last heard (at least
+    /// `PACE_STEP`, while the client holds the session back).
+    fn blocked(&mut self) -> bool {
+        self.paced_at(PACE_STEP)
+    }
+
+    fn paced_at(&mut self, step: usize) -> bool {
+        let due = self.holding && self.paced >= step;
+        if due {
+            self.paced = 0;
+        }
+        due
+    }
+
+    /// Once no more than `HOLD_LOW_WATER` of output waits, the client
+    /// holds nothing back any more; whether it just stopped.
+    fn release_hold(&mut self) -> bool {
+        let released = self.holding && self.waiting() <= HOLD_LOW_WATER;
+        if released {
+            self.holding = false;
+            self.paced = 0;
+        }
+        released
     }
 
     /// The subscriber fell behind: its queued events give way to one
@@ -379,6 +630,42 @@ impl State {
     }
 }
 
+impl State {
+    /// While output waits behind the socket, output that continues the
+    /// last output queued joins it, up to `MERGED_OUTPUT` (the renderer
+    /// gets the same bytes in fewer, bigger frames, which cost it less per
+    /// byte). Whether it did. Output nothing waits ahead of goes at once,
+    /// as it is.
+    fn merge_output(&mut self, output: &Output) -> bool {
+        let Some(last) = self.items.back_mut() else {
+            return false;
+        };
+        if last.kind != Kind::Output {
+            return false;
+        }
+        let Some((offset, data)) = output_frame_parts(&last.frame) else {
+            return false;
+        };
+        let Some((next, more)) = output_frame_parts(&output.frame) else {
+            return false;
+        };
+        if offset.checked_add(data.len() as u64) != Some(next)
+            || data.len() + more.len() > MERGED_OUTPUT
+        {
+            return false;
+        }
+        // Its own copy the first time (another client's queue may hold the
+        // same frame), then in place.
+        let frame = Arc::make_mut(&mut last.frame);
+        frame.extend_from_slice(more);
+        let length = (frame.len() - 4) as u32;
+        frame[..4].copy_from_slice(&length.to_be_bytes());
+        self.bytes += more.len();
+        self.output_bytes += more.len();
+        true
+    }
+}
+
 /// Queued items a resync snapshot supersedes: all but replies (and the
 /// rest of a frame already written in part).
 fn superseded_by_resync(kind: Kind) -> bool {
@@ -413,13 +700,14 @@ fn send_now(socket: &UnixStream, bytes: &[u8]) -> Option<usize> {
 }
 
 impl State {
-    /// Write `frame` right away when nothing is queued ahead of it and the
-    /// writer is idle; what the socket does not take is queued as the rest
-    /// of the frame, first. Returns `Some(queued)` when it was written, in
-    /// whole or in part (`queued`: its rest waits for the writer), and None
-    /// when it was not written and still has to be queued. Marks the
-    /// connection dead when the write fails.
-    fn write_now(&mut self, frame: &Arc<Vec<u8>>) -> Option<Result<bool, ()>> {
+    /// Write `frame` (an `Output` frame when `output`) right away when
+    /// nothing is queued ahead of it and the writer is idle; what the
+    /// socket does not take is queued as the rest of the frame, first.
+    /// Returns `Some(queued)` when it was written, in whole or in part
+    /// (`queued`: its rest waits for the writer), and None when it was not
+    /// written and still has to be queued. Marks the connection dead when
+    /// the write fails.
+    fn write_now(&mut self, frame: &Arc<Vec<u8>>, output: bool) -> Option<Result<bool, ()>> {
         if !self.items.is_empty() || self.writing {
             return None;
         }
@@ -430,16 +718,20 @@ impl State {
         if sent == 0 {
             return None;
         }
-        self.written += sent as u64;
+        self.took(sent);
         if sent == frame.len() {
             return Some(Ok(false));
         }
+        self.waiting_from_now();
         self.bytes += frame.len() - sent;
+        if output {
+            self.rest_bytes += frame.len() - sent;
+        }
         self.items.push_back(Item {
             frame: frame.clone(),
             start: sent,
             kind: Kind::Rest,
-            data: None,
+            output,
             key: None,
             seq: 0,
         });
@@ -635,6 +927,31 @@ fn live_key(token: &[u8]) -> Option<Option<&[u8]>> {
     }
 }
 
+/// How a client paces the session's program (see `Outbox::pacing`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pacing {
+    /// No more than `HOLD_HIGH_WATER` of output waits for it: it takes its
+    /// output as fast as the program makes it, for now.
+    KeepsUp,
+    /// It takes its output slowly, but takes it: it can take `room` more
+    /// now, and holds the program back until `until` at most if it takes
+    /// nothing more. `waiting`: the output that waits for it. It has taken
+    /// nothing since `since` (its last progress, or when output started to
+    /// wait), and from `idle` (see `IDLE_AFTER`) counts as taking nothing:
+    /// once another client took anything since `since`, it paces nothing
+    /// (see `session::Worker::pace`).
+    Slow {
+        room: usize,
+        until: Instant,
+        waiting: usize,
+        since: Instant,
+        idle: Instant,
+    },
+    /// It paces nothing: it lags, is gone or closing, or took none of its
+    /// output for the stall.
+    Out,
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum Push {
     Queued,
@@ -679,9 +996,13 @@ impl Outbox {
             revents: 0,
         };
         // Until there is room or the connection is shut down (a vanished
-        // peer is noticed by the reader, which shuts the socket down).
+        // peer is noticed by the reader, which shuts the socket down), or
+        // `WRITABLE_RECHECK`: a macOS Unix socket reports room only once
+        // its peer read nearly all it holds, though it takes more as soon
+        // as the peer reads any. Trying again sooner keeps a slow peer's
+        // socket topped up, and shows that it reads (`pacing`).
         unsafe {
-            libc::poll(&mut poll, 1, -1);
+            libc::poll(&mut poll, 1, WRITABLE_RECHECK.as_millis() as libc::c_int);
         }
         true
     }
@@ -694,14 +1015,8 @@ impl Outbox {
 
     /// Write `frame` now if nothing is ahead of it, or queue it as `kind`.
     /// False when the connection turned out to be gone.
-    fn deliver(
-        &self,
-        state: &mut State,
-        frame: Arc<Vec<u8>>,
-        kind: Kind,
-        data: Option<Arc<Vec<u8>>>,
-    ) -> bool {
-        match state.write_now(&frame) {
+    fn deliver(&self, state: &mut State, frame: Arc<Vec<u8>>, kind: Kind, output: bool) -> bool {
+        match state.write_now(&frame, kind == Kind::Output) {
             Some(Ok(queued_rest)) => {
                 if queued_rest {
                     self.ready.notify_one();
@@ -718,7 +1033,7 @@ impl Outbox {
                 false
             }
             None => {
-                state.push(frame, kind, data);
+                state.push(frame, kind, output);
                 self.ready.notify_one();
                 true
             }
@@ -733,27 +1048,111 @@ impl Outbox {
             return Push::Gone;
         }
         if state.lagging {
-            state.carry.scan(&output.data);
+            state.carry.scan(output.data());
             return Push::Lagging;
         }
         // An empty queue always accepts one frame, however large (a big
         // clipboard write must still reach a client that keeps up).
         if state.output_bytes > 0 && state.output_bytes + output.frame.len() > OUTPUT_BUDGET {
             state.lagging = true;
+            // It paces nothing any more, and once resynchronized it starts
+            // afresh: it keeps up until more than `HOLD_HIGH_WATER` waits
+            // again, with no room left over from before.
+            state.holding = false;
+            state.paced = 0;
             state.hold_queries(|kind| kind == Kind::Output);
             state.drop_where(|kind| kind == Kind::Output);
-            state.carry.scan(&output.data);
+            state.carry.scan(output.data());
             return Push::Lagging;
         }
-        if self.deliver(
-            &mut state,
-            output.frame.clone(),
-            Kind::Output,
-            Some(output.data.clone()),
-        ) {
-            Push::Queued
+        let queued = if state.merge_output(output) {
+            self.ready.notify_one();
+            true
         } else {
-            Push::Gone
+            self.deliver(&mut state, output.frame.clone(), Kind::Output, true)
+        };
+        if !queued {
+            return Push::Gone;
+        }
+        let waiting = state.waiting();
+        if waiting > HOLD_HIGH_WATER {
+            if !state.holding {
+                state.holding = true;
+                state.hold_limit = 0;
+            }
+            state.hold_limit = state.hold_limit.max(waiting.min(PACE_WINDOW));
+        }
+        Push::Queued
+    }
+
+    /// How the client paces the session's program (see
+    /// `session::Worker::pace`), and when it last took anything. While no
+    /// more than `HOLD_HIGH_WATER` of output waits for it (until no more
+    /// than `HOLD_LOW_WATER` does again once more did), it keeps up. Beyond
+    /// that it takes its output slowly: if it took some within `stall`, it
+    /// can take as much more now as it took since the most waited for it
+    /// (up to `PACE_WINDOW`), and holds the program back until `stall`
+    /// after its last progress at most if it takes nothing more (a peer
+    /// that is slow but reads gets the output at its own pace, as a
+    /// program's terminal does: the program waits, unless another client
+    /// takes it faster), or, while another client takes output, until it
+    /// took none for a while (`IDLE_AFTER`). A client that takes nothing
+    /// for `stall`, lags, or is gone or closing, paces nothing: output goes
+    /// on without it, and once more than `OUTPUT_BUDGET` waits it lags (see
+    /// `push_output`) and is resynchronized once it drains.
+    pub fn pacing(&self, stall: Duration) -> (Pacing, Option<Instant>) {
+        let state = self.lock();
+        let pacing = if state.lagging || state.dead || state.closed {
+            Pacing::Out
+        } else if !state.holding {
+            Pacing::KeepsUp
+        } else {
+            let now = Instant::now();
+            let since = state.progress_at.unwrap_or(now);
+            let until = since + stall;
+            let waiting = state.waiting();
+            let idle = (state.gaps.longest(since) * IDLE_GAPS)
+                .max(IDLE_AFTER)
+                .min(stall);
+            if now < until {
+                Pacing::Slow {
+                    room: state.hold_limit.saturating_sub(waiting),
+                    until,
+                    waiting,
+                    since,
+                    idle: since + idle,
+                }
+            } else {
+                Pacing::Out
+            }
+        };
+        (pacing, state.took_at)
+    }
+
+    /// The session's program goes at this client's pace now, in place of
+    /// another client's (which left, stalled, or took nothing while this
+    /// one took its output; see `session::Worker::pace`): the output that
+    /// waits for it may go on waiting, up to `LEAD_LIMIT`, so the program
+    /// goes on at its pace from here, rather than stop until it took all
+    /// that. What waits beyond `PACE_WINDOW` shrinks by half of what it
+    /// takes (see `State::wrote`): the program goes on at half its pace
+    /// until it caught up.
+    pub fn lead(&self) {
+        let mut state = self.lock();
+        if state.holding {
+            let waiting = state.waiting();
+            state.hold_limit = state.hold_limit.max(waiting.min(LEAD_LIMIT));
+        }
+    }
+
+    /// Whether the session's program is held back for this client alone,
+    /// and so how much more output it can take now and until when at most
+    /// (see `pacing`).
+    #[cfg(test)]
+    fn holds_back(&self, stall: Duration) -> Option<(usize, Instant)> {
+        match self.pacing(stall).0 {
+            Pacing::Slow { room, until, .. } => Some((room, until)),
+            Pacing::KeepsUp | Pacing::Out => None,
         }
     }
 
@@ -789,12 +1188,12 @@ impl Outbox {
         state.hold_queries(superseded_by_resync);
         state.drop_where(superseded_by_resync);
         state.lagging = false;
-        state.push(frame, Kind::Resync, None);
+        state.push(frame, Kind::Resync, false);
         if let Some(output) = carried {
-            state.push(output.frame, Kind::Carried, Some(output.data));
+            state.push(output.frame, Kind::Carried, true);
         }
         while let Some(query) = state.held.pop_front() {
-            state.push(query, Kind::Query, None);
+            state.push(query, Kind::Query, false);
         }
         self.ready.notify_one();
         true
@@ -814,7 +1213,7 @@ impl Outbox {
             state.held.push_back(frame);
             return true;
         }
-        match state.write_now(&frame) {
+        match state.write_now(&frame, false) {
             Some(Ok(_)) => true,
             Some(Err(())) => {
                 drop(state);
@@ -823,7 +1222,7 @@ impl Outbox {
             }
             None => {
                 state.query_bytes += frame.len();
-                state.push(frame, Kind::Query, None);
+                state.push(frame, Kind::Query, false);
                 self.ready.notify_one();
                 true
             }
@@ -856,7 +1255,7 @@ impl Outbox {
             Kind::Resized => true,
             _ => false,
         });
-        state.push(frame, Kind::Replacement { full }, None);
+        state.push(frame, Kind::Replacement { full }, false);
         self.ready.notify_one();
         true
     }
@@ -869,7 +1268,7 @@ impl Outbox {
         if state.dead || state.closed {
             return false;
         }
-        self.deliver(&mut state, frame, Kind::Resized, None)
+        self.deliver(&mut state, frame, Kind::Resized, false)
     }
 
     /// A reply or notice that is never dropped.
@@ -878,7 +1277,7 @@ impl Outbox {
         if state.dead || state.closed {
             return false;
         }
-        self.deliver(&mut state, frame, Kind::Control, None)
+        self.deliver(&mut state, frame, Kind::Control, false)
     }
 
     /// An event for this subscribed connection, in order with its replies.
@@ -941,7 +1340,7 @@ impl Outbox {
         if state.dead || state.closed {
             return;
         }
-        state.push(frame, Kind::Final, None);
+        state.push(frame, Kind::Final, false);
         state.closed = true;
         self.ready.notify_one();
     }
@@ -1019,10 +1418,18 @@ impl Outbox {
                 if item.kind == Kind::Output {
                     state.output_bytes -= item.frame.len();
                 }
+                if item.output_rest() {
+                    state.rest_bytes -= item.bytes().len();
+                }
+                if item.waiting_output() {
+                    // It waits for the client until it is written.
+                    state.writing_output = item.bytes().len();
+                }
                 if item.kind == Kind::Query {
                     state.query_bytes -= item.frame.len();
                 }
                 state.writing = true;
+                // A lagging client that drained is resynchronized.
                 let waker = (state.lagging && state.bytes <= RESYNC_BELOW)
                     .then(|| state.waker.clone())
                     .flatten();
@@ -1061,6 +1468,7 @@ impl Outbox {
     pub fn write_all_to(&self, mut writer: impl Write) {
         while let Some(item) = self.next() {
             priority::interactive(self.interactive.load(Ordering::Relaxed));
+            let output = item.waiting_output();
             for chunk in item.bytes().chunks(WRITE_CHUNK) {
                 let mut rest = chunk;
                 while !rest.is_empty() {
@@ -1071,12 +1479,18 @@ impl Outbox {
                         }
                         Ok(n) => {
                             rest = &rest[n..];
-                            self.lock().written += n as u64;
+                            self.wrote(n, output);
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock
-                                && self.wait_writable() => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            // The client takes no more for now: the
+                            // session's worker hears what it took.
+                            self.blocked();
+                            if !self.wait_writable() {
+                                self.fail();
+                                return;
+                            }
+                        }
                         Err(_) => {
                             self.fail();
                             return;
@@ -1091,7 +1505,34 @@ impl Outbox {
             if item.kind == Kind::Final {
                 return;
             }
-            self.lock().writing = false;
+            let mut state = self.lock();
+            state.writing = false;
+            state.writing_output = 0;
+        }
+    }
+
+    /// The writer wrote `bytes` of its item (output when `output`): the
+    /// session's worker is woken when that matters to it (see
+    /// `State::wrote`).
+    fn wrote(&self, bytes: usize, output: bool) {
+        self.wake_if(|state| state.wrote(bytes, output));
+    }
+
+    /// The writer waits for the client to take more (see `State::blocked`).
+    fn blocked(&self) {
+        self.wake_if(State::blocked);
+    }
+
+    fn wake_if(&self, due: impl FnOnce(&mut State) -> bool) {
+        let waker = {
+            let mut state = self.lock();
+            if !due(&mut state) {
+                return;
+            }
+            state.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -1099,20 +1540,24 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signals;
 
     fn frame(len: usize) -> Arc<Vec<u8>> {
         Arc::new(vec![0; len])
     }
 
-    /// Output of `len` frame bytes holding `data`.
+    /// Output of `len` frame bytes (at least its header's).
     fn output(len: usize) -> Output {
         text(len, b"")
     }
 
+    /// An `Output` frame holding `data`, padded to `len` bytes when that is
+    /// more than it takes. The padding (zeros) holds no token.
     fn text(len: usize, data: &[u8]) -> Output {
+        let mut frame = encode_output_frame(0, data).unwrap();
+        frame.resize(len.max(frame.len()), 0);
         Output {
-            frame: frame(len),
-            data: Arc::new(data.to_vec()),
+            frame: Arc::new(frame),
         }
     }
 
@@ -1123,6 +1568,474 @@ mod tests {
             items.push((item.kind, item.bytes().len()));
         }
         items
+    }
+
+    #[test]
+    fn output_that_waits_merges_with_the_output_it_continues() {
+        // No socket: every frame waits for the writer.
+        let outbox = Outbox::default();
+        let at = |offset: u64, data: &[u8]| Output::new(offset, data).unwrap();
+        assert!(outbox.push_control(frame(1)));
+        let first = at(10, b"ab");
+        assert_eq!(outbox.push_output(&first), Push::Queued);
+        assert_eq!(outbox.push_output(&at(12, b"cd")), Push::Queued);
+        assert_eq!(outbox.push_output(&at(14, b"")), Push::Queued);
+        // Output that does not continue it is a frame of its own, and so
+        // is output behind another kind of frame.
+        assert_eq!(outbox.push_output(&at(20, b"x")), Push::Queued);
+        assert!(outbox.push_query(frame(5)));
+        assert_eq!(outbox.push_output(&at(21, b"y")), Push::Queued);
+        let header = OUTPUT_HEADER;
+        assert_eq!(
+            drain(&outbox),
+            vec![
+                (Kind::Control, 1),
+                (Kind::Output, header + 4),
+                (Kind::Output, header + 1),
+                (Kind::Query, 5),
+                (Kind::Output, header + 1)
+            ]
+        );
+        assert_eq!(outbox.lock().output_bytes, 3 * header + 6);
+        // The frame another client's queue may share is left alone.
+        assert_eq!(output_frame_parts(&first.frame), Some((10, &b"ab"[..])));
+        // Up to MERGED_OUTPUT of output in one frame.
+        let big = vec![b'z'; MERGED_OUTPUT - 2];
+        assert_eq!(outbox.push_output(&at(100, &big)), Push::Queued);
+        assert_eq!(
+            outbox.push_output(&at(100 + big.len() as u64, b"12")),
+            Push::Queued
+        );
+        assert_eq!(
+            outbox.push_output(&at(102 + big.len() as u64, b"3")),
+            Push::Queued
+        );
+        let queued = drain(&outbox);
+        assert_eq!(
+            &queued[queued.len() - 2..],
+            [
+                (Kind::Output, header + MERGED_OUTPUT),
+                (Kind::Output, header + 1)
+            ]
+        );
+        // Each a whole frame, whose length word counts the merged output.
+        let mut outputs = Vec::new();
+        outbox.close();
+        while let Some(item) = outbox.next() {
+            if item.kind == Kind::Output {
+                let frame = &item.frame[..];
+                let message = cherry_protocol::read_frame::<_, ServerMessage>(&mut &frame[..]);
+                let Ok(Some(ServerMessage::Output { offset, data })) = message else {
+                    panic!("not an output frame");
+                };
+                outputs.push((offset, data.len()));
+            }
+        }
+        assert_eq!(
+            outputs,
+            [
+                (10, 4),
+                (20, 1),
+                (21, 1),
+                (100, MERGED_OUTPUT),
+                (100 + MERGED_OUTPUT as u64, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_client_that_takes_its_output_holds_the_session_back_while_too_much_waits() {
+        let stall = Duration::from_secs(60);
+        let outbox = Outbox::default();
+        let (waker, woken) = Wake::pair().unwrap();
+        outbox.set_waker(waker);
+        let chunk = 64 * 1024;
+        let mut offset = 0u64;
+        let mut push = |outbox: &Outbox| {
+            let output = Output::new(offset, &vec![b'x'; chunk]).unwrap();
+            offset += chunk as u64;
+            outbox.push_output(&output)
+        };
+        // Up to the high mark it holds nothing back.
+        while outbox.lock().waiting() + chunk <= HOLD_HIGH_WATER {
+            assert_eq!(push(&outbox), Push::Queued);
+            assert_eq!(outbox.holds_back(stall), None);
+        }
+        assert_eq!(push(&outbox), Push::Queued);
+        let waiting = outbox.lock().waiting();
+        assert!(waiting > HOLD_HIGH_WATER, "{waiting}");
+        // It can take no more for now.
+        let (room, until) = outbox.holds_back(stall).expect("held back");
+        assert_eq!(room, 0);
+        assert!(until > Instant::now() + stall - Duration::from_secs(1));
+        // Output the writer took from the queue waits until it is written.
+        signals::drain(&woken);
+        let mut item = outbox.next().unwrap();
+        assert_eq!(outbox.holds_back(stall).map(|(room, _)| room), Some(0));
+        assert!(!readable(&woken), "woken for nothing taken");
+        // As the client takes it, less waits, and it can take that much
+        // more; the session's worker is woken for every PACE_STEP it took.
+        // It holds the session back down to the low mark, and the worker
+        // hears when it stops.
+        let (mut taken, mut steps) = (0, 0);
+        let mut written = 0;
+        loop {
+            if written == item.bytes().len() {
+                outbox.lock().writing = false;
+                item = outbox.next().unwrap();
+                written = 0;
+            }
+            let n = (item.bytes().len() - written).min(1024);
+            written += n;
+            taken += n;
+            outbox.wrote(n, true);
+            // The client takes no more for now.
+            outbox.blocked();
+            let left = outbox.lock().waiting();
+            assert_eq!(left, waiting - taken);
+            match outbox.holds_back(stall) {
+                Some((room, _)) => {
+                    assert_eq!(room, taken);
+                    assert!(left > HOLD_LOW_WATER, "{left}");
+                    if readable(&woken) {
+                        signals::drain(&woken);
+                        steps += 1;
+                    }
+                    assert_eq!(steps, taken / PACE_STEP, "after {taken} bytes");
+                }
+                None => {
+                    assert!(left <= HOLD_LOW_WATER, "{left}");
+                    assert!(readable(&woken), "the worker was not woken");
+                    break;
+                }
+            }
+        }
+        // Never beyond the budget: output is held back long before.
+        const { assert!(HOLD_HIGH_WATER + MERGED_OUTPUT < OUTPUT_BUDGET) };
+    }
+
+    #[test]
+    fn a_client_that_takes_output_in_bursts_wakes_the_worker_per_burst() {
+        let outbox = Outbox::default();
+        let (waker, woken) = Wake::pair().unwrap();
+        outbox.set_waker(waker);
+        assert!(outbox.push_control(frame(1)));
+        let big = Output::new(0, &vec![b'x'; 2 * HOLD_HIGH_WATER]).unwrap();
+        assert_eq!(outbox.push_output(&big), Push::Queued);
+        assert!(outbox.holds_back(Duration::from_secs(60)).is_some());
+        outbox.next().unwrap();
+        outbox.lock().writing = false;
+        outbox.next().unwrap();
+        // While it goes on taking output, the worker hears of it every
+        // PACE_BURST, not every PACE_STEP.
+        for _ in 0..PACE_BURST / 1024 - 1 {
+            outbox.wrote(1024, true);
+        }
+        assert!(!readable(&woken), "woken mid-burst");
+        outbox.wrote(1024, true);
+        assert!(readable(&woken), "not woken after a long burst");
+        signals::drain(&woken);
+        // Once it takes no more for now, the worker hears of what it took,
+        // if that is at least PACE_STEP.
+        outbox.wrote(PACE_STEP - 1, true);
+        outbox.blocked();
+        assert!(!readable(&woken), "woken for less than a step");
+        outbox.wrote(1, true);
+        outbox.blocked();
+        assert!(readable(&woken), "not woken for a step");
+    }
+
+    /// The writer takes `bytes` of what is queued, from the item it holds
+    /// (`item`) on.
+    fn take(outbox: &Outbox, item: &mut Option<(Item, usize)>, mut bytes: usize) {
+        while bytes > 0 {
+            let (current, written) = match item {
+                Some((current, written)) if *written < current.bytes().len() => (current, written),
+                _ => {
+                    outbox.lock().writing = false;
+                    *item = Some((outbox.next().unwrap(), 0));
+                    continue;
+                }
+            };
+            let n = bytes.min(current.bytes().len() - *written);
+            *written += n;
+            bytes -= n;
+            outbox.wrote(n, current.waiting_output());
+        }
+    }
+
+    #[test]
+    fn output_already_on_its_way_waits_too_within_bounds() {
+        let stall = Duration::from_secs(60);
+        let outbox = Outbox::default();
+        let chunk = 64 * 1024;
+        let mut offset = 0;
+        let mut push = |len: usize| {
+            let output = Output::new(offset, &vec![b'x'; len]).unwrap();
+            offset += len as u64;
+            assert_eq!(outbox.push_output(&output), Push::Queued);
+        };
+        // Behind a reply: nothing is written at once.
+        assert!(outbox.push_control(frame(1)));
+        for _ in 0..9 {
+            push(chunk);
+        }
+        // Beyond the high mark: it can take no more for now.
+        let waiting = outbox.lock().waiting();
+        assert!(waiting > HOLD_HIGH_WATER);
+        assert_eq!(outbox.holds_back(stall).map(|(room, _)| room), Some(0));
+        // As it takes output, it can take as much more: what reached it
+        // beyond the high mark (the program's output already on its way)
+        // waits as well, and the session goes on at its pace from there.
+        let mut item = None;
+        take(&outbox, &mut item, 1 + 100_000);
+        assert_eq!(outbox.lock().waiting(), waiting - 100_000);
+        assert_eq!(
+            outbox.holds_back(stall).map(|(room, _)| room),
+            Some(100_000)
+        );
+        // But no more than HOLD_SLACK beyond the high mark: beyond it, the
+        // client must take the rest first.
+        push(HOLD_SLACK);
+        push(HOLD_SLACK);
+        let waiting = outbox.lock().waiting();
+        let over = waiting - (HOLD_HIGH_WATER + HOLD_SLACK);
+        assert_eq!(outbox.holds_back(stall).map(|(room, _)| room), Some(0));
+        take(&outbox, &mut item, over - 10);
+        assert_eq!(outbox.holds_back(stall).map(|(room, _)| room), Some(0));
+        take(&outbox, &mut item, 20);
+        assert_eq!(outbox.holds_back(stall).map(|(room, _)| room), Some(10));
+    }
+
+    #[test]
+    fn a_client_keeps_up_until_too_much_waits_and_paces_nothing_once_it_lags() {
+        let stall = Duration::from_secs(60);
+        let outbox = Outbox::default();
+        assert_eq!(outbox.pacing(stall), (Pacing::KeepsUp, None));
+        let at = |offset: usize, len: usize| Output::new(offset as u64, &vec![b'x'; len]).unwrap();
+        let most = HOLD_HIGH_WATER - OUTPUT_HEADER;
+        assert_eq!(outbox.push_output(&at(0, most)), Push::Queued);
+        assert_eq!(outbox.pacing(stall).0, Pacing::KeepsUp);
+        assert_eq!(outbox.push_output(&at(most, 1)), Push::Queued);
+        let waiting = outbox.lock().waiting();
+        assert!(matches!(
+            outbox.pacing(stall).0,
+            Pacing::Slow { room: 0, waiting: w, .. } if w == waiting
+        ));
+        // When it last took anything comes along.
+        let before = Instant::now();
+        outbox.lock().took(10);
+        assert!(outbox.pacing(stall).1.is_some_and(|at| at >= before));
+        // More than the low mark of it will still wait once it lags: the
+        // rest of a frame its writer wrote in part, say.
+        let rest = frame(HOLD_LOW_WATER * 2);
+        {
+            let mut state = outbox.lock();
+            state.bytes += rest.len();
+            state.rest_bytes += rest.len();
+            state.items.push_front(Item {
+                frame: rest,
+                start: 0,
+                kind: Kind::Rest,
+                output: true,
+                key: None,
+                seq: 0,
+            });
+        }
+        // Beyond its budget it lags, and paces nothing.
+        assert_eq!(
+            outbox.push_output(&at(most + 1, OUTPUT_BUDGET)),
+            Push::Lagging
+        );
+        assert_eq!(outbox.pacing(stall).0, Pacing::Out);
+        // Resynchronized, it starts afresh: it keeps up until more than
+        // `HOLD_HIGH_WATER` waits again, with no room left over from before.
+        outbox.take_superseded();
+        assert!(outbox.push_snapshot(frame(100), None));
+        assert!(outbox.lock().waiting() > HOLD_LOW_WATER);
+        assert_eq!(outbox.pacing(stall).0, Pacing::KeepsUp);
+    }
+
+    #[test]
+    fn a_slow_client_counts_as_taking_nothing_after_a_few_of_its_longest_waits() {
+        let stall = Duration::from_secs(60);
+        let outbox = Outbox::default();
+        let big = Output::new(0, &vec![b'x'; HOLD_HIGH_WATER + 1]).unwrap();
+        assert!(outbox.push_control(frame(1)));
+        assert_eq!(outbox.push_output(&big), Push::Queued);
+        let idle = |outbox: &Outbox, stall| match outbox.pacing(stall).0 {
+            Pacing::Slow { since, idle, .. } => idle - since,
+            other => panic!("{other:?}"),
+        };
+        // A client that took nothing yet: `IDLE_AFTER`, within its stall.
+        assert_eq!(idle(&outbox, stall), IDLE_AFTER);
+        assert_eq!(idle(&outbox, IDLE_AFTER / 2), IDLE_AFTER / 2);
+        // A client that takes output in steps, with waits between them
+        // (a slow terminal behind `cherry attach`): a few of its longest.
+        let mut item = None;
+        take(&outbox, &mut item, 1);
+        std::thread::sleep(Duration::from_millis(120));
+        take(&outbox, &mut item, 1);
+        let waited = idle(&outbox, stall);
+        assert!(
+            (3 * Duration::from_millis(120)..3 * Duration::from_millis(400)).contains(&waited),
+            "{waited:?}"
+        );
+        // A wait while nothing waited for it does not count, nor one for a
+        // frame other than output (a reply, say).
+        let left = outbox.lock().waiting();
+        take(&outbox, &mut item, left);
+        outbox.lock().writing = false;
+        assert_eq!(outbox.pacing(stall).0, Pacing::KeepsUp);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(outbox.push_control(frame(1)));
+        std::thread::sleep(Duration::from_millis(200));
+        let big = Output::new(big.data().len() as u64, &vec![b'x'; HOLD_HIGH_WATER + 1]).unwrap();
+        assert_eq!(outbox.push_output(&big), Push::Queued);
+        let mut item = None;
+        take(&outbox, &mut item, 2);
+        assert_eq!(idle(&outbox, stall), waited);
+    }
+
+    #[test]
+    fn the_longest_waits_are_those_of_the_last_two_windows() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut gaps = Gaps::default();
+        assert_eq!(gaps.longest(start), Duration::ZERO);
+        gaps.note(ms(300), start);
+        gaps.note(ms(10), start + ms(500));
+        assert_eq!(gaps.longest(start + ms(500)), ms(300));
+        // A new window: the last one's longest is kept.
+        gaps.note(ms(20), start + ms(1200));
+        assert_eq!(gaps.longest(start + ms(1200)), ms(300));
+        // Its last progress a window later: only the window it fell in.
+        assert_eq!(gaps.longest(start + ms(2300)), ms(20));
+        gaps.note(ms(30), start + ms(2300));
+        assert_eq!(gaps.longest(start + ms(2300)), ms(30));
+        // Nothing for two windows: nothing is kept.
+        assert_eq!(gaps.longest(start + ms(4400)), Duration::ZERO);
+        gaps.note(ms(5), start + ms(4400));
+        assert_eq!(gaps.longest(start + ms(4400)), ms(5));
+    }
+
+    #[test]
+    fn a_client_that_takes_over_pacing_lets_what_waits_wait_and_catches_up() {
+        let stall = Duration::from_secs(60);
+        let outbox = Outbox::default();
+        let room = |outbox: &Outbox| outbox.holds_back(stall).map(|(room, _)| room);
+        let mut offset = 0;
+        let mut push = |len: usize| {
+            let output = Output::new(offset, &vec![b'x'; len]).unwrap();
+            offset += len as u64;
+            assert_eq!(outbox.push_output(&output), Push::Queued);
+        };
+        // Behind a reply: nothing is written at once. Far behind: another
+        // client paced the program.
+        assert!(outbox.push_control(frame(1)));
+        for _ in 0..8 {
+            push(MERGED_OUTPUT);
+        }
+        let waiting = outbox.lock().waiting();
+        assert!(waiting > PACE_WINDOW);
+        assert_eq!(room(&outbox), Some(0));
+        // The program now goes at its pace: as it takes output it can take
+        // more at once, half as much, rather than only once all but
+        // PACE_WINDOW of what waits was taken.
+        outbox.lead();
+        assert_eq!(outbox.lock().hold_limit, waiting);
+        let mut item = None;
+        take(&outbox, &mut item, 1 + 100_000);
+        assert_eq!(room(&outbox), Some(50_000));
+        // As the program goes on at that pace, what waits shrinks until no
+        // more than PACE_WINDOW does; the program never stops meanwhile.
+        let mut steps = 0;
+        while outbox.lock().hold_limit > PACE_WINDOW {
+            // Frames merge while they wait, so this fills it, but for a
+            // header at most.
+            push(room(&outbox).unwrap());
+            let before = room(&outbox).unwrap();
+            assert!(before <= OUTPUT_HEADER, "{before}");
+            take(&outbox, &mut item, 64 * 1024);
+            // Half as much (rounded up per write, less the header of a
+            // frame that did not merge), and all of it once caught up.
+            let gained = room(&outbox).unwrap() - before;
+            let half = 32 * 1024;
+            let expected = if outbox.lock().hold_limit > PACE_WINDOW {
+                half - OUTPUT_HEADER - 2..=half
+            } else {
+                half..=2 * half
+            };
+            assert!(expected.contains(&gained), "{gained}");
+            steps += 1;
+            assert!(steps < 1000, "never caught up");
+        }
+        let left = outbox.lock().waiting();
+        assert!(left <= PACE_WINDOW, "{left}");
+        // Then it can take as much more as it takes.
+        assert_eq!(room(&outbox), Some(PACE_WINDOW - left));
+        take(&outbox, &mut item, 1000);
+        assert_eq!(room(&outbox), Some(PACE_WINDOW - left + 1000));
+        // What may keep waiting is bounded well within the budget.
+        drop(item);
+        let outbox = Outbox::default();
+        assert!(outbox.push_control(frame(1)));
+        let mut offset = 0;
+        while outbox.lock().waiting() + MERGED_OUTPUT < OUTPUT_BUDGET {
+            let output = Output::new(offset, &vec![b'x'; MERGED_OUTPUT]).unwrap();
+            offset += MERGED_OUTPUT as u64;
+            assert_eq!(outbox.push_output(&output), Push::Queued);
+        }
+        outbox.lead();
+        assert_eq!(outbox.lock().hold_limit, LEAD_LIMIT);
+        assert_eq!(room(&outbox), Some(0));
+        // What waits beyond that goes first, at its full pace; then the
+        // program goes on at half its pace.
+        let mut item = None;
+        let excess = outbox.lock().waiting() - LEAD_LIMIT;
+        take(&outbox, &mut item, 1 + excess - 1000);
+        assert_eq!(outbox.lock().hold_limit, LEAD_LIMIT);
+        assert_eq!(room(&outbox), Some(0));
+        take(&outbox, &mut item, 2000);
+        assert_eq!(outbox.lock().hold_limit, LEAD_LIMIT - 500);
+        assert_eq!(room(&outbox), Some(500));
+        // A client that holds nothing back has nothing to keep waiting.
+        let outbox = Outbox::default();
+        outbox.lead();
+        assert_eq!(outbox.lock().hold_limit, 0);
+        assert_eq!(outbox.pacing(stall).0, Pacing::KeepsUp);
+    }
+
+    #[test]
+    fn a_client_that_takes_nothing_holds_nothing_back_once_its_stall_ends() {
+        let outbox = Outbox::default();
+        let big = Output::new(0, &vec![b'x'; HOLD_HIGH_WATER + 1]).unwrap();
+        assert_eq!(outbox.push_output(&big), Push::Queued);
+        let stall = Duration::from_millis(100);
+        assert!(outbox.holds_back(stall).is_some());
+        std::thread::sleep(stall + Duration::from_millis(20));
+        assert_eq!(outbox.holds_back(stall), None);
+        // Taking some of it (the writer's) holds the session back again.
+        outbox.lock().took(1);
+        assert!(outbox.holds_back(stall).is_some());
+        // A lagging client, and one that is gone, hold nothing back.
+        let rest = Output::new(big.data().len() as u64, &vec![b'y'; OUTPUT_BUDGET]).unwrap();
+        assert_eq!(outbox.push_output(&rest), Push::Lagging);
+        assert_eq!(outbox.holds_back(stall), None);
+        let outbox = Outbox::default();
+        assert_eq!(outbox.push_output(&big), Push::Queued);
+        outbox.close();
+        assert_eq!(outbox.holds_back(stall), None);
+    }
+
+    /// Whether a wake socket has a wakeup waiting.
+    fn readable(woken: &UnixStream) -> bool {
+        let mut fd = libc::pollfd {
+            fd: woken.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 0) > 0 }
     }
 
     #[test]
@@ -1137,10 +2050,10 @@ mod tests {
         assert!(outbox.resync_due());
         assert!(outbox.push_snapshot(frame(100), None));
         assert!(!outbox.is_lagging());
-        assert_eq!(outbox.push_output(&output(5)), Push::Queued);
+        assert_eq!(outbox.push_output(&output(50)), Push::Queued);
         assert_eq!(
             drain(&outbox),
-            vec![(Kind::Control, 10), (Kind::Resync, 100), (Kind::Output, 5)]
+            vec![(Kind::Control, 10), (Kind::Resync, 100), (Kind::Output, 50)]
         );
     }
 
@@ -1241,18 +2154,18 @@ mod tests {
         let outbox = Outbox::default();
         assert!(outbox.push_control(frame(1)));
         assert_eq!(
-            outbox.push_output(&text(10, b"ls\r\n\x1b]52;c;QUJD\x07")),
+            outbox.push_output(&text(40, b"ls\r\n\x1b]52;c;QUJD\x07")),
             Push::Queued
         );
         assert!(outbox.push_replacement(frame(100), false));
-        assert_eq!(outbox.push_output(&output(5)), Push::Queued);
+        assert_eq!(outbox.push_output(&output(50)), Push::Queued);
         assert!(outbox.push_replacement(frame(200), false));
         assert_eq!(
             drain(&outbox),
             vec![
                 (Kind::Control, 1),
-                (Kind::Output, 10),
-                (Kind::Output, 5),
+                (Kind::Output, 40),
+                (Kind::Output, 50),
                 (REFRESH, 200)
             ]
         );
@@ -1262,29 +2175,29 @@ mod tests {
         assert!(outbox.push_replacement(frame(300), true));
         assert!(outbox.full_replacement_queued());
         assert!(outbox.push_replacement(frame(20), false));
-        assert_eq!(outbox.push_output(&output(6)), Push::Queued);
+        assert_eq!(outbox.push_output(&output(60)), Push::Queued);
         assert!(outbox.push_replacement(frame(400), true));
         assert_eq!(
             drain(&outbox),
             vec![
                 (Kind::Control, 1),
-                (Kind::Output, 10),
-                (Kind::Output, 5),
-                (Kind::Output, 6),
+                (Kind::Output, 40),
+                (Kind::Output, 50),
+                (Kind::Output, 60),
                 (FULL, 400)
             ]
         );
         // Nor a resync, which the output after it does not continue.
-        assert!(outbox.push_snapshot(frame(500), Some(text(7, b"\x07"))));
-        assert_eq!(outbox.push_output(&output(8)), Push::Queued);
+        assert!(outbox.push_snapshot(frame(500), Some(text(70, b"\x07"))));
+        assert_eq!(outbox.push_output(&output(80)), Push::Queued);
         assert!(outbox.push_replacement(frame(30), false));
         assert_eq!(
             drain(&outbox),
             vec![
                 (Kind::Control, 1),
                 (Kind::Resync, 500),
-                (Kind::Carried, 7),
-                (Kind::Output, 8),
+                (Kind::Carried, 70),
+                (Kind::Output, 80),
                 (REFRESH, 30)
             ]
         );
@@ -1295,24 +2208,24 @@ mod tests {
         let outbox = Outbox::default();
         assert!(outbox.push_control(frame(1)));
         assert_eq!(
-            outbox.push_output(&text(10, b"ls\r\n\x1b]52;c;QUJD\x07")),
+            outbox.push_output(&text(40, b"ls\r\n\x1b]52;c;QUJD\x07")),
             Push::Queued
         );
         assert!(outbox.push_replacement(frame(50), true));
         assert_eq!(
-            outbox.push_output(&text(10, b"\x1b]9;done\x07 more")),
+            outbox.push_output(&text(40, b"\x1b]9;done\x07 more")),
             Push::Queued
         );
         let carried = outbox.take_superseded();
         assert_eq!(carried, b"\x1b]52;c;QUJD\x07\x1b]9;done\x07");
         assert_eq!(drain(&outbox), vec![(Kind::Control, 1)]);
-        assert!(outbox.push_snapshot(frame(100), Some(text(20, &carried))));
+        assert!(outbox.push_snapshot(frame(100), Some(text(60, &carried))));
         assert_eq!(
             drain(&outbox),
-            vec![(Kind::Control, 1), (Kind::Resync, 100), (Kind::Carried, 20)]
+            vec![(Kind::Control, 1), (Kind::Resync, 100), (Kind::Carried, 60)]
         );
         // Superseded in turn, the carried output is carried again.
-        assert_eq!(outbox.push_output(&text(5, b"\x07")), Push::Queued);
+        assert_eq!(outbox.push_output(&text(50, b"\x07")), Push::Queued);
         assert_eq!(
             outbox.take_superseded(),
             b"\x1b]52;c;QUJD\x07\x1b]9;done\x07\x07"
@@ -1380,7 +2293,7 @@ mod tests {
         // once each.
         assert!(outbox.take_superseded().is_empty());
         assert!(outbox.push_snapshot(frame(100), Some(text(20, b"\x07"))));
-        assert_eq!(outbox.push_output(&output(5)), Push::Queued);
+        assert_eq!(outbox.push_output(&output(50)), Push::Queued);
         assert_eq!(
             drain(&outbox),
             vec![
@@ -1391,13 +2304,13 @@ mod tests {
                 (Kind::Query, 12),
                 (Kind::Query, 13),
                 (Kind::Query, 14),
-                (Kind::Output, 5)
+                (Kind::Output, 50)
             ]
         );
         let mut written = Vec::new();
         outbox.close();
         outbox.write_all_to(&mut written);
-        assert_eq!(written.len(), 11 + 1 + 100 + 20 + 12 + 13 + 14 + 5);
+        assert_eq!(written.len(), 11 + 1 + 100 + 20 + 12 + 13 + 14 + 50);
         assert_eq!(outbox.lock().query_bytes, 0);
     }
 
@@ -1819,14 +2732,18 @@ mod tests {
     #[test]
     fn frames_nothing_waits_ahead_of_go_out_without_the_writer() {
         let (outbox, mut peer) = connected();
-        assert_eq!(outbox.push_output(&text(3, b"")), Push::Queued);
+        let first = text(0, b"out");
+        assert_eq!(outbox.push_output(&first), Push::Queued);
         assert!(outbox.push_control(Arc::new(b"ctl".to_vec())));
         assert!(outbox.push_query(Arc::new(b"qry".to_vec())));
         assert!(outbox.push_resized(Arc::new(b"rsz".to_vec())));
         // Written at once, in order; nothing is left for a writer thread.
-        assert_eq!(arrived(&mut peer), b"\0\0\0ctlqryrsz");
+        assert_eq!(
+            arrived(&mut peer),
+            [&first.frame[..], b"ctlqryrsz"].concat()
+        );
         assert!(drain(&outbox).is_empty());
-        assert_eq!(outbox.written(), 12);
+        assert_eq!(outbox.written(), first.frame.len() as u64 + 9);
         // While the writer holds an item, frames queue behind it.
         outbox.lock().writing = true;
         assert!(outbox.push_control(Arc::new(b"later".to_vec())));
@@ -1834,8 +2751,8 @@ mod tests {
         assert!(arrived(&mut peer).is_empty());
         outbox.lock().writing = false;
         // And behind anything queued.
-        assert_eq!(outbox.push_output(&text(4, b"")), Push::Queued);
-        assert_eq!(drain(&outbox), vec![(Kind::Control, 5), (Kind::Output, 4)]);
+        assert_eq!(outbox.push_output(&text(40, b"")), Push::Queued);
+        assert_eq!(drain(&outbox), vec![(Kind::Control, 5), (Kind::Output, 40)]);
     }
 
     #[test]
@@ -1845,7 +2762,6 @@ mod tests {
         let big: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
         let first = Output {
             frame: Arc::new(big.clone()),
-            data: Arc::new(Vec::new()),
         };
         assert_eq!(outbox.push_output(&first), Push::Queued);
         let queued = drain(&outbox);

@@ -3,15 +3,31 @@
 //!
 //! # Frames
 //!
-//! A frame is a 4-byte big-endian length followed by that many bytes of JSON,
-//! at most [`MAX_FRAME_BYTES`]. Terminal bytes travel as standard base64
-//! strings. A client sends [`Request`]s (a [`ClientMessage`], tagged by `op`)
-//! and the host sends [`Response`]s (a [`ServerMessage`], tagged by `type`).
-//! Unknown fields are ignored everywhere, so a field can be added without
-//! breaking an older peer; an unknown `op` or `type` cannot be decoded. A
-//! field that changes what the answer means (`ClientMessage::Screen`'s
-//! `max_lines`) is ignored by an older host of the same version too, so its
-//! documentation says how a client tells a host that knows it.
+//! A frame is a 4-byte big-endian length followed by that many bytes, at
+//! most [`MAX_FRAME_BYTES`]. A client sends [`Request`]s (a [`ClientMessage`])
+//! and the host sends [`Response`]s (a [`ServerMessage`]). A frame whose
+//! first byte is `{` holds a JSON message, tagged by `op` (a client's) or
+//! `type` (the host's): the handshake and every control message. An
+//! attachment's terminal bytes travel as they are, in binary frames, whose
+//! first byte is their kind ([`binary_kind`]; version 6):
+//!
+//! - `Output` (1, host to client): the offset (8 bytes, big-endian), then
+//!   the output.
+//! - `Input` (2, client to host): the input.
+//! - `Query` (3, host to client): the query.
+//! - `Attached` (4, host to client): the length of a JSON header (4 bytes,
+//!   big-endian), the header (an object with `session`, `offset`, `reason`
+//!   and `refreshes`), then the snapshot.
+//!
+//! Those four messages have no JSON form, and a binary frame carries no
+//! `req`. Terminal bytes inside JSON messages (`SendInput`) are standard
+//! base64 strings. Unknown fields are ignored everywhere (the `Attached`
+//! header's too), so a field can be added without breaking an older peer;
+//! an unknown `op`, `type` or binary kind cannot be decoded. A field that
+//! changes what the answer means (`ClientMessage::Screen`'s `max_lines`) is
+//! ignored by an older host of the same version too, so its documentation
+//! says how a client tells a host that knows it. See [`Message`] for
+//! encoding and decoding frames.
 //!
 //! # Versions
 //!
@@ -55,10 +71,11 @@
 //! Any request may carry `"req": <u64>`, which the host echoes on its reply,
 //! so one connection can have several requests in flight. The host answers
 //! every request with exactly one frame, except `Input` and `Resize`, which
-//! are answered only when they fail. Frames the host sends on its own never
-//! carry a `req`: `Event`s, and attachment traffic. `Attach`, `Input`, `Resize`
-//! and `Detach` belong to an attachment: every frame that answers them
-//! (`Attached`, an `Error`, the `Ok` after `Detach`) is attachment traffic,
+//! are answered only when they fail, and `Refresh`, which is answered with a
+//! replacement snapshot (or an error). Frames the host sends on its own never
+//! carry a `req`: `Event`s, and attachment traffic. `Attach`, `Input`,
+//! `Resize`, `Refresh` and `Detach` belong to an attachment: every frame that
+//! answers them (`Attached`, an `Error`, the `Ok` after `Detach`) is attachment traffic,
 //! like `Output`, `Query`, `Exit` and the keepalive `Pong`s of a paused
 //! attachment, and a `req` on them is ignored. A connection carries at most
 //! one attachment, whose frames carry no session ID: a control connection
@@ -75,7 +92,7 @@
 //! connection is exempt from the idle limit but must send `Ping` at least
 //! every [`HEARTBEAT_INTERVAL`]; one that sends nothing for
 //! [`HEARTBEAT_TIMEOUT`] is dropped.
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -91,7 +108,7 @@ use std::{
 
 pub mod priority;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 /// The environment variable in which the CLI tells a remote
 /// `cherry-host gateway` which host identity it expects
 /// (`--expected-host-id`, or the host an attachment reconnects to). The
@@ -102,10 +119,29 @@ pub const PROTOCOL_VERSION: u32 = 5;
 /// CLI what it is.
 pub const EXPECTED_HOST_ID_VAR: &str = "CHERRY_EXPECTED_HOST_ID";
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// The first byte of a binary frame: what it carries (see the crate
+/// documentation). A JSON frame starts with `{`, which no kind is.
+pub mod binary_kind {
+    /// `ServerMessage::Output`: the offset (8 bytes, big-endian), then the
+    /// output.
+    pub const OUTPUT: u8 = 1;
+    /// `ClientMessage::Input`: the input.
+    pub const INPUT: u8 = 2;
+    /// `ServerMessage::Query`: the query.
+    pub const QUERY: u8 = 3;
+    /// `ServerMessage::Attached`: the length of its JSON header (4 bytes,
+    /// big-endian), the header, then the snapshot.
+    pub const ATTACHED: u8 = 4;
+}
+
+/// The bytes of an `Output` frame before its output: the length word, the
+/// kind and the offset.
+pub const OUTPUT_HEADER: usize = 4 + 1 + 8;
 /// The most bytes one `Input` or `SendInput` carries.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
-/// Snapshots are base64 inside JSON (4/3 expansion). Keep the raw bytes well
-/// below the frame limit so an attach can never exceed it.
+/// Keep snapshots well below the frame limit so an attach can never exceed
+/// it, header and all.
 pub const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 /// `ScreenText::text` is at most this long: the oldest lines are dropped to
 /// fit. Plain text doubles at most in JSON, so the frame always fits.
@@ -355,14 +391,23 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
     },
+    /// Terminal input for the attached session, at most `MAX_INPUT_BYTES`.
+    /// A binary frame only (`binary_kind::INPUT`).
+    #[serde(skip)]
     Input {
-        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     Resize {
         cols: u16,
         rows: u16,
     },
+    /// Ask for a replacement snapshot of the grid (`Attached{Resize}`),
+    /// queued behind the attachment's output like any replacement; the host
+    /// answers only with it, or with `Error{snapshot_failed}`. A client that
+    /// follows the stream without a copy of the screen (see `Attached`'s
+    /// `refreshes`) asks for one when it needs the screen: to paint a
+    /// viewport, say. One already on its way answers it too.
+    Refresh,
     Detach,
     /// Liveness probe; the host answers `Pong`.
     Ping,
@@ -423,7 +468,11 @@ impl ClientMessage {
     pub fn belongs_to_attachment(&self) -> bool {
         matches!(
             self,
-            Self::Attach { .. } | Self::Input { .. } | Self::Resize { .. } | Self::Detach
+            Self::Attach { .. }
+                | Self::Input { .. }
+                | Self::Resize { .. }
+                | Self::Refresh
+                | Self::Detach
         )
     }
 }
@@ -466,15 +515,21 @@ pub enum ServerMessage {
     Created {
         session: SessionInfo,
     },
+    /// Initial attachment or an atomic replacement snapshot after the
+    /// shared terminal grid changes or a lagging client is resynchronized.
+    /// Subsequent Output resumes at offset. A binary frame only
+    /// (`binary_kind::ATTACHED`): everything but the snapshot is its JSON
+    /// header.
+    #[serde(skip)]
     Attached {
-        /// Initial attachment or an atomic replacement snapshot after the
-        /// shared terminal grid changes or a lagging client is resynchronized.
-        /// Subsequent Output resumes at offset.
         session: SessionInfo,
         offset: u64,
-        #[serde(with = "base64_bytes")]
         snapshot: Vec<u8>,
         reason: AttachReason,
+        /// The host answers `ClientMessage::Refresh`, so a client that
+        /// shows the stream as it is need not keep a copy of the screen.
+        /// Every host of this version sends true.
+        refreshes: bool,
     },
     /// The shared grid changed to `cols` by `rows` at `offset` without a
     /// replacement snapshot, because the program shows the alternate
@@ -494,10 +549,11 @@ pub enum ServerMessage {
         cols: u16,
         rows: u16,
     },
-    /// offset is the first byte position of this chunk, not its end.
+    /// offset is the first byte position of this chunk, not its end. A
+    /// binary frame only (`binary_kind::OUTPUT`).
+    #[serde(skip)]
     Output {
         offset: u64,
-        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     /// Terminal queries the host does not answer itself (a cursor report,
@@ -508,9 +564,10 @@ pub enum ServerMessage {
     /// client, in order with its output. Of the clients that answer queries
     /// (`ClientMessage::Attach`), that is the one that most recently sent
     /// input, or else the most recently attached one. While no such client
-    /// is attached they are dropped.
+    /// is attached they are dropped. A binary frame only
+    /// (`binary_kind::QUERY`).
+    #[serde(skip)]
     Query {
-        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     Exit {
@@ -974,29 +1031,306 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
+fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// A message that travels in frames: a JSON frame, or a binary one for an
+/// attachment's terminal bytes (see the crate documentation).
+pub trait Message: Sized {
+    /// Append the frame's body: what follows its length word.
+    fn encode_body(&self, out: &mut Vec<u8>) -> io::Result<()>;
+    /// The message in a frame's body.
+    fn decode_body(body: &[u8]) -> io::Result<Self>;
+}
+
+/// Whether a frame's body is a JSON message rather than a binary frame.
+fn is_json(body: &[u8]) -> bool {
+    body.first() == Some(&b'{')
+}
+
+fn json_body<T: Serialize>(value: &T, out: &mut Vec<u8>) -> io::Result<()> {
+    serde_json::to_writer(out, value).map_err(invalid)
+}
+
+fn from_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(body).map_err(invalid)
+}
+
+/// The frame of `ClientMessage::Input { data }` (at most
+/// `MAX_INPUT_BYTES`; a longer one is the caller's to split).
+pub fn encode_input_frame(data: &[u8]) -> io::Result<Vec<u8>> {
+    binary_frame(binary_kind::INPUT, &[], data)
+}
+
+/// The frame of `ServerMessage::Output { offset, data }`: `OUTPUT_HEADER`
+/// bytes, then `data`.
+pub fn encode_output_frame(offset: u64, data: &[u8]) -> io::Result<Vec<u8>> {
+    binary_frame(binary_kind::OUTPUT, &offset.to_be_bytes(), data)
+}
+
+/// The frame of `ServerMessage::Query { data }`.
+pub fn encode_query_frame(data: &[u8]) -> io::Result<Vec<u8>> {
+    binary_frame(binary_kind::QUERY, &[], data)
+}
+
+/// The JSON header of an `Attached` frame, borrowed to encode it.
+#[derive(Serialize)]
+struct AttachedHeaderRef<'a> {
+    session: &'a SessionInfo,
+    offset: u64,
+    reason: AttachReason,
+    refreshes: bool,
+}
+
+/// The JSON header of an `Attached` frame, as decoded.
+#[derive(Deserialize)]
+struct AttachedHeader {
+    session: SessionInfo,
+    offset: u64,
+    reason: AttachReason,
+    #[serde(default)]
+    refreshes: bool,
+}
+
+/// The frame of `ServerMessage::Attached`, with `snapshot` as it is.
+pub fn encode_attached_frame(
+    session: &SessionInfo,
+    offset: u64,
+    reason: AttachReason,
+    refreshes: bool,
+    snapshot: &[u8],
+) -> io::Result<Vec<u8>> {
+    let header = serde_json::to_vec(&AttachedHeaderRef {
+        session,
+        offset,
+        reason,
+        refreshes,
+    })
+    .map_err(invalid)?;
+    let header_len = u32::try_from(header.len()).map_err(|_| invalid("frame exceeds limit"))?;
+    let mut frame = Vec::with_capacity(4 + 1 + 4 + header.len() + snapshot.len());
+    frame.extend_from_slice(&[0; 4]);
+    frame.push(binary_kind::ATTACHED);
+    frame.extend_from_slice(&header_len.to_be_bytes());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(snapshot);
+    seal(frame)
+}
+
+/// A binary frame: `kind`, `head`, then `data`.
+fn binary_frame(kind: u8, head: &[u8], data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(4 + 1 + head.len() + data.len());
+    frame.extend_from_slice(&[0; 4]);
+    frame.push(kind);
+    frame.extend_from_slice(head);
+    frame.extend_from_slice(data);
+    seal(frame)
+}
+
+/// Fill in the length word of `frame`, whose body follows 4 bytes left for
+/// it; an error when the body exceeds `MAX_FRAME_BYTES`.
+fn seal(mut frame: Vec<u8>) -> io::Result<Vec<u8>> {
+    let len = frame.len() - 4;
+    if len > MAX_FRAME_BYTES {
+        return Err(invalid("frame exceeds limit"));
+    }
+    frame[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    Ok(frame)
+}
+
+/// The offset and the output of an `Output` frame (length word included),
+/// or None when it is not one.
+pub fn output_frame_parts(frame: &[u8]) -> Option<(u64, &[u8])> {
+    if frame.len() < OUTPUT_HEADER || frame[4] != binary_kind::OUTPUT {
+        return None;
+    }
+    let offset = u64::from_be_bytes(frame[5..OUTPUT_HEADER].try_into().ok()?);
+    Some((offset, &frame[OUTPUT_HEADER..]))
+}
+
+/// A binary frame's message from the host.
+fn decode_server_binary(body: &[u8]) -> io::Result<ServerMessage> {
+    let (&kind, rest) = body.split_first().ok_or_else(|| invalid("empty frame"))?;
+    match kind {
+        binary_kind::OUTPUT => {
+            if rest.len() < 8 {
+                return Err(invalid("truncated output frame"));
+            }
+            let (offset, data) = rest.split_at(8);
+            Ok(ServerMessage::Output {
+                offset: u64::from_be_bytes(offset.try_into().unwrap()),
+                data: data.to_vec(),
+            })
+        }
+        binary_kind::QUERY => Ok(ServerMessage::Query {
+            data: rest.to_vec(),
+        }),
+        binary_kind::ATTACHED => {
+            if rest.len() < 4 {
+                return Err(invalid("truncated attached frame"));
+            }
+            let (len, rest) = rest.split_at(4);
+            let len = u32::from_be_bytes(len.try_into().unwrap()) as usize;
+            if len > rest.len() {
+                return Err(invalid("attached header exceeds the frame"));
+            }
+            let (header, snapshot) = rest.split_at(len);
+            if !is_json(header) {
+                return Err(invalid("attached header is not a JSON object"));
+            }
+            let header: AttachedHeader = from_json(header)?;
+            Ok(ServerMessage::Attached {
+                session: header.session,
+                offset: header.offset,
+                snapshot: snapshot.to_vec(),
+                reason: header.reason,
+                refreshes: header.refreshes,
+            })
+        }
+        kind => Err(invalid(format!("unexpected binary frame of kind {kind}"))),
+    }
+}
+
+/// A binary frame's message from a client.
+fn decode_client_binary(body: &[u8]) -> io::Result<ClientMessage> {
+    let (&kind, rest) = body.split_first().ok_or_else(|| invalid("empty frame"))?;
+    match kind {
+        binary_kind::INPUT => Ok(ClientMessage::Input {
+            data: rest.to_vec(),
+        }),
+        kind => Err(invalid(format!("unexpected binary frame of kind {kind}"))),
+    }
+}
+
+impl ServerMessage {
+    /// Whether it travels in a binary frame.
+    fn is_binary(&self) -> bool {
+        matches!(
+            self,
+            Self::Output { .. } | Self::Query { .. } | Self::Attached { .. }
+        )
+    }
+
+    /// The binary frame of a message that has one.
+    fn binary_frame(&self) -> Option<io::Result<Vec<u8>>> {
+        Some(match self {
+            Self::Output { offset, data } => encode_output_frame(*offset, data),
+            Self::Query { data } => encode_query_frame(data),
+            Self::Attached {
+                session,
+                offset,
+                snapshot,
+                reason,
+                refreshes,
+            } => encode_attached_frame(session, *offset, *reason, *refreshes, snapshot),
+            _ => return None,
+        })
+    }
+}
+
+/// Append a binary frame's body (made whole, length word and all) to `out`.
+fn append_body(frame: io::Result<Vec<u8>>, out: &mut Vec<u8>) -> io::Result<()> {
+    out.extend_from_slice(&frame?[4..]);
+    Ok(())
+}
+
+impl Message for ClientMessage {
+    fn encode_body(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Input { data } => append_body(encode_input_frame(data), out),
+            message => json_body(message, out),
+        }
+    }
+
+    fn decode_body(body: &[u8]) -> io::Result<Self> {
+        if is_json(body) {
+            from_json(body)
+        } else {
+            decode_client_binary(body)
+        }
+    }
+}
+
+impl Message for Request {
+    /// A binary frame carries no `req`: `Input` is attachment traffic,
+    /// whose `req` the host ignores.
+    fn encode_body(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match &self.message {
+            ClientMessage::Input { .. } => self.message.encode_body(out),
+            _ => json_body(self, out),
+        }
+    }
+
+    fn decode_body(body: &[u8]) -> io::Result<Self> {
+        if is_json(body) {
+            from_json(body)
+        } else {
+            decode_client_binary(body).map(Self::from)
+        }
+    }
+}
+
+impl Message for ServerMessage {
+    fn encode_body(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self.binary_frame() {
+            Some(frame) => append_body(frame, out),
+            None => json_body(self, out),
+        }
+    }
+
+    fn decode_body(body: &[u8]) -> io::Result<Self> {
+        if is_json(body) {
+            from_json(body)
+        } else {
+            decode_server_binary(body)
+        }
+    }
+}
+
+impl Message for Response {
+    /// A binary frame carries no `req`: it is attachment traffic.
+    fn encode_body(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        if self.message.is_binary() {
+            self.message.encode_body(out)
+        } else {
+            json_body(self, out)
+        }
+    }
+
+    fn decode_body(body: &[u8]) -> io::Result<Self> {
+        if is_json(body) {
+            from_json(body)
+        } else {
+            decode_server_binary(body).map(Self::from)
+        }
+    }
+}
+
+pub fn write_frame<W: Write, T: Message>(writer: &mut W, value: &T) -> io::Result<()> {
     let bytes = encode_frame(value)?;
     writer.write_all(&bytes)?;
     writer.flush()
 }
 
-/// A complete frame (length prefix + JSON), for callers that queue bytes.
-pub fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
-    let body =
-        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds limit",
-        ));
-    }
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
-    Ok(frame)
+/// A complete frame (length prefix and body), for callers that queue bytes.
+pub fn encode_frame<T: Message>(value: &T) -> io::Result<Vec<u8>> {
+    let mut frame = vec![0; 4];
+    value.encode_body(&mut frame)?;
+    seal(frame)
 }
 
-pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<Option<T>> {
+/// A frame's body length from its length word; an error when no frame can
+/// have it (zero, or beyond `MAX_FRAME_BYTES`).
+pub fn frame_length(word: [u8; 4]) -> io::Result<usize> {
+    let len = u32::from_be_bytes(word) as usize;
+    if len == 0 || len > MAX_FRAME_BYTES {
+        return Err(invalid("invalid frame length"));
+    }
+    Ok(len)
+}
+
+pub fn read_frame<R: Read, T: Message>(reader: &mut R) -> io::Result<Option<T>> {
     let mut header = [0u8; 4];
     loop {
         match reader.read(&mut header[..1]) {
@@ -1007,24 +1341,20 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<Op
         }
     }
     reader.read_exact(&mut header[1..])?;
-    let len = u32::from_be_bytes(header) as usize;
-    if len == 0 || len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid frame length",
-        ));
-    }
+    let len = frame_length(header)?;
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    T::decode_body(&bytes).map(Some)
 }
 
-/// Terminal bytes travel as standard base64 strings (4/3 expansion) instead of
-/// JSON number arrays (3–4x expansion).
+/// Terminal bytes inside JSON messages (`SendInput`) travel as standard
+/// base64 strings (4/3 expansion) instead of JSON number arrays (3–4x
+/// expansion).
 pub mod base64_bytes {
-    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    use serde::{
+        de::{Error, Visitor},
+        Deserializer, Serializer,
+    };
 
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -1053,42 +1383,56 @@ pub mod base64_bytes {
         out
     }
 
+    /// Each character's value, or `INVALID` for one outside the alphabet
+    /// (padding included).
+    const INVALID: u8 = 0xff;
+    static VALUES: [u8; 256] = {
+        let mut values = [INVALID; 256];
+        let mut i = 0;
+        while i < 64 {
+            values[ALPHABET[i] as usize] = i as u8;
+            i += 1;
+        }
+        values
+    };
+
     pub fn decode(text: &str) -> Result<Vec<u8>, &'static str> {
         let text = text.as_bytes();
         if text.len() % 4 != 0 {
             return Err("base64 length is not a multiple of 4");
         }
-        let mut out = Vec::with_capacity(text.len() / 4 * 3);
-        for (index, chunk) in text.chunks(4).enumerate() {
-            let last = index + 1 == text.len() / 4;
-            let mut n = 0u32;
-            let mut padding = 0;
-            for (i, &c) in chunk.iter().enumerate() {
-                let value = match c {
-                    b'A'..=b'Z' => c - b'A',
-                    b'a'..=b'z' => c - b'a' + 26,
-                    b'0'..=b'9' => c - b'0' + 52,
-                    b'+' => 62,
-                    b'/' => 63,
-                    b'=' if last && i >= 2 => {
-                        padding += 1;
-                        0
-                    }
-                    _ => return Err("invalid base64"),
-                };
-                if padding > 0 && c != b'=' {
-                    return Err("invalid base64 padding");
-                }
-                n = (n << 6) | u32::from(value);
+        let Some(split) = text.len().checked_sub(4) else {
+            return Ok(Vec::new());
+        };
+        // Every group but the last has no padding: a table lookup per
+        // character, and one check per group.
+        let (body, last) = text.split_at(split);
+        let mut out = vec![0u8; body.len() / 4 * 3];
+        for (group, bytes) in body.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+            let [a, b, c, d] = [0, 1, 2, 3].map(|i| VALUES[group[i] as usize]);
+            if (a | b | c | d) & 0xc0 != 0 {
+                return Err("invalid base64");
             }
-            out.push((n >> 16) as u8);
-            if padding < 2 {
-                out.push((n >> 8) as u8);
-            }
-            if padding < 1 {
-                out.push(n as u8);
-            }
+            let n =
+                (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+            bytes.copy_from_slice(&n.to_be_bytes()[1..]);
         }
+        // The last group may end in one or two `=`, and nothing after them.
+        let mut n = 0u32;
+        let mut padding = 0;
+        for (i, &c) in last.iter().enumerate() {
+            let value = match VALUES[c as usize] {
+                INVALID if c == b'=' && i >= 2 => {
+                    padding += 1;
+                    0
+                }
+                INVALID => return Err("invalid base64"),
+                _ if padding > 0 => return Err("invalid base64 padding"),
+                value => value,
+            };
+            n = (n << 6) | u32::from(value);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - padding]);
         Ok(out)
     }
 
@@ -1096,9 +1440,22 @@ pub mod base64_bytes {
         serializer.serialize_str(&encode(bytes))
     }
 
+    /// Decodes the string where the deserializer has it (the frame's own
+    /// bytes, when it can lend them), rather than copying it first.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        decode(&text).map_err(D::Error::custom)
+        struct Base64;
+        impl Visitor<'_> for Base64 {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 string")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Vec<u8>, E> {
+                decode(text).map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_str(Base64)
     }
 }
 
@@ -1152,16 +1509,295 @@ mod tests {
         assert!(base64_bytes::decode("Zm*v").is_err());
     }
     #[test]
-    fn terminal_bytes_are_compact_on_the_wire() {
-        let data = vec![b'x'; 3000];
-        let frame = encode_frame(&ServerMessage::Output { offset: 0, data }).unwrap();
-        assert!(frame.len() < 4100, "frame was {} bytes", frame.len());
+    fn terminal_bytes_travel_as_they_are_in_binary_frames() {
+        let data: Vec<u8> = (0..=255).chain(b"\x1b[1mhi{".iter().copied()).collect();
+        // Output: kind, offset, bytes.
+        let frame = encode_frame(&ServerMessage::Output {
+            offset: 1 << 40,
+            data: data.clone(),
+        })
+        .unwrap();
+        assert_eq!(frame.len(), OUTPUT_HEADER + data.len());
+        assert_eq!(
+            u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize,
+            frame.len() - 4
+        );
+        assert_eq!(frame[4], binary_kind::OUTPUT);
+        assert_eq!(&frame[5..13], &(1u64 << 40).to_be_bytes());
+        assert_eq!(&frame[13..], &data[..]);
+        assert_eq!(frame, encode_output_frame(1 << 40, &data).unwrap());
+        assert_eq!(output_frame_parts(&frame), Some((1 << 40, &data[..])));
+        // Query and Input: kind, bytes.
         let frame = encode_frame(&ServerMessage::Query {
             data: b"\x1b[?6n".to_vec(),
         })
         .unwrap();
-        assert_eq!(&frame[4..], br#"{"type":"query","data":"G1s/Nm4="}"#);
-        assert!(MAX_SNAPSHOT_BYTES.div_ceil(3) * 4 + 4096 < MAX_FRAME_BYTES);
+        assert_eq!(frame, b"\0\0\0\x06\x03\x1b[?6n");
+        assert_eq!(output_frame_parts(&frame), None);
+        let frame = encode_frame(&ClientMessage::Input {
+            data: b"ls\r".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(frame, b"\0\0\0\x04\x02ls\r");
+        // An empty one is a frame of its kind alone.
+        assert_eq!(encode_input_frame(b"").unwrap(), b"\0\0\0\x01\x02");
+        // Attached: kind, header length, JSON header, snapshot.
+        let session = session_info();
+        let frame = encode_frame(&ServerMessage::Attached {
+            session: session.clone(),
+            offset: 7,
+            snapshot: b"\x1bcSCREEN".to_vec(),
+            reason: AttachReason::Resize,
+            refreshes: true,
+        })
+        .unwrap();
+        assert_eq!(frame[4], binary_kind::ATTACHED);
+        let header_len = u32::from_be_bytes(frame[5..9].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&frame[9..9 + header_len]).unwrap();
+        assert_eq!(header["offset"], 7);
+        assert_eq!(header["reason"], "resize");
+        assert_eq!(header["refreshes"], true);
+        assert_eq!(header["session"]["id"], "3f6c");
+        assert_eq!(&frame[9 + header_len..], b"\x1bcSCREEN");
+        // The largest snapshot fits a frame, whatever its header.
+        const { assert!(MAX_SNAPSHOT_BYTES + 64 * 1024 < MAX_FRAME_BYTES) };
+    }
+
+    #[test]
+    fn the_json_forms_of_binary_messages_are_gone() {
+        for text in [
+            r#"{"type":"output","offset":0,"data":"eA=="}"#,
+            r#"{"type":"query","data":"eA=="}"#,
+            r#"{"type":"attached","session":{},"offset":0,"snapshot":"","reason":"attach"}"#,
+        ] {
+            let frame = [&(text.len() as u32).to_be_bytes()[..], text.as_bytes()].concat();
+            assert!(
+                read_frame::<_, ServerMessage>(&mut frame.as_slice()).is_err(),
+                "{text}"
+            );
+            assert!(read_frame::<_, Response>(&mut frame.as_slice()).is_err());
+        }
+        let text = r#"{"op":"input","data":"eA=="}"#;
+        let frame = [&(text.len() as u32).to_be_bytes()[..], text.as_bytes()].concat();
+        assert!(read_frame::<_, ClientMessage>(&mut frame.as_slice()).is_err());
+        assert!(read_frame::<_, Request>(&mut frame.as_slice()).is_err());
+        // And serde refuses to make them.
+        assert!(serde_json::to_string(&ClientMessage::Input { data: vec![1] }).is_err());
+        assert!(serde_json::to_string(&ServerMessage::Query { data: vec![1] }).is_err());
+    }
+
+    #[test]
+    fn malformed_binary_frames_are_rejected() {
+        let frame = |body: &[u8]| [&(body.len() as u32).to_be_bytes()[..], body].concat();
+        for body in [
+            // Unknown kinds, and a JSON frame that does not start with `{`.
+            &[9u8, 1, 2][..],
+            &[0],
+            b" {\"type\":\"ok\"}",
+            // Output too short to hold its offset.
+            &[binary_kind::OUTPUT, 0, 0, 0, 0, 0, 0, 0],
+            // An Attached header longer than the frame, not JSON, or
+            // without its fields.
+            &[binary_kind::ATTACHED, 0, 0, 0, 9, b'{', b'}'],
+            &[binary_kind::ATTACHED, 0, 0],
+            &[binary_kind::ATTACHED, 0, 0, 0, 2, b'[', b']'],
+            &[binary_kind::ATTACHED, 0, 0, 0, 2, b'{', b'}'],
+            // A client's frame from the host.
+            &[binary_kind::INPUT, b'x'],
+        ] {
+            assert!(
+                read_frame::<_, Response>(&mut frame(body).as_slice()).is_err(),
+                "{body:?}"
+            );
+        }
+        // The host's frames from a client.
+        for kind in [
+            binary_kind::OUTPUT,
+            binary_kind::QUERY,
+            binary_kind::ATTACHED,
+            7,
+        ] {
+            let body = [kind, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert!(read_frame::<_, Request>(&mut frame(&body).as_slice()).is_err());
+            assert!(read_frame::<_, ClientMessage>(&mut frame(&body).as_slice()).is_err());
+        }
+        // A binary frame cut short is an error, as a JSON one is.
+        let output = encode_output_frame(0, b"abc").unwrap();
+        assert!(read_frame::<_, Response>(&mut &output[..output.len() - 1]).is_err());
+        // Frames beyond the limit are refused both ways.
+        assert!(encode_output_frame(0, &vec![0; MAX_FRAME_BYTES - 9]).is_ok());
+        assert!(encode_output_frame(0, &vec![0; MAX_FRAME_BYTES - 8]).is_err());
+        assert!(frame_length((MAX_FRAME_BYTES as u32 + 1).to_be_bytes()).is_err());
+        assert!(frame_length([0; 4]).is_err());
+        assert_eq!(
+            frame_length((MAX_FRAME_BYTES as u32).to_be_bytes()).unwrap(),
+            MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn binary_frames_carry_no_request_id() {
+        // Attachment traffic, whose req is ignored: none is sent.
+        let input = Request::new(
+            Some(4),
+            ClientMessage::Input {
+                data: b"x".to_vec(),
+            },
+        );
+        let frame = encode_frame(&input).unwrap();
+        assert_eq!(frame, encode_input_frame(b"x").unwrap());
+        assert_eq!(
+            read_frame::<_, Request>(&mut frame.as_slice()).unwrap(),
+            Some(Request::from(ClientMessage::Input {
+                data: b"x".to_vec()
+            }))
+        );
+        let output = Response::new(
+            Some(4),
+            ServerMessage::Output {
+                offset: 1,
+                data: b"x".to_vec(),
+            },
+        );
+        let frame = encode_frame(&output).unwrap();
+        assert_eq!(frame, encode_output_frame(1, b"x").unwrap());
+        assert_eq!(
+            read_frame::<_, Response>(&mut frame.as_slice())
+                .unwrap()
+                .unwrap()
+                .req,
+            None
+        );
+    }
+
+    /// The decoder before the lookup table: the table must accept and
+    /// reject exactly what it did.
+    fn reference_decode(text: &str) -> Result<Vec<u8>, &'static str> {
+        let text = text.as_bytes();
+        if text.len() % 4 != 0 {
+            return Err("base64 length is not a multiple of 4");
+        }
+        let mut out = Vec::with_capacity(text.len() / 4 * 3);
+        for (index, chunk) in text.chunks(4).enumerate() {
+            let last = index + 1 == text.len() / 4;
+            let mut n = 0u32;
+            let mut padding = 0;
+            for (i, &c) in chunk.iter().enumerate() {
+                let value = match c {
+                    b'A'..=b'Z' => c - b'A',
+                    b'a'..=b'z' => c - b'a' + 26,
+                    b'0'..=b'9' => c - b'0' + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    b'=' if last && i >= 2 => {
+                        padding += 1;
+                        0
+                    }
+                    _ => return Err("invalid base64"),
+                };
+                if padding > 0 && c != b'=' {
+                    return Err("invalid base64 padding");
+                }
+                n = (n << 6) | u32::from(value);
+            }
+            out.push((n >> 16) as u8);
+            if padding < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if padding < 1 {
+                out.push(n as u8);
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn base64_decoding_matches_the_reference_on_any_input() {
+        // Every character in every position of a short string, then random
+        // strings over an alphabet weighted towards the tricky ones.
+        let mut texts = Vec::new();
+        for c in 0..=255u8 {
+            for position in 0..8 {
+                let mut text = b"QUJDREVG".to_vec();
+                text[position] = c;
+                texts.push(text.clone());
+                text.truncate(4);
+                if position < 4 {
+                    texts.push(text);
+                }
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pool = b"AZaz09+/==*-_ \n\0\xff";
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| match next() % 4 {
+                        0 => pool[(next() % pool.len() as u64) as usize],
+                        _ => base64_bytes::encode(&[next() as u8]).as_bytes()[0],
+                    })
+                    .collect(),
+            );
+        }
+        for text in texts {
+            // The decoder takes a str; bytes that are not UTF-8 never reach it.
+            let Ok(text) = std::str::from_utf8(&text) else {
+                continue;
+            };
+            assert_eq!(
+                base64_bytes::decode(text),
+                reference_decode(text),
+                "{text:?}"
+            );
+        }
+        for len in 0..300usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 131 + len) as u8).collect();
+            let text = base64_bytes::encode(&bytes);
+            assert_eq!(base64_bytes::decode(&text).unwrap(), bytes);
+            assert_eq!(reference_decode(&text).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn base64_fields_decode_from_escaped_and_borrowed_strings() {
+        // A peer may escape characters JSON allows it to escape; the
+        // decoder then gets a string of its own rather than the frame's.
+        for text in [
+            r#"{"op":"send_input","id":"s","data":"Zm9vYmFy"}"#,
+            r#"{"op":"send_input","id":"s","data":"Zm9vYmFy"}"#,
+            r#"{"op":"send_input","id":"s","data":"Zm9vYmFy","req":null}"#,
+        ] {
+            let expected = ClientMessage::SendInput {
+                id: "s".into(),
+                data: b"foobar".to_vec(),
+            };
+            assert_eq!(
+                serde_json::from_str::<Request>(text).unwrap().message,
+                expected,
+                "{text}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<ClientMessage>(text.as_bytes()).unwrap(),
+                expected,
+                "{text}"
+            );
+        }
+        let error =
+            serde_json::from_str::<ClientMessage>(r#"{"op":"send_input","id":"s","data":"Zm=v"}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("invalid base64 padding"), "{error}");
+        assert!(serde_json::from_str::<ClientMessage>(
+            r#"{"op":"send_input","id":"s","data":[1,2]}"#
+        )
+        .is_err());
     }
     #[test]
     fn messages_without_required_fields_are_rejected() {
@@ -1397,6 +2033,7 @@ mod tests {
                 cols: u16::MAX,
                 rows: 1,
             },
+            ClientMessage::Refresh,
             ClientMessage::Detach,
             ClientMessage::Ping,
             ClientMessage::Kill { id: "s".into() },
@@ -1508,6 +2145,7 @@ mod tests {
                 offset: u64::MAX,
                 snapshot: (0..=255).rev().collect(),
                 reason: AttachReason::Resync,
+                refreshes: true,
             },
             ServerMessage::Resized {
                 offset: u64::MAX,
@@ -1551,12 +2189,16 @@ mod tests {
             let bare = encode_frame(&message).unwrap();
             // Without an ID the envelope is the bare message.
             assert_eq!(encode_frame(&Request::from(message.clone())).unwrap(), bare);
+            // Binary frames (`Input`) carry none.
+            let binary = !is_json(&bare[4..]);
+            assert_eq!(binary, matches!(message, ClientMessage::Input { .. }));
             for req in [None, Some(0), Some(41), Some(u64::MAX)] {
                 let request = Request::new(req, message.clone());
                 let frame = encode_frame(&request).unwrap();
                 let decoded: Request = read_frame(&mut frame.as_slice()).unwrap().unwrap();
-                assert_eq!(decoded, request);
-                // An old-style reader of bare messages still understands it.
+                let expected = Request::new(req.filter(|_| !binary), message.clone());
+                assert_eq!(decoded, expected);
+                // A reader of bare messages understands it too.
                 let bare: ClientMessage = read_frame(&mut frame.as_slice()).unwrap().unwrap();
                 assert_eq!(bare, message);
             }
@@ -1567,13 +2209,16 @@ mod tests {
                 encode_frame(&Response::from(message.clone())).unwrap(),
                 bare
             );
+            let binary = !is_json(&bare[4..]);
+            assert_eq!(binary, message.is_binary(), "{message:?}");
             let decoded: Response = read_frame(&mut bare.as_slice()).unwrap().unwrap();
             assert_eq!(decoded, Response::from(message.clone()));
             for req in [Some(0), Some(u64::MAX)] {
                 let response = Response::new(req, message.clone());
                 let frame = encode_frame(&response).unwrap();
                 let decoded: Response = read_frame(&mut frame.as_slice()).unwrap().unwrap();
-                assert_eq!(decoded, response);
+                let expected = Response::new(req.filter(|_| !binary), message.clone());
+                assert_eq!(decoded, expected);
                 let bare: ServerMessage = read_frame(&mut frame.as_slice()).unwrap().unwrap();
                 assert_eq!(bare, message);
             }
@@ -1590,16 +2235,16 @@ mod tests {
                 offset: 12,
                 snapshot,
                 reason: AttachReason::Attach,
+                refreshes: true,
             },
         );
         let frame = encode_frame(&response).unwrap();
         assert!(frame.len() <= MAX_FRAME_BYTES + 4);
-        assert_eq!(
-            read_frame::<_, Response>(&mut frame.as_slice())
-                .unwrap()
-                .unwrap(),
-            response
-        );
+        // A binary frame, which carries no request ID.
+        let decoded = read_frame::<_, Response>(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert!(decoded == Response::from(response.message));
         let request = Request::new(
             Some(2),
             ClientMessage::SendInput {
@@ -1825,6 +2470,7 @@ mod tests {
                 ClientMessage::Attach { .. }
                     | ClientMessage::Input { .. }
                     | ClientMessage::Resize { .. }
+                    | ClientMessage::Refresh
                     | ClientMessage::Detach
             );
             assert_eq!(message.belongs_to_attachment(), attachment, "{message:?}");

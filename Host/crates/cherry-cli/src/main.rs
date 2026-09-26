@@ -6,7 +6,9 @@ mod status;
 mod stderr_relay;
 mod sys;
 mod timing;
+mod tracker;
 mod transport;
+mod writer;
 
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
@@ -884,6 +886,172 @@ mod tests {
         assert!(matches!(decoder.next().unwrap(), Some(ServerMessage::Ok)));
         assert!(matches!(decoder.next().unwrap(), Some(ServerMessage::Ok)));
         assert!(decoder.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn decoder_takes_binary_frames_and_merges_output_that_arrived_together() {
+        let output = |offset: u64, data: &[u8]| {
+            frame(&ServerMessage::Output {
+                offset,
+                data: data.to_vec(),
+            })
+        };
+        let stream = [
+            output(10, b"ab"),
+            output(12, b"cd"),
+            output(14, b""),
+            output(14, b"ef"),
+            // Not contiguous: a message of its own.
+            output(30, b"x"),
+            frame(&ServerMessage::Query {
+                data: b"\x1b[?6n".to_vec(),
+            }),
+            output(31, b"y"),
+            frame(&ServerMessage::Ok),
+            output(32, b"z"),
+        ]
+        .concat();
+        let mut decoder = FrameDecoder::with_bytes(&stream, false);
+        let mut messages = Vec::new();
+        while let Some(message) = decoder.next().unwrap() {
+            messages.push(message);
+        }
+        let output = |offset: u64, data: &[u8]| ServerMessage::Output {
+            offset,
+            data: data.to_vec(),
+        };
+        assert_eq!(
+            messages,
+            [
+                output(10, b"abcdef"),
+                output(30, b"x"),
+                ServerMessage::Query {
+                    data: b"\x1b[?6n".to_vec()
+                },
+                output(31, b"y"),
+                ServerMessage::Ok,
+                output(32, b"z"),
+            ]
+        );
+        // What has not arrived whole is left for later, split anywhere.
+        for split in 1..stream.len() {
+            let mut decoder = FrameDecoder::with_bytes(&stream[..split], false);
+            let mut got = Vec::new();
+            while let Some(message) = decoder.next().unwrap() {
+                got.push(message);
+            }
+            decoder.push(&stream[split..]);
+            while let Some(message) = decoder.next().unwrap() {
+                got.push(message);
+            }
+            let bytes = |messages: &[ServerMessage]| -> Vec<u8> {
+                messages
+                    .iter()
+                    .flat_map(|message| match message {
+                        ServerMessage::Output { data, .. } => data.clone(),
+                        _ => b"|".to_vec(),
+                    })
+                    .collect()
+            };
+            assert_eq!(bytes(&got), bytes(&messages), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn decoder_gives_a_big_output_frame_as_it_arrives() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let stream = [
+            frame(&ServerMessage::Output {
+                offset: 1000,
+                data: data.clone(),
+            }),
+            frame(&ServerMessage::Query {
+                data: b"\x1b[c".to_vec(),
+            }),
+            frame(&ServerMessage::Output {
+                offset: 201_000,
+                data: b"after".to_vec(),
+            }),
+        ]
+        .concat();
+        let mut decoder = FrameDecoder::with_bytes(&[], false);
+        let mut output = Vec::new();
+        let mut offset = 1000;
+        let mut rest = Vec::new();
+        for piece in stream.chunks(16 * 1024 + 7) {
+            decoder.push(piece);
+            while let Some(message) = decoder.next().unwrap() {
+                match message {
+                    ServerMessage::Output { offset: at, data } => {
+                        // In parts, contiguous, none tiny but the last.
+                        assert_eq!(at, offset);
+                        offset += data.len() as u64;
+                        assert!(data.len() >= 4096 || offset == 201_000 || at == 201_000);
+                        if at < 201_000 {
+                            output.push(data);
+                        } else {
+                            rest.push(ServerMessage::Output { offset: at, data });
+                        }
+                    }
+                    other => rest.push(other),
+                }
+            }
+        }
+        assert!(output.len() > 1, "not given in parts");
+        assert_eq!(output.concat(), data);
+        assert_eq!(
+            rest,
+            [
+                ServerMessage::Query {
+                    data: b"\x1b[c".to_vec()
+                },
+                ServerMessage::Output {
+                    offset: 201_000,
+                    data: b"after".to_vec()
+                }
+            ]
+        );
+        // What was not given yet is a whole frame again.
+        let mut decoder = FrameDecoder::with_bytes(&stream[..50_000], false);
+        let Some(ServerMessage::Output {
+            offset,
+            data: first,
+        }) = decoder.next().unwrap()
+        else {
+            panic!("no output yet");
+        };
+        assert_eq!(offset, 1000);
+        let mut again = decoder.take_buffered();
+        again.extend_from_slice(&stream[50_000..]);
+        let mut decoder = FrameDecoder::with_bytes(&again, false);
+        let Some(ServerMessage::Output {
+            offset,
+            data: second,
+        }) = decoder.next().unwrap()
+        else {
+            panic!("not an output frame");
+        };
+        assert_eq!(offset, 1000 + first.len() as u64);
+        assert_eq!([first, second].concat(), data);
+    }
+
+    #[test]
+    fn decoder_rejects_malformed_binary_frames() {
+        for body in [
+            &[9u8, 1, 2][..],
+            &[cherry_protocol::binary_kind::OUTPUT, 0, 0],
+            &[cherry_protocol::binary_kind::INPUT, b'x'],
+            &[cherry_protocol::binary_kind::ATTACHED, 0, 0, 0, 9, b'{'],
+            b"{\"type\":\"output\",\"offset\":0,\"data\":\"eA==\"}",
+        ] {
+            let frame = [&(body.len() as u32).to_be_bytes()[..], body].concat();
+            let mut decoder = FrameDecoder::with_bytes(&frame, false);
+            let error = decoder.next().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("host sent an invalid frame"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

@@ -17,8 +17,8 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, priority, read_frame, write_frame, ClientMessage, Request, Response,
-    ServerMessage, SessionEvent, SessionState, MAX_CLIENT_ID_BYTES, MAX_FRAME_BYTES,
+    encode_frame, error_code, priority, read_frame, write_frame, ClientMessage, Message, Request,
+    Response, ServerMessage, SessionEvent, SessionState, MAX_CLIENT_ID_BYTES, MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
 };
 use std::{
@@ -255,9 +255,7 @@ fn read_first(stream: &mut UnixStream) -> io::Result<Option<First>> {
             .map(|frame| Some(First::Holder(frame)))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
     }
-    serde_json::from_slice(&body)
-        .map(|request| Some(First::Client(request)))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Request::decode_body(&body).map(|request| Some(First::Client(request)))
 }
 
 fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
@@ -743,6 +741,13 @@ impl Connection {
                         cols,
                         rows,
                     })?;
+                return Ok((None, Flow::Continue));
+            }
+            ClientMessage::Refresh => {
+                self.attached
+                    .as_ref()
+                    .context("attach before refresh")?
+                    .send(Command::Refresh { lease: self.lease })?;
                 return Ok((None, Flow::Continue));
             }
             ClientMessage::Detach => {

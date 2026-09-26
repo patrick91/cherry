@@ -65,6 +65,13 @@
 //!   `size` reply takes no work, so the pass goes on. An older holder is
 //!   sent neither (it would answer an unknown snapshot kind with an
 //!   error).
+//! - Version 6 adds, daemon to holder, `Pace`: how far the holder may read
+//!   the program's output (`limit`, an output offset), so that the program
+//!   goes at the pace of the session's fastest client when all of them take
+//!   their output slowly, without the daemon ever leaving the link unread
+//!   (see `session::Worker::pace`); `null` lifts it. A holder without a daemon
+//!   reads freely. An older holder is never sent it, and is never held
+//!   back: its slow clients lag and are resynchronized instead.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -78,19 +85,23 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 5;
+pub const LINK_VERSION: u16 = 6;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
 /// The oldest link version whose holders answer the snapshot kind
 /// `resized`.
 pub const RESIZED_SNAPSHOT_VERSION: u16 = 5;
+/// The oldest link version whose holders take `Pace`.
+pub const PACE_VERSION: u16 = 6;
 /// The oldest link version this daemon adopts holders of.
 pub const MIN_LINK_VERSION: u16 = 1;
 /// Frames are at most this long (an 8 MiB snapshot, and room to spare).
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Bytes before the meta: kind, version and the meta length.
 const HEADER: usize = 1 + 2 + 4;
+/// The room a read into `Reader`'s buffer has, at least.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// Frame kinds. Holder to daemon below 64, daemon to holder from 64.
 pub mod kind {
@@ -124,12 +135,15 @@ pub mod kind {
     pub const REFUSED: u8 = 74;
     /// Version 5.
     pub const ATTENDED: u8 = 75;
+    /// Version 6.
+    pub const PACE: u8 = 76;
 
     /// The link version that introduced a daemon-to-holder kind.
     pub fn since(kind: u8) -> u16 {
         match kind {
             SCREEN | UPDATE => 2,
             ATTENDED => 5,
+            PACE => 6,
             _ => 1,
         }
     }
@@ -233,10 +247,22 @@ impl Reader {
             self.buffer.clear();
             self.start = 0;
         }
-        let mut chunk = [0u8; 65536];
+        // Frames left for a later pass (a reader that stops early, as a
+        // holder does after a costly request, see `holder::Holder::pump_link`)
+        // keep the buffer from being emptied:
+        // what was taken goes once it is at least as much as what is left,
+        // so the buffer never holds more than twice what waits in it.
+        if self.start > 0 && self.start >= self.buffered() {
+            self.compact();
+        }
         let mut taken = 0;
         while taken < limit {
-            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            // Read into the buffer's spare room: nothing is zeroed or
+            // copied first.
+            self.buffer.reserve(READ_CHUNK);
+            let spare = self.buffer.spare_capacity_mut();
+            let want = spare.len().min(limit - taken);
+            let n = unsafe { libc::read(fd, spare.as_mut_ptr().cast(), want) };
             if n < 0 {
                 let error = io::Error::last_os_error();
                 match error.kind() {
@@ -248,7 +274,8 @@ impl Reader {
             if n == 0 {
                 return false;
             }
-            self.buffer.extend_from_slice(&chunk[..n as usize]);
+            // The read initialized them.
+            unsafe { self.buffer.set_len(self.buffer.len() + n as usize) };
             taken += n as usize;
         }
         true
@@ -279,6 +306,11 @@ impl Reader {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.start == self.buffer.len()
+    }
+
+    /// Bytes read and not yet taken as frames.
+    pub fn buffered(&self) -> usize {
+        self.buffer.len() - self.start
     }
 
     fn compact(&mut self) {
@@ -612,6 +644,16 @@ pub struct Attended {
     pub attached: bool,
 }
 
+/// Daemon to holder, version 6: read the program's output only while the
+/// output offset is below `limit` (and no further than it, as nearly as a
+/// read allows); None: read freely. The latest one counts. A holder that
+/// loses its daemon reads freely again.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Pace {
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
 /// The screen as text, with its history when `scrollback`.
 #[derive(Serialize, Deserialize)]
 pub struct ScreenRequest {
@@ -778,6 +820,42 @@ mod tests {
         drop(theirs);
         assert!(!reader.fill(std::os::unix::io::AsRawFd::as_raw_fd(&ours), 1 << 20));
         let _ = ours.flush();
+    }
+
+    #[test]
+    fn a_reader_that_stops_early_keeps_its_buffer_bounded() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let frame = encode(kind::OUTPUT, &OutputMeta { offset: 0 }, &[b'x'; 4000]);
+        const FRAMES: usize = 4000;
+        // The holder's side keeps its end full.
+        let writer = std::thread::spawn(move || {
+            for _ in 0..FRAMES {
+                (&theirs).write_all(&frame).unwrap();
+            }
+        });
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&ours);
+        let mut reader = Reader::default();
+        let mut taken = 0;
+        let limit: usize = 64 * 1024;
+        while taken < FRAMES {
+            // Take a few frames and leave the rest for later, as a worker
+            // that a client holds back does; at most `limit` waits here.
+            let room = limit.saturating_sub(reader.buffered());
+            // False once the writer is done and its end closed.
+            let _ = reader.fill(fd, room);
+            for _ in 0..4 {
+                if reader.next().unwrap().is_some() {
+                    taken += 1;
+                }
+            }
+            assert!(
+                reader.buffer.len() <= 2 * limit + 8192,
+                "{} bytes after {taken} frames",
+                reader.buffer.len()
+            );
+        }
+        writer.join().unwrap();
     }
 
     #[test]

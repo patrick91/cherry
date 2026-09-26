@@ -302,6 +302,9 @@ struct FakeHolder {
     /// What the daemon said of attached clients (`Attended`), in order;
     /// `next` passes over those frames.
     attended: Vec<bool>,
+    /// How far the daemon let the program's output be read (`Pace`), in
+    /// order; `next` passes over those frames too.
+    paces: Vec<Option<u64>>,
 }
 
 impl FakeHolder {
@@ -316,6 +319,7 @@ impl FakeHolder {
             id,
             received: Vec::new(),
             attended: Vec::new(),
+            paces: Vec::new(),
         }
     }
 
@@ -328,6 +332,10 @@ impl FakeHolder {
             if frame.kind == link::ATTENDED {
                 self.attended
                     .push(frame.meta["attached"].as_bool().expect("attached"));
+                continue;
+            }
+            if frame.kind == link::PACE {
+                self.paces.push(frame.meta["limit"].as_u64());
                 continue;
             }
             return frame;
@@ -1427,4 +1435,85 @@ fn a_subscriber_that_falls_behind_is_told_to_resync_and_stays_connected() {
     write_frame(&mut lagging, &ClientMessage::Ping).unwrap();
     assert_eq!(receive(&mut lagging), ServerMessage::Pong);
     assert_eq!(host.sessions().len(), 1);
+}
+
+#[test]
+fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens() {
+    let host = Host::new();
+    let mut holder = FakeHolder::register(
+        &host,
+        link::VERSION,
+        hello(&Uuid::new_v4().to_string(), json!({})),
+    );
+    wait_until("the session", || {
+        host.sessions().iter().any(|s| s.id == holder.id)
+    });
+    let id = holder.id.clone();
+    let snapshot_reply = |holder: &mut FakeHolder,
+                          request: &link::Frame,
+                          kind: &str,
+                          size: (u16, u16),
+                          bytes: &[u8]| {
+        holder.send(
+            link::SNAPSHOT_REPLY,
+            link::VERSION,
+            json!({"req": request.meta["req"], "kind": kind, "offset": 5, "cols": size.0, "rows": size.1}),
+            bytes,
+        );
+    };
+    thread::scope(|scope| {
+        // A window of the grid's size, and a larger one.
+        let first = scope.spawn(|| host.attach(&id, 80, 24).0);
+        let request = holder.expect(link::SNAPSHOT);
+        snapshot_reply(&mut holder, &request, "limited", (80, 24), b"SNAP");
+        let mut small = first.join().unwrap();
+        let second = scope.spawn(|| host.attach(&id, 100, 30).0);
+        let request = holder.expect(link::SNAPSHOT);
+        snapshot_reply(&mut holder, &request, "limited", (80, 24), b"SNAP");
+        let mut large = second.join().unwrap();
+        // The small window shrinks the grid; the holder is asked where the
+        // new size took effect, which it may answer without the screens
+        // (the program on the alternate screen repaints).
+        send(&mut small, &ClientMessage::Resize { cols: 70, rows: 20 });
+        let resize = holder.expect(link::RESIZE);
+        assert_eq!(
+            (resize.meta["cols"].as_u64(), resize.meta["rows"].as_u64()),
+            (Some(70), Some(20))
+        );
+        let resized = holder.expect(link::SNAPSHOT);
+        assert_eq!(resized.meta["kind"], "resized");
+        // Meanwhile the large window asks for the screens (it has no copy
+        // to paint its viewport from); its input after it shows the host
+        // took the request.
+        send(&mut large, &ClientMessage::Refresh);
+        input(&mut large, b"x");
+        let typed = holder.expect(link::INPUT);
+        assert_eq!(typed.data, b"x");
+        // The answer carries no screens: the large window still gets them.
+        snapshot_reply(&mut holder, &resized, "size", (70, 20), b"");
+        let refresh = holder.expect(link::SNAPSHOT);
+        assert_eq!(refresh.meta["kind"], "refresh");
+        snapshot_reply(&mut holder, &refresh, "refresh", (70, 20), b"SCREENS");
+        large
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut seen = Vec::new();
+        loop {
+            match receive(&mut large) {
+                ServerMessage::Resized { cols, rows, .. } => {
+                    seen.push(format!("resized {cols}x{rows}"))
+                }
+                ServerMessage::Attached {
+                    reason, snapshot, ..
+                } => {
+                    assert_eq!(reason, AttachReason::Resize);
+                    assert_eq!(snapshot, b"SCREENS");
+                    seen.push("screens".into());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["resized 70x20", "screens"]);
+    });
 }

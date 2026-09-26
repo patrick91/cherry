@@ -231,7 +231,7 @@ final class HostControlConnection: @unchecked Sendable {
             do {
                 while let body = try decoder.nextFrame() {
                     do {
-                        continuation.yield(.frame(try json.decode(HostResponse.self, from: body)))
+                        continuation.yield(.frame(try HostResponse.decode(frameBody: body, using: json)))
                     } catch {
                         continuation.yield(.unreadable(
                             req: HostResponse.requestID(inUndecodable: body), reason: String(describing: error)
@@ -279,7 +279,7 @@ final class HostControlLease: @unchecked Sendable {
 }
 
 /// The app's one control connection to a session host (`cherry control`,
-/// protocol 5). It verifies the host's identity, subscribes to events, keeps
+/// protocol 6). It verifies the host's identity, subscribes to events, keeps
 /// `sessions` current from them, pings every heartbeat interval, and — while
 /// leased — reconnects with backoff, re-listing after every reconnect or
 /// host resync.
@@ -758,6 +758,8 @@ final class HostControl: ObservableObject {
             } else if case .event(let event) = response.message {
                 apply(event, from: connection)
             }
+            // Anything else without a `req` (attachment traffic, which
+            // includes every binary frame) is not for a control connection.
         case .unreadable(let req, _):
             guard let req, let request = pending.removeValue(forKey: req) else { return }
             request.timeout?.cancel()

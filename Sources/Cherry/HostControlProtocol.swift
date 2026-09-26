@@ -1,18 +1,22 @@
 import Foundation
 
-/// Protocol v5 between Cherry and a session host (Host/crates/cherry-protocol),
+/// Protocol v6 between Cherry and a session host (Host/crates/cherry-protocol),
 /// as `cherry control` relays it on its standard input and output.
 ///
-/// A frame is a 4-byte big-endian length followed by that many bytes of JSON.
-/// Requests are tagged by `op`, replies and events by `type`. Any request may
-/// carry `"req": <u64>`, which the host echoes on its direct reply, so several
-/// requests can be in flight on one connection. Events carry none. Terminal
-/// bytes travel as standard padded base64. Unknown fields are ignored.
+/// A frame is a 4-byte big-endian length followed by that many bytes. A body
+/// whose first byte is `{` is JSON, which is all the control connection
+/// sends and expects: requests are tagged by `op`, replies and events by
+/// `type`. Any request may carry `"req": <u64>`, which the host echoes on its
+/// direct reply, so several requests can be in flight on one connection.
+/// Events carry none. Terminal bytes in JSON (`SendInput`) travel as standard
+/// padded base64. Unknown fields are ignored. Any other body is a binary
+/// frame of attachment traffic (`HostBinaryFrame`), which only `cherry
+/// attach` sends and receives: a control connection skips one it gets.
 enum HostProtocol {
-    /// v5: an attach adapter names its client (`cherry attach --client-id`,
-    /// a tab's ID), and the host replaces that client's older attachment.
-    /// The app's control connection speaks the same messages as in v4.
-    static let version: UInt32 = 5
+    /// v6: attachment traffic (output, input, queries and snapshots) travels
+    /// in binary frames instead of base64 in JSON. The app's control
+    /// connection speaks the same JSON messages as in v5.
+    static let version: UInt32 = 6
     static let maxFrameBytes = 16 * 1_024 * 1_024
     /// The most bytes one `SendInput` carries.
     static let maxInputBytes = 64 * 1_024
@@ -79,6 +83,15 @@ enum HostFrame {
         return encoder
     }()
 
+    /// The first byte of every JSON body; any other first byte is a binary
+    /// frame's kind.
+    static let jsonMarker = UInt8(ascii: "{")
+
+    /// Whether a frame body is JSON rather than a binary frame.
+    static func isJSON(_ body: Data) -> Bool {
+        body.first == jsonMarker
+    }
+
     /// Length prefix + body.
     static func frame(body: Data) throws -> Data {
         guard !body.isEmpty, body.count <= HostProtocol.maxFrameBytes else {
@@ -90,8 +103,151 @@ enum HostFrame {
         return frame
     }
 
+    /// A JSON frame. Every message the control connection sends is an
+    /// object, so its body starts with `{` as the host requires.
     static func encode<Value: Encodable>(_ value: Value) throws -> Data {
         try frame(body: encoder.encode(value))
+    }
+
+    static func encode(_ binary: HostBinaryFrame) throws -> Data {
+        try frame(body: binary.body)
+    }
+}
+
+enum HostBinaryFrameError: Error, Equatable, LocalizedError {
+    /// The body is too short for its kind, or its parts do not add up.
+    case malformed(kind: UInt8, length: Int)
+    case unknownKind(UInt8)
+
+    var errorDescription: String? {
+        switch self {
+        case .malformed(let kind, let length):
+            "The session host sent a malformed binary frame (kind \(kind), \(length) bytes)."
+        case .unknownKind(let kind):
+            "The session host sent a binary frame of unknown kind \(kind)."
+        }
+    }
+}
+
+/// A frame body that is not JSON: attachment traffic, raw bytes after a
+/// one-byte kind, integers big-endian. Only `cherry attach` sends and
+/// receives these; a control connection never attaches, so it skips any
+/// that arrive (`HostResponse.decode(frameBody:using:)`).
+enum HostBinaryFrame: Equatable, Sendable {
+    /// Host to client: the output from byte position `offset` of the stream.
+    case output(offset: UInt64, data: Data)
+    /// Client to host: bytes for the attached session's program.
+    case input(Data)
+    /// Host to client: terminal queries for the client's terminal to answer.
+    case query(Data)
+    /// Host to client: a snapshot. `header` is the JSON object of the other
+    /// `Attached` fields (session, offset, reason, …).
+    case attached(header: Data, snapshot: Data)
+
+    enum Kind {
+        static let output: UInt8 = 1
+        static let input: UInt8 = 2
+        static let query: UInt8 = 3
+        static let attached: UInt8 = 4
+    }
+
+    /// Output's kind byte and offset; Attached's kind byte and header length.
+    private static let outputPrefix = 1 + 8
+    private static let attachedPrefix = 1 + 4
+
+    var kind: UInt8 {
+        switch self {
+        case .output: Kind.output
+        case .input: Kind.input
+        case .query: Kind.query
+        case .attached: Kind.attached
+        }
+    }
+
+    /// The `type` of the JSON message this frame replaced (v5).
+    static func name(ofKind kind: UInt8) -> String {
+        switch kind {
+        case Kind.output: "output"
+        case Kind.input: "input"
+        case Kind.query: "query"
+        case Kind.attached: "attached"
+        default: "binary \(kind)"
+        }
+    }
+
+    /// Checks a binary body's layout without copying its bytes and returns
+    /// its kind. Throws `.unknownKind` for a kind this version does not
+    /// know, whose layout it cannot check.
+    @discardableResult
+    static func validate(_ body: Data) throws -> UInt8 {
+        guard let kind = body.first, kind != HostFrame.jsonMarker else {
+            throw HostBinaryFrameError.malformed(kind: body.first ?? 0, length: body.count)
+        }
+        let malformed = HostBinaryFrameError.malformed(kind: kind, length: body.count)
+        switch kind {
+        case Kind.output:
+            guard body.count >= outputPrefix else { throw malformed }
+        case Kind.input, Kind.query:
+            break
+        case Kind.attached:
+            guard body.count >= attachedPrefix else { throw malformed }
+            let headerLength = Int(readUInt32(body, at: 1))
+            // The header is a JSON object: at least `{}`.
+            guard headerLength >= 2, headerLength <= body.count - attachedPrefix,
+                  body[body.startIndex + attachedPrefix] == HostFrame.jsonMarker
+            else { throw malformed }
+        default:
+            throw HostBinaryFrameError.unknownKind(kind)
+        }
+        return kind
+    }
+
+    /// Decodes a binary body (one `HostFrame.isJSON` rejects).
+    init(body: Data) throws {
+        let kind = try Self.validate(body)
+        let start = body.startIndex
+        switch kind {
+        case Kind.output:
+            self = .output(
+                offset: Self.readUInt64(body, at: 1),
+                data: Data(body[(start + Self.outputPrefix)...])
+            )
+        case Kind.input:
+            self = .input(Data(body[(start + 1)...]))
+        case Kind.query:
+            self = .query(Data(body[(start + 1)...]))
+        default:
+            let headerEnd = start + Self.attachedPrefix + Int(Self.readUInt32(body, at: 1))
+            self = .attached(
+                header: Data(body[(start + Self.attachedPrefix)..<headerEnd]),
+                snapshot: Data(body[headerEnd...])
+            )
+        }
+    }
+
+    /// The frame body (without its length prefix).
+    var body: Data {
+        var body = Data([kind])
+        switch self {
+        case .output(let offset, let data):
+            withUnsafeBytes(of: offset.bigEndian) { body.append(contentsOf: $0) }
+            body.append(data)
+        case .input(let data), .query(let data):
+            body.append(data)
+        case .attached(let header, let snapshot):
+            withUnsafeBytes(of: UInt32(clamping: header.count).bigEndian) { body.append(contentsOf: $0) }
+            body.append(header)
+            body.append(snapshot)
+        }
+        return body
+    }
+
+    private static func readUInt32(_ body: Data, at index: Int) -> UInt32 {
+        body[(body.startIndex + index)..<(body.startIndex + index + 4)].reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    private static func readUInt64(_ body: Data, at index: Int) -> UInt64 {
+        body[(body.startIndex + index)..<(body.startIndex + index + 8)].reduce(0) { $0 << 8 | UInt64($1) }
     }
 }
 
@@ -395,8 +551,9 @@ enum HostServerMessage: Equatable, Sendable {
     /// An event of a kind this version does not know.
     case unknownEvent(kind: String)
     case screenText(HostScreenText)
-    /// A message a control connection does not expect (attachment traffic)
-    /// or does not know.
+    /// A message a control connection does not expect (attachment traffic,
+    /// binary frames included, named `HostBinaryFrame.name(ofKind:)`) or
+    /// does not know.
     case other(type: String)
 }
 
@@ -487,8 +644,27 @@ extension HostResponse: Codable {
 
     /// Just the `req` of a frame whose message could not be decoded, so the
     /// request it answers still fails instead of waiting for its timeout.
+    /// A binary frame answers no request.
     static func requestID(inUndecodable body: Data) -> UInt64? {
         struct Envelope: Decodable { let req: UInt64? }
+        guard HostFrame.isJSON(body) else { return nil }
         return (try? JSONDecoder().decode(Envelope.self, from: body))?.req
+    }
+
+    /// A frame body as a control connection reads it. JSON decodes as a
+    /// `HostResponse`. A binary frame is attachment traffic, which never
+    /// answers a request, so it becomes `.other` without a `req`, named
+    /// after its kind (a kind this version does not know too, like an
+    /// unknown `type`); its bytes are checked, not copied. Throws for JSON
+    /// it cannot decode and for a malformed binary frame.
+    static func decode(frameBody body: Data, using decoder: JSONDecoder) throws -> HostResponse {
+        if HostFrame.isJSON(body) { return try decoder.decode(HostResponse.self, from: body) }
+        let kind: UInt8
+        do {
+            kind = try HostBinaryFrame.validate(body)
+        } catch HostBinaryFrameError.unknownKind(let unknown) {
+            kind = unknown
+        }
+        return HostResponse(req: nil, message: .other(type: HostBinaryFrame.name(ofKind: kind)))
     }
 }

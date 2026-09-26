@@ -51,6 +51,7 @@ impl Window {
                     offset,
                     snapshot,
                     reason,
+                    ..
                 } => {
                     assert_eq!(reason, AttachReason::Resize);
                     return (session, offset, snapshot);
@@ -468,10 +469,12 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
 #[test]
 fn a_resync_delivers_the_clipboard_writes_of_output_the_client_missed() {
     let host = Host::new();
-    // About 6 MiB: more than a client may have queued. A clipboard write
-    // and a title follow the first MiB, and another title comes last.
+    // About 12 MiB: more than a client may have waiting for it (its socket,
+    // which Linux lets hold up to 3 MiB, and its 4 MiB output budget). A
+    // clipboard write and a title follow the first MiB, and another title
+    // comes last.
     let session = host.create(shell(
-        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]2;FIRST\\007\\033]52;c;Q0xJUA==\\007'; dd if=/dev/zero bs=65536 count=80 2>/dev/null | tr '\\0' y; printf '\\033]2;SECOND\\007\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
+        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]2;FIRST\\007\\033]52;c;Q0xJUA==\\007'; dd if=/dev/zero bs=65536 count=176 2>/dev/null | tr '\\0' y; printf '\\033]2;SECOND\\007\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
     ));
     let (mut slow, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut slow_screen = Screen::new(80, 24, offset, &snapshot);
@@ -587,6 +590,7 @@ fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             session: attached,
             offset,
             snapshot,
+            ..
         } => {
             assert_eq!((attached.cols, attached.rows), (100, 30));
             Screen::new(100, 30, offset, &snapshot)
@@ -644,4 +648,41 @@ fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     screen.wait_text(&mut active, "LINE:after");
     assert_eq!(lagging_screen.offset, screen.offset);
     assert_eq!(lagging_screen.text(), screen.text());
+}
+
+#[test]
+fn a_refresh_is_answered_with_the_screens_of_the_grid() {
+    let host = Host::new();
+    let session = host.create(shell(
+        "stty -echo; printf '\\033[?2004hREADY\\r\\n'; IFS= read -r line; printf 'GOT:%s\\r\\n' \"$line\"; exec sleep 60",
+    ));
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut window = Window::new(80, 24, offset, &snapshot);
+    window.wait_text(&mut socket, "READY");
+    // A client that keeps no copy of the screen asks for one: the screens
+    // of the grid at the stream's offset, which the window shows already.
+    send(&mut socket, &ClientMessage::Refresh);
+    let (grid, at, refresh) = window.until_attached(&mut socket);
+    assert_eq!((grid.cols, grid.rows), (80, 24));
+    assert_eq!(at, window.offset, "the replacement is placed in the stream");
+    assert!(!is_full(&refresh) && refresh.len() < 16 * 1024);
+    let mut copy = Terminal::new(80, 24, 0).unwrap();
+    copy.feed(&refresh);
+    assert!(copy.screen_text().unwrap().contains("READY"));
+    assert!(copy
+        .modes()
+        .unwrap()
+        .windows(8)
+        .any(|m| m == b"\x1b[?2004h"));
+    // Output goes on after it.
+    input(&mut socket, b"after\n");
+    window.replace(&grid, at, &refresh);
+    window.wait_text(&mut socket, "GOT:after");
+    // A Refresh without an attachment is refused.
+    let mut control = host.connect();
+    send(&mut control, &ClientMessage::Refresh);
+    assert!(matches!(
+        receive(&mut control),
+        ServerMessage::Error { code, .. } if code == error_code::REQUEST_FAILED
+    ));
 }

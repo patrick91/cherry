@@ -11,6 +11,7 @@ mod screen;
 mod session;
 mod signals;
 mod stream;
+mod terminal_thread;
 mod watch;
 
 use anyhow::Result;

@@ -884,3 +884,47 @@ fn a_resized_snapshot_holds_the_screens_unless_the_program_repaints_them() {
     }
     assert_eq!(first.meta["offset"], second.meta["offset"]);
 }
+
+#[test]
+fn replies_to_the_programs_queries_reach_it_before_input_that_follows_them() {
+    // Enabling in-band resize reports (mode 2048) has the host's terminal
+    // answer at once with the size; the display stream does not single it
+    // out as a query the host answers. However long the terminal takes to
+    // parse the output, input that comes after it reaches the program after
+    // the reply, as it would if the holder parsed the output itself.
+    let sandbox = Sandbox::new();
+    let (_holder, mut daemon) = held_session(
+        &sandbox,
+        "stty raw -echo; printf 'GO\\033[?2048hQ'; got=''; \
+         while :; do c=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+         got=\"$got$c\"; [ \"$c\" = 6b ] && break; done; \
+         printf 'GOT:%s:END' \"$got\"; exec sleep 30",
+    );
+    // The output with the query, then input at once.
+    let mut seen = Vec::new();
+    while !seen.contains(&b'Q') {
+        let frame = link::until(&mut daemon, link::OUTPUT, |_| {});
+        seen.extend_from_slice(&frame.data);
+    }
+    link::send(
+        &mut daemon,
+        link::INPUT,
+        link::VERSION,
+        json!({"lease": null}),
+        b"k",
+    );
+    let mut output = Vec::new();
+    while !output.windows(4).any(|window| window == b":END") {
+        let frame = link::until(&mut daemon, link::OUTPUT, |_| {});
+        output.extend_from_slice(&frame.data);
+    }
+    let text = String::from_utf8_lossy(&output);
+    let got = text
+        .split("GOT:")
+        .nth(1)
+        .and_then(|rest| rest.split(":END").next())
+        .unwrap_or_default();
+    // ESC [ 4 8 ; ... t, then the k.
+    assert!(got.starts_with("1b5b3438"), "the input came first: {got}");
+    assert!(got.ends_with("746b"), "{got}");
+}

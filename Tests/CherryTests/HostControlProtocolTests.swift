@@ -15,6 +15,9 @@ private func body(of request: HostRequest) throws -> NSDictionary {
     let frame = try HostFrame.encode(request)
     let length = frame.prefix(4).reduce(0) { $0 << 8 | Int($1) }
     #expect(length == frame.count - 4)
+    // The host reads a body that starts with anything else as binary.
+    #expect(frame.dropFirst(4).first == UInt8(ascii: "{"))
+    #expect(HostFrame.isJSON(frame.dropFirst(4)))
     return try json(frame.dropFirst(4))
 }
 
@@ -32,6 +35,10 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(source.contains("pub const MAX_INPUT_BYTES: usize = 64 * 1024;"))
     #expect(source.contains("pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;"))
     #expect(source.contains("pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);"))
+    #expect(source.contains("pub const OUTPUT: u8 = \(HostBinaryFrame.Kind.output);"))
+    #expect(source.contains("pub const INPUT: u8 = \(HostBinaryFrame.Kind.input);"))
+    #expect(source.contains("pub const QUERY: u8 = \(HostBinaryFrame.Kind.query);"))
+    #expect(source.contains("pub const ATTACHED: u8 = \(HostBinaryFrame.Kind.attached);"))
 }
 
 @Test func HostControlEncodesEveryRequestAsTheHostExpects() throws {
@@ -97,8 +104,10 @@ private func decode(_ text: String) throws -> HostResponse {
 
 @Test func HostControlFrameDecoderReassemblesSplitFramesAndRejectsBadLengths() throws {
     let first = try HostFrame.encode(HostResponse(req: 1, message: .ok))
+    // Binary frames share the length prefix; their bytes are raw.
+    let binary = try HostFrame.encode(HostBinaryFrame.output(offset: 1, data: Data([0, 0, 0, 0, 0x7B, 0xFF])))
     let second = try HostFrame.encode(HostResponse(req: nil, message: .event(.bell(id: "s"))))
-    let stream = first + second
+    let stream = first + binary + second
     // Every split point, including inside a length prefix.
     for split in 0...stream.count {
         var decoder = HostFrameDecoder()
@@ -107,7 +116,7 @@ private func decode(_ text: String) throws -> HostResponse {
         while let body = try decoder.nextFrame() { bodies.append(body) }
         decoder.append(stream.dropFirst(split))
         while let body = try decoder.nextFrame() { bodies.append(body) }
-        #expect(bodies == [first.dropFirst(4), second.dropFirst(4)].map { Data($0) })
+        #expect(bodies == [first.dropFirst(4), binary.dropFirst(4), second.dropFirst(4)].map { Data($0) })
         #expect(decoder.bufferedByteCount == 0)
     }
     // One byte at a time.
@@ -117,7 +126,7 @@ private func decode(_ text: String) throws -> HostResponse {
         trickle.append(Data([byte]))
         while try trickle.nextFrame() != nil { count += 1 }
     }
-    #expect(count == 2)
+    #expect(count == 3)
 
     var empty = HostFrameDecoder()
     empty.append(Data([0, 0, 0, 0]))
@@ -162,11 +171,91 @@ private func decode(_ text: String) throws -> HostResponse {
     // Unknown fields are ignored; messages a control connection does not
     // use (or does not know) still decode.
     #expect(try decode(#"{"type":"ok","req":1,"future":{"x":1}}"#) == HostResponse(req: 1, message: .ok))
-    #expect(try decode(#"{"type":"output","offset":0,"data":"AA=="}"#).message == .other(type: "output"))
+    #expect(try decode(#"{"type":"exit","id":"s1","exit_code":0,"signal":null}"#).message == .other(type: "exit"))
+    #expect(try decode(#"{"type":"resized","offset":0,"cols":80,"rows":24}"#).message == .other(type: "resized"))
     #expect(try decode(#"{"type":"from_the_future"}"#).message == .other(type: "from_the_future"))
     // An unreadable reply still names its request.
     #expect(HostResponse.requestID(inUndecodable: Data(#"{"type":"created","session":{},"req":11}"#.utf8)) == 11)
     #expect(throws: DecodingError.self) { try decode(#"{"type":"created","session":{},"req":11}"#) }
+}
+
+@Test func HostControlBinaryFramesHaveTheHostsLayout() throws {
+    // The kind, then big-endian integers, then raw bytes.
+    let output = HostBinaryFrame.output(offset: 0x0102_0304_0506_0708, data: Data([0, 0x7B, 0xFF]))
+    #expect(output.body == Data([1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0x7B, 0xFF]))
+    #expect(try HostFrame.encode(output) == Data([0, 0, 0, 12]) + output.body)
+    #expect(HostBinaryFrame.input(Data("ls\r".utf8)).body == Data([2]) + Data("ls\r".utf8))
+    #expect(HostBinaryFrame.query(Data([0x1B, 0x5B, 0x36, 0x6E])).body == Data([3, 0x1B, 0x5B, 0x36, 0x6E]))
+    let header = Data(#"{"offset":7,"reason":"attach","session":{"id":"s1"}}"#.utf8)
+    let attached = HostBinaryFrame.attached(header: header, snapshot: Data("snap".utf8))
+    #expect(attached.body == Data([4, 0, 0, 0, UInt8(header.count)]) + header + Data("snap".utf8))
+    #expect(try JSONSerialization.jsonObject(with: header) is NSDictionary)
+    #expect([output, .input(Data()), .query(Data()), attached].map(\.kind) == [1, 2, 3, 4])
+
+    // Round trips, with empty payloads and payloads that look like JSON.
+    let frames: [HostBinaryFrame] = [
+        output, .output(offset: 0, data: Data()), .output(offset: .max, data: Data(#"{"type":"ok"}"#.utf8)),
+        .input(Data()), .input(Data([0x7B])), .query(Data([0])), attached,
+        .attached(header: Data("{}".utf8), snapshot: Data()), .attached(header: Data("{}".utf8), snapshot: Data("{x".utf8)),
+    ]
+    for frame in frames {
+        #expect(!HostFrame.isJSON(frame.body))
+        #expect(try HostBinaryFrame(body: frame.body) == frame)
+        // A slice of a larger buffer (not indexed from zero) decodes the same.
+        #expect(try HostBinaryFrame(body: (Data([9, 9]) + frame.body).dropFirst(2)) == frame)
+    }
+
+    // Too short for its kind, or an Attached header that does not fit or is
+    // no JSON object.
+    let malformed: [Data] = [
+        Data([1]), Data([1, 0, 0, 0, 0, 0, 0, 0]), Data([4]), Data([4, 0, 0, 0]),
+        Data([4, 0, 0, 0, 0]), Data([4, 0, 0, 0, 1, 0x7B]), Data([4, 0, 0, 0, 3, 0x7B, 0x7D]),
+        Data([4, 0xFF, 0xFF, 0xFF, 0xFF, 0x7B, 0x7D]), Data([4, 0, 0, 0, 2]) + Data("[]".utf8),
+    ]
+    for body in malformed {
+        #expect(throws: HostBinaryFrameError.malformed(kind: body[0], length: body.count)) {
+            try HostBinaryFrame(body: body)
+        }
+    }
+    #expect(throws: HostBinaryFrameError.unknownKind(9)) { try HostBinaryFrame(body: Data([9, 1, 2])) }
+    #expect(throws: HostBinaryFrameError.unknownKind(0)) { try HostBinaryFrame(body: Data([0])) }
+    // A JSON body is not a binary frame.
+    #expect(throws: HostBinaryFrameError.self) { try HostBinaryFrame(body: Data(#"{"type":"ok"}"#.utf8)) }
+}
+
+@Test func HostControlReadsBinaryFramesAsAttachmentTrafficThatAnswersNoRequest() throws {
+    let decoder = JSONDecoder()
+    func read(_ body: Data) throws -> HostResponse { try HostResponse.decode(frameBody: body, using: decoder) }
+    // JSON decodes as before.
+    #expect(try read(Data(#"{"type":"pong","req":4}"#.utf8)) == HostResponse(req: 4, message: .pong))
+    #expect(throws: DecodingError.self) { try read(Data(#"{"type":"created","session":{},"req":11}"#.utf8)) }
+    // A binary frame never answers a request, whatever its bytes look like,
+    // and is named after the message it replaced.
+    let reply = Data(#"{"type":"pong","req":4}"#.utf8)
+    let header = Data(#"{"offset":0,"reason":"attach","req":4}"#.utf8)
+    #expect(try read(HostBinaryFrame.output(offset: 3, data: reply).body)
+        == HostResponse(req: nil, message: .other(type: "output")))
+    #expect(try read(HostBinaryFrame.input(reply).body) == HostResponse(req: nil, message: .other(type: "input")))
+    #expect(try read(HostBinaryFrame.query(reply).body) == HostResponse(req: nil, message: .other(type: "query")))
+    #expect(try read(HostBinaryFrame.attached(header: header, snapshot: reply).body)
+        == HostResponse(req: nil, message: .other(type: "attached")))
+    // A kind from a newer host is skipped like an unknown `type`; only `{`
+    // marks JSON.
+    #expect(try read(Data([200, 1, 2])) == HostResponse(req: nil, message: .other(type: "binary 200")))
+    #expect(try read(Data(#" {"type":"ok"}"#.utf8)) == HostResponse(req: nil, message: .other(type: "binary 32")))
+    // Even when JSONDecoder would accept it (leading whitespace) and it
+    // carries a `req`: it answers nothing, and as unreadable names nothing.
+    for space: UInt8 in [0x20, 0x09, 0x0A, 0x0D] {
+        let body = Data([space]) + reply
+        #expect(try JSONDecoder().decode(HostResponse.self, from: body) == HostResponse(req: 4, message: .pong))
+        #expect(try read(body) == HostResponse(req: nil, message: .other(type: "binary \(space)")))
+        #expect(HostResponse.requestID(inUndecodable: body) == nil)
+        #expect(HostResponse.requestID(inUndecodable: Data([space]) + Data(#"{"req":1}"#.utf8)) == nil)
+    }
+    // A malformed one is unreadable and names no request.
+    #expect(throws: HostBinaryFrameError.malformed(kind: 1, length: 3)) { try read(Data([1, 0, 0])) }
+    #expect(HostResponse.requestID(inUndecodable: Data([1, 0, 0])) == nil)
+    #expect(HostResponse.requestID(inUndecodable: Data([4, 0, 0, 0, 9]) + Data(#"{"req":1}"#.utf8)) == nil)
 }
 
 @Test func HostControlDecodesEveryEventKind() throws {

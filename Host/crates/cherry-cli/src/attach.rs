@@ -50,8 +50,10 @@ use crate::{
     status::{Live, StatusFile},
     sys::{self, interrupted, poll, pollfd, read_some, set_nonblocking},
     timing::timing,
-    transport::{is_lost, lost, Transport, RPC_TIMEOUT, SSH_TAIL_WAIT},
+    tracker::Tracker,
+    transport::{is_lost, lost, Transport, READ_BYTES, RPC_TIMEOUT, SSH_TAIL_WAIT},
     unexpected, unresolvable,
+    writer::{Writer, ROOM_STEP},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use cherry_protocol::{
@@ -60,6 +62,7 @@ use cherry_protocol::{
 };
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::VecDeque,
     io::{self, Write},
     os::{
@@ -91,6 +94,11 @@ pub const GRID_WAIT: Duration = Duration::from_millis(300);
 /// Upper bound on one poll, which also bounds how late a signal that arrives
 /// just before poll() is noticed.
 const MAX_WAIT: Duration = Duration::from_millis(250);
+/// While buffered frames are handled, terminal input is looked for at most
+/// this often, and at the latest once they are (the next poll). One look
+/// per frame would cost more than writing the frame: a poll on a macOS
+/// terminal takes 10-16 µs, and a frame is a few KiB.
+const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 const RENDER_SCROLLBACK_BYTES: usize = 1024 * 1024;
 /// A keyboard detach waits this long at most for the host's confirmation.
 const KEY_DETACH_WAIT: Duration = Duration::from_secs(2);
@@ -233,6 +241,8 @@ struct Snapshot {
     canonical: (u16, u16),
     offset: u64,
     bytes: Vec<u8>,
+    /// The host answers `ClientMessage::Refresh`.
+    refreshes: bool,
 }
 
 /// The host answered an Attach with an error.
@@ -283,11 +293,13 @@ fn request_attach(
             session,
             offset,
             snapshot,
+            refreshes,
             ..
         } if session.id == id => Ok(Snapshot {
             canonical: (session.cols, session.rows),
             offset,
             bytes: snapshot,
+            refreshes,
         }),
         ServerMessage::Error { code, message } => Err(Refused { code, message }.into()),
         message => {
@@ -478,6 +490,7 @@ impl Attachment<'_> {
     ) -> Result<Connection> {
         transport.silence_stderr();
         self.connected_at = Instant::now();
+        self.renderer.refreshes = snapshot.refreshes;
         let write = self.renderer.replace(snapshot.canonical, &snapshot.bytes)?;
         drop(snapshot.bytes);
         self.output.write_all(&write, transport)?;
@@ -580,18 +593,36 @@ impl Attachment<'_> {
             transport.heartbeat(now)?;
             // Drain buffered frames before polling so a snapshot and live output in
             // one read cannot leave the live bytes waiting for another network event.
+            // The poll that ended the last pass looked at the terminal's input.
+            let mut input_checked = now;
             while let Some(message) = transport.next_message()? {
                 if let Some(outcome) = self.message(message, transport, connection)? {
                     return Ok(outcome);
                 }
                 // Keys typed meanwhile go out between frames, not after all
-                // of them.
-                if self.input_waiting(transport, connection) {
-                    self.read_input(transport, connection)?;
+                // of them: looked for every INPUT_CHECK_INTERVAL.
+                let checked = Instant::now();
+                if checked >= input_checked + INPUT_CHECK_INTERVAL {
+                    input_checked = checked;
+                    if self.input_waiting(transport, connection) {
+                        self.read_input(transport, connection)?;
+                    }
                 }
             }
-            if let Some(frame) = self.renderer.flush()? {
-                self.write_output(&frame, transport, connection)?;
+            // A viewport frame is painted once the terminal took the one
+            // before (see `TerminalOutput::caught_up`); until then output
+            // only changes the copy, and the next frame shows all of it.
+            let mut frame_held = false;
+            if self.output.caught_up() {
+                if let Some(frame) = self.renderer.flush()? {
+                    self.write_output(&frame, transport, connection)?;
+                }
+            } else {
+                frame_held = self.renderer.frame_pending();
+            }
+            // The host reads nothing after Detach.
+            if connection.detach.is_none() && self.renderer.take_refresh() {
+                transport.queue(&ClientMessage::Refresh)?;
             }
             self.publish(false);
             // A host that stopped reading decides the outcome by what it sent
@@ -631,6 +662,7 @@ impl Attachment<'_> {
                 }
             }
             let read_stdin = self.read_limit(transport, connection) > 0;
+            let frame_wait = frame_wait(frame_held, self.output);
             // Input waits beyond the mark only while the transport is polled.
             debug_assert!(
                 connection.detach.is_some()
@@ -655,8 +687,17 @@ impl Attachment<'_> {
                     },
                     libc::POLLIN,
                 ),
+                // A viewport frame waits for the terminal to catch up.
+                pollfd(
+                    if frame_wait == FrameWait::Wake {
+                        self.output.wake_fd()
+                    } else {
+                        -1
+                    },
+                    libc::POLLIN,
+                ),
             ];
-            let wait = if read_stdin && self.stdin_is_file {
+            let wait = if (read_stdin && self.stdin_is_file) || frame_wait == FrameWait::Now {
                 Duration::ZERO
             } else {
                 let detach = connection.detach.as_ref();
@@ -693,10 +734,13 @@ impl Attachment<'_> {
             };
             poll(&mut fds, wait)?;
             interrupted()?;
+            if fds[3].revents != 0 {
+                self.output.clear_wake();
+            }
             if fds[1].revents != 0 {
                 transport.write_ready()?;
             }
-            if fds[0].revents != 0 && !transport.read_ready()? {
+            if fds[0].revents != 0 && !transport.read_ready(self.output.read_size())? {
                 if connection.detach.is_some() {
                     // The host closes the connection only after its Ok, which
                     // would have been handled before this end of file.
@@ -725,7 +769,7 @@ impl Attachment<'_> {
         match message {
             ServerMessage::Output { offset: next, data } => {
                 check_output_offset(&mut connection.offset, next, data.len())?;
-                if self.renderer.direct() {
+                if self.renderer.streams() {
                     // The window takes the stream as it is: written first,
                     // then followed by the copy, so tracking it never delays
                     // it.
@@ -753,12 +797,14 @@ impl Attachment<'_> {
                 session,
                 offset: next,
                 snapshot,
+                refreshes,
                 ..
             } if session.id == id => {
                 connection.offset = next;
                 if let Some((physical, _)) = connection.awaiting_grid.take() {
                     self.renderer.physical = physical;
                 }
+                self.renderer.refreshes = refreshes;
                 let write = self
                     .renderer
                     .replace((session.cols, session.rows), &snapshot)?;
@@ -810,7 +856,9 @@ impl Attachment<'_> {
             ServerMessage::Error { code, message } => match code.as_str() {
                 // The shared size or a replacement snapshot could not be
                 // produced; the attachment itself continues.
-                error_code::RESIZE_FAILED | error_code::SNAPSHOT_FAILED => {}
+                error_code::RESIZE_FAILED => {}
+                // A copy asked for may be asked for again when needed.
+                error_code::SNAPSHOT_FAILED => self.renderer.refresh_failed(),
                 error_code::TAKEN_OVER => {
                     paint(self.renderer, self.output, transport)?;
                     return Ok(Some(Outcome::TakenOver(message)));
@@ -1481,8 +1529,29 @@ fn queue_detach(
 /// bottom edges, and the output that acts on the terminal itself rather than
 /// its screen (see `Passthrough`). Either way the window answers the queries
 /// the host sends this client (`query`).
+///
+/// With a host that sends a replacement on request (`refreshes`), a window
+/// of the grid's size keeps no copy: it follows the session's modes, all it
+/// reads there, with a `Tracker`. When it needs the screen (a window that
+/// leaves the grid's size paints a viewport), it asks the host for a
+/// replacement (`take_refresh`), and meanwhile shows the stream as it is, as
+/// while it waits for the grid to follow its size (see `GRID_WAIT`).
 pub struct Renderer {
     terminal: Option<cherry_vt::Terminal>,
+    /// Follows the session's modes in place of the copy, in direct mode
+    /// (see the type's documentation); never both.
+    tracker: Option<Tracker>,
+    /// The host answers `ClientMessage::Refresh`, by the connection's last
+    /// `Attached`.
+    pub refreshes: bool,
+    /// A replacement is wanted for a copy of the screen, and is to be asked
+    /// for (`take_refresh`).
+    refresh_wanted: bool,
+    /// One was asked for, and no replacement arrived since.
+    refresh_asked: bool,
+    /// The session may have used origin mode, for which the reset needs
+    /// the cursor (see `detach_reset`): the copy is kept from then on.
+    keep_copy: bool,
     canonical: (u16, u16),
     /// The real window size, never clamped.
     physical: (u16, u16),
@@ -1546,6 +1615,11 @@ impl Renderer {
     pub fn new(physical: (u16, u16)) -> Self {
         Self {
             terminal: None,
+            tracker: None,
+            refreshes: false,
+            refresh_wanted: false,
+            refresh_asked: false,
+            keep_copy: false,
             canonical: (0, 0),
             physical,
             sent_modes: None,
@@ -1564,11 +1638,74 @@ impl Renderer {
         self.canonical == self.physical
     }
 
-    /// Follow output that was written to the window as it is, in direct
-    /// mode (`output` without the bytes to write).
+    /// Output is written to the window as it is: in direct mode, and while
+    /// a window of another size waits for the copy it paints from.
+    pub fn streams(&self) -> bool {
+        self.direct() || self.terminal.is_none()
+    }
+
+    /// Follow output that was written to the window as it is (`streams`;
+    /// `output` without the bytes to write).
     fn track(&mut self, bytes: &[u8]) {
+        if let Some(tracker) = &mut self.tracker {
+            tracker.feed(bytes);
+            if tracker.origin() && !self.keep_copy {
+                self.keep_copy = true;
+                self.want_copy();
+            }
+            return;
+        }
         self.passthrough.feed(bytes);
         self.feed(bytes);
+    }
+
+    /// Where the session's modes are read: the copy, or the tracker.
+    fn follows(&self) -> Option<&cherry_vt::Terminal> {
+        self.terminal
+            .as_ref()
+            .or_else(|| self.tracker.as_ref().map(Tracker::shadow))
+    }
+
+    /// Ask the host for a replacement, which brings a copy (`replace`).
+    fn want_copy(&mut self) {
+        if !self.refresh_asked {
+            self.refresh_wanted = true;
+        }
+    }
+
+    /// Whether to ask the host for a replacement now
+    /// (`ClientMessage::Refresh`).
+    pub fn take_refresh(&mut self) -> bool {
+        if !(self.refresh_wanted && self.refreshes) {
+            return false;
+        }
+        self.refresh_wanted = false;
+        self.refresh_asked = true;
+        true
+    }
+
+    /// The host could not make the replacement asked for: the next need
+    /// asks again.
+    pub fn refresh_failed(&mut self) {
+        self.refresh_asked = false;
+    }
+
+    /// Back in direct mode after `snapshot` of the copy was written: follow
+    /// the modes from it instead of the copy, when the host can send a copy
+    /// again.
+    fn lighten(&mut self, snapshot: &[u8]) -> Result<()> {
+        if !self.refreshes || self.keep_copy || !self.direct() {
+            return Ok(());
+        }
+        let mut tracker = Tracker::new()?;
+        tracker.feed(snapshot);
+        if tracker.origin() {
+            self.keep_copy = true;
+            return Ok(());
+        }
+        self.tracker = Some(tracker);
+        self.terminal = None;
+        Ok(())
     }
 
     /// The copy is inside the session's synchronized update.
@@ -1586,8 +1723,7 @@ impl Renderer {
 
     /// The session has bracketed paste on (mode 2004), by the copy.
     fn bracketed_paste(&self) -> bool {
-        self.terminal
-            .as_ref()
+        self.follows()
             .and_then(|terminal| terminal.modes().ok())
             .is_some_and(|modes| modes.windows(8).any(|window| window == b"\x1b[?2004h"))
     }
@@ -1605,15 +1741,30 @@ impl Renderer {
             // Leaving direct mode: the window shows the replaced copy's screen.
             self.window = self.followed_screen()?;
         }
-        let mut terminal =
-            cherry_vt::Terminal::new(canonical.0, canonical.1, RENDER_SCROLLBACK_BYTES)?;
-        let _ = terminal.feed(snapshot);
-        self.terminal = Some(terminal);
+        // Whatever it was asked for, this is the replacement.
+        self.refresh_wanted = false;
+        self.refresh_asked = false;
         self.canonical = canonical;
         self.dirty = false;
         self.held_since = None;
         // The host sends whole sequences: output resumes at a boundary.
         self.passthrough.reset();
+        if self.refreshes && self.direct() && !self.keep_copy {
+            let mut tracker = Tracker::new()?;
+            tracker.feed(snapshot);
+            if !tracker.origin() {
+                self.tracker = Some(tracker);
+                self.terminal = None;
+                self.sent_modes = None;
+                return Ok(snapshot.to_vec());
+            }
+            self.keep_copy = true;
+        }
+        let mut terminal =
+            cherry_vt::Terminal::new(canonical.0, canonical.1, RENDER_SCROLLBACK_BYTES)?;
+        let _ = terminal.feed(snapshot);
+        self.terminal = Some(terminal);
+        self.tracker = None;
         if self.direct() {
             self.sent_modes = None;
             Ok(snapshot.to_vec())
@@ -1626,11 +1777,12 @@ impl Renderer {
     /// mode that is the output itself. In viewport mode `flush` paints the
     /// screen, and what acts on the terminal itself is written through now.
     pub fn output<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
-        let found = self.passthrough.feed(bytes);
-        self.feed(bytes);
-        if self.direct() {
+        if self.streams() {
+            self.track(bytes);
             return Ok(Cow::Borrowed(bytes));
         }
+        let found = self.passthrough.feed(bytes);
+        self.feed(bytes);
         self.dirty |= !bytes.is_empty();
         Ok(Cow::Owned(found))
     }
@@ -1641,7 +1793,7 @@ impl Renderer {
     /// mode the window first shows the screen up to the query.
     pub fn query(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
         self.queried = true;
-        let mut write = if self.direct() {
+        let mut write = if self.streams() {
             Vec::new()
         } else {
             self.flush_now()?.unwrap_or_default()
@@ -1696,6 +1848,11 @@ impl Renderer {
         Ok(Some(frame))
     }
 
+    /// Whether a viewport frame waits to be painted (`flush`).
+    pub fn frame_pending(&self) -> bool {
+        self.dirty
+    }
+
     /// When a frame held for the session's synchronized update is painted
     /// at the latest.
     pub fn paint_deadline(&self) -> Option<Instant> {
@@ -1717,23 +1874,29 @@ impl Renderer {
         if !valid_size(canonical.0, canonical.1) {
             bail!("host sent invalid terminal dimensions");
         }
-        if self.terminal.is_none() {
+        if self.follows().is_none() {
             bail!("host resized the grid before sending a snapshot");
         }
         if self.sent_modes.is_none() && canonical != self.physical {
             // Leaving direct mode: the window shows the copy's screen.
             self.window = self.followed_screen()?;
         }
-        let terminal = self.terminal.as_mut().expect("checked above");
-        // Its replies are the host's to answer.
-        let _ = terminal.resize(canonical.0, canonical.1)?;
+        if let Some(terminal) = self.terminal.as_mut() {
+            // Its replies are the host's to answer.
+            let _ = terminal.resize(canonical.0, canonical.1)?;
+        }
         self.canonical = canonical;
         if self.direct() {
             self.dirty = false;
             self.held_since = None;
             if self.sent_modes.take().is_some() {
-                return self.terminal().snapshot();
+                let snapshot = self.terminal().snapshot()?;
+                self.lighten(&snapshot)?;
+                return Ok(snapshot);
             }
+        } else if self.terminal.is_none() {
+            // A viewport is painted from a copy, which the host sends.
+            self.want_copy();
         }
         Ok(Vec::new())
     }
@@ -1745,10 +1908,20 @@ impl Renderer {
         self.physical = physical;
         self.dirty = false;
         self.held_since = None;
+        if self.terminal.is_none() {
+            // Without a copy the window showed the stream all along; a
+            // viewport waits for the copy the host sends.
+            if !self.direct() {
+                self.want_copy();
+            }
+            return Ok(Vec::new());
+        }
         if self.direct() {
             // Back to the direct stream: a full snapshot resets the window.
             self.sent_modes = None;
-            self.terminal().snapshot()
+            let snapshot = self.terminal().snapshot()?;
+            self.lighten(&snapshot)?;
+            Ok(snapshot)
         } else {
             if self.sent_modes.is_none() {
                 // Leaving direct mode: the window shows the copy's screen.
@@ -1761,7 +1934,7 @@ impl Renderer {
     /// The window's screen in direct mode, where it followed the copy's
     /// stream; the primary one before any snapshot.
     fn followed_screen(&mut self) -> Result<WindowScreen> {
-        let Some(terminal) = &self.terminal else {
+        let Some(terminal) = self.follows() else {
             return Ok(WindowScreen::Primary);
         };
         let modes = terminal.modes()?;
@@ -1778,7 +1951,7 @@ impl Renderer {
     /// modes() in viewport mode, the session's own in direct mode.
     pub fn reporting(&self) -> Reporting {
         let copy;
-        let modes: &[u8] = match (&self.sent_modes, &self.terminal) {
+        let modes: &[u8] = match (&self.sent_modes, self.follows()) {
             (Some(modes), _) => modes,
             (None, Some(terminal)) => {
                 copy = terminal.modes().unwrap_or_default();
@@ -1820,9 +1993,17 @@ impl Renderer {
     /// or nothing of the window's (47, 1047), so the reset leaves the way the
     /// session entered, as in direct mode. Viewport frames never turn origin
     /// mode on.
+    ///
+    /// Without a copy (see `Tracker`) the modes come from the tracker; the
+    /// copy is kept once the session may use origin mode, so only a detach
+    /// before the copy asked for then arrived leaves origin mode on, with
+    /// the cursor where it is.
     pub fn detach_reset(&mut self) -> Vec<u8> {
-        let Some(terminal) = &mut self.terminal else {
-            return terminal_reset(LEAVE_ANY_ALTERNATE);
+        let copy = self.terminal.is_some();
+        let terminal = match (&mut self.terminal, &mut self.tracker) {
+            (Some(terminal), _) => terminal,
+            (None, Some(tracker)) => tracker.shadow_mut(),
+            (None, None) => return terminal_reset(LEAVE_ANY_ALTERNATE),
         };
         if self.sent_modes.is_some() {
             let leave = match self.window {
@@ -1841,7 +2022,7 @@ impl Renderer {
         let mut reset = terminal_reset(leave.as_bytes());
         terminal.feed(&reset);
         let replies = terminal.feed(b"\x1b[?6$p\x1b[6n");
-        if mode_is_set(&replies, 6) {
+        if copy && mode_is_set(&replies, 6) {
             // The margins are reset, so the report is absolute.
             if let Some((row, col)) = cursor_report(&replies) {
                 let _ = write!(reset, "\x1b[?6l\x1b[{row};{col}H");
@@ -2056,10 +2237,40 @@ fn cursor_report(replies: &[u8]) -> Option<(u16, u16)> {
     Some((row.parse().ok()?, col.parse().ok()?))
 }
 
+/// How the attachment waits for a viewport frame it held for the terminal
+/// to take the frame before (see `TerminalOutput::caught_up`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameWait {
+    /// No frame waits for the terminal.
+    Nothing,
+    /// Until the terminal caught up (`TerminalOutput::wake_fd`).
+    Wake,
+    /// Not at all: the terminal caught up since the frame was held, and
+    /// nothing would wake the attachment for it, so it is painted at once.
+    Now,
+}
+
+/// See `FrameWait`: `held`, a frame was held for the terminal.
+fn frame_wait(held: bool, output: &TerminalOutput) -> FrameWait {
+    if !held {
+        FrameWait::Nothing
+    } else if output.arm_caught_up() {
+        FrameWait::Wake
+    } else {
+        FrameWait::Now
+    }
+}
+
 pub struct TerminalOutput {
     fd: RawFd,
     original_flags: i32,
     restore_screen: bool,
+    /// Writes the output, in order, while this thread goes on (see
+    /// `Writer`); the descriptor is written here only once it finished.
+    writer: Writer,
+    /// The terminal took nothing for as long as output may wait: what is
+    /// still queued once the attachment ends is dropped, not waited for.
+    blocked: Cell<bool>,
     /// The same terminal's input, in raw mode. Input that arrives once the
     /// attachment ended is read, so the reports the terminal sent for the
     /// session never reach the user's shell (see `Leftover`).
@@ -2080,10 +2291,13 @@ impl TerminalOutput {
         }
         set_nonblocking(fd)?;
         let restore_screen = unsafe { libc::isatty(fd) } == 1;
+        let writer = Writer::start(fd).context("could not start writing terminal output")?;
         Ok(Self {
             fd,
             original_flags,
             restore_screen,
+            writer,
+            blocked: Cell::new(false),
             input: input.filter(|&input| restore_screen && same_terminal(input, fd)),
             aside: Vec::new(),
             reporting: Reporting::default(),
@@ -2101,11 +2315,45 @@ impl TerminalOutput {
         self.aside.extend_from_slice(bytes);
     }
 
+    /// Whether the terminal took everything queued for it (see `Writer`),
+    /// but perhaps the last batch it is writing: a viewport frame is
+    /// painted only then, so that frames never pile up in the queue behind
+    /// a slow terminal (each would be stale before it showed).
+    pub fn caught_up(&self) -> bool {
+        self.writer.drained()
+    }
+
+    /// Have `wake_fd` become readable once the terminal caught up; false
+    /// when it has already.
+    pub fn arm_caught_up(&self) -> bool {
+        self.writer.arm_drained()
+    }
+
+    pub fn wake_fd(&self) -> RawFd {
+        self.writer.wake_fd()
+    }
+
+    pub fn clear_wake(&self) {
+        self.writer.clear_wake();
+    }
+
+    /// How much the host connection is read at a time: as much as the
+    /// terminal has room for (see `Writer`), from `ROOM_STEP` up to
+    /// `READ_BYTES`. A terminal slower than the output takes it in steps
+    /// that small, and the connection is read in steps as small, rather
+    /// than in bursts that each wait for the terminal to take them: the
+    /// host holds the program to that pace (see the host's lag policy),
+    /// and evenly paced, the session's other clients get its output evenly
+    /// too.
+    pub fn read_size(&self) -> usize {
+        self.writer.room().clamp(ROOM_STEP, READ_BYTES)
+    }
+
     /// Best effort, while no host connection needs heartbeats: a terminal
     /// that takes nothing for a second loses the rest, which the next
     /// snapshot's leading CAN cuts off.
     pub fn notice(&self, bytes: &[u8]) {
-        let _ = sys::write_all(self.fd, bytes, Duration::from_secs(1), true);
+        let _ = self.queue(bytes, None, None, Duration::from_secs(1));
     }
 
     /// Write everything, failing only when the terminal accepts nothing for
@@ -2118,55 +2366,89 @@ impl TerminalOutput {
     /// Like `write_all`, but while the terminal takes no more output, stop
     /// once `input` (the terminal's input) is readable: returns how much was
     /// written, all of it unless input interrupted.
+    ///
+    /// Written means queued for the terminal (see `Writer`): what the
+    /// terminal has not taken yet waits in a bounded queue, and only once
+    /// that is full does this wait for the terminal.
     pub fn write_until_input(
         &self,
         bytes: &[u8],
         transport: &mut Transport,
         input: Option<RawFd>,
     ) -> Result<usize> {
+        self.queue(bytes, Some(transport), input, RPC_TIMEOUT)
+    }
+
+    /// Queue `bytes` for the terminal, waiting for room while it is full,
+    /// with the heartbeat going when there is a `transport`. Fails once the
+    /// terminal takes nothing for `idle`.
+    fn queue(
+        &self,
+        bytes: &[u8],
+        mut transport: Option<&mut Transport>,
+        input: Option<RawFd>,
+        idle: Duration,
+    ) -> Result<usize> {
         let mut written = 0;
-        let mut deadline = Instant::now() + RPC_TIMEOUT;
+        // What the terminal took so far, and since when.
+        let mut progress = (self.writer.written(), Instant::now());
         while written < bytes.len() {
             interrupted()?;
-            if transport.next_ping().is_some_and(|at| Instant::now() >= at) {
-                transport.heartbeat(Instant::now())?;
-                transport.write_ready()?;
+            if let Some(transport) = transport.as_deref_mut() {
+                if transport.next_ping().is_some_and(|at| Instant::now() >= at) {
+                    transport.heartbeat(Instant::now())?;
+                    transport.write_ready()?;
+                }
             }
-            if let Some(n) = sys::write_some(self.fd, &bytes[written..])
-                .context("could not write terminal output")?
-            {
+            let n = self
+                .writer
+                .push(&bytes[written..])
+                .context("could not write terminal output")?;
+            if n > 0 {
                 written += n;
-                deadline = Instant::now() + RPC_TIMEOUT;
                 continue;
             }
+            // The queue is full: wait for the terminal to take some.
             let now = Instant::now();
+            let taken = self.writer.written();
+            if taken != progress.0 {
+                progress = (taken, now);
+            }
+            let deadline = progress.1 + idle;
             if now >= deadline {
+                self.blocked.set(true);
                 bail!(
                     "could not write terminal output: {}",
-                    sys::blocked_output(RPC_TIMEOUT)
+                    sys::blocked_output(idle)
                 );
             }
             // Pings and input the transport did not take yet.
-            transport.write_ready()?;
+            if let Some(transport) = transport.as_deref_mut() {
+                transport.write_ready()?;
+            }
+            if !self.writer.arm(bytes.len() - written) {
+                continue;
+            }
+            let pending = transport
+                .as_deref()
+                .filter(|transport| transport.pending() > 0)
+                .map(|transport| transport.write_fd());
             let mut fds = [
-                pollfd(self.fd, libc::POLLOUT),
-                pollfd(
-                    if transport.pending() > 0 {
-                        transport.write_fd()
-                    } else {
-                        -1
-                    },
-                    libc::POLLOUT,
-                ),
+                pollfd(self.writer.wake_fd(), libc::POLLIN),
+                pollfd(pending.unwrap_or(-1), libc::POLLOUT),
                 pollfd(input.unwrap_or(-1), libc::POLLIN),
             ];
             let wake = transport
-                .next_ping()
+                .as_deref()
+                .and_then(Transport::next_ping)
                 .map_or(deadline, |at| at.min(deadline));
             poll(
                 &mut fds,
                 Duration::from_millis(100).min(wake.saturating_duration_since(now)),
             )?;
+            if fds[0].revents != 0 {
+                self.writer.clear_wake();
+            }
             if fds[2].revents != 0 {
                 break;
             }
@@ -2177,6 +2459,17 @@ impl TerminalOutput {
 
 impl Drop for TerminalOutput {
     fn drop(&mut self) {
+        // The output queued so far goes first, as long as the terminal
+        // keeps taking it. After a termination signal, or once the terminal
+        // took nothing for as long as output may wait, it is dropped: the
+        // reset is then one bounded attempt.
+        let idle = if sys::termination_signal().is_some() || self.blocked.get() {
+            Duration::ZERO
+        } else {
+            RPC_TIMEOUT
+        };
+        self.writer
+            .finish(idle, || sys::termination_signal().is_some());
         let mut leftover = Leftover::new(self.reporting.utf8_mouse);
         leftover.feed(&self.aside);
         if self.restore_screen {
@@ -2260,6 +2553,41 @@ fn give_back(fd: RawFd, keys: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_held_for_a_terminal_that_caught_up_meanwhile_is_painted_at_once() {
+        use std::{fs::File, io::Read, os::fd::FromRawFd};
+        // A pipe stands in for the terminal; nothing reads it yet.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut terminal = unsafe { File::from_raw_fd(fds[0]) };
+        let output = TerminalOutput::new(fds[1], None).unwrap();
+        assert_eq!(frame_wait(false, &output), FrameWait::Nothing);
+        // More than the pipe and the writer's thread hold: some stays
+        // queued, and a viewport frame is held for the terminal.
+        let mut queued = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while output.caught_up() {
+            assert!(Instant::now() < deadline, "nothing stayed queued");
+            queued += output.writer.push(&[b'x'; 16 * 1024]).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(frame_wait(true, &output), FrameWait::Wake);
+        output.clear_wake();
+        // The terminal reads, and the writer's thread takes the queue
+        // before the attachment looks again: nothing would wake it for
+        // the frame, which is painted at once instead.
+        let mut read = 0;
+        let mut buffer = vec![0; 64 * 1024];
+        while !output.caught_up() || read < queued {
+            let n = terminal.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            read += n;
+        }
+        assert_eq!(frame_wait(true, &output), FrameWait::Now);
+        drop(output);
+        unsafe { libc::close(fds[1]) };
+    }
 
     /// What the window receives for live output right away.
     fn live(renderer: &mut Renderer, bytes: &[u8]) -> Vec<u8> {
@@ -2889,5 +3217,229 @@ mod tests {
         assert!(!mode_is_set(b"\x1b[?16;1$y", 6));
         assert_eq!(cursor_report(b"\x1b[?6;1$y\x1b[12;34R"), Some((12, 34)));
         assert_eq!(cursor_report(b"\x1b[?6;1$y"), None);
+    }
+
+    /// A renderer whose host sends a replacement on request.
+    fn lazy(physical: (u16, u16)) -> Renderer {
+        let mut renderer = Renderer::new(physical);
+        renderer.refreshes = true;
+        renderer
+    }
+
+    /// A session's snapshot after `bytes`.
+    fn session(size: (u16, u16), bytes: &[u8]) -> Vec<u8> {
+        let mut session = cherry_vt::Terminal::new(size.0, size.1, 0).unwrap();
+        session.feed(bytes);
+        session.snapshot().unwrap()
+    }
+
+    #[test]
+    fn a_window_of_the_grids_size_keeps_no_copy_when_the_host_can_send_one() {
+        let mut renderer = lazy((80, 24));
+        assert_eq!(
+            renderer.replace((80, 24), b"\x1bcSNAPSHOT").unwrap(),
+            b"\x1bcSNAPSHOT"
+        );
+        assert!(renderer.terminal.is_none() && renderer.tracker.is_some());
+        assert!(!renderer.viewport());
+        let output = b"live\x1b]52;c;aGk=\x07\x07";
+        assert!(
+            matches!(renderer.output(output).unwrap(), Cow::Borrowed(bytes) if bytes == output)
+        );
+        assert_eq!(renderer.query(b"\x1b[6n").unwrap(), b"\x1b[6n");
+        assert_eq!(renderer.flush().unwrap(), None);
+        assert_eq!(renderer.paint_deadline(), None);
+        assert!(!renderer.take_refresh(), "nothing to ask for");
+        // A host that cannot send one: the copy is kept, as before.
+        let mut renderer = Renderer::new((80, 24));
+        renderer.replace((80, 24), b"").unwrap();
+        assert!(renderer.terminal.is_some() && renderer.tracker.is_none());
+    }
+
+    #[test]
+    fn without_a_copy_reports_paste_and_the_reset_are_the_copys() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"$ ", b"\x1b[?1049h\x1b[?1004h\x1b[1;31mEDIT\x1b[0m"),
+            (b"\x1b[?2004h$ ", b"text\r\n\x1b[?2004l\x1b[?1000;1006h"),
+            (b"\x1b[?1047h\x1b[?2004h", b"\x1b[>1u\x1b[?1005h\x1b[?1000h"),
+            (b"\x1b[?47h", b"\x1b[?47l\x1b[?1049h\x1b[=5;1u"),
+            (b"\x1b[?1049h\x1b[?2031h", b"\x1b[?1049l"),
+            (b"\x1b[2;2H\x1b7\x1b[10;10Hprompt$ ", b"x"),
+            (SESSION_MODES, b"more \x1b]2;title\x07"),
+            // Origin mode in the snapshot: the copy is kept.
+            (
+                &[
+                    SESSION_MODES,
+                    b"\x1b[3;20r\x1b[?69h\x1b[5;40s\x1b[?6h\x1b[5;9H",
+                ]
+                .concat(),
+                b"",
+            ),
+            (b"\x1b[3;20r\x1b[?6h\x1b[5;9H\x1b[?1049h\x1b[12;40H", b"x"),
+        ];
+        for (snapshot, output) in cases {
+            let mut copy = Renderer::new((80, 24));
+            let mut lazy = lazy((80, 24));
+            let written = copy.replace((80, 24), snapshot).unwrap();
+            assert_eq!(lazy.replace((80, 24), snapshot).unwrap(), written);
+            assert_eq!(live(&mut lazy, output), live(&mut copy, output));
+            assert_eq!(
+                lazy.reporting(),
+                copy.reporting(),
+                "{snapshot:?} {output:?}"
+            );
+            assert_eq!(lazy.bracketed_paste(), copy.bracketed_paste());
+            let reset = copy.detach_reset();
+            assert_eq!(lazy.detach_reset(), reset, "{snapshot:?} {output:?}");
+            // And the window it leaves is the fresh one the tests above expect.
+            let state = window((80, 24), &[&written, output, &reset])
+                .inspect()
+                .unwrap();
+            assert!(
+                !state.alternate && state.modes.is_empty(),
+                "{:?}",
+                state.modes
+            );
+        }
+    }
+
+    #[test]
+    fn origin_mode_in_the_output_brings_a_copy_to_keep() {
+        let origin = b"\x1b[3;20r\x1b[?6h\x1b[5;9H";
+        let mut renderer = lazy((80, 24));
+        renderer.replace((80, 24), b"$ ").unwrap();
+        live(&mut renderer, origin);
+        assert!(renderer.take_refresh(), "asks for a copy");
+        assert!(!renderer.take_refresh(), "once");
+        // Detaching before it arrives leaves origin mode on and the cursor
+        // where it is (the tracker does not know where that is).
+        let mut early = lazy((80, 24));
+        let written = early.replace((80, 24), b"$ ").unwrap();
+        live(&mut early, origin);
+        let reset = early.detach_reset();
+        assert_eq!(reset, terminal_reset(b""), "no origin fix without a copy");
+        let mut copy = Renderer::new((80, 24));
+        copy.replace((80, 24), b"$ ").unwrap();
+        live(&mut copy, origin);
+        let fixed = copy.detach_reset();
+        assert!(
+            fixed.starts_with(&reset) && fixed.ends_with(b"\x1b[?6l\x1b[7;9H"),
+            "{fixed:?}"
+        );
+        let state = window((80, 24), &[&written, origin, &reset])
+            .inspect()
+            .unwrap();
+        assert_eq!(state.cursor, (8, 6), "the cursor moved");
+        // The replacement brings the copy, which is kept from then on.
+        let snapshot = session((80, 24), &[&b"$ "[..], origin].concat());
+        renderer.replace((80, 24), &snapshot).unwrap();
+        assert!(renderer.terminal.is_some() && renderer.tracker.is_none());
+        live(&mut renderer, b"\x1b[?6l\x1b[r");
+        renderer.replace((80, 24), b"").unwrap();
+        assert!(renderer.terminal.is_some(), "kept");
+        assert_eq!(
+            renderer.detach_reset(),
+            terminal_reset(b""),
+            "no origin fix needed"
+        );
+    }
+
+    #[test]
+    fn without_a_copy_a_viewport_waits_for_the_hosts_replacement() {
+        let snapshot = b"\x1b[?1004h\x1b[?2004hTEXT";
+        let mut renderer = lazy((80, 24));
+        let mut shown = window((80, 24), &[&renderer.replace((80, 24), snapshot).unwrap()]);
+        // The window grows and the grid does not follow: without a copy
+        // nothing is painted, and the host is asked for one.
+        shown.resize(100, 30).unwrap();
+        assert!(renderer.resize_physical((100, 30)).unwrap().is_empty());
+        assert!(!renderer.viewport());
+        assert!(renderer.take_refresh());
+        assert!(!renderer.take_refresh(), "asked once");
+        assert!(renderer.resize_physical((101, 30)).unwrap().is_empty());
+        assert!(!renderer.take_refresh(), "still asked once");
+        // Meanwhile the stream goes through as it is.
+        assert_eq!(live(&mut renderer, b" more"), b" more");
+        assert_eq!(renderer.query(b"\x1b[6n").unwrap(), b"\x1b[6n");
+        shown.feed(b" more");
+        // The replacement paints the viewport, modes first.
+        let replacement = session((80, 24), &[&snapshot[..], b" more"].concat());
+        let frame = renderer.replace((80, 24), &replacement).unwrap();
+        assert!(frame.starts_with(b"\x1b[?2026h"), "{frame:?}");
+        assert!(contains(&frame, b"\x1b[?1004h") && contains(&frame, b"TEXT more"));
+        assert!(renderer.viewport());
+        shown.resize(101, 30).unwrap();
+        shown.feed(&frame);
+        // It shows what a renderer with a copy shows.
+        let mut copy = Renderer::new((80, 24));
+        let mut expected = window((80, 24), &[&copy.replace((80, 24), snapshot).unwrap()]);
+        expected.resize(101, 30).unwrap();
+        expected.feed(&copy.resize_physical((101, 30)).unwrap());
+        live(&mut copy, b" more");
+        expected.feed(&copy.flush().unwrap().unwrap());
+        let (shown, expected) = (shown.inspect().unwrap(), expected.inspect().unwrap());
+        assert_eq!(shown.active, expected.active);
+        assert_eq!(shown.cursor, expected.cursor);
+        assert_eq!(shown.modes, expected.modes);
+        // Back at the grid's size: a full snapshot of the copy, and the copy
+        // gives way to the tracker again.
+        let direct = renderer.resize_physical((80, 24)).unwrap();
+        assert!(direct.starts_with(b"\x18\x1bc") || direct.starts_with(b"\x1bc"));
+        assert!(contains(&direct, b"TEXT more"));
+        assert!(renderer.terminal.is_none() && renderer.tracker.is_some());
+        assert!(renderer.bracketed_paste());
+        assert!(renderer.reporting().reports, "focus reports");
+        assert_eq!(live(&mut renderer, b"!"), b"!");
+    }
+
+    #[test]
+    fn without_a_copy_a_grid_that_shrinks_asks_for_one() {
+        let mut renderer = lazy((80, 24));
+        renderer
+            .replace((80, 24), b"\x1b[?1049h\x1b[?2004h\x1b[HEDIT")
+            .unwrap();
+        // Another window shrinks the grid.
+        assert!(renderer.resize_grid((70, 20)).unwrap().is_empty());
+        assert!(!renderer.viewport());
+        assert!(renderer.take_refresh());
+        assert_eq!(live(&mut renderer, b"x"), b"x");
+        // The grid comes back before the copy did: nothing to paint.
+        assert!(renderer.resize_grid((80, 24)).unwrap().is_empty());
+        assert!(renderer.bracketed_paste());
+        // A grid that follows the window asks for nothing.
+        let mut renderer = lazy((80, 24));
+        renderer.replace((80, 24), b"\x1b[?2004h").unwrap();
+        renderer.physical = (90, 30);
+        assert!(renderer.resize_grid((90, 30)).unwrap().is_empty());
+        assert!(!renderer.take_refresh());
+        assert!(renderer.bracketed_paste());
+        // A viewport's copy back at the grid's size gives way to the
+        // tracker after its full snapshot.
+        let mut renderer = lazy((90, 30));
+        assert!(renderer
+            .replace((80, 24), b"TEXT")
+            .unwrap()
+            .starts_with(b"\x1b[?2026h"));
+        let snapshot = renderer.resize_grid((90, 30)).unwrap();
+        assert!(snapshot.starts_with(b"\x18\x1bc") || snapshot.starts_with(b"\x1bc"));
+        assert!(renderer.terminal.is_none() && renderer.tracker.is_some());
+    }
+
+    #[test]
+    fn a_failed_refresh_is_asked_for_again_when_needed() {
+        let mut renderer = lazy((80, 24));
+        renderer.replace((80, 24), b"").unwrap();
+        renderer.resize_physical((100, 30)).unwrap();
+        assert!(renderer.take_refresh());
+        renderer.refresh_failed();
+        assert!(!renderer.take_refresh(), "not at once");
+        renderer.resize_physical((102, 30)).unwrap();
+        assert!(renderer.take_refresh());
+        // Without the host's support nothing is asked for.
+        renderer.refreshes = false;
+        renderer.refresh_failed();
+        renderer.resize_physical((103, 30)).unwrap();
+        assert!(!renderer.take_refresh());
     }
 }

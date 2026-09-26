@@ -35,6 +35,7 @@ fn attach_as(
             session,
             offset,
             snapshot,
+            ..
         } => (socket, session, offset, snapshot),
         other => panic!("attach failed: {other:?}"),
     }
@@ -230,9 +231,10 @@ fn an_attachment_is_served_at_interactive_priority_while_it_lasts() {
     let mut screen = Screen::new(80, 24, offset, &snapshot);
     input(&mut socket, b"hello\n");
     screen.wait_text(&mut socket, "ECHO:hello");
-    // The holder's thread, and the daemon's session worker and connection
-    // reader (its writer too, once it has something to write).
-    wait_raised(holder, |raised| raised == 1);
+    // The holder's thread and its terminal's, and the daemon's session
+    // worker and connection reader (its writer too, once it has something
+    // to write).
+    wait_raised(holder, |raised| raised == 2);
     wait_raised(daemon, |raised| raised >= 2);
     send(&mut socket, &ClientMessage::Detach);
     loop {

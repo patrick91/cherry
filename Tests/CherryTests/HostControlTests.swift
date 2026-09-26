@@ -168,6 +168,51 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(control.sessions.first?.title == "vim")
 }
 
+@Test @MainActor func HostControlSkipsBinaryFramesAndKeepsTheConnection() async throws {
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper(sessions: [hostedSession("s1")])
+    let control = makeFakeHostControl(fake, hostStore: store)
+    defer { control.disconnect() }
+    let recorder = EventRecorder(control)
+    try await control.connect()
+
+    // A control connection never attaches, so no binary frame is for it.
+    // Any that arrive (every kind, one this version does not know, a
+    // malformed one, a large one) are skipped, even when their bytes look
+    // like the reply a request waits for, and the connection carries on.
+    fake.respond = { request, connection in
+        guard request.op == "screen", let req = request.req else { return nil }
+        let impostor = Data(#"{"type":"screen_text","id":"s1","text":"impostor","cursor_row":0,"cursor_col":0,"alternate_screen":false,"req":\#(req)}"#.utf8)
+        connection.push(.output(offset: 0, data: impostor))
+        connection.push(.query(impostor))
+        connection.push(.input(impostor))
+        connection.push(.attached(header: Data(#"{"offset":0,"reason":"attach","req":\#(req)}"#.utf8), snapshot: impostor))
+        connection.push(.output(offset: 1 << 40, data: Data(repeating: 0x61, count: 4 * 1_024 * 1_024)))
+        connection.write(try! HostFrame.frame(body: Data([99]) + impostor))
+        connection.write(try! HostFrame.frame(body: Data([1, 0, 0])))
+        connection.write(try! HostFrame.frame(body: Data([4, 0xFF, 0, 0, 0]) + impostor))
+        // Only a leading `{` marks JSON. JSONDecoder would accept these
+        // whitespace-led replies to the pending request (protocol 5 read
+        // them as its answer); they are binary frames of unknown kinds.
+        let failure = Data(#"{"type":"error","code":"request_failed","message":"impostor","req":\#(req)}"#.utf8)
+        connection.write(try! HostFrame.frame(body: Data([0x20]) + failure))
+        connection.write(try! HostFrame.frame(body: Data([0x0A]) + impostor))
+        connection.write(try! HostFrame.frame(body: Data([0x09]) + failure))
+        connection.write(try! HostFrame.frame(body: Data([0x0D, 0x0A]) + impostor))
+        connection.push(.event(.bell(id: "s1")))
+        return nil
+    }
+    let screen = try await control.screen("s1")
+    #expect(screen.text == "fake screen")
+    #expect(await recorder.wait { $0 == [.bell(id: "s1")] })
+    #expect(control.state == .connected)
+    #expect(fake.launches.count == 1)
+    fake.respond = nil
+    #expect(try await control.list().sessions.map(\.id) == ["s1"])
+    #expect(fake.launches.count == 1)
+}
+
 @Test @MainActor func HostControlReconnectsAfterALostConnectionAndRelistsWhatChanged() async throws {
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
@@ -789,7 +834,7 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(kill(pid, 0) != 0)
 }
 
-/// Serves protocol 4 on a Unix socket, one client at a time: Welcome, then
+/// Serves protocol 6 on a Unix socket, one client at a time: Welcome, then
 /// answers (subscribe, list, send_input, ping).
 private final class FakeHostSocketServer: @unchecked Sendable {
     private let listener: Int32

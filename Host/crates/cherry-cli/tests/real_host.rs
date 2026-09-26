@@ -1327,7 +1327,7 @@ fn remote_kill_remove_and_shutdown_never_start_a_host_through_the_real_gateway()
     assert!(!remote.socket.exists());
 }
 
-fn frame(message: &impl serde::Serialize) -> Vec<u8> {
+fn frame(message: &impl cherry_protocol::Message) -> Vec<u8> {
     cherry_protocol::encode_frame(message).unwrap()
 }
 
@@ -1528,4 +1528,115 @@ fn an_attachment_reconnects_by_itself_after_the_daemon_is_killed_and_restarted()
         "detached"
     );
     host.wait_for_detached_running(id, &created["pid"]);
+}
+
+/// Read a client's terminal (the PTY master) at `rate` bytes a second (as
+/// fast as it comes: None) until `stop` is set, noting when each read came
+/// and how much it took.
+fn read_terminal(
+    master: File,
+    rate: Option<usize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<Vec<(Instant, usize)>> {
+    thread::spawn(move || {
+        let mut master = master;
+        let started = Instant::now();
+        let (mut total, mut arrivals) = (0, Vec::new());
+        let mut bytes = [0u8; 16 * 1024];
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let want = match rate {
+                Some(rate) => {
+                    let allowed = (rate as f64 * started.elapsed().as_secs_f64()) as usize;
+                    allowed.saturating_sub(total).min(bytes.len())
+                }
+                None => bytes.len(),
+            };
+            if want < 1024 {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            match master.read(&mut bytes[..want]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    arrivals.push((Instant::now(), n));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        arrivals
+    })
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_slow_terminal_holds_back_neither_the_program_nor_a_faster_window() {
+    // One window's terminal takes its output slowly: the program goes at
+    // the pace of the session's faster window, which gets its output
+    // evenly, without long pauses; the slow terminal takes output all along
+    // at its own pace, falling behind (it is resynchronized instead).
+    let host = Host::start();
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; exec yes \"$(printf %0120d 7)\"",
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let mut fast = Attached::new(&host, id, 80, 24);
+    let mut slow = Attached::new(&host, id, 80, 24);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rate = 50 * 1024;
+    let fast_reader = read_terminal(fast.master.try_clone().unwrap(), None, stop.clone());
+    let slow_reader = read_terminal(slow.master.try_clone().unwrap(), Some(rate), stop.clone());
+    // The slow window's buffers fill first.
+    thread::sleep(Duration::from_secs(3));
+    let from = Instant::now();
+    thread::sleep(Duration::from_secs(4));
+    let to = Instant::now();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let window = |arrivals: &[(Instant, usize)]| -> Vec<(Instant, usize)> {
+        arrivals
+            .iter()
+            .copied()
+            .filter(|(at, _)| (from..=to).contains(at))
+            .collect()
+    };
+    let fast_arrivals = window(&fast_reader.join().unwrap());
+    let slow_arrivals = window(&slow_reader.join().unwrap());
+    let bytes = |arrivals: &[(Instant, usize)]| arrivals.iter().map(|(_, n)| n).sum::<usize>();
+    let seconds = (to - from).as_secs_f64();
+    let (fast_rate, slow_rate) = (
+        bytes(&fast_arrivals) as f64 / seconds,
+        bytes(&slow_arrivals) as f64 / seconds,
+    );
+    // The slow terminal takes output all along, at its pace.
+    assert!(slow_rate > 0.8 * rate as f64, "slow {slow_rate:.0} B/s");
+    // The program, and so the other window, goes far faster (a debug
+    // build's pipeline takes about 800 KB/s).
+    assert!(
+        fast_rate > 5.0 * slow_rate,
+        "fast {fast_rate:.0} B/s, slow {slow_rate:.0} B/s"
+    );
+    // Evenly: no long pause.
+    let mut last = from;
+    let mut longest = Duration::ZERO;
+    for (at, _) in fast_arrivals.iter().copied().chain([(to, 0)]) {
+        longest = longest.max(at - last);
+        last = at;
+    }
+    assert!(
+        longest < Duration::from_millis(500),
+        "the other window waited {longest:?} for output"
+    );
+    let _ = fast.child.kill();
+    let _ = slow.child.kill();
+    let _ = fast.child.wait();
+    let _ = slow.child.wait();
 }

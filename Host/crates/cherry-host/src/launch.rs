@@ -418,8 +418,10 @@ pub fn gateway(path: &Path, start_host: bool, expected_host_id: Option<&str>) ->
             let _ = io::copy(&mut io::stdin().lock(), &mut input_socket);
             let _ = input_socket.shutdown(std::net::Shutdown::Write);
         })?;
-    // stdout is line-buffered even when redirected. Protocol frames contain no
-    // literal newline, so io::copy alone can withhold an entire handshake.
+    // stdout is buffered (by line, even when redirected), and a frame need
+    // not end with a newline: io::copy alone could withhold part of one,
+    // such as an entire handshake. Every read is flushed, so the relay
+    // passes the host's bytes on as they come.
     let mut socket = socket;
     let mut bytes = [0u8; 16384];
     loop {

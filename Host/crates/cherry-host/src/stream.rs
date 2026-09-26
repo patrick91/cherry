@@ -11,8 +11,14 @@
 //! part of the offset-accounted output, so neither snapshots nor a lagging
 //! client's resync repeat them. Kitty graphics commands reach the renderers
 //! with `q=2`, so only the host replies.
+//!
+//! Output floods are mostly text and short CSI sequences, so the ground
+//! state passes runs of text through whole and routes a CSI or OSC sequence
+//! that arrives complete without buffering it; everything else goes through
+//! the byte-at-a-time state machine (`step`), which the fast paths match
+//! exactly.
 use cherry_vt::Terminal;
-use std::{collections::HashMap, sync::Mutex};
+use std::{borrow::Cow, collections::HashMap, sync::Mutex};
 
 #[derive(Default)]
 pub struct DisplayStream {
@@ -46,10 +52,14 @@ pub struct Batch {
     /// position in `terminal` (the length `terminal` had when it came), so
     /// that it is reported in order with what the terminal reports.
     pub notifications: Vec<(usize, Vec<u8>)>,
+    /// `terminal` holds a query the host answers: its reply goes to the
+    /// program once the host terminal has parsed it.
+    pub answered: bool,
 }
 
 impl Batch {
-    /// Append the batch that follows this one.
+    /// Append the batch that follows this one (what `feed_into` does).
+    #[cfg(test)]
     pub fn append(&mut self, next: Batch) {
         let base = self.display.len();
         let terminal_base = self.terminal.len();
@@ -63,6 +73,7 @@ impl Batch {
                 .into_iter()
                 .map(|(at, sequence)| (terminal_base + at, sequence)),
         );
+        self.answered |= next.answered;
     }
 
     fn query(&mut self, bytes: &[u8]) {
@@ -90,18 +101,147 @@ impl Batch {
             self.display.push(byte);
         }
     }
+
+    /// Bytes for the host terminal and every renderer alike.
+    fn both(&mut self, bytes: &[u8]) {
+        self.terminal.extend_from_slice(bytes);
+        self.display.extend_from_slice(bytes);
+    }
+
+    /// A complete token, routed.
+    fn token(&mut self, token: &[u8]) {
+        if token.starts_with(KITTY_NOTIFICATION) {
+            self.notifications
+                .push((self.terminal.len(), token.to_vec()));
+        }
+        match route(token) {
+            Route::Both => {
+                self.terminal.extend_from_slice(token);
+                self.display.extend_from_slice(&display_sequence(token));
+            }
+            Route::Host => {
+                self.answered = true;
+                self.terminal.extend_from_slice(token);
+            }
+            Route::Display => self.display.extend_from_slice(token),
+            Route::Query => self.query(token),
+            Route::Forward => {
+                self.terminal.extend_from_slice(token);
+                self.query(token);
+            }
+            Route::Split { display, query } => {
+                // Whatever of it the host answers (a colour query, a kitty
+                // graphics command's acknowledgement).
+                self.answered = true;
+                self.terminal.extend_from_slice(token);
+                self.display.extend(display);
+                self.query(&query);
+            }
+        }
+    }
 }
 const MAX_CONTROL: usize = 64 * 1024;
+/// The longest CSI or OSC sequence the ground state routes without
+/// buffering it; a longer one takes the byte-at-a-time path. Far below
+/// `MAX_CONTROL`, so the fast path never meets the discard rule.
+const MAX_FAST_TOKEN: usize = 4096;
 /// OSC 52 clipboard writes carry base64 text and go only to the renderer;
 /// they may be much larger than other control strings.
 pub const MAX_CLIPBOARD: usize = 8 * 1024 * 1024;
 const CLIPBOARD: &[u8] = b"\x1b]52;";
 const KITTY_NOTIFICATION: &[u8] = b"\x1b]99;";
 const ENQ: u8 = 0x05;
+const ESC: u8 = 0x1b;
 
 impl DisplayStream {
     pub fn feed(&mut self, bytes: &[u8]) -> Batch {
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            terminal: Vec::with_capacity(bytes.len()),
+            display: Vec::with_capacity(bytes.len()),
+            ..Batch::default()
+        };
+        self.feed_into(bytes, &mut batch);
+        batch
+    }
+
+    /// Feed `bytes`, which follow what `batch` holds: what `feed` would
+    /// return, appended to it (`Batch::append`), without a batch of its own.
+    pub fn feed_into(&mut self, bytes: &[u8], batch: &mut Batch) {
+        let mut at = 0;
+        while at < bytes.len() {
+            if self.mode == Mode::Ground {
+                at = self.ground(bytes, at, batch);
+            } else {
+                self.step(&bytes[at..at + 1], batch);
+                at += 1;
+            }
+        }
+    }
+
+    /// The ground state, from `start`: text and complete CSI sequences
+    /// that every parser gets unchanged (SGR, cursor movement, erasing)
+    /// pass through as one run, which ends at the input's end (where a
+    /// UTF-8 character it ends inside is held back) or at the first ENQ
+    /// or other escape sequence. A complete CSI or OSC sequence there is
+    /// routed in place. Returns where `step`, or the next call, goes on.
+    fn ground(&mut self, bytes: &[u8], start: usize, batch: &mut Batch) -> usize {
+        let mut at = start;
+        loop {
+            let Some(stop) = memchr::memchr2(ESC, ENQ, &bytes[at..]).map(|stop| at + stop) else {
+                let cut = at + self.hold_utf8_tail(&bytes[at..]);
+                batch.both(&bytes[start..cut]);
+                return bytes.len();
+            };
+            let csi = complete_csi(&bytes[stop..]);
+            if let Some(len) = csi.filter(|&len| unchanged_csi(&bytes[stop..stop + len])) {
+                at = stop + len;
+                continue;
+            }
+            // An unfinished character before ESC or ENQ is passed on as
+            // it is, as `step` would.
+            batch.both(&bytes[start..stop]);
+            if bytes[stop] == ENQ {
+                batch.control(ENQ);
+                return stop + 1;
+            }
+            if let Some(len) = csi.or_else(|| complete_osc(&bytes[stop..])) {
+                batch.token(&bytes[stop..stop + len]);
+                return stop + len;
+            }
+            self.pending.push(ESC);
+            self.mode = Mode::Escape;
+            return stop + 1;
+        }
+    }
+
+    /// Keep a UTF-8 character that `run` ends inside for the next read,
+    /// as `step` would; returns where it starts (`run.len()` when none).
+    fn hold_utf8_tail(&mut self, run: &[u8]) -> usize {
+        // Its lead byte is the last non-continuation byte, at most three
+        // from the end.
+        for back in 1..=run.len().min(3) {
+            let at = run.len() - back;
+            let needed = match run[at] {
+                0x80..=0xbf => continue,
+                0xc2..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf4 => 3,
+                _ => 0,
+            };
+            // `back - 1` continuation bytes follow the lead byte.
+            if needed >= back {
+                self.pending.extend_from_slice(&run[at..]);
+                self.mode = Mode::Utf8;
+                self.utf8_left = needed - (back - 1);
+                return at;
+            }
+            break;
+        }
+        run.len()
+    }
+
+    /// Byte at a time: whatever the ground state's fast paths leave.
+    fn step(&mut self, bytes: &[u8], batch: &mut Batch) {
         for &b in bytes {
             if self.mode == Mode::Ground {
                 match b {
@@ -129,8 +269,8 @@ impl DisplayStream {
                 continue;
             }
             if self.mode == Mode::Utf8 && !(0x80..=0xbf).contains(&b) {
-                self.finish(&mut batch);
-                batch.append(self.feed(&[b]));
+                self.finish(batch);
+                self.step(&[b], batch);
                 continue;
             }
             // ESC starts a new sequence even inside an unfinished CSI or
@@ -165,7 +305,7 @@ impl DisplayStream {
                 self.mode = Mode::Escape;
                 self.escaped = false;
                 self.discarding = false;
-                batch.append(self.feed(&[b]));
+                self.step(&[b], batch);
                 continue;
             }
             if !self.discarding {
@@ -201,14 +341,13 @@ impl DisplayStream {
                 Mode::Ground => unreachable!(),
             };
             if complete {
-                self.finish(&mut batch);
+                self.finish(batch);
             } else if self.pending.len() > self.limit() {
                 // Oversized control strings cannot grow memory without bound.
                 self.pending.clear();
                 self.discarding = true;
             }
         }
-        batch
     }
 
     fn limit(&self) -> usize {
@@ -221,29 +360,7 @@ impl DisplayStream {
 
     fn finish(&mut self, batch: &mut Batch) {
         if !self.discarding {
-            if self.pending.starts_with(KITTY_NOTIFICATION) {
-                batch
-                    .notifications
-                    .push((batch.terminal.len(), self.pending.clone()));
-            }
-            match route(&self.pending) {
-                Route::Both => {
-                    batch.terminal.extend(&self.pending);
-                    batch.display.extend(display_sequence(&self.pending));
-                }
-                Route::Host => batch.terminal.extend(&self.pending),
-                Route::Display => batch.display.extend(&self.pending),
-                Route::Query => batch.query(&self.pending),
-                Route::Forward => {
-                    batch.terminal.extend(&self.pending);
-                    batch.query(&self.pending);
-                }
-                Route::Split { display, query } => {
-                    batch.terminal.extend(&self.pending);
-                    batch.display.extend(display);
-                    batch.query(&query);
-                }
-            }
+            batch.token(&self.pending);
         }
         self.pending.clear();
         self.reset();
@@ -253,6 +370,44 @@ impl DisplayStream {
         self.escaped = false;
         self.discarding = false;
         self.utf8_left = 0;
+    }
+}
+
+/// The length of the CSI sequence `bytes` starts with, when it is complete
+/// and has only parameter and intermediate bytes before its final byte:
+/// `step` treats those bytes no differently. Anything else (an embedded
+/// control, ESC, CAN/SUB, a byte from 0x7f up, or the end of the input) is
+/// left to `step`.
+fn complete_csi(bytes: &[u8]) -> Option<usize> {
+    if bytes.get(1) != Some(&b'[') {
+        return None;
+    }
+    for (at, &b) in bytes.iter().enumerate().take(MAX_FAST_TOKEN).skip(2) {
+        match b {
+            0x20..=0x3f => {}
+            0x40..=0x7e => return Some(at + 1),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The length of the OSC sequence `bytes` starts with, when it is complete,
+/// ends in BEL or ST, and holds no ESC, CAN or SUB before its terminator:
+/// `step` accumulates every other byte of an OSC string.
+fn complete_osc(bytes: &[u8]) -> Option<usize> {
+    if bytes.get(1) != Some(&b']') {
+        return None;
+    }
+    let end = bytes.len().min(MAX_FAST_TOKEN);
+    let body = bytes.get(2..end)?;
+    let at = body
+        .iter()
+        .position(|&b| matches!(b, 0x07 | 0x1b | 0x18 | 0x1a))?;
+    match body[at] {
+        0x07 => Some(2 + at + 1),
+        0x1b if body.get(at + 1) == Some(&b'\\') => Some(2 + at + 2),
+        _ => None,
     }
 }
 
@@ -298,10 +453,33 @@ fn route(token: &[u8]) -> Route {
     Route::Both
 }
 
+/// Whether a CSI sequence (`body` its bytes between `CSI` and the final
+/// byte `last`) may be one the host answers or a query (see `route_csi` and
+/// `csi_query`). Most (SGR, cursor movement, erasing) are neither.
+fn csi_may_query(last: u8, body: &[u8]) -> bool {
+    match last {
+        b'c' | b'n' | b'p' | b'q' | b'u' | b't' | b'x' | b'w' | b'y' | b'|' => true,
+        b'm' | b'S' => body.first() == Some(&b'?'),
+        _ => false,
+    }
+}
+
+/// Whether a complete CSI sequence goes to the host and, unchanged, to
+/// every renderer: routed `Both` and left alone by `display_sequence`.
+fn unchanged_csi(token: &[u8]) -> bool {
+    let (&last, body) = token[2..].split_last().expect("a complete CSI sequence");
+    // `display_sequence` takes the host's modes out of DEC private modes.
+    let private_mode = body.first() == Some(&b'?') && matches!(last, b'h' | b'l');
+    !(csi_may_query(last, body) || private_mode)
+}
+
 fn route_csi(token: &[u8]) -> Route {
     let Some((&last, body)) = token[2..].split_last() else {
         return Route::Both;
     };
+    if !csi_may_query(last, body) {
+        return Route::Both;
+    }
     let (prefix, rest) = match body.first() {
         Some(&b @ (b'<' | b'=' | b'>' | b'?')) => (Some(b), &body[1..]),
         _ => (None, body),
@@ -612,7 +790,7 @@ fn route_graphics(token: &[u8]) -> Route {
 /// inject a second report.
 const HOST_MODES: [&[u8]; 2] = [b"2048", b"2033"];
 
-fn display_sequence(bytes: &[u8]) -> Vec<u8> {
+fn display_sequence(bytes: &[u8]) -> Cow<'_, [u8]> {
     if bytes.starts_with(b"\x1b[?") && matches!(bytes.last(), Some(b'h' | b'l')) {
         let modes: Vec<_> = bytes[3..bytes.len() - 1]
             .split(|&b| b == b';')
@@ -620,7 +798,7 @@ fn display_sequence(bytes: &[u8]) -> Vec<u8> {
             .collect();
         if modes.len() != bytes[3..bytes.len() - 1].split(|&b| b == b';').count() {
             if modes.is_empty() {
-                return Vec::new();
+                return Cow::Borrowed(&[]);
             }
             let mut out = b"\x1b[?".to_vec();
             for (i, mode) in modes.iter().enumerate() {
@@ -630,11 +808,14 @@ fn display_sequence(bytes: &[u8]) -> Vec<u8> {
                 out.extend(*mode);
             }
             out.push(*bytes.last().unwrap());
-            return out;
+            return Cow::Owned(out);
         }
     }
-    bytes.to_vec()
+    Cow::Borrowed(bytes)
 }
+
+#[cfg(test)]
+mod reference;
 
 #[cfg(test)]
 mod tests {
@@ -922,6 +1103,419 @@ mod tests {
         let batch = DisplayStream::default().feed(b"\x1b[1\x05\x07m");
         assert_eq!(batch.display, b"\x07\x1b[1m");
         assert_eq!(batch.queries, [(0, b"\x05".to_vec())]);
+    }
+
+    /// Everything a batch holds, for comparisons.
+    type Parts = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<(usize, Vec<u8>)>,
+        Vec<(usize, Vec<u8>)>,
+    );
+    fn parts(batch: Batch) -> Parts {
+        (
+            batch.terminal,
+            batch.display,
+            batch.queries,
+            batch.notifications,
+        )
+    }
+
+    /// The fast paths (whole runs of text and plain CSI sequences, complete
+    /// CSI and OSC sequences) agree with the byte-at-a-time state machine,
+    /// wherever reads split the output: a byte at a time never completes a
+    /// sequence on a fast path.
+    #[test]
+    fn read_boundaries_do_not_change_the_split() {
+        let long_csi = [&b"\x1b["[..], &vec![b';'; MAX_FAST_TOKEN + 10], b"m"].concat();
+        let long_osc = [&b"\x1b]2;"[..], &vec![b'x'; MAX_FAST_TOKEN + 10], b"\x07"].concat();
+        let pieces: &[&[u8]] = &[
+            b"plain text\r\n",
+            "h\u{e9}llo \u{65e5}\u{672c} \u{1f389}\r\n".as_bytes(),
+            b"\x1b[1;31mred\x1b[0m \x1b[38;5;208m\x1b[48;2;1;2;3m",
+            b"\x1b[H\x1b[2J\x1b[12;40H\x1b[K\x1b[?25l\x1b[?25h",
+            b"\x1b[?2004;2048h\x1b[?2033l",
+            b"\x1b[6n\x1b[c\x1b[?6n\x1b[18t\x1b[?4m",
+            b"\x1b]0;title \xe2\x9c\x93\x07\x1b]8;;file:///x\x1b\\link\x1b]8;;\x1b\\",
+            b"\x1b]99;i=1:d=0;Done\x1b\\\x1b]99;i=1:p=?;\x1b\\",
+            b"\x1b]11;?\x1b\\\x1b]10;red;?\x07\x1b]13;?\x07\x1b]52;c;aGk=\x07\x1b]52;c;?\x07",
+            b"\x05",
+            b"\xe2\x82",
+            b"\xf0\x9f",
+            b"\xc3\x1b[m\xe2\x05\x82",
+            b"\x1b[12;\x1b[5n\x1b[1\x07m\x1b[1\x18\x1b[\x7f1m\x1b[1\xc3m",
+            b"\x1b]2;x\x18\x1b]2;y\x1bZ\x1b]2;z\x1a",
+            b"\x1bP$qm\x1b\\\x1bP+q544e;4d73\x1b\\\x1b_Ga=t,q=0;AAAA\x1b\\",
+            b"\x1b(B\x1b7\x1b8\x1b=\x1b>\x1bZ\x1b",
+            b"\x80\xbf\xc0\xf5\xff\x07\x08\t",
+            &long_csi,
+            &long_osc,
+        ];
+        let mut seed = 7u32;
+        let mut next = |bound: usize| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as usize % bound
+        };
+        let mut output = Vec::new();
+        for _ in 0..3000 {
+            output.extend_from_slice(pieces[next(pieces.len())]);
+        }
+        let reference = parts(split(&output));
+        let whole = parts(DisplayStream::default().feed(&output));
+        assert!(whole == reference, "one read");
+        for most in [2, 7, 64, 1024] {
+            let mut stream = DisplayStream::default();
+            let mut batch = Batch::default();
+            let mut at = 0;
+            while at < output.len() {
+                let end = (at + 1 + next(most)).min(output.len());
+                batch.append(stream.feed(&output[at..end]));
+                at = end;
+            }
+            assert!(parts(batch) == reference, "reads of up to {most} bytes");
+        }
+        // A read that ends inside a character keeps it for the next.
+        for character in ["\u{e9}", "\u{65e5}", "\u{1f389}"] {
+            let character = character.as_bytes();
+            for cut in 1..character.len() {
+                let mut stream = DisplayStream::default();
+                let first = stream.feed(&[b"ab", &character[..cut]].concat());
+                assert_eq!(
+                    (first.terminal, first.display),
+                    (b"ab".to_vec(), b"ab".to_vec())
+                );
+                let rest = stream.feed(&[&character[cut..], b"z\x1b[m"].concat());
+                let whole = [character, b"z\x1b[m"].concat();
+                assert_eq!((rest.terminal, rest.display), (whole.clone(), whole));
+            }
+        }
+    }
+
+    /// A xorshift generator for the differential tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len())]
+        }
+        fn chance(&mut self, percent: usize) -> bool {
+            self.below(100) < percent
+        }
+        fn bytes(&mut self, items: &[&'static [u8]]) -> &'static [u8] {
+            items[self.below(items.len())]
+        }
+    }
+
+    fn parameters(r: &mut Rng, out: &mut Vec<u8>) {
+        for i in 0..r.below(5) {
+            if i > 0 {
+                out.push(if r.chance(90) { b';' } else { b':' });
+            }
+            let parameter = r.bytes(&[
+                &b"0"[..],
+                b"1",
+                b"2",
+                b"5",
+                b"6",
+                b"11",
+                b"13",
+                b"14",
+                b"15",
+                b"16",
+                b"18",
+                b"19",
+                b"20",
+                b"21",
+                b"38",
+                b"48",
+                b"996",
+                b"2004",
+                b"2048",
+                b"2033",
+                b"1049",
+                b"1004",
+                b"4",
+                b"255",
+                b"12345",
+            ]);
+            out.extend_from_slice(parameter);
+        }
+    }
+
+    fn csi(r: &mut Rng, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[");
+        if r.chance(30) {
+            out.push(*r.pick(b"?<=>"));
+        }
+        parameters(r, out);
+        if r.chance(15) {
+            out.push(*r.pick(b" !\"#$%&'()*+,-./"));
+        }
+        if r.chance(3) {
+            // Odd bytes inside a CSI sequence.
+            out.push(*r.pick(&[0x07u8, 0x05, 0x18, 0x1a, 0x1b, 0x7f, 0x80, 0xc3, 0x0a, 0x0d]));
+            if r.chance(50) {
+                parameters(r, out);
+            }
+        }
+        if r.chance(1) {
+            out.resize(out.len() + r.below(70_000), b'1');
+        }
+        if r.chance(1) {
+            out.resize(out.len() + MAX_FAST_TOKEN - 6 + r.below(12), b';');
+        }
+        if r.chance(95) {
+            out.push(*r.pick(b"mmmmmmmmcnpqutxwyS|hlHJKABCDGfrsr@`~"));
+        }
+    }
+
+    fn osc(r: &mut Rng, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b]");
+        let code = r.bytes(&[
+            &b"0"[..],
+            b"2",
+            b"4",
+            b"5",
+            b"8",
+            b"10",
+            b"11",
+            b"12",
+            b"13",
+            b"17",
+            b"19",
+            b"21",
+            b"22",
+            b"52",
+            b"99",
+            b"133",
+            b"5522",
+            b"7",
+            b"",
+        ]);
+        out.extend_from_slice(code);
+        for _ in 0..r.below(4) {
+            out.push(b';');
+            out.extend_from_slice(match r.below(8) {
+                0 => &b"?"[..],
+                1 => b"1;?",
+                2 => b"rgb:00/11/22",
+                3 => b"i=1:p=?",
+                4 => b"foreground=?",
+                5 => "t\u{ef}tle \u{2713} \u{65e5}\u{672c}".as_bytes(),
+                6 => b"c;aGVsbG8=",
+                _ => b"file:///tmp/x",
+            });
+        }
+        if r.chance(3) {
+            out.push(*r.pick(&[0x05u8, 0x0a, 0x7f, 0x9c, 0x00, 0x1b]));
+        }
+        if r.chance(1) {
+            out.resize(out.len() + MAX_FAST_TOKEN - 16 + r.below(30), b'x');
+        }
+        if r.chance(1) {
+            out.resize(out.len() + MAX_CONTROL - 6 + r.below(20), b'y');
+        }
+        match r.below(10) {
+            0..=4 => out.push(0x07),
+            5..=7 => out.extend_from_slice(b"\x1b\\"),
+            8 => out.push(*r.pick(&[0x18u8, 0x1a, 0x1b])),
+            _ => {}
+        }
+    }
+
+    fn string(r: &mut Rng, out: &mut Vec<u8>) {
+        match r.below(5) {
+            0 => out.extend_from_slice(b"\x1bP$qm"),
+            1 => out.extend_from_slice(b"\x1bP+q544e;4d73;6b31"),
+            2 => out.extend_from_slice(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA"),
+            3 => out.extend_from_slice(b"\x1b_Ga=t,q=0;AAAA"),
+            _ => {
+                out.push(0x1b);
+                out.push(*r.pick(b"P_^X"));
+                out.extend_from_slice(b"junk\x07more");
+            }
+        }
+        match r.below(4) {
+            0..=2 => out.extend_from_slice(b"\x1b\\"),
+            _ => out.push(*r.pick(&[0x18u8, 0x1b, 0x07])),
+        }
+    }
+
+    fn text(r: &mut Rng, out: &mut Vec<u8>) {
+        for _ in 0..r.below(200) {
+            match r.below(40) {
+                0 => out.extend_from_slice("\u{e9}".as_bytes()),
+                1 => out.extend_from_slice("\u{65e5}\u{672c}".as_bytes()),
+                2 => out.extend_from_slice("\u{1f389}".as_bytes()),
+                // Stray and cut characters.
+                3 => out.push(*r.pick(&[
+                    0xc2u8, 0xe2, 0xf0, 0xf4, 0xe0, 0xc0, 0xc1, 0xf5, 0xff, 0x80, 0xbf,
+                ])),
+                4 => out
+                    .push(*r.pick(&[0x07u8, 0x05, 0x18, 0x1a, 0x0a, 0x0d, 0x08, 0x09, 0x00, 0x7f])),
+                5 => {
+                    let rocket = "\u{1f680}".as_bytes();
+                    out.extend_from_slice(&rocket[..1 + r.below(3)]);
+                }
+                _ => out.push(b'a' + r.below(26) as u8),
+            }
+        }
+    }
+
+    fn output(r: &mut Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..1 + r.below(60) {
+            match r.below(12) {
+                0..=3 => text(r, &mut out),
+                4..=6 => csi(r, &mut out),
+                7..=8 => osc(r, &mut out),
+                9 => string(r, &mut out),
+                10 => {
+                    out.push(0x1b);
+                    out.push(*r.pick(b"Z78=>c()#% \x1b\x18[]\\M"));
+                    if r.chance(50) {
+                        out.push(*r.pick(b"B0A5@G"));
+                    }
+                }
+                _ => out.push(0x1b),
+            }
+        }
+        out
+    }
+
+    /// Everything a batch holds, the reference's or the fast one's.
+    type Split = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<(usize, Vec<u8>)>,
+        Vec<(usize, Vec<u8>)>,
+    );
+
+    fn fast(batch: Batch) -> Split {
+        (
+            batch.terminal,
+            batch.display,
+            batch.queries,
+            batch.notifications,
+        )
+    }
+
+    fn slow(batch: reference::Batch) -> Split {
+        (
+            batch.terminal,
+            batch.display,
+            batch.queries,
+            batch.notifications,
+        )
+    }
+
+    /// The fast paths against the byte-at-a-time state machine they
+    /// replaced (`reference`, which is HEAD's stream.rs of before them):
+    /// random output of every kind, read in random pieces, then flushed
+    /// with terminators, must split the same, read by read.
+    #[test]
+    fn the_fast_paths_split_output_as_the_reference_does() {
+        for seed in [1u64, 31, 97, 4242] {
+            let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            for input in 0..1000 {
+                let bytes = output(&mut r);
+                let mut ours = DisplayStream::default();
+                let mut theirs = reference::DisplayStream::default();
+                // The same, gathered read after read as the holder does.
+                let mut gathering = DisplayStream::default();
+                let (mut gathered, mut appended) = (Batch::default(), reference::Batch::default());
+                let mode = r.below(4);
+                let mut at = 0;
+                while at < bytes.len() {
+                    let len = match mode {
+                        0 => bytes.len() - at,
+                        1 => 1,
+                        2 => 1 + r.below(8),
+                        _ => 1 + r.below(2048),
+                    }
+                    .min(bytes.len() - at);
+                    let piece = &bytes[at..at + len];
+                    let (b, a) = (theirs.feed(piece), ours.feed(piece));
+                    appended.append(reference::Batch {
+                        terminal: b.terminal.clone(),
+                        display: b.display.clone(),
+                        queries: b.queries.clone(),
+                        notifications: b.notifications.clone(),
+                    });
+                    let (a, b) = (fast(a), slow(b));
+                    assert!(
+                        a == b,
+                        "seed {seed} input {input}, read at {at} of {len}: {:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    gathering.feed_into(piece, &mut gathered);
+                    at += len;
+                }
+                assert!(
+                    fast(gathered) == slow(appended),
+                    "seed {seed} input {input}"
+                );
+                // Whatever is left pending ends the same way.
+                for tail in [&b"\x07"[..], b"\x1b\\", b"\x18", b"ok\xe2", b"\x82\xac"] {
+                    assert!(fast(ours.feed(tail)) == slow(theirs.feed(tail)));
+                }
+            }
+        }
+    }
+
+    /// Snapshots go through a fresh display stream in one piece (see
+    /// `holder::Holder::snapshot`): those of a terminal fed random output
+    /// split as before too.
+    #[test]
+    fn snapshots_split_as_the_reference_does() {
+        let mut r = Rng(99);
+        for _ in 0..150 {
+            let mut terminal = Terminal::new(80, 24, 64 * 1024).unwrap();
+            let _ = terminal.feed(&output(&mut r));
+            let _ = terminal.feed(b"\x1b\\\x18");
+            for raw in [
+                terminal.snapshot().unwrap(),
+                terminal.refresh().unwrap(),
+                terminal.viewport(40, 10).unwrap(),
+                terminal.modes().unwrap(),
+            ] {
+                assert!(
+                    fast(DisplayStream::default().feed(&raw))
+                        == slow(reference::DisplayStream::default().feed(&raw))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queries_the_host_answers_are_marked() {
+        for (bytes, answered) in [
+            (&b"text \x1b[1;31mred\x1b[0m\r\n"[..], false),
+            (b"\x1b[c", true),
+            (b"ab\x1b[6ncd", true),
+            (b"\x1b]11;?\x07", true),
+            (b"\x1b_Ga=t,q=0;AAAA\x1b\\", true),
+            // Only a client answers these.
+            (b"\x1b[?6n\x1b]13;?\x07\x05", false),
+            (b"\x1b]2;title\x07\x1b[?1049h", false),
+        ] {
+            assert_eq!(
+                DisplayStream::default().feed(bytes).answered,
+                answered,
+                "{bytes:?}"
+            );
+            // Byte after byte too.
+            assert_eq!(split(bytes).answered, answered, "{bytes:?}");
+        }
     }
 
     #[test]

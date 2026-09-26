@@ -4,9 +4,9 @@ import Foundation
 
 /// An in-process stand-in for `cherry control` and the daemon behind it. Each
 /// launch gets real pipes: the fake writes the host's Welcome, then answers
-/// protocol 4 requests (echoing `req`) until the app closes its input. Given
-/// `--expected-host-id` for another identity it exits before the Welcome
-/// with the CLI's message.
+/// protocol 6 control requests (echoing `req`) until the app closes its
+/// input. Given `--expected-host-id` for another identity it exits before
+/// the Welcome with the CLI's message.
 ///
 /// Defaults: subscribe → ok, list → the sessions (with `pendingHolders`, nil
 /// for a host that does not report it), create → a running session
@@ -51,6 +51,12 @@ final class FakeControlHelper: @unchecked Sendable {
 
         func push(_ message: HostServerMessage, req: UInt64? = nil) {
             guard let frame = try? HostFrame.encode(HostResponse(req: req, message: message)) else { return }
+            write(frame)
+        }
+
+        /// Attachment traffic, which a control connection never asks for.
+        func push(_ binary: HostBinaryFrame) {
+            guard let frame = try? HostFrame.encode(binary) else { return }
             write(frame)
         }
 

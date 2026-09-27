@@ -76,26 +76,53 @@ extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
 
+/// What quitting Cherry or closing a project window does with the local
+/// sessions still running there (Settings › Sessions). "Don't ask again" in
+/// that question stores the answer here.
+enum LocalSessionsOnQuit: String, CaseIterable, Identifiable, Sendable {
+    /// Ask (`SessionTeardownQuestion`).
+    case ask
+    /// Keep them running with no question: their tabs come back.
+    case keep
+    /// End them with no question.
+    case end
+
+    var id: String { rawValue }
+
+    /// The words of the question's buttons.
+    var label: String {
+        switch self {
+        case .ask: "Ask"
+        case .keep: "Keep Running"
+        case .end: "End Sessions"
+        }
+    }
+}
+
 /// Settings → Sessions, as one value for close and backend decisions.
 struct SessionPersistenceSettings: Equatable, Sendable {
     /// Run new local terminal, command and agent tabs as persistent sessions.
     var persistLocalSessions: Bool
-    /// Closing a local persistent tab detaches instead of ending its session.
-    var keepLocalSessionsAfterTabClose: Bool
-    /// Quitting (and closing a window) ends local persistent sessions.
-    var endLocalSessionsOnQuit: Bool
+    /// Whether quitting or closing a window asks about the local sessions
+    /// running there, keeps them or ends them. The answer travels with the
+    /// close intent (`SessionTeardown`), so no close action reads this.
+    var localSessionsOnQuit: LocalSessionsOnQuit
+    /// A terminal tab closes when its shell exits with status 0
+    /// (`TerminalWorkspace.tabProgramDidExit`), native tabs too.
+    var closeTabsOnCleanExit: Bool = true
 
     static let defaults = SessionPersistenceSettings(
         persistLocalSessions: true,
-        keepLocalSessionsAfterTabClose: false,
-        endLocalSessionsOnQuit: false
+        localSessionsOnQuit: .ask,
+        closeTabsOnCleanExit: true
     )
 
-    /// Everything native, as tests expect unless they opt in.
+    /// Everything native, and exited tabs stay, as tests expect unless they
+    /// opt in. With no persistent tab, nothing asks about sessions.
     static let native = SessionPersistenceSettings(
         persistLocalSessions: false,
-        keepLocalSessionsAfterTabClose: false,
-        endLocalSessionsOnQuit: false
+        localSessionsOnQuit: .ask,
+        closeTabsOnCleanExit: false
     )
 }
 
@@ -107,24 +134,43 @@ struct SessionPersistenceSettings: Equatable, Sendable {
 struct SessionBackendPolicy {
     /// Read at every decision, so a settings change applies to the next one.
     var settings: @MainActor () -> SessionPersistenceSettings
-    /// Whether local persistent tabs follow the Sessions settings when
-    /// closed; see `SessionClosePolicy.hostedLocalTabsFollowSettings`.
+    /// Whether closing a local persistent tab follows its intent; see
+    /// `SessionClosePolicy.hostedLocalTabsFollowSettings`.
     var hostedLocalTabsFollowSettings = SessionClosePolicy.hostedLocalTabsFollowSettings
     /// Ends a local persistent tab's session on its host after a
     /// `.terminate` close action detached the tab: Kill, then Remove once the
-    /// host reports the exit (bounded). Tests replace it to record calls.
+    /// host reports the exit (bounded). For a user's close in a window that
+    /// stays open, only once the close can no longer be undone
+    /// (`PersistentLocalSessions.deferEnd`). Tests replace it to record calls.
     var terminateHostedSession: @MainActor (TerminalSession, SessionCloseIntent) -> Void = { session, _ in
         session.endPersistentSession()
     }
     /// Runs new local tabs as persistent sessions when the settings prefer
     /// them and the local host can run them. Nil keeps every new tab native.
     var localSessions: PersistentLocalSessions?
+    /// A terminal whose shell exits within this long of starting keeps its
+    /// tab: a shell that ends at once (a broken startup file, or a native
+    /// tab's login(1), which always reports 0) must not close a window as it
+    /// opens, and what it printed stays readable. Tests shorten it.
+    var cleanExitMinimumRunTime: TimeInterval = 1
+    /// Stores the answer of a sessions question whose "Don't ask again" was
+    /// ticked (`localSessionsOnQuit`). Tests record it; only the app's
+    /// policy writes the setting.
+    var rememberLocalSessionsOnQuit: @MainActor (LocalSessionsOnQuit) -> Void = { _ in }
+    /// The user detached a tab (⌘D, Detach) keeping its persistent session
+    /// running: they know it runs in the background, so the launch notice
+    /// does not name it (`BackgroundSessionsNotice.noteTold`). Given its
+    /// host session id. Tests record it; only the app's policy tells the
+    /// app's notice.
+    var sessionDetached: @MainActor (String) -> Void = { _ in }
 
     static let native = SessionBackendPolicy(settings: { .native })
 
     static let userSettings = SessionBackendPolicy(
         settings: { TerminalSettings.shared.sessionPersistenceSettings },
-        localSessions: .shared
+        localSessions: .shared,
+        rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
+        sessionDetached: { ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold([$0]) }
     )
 
     /// Whether new local tabs should be persistent sessions (the setting;
@@ -145,7 +191,6 @@ struct SessionBackendPolicy {
         SessionClosePolicy.closeAction(
             for: session,
             intent: intent,
-            settings: settings(),
             hostedLocalTabsFollowSettings: hostedLocalTabsFollowSettings
         )
     }
@@ -250,21 +295,28 @@ final class TerminalSettings: ObservableObject {
         didSet { save(persistLocalSessions, forKey: Keys.persistLocalSessions, notifyTerminal: false) }
     }
 
-    @Published var keepLocalSessionsAfterTabClose: Bool {
-        didSet {
-            save(keepLocalSessionsAfterTabClose, forKey: Keys.keepLocalSessionsAfterTabClose, notifyTerminal: false)
-        }
+    @Published var localSessionsOnQuit: LocalSessionsOnQuit {
+        didSet { save(localSessionsOnQuit.rawValue, forKey: Keys.localSessionsOnQuit, notifyTerminal: false) }
     }
 
-    @Published var endLocalSessionsOnQuit: Bool {
-        didSet { save(endLocalSessionsOnQuit, forKey: Keys.endLocalSessionsOnQuit, notifyTerminal: false) }
+    @Published var closeTabsOnCleanExit: Bool {
+        didSet { save(closeTabsOnCleanExit, forKey: Keys.closeTabsOnCleanExit, notifyTerminal: false) }
+    }
+
+    /// When Cherry opens, say once which sessions of closed windows or tabs
+    /// are still at work in the background, other than those the user kept
+    /// running on purpose (`BackgroundSessionsNotice`).
+    @Published var noticeBackgroundSessionsAtLaunch: Bool {
+        didSet {
+            save(noticeBackgroundSessionsAtLaunch, forKey: Keys.noticeBackgroundSessionsAtLaunch, notifyTerminal: false)
+        }
     }
 
     var sessionPersistenceSettings: SessionPersistenceSettings {
         SessionPersistenceSettings(
             persistLocalSessions: persistLocalSessions,
-            keepLocalSessionsAfterTabClose: keepLocalSessionsAfterTabClose,
-            endLocalSessionsOnQuit: endLocalSessionsOnQuit
+            localSessionsOnQuit: localSessionsOnQuit,
+            closeTabsOnCleanExit: closeTabsOnCleanExit
         )
     }
 
@@ -294,10 +346,13 @@ final class TerminalSettings: ObservableObject {
         defaultEditorID = defaults.object(forKey: Keys.defaultEditorID) as? String ?? Defaults.defaultEditorID
         persistLocalSessions = defaults.object(forKey: Keys.persistLocalSessions) as? Bool
             ?? Defaults.sessions.persistLocalSessions
-        keepLocalSessionsAfterTabClose = defaults.object(forKey: Keys.keepLocalSessionsAfterTabClose) as? Bool
-            ?? Defaults.sessions.keepLocalSessionsAfterTabClose
-        endLocalSessionsOnQuit = defaults.object(forKey: Keys.endLocalSessionsOnQuit) as? Bool
-            ?? Defaults.sessions.endLocalSessionsOnQuit
+        // A string, so `-sessions.onQuit keep` works as a launch argument.
+        localSessionsOnQuit = (defaults.object(forKey: Keys.localSessionsOnQuit) as? String)
+            .flatMap(LocalSessionsOnQuit.init(rawValue:)) ?? Defaults.sessions.localSessionsOnQuit
+        closeTabsOnCleanExit = defaults.object(forKey: Keys.closeTabsOnCleanExit) as? Bool
+            ?? Defaults.sessions.closeTabsOnCleanExit
+        noticeBackgroundSessionsAtLaunch = defaults.object(forKey: Keys.noticeBackgroundSessionsAtLaunch) as? Bool
+            ?? Defaults.noticeBackgroundSessionsAtLaunch
     }
 
     func resetTerminalAppearance() {
@@ -487,6 +542,7 @@ final class TerminalSettings: ObservableObject {
         static let darkTerminalThemeName = "Afterglow"
         static let defaultEditorID = ""
         static let sessions = SessionPersistenceSettings.defaults
+        static let noticeBackgroundSessionsAtLaunch = true
     }
 
     private enum Keys {
@@ -503,8 +559,9 @@ final class TerminalSettings: ObservableObject {
         static let darkTerminalThemeName = "terminal.theme.dark"
         static let defaultEditorID = "editor.default"
         static let persistLocalSessions = "sessions.persistLocal"
-        static let keepLocalSessionsAfterTabClose = "sessions.keepAfterTabClose"
-        static let endLocalSessionsOnQuit = "sessions.endOnQuit"
+        static let localSessionsOnQuit = "sessions.onQuit"
+        static let closeTabsOnCleanExit = "sessions.closeTabOnExit"
+        static let noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

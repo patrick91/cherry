@@ -426,13 +426,87 @@ runs `cherry attach … --detach-key none --status-file … --client-id <tab ID>
 (the attach adapter),
 and the app keeps one `cherry control` connection per host. Quitting Cherry,
 a crash of Cherry or an update leaves the programs running, and each project
-window reopens its saved tabs attached to them. Closing a tab ends its
-session, unless **Keep running after closing a tab** is on; **End sessions
-when quitting** ends them when you quit or close a window. Removing a
-worktree ends its sessions. A running agent's tab asks before closing: **Close
-agent?** when that stops it, **Close agent tab?** when the agent keeps
-running. Sessions on SSH hosts, and sessions a tab only attached to, always
-keep running when you close a tab or quit.
+window reopens its saved tabs attached to them. Closing a tab (Cmd-W) ends
+its session; **Detach Tab** (Cmd-D, or Detach in the sidebar's menus) closes
+the tab and leaves its session running in the background. **Cmd-Z** brings
+back a tab just closed or detached, where it was and attached to the same
+session again (no new Create), while its notice would stay (about 6 s); a
+closed tab's session is ended (Kill, then Remove) only once that has passed,
+or when its window closes or Cherry quits, and meanwhile it is recorded in
+`sessions-to-end.json` so the next launch ends it if Cherry exits first.
+Quitting or
+closing a project window while local sessions run there asks one question,
+**Keep N sessions running in the background?**: **Keep Running** (the
+default) leaves them running for next time, **End Sessions** ends them (and
+the sessions of that window's saved tabs no open tab shows), and **Cancel**
+stays; it also names the native programs that stop anyway, so no second
+dialog follows. **Don't ask again** stores the answer in **When quitting or
+closing a window** (Ask, Keep Running, End Sessions). A quit that keeps
+sessions exits at once, touching no tab (the attach adapters end with the
+app), unless native tabs have busy programs to stop or a tab closed just
+before still has a session to end (its Kill under way, its **Cmd-Z** still
+possible, or its Create still unanswered); that quit, and one that ends
+sessions, orders every window out first, then stops the native programs and
+ends the sessions, waiting at most 10 s. A closed window likewise leaves
+the screen before its tabs are torn down. A log out, restart or
+shut down does not ask about sessions and ends none itself (the system then
+ends them with the user's processes), but warns about programs still running
+in them, as it does for native tabs, so the log out can be cancelled, and an update (the app on disk has
+another build number than at launch) keeps them without asking. Removing a
+worktree ends its sessions. Closing a tab whose program is at work (an
+agent, a command, or a terminal running a job) asks **Close “<name>”?**
+first: **Close** stops it, **Detach Instead** keeps it running in the
+background, **Cancel** keeps the tab. Detaching asks nothing, nor does
+closing a tab whose program keeps running (a session it only attached to);
+a notice at the bottom of the window says where it went, with **Reopen**
+(after such a close, only when that program was at work). Sessions on SSH
+hosts, and sessions a tab only attached to, always keep running when you
+close a tab, close a window or quit.
+
+A session of this app that no open tab shows is in the background: its
+window was closed with Keep Running, its tab was detached, or it is a
+command tab a restore set aside because another tab runs that command.
+The Cherry menu bar icon lists them under
+**Background sessions**, with the project each belongs to and what it does
+(`idle`, the program in the foreground, `running`, `attached`, or `exit N`);
+a terminal whose shell exited with status 0 is removed instead, as its tab
+would have closed, while **Close a tab when its shell exits** is on.
+Clicking one opens (or focuses) its project's window, whose restore brings it
+back with its sibling tabs, and shows its tab; a session no saved tab names
+becomes a tab of its worktree with its kind and name. **End** (twice, for a
+running session) kills it, waits for its exit and removes it; an ended one is
+only removed. **Cherry → End Background Sessions…** and **End All…** (in that
+list and in **Settings › Sessions › Background Sessions**) end them all after
+asking, on a project window. Ending one does not change its window's saved
+tabs: that window's next restore finds the session gone and drops its tab.
+Sessions of the `cherry` CLI, of **Create & Attach** and of other apps (Cherry
+Sessions, CherryDev) are never listed or ended there; Persistent Sessions
+manages them. The list never starts a daemon to find out: it shows what
+Cherry's control connection knows, and connects only when this run reached
+the host already or local tabs run in it. When Cherry opens and sessions at
+work (an agent, a command, or a terminal running a job; never an idle shell)
+are in the background that it has not told about, it says so once in a
+notice at the bottom of its first project window, with **Reopen** (each back
+in a tab of its project's window) and **End…** (asks, then ends those
+sessions); its time runs only while that window is in front, and it waits
+for a closed tab's notice to go. **Settings › Sessions › Tell me about
+background sessions when Cherry opens**,
+`sessions.backgroundNoticeAtLaunch`, turns it off. Sessions
+kept on purpose are never named: a detached tab's, a window's closed with
+Keep Running or while **When quitting or closing a window** is Keep
+Running. Nor are those a notice named once it
+is dismissed, times out or is acted on.
+
+A terminal tab whose shell exits with status 0 closes by itself and its
+ended session is removed (`exit` ends the shell with the last command's
+status, so after a failed command the tab stays); on a window's last tab the
+window closes too, as with Cmd-W, unless a note is shown there (**Settings ›
+Sessions › Close a tab when its shell exits**, on by default). A shell that fails or is killed, a shell that ends
+within its first second, command and agent tabs, and tabs attached to a
+session they do not own stay open and show how the program ended. Such a
+terminal that exited with status 0 while Cherry was closed is not restored;
+its session is removed. Native tabs cannot report their shell's status (their
+launch goes through login(1)), so they close whenever their shell ends.
 
 When the local host cannot run sessions, new tabs run as ordinary native tabs
 and Settings › Sessions says why: the app runs from a disk image or an App
@@ -447,9 +521,11 @@ in a sheet on its first project window (**Persistent sessions are off in this
 copy**).
 
 The settings are the user defaults `sessions.persistLocal`,
-`sessions.keepAfterTabClose` and `sessions.endOnQuit`. As a launch argument,
-give a plist boolean: `-sessions.persistLocal '<false/>'` (or `'<true/>'`);
-`-sessions.persistLocal NO` or `0` is ignored.
+`sessions.closeTabOnExit`, `sessions.backgroundNoticeAtLaunch` (booleans) and
+`sessions.onQuit` (the string `ask`, `keep` or `end`). As a launch argument,
+give a boolean as a plist boolean: `-sessions.persistLocal '<false/>'` (or
+`'<true/>'`); `-sessions.persistLocal NO` or `0` is ignored. The string takes
+its value as is: `-sessions.onQuit keep`.
 
 ### Persistent Sessions
 

@@ -30,30 +30,266 @@ Ghostty config when they change):
 | Setting (as Settings › Sessions labels it) | Key | Default |
 |---|---|---|
 | Run local terminals as persistent sessions | `sessions.persistLocal` | on |
-| Keep running after closing a tab (*keep after tab close*) | `sessions.keepAfterTabClose` | off |
-| End sessions when quitting (*end on quit*) | `sessions.endOnQuit` | off |
+| When quitting or closing a window (*on quit*: Ask, Keep Running, End Sessions) | `sessions.onQuit` (`ask`, `keep`, `end`) | `ask` |
+| Close a tab when its shell exits (*close on exit*) | `sessions.closeTabOnExit` | on |
+| Tell me about background sessions when Cherry opens (*background notice*) | `sessions.backgroundNoticeAtLaunch` | on |
 
-The keys are read with `object(forKey:) as? Bool`, so a launch argument must
-be a plist boolean: `-sessions.persistLocal '<false/>'` works,
-`-sessions.persistLocal NO` (or `0`) is ignored.
+The boolean keys are read with `object(forKey:) as? Bool`, so a launch
+argument must be a plist boolean: `-sessions.persistLocal '<false/>'` works,
+`-sessions.persistLocal NO` (or `0`) is ignored. `sessions.onQuit` is a
+string (`-sessions.onQuit keep`); anything else reads as `ask`.
 
 Close intents (every path that used to call `TerminalSession.stop()` names one):
 
 | Intent | Local hosted tab | Remote hosted tab | Native tab |
 |---|---|---|---|
-| `userClosedTab` (tab close, ⌘W, sidebar close, MCP `close_process`) | terminate, unless *keep after tab close* | detach | stop |
-| `windowClosed` | follows *end on quit* | detach | stop |
-| `appQuit` | detach (terminate if *end on quit*) | detach | stop |
+| `userClosedTab` (⌘W, Close Tab, the sidebar's and pane menu's Close) | terminate (in a window that stays open, once ⌘Z can no longer undo the close) | detach | stop |
+| `userDetachedTab` (⌘D, Detach Tab, the sidebar's and pane menu's Detach, Detach Instead) | detach | detach | — (not offered) |
+| `mcpClose` (MCP `close_process`, never asked about) | terminate | detach | stop |
+| `windowClosed` (Keep Running, *on quit* = keep, or nothing asked) | detach | detach | stop |
+| `windowClosedEndingSessions` (End Sessions, or *on quit* = end) | terminate | detach | stop |
+| `appQuit` (Keep Running, *on quit* = keep, nothing asked, or a log out, restart, shut down or update) | detach | detach | stop |
+| `appQuitEndingSessions` (End Sessions, or *on quit* = end) | terminate | detach | stop |
 | `duplicateWindowTeardown` | detach | detach | stop |
 | `worktreeRemoved` | terminate (confirm busy first) | detach | stop |
 | `restart` (menu, MCP `restart_process`) | terminate + create with the same tab id | reconnect | restart |
+| `programExited` (a terminal's shell exited with status 0) | terminate (removes the ended session) | — (attached tabs never close by themselves) | stop |
 
 A tab attached to a session it does not own (from the Persistent Sessions
 sheet: another app's or the CLI's local session, or an SSH host's) behaves
-like a remote hosted tab: it detaches, and `restart` reconnects it. ⌘W or File › Close Tab on a window's
-last tab (no other worktree of the window has tabs) closes that tab as
-`userClosedTab` and then closes the window; it does not close the window with
-`windowClosed`, which would detach and restore the tab.
+like a remote hosted tab: it detaches, and `restart` reconnects it.
+
+Closing and detaching a tab (the menu's Close Tab and Detach Tab, which say
+Pane in a split, act on the selected tab or the focused pane):
+
+- **⌘W** (Close Tab) always ends the tab's program: a persistent tab's
+  session ends, a native tab's process tree stops, and a tab attached to a
+  session it does not own only disconnects (not this app's to end). There
+  is no setting to keep a closed tab's session running; detach it instead.
+- **⌘D** (Detach Tab; Split Right moved to **⌘⇧D**) closes the tab and
+  keeps its session running in the background, where Background Sessions
+  lists it (a tab attached to a session it does not own disconnects). It is
+  offered for this app's own persistent tabs while their program runs and
+  for attached tabs whose session has not ended
+  (`SessionCloseCoordinator.canDetach`); for a native tab the menu item is
+  disabled and ⌘D does nothing. An agent with sub-agents detaches just its
+  own tab (the sub-agents stay, promoted). The sidebar's tab and agent rows
+  and a split's pane menu offer Detach (Detach Pane) beside Close. Every
+  detach, an idle shell's too, shows the window's toast ("<name> is running
+  in the background", with Reopen), and the session counts as told for the
+  launch notice (`SessionBackendPolicy.sessionDetached`). ⌘Z undoes it
+  (below).
+- Both shortcuts are taken by `AppShortcutMonitor` before the terminal sees
+  them (Ghostty's own ⌘D and ⌘⇧D would split its surface); ⌘⇧D arrives with
+  its characters shifted ("D"), and Caps Lock (like the keypad and function
+  flags) does not count as a held modifier.
+- A user's close that would stop a program at work (an agent, a running
+  command, or a terminal whose host or PTY reports a job in its foreground;
+  an idle shell never asks: a native terminal Ghostty cannot see at a
+  prompt, as with a shell without its shell integration such as macOS's
+  bash 3.2, counts as busy only while the PTY's foreground process group is
+  not its shell's, `ShellProcessController.nativeShellHasForegroundJob`)
+  asks one question first, a sheet on the window:
+  "Close “<name>”?", "<program> is running. Closing the tab stops it."
+  (the program is "This agent", a command's command line, a terminal's
+  foreground job as its host reports it, or "A program"), with **Close**
+  (destructive), **Detach Instead** (only for a tab that can detach) and
+  **Cancel** (`TabCloseQuestion`, `ProjectWindowChromeState.pendingTabClose`,
+  `TabCloseAlertPresenterView`). It is the only dialog a tab close shows:
+  it replaced "Close agent?" and ⌘W's "Close window?" for a last tab, and a
+  second close while it is up asks nothing more. An agent with sub-agents
+  asks "Close Agent Group?" instead (Close Parent and Sub-Agents, Close
+  Parent Only, and Detach Parent and Sub-Agents when they can all detach),
+  and Close Split Group… asks as before, adding Detach Instead when every
+  pane can detach and the close would stop one. MCP `close_process` never
+  asks and ends the session.
+- On a window's last tab (no other worktree of the window has tabs), ⌘W
+  and ⌘D close (or detach) the tab, after its question if any, and then
+  close the window, which has nothing left to ask about; they do not close
+  the window with the tab in it, which would ask whether to keep its
+  session. After the question, the window closes once its sheet has gone
+  (`SessionCloseCoordinator.performClose`: `NSAlert` answers while the sheet
+  is still attached, and AppKit ignores a close meanwhile), unless a tab
+  came to it.
+
+Undoing a close or detach (`ClosedTabHistory`):
+
+- **⌘Z** (Edit › Undo, which then reads "Undo Close Tab" or "Undo Detach
+  Tab", "Tabs" for a group) brings back what a close (⌘W, Close, a question
+  answered Close or Detach Instead, Close Split Group…, "Close Agent
+  Group?") or a detach (⌘D, Detach) just took out of a window that stays
+  open: each tab where it was (its place in the sidebar, its pane in its
+  split, which is made again when the close left one pane), with the same
+  tab id, kind, title, agent and command, and the sub-agents its close
+  promoted back under it. It attaches to the same session again, with no
+  new Create: this app's own session becomes the tab's own again, and a
+  session the tab did not own is attached again. Several closes come back
+  latest first, then the one before, and so on. Redo (⌘⇧Z) is not offered.
+- Each close can be undone for as long as its toast would stay: 6 s (30 s
+  while VoiceOver runs), its time stopped while the pointer rests on its
+  toast (then at least 2 s more) and while its window is not key in the
+  active app. A close whose sessions end with it waits for its window for a
+  minute at most (`ClosedTabHistory.longestUnattendedWait`), then its time
+  runs anyway: its programs keep running until it ends, and nothing shows
+  them meanwhile. Each keeps its own time: a newer toast replacing its toast
+  leaves it as it is. Once that runs out it drops out of ⌘Z.
+- A close's toast says "Closed <name>" ("Closed N tabs") with **Undo**
+  (⌘Z). A detach, or a close that leaves a program at work running in a
+  session the tab did not own, keeps its "is running in the background"
+  toast, whose **Reopen** does what ⌘Z does while the undo lasts (and, once
+  it ran out, what it did before). These toasts, like the undo, wait while
+  their window is not key.
+- Until then a closed persistent tab's session is not ended: ⌘W (a
+  confirmed "Close “<name>”?" too, as Ghostty does) stops only the tab's
+  attach adapter, and the session ends as any close ends it (Kill, then
+  Remove; only Remove for a program that ended) when the undo runs out,
+  and at once when its window closes or Cherry quits (a quit that keeps
+  sessions then takes its slow path to end them). Meanwhile nothing else
+  takes it: Background Sessions, the launch notice, orphan adoption and
+  Persistent Sessions treat it as being ended (the sheet marks it "Ending"
+  and does not attach it, `BackgroundSessionsModel.isEnding`); ⌘Z brings
+  the tab back as its session's own even if another tab attached to it. It is recorded in
+  `sessions-to-end.json` when its tab closes, and dropped once it ended or
+  the close was undone, so a launch after Cherry exited without ending it
+  ends it.
+- Not undoable, and ending at once as before: native tabs (their program
+  stops with the tab), MCP `close_process`, a clean-exit close
+  (`programExited`), a worktree removal, a window close or quit, a ⌘W or
+  ⌘D that closes the window with its last tab (its toast goes to another
+  window, whose Reopen still brings a detached session back), and a
+  persistent tab whose Create was still under way. A command tab does not
+  come back once its command was started again in another tab (a command
+  runs in one tab per workspace): a closed one's session then ends, and a
+  detached one's stays in the background.
+- ⌘Z goes to the closed tabs only while no text view has the keyboard: the
+  terminal, the sidebar or any other view. In a text view (the notes
+  editor, a search, name or palette field) ⌘Z and Edit › Undo are its own
+  text undo, as before; closed tabs never join it. ⌘Z never reaches the
+  terminal program, and with nothing to bring back it beeps.
+
+Quit and window close ask at most one question. When local persistent tabs
+(not native tabs, not tabs attached to a session they do not own) have a
+running program, a Create under way included, and *on quit* is Ask, a sheet
+asks "Keep N sessions running in the background?": **Keep Running** (the
+default, Return) closes with `windowClosed`/`appQuit`, **End Sessions**
+(destructive) with `windowClosedEndingSessions`/`appQuitEndingSessions`, and
+**Cancel** closes nothing. It lists up to five of them (busy ones first,
+marked "(running)", by their sidebar names and their project, or worktree
+when a window has tabs in several), and names the native programs that stop
+either way ("N other running processes will be stopped"), so the "Quit
+Cherry?" or "Close window?" confirmation never follows it. A window's
+question also says where the kept sessions are until the project opens again
+("Until then, open or end them from Background Sessions in the Cherry menu
+bar icon"), and those sessions are ones the user knows about: the launch
+notice below never names them, nor those of a window closed while *on quit*
+is Keep Running, nor a detached tab's.
+**Don't ask
+again** stores Keep Running or End Sessions as *on quit*; Cancel stores
+nothing. With *on quit* Keep Running or End Sessions, or with no running
+session, nothing is asked about sessions: "Quit Cherry?" / "Close window?"
+asks only when the close stops a busy program (with End Sessions, busy
+persistent tabs count). Ended persistent tabs never cause the question; they
+follow *on quit* (Ask keeps them, showing their exit next time). End
+Sessions also ends the sessions of the window's (or every window's) saved
+tabs that no open tab shows, as a worktree removal does (below), so none is
+left running unseen; so does *on quit* = End Sessions, also for a quit with
+no open persistent tab (`SessionTeardownSummary.savedSessionsNotOpen`,
+`SessionQuitPlan`). The quit sheet goes where "Quit Cherry?" goes, and a
+window's on that window. A window closed without its confirmation
+(`window.close()`) follows *on quit*, keeping when it would ask. A window
+whose close is decided leaves the screen before its tabs are torn down
+(`ProjectWindowCloseDelegate.takeOffScreen`: ordered out, or made
+transparent while its question's sheet is still going away), so it
+disappears at once. A user quit
+while a window's own question ("Keep N sessions…?" or "Close window?"), or
+a question of a close of its tabs ("Close “<name>”?", "Close Agent Group?"),
+is up is cancelled and that window brought forward: its answer decides
+those sessions, and a quit question queued behind it would list them
+still.
+
+Quits that never ask about sessions and end none themselves: a log out,
+restart or shut down (the quit Apple event's `kAEQuitReason`, or a quit
+Apple event without one within 5 minutes of
+`NSWorkspace.willPowerOffNotification`; ⌘Q and menu quits send no event, so
+an announcement never makes them count), after which the system ends the
+sessions with the user's processes, so their busy programs are confirmed with
+the native ones in "Quit Cherry?" (`decide(systemEndsSessions:)`; Cancel
+cancels the log out); an update
+(the app bundle on disk has another `CFBundleVersion` than at launch, as
+`Scripts/install-local-app` and `Scripts/package-dmg` stamp every build, or
+`CherryAppDelegate.terminateKeepingSessions()`); and SIGTERM, SIGKILL, Force
+Quit or a crash, which run no Cherry code. A second copy of the app has no
+persistent tabs to ask about. With `sessions.persistLocal` off new tabs are
+native, but tabs restored as persistent sessions still ask (so *on quit*
+stays editable), and a duplicate window's teardown always detaches.
+
+With *close on exit* on, a terminal tab whose own shell exits by itself with
+status 0, after running at least a second (`cleanExitMinimumRunTime`,
+counted from `programStartedAt`: when its session's Create answered or it
+fell back to running natively, not when the tab asked; a restored tab counts
+from its restore), closes as `programExited` on
+the next main-loop turn, as most terminals close it. `exit` ends a shell
+with its last command's status, so after a failed command the tab stays. On
+the window's last tab the window closes too, as with ⌘W, without asking
+(nothing runs); with no window, while a sheet is on it, or while it shows a
+note (⌘W would close the note), the tab stays.
+Non-zero exits and signals, command and agent tabs, attached tabs, a stop or
+restart (MCP `stop_process` included), and a shell that ended within its
+first second keep the tab, showing how it ended. Native tabs follow the same
+rule, but their launches go through login(1), which always exits with status
+0, so a native terminal tab closes whenever its shell ends (after its first
+second); Settings › Sessions says so while persistent sessions are off or
+the local host cannot run them. MCP reports `terminal_not_found` for a closed
+tab's `process_id`; a `wait_for_process_idle` under way returns `exited` with
+the lines the tab showed last (`TerminalSession.keepContentAfterClosing`).
+
+Background sessions: this app's own local sessions (its identity, `owner`)
+that no open tab shows, running or ended. They come from a window closed
+keeping its sessions, a detached tab (⌘D), a command tab
+a restore set aside (another tab runs that command), a Create that answered
+after a detaching close, and an orphan of a project whose window is not open.
+The Cherry menu bar icon's panel lists them under **Background sessions**,
+below the agents and in the same scrolling list: the command's or agent's
+name (or the session's), the project, and `idle`, the foreground program of a
+busy terminal, `running`, `attached` or `exit N`. Clicking a row shows it in a
+tab: its project's window opens (or is focused), and that window's restore
+brings a closed window's session back with its sibling tabs and layout; a
+session no saved tab names is adopted into its worktree as the tab it was
+started for (same tab id, kind, agent and command), or attached when another
+client shows it. Hovering a row offers **End**, then **End Session** (a
+second click, inline: an alert would close the panel); an ended session
+offers **Remove**; the inline confirmation ignores clicks for 0.45 s, so a
+double click on **End** is not a yes. A terminal whose shell exited with
+status 0 is removed instead of listed while *close on exit* is on (its tab
+would have closed, and its window's restore removes it too). **Cherry → End
+Background Sessions…** (disabled when there are none), the panel's **End
+All…** and Settings › Sessions' **Background Sessions** card end them all
+after "End N background sessions?" (**End Sessions**, destructive, and
+Cancel; "Remove N ended background sessions?" when none runs), shown on the
+Settings window when asked there, else where the quit confirmation goes,
+never on the panel; only the sessions still in the background when it is
+answered end. Ownerless sessions (`cherry new`, the sheet's **Create &
+Attach**), other identities' and SSH hosts' sessions are never listed or
+ended there; File › Persistent Sessions keeps managing them, and marks this
+app's sessions "In a tab", "In the background" or "This app". When Cherry
+opens, once its windows restored their tabs, a toast at the bottom of the
+first project window names the background sessions at work (an agent, a
+command, or a terminal whose host reports a foreground job; never an idle
+shell) that it has not told about: "3 sessions are still running in the
+background", "From tabs or windows you closed (<projects>). Open or end them
+from Background Sessions in the Cherry menu bar icon.", with **Reopen**
+(each session back in a tab of its project's window, as Background Sessions
+→ Open does), **End…** (the End Background Sessions confirmation for those
+sessions only) and dismiss. Its time runs only while that window is key in
+the active app, and it takes turns with a closed tab's toast: it waits for
+one on screen to go, and one shown over it sets it aside until that one
+goes. Sessions the user kept on purpose count as told already: a detached
+tab's, a window's closed with Keep Running or while *on quit* is Keep
+Running. So do those a notice
+named once its toast is dismissed, runs out its time or is acted on. Those
+that went to the background without a choice (orphans, a Create that
+answered after its tab closed, a command a restore set aside, a window closed
+without its question) are named. *background notice* turns it off.
 
 Quit/close confirmations use the host-reported foreground process for hosted
 tabs (busy = foreground process group differs from the session leader's, or the
@@ -61,10 +297,12 @@ tab is a running command/agent), exactly as native tabs use their PTY today.
 
 Relaunch: each project window restores its saved tabs (same tab UUIDs, kinds,
 titles, split layout, selection). Hosted sessions that still run are reattached;
-exited ones show "Session ended (exit N)" with Close/Remove; missing ones are
-dropped. Native tabs are not restored (their processes are gone), except that
-auto-start commands start as today. Windows that had tabs reopen even when macOS
-window restoration is off.
+exited ones show "Session ended (exit N)" with Close/Remove, except that with
+*close on exit* on, a terminal of this app whose shell exited with status 0
+is not restored and its session is removed; missing ones are dropped. Native
+tabs are not restored (their processes are gone), except that auto-start
+commands start as today. Windows that had tabs reopen even when macOS window
+restoration is off.
 
 Fallback: when the local host cannot run (disk image, App Translocation, helper
 missing, daemon start failure, or another copy of the app with the same app
@@ -545,19 +783,101 @@ differs from the design above.
   unless the surface already showed a matching one. Otherwise bells and
   notifications from host and surface are shown once (deduplicated within
   1 s and 3 s).
-- Close intents follow the table above. The additions: closing a persistent
-  tab whose program already ended removes its session whatever the
-  settings. ⌘W on a window's last tab asks "Close window?" only when the
-  close actually stops a busy program (attached tabs never ask); a running
-  agent uses the agent confirmation. A running agent's close confirmation is
-  "Close agent tab?" / "This agent keeps running in the background after its
-  tab closes. Attach to it again from File › Persistent Sessions." /
-  **Close Tab** whenever closing the tab does not stop the agent (a
-  persistent agent with *keep after tab close* on, or a tab attached to a
-  session it does not own), and "Close agent?" / **Stop and close**
-  otherwise. MCP `stop_process` reports a clean `exit 0`. New MCP errors are
+- Close intents follow the table above. The additions: closing or
+  detaching a persistent tab whose program already ended removes its
+  session. A user's close asks "Close “<name>”?" only when it stops a
+  program at work (`SessionCloseCoordinator.closeAsks`; attached tabs never
+  ask), through the window's chrome state (without one, as in a test with
+  no window, it closes at once); the answer closes, detaches instead or
+  keeps the tab (`SessionCloseCoordinator.answerTabClose`), and a program
+  that ended before the answer leaves nothing to ask (the tab closes). A
+  detach, and a close that leaves the program running (a tab attached to a
+  session it does not own: `SessionCloseCoordinator.closeEndsProgram` is
+  false), ask nothing: the tab closes at once. A detach always, and such a
+  close when its program was at work (a command or an agent, or a terminal
+  whose host reports a foreground job), show
+  a toast at the bottom of the window that says "<sidebar name> is running
+  in the background" (only the name is cut short to fit) and "Open or end
+  it from Background Sessions in the Cherry menu bar icon." ("Attach to it
+  again from File › Persistent Sessions." for a session the tab did not
+  own), with **Reopen** and a dismiss button (`ClosedTabNotice`). Any other
+  close that ⌘Z can undo (an idle shell's too) shows "Closed <name>" with
+  **Undo** instead (see Undo below); a native tab's close shows nothing.
+  While ⌘Z can still undo it, Reopen is that undo; after that, Reopen brings a session back where its tab was: this
+  app's own session the way Background Sessions → Open does
+  (`ProjectWindowRegistry.showBackgroundSession`: its project's window,
+  adopted with its tab id, kind, agent and command), and a session the tab
+  did not own attached again in the worktree it was closed from
+  (`ProjectWindowRegistry.workspaceOpeningWindow`); either opens that
+  project's window again when it closed with its last tab. A session of
+  This Mac that is gone brings nothing back. On a window's last tab the
+  window closes too, and the toast goes on the project window that was
+  active last and is on screen (not minimized), when there is one. A window
+  shows one toast (`ProjectWindowToasts`; a new one replaces it, except
+  that the launch notice's unprompted toast waits for the one shown to go,
+  and one shown over it sets it aside, to come back with the time it had
+  left once that one goes), at the
+  bottom of its detail pane where the pane's bottom bars (command exited,
+  reconnecting, program ended) sit, and above any of them it would cover
+  (`ProjectWindowToastObstacles`). It dismisses itself after 6 s on screen
+  (30 s while VoiceOver runs; the launch notice's `.long` toast 12 s, 60 s
+  with VoiceOver, with its two buttons under its text), not counting the
+  time the pointer rests on
+  it (at least 2 s once the pointer leaves; AppKit may not say the pointer
+  left, so a paused toast looks each second whether it is still there) nor,
+  for the launch notice's unprompted toast (`isUnprompted`), the time its
+  window is not key in the active app (`ToastAttentionProbe`: AppKit's key
+  and active notifications, a look each second while paused and one more
+  before its time runs out), is
+  announced to VoiceOver, never takes the keyboard from the terminal, and
+  slides in (only fades with Reduce Motion). The sidebar's Close and
+  Detach for a terminal tab or split pane go the same way. Tabs closed or
+  detached together get one toast, "N tabs are running in the background"
+  when more than one runs on, whose Reopen brings each back as a tab: Close
+  Split Group… (whose confirmation says which panes' programs stop and
+  which keep running, and offers Detach Instead) and "Close Agent Group?"'s
+  Close Parent and Sub-Agents, Close Parent Only or Detach Parent and
+  Sub-Agents. MCP `stop_process` reports a clean `exit 0`. New MCP errors are
   `process_not_accepting_input`, `input_not_delivered`,
   `input_partially_delivered` and `agent_awaiting_permission`.
+- **Undo** (`ClosedTabUndo.swift`). `SessionCloseCoordinator.closeTabs`
+  records a user's close or detach in a window that stays open: it reads
+  each tab's `ClosedTab` before the close (`TerminalWorkspace.closedTab`:
+  its `WorkspaceSessionRecord`, the host session it shows, whether it owned
+  it, and its `ClosedTabPlacement`), runs the close inside
+  `TerminalWorkspace.deferringSessionEnds`, where a `userClosedTab` of this
+  app's own persistent tab stops only the adapter (its `.terminate`, or the
+  Remove of an ended session, is left out), and hands those sessions to
+  `PersistentLocalSessions.deferEnd` with the tab's usual end
+  (`SessionBackendPolicy.terminateHostedSession`) and the app's store
+  (`sessions-to-end.json`). A deferred end counts in `isEnding` (so
+  `canAdopt`, `BackgroundSessions.classify`, the orphan scan and the restore
+  leave it alone) and keeps the control connection leased;
+  `hasDeferredEnds` makes a quit that keeps sessions take the slow path
+  (`CherryAppDelegate.confirmedQuitPlan`). The window's `ClosedTabHistory`
+  (`ProjectWindowChromeState.closedTabs`, on the toasts' clock) keeps an
+  entry per close with its own `ToastLifetime`, paused while its toast is
+  hovered (`ProjectWindowToasts.hoverDidChange`) or its window is not key
+  (`ClosedTabAttentionProbe`, in the toast overlay, which is always there;
+  an entry with sessions to end, `Entry.endsSessions`, for
+  `longestUnattendedWait` at most);
+  its toast pauses the same way (`ProjectWindowToast.pausesWhileUnattended`).
+  Running out calls `endDeferred`; `endAll` ends them all at a window close
+  (`ProjectWindowCloseDelegate.closeWorkspaceIfNeeded`) and a quit
+  (`ProjectWindowRegistry.tearDownForQuit`, and `QuitTeardownSteps.app`
+  ends any left with `endAllDeferred` before it waits). Undo (`undoLatest`,
+  and `undo(_:)` for a toast's button) calls `resumeDeferred`, then
+  `TerminalWorkspace.reopenClosedTab`, which builds the tab as a restore
+  builds one (`makeRestoredPersistentSession` with its adapter launch
+  deferred, or `makeRestoredHostedSession`) and inserts it at its
+  placement; an entry whose workspace went (a removed worktree) ends and is
+  skipped. Edit › Undo: the project window's delegate answers
+  `windowWillReturnUndoManager` with `ClosedTabUndoManager`, a stand-in
+  whose `canUndo`, `undoMenuItemTitle` and `undo()` read the history,
+  unless an `NSText` or `NSTextField` is first responder
+  (`ClosedTabUndoRouting`), when it returns the window's own undo manager,
+  as AppKit made one before; `AppShortcutMonitor` takes ⌘Z in the same
+  case, before the terminal sees it.
 - **Restart.** A tab runs one launch at a time. A stop or close during a
   restart's wait for the old program to exit starts nothing. A second restart
   waits (bounded) for the first. A session created by a Create that answers
@@ -565,26 +885,61 @@ differs from the design above.
   before the tab's next launch.
 - **Detaching close during a Create.** When a persistent tab closes with a
   detaching close action while its session's Create is under way, the
-  session that Create makes is kept, not ended. Detaching actions: quit or
-  window close with *end on quit* off (the default), a tab close with *keep
-  after tab close* on, and a duplicate window teardown. The tab's saved
-  record names the session by its launch request id, and the next restore
-  brings the tab back with it. A stop, a restart, or a close that terminates
-  (a tab close by default, a worktree removal, quit with *end on quit* on)
-  still ends a late-created session.
-- **Ending a session** (close, worktree removal, restart, quit with *end on
-  quit*): a Kill or Remove that gets no definite answer is resent with
+  session that Create makes is kept, not ended. Detaching actions: a quit or
+  window close that keeps sessions (Keep Running, *on quit* = keep, or
+  nothing asked), a detach (⌘D), and a duplicate window teardown. A quit
+  leaves such a tab to the exit (`keepSessionUntilExit`), which keeps it
+  the same way and does not wait for its Create. The tab's saved record names the session by its
+  launch request id, and the next restore brings the tab back with it. A
+  stop, a restart, or a close that terminates (a tab close, a
+  worktree removal, a quit or window close answered End Sessions) still ends
+  a late-created session: the answer travels in the close intent, which a
+  restore finishing after the close also uses.
+- **Ending a session** (close, worktree removal, restart, a quit answered
+  End Sessions): a Kill or Remove that gets no definite answer is resent with
   backoff (250 ms, doubling to 4 s) for up to 60 s. Only the host saying
   `unknown_session`, or another host identity answering, stops it early.
   Quit still waits at most its own bound.
-- **Quit** waits at most 8 s (and at least 900 ms) for sessions being ended
-  and for tabs' launches in flight whose session will be ended (so such
-  sessions are ended rather than orphaned), and replies to macOS within
-  10 s either way. Its confirmation sheet goes on the key window when that
-  is a project window, otherwise on the active project's window, which is
-  unhidden, deminiaturized and activated; never on the menu-bar panel. With
-  no project window it is an app-modal alert. Closing the sheet's window
-  before answering cancels the quit.
+- **Quit.** Its confirmation sheet (the sessions question or "Quit
+  Cherry?") goes on the key window when that is a project window, otherwise
+  on the active project's window, which is unhidden, deminiaturized and
+  activated; never on the menu-bar panel. With no project window it is an
+  app-modal alert. Closing the sheet's window before answering cancels the
+  quit. A quit that keeps sessions, has no busy native program to stop and
+  no session still being ended (a tab closed just before, one ⌘Z could
+  still bring back, whose session the quit ends, or one closed while its
+  Create was under way, whose session is ended when the Create answers:
+  `TerminalSession.hasLaunchesEndingTheirSessions`) quits at once,
+  whether it asked nothing or was answered Keep Running (or "Quit Cherry?"
+  for a log out's busy persistent programs; `SessionQuitPlan.confirmed`,
+  which counts them when answered): it saves the windows and tabs and
+  tears nothing down. Idle native shells and the attach adapters of
+  persistent tabs end with the app (their terminals hang up), and the
+  sessions run on in their holders. A background job of an idle native
+  shell that ignores SIGHUP (`tilt up &` at the prompt) therefore outlives
+  that quit, as it outlives a quit that asked nothing; a job in the
+  foreground makes the tab busy, and the quit then stops its process tree. Any other confirmed quit (End
+  Sessions, *on quit* = end, native programs to stop, or sessions being
+  ended) first orders every window out (project windows,
+  Settings, sheets, panels; not the menu bar icon's), so the app looks gone
+  at once, then saves and tears down only the tabs whose close does what
+  the exit does not (`CherryAppDelegate.tearDownForQuit`,
+  `TerminalWorkspace.closeSessionsForQuit`): native tabs are stopped
+  (HUP → TERM → KILL) and persistent tabs whose sessions the quit ends
+  terminate. Tabs that only detach (persistent tabs a quit keeping sessions
+  leaves running, tabs attached to sessions they do not own) are left as
+  they are until the exit, which also spares stopping each adapter and
+  freeing each surface (about 20 ms a tab under the fake host; 30 tabs took
+  0.6 s). It then waits at most 8 s for sessions being ended and for tabs'
+  launches in flight whose session will be ended (so such sessions are
+  ended rather than orphaned), and, only when it stopped a native tab's
+  busy program (`hasRunningProcess`, as the quit counted it; an idle
+  shell's hang-up is not waited for), until 900 ms after the teardown
+  (`ShellProcessController.terminationEscalationDuration`), so the
+  escalation's KILL (at 700 ms) goes out before the exit. It replies to
+  macOS within 10 s either way. The instance lock is marked quitting
+  (`noteAppQuitting`) before the teardown, so a copy launched meanwhile
+  waits for this one.
 - **MCP and agents.** MCP input to an agent is checked against its current
   screen first (read from its session host when no surface shows it). While
   the screen shows a tool-permission prompt, input is refused with
@@ -628,7 +983,13 @@ differs from the design above.
     command, launch settings, project, title and directory. The attach
     adapter is launched later (see below).
   - Ended: "Session ended (exit N)". No adapter runs; the host's final screen
-    (`Screen` with history) is shown as plain text, without colours.
+    (`Screen` with history) is shown as plain text, without colours. With
+    *close on exit* on, an owned terminal whose shell exited with status 0
+    (no signal) is not restored: its record is dropped and its session
+    removed (Remove only, as it is not running). A tab opened for a session
+    that had already ended (a restored one, or one attached from the
+    Persistent Sessions sheet) never closes by itself: it was opened to
+    show that exit.
   - Missing on a host that answered: a daemon that just restarted lists a
     session only once its holder registered again. While the host reports
     `pending_holders` > 0 it is listed again every 250 ms, for up to 10 s,
@@ -659,8 +1020,8 @@ differs from the design above.
   the tabs already open: a tab never saved because the app crashed right
   after opening it, or a record that was lost. The session must have been
   created after the last save (to the second) and before this app run began.
-  A session created before the last save and missing from it (a tab closed
-  with *keep after tab close*) is left alone. While a project has no usable
+  A session created before the last save and missing from it (a detached
+  tab's) is left alone. While a project has no usable
   state file but one was moved aside, that file counts: its `savedAt` (or its
   modification time) is the lower bound, and the tabs it named come back
   whenever they were created, until this version saves a file for the
@@ -668,7 +1029,9 @@ differs from the design above.
   sessions from before this run are adopted. Each worktree is scanned once
   per run: at window open and after discovery, again once the host is
   reachable, and after a restarted daemon's holders have registered.
-  Sessions recorded to be ended (below) are never adopted.
+  Sessions recorded to be ended (below) are never adopted. With *close on
+  exit* on, a terminal (its `cherry.kind` tag) whose shell exited with status
+  0 is removed instead of adopted.
 - **Hosts that answer late.** The restore adds what the hosts that answered
   within 1.5 s brought back; the others (and the second look for missing
   sessions) finish in the background (`WorkspaceRestoreResult.remainder`),
@@ -737,12 +1100,15 @@ differs from the design above.
     restored tab whose program runs replaces an open tab whose program ended
     (closed as a user close would); otherwise the restored tab is detached,
     and if its program runs, its record is set aside and stays saved (its
-    session keeps running and shows in the Persistent Sessions sheet), so
+    session keeps running, in Background Sessions and the Persistent
+    Sessions sheet), so
     nothing is orphaned without a record.
 - **Deviation (ended tabs).** Ended persistent terminal and agent tabs show
   "Session ended (exit N)" with **Restart** and **Close**; Close removes the
-  ended session, so there is no separate Remove. Attached tabs whose session
-  ended show Remove from Host and Close Tab.
+  ended session, so there is no separate Remove. A terminal whose shell
+  exited with status 0 closes instead, and its session is removed, unless
+  *close on exit* is off or the shell ended within its first second.
+  Attached tabs whose session ended show Remove from Host and Close Tab.
 - **Worktrees.** Removing a worktree, or its disappearing from discovery,
   ends the local sessions owned by its saved tabs that are not open tabs:
   not restored yet, still being restored, kept while the host was
@@ -755,6 +1121,86 @@ differs from the design above.
   its sessions left. Whatever this run could not end (the host stayed
   unreachable, or the app quit first) is ended when the next launch opens
   its first project window. Entries expire after 14 days.
+- **Background sessions** (`BackgroundSessions.swift`). One pure classifier
+  (`BackgroundSessions.classify`) serves the menu bar list, End All, the
+  launch notice and the Persistent Sessions sheet's label. A session is in
+  the background when this copy holds the instance lock, its `owner` is this
+  app's identity, and none of these holds:
+  - an open tab shows it (`PersistentLocalSessions.isShownByOpenTab`): the
+    tab that owns it, a tab attached to it (`OpenHostedTabs`), an open tab
+    whose id its `cherry.tab` names, or an open persistent tab whose Create or
+    restart started it and has not answered (`persistentLaunchRequestID`
+    against its `request_id` or `cherry.launch`);
+  - it is being ended, or a search for the sessions of forgotten saved tabs
+    under way names it (`isScheduledToEnd`);
+  - a saved tab an open window may still restore names it (by binding,
+    attached ones included, launch request id or tab id): not restored yet,
+    being restored, or kept while the host could not be listed
+    (`RepositoryWorkspace.savedRecordsAwaitingRestore`). Set-aside records
+    do not count: their sessions run unseen until the next launch.
+
+  `BackgroundSessionsModel` reads `HostControl.sessions` (what the control
+  connection last knew) every second and on `added`, `removed`, `exited` and
+  `resync` events (never `changed`, which carries agents' spinner titles),
+  and publishes only a changed list; rows carry no OSC title. The app body
+  observes only its `BackgroundSessionsSummary` (a count, for the Cherry
+  menu). It never starts a daemon to list: it connects (a list when the
+  panel opens) only in the copy that holds the lock, and only once this run
+  reached the host (`connectionGeneration` > 0), while local tabs run in it
+  (`sessions.persistLocal`), or while it lists sessions already. It holds a
+  lease on the connection while it lists any, so the list does not go stale
+  when an unused connection closes; opening the panel only lists the host
+  once (nothing waits for the panel to close). With *close on exit* on it
+  ends (removes) listed terminals whose shell exited with status 0, from a
+  live list only. End is
+  `PersistentLocalSessions.end` with `waitingForExitUpTo: endRetryWindow`:
+  Kill, wait for the exit, Remove (Remove only for an ended session), sent
+  again for 60 s without a definite answer; the row leaves the list at once.
+  A closed window's saved record is never rewritten (its window may load it
+  at any moment): its next restore lists the host completely, finds the
+  session gone and drops the tab, with no "Session ended" tab. A restore or
+  orphan scan that runs while the ending does treats the session as gone
+  too (`isEnding`, `isScheduledToEnd`), and `canAdopt` refuses it, so a
+  window reopened meanwhile builds no tab that outlives it. Quit already
+  waits for ends under way. Open (`ProjectWindowRegistry.showBackgroundSession`)
+  finds the window by `cherry.project` (the open window of that worktree's
+  repository, else `AgentSettings.repositoryRoot(for:)` or the worktree
+  itself, opened with SwiftUI's `openWindow` through `projectWindowOpener`,
+  else the active window), waits (10 s at most) for that window's restores
+  and orphan scan, then reveals the tab that shows the session, or else,
+  unless it is being ended by then (End, or that window's restore removing
+  a clean exit), adopts it through the orphan restore step (`RepositoryWorkspace.showBackgroundSession`,
+  which sets a command aside when another tab runs it and shows that tab),
+  or attaches it when `canAdopt` refuses (a client shows it).
+  `BackgroundSessionsNotice` (installed by `startLaunchHousekeeping`) starts
+  when the launch has asked for its windows: 2 s later it waits (20 s at
+  most) for the reopened windows to register and for every window's restores
+  and orphan scans, then, when *background notice* is on, this copy holds
+  the lock and this run reached the host, takes a complete list and names
+  the background sessions at work (`BackgroundSession.isAtWork`, as
+  `ClosedTabNotice.programIsAtWork` counts a closed tab's program) whose ids
+  are not in `sessions.backgroundNoticeToldIDs` (UserDefaults, pruned to the
+  listed ids, at most 512). It shows them in a toast in the first project
+  window on screen (`ProjectWindowToasts`, no alert), an unprompted toast
+  (`ProjectWindowToast.isUnprompted`): its time runs only while its window
+  is key in the active app, so it never runs out unseen while Cherry is in
+  the background, and it takes turns with a closed tab's toast instead of
+  replacing it or being replaced (see "Close intents"). Reopen runs
+  `SessionCloseCoordinator.reopen` for each, one after the other; End… is
+  `BackgroundSessionsModel.confirmEndAll(from:limitedTo:)` on that window.
+  The toast's `onDismiss` (its dismiss button, its time running out, or
+  either action; not a toast that replaces it or its window closing) adds
+  them to the told ids. So do the closes that keep sessions on purpose: a
+  tab detached with `userDetachedTab` whose own persistent session keeps
+  running (`TerminalWorkspace.finishClosing` →
+  `SessionBackendPolicy.sessionDetached`),
+  and a window close that keeps its sessions after Keep Running or with *on
+  quit* = Keep Running (`ProjectWindowCloseDelegate.sessionsKeptInBackground`,
+  the running persistent tabs' sessions as the tabs close). A tab whose
+  Create was under way has no session id yet and is not told. With no
+  project window on screen it tries again shortly, then on the next window
+  that registers, on the next turn of the main queue (a window registers
+  from inside its SwiftUI update, which must not change the toast).
 
 ### Not done yet
 
@@ -807,9 +1253,49 @@ differs from the design above.
   launched while the lock's holder quits blocks its main thread at the
   first lock check for up to 12 s (the launch's warm-up of the local host
   checks the lock on the main thread).
+- **Background sessions.** A terminal in the background whose shell exits
+  with status 0 stays listed as `exit 0` (with Remove) until its window's
+  next restore removes it; nothing removes it by itself meanwhile. After a
+  relaunch, a linked worktree's repository is known only once its window
+  opened (no `cherry.repository` tag): Open for such a session opens a
+  window for the worktree itself. Saved tabs of a worktree an open window
+  never restores (worktree spaces off) count as awaiting restore for the
+  whole run, so their sessions are not listed. The menu bar panel, the
+  Settings card, the Cherry menu command and the sheets are not covered by
+  tests (the model, classifier, copy, Open, End and the notice are); the
+  Persistent Sessions sheet's Create still makes ownerless sessions, which
+  are never in the background.
+- End Sessions on quit ends the sessions of saved tabs no open tab shows
+  only if the host lists them before the quit's wait ends; otherwise they
+  are recorded in `sessions-to-end.json` and ended when the next launch
+  opens the project's window, after its restore (which may bring such a tab
+  back first).
 - Test gaps: bringing the quit sheet's window on screen is not unit-tested
-  (it would take focus from the user's apps); ⌘W on a last tab attached to
+  (it would take focus from the user's apps), nor is the quit's reply to
+  AppKit after the sessions question (what it does is: `SessionQuitPlan`,
+  `SessionQuitPlan.confirmed`, `SessionTeardown.intent(for:)`,
+  `windowToAnswerBeforeQuitting`, and the teardown's order and waits through
+  `QuitTeardownSteps`), nor ordering real windows out
+  (`takeWindowsOffScreen`, the default `takeOffScreen`: tests' windows never
+  come on screen), or
+  presenting that question as a sheet (the window close's is tested through
+  its seam); ⌘W on a last tab attached to
   someone else's session is covered only through `closeEndsProgram`. The
+  tab close question is tested through its request and answer
+  (`pendingTabClose`, `answerTabClose`) and its alert's buttons, not its
+  sheet (`TabCloseAlertPresenterView`); ⌘D and ⌘⇧D through
+  `AppShortcutMonitor.shortcutAction` and the coordinator, not the menu
+  items' or context menus' enablement. ⌘Z's routing is tested through
+  `ClosedTabUndoRouting`, `AppShortcutMonitor.shortcutAction`, and an
+  off-screen window whose first responder changes (AppKit's own Undo
+  validation and the window's undo manager), not with key events in the
+  running app. The
+  closed-tab toast is tested through its model (`ProjectWindowToasts`,
+  `ToastLifetime`), its placement above the bottom bars
+  (`ProjectWindowToastOverlay.bottomInset`) and the close flows, not its
+  SwiftUI view (hover events, truncation, animation, and the key and active
+  notifications `ToastAttentionProbe` reports, which tests inject through
+  `setAttended` and `setAttentionProbe`), which no test puts on screen. The
   instance-lock sheet is tested only with an injected presenter (no run
   with two copies of the app), and keys typed while an adapter is away only
   against a fake host (MCP cursor keys also against a real one), not in the

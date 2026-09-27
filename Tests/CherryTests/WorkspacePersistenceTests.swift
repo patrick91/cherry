@@ -142,21 +142,16 @@ private final class FakeHostedRestorer {
     }
 }
 
-/// A backend policy whose local hosted tabs follow the Sessions settings,
+/// A backend policy whose local hosted tabs follow their close intents,
 /// recording each hosted session it terminates.
 @MainActor
 private final class RecordingBackendPolicy {
     var settings = SessionPersistenceSettings.defaults
     private(set) var terminated: [(sessionID: String, intent: SessionCloseIntent)] = []
-    /// How many close decisions the policy made.
-    private(set) var decisionCount = 0
 
     var policy: SessionBackendPolicy {
         SessionBackendPolicy(
-            settings: { [self] in
-                decisionCount += 1
-                return settings
-            },
+            settings: { [self] in settings },
             hostedLocalTabsFollowSettings: true,
             terminateHostedSession: { [self] session, intent in
                 terminated.append((session.hostedAttachment?.sessionID ?? "native", intent))
@@ -562,64 +557,48 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func sessionClosePolicyMatchesTodayAndTheSpecTable() {
-    let settingsCombinations = [false, true].flatMap { keep in
-        [false, true].map { end in
-            SessionPersistenceSettings(
-                persistLocalSessions: true,
-                keepLocalSessionsAfterTabClose: keep,
-                endLocalSessionsOnQuit: end
-            )
-        }
-    }
-
     // Native tabs stop and remote (attached) tabs detach, whatever the
-    // intent; local persistent tabs follow the settings, unless a policy
+    // intent; local persistent tabs follow their intent, unless a policy
     // turns that off, when they detach too.
     #expect(SessionClosePolicy.hostedLocalTabsFollowSettings)
     for intent in SessionCloseIntent.allCases {
-        for settings in settingsCombinations {
-            #expect(SessionClosePolicy.closeAction(for: .native, intent: intent, settings: settings) == .stop)
-            #expect(SessionClosePolicy.closeAction(for: .hostedRemote, intent: intent, settings: settings) == .detach)
-            #expect(SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent, settings: settings)
-                == SessionClosePolicy.hostedLocalAction(for: intent, settings: settings))
-            #expect(SessionClosePolicy.closeAction(
-                for: .hostedLocal, intent: intent, settings: settings, hostedLocalTabsFollowSettings: false
-            ) == .detach)
-            #expect(SessionClosePolicy.closeAction(
-                for: .native, intent: intent, settings: settings, hostedLocalTabsFollowSettings: false
-            ) == .stop)
-        }
+        #expect(SessionClosePolicy.closeAction(for: .native, intent: intent) == .stop)
+        #expect(SessionClosePolicy.closeAction(for: .hostedRemote, intent: intent) == .detach)
+        #expect(SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent)
+            == SessionClosePolicy.hostedLocalAction(for: intent))
+        #expect(SessionClosePolicy.closeAction(
+            for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: false
+        ) == .detach)
+        #expect(SessionClosePolicy.closeAction(
+            for: .native, intent: intent, hostedLocalTabsFollowSettings: false
+        ) == .stop)
     }
 
-    // The spec's local hosted column.
-    func local(_ intent: SessionCloseIntent, keep: Bool = false, end: Bool = false) -> SessionCloseAction {
-        let settings = SessionPersistenceSettings(
-            persistLocalSessions: true,
-            keepLocalSessionsAfterTabClose: keep,
-            endLocalSessionsOnQuit: end
-        )
-        let action = SessionClosePolicy.hostedLocalAction(for: intent, settings: settings)
-        #expect(SessionClosePolicy.closeAction(
-            for: .hostedLocal, intent: intent, settings: settings, hostedLocalTabsFollowSettings: true
-        ) == action)
-        return action
+    // The spec's local hosted column. A tab close ends its session and a
+    // detach keeps it; a window close or quit carries its answer (or the
+    // quit preference) in its intent.
+    func local(_ intent: SessionCloseIntent) -> SessionCloseAction {
+        SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: true)
     }
     #expect(local(.userClosedTab) == .terminate)
-    #expect(local(.userClosedTab, keep: true) == .detach)
+    #expect(local(.userDetachedTab) == .detach)
     #expect(local(.mcpClose) == .terminate)
-    #expect(local(.mcpClose, keep: true) == .detach)
     #expect(local(.windowClosed) == .detach)
-    #expect(local(.windowClosed, end: true) == .terminate)
     #expect(local(.appQuit) == .detach)
-    #expect(local(.appQuit, keep: true) == .detach)
-    #expect(local(.appQuit, end: true) == .terminate)
-    #expect(local(.duplicateWindowTeardown, end: true) == .detach)
-    #expect(local(.duplicateWindowTeardown, keep: true) == .detach)
-    #expect(local(.worktreeRemoved, keep: true) == .terminate)
-    #expect(local(.restart, keep: true) == .terminate)
+    #expect(local(.windowClosedEndingSessions) == .terminate)
+    #expect(local(.appQuitEndingSessions) == .terminate)
+    #expect(local(.duplicateWindowTeardown) == .detach)
+    #expect(local(.worktreeRemoved) == .terminate)
+    #expect(local(.restart) == .terminate)
+    #expect(local(.programExited) == .terminate)
 
     #expect(Set(SessionCloseIntent.allCases.filter(\.tearsDownWorkspace))
-        == [.windowClosed, .appQuit, .duplicateWindowTeardown])
+        == [.windowClosed, .windowClosedEndingSessions, .appQuit, .appQuitEndingSessions, .duplicateWindowTeardown])
+    #expect(Set(SessionCloseIntent.allCases.filter(\.isAppQuit)) == [.appQuit, .appQuitEndingSessions])
+    #expect(SessionTeardown.windowClose.intent(endingSessions: false) == .windowClosed)
+    #expect(SessionTeardown.windowClose.intent(endingSessions: true) == .windowClosedEndingSessions)
+    #expect(SessionTeardown.quit.intent(endingSessions: false) == .appQuit)
+    #expect(SessionTeardown.quit.intent(endingSessions: true) == .appQuitEndingSessions)
 }
 
 @Test @MainActor func closePathsNameTheirIntentAndApplyTheCloseAction() throws {
@@ -650,22 +629,25 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     workspace.close(remote, intent: .mcpClose)
     #expect(terminated.count == 1)
 
-    settingsBox.value.keepLocalSessionsAfterTabClose = true
-    workspace.close(second, intent: .mcpClose)
+    // A tab attached to a session it does not own only disconnects, even
+    // when detached.
+    workspace.close(second, intent: .userDetachedTab)
     #expect(terminated.count == 1)
 
-    // Quitting keeps local sessions unless the setting ends them.
+    // Quitting keeps local sessions unless its answer (or the setting)
+    // ends them, which its intent says.
+    settingsBox.value.localSessionsOnQuit = .end
     workspace.closeAllSessions(intent: .appQuit)
     #expect(terminated.count == 1)
     #expect(workspace.isTornDown)
     #expect(workspace.sessions.isEmpty)
 
-    settingsBox.value.endLocalSessionsOnQuit = true
     let quitting = TerminalWorkspace(createInitialSession: false, backendPolicy: policy)
     _ = quitting.attachHostedSession(localAttachment(sessionID: "local-4"), launchShell: false)
-    quitting.closeAllSessions(intent: .appQuit)
+    quitting.closeAllSessions(intent: .appQuitEndingSessions)
     #expect(terminated.map(\.0) == ["local-1", "local-4"])
-    #expect(terminated.last?.1 == .appQuit)
+    #expect(terminated.last?.1 == .appQuitEndingSessions)
+    #expect(quitting.isTornDown)
 
     // A workspace with the default policy never terminates anything.
     let native = TerminalWorkspace(createInitialSession: false)
@@ -673,6 +655,16 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     native.closeAllSessions(intent: .worktreeRemoved)
     #expect(!native.isTornDown)
     #expect(terminated.count == 2)
+
+    // A tab closing because its shell exited ends its session.
+    let exiting = TerminalWorkspace(createInitialSession: false, backendPolicy: policy)
+    _ = exiting.attachHostedSession(localAttachment(sessionID: "local-6"), launchShell: false)
+    let exited = exiting.attachHostedSession(localAttachment(sessionID: "local-7"), launchShell: false)
+    exiting.close(exited, intent: .programExited)
+    #expect(terminated.map(\.0) == ["local-1", "local-4", "local-7"])
+    #expect(terminated.last?.1 == .programExited)
+    #expect(exiting.sessions.count == 1)
+    #expect(!exiting.isTornDown)
 }
 
 // MARK: - Settings
@@ -684,9 +676,10 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 
     let settings = TerminalSettings(defaults: defaults)
     #expect(settings.persistLocalSessions)
-    #expect(!settings.keepLocalSessionsAfterTabClose)
-    #expect(!settings.endLocalSessionsOnQuit)
+    #expect(settings.localSessionsOnQuit == .ask)
+    #expect(settings.closeTabsOnCleanExit)
     #expect(settings.sessionPersistenceSettings == .defaults)
+    #expect(!SessionPersistenceSettings.native.closeTabsOnCleanExit)
 
     let revision = settings.terminalAppearanceRevision
     let notifications = Counter()
@@ -698,30 +691,41 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     defer { NotificationCenter.default.removeObserver(observer) }
 
     settings.persistLocalSessions = false
-    settings.keepLocalSessionsAfterTabClose = true
-    settings.endLocalSessionsOnQuit = true
+    settings.localSessionsOnQuit = .end
+    settings.closeTabsOnCleanExit = false
 
     #expect(settings.terminalAppearanceRevision == revision)
     #expect(notifications.value == 0)
     #expect(defaults.object(forKey: "sessions.persistLocal") as? Bool == false)
-    #expect(defaults.object(forKey: "sessions.keepAfterTabClose") as? Bool == true)
-    #expect(defaults.object(forKey: "sessions.endOnQuit") as? Bool == true)
+    #expect(defaults.object(forKey: "sessions.onQuit") as? String == "end")
+    #expect(defaults.object(forKey: "sessions.closeTabOnExit") as? Bool == false)
 
     // Not part of the terminal appearance.
     settings.resetTerminalAppearance()
     #expect(!settings.persistLocalSessions)
-    #expect(settings.keepLocalSessionsAfterTabClose)
-    #expect(settings.endLocalSessionsOnQuit)
+    #expect(settings.localSessionsOnQuit == .end)
+    #expect(!settings.closeTabsOnCleanExit)
 
     let reloaded = TerminalSettings(defaults: defaults)
     #expect(reloaded.sessionPersistenceSettings == SessionPersistenceSettings(
         persistLocalSessions: false,
-        keepLocalSessionsAfterTabClose: true,
-        endLocalSessionsOnQuit: true
+        localSessionsOnQuit: .end,
+        closeTabsOnCleanExit: false
     ))
+    // A string key, as a launch argument sets it (`-sessions.onQuit keep`);
+    // anything else asks.
+    defaults.set("keep", forKey: "sessions.onQuit")
+    #expect(TerminalSettings(defaults: defaults).localSessionsOnQuit == .keep)
+    defaults.set("sometimes", forKey: "sessions.onQuit")
+    #expect(TerminalSettings(defaults: defaults).localSessionsOnQuit == .ask)
+    #expect(LocalSessionsOnQuit.allCases.map(\.label) == ["Ask", "Keep Running", "End Sessions"])
     #expect(!SessionBackendPolicy(settings: { reloaded.sessionPersistenceSettings }).prefersPersistentLocalSessions)
     #expect(!SessionBackendPolicy.native.prefersPersistentLocalSessions)
     #expect(SettingsPage.filtered(by: "quitting") == [.sessions])
+    // Close a tab when its shell exits.
+    for query in ["exit", "shell", "close"] {
+        #expect(SettingsPage.filtered(by: query) == [.sessions], Comment(rawValue: query))
+    }
     #expect(SettingsPage.sessions.title == "Sessions")
 }
 
@@ -1020,44 +1024,47 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func restoreFinishingAfterTheWindowClosedEndsTabsWithThatIntent() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned-store")
-    defer {
-        try? FileManager.default.removeItem(at: root)
-        try? FileManager.default.removeItem(at: storeDirectory)
-    }
-    let store = WorkspaceStateStore(directory: storeDirectory)
-    let editor = hostedRecord(title: "Editor", sessionID: "s-editor")
-    let recorder = RecordingBackendPolicy()
-    recorder.settings.endLocalSessionsOnQuit = true
-    let gate = RestoreGate()
-    let fake = FakeHostedRestorer()
-    fake.gate = gate
-    let repository = makeRestoringRepository(
-        root: root,
-        records: [editor],
-        store: store,
-        restorer: fake,
-        backendPolicy: recorder.policy
-    )
-    defer { gate.open() }
-    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    for _ in 0..<100 where !gate.isWaiting {
-        await Task.yield()
-    }
-    #expect(gate.isWaiting)
-
     // Cherry quits while the restore runs; the tab it then builds ends as
-    // the quit ends tabs (here: 'End local sessions when quitting').
-    repository.closeAllSessions(intent: .appQuit)
-    gate.open()
-    await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.sessions.isEmpty)
-    #expect(repository.activeWorkspace.closeAllIntent == .appQuit)
-    #expect(recorder.terminated.map(\.sessionID) == ["s-editor"])
-    #expect(recorder.terminated.map(\.intent) == [.appQuit])
-    store.flush()
-    #expect(savedSessionIDs(store.load(repositoryRoot: repositoryKey(root)), root: root.path) == [editor.id])
+    // the quit ends tabs: its session ends when the quit ends sessions (End
+    // Sessions), and is kept, as its saved record, when it keeps them.
+    for (intent, ends) in [(SessionCloseIntent.appQuitEndingSessions, true), (.appQuit, false)] {
+        let label = Comment(rawValue: "\(intent)")
+        let root = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned")
+        let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned-store")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: storeDirectory)
+        }
+        let store = WorkspaceStateStore(directory: storeDirectory)
+        let editor = hostedRecord(title: "Editor", sessionID: "s-editor")
+        let recorder = RecordingBackendPolicy()
+        let gate = RestoreGate()
+        let fake = FakeHostedRestorer()
+        fake.gate = gate
+        let repository = makeRestoringRepository(
+            root: root,
+            records: [editor],
+            store: store,
+            restorer: fake,
+            backendPolicy: recorder.policy
+        )
+        defer { gate.open() }
+        repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+        for _ in 0..<100 where !gate.isWaiting {
+            await Task.yield()
+        }
+        #expect(gate.isWaiting, label)
+
+        repository.closeAllSessions(intent: intent)
+        gate.open()
+        await repository.waitForPendingRestores()
+        #expect(repository.activeWorkspace.sessions.isEmpty, label)
+        #expect(repository.activeWorkspace.closeAllIntent == intent, label)
+        #expect(recorder.terminated.map(\.sessionID) == (ends ? ["s-editor"] : []), label)
+        #expect(recorder.terminated.map(\.intent) == (ends ? [intent] : []), label)
+        store.flush()
+        #expect(savedSessionIDs(store.load(repositoryRoot: repositoryKey(root)), root: root.path) == [editor.id], label)
+    }
 }
 
 @Test @MainActor func worktreesRestoreOnDiscoveryAndRemovalEndsTheirTabs() async throws {
@@ -1615,17 +1622,17 @@ struct WorkspaceRegistryPersistenceTests {
         #expect(workspaceA.sessions.count == 2)
         #expect(recorderB.terminated.map(\.sessionID) == ["b-1"])
         #expect(recorderB.terminated.map(\.intent) == [.mcpClose])
-        #expect(recorderA.decisionCount == 0)
+        #expect(recorderA.terminated.isEmpty)
 
-        // Restarting window B's shell from window A is B's decision too.
-        let decisionsBefore = recorderB.decisionCount
+        // Restarting window B's shell from window A restarts it in B.
         let restarted = try await send(.restartProcess(.init(processID: shellB.id.uuidString)))
         guard case .restartProcess(let restartResult)? = restarted.result else {
             Issue.record("Expected restartProcess result, got \(String(describing: restarted))")
             return
         }
         #expect(restartResult.process.id == shellB.id.uuidString)
-        #expect(recorderB.decisionCount == decisionsBefore + 1)
-        #expect(recorderA.decisionCount == 0)
+        #expect(workspaceB.sessions.map(\.id) == [shellB.id])
+        #expect(workspaceA.sessions.count == 2)
+        #expect(recorderA.terminated.isEmpty)
     }
 }

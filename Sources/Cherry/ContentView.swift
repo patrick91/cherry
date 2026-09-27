@@ -348,10 +348,7 @@ struct ContentView: View {
             openSettings: { openSettings() }
         ))
         .background(WindowConfigurator())
-        .background(AgentCloseAlertPresenter(
-            workspace: workspace,
-            chromeState: chromeState
-        ))
+        .background(TabCloseAlertPresenter(chromeState: chromeState))
         .frame(minWidth: 320, minHeight: 460)
         .sheet(isPresented: $chromeState.isHostedSessionsPresented) {
             HostedSessionsSheet(workspace: workspace, chromeState: chromeState)
@@ -384,19 +381,42 @@ struct ContentView: View {
             if let session = pendingAgentGroupCloseSession {
                 if canCloseAgentGroup(session) {
                     Button("Close Parent and Sub-Agents", role: .destructive) {
-                        workspace.closeAgentGroup(
-                            session,
-                            allowEmptyWorkspace: chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace
-                        )
+                        let allowEmptyWorkspace = chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace
+                        SessionCloseCoordinator.closeTabs(
+                            [session] + workspace.descendantAgentSessions(of: session),
+                            in: workspace,
+                            chromeState: chromeState
+                        ) {
+                            workspace.closeAgentGroup(session, allowEmptyWorkspace: allowEmptyWorkspace)
+                        }
                         chromeState.pendingAgentGroupCloseSessionID = nil
                         chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
                     }
                 }
 
                 Button("Close Parent Only") {
-                    workspace.closeAgentPromotingChildren(session)
+                    SessionCloseCoordinator.closeTabs([session], in: workspace, chromeState: chromeState) {
+                        workspace.closeAgentPromotingChildren(session)
+                    }
                     chromeState.pendingAgentGroupCloseSessionID = nil
                     chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
+                }
+
+                let group = [session] + workspace.descendantAgentSessions(of: session)
+                if canCloseAgentGroup(session),
+                   SessionCloseCoordinator.canDetachInstead(group, policy: workspace.backendPolicy) {
+                    Button("Detach Parent and Sub-Agents") {
+                        let allowEmptyWorkspace = chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace
+                        SessionCloseCoordinator.closeTabs(
+                            group, in: workspace, chromeState: chromeState, intent: .userDetachedTab
+                        ) {
+                            workspace.closeAgentGroup(
+                                session, allowEmptyWorkspace: allowEmptyWorkspace, intent: .userDetachedTab
+                            )
+                        }
+                        chromeState.pendingAgentGroupCloseSessionID = nil
+                        chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false
+                    }
                 }
             }
 
@@ -985,125 +1005,61 @@ private struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
-private struct AgentCloseAlertPresenter: NSViewRepresentable {
-    @ObservedObject var workspace: TerminalWorkspace
+private struct TabCloseAlertPresenter: NSViewRepresentable {
     @ObservedObject var chromeState: ProjectWindowChromeState
 
-    func makeNSView(context: Context) -> AgentCloseAlertPresenterView {
-        let view = AgentCloseAlertPresenterView()
-        view.workspace = workspace
+    func makeNSView(context: Context) -> TabCloseAlertPresenterView {
+        let view = TabCloseAlertPresenterView()
         view.chromeState = chromeState
         return view
     }
 
-    func updateNSView(_ nsView: AgentCloseAlertPresenterView, context: Context) {
-        nsView.workspace = workspace
+    func updateNSView(_ nsView: TabCloseAlertPresenterView, context: Context) {
         nsView.chromeState = chromeState
         nsView.presentIfNeeded()
     }
 }
 
+/// Asks the window's pending "Close “<name>”?" (`TabCloseQuestion`) as a
+/// sheet, and passes its answer on (`SessionCloseCoordinator.answerTabClose`).
 @MainActor
-final class AgentCloseAlertPresenterView: NSView {
-    weak var workspace: TerminalWorkspace?
+final class TabCloseAlertPresenterView: NSView {
     weak var chromeState: ProjectWindowChromeState?
-    private var presentedSessionID: UUID?
-
-    /// What closing a running agent's tab does
-    /// (`SessionCloseCoordinator.closeEndsProgram`): a persistent agent's
-    /// tab that keeps its session running (Settings › Sessions), or a tab
-    /// attached to a session it does not own, does not stop the agent.
-    static func makeAlert(for session: TerminalSession, policy: SessionBackendPolicy) -> NSAlert {
-        makeAlert(stopsAgent: SessionCloseCoordinator.closeEndsProgram(of: session, policy: policy))
-    }
-
-    static func makeAlert(stopsAgent: Bool) -> NSAlert {
-        let alert = NSAlert()
-        if stopsAgent {
-            alert.messageText = "Close agent?"
-            alert.informativeText = "This agent is running. It will be stopped and removed."
-            alert.addButton(withTitle: "Stop and close")
-        } else {
-            alert.messageText = "Close agent tab?"
-            alert.informativeText = "This agent keeps running in the background after its tab closes. "
-                + "Attach to it again from File › Persistent Sessions."
-            alert.addButton(withTitle: "Close Tab")
-        }
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Cancel")
-        return alert
-    }
+    private var presentedRequestID: UUID?
 
     func presentIfNeeded() {
-        guard let workspace,
-              let chromeState,
-              let sessionID = chromeState.pendingAgentCloseSessionID,
-              presentedSessionID != sessionID
+        guard let chromeState,
+              let request = chromeState.pendingTabClose,
+              presentedRequestID != request.id
         else {
             return
         }
+        presentedRequestID = request.id
 
-        guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else {
-            chromeState.pendingAgentCloseSessionID = nil
-            chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
-            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: false, workspace: workspace)
+        guard let question = SessionCloseCoordinator.question(for: request) else {
+            // Its tab closed, or its program stopped, meanwhile: nothing to
+            // ask. Not from inside this SwiftUI update.
+            DispatchQueue.main.async { [weak self, weak chromeState] in
+                self?.presentedRequestID = nil
+                SessionCloseCoordinator.answerTabClose(.close, to: request, chromeState: chromeState)
+            }
             return
         }
 
-        guard session.kind == .agent, session.isRunning else {
-            workspace.close(
-                session,
-                allowEmptyWorkspace: chromeState.pendingAgentCloseAllowsEmptyWorkspace
-            )
-            chromeState.pendingAgentCloseSessionID = nil
-            chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
-            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: true, workspace: workspace)
-            return
+        let alert = question.makeAlert()
+        let answer: @MainActor (NSApplication.ModalResponse) -> Void = { [weak self, weak chromeState] response in
+            self?.presentedRequestID = nil
+            SessionCloseCoordinator.answerTabClose(question.answer(for: response), to: request, chromeState: chromeState)
         }
-
-        presentedSessionID = sessionID
-        let alert = Self.makeAlert(for: session, policy: workspace.backendPolicy)
-
         if let window {
             // ViewBridge loads lazily, so retry the compatibility hook at the exact
             // point where AppKit may create an NSRemoteView-backed alert sheet.
             RemoteViewCrashGuard.installIfNeeded()
-            alert.beginSheetModal(for: window) { [weak self, weak workspace, weak chromeState] response in
-                Task { @MainActor in
-                    guard let self else { return }
-                    var closed = false
-                    if response == .alertFirstButtonReturn,
-                       let workspace,
-                       let session = workspace.sessions.first(where: { $0.id == sessionID }) {
-                        workspace.close(
-                            session,
-                            allowEmptyWorkspace: chromeState?.pendingAgentCloseAllowsEmptyWorkspace == true
-                        )
-                        closed = true
-                    }
-                    if chromeState?.pendingAgentCloseSessionID == sessionID {
-                        chromeState?.pendingAgentCloseSessionID = nil
-                        chromeState?.pendingAgentCloseAllowsEmptyWorkspace = false
-                    }
-                    self.presentedSessionID = nil
-                    SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: closed, workspace: workspace)
-                }
+            alert.beginSheetModal(for: window) { response in
+                MainActor.assumeIsolated { answer(response) }
             }
         } else {
-            let response = alert.runModal()
-            let closed = response == .alertFirstButtonReturn
-            if closed {
-                workspace.close(
-                    session,
-                    allowEmptyWorkspace: chromeState.pendingAgentCloseAllowsEmptyWorkspace
-                )
-            }
-            if chromeState.pendingAgentCloseSessionID == sessionID {
-                chromeState.pendingAgentCloseSessionID = nil
-                chromeState.pendingAgentCloseAllowsEmptyWorkspace = false
-            }
-            presentedSessionID = nil
-            SessionCloseCoordinator.agentTabCloseDidFinish(sessionID: sessionID, closed: closed, workspace: workspace)
+            answer(alert.runModal())
         }
     }
 }
@@ -1153,6 +1109,12 @@ private struct DetailPaneView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlayPreferenceValue(ProjectWindowToastObstacles.self, alignment: .bottom) { bottomBars in
+            // Notices that ask nothing, such as a closed tab's Undo or a
+            // detached tab's program running on (`ClosedTabNotice`), above
+            // the pane's bottom bars.
+            ProjectWindowToastOverlay(toasts: chromeState.toasts, closedTabs: chromeState.closedTabs, obstacles: bottomBars)
+        }
         .padding(.top, projectNavigationTopInset + 5)
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
@@ -7227,6 +7189,11 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
+            Button("Detach") {
+                SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
+            }
+            .disabled(workspace.sessions.count <= 1 || !SessionCloseCoordinator.canDetach(session))
+
             Button(session.closeActionTitle, role: session.hostedAttachment == nil ? .destructive : nil) {
                 close(session)
             }
@@ -8332,8 +8299,13 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
+        Button("Detach") {
+            SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
+        }
+        .disabled(workspace.sessions.count <= 1 || !SessionCloseCoordinator.canDetach(session))
+
         Button(session.closeActionTitle, role: session.hostedAttachment == nil ? .destructive : nil) {
-            workspace.close(session)
+            SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState)
         }
         .disabled(workspace.sessions.count <= 1)
     }
@@ -8465,16 +8437,7 @@ private struct SidebarSplitTabRow: View {
     }
 
     private func confirmCloseSplitGroup() {
-        let alert = NSAlert()
-        alert.messageText = "Close Split Group?"
-        alert.informativeText = "This will stop and close \(group.paneSessionIDs.count) terminal panes."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Close Split Group")
-        alert.addButton(withTitle: "Cancel")
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-        workspace.closeSplitGroup(id: group.id)
+        SessionCloseCoordinator.confirmAndCloseSplitGroup(group, in: workspace, chromeState: chromeState)
     }
 }
 
@@ -8659,8 +8622,13 @@ private struct SidebarSplitPaneIconSelector: View {
 
             AttentionToolsMenu(session: session)
 
+            Button("Detach Pane") {
+                SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
+            }
+            .disabled(workspace.sessions.count <= 1 || !SessionCloseCoordinator.canDetach(session))
+
             Button("Close Pane", role: .destructive) {
-                workspace.close(session)
+                SessionCloseCoordinator.close(session, in: workspace, chromeState: chromeState)
             }
             .disabled(workspace.sessions.count <= 1)
 
@@ -8704,15 +8672,7 @@ private struct SidebarSplitPaneIconSelector: View {
     }
 
     private func confirmCloseSplitGroup(_ group: TerminalSplitGroup) {
-        let alert = NSAlert()
-        alert.messageText = "Close Split Group?"
-        alert.informativeText = "This will stop and close \(group.paneSessionIDs.count) terminal panes."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Close Split Group")
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        workspace.closeSplitGroup(id: group.id)
+        SessionCloseCoordinator.confirmAndCloseSplitGroup(group, in: workspace, chromeState: chromeState)
     }
 }
 
@@ -9835,7 +9795,7 @@ private final class SidebarTabRowState: ObservableObject {
             title: session.title,
             commandLine: session.subtitle
         )
-        self.label = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        self.label = SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
         self.attentionClassifierPrediction = session.attentionClassifierPrediction
@@ -9947,12 +9907,17 @@ private final class SidebarTabRowState: ObservableObject {
             title: session.title,
             commandLine: session.subtitle
         )
-        let nextLabel = Self.label(for: session, pathDisplayMode: pathDisplayMode)
+        let nextLabel = SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode)
         guard label != nextLabel else { return }
         label = nextLabel
     }
+}
 
-    private static func label(
+/// A tab's name as the sidebar shows it; also the name the close and quit
+/// questions list it by.
+@MainActor
+enum SidebarSessionLabel {
+    static func label(
         for session: TerminalSession,
         pathDisplayMode: SidebarTerminalPathDisplayMode
     ) -> SidebarTerminalPathLabel {
@@ -12396,6 +12361,7 @@ private struct CommandExitStatusBar: View {
             }
             .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
             .frame(maxWidth: 460)
+            .projectWindowToastObstacle()
         }
     }
 }
@@ -12433,6 +12399,7 @@ private struct PersistentSessionReconnectBar: View {
             }
             .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
             .frame(maxWidth: 460)
+            .projectWindowToastObstacle()
         }
     }
 }
@@ -12440,7 +12407,9 @@ private struct PersistentSessionReconnectBar: View {
 // A local persistent terminal or agent tab whose program ended (while Cherry
 // was closed, or since): its session stays on the host with the final screen
 // until the tab closes (which removes it) or restarts. Commands show
-// CommandExitStatusBar instead.
+// CommandExitStatusBar instead. A terminal whose shell exited with status 0
+// closes instead (TerminalWorkspace.tabProgramDidExit), unless Settings ›
+// Sessions keeps such tabs or it ended within its first second.
 private struct PersistentSessionEndedBar: View {
     @ObservedObject var session: TerminalSession
     /// nil when the tab cannot be closed (the workspace's last tab).
@@ -12481,6 +12450,7 @@ private struct PersistentSessionEndedBar: View {
             }
             .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
             .frame(maxWidth: 460)
+            .projectWindowToastObstacle()
         }
     }
 }

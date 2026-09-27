@@ -185,13 +185,23 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
         present: { content, window in shown.shown.append((content, window)) }
     )
     var sweeps = 0
+    let harness = try PersistentHarness()
+    defer { harness.cleanUp() }
+    let background = BackgroundSessionsModel(
+        localSessions: harness.hosting, registry: registry, presentAlert: { _, _, _ in }
+    )
+    let backgroundNotice = BackgroundSessionsNotice(model: background, registry: registry, isEnabled: { false })
     CherryAppDelegate.startLaunchHousekeeping(
         registry: registry,
         sweepSSHMasters: { sweeps += 1 },
-        instanceLockNotice: notice
+        instanceLockNotice: notice,
+        backgroundSessionsNotice: backgroundNotice
     )
     #expect(sweeps == 1)
     #expect(registry.instanceLockNotice === notice)
+    // The background sessions notice waits for the launch's windows.
+    #expect(registry.backgroundSessionsNotice === backgroundNotice)
+    #expect(backgroundNotice.phase == .idle)
     #expect(await eventually { shown.shown.count == 1 })
     #expect(shown.shown.first?.window === projectWindow)
 
@@ -199,7 +209,10 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
     let other = InstanceLockNotice(reason: { nil }, canPresent: { _ in true }, present: { _, _ in })
     registry.installInstanceLockNotice(other)
     #expect(registry.instanceLockNotice === notice)
+    registry.installBackgroundSessionsNotice(BackgroundSessionsNotice(model: background, registry: registry))
+    #expect(registry.backgroundSessionsNotice === backgroundNotice)
     // A registry without one (tests, and the app before launch finished)
     // never asks the real lock.
     #expect(ProjectWindowRegistry().instanceLockNotice == nil)
+    #expect(ProjectWindowRegistry().backgroundSessionsNotice == nil)
 }

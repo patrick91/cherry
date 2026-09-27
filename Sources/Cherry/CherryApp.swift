@@ -10,6 +10,9 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private var didScheduleInitialWindowOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            Self.observeQuitReasons()
+        }
         NSApp.setActivationPolicy(.regular)
         if Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") == nil,
            Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil,
@@ -26,6 +29,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         // daemon to start.
         MainActor.assumeIsolated {
             SessionBackendPolicy.userSettings.persistentHostingForNewTab()?.warmUp()
+            // The menu bar's Background Sessions list; it starts no host.
+            BackgroundSessionsModel.shared.start()
         }
 
         DispatchQueue.main.async {
@@ -42,15 +47,19 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     /// ever uses SSH or persistent sessions; and tells the user, on the
     /// first project window, when this copy leaves the persistent sessions
     /// and saved tabs alone because another copy holds the instance lock
-    /// (`InstanceLockNotice`). The parameters are for tests.
+    /// (`InstanceLockNotice`), or, once the launch's windows opened, that
+    /// sessions of closed windows or tabs still run in the background
+    /// (`BackgroundSessionsNotice`). The parameters are for tests.
     @MainActor
     static func startLaunchHousekeeping(
         registry: ProjectWindowRegistry = .shared,
         sweepSSHMasters: () -> Void = { HostSSHMasterManager.sweepAbandonedMasters() },
-        instanceLockNotice: InstanceLockNotice? = nil
+        instanceLockNotice: InstanceLockNotice? = nil,
+        backgroundSessionsNotice: BackgroundSessionsNotice? = nil
     ) {
         sweepSSHMasters()
         registry.installInstanceLockNotice(instanceLockNotice ?? .app(registry: registry))
+        registry.installBackgroundSessionsNotice(backgroundSessionsNotice ?? .app(registry: registry))
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows _: Bool) -> Bool {
@@ -90,40 +99,81 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         guard !isQuitConfirmed else { return .terminateNow }
 
+        let reason = MainActor.assumeIsolated { Self.currentQuitReason() }
+        if let window = MainActor.assumeIsolated({ Self.windowToAnswerBeforeQuitting(reason: reason, among: NSApp.windows) }) {
+            // A window's close question is up, or a tab close's: its answer
+            // keeps, detaches or ends sessions, so the quit's own question
+            // (which would queue behind it and list them still) waits for
+            // it. Quit again once it is answered.
+            MainActor.assumeIsolated {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
+            return .terminateCancel
+        }
+
         // Save every window's tabs and the open windows before anything is
         // torn down: the teardown saves nothing.
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.flushWorkspacePersistence()
         }
 
-        // What quitting ends: native tabs' processes, and persistent tabs'
-        // sessions only with Settings › Sessions › End sessions when quitting
-        // (otherwise they keep running and come back at the next launch).
-        let (runningCount, endedSessionCount) = MainActor.assumeIsolated {
-            (
-                ProjectWindowRegistry.shared.runningProcessCount(endingWith: .appQuit),
-                ProjectWindowRegistry.shared.persistentSessionCountEndedByQuit()
+        // One dialog at most: the question about local sessions still
+        // running (Settings › Sessions can keep or end them without it),
+        // which also names the native programs quitting stops, or else the
+        // confirmation for those programs. A log out, restart, shut down or
+        // update asks nothing about sessions and ends none itself; a log
+        // out, restart or shut down still confirms the busy programs of
+        // persistent tabs, which the system is about to end.
+        let (summary, decision) = MainActor.assumeIsolated {
+            let summary = ProjectWindowRegistry.shared.teardownSummary(
+                pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode
             )
+            let decision = SessionTeardownConfirmation.decide(
+                summary,
+                preference: TerminalSettings.shared.localSessionsOnQuit,
+                mayAsk: reason == .user,
+                systemEndsSessions: reason == .powerOff
+            )
+            return (summary, decision)
         }
-        // Nothing running: quit immediately. Idle shells exit on the SIGHUP they
-        // receive when Cherry dies, so there's nothing to confirm — like ghostty.
-        guard runningCount > 0 else {
-            guard endedSessionCount > 0 else {
-                MainActor.assumeIsolated {
-                    ProjectWindowRegistry.shared.prepareForTermination()
-                }
-                return .terminateNow
-            }
-            // Idle persistent sessions that quitting ends: end them, then quit.
-            finishQuit()
-            return .terminateLater
+        switch SessionQuitPlan(decision, summary: summary) {
+        case .terminateNow:
+            // Nothing running: quit immediately. Idle shells exit on the
+            // SIGHUP they receive when Cherry dies, so there's nothing to
+            // confirm — like ghostty. Kept sessions outlive the app. Only
+            // sessions still being ended (a tab closed just before) are
+            // waited for (`finishQuit`).
+            return finishQuit(intent: .appQuit)
+        case .finish(let intent):
+            // Sessions quitting ends with nothing to ask (idle persistent
+            // tabs, or saved tabs no open tab shows): end them, then quit.
+            return finishQuit(intent: intent)
+        case .confirmStopping(let count, let intent):
+            return confirmStoppingProcesses(count, intent: intent)
+        case .askAboutSessions:
+            return askAboutSessions(SessionTeardownQuestion(teardown: .quit, summary: summary, projectName: nil))
         }
+    }
 
+    /// The project window whose close question, or tab close question
+    /// ("Close “<name>”?", "Close Agent Group?"), must be answered before
+    /// the user's quit asks its own (`ProjectWindowCloseDelegate`); none
+    /// for a log out, restart, shut down or update, which never wait.
+    @MainActor
+    static func windowToAnswerBeforeQuitting(reason: QuitReason, among windows: [NSWindow]) -> NSWindow? {
+        guard reason == .user else { return nil }
+        return ProjectWindowCloseDelegate.windowAskingToClose(among: windows)
+    }
+
+    /// "Quit Cherry?" for `count` busy programs quitting stops.
+    @MainActor
+    private func confirmStoppingProcesses(_ count: Int, intent: SessionCloseIntent) -> NSApplication.TerminateReply {
         let alert = NSAlert()
         alert.messageText = "Quit Cherry?"
-        alert.informativeText = runningCount == 1
+        alert.informativeText = count == 1
             ? "1 running process will be stopped."
-            : "\(runningCount) running processes will be stopped."
+            : "\(count) running processes will be stopped."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
@@ -131,31 +181,188 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         // The sheet goes on a project window the user can see: never the
         // menu bar panel (which closes as soon as it loses focus), a
         // closed or minimized window, or the status item's.
-        let window = MainActor.assumeIsolated { Self.visibleProjectWindowForQuitConfirmation() }
-        if let window {
+        if let window = Self.visibleProjectWindowForQuitConfirmation() {
             // Closing the sheet's window before it is answered cancels the
             // quit: AppKit is never left waiting for a reply.
-            let answer = MainActor.assumeIsolated {
-                QuitConfirmationAnswer(parent: window) { [weak self] confirmed in
-                    guard confirmed else {
-                        self?.cancelQuit()
-                        NSApp.reply(toApplicationShouldTerminate: false)
-                        return
-                    }
-                    self?.finishQuit()
+            let answer = QuitConfirmationAnswer(parent: window) { [weak self] confirmed in
+                guard confirmed, let self else {
+                    self?.cancelQuit()
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                    return
                 }
+                Self.replyToTermination(self.finishQuit(intent: intent))
             }
             alert.beginSheetModal(for: window) { response in
                 MainActor.assumeIsolated { answer.resolve(response == .alertFirstButtonReturn) }
             }
             return .terminateLater
         } else if alert.runModal() == .alertFirstButtonReturn {
-            finishQuit()
-            return .terminateLater
+            return finishQuit(intent: intent)
         } else {
             cancelQuit()
             return .terminateCancel
         }
+    }
+
+    /// "Keep N sessions running in the background?", where the quit
+    /// confirmation goes. Keep Running and End Sessions quit with that
+    /// intent (`finishQuit`: Keep Running quits at once unless native
+    /// programs must stop); "Don't ask again" stores the answer.
+    @MainActor
+    private func askAboutSessions(_ question: SessionTeardownQuestion) -> NSApplication.TerminateReply {
+        let alert = question.makeAlert()
+        // How the quit goes on.
+        let finish: @MainActor (SessionTeardownAnswer) -> NSApplication.TerminateReply = { [weak self] answer in
+            guard let self, let intent = SessionTeardown.quit.intent(for: answer) else {
+                self?.cancelQuit()
+                return .terminateCancel
+            }
+            return self.finishQuit(intent: intent)
+        }
+        let remember = { (answered: (answer: SessionTeardownAnswer, remember: LocalSessionsOnQuit?)) in
+            if let remember = answered.remember {
+                SessionBackendPolicy.userSettings.rememberLocalSessionsOnQuit(remember)
+            }
+        }
+        guard let window = Self.visibleProjectWindowForQuitConfirmation() else {
+            let answered = SessionTeardownQuestion.answer(of: alert, response: alert.runModal())
+            remember(answered)
+            return finish(answered.answer)
+        }
+        // Closing the sheet's window before it is answered cancels the
+        // quit, as for "Quit Cherry?".
+        let answer = QuitConfirmationAnswer<SessionTeardownAnswer>(parent: window, cancelled: .cancel) { answer in
+            Self.replyToTermination(finish(answer))
+        }
+        RemoteViewCrashGuard.installIfNeeded()
+        alert.beginSheetModal(for: window) { response in
+            MainActor.assumeIsolated {
+                guard !answer.isResolved else { return }
+                let answered = SessionTeardownQuestion.answer(of: alert, response: response)
+                remember(answered)
+                answer.resolve(answered.answer)
+            }
+        }
+        return .terminateLater
+    }
+
+    // MARK: Why the app quits
+
+    /// Why Cherry quits, as far as asking about local sessions goes.
+    enum QuitReason: Equatable {
+        /// The user quit (the menu, ⌘Q, the Dock, the menu bar panel,
+        /// Activity Monitor or AppleScript): the preference applies.
+        case user
+        /// Log out, restart or shut down: sessions are kept, unasked (the
+        /// system ends them anyway, and waiting would hold it up), but busy
+        /// programs in them are confirmed as native ones are.
+        case powerOff
+        /// A new version replaced this one: sessions are kept, unasked.
+        case update
+    }
+
+    /// The quit reasons (`kAEQuitReason`) of a log out, restart or shut down.
+    private static let powerOffQuitReasons: Set<OSType> = [
+        OSType(kAELogOut), OSType(kAEReallyLogOut), OSType(kAEShowRestartDialog),
+        OSType(kAEShowShutdownDialog), OSType(kAERestart), OSType(kAEShutDown)
+    ]
+
+    /// How long a log out, restart or shut down the system announced
+    /// (`willPowerOffNotification`) counts for a quit Apple event that does
+    /// not say why (never for ⌘Q or a menu's Quit, which send none): a log
+    /// out another app cancels leaves no trace.
+    private static let powerOffAnnouncementLifetime: TimeInterval = 300
+
+    /// `CFBundleVersion` of the app on disk at launch (nil for `swift run`).
+    @MainActor private static var launchBundleVersion: String?
+    @MainActor private static var powerOffAnnouncedAt: Date?
+    /// `terminateKeepingSessions()` asked for this quit.
+    @MainActor private static var quitKeepsSessionsForUpdate = false
+    @MainActor private static var powerOffObserver: NSObjectProtocol?
+
+    @MainActor
+    private static func observeQuitReasons() {
+        launchBundleVersion = bundleVersionOnDisk()
+        guard powerOffObserver == nil else { return }
+        powerOffObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { powerOffAnnouncedAt = Date() }
+        }
+    }
+
+    /// Quits keeping every local session running, asking nothing about
+    /// them, as an update does: for an updater that relaunches the app. On
+    /// the main thread.
+    func terminateKeepingSessions() {
+        MainActor.assumeIsolated {
+            Self.quitKeepsSessionsForUpdate = true
+            NSApp.terminate(nil)
+        }
+    }
+
+    @MainActor
+    private static func currentQuitReason() -> QuitReason {
+        quitReason(
+            appleEvent: NSAppleEventManager.shared().currentAppleEvent,
+            launchBundleVersion: launchBundleVersion,
+            diskBundleVersion: bundleVersionOnDisk(),
+            powerOffAnnounced: powerOffAnnouncedAt.map { Date().timeIntervalSince($0) < powerOffAnnouncementLifetime } ?? false,
+            updateRequested: quitKeepsSessionsForUpdate
+        )
+    }
+
+    /// Why this quit happens. `appleEvent`: the quit Apple event being
+    /// handled, whose `kAEQuitReason` names a log out, restart or shut down
+    /// (none for ⌘Q, which sends no event); with `powerOffAnnounced` (the
+    /// system announced one) any quit event counts. A quit is an update
+    /// when the app on disk has another `CFBundleVersion` than at launch
+    /// (Scripts/install-local-app and Scripts/package-dmg stamp each build,
+    /// and an install replaces the app while it runs), or when an updater
+    /// asked for it.
+    nonisolated static func quitReason(
+        appleEvent: NSAppleEventDescriptor?,
+        launchBundleVersion: String?,
+        diskBundleVersion: String?,
+        powerOffAnnounced: Bool = false,
+        updateRequested: Bool = false
+    ) -> QuitReason {
+        if isPowerOffQuit(appleEvent) || (powerOffAnnounced && isQuitEvent(appleEvent)) {
+            return .powerOff
+        }
+        if updateRequested {
+            return .update
+        }
+        if let launchBundleVersion, let diskBundleVersion, launchBundleVersion != diskBundleVersion {
+            return .update
+        }
+        return .user
+    }
+
+    private nonisolated static func isQuitEvent(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event else { return false }
+        return event.eventClass == AEEventClass(kCoreEventClass) && event.eventID == AEEventID(kAEQuitApplication)
+    }
+
+    private nonisolated static func isPowerOffQuit(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event, isQuitEvent(event),
+              let reason = event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))
+                ?? event.paramDescriptor(forKeyword: AEKeyword(kAEQuitReason))
+        else { return false }
+        return powerOffQuitReasons.contains(reason.typeCodeValue)
+            || powerOffQuitReasons.contains(reason.enumCodeValue)
+    }
+
+    /// The `CFBundleVersion` in the app bundle's Info.plist on disk now, not
+    /// the one loaded at launch; nil without one (`swift run`).
+    nonisolated static func bundleVersionOnDisk(bundleURL: URL = Bundle.main.bundleURL) -> String? {
+        let url = bundleURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return nil }
+        return plist["CFBundleVersion"] as? String
     }
 
     /// The project window a quit confirmation sheet goes on
@@ -201,52 +408,143 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private func cancelQuit() {
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.cancelTermination()
+            Self.quitKeepsSessionsForUpdate = false
+            Self.powerOffAnnouncedAt = nil
         }
     }
 
-    /// Tear down every window's tabs (tabs and windows that changed while the
-    /// alert was up are saved first), then let the pending termination go
-    /// through once their programs have ended: native tabs get the HUP →
-    /// TERM → KILL escalation's 900 ms (app termination skips the per-window
-    /// `windowWillClose` teardown, so without this a SIGHUP-ignoring server
-    /// like `tilt up` would outlive Cherry), and persistent sessions a quit
-    /// ends get a bounded wait for their host to confirm they exited.
-    private func finishQuit() {
+    /// The quit was answered or confirmed with `intent`, or asked nothing
+    /// and ends sessions. One that keeps local sessions and stops no native
+    /// program goes at once (`SessionQuitPlan.confirmed`): saved, it returns
+    /// `.terminateNow`, as a quit with nothing running does. Otherwise
+    /// every window leaves the screen at once and the tabs whose close does
+    /// what the app's exit does not are torn down, then the pending
+    /// termination goes through once they ended (`tearDownForQuit`), within
+    /// `quitReplyDeadline`: `.terminateLater`. App termination skips the
+    /// per-window `windowWillClose` teardown, so without it a SIGHUP-ignoring
+    /// server like `tilt up` would outlive Cherry, and sessions a quit ends
+    /// would run on.
+    private func finishQuit(intent: SessionCloseIntent) -> NSApplication.TerminateReply {
         isQuitConfirmed = true
-        MainActor.assumeIsolated {
-            ProjectWindowRegistry.shared.tearDownForQuit()
+        return MainActor.assumeIsolated {
+            let registry = ProjectWindowRegistry.shared
+            guard Self.confirmedQuitPlan(intent, registry: registry) == .finish(intent) else {
+                registry.prepareForTermination()
+                return .terminateNow
+            }
             Self.hasRepliedToTermination = false
+            let reply: @MainActor @Sendable () -> Void = {
+                guard !CherryAppDelegate.hasRepliedToTermination else { return }
+                CherryAppDelegate.hasRepliedToTermination = true
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            Self.tearDownForQuit(intent: intent, registry: registry, reply: reply)
+            // While a quit waits (`.terminateLater`), AppKit runs the run
+            // loop in its modal panel mode. When the quit was asked for from
+            // inside a main-queue block (a main-actor Task or a
+            // DispatchQueue.main block calling `NSApp.terminate`), the main
+            // queue, and with it the waits' task, cannot run until the
+            // reply: only a run loop timer still fires, and lets the quit
+            // through.
+            let deadline = Timer(timeInterval: Self.quitReplyDeadline, repeats: false) { _ in
+                MainActor.assumeIsolated { reply() }
+            }
+            RunLoop.main.add(deadline, forMode: .common)
+            RunLoop.main.add(deadline, forMode: .modalPanel)
+            return .terminateLater
         }
-        let reply: @MainActor @Sendable () -> Void = {
-            guard !CherryAppDelegate.hasRepliedToTermination else { return }
-            CherryAppDelegate.hasRepliedToTermination = true
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
+    }
+
+    /// What a quit answered or confirmed with `intent` does
+    /// (`SessionQuitPlan.confirmed`), with the native programs `registry`'s
+    /// windows run now and the sessions `localSessions` is ending, or will
+    /// end: once their tabs' closes can no longer be undone (a tab closed
+    /// with ⌘W just before: the quit ends it, `tearDownForQuit`), or once
+    /// the Create of a tab closed while it was under way answers (the quit
+    /// waits for it): `.terminateNow` or `.finish`.
+    @MainActor
+    static func confirmedQuitPlan(
+        _ intent: SessionCloseIntent,
+        registry: ProjectWindowRegistry,
+        localSessions: PersistentLocalSessions? = .shared
+    ) -> SessionQuitPlan {
+        let endingSessions = localSessions.map { hosting in
+            hosting.hasPendingEnds || hosting.hasDeferredEnds
+                || TerminalSession.hasLaunchesEndingTheirSessions(on: hosting)
+        } ?? false
+        return SessionQuitPlan.confirmed(
+            intent,
+            nativeProgramsStopped: registry.runningProcessCount(endingWith: .appQuit),
+            endingSessions: endingSessions
+        )
+    }
+
+    /// A confirmed quit's teardown (`finishQuit`): every window leaves the
+    /// screen first, so the app looks gone at once; then `registry` saves
+    /// what changed while the quit's question was up, ends the sessions of
+    /// tabs closed (⌘W) while ⌘Z could still bring them back, and tears
+    /// down the tabs whose close does what the app's exit does not
+    /// (`ProjectWindowRegistry.tearDownForQuit`). Then it waits: for tabs
+    /// whose session was still being created (or whose restart waited for
+    /// the previous program) and that end what their Create makes, then for
+    /// every session being ended, 8 s in all; and, only when native tabs'
+    /// busy programs were stopped, for their HUP → TERM → KILL escalation
+    /// (`ShellProcessController.terminationEscalationDuration`), which the
+    /// exit would cut short. Then `reply`.
+    @MainActor
+    static func tearDownForQuit(
+        intent: SessionCloseIntent,
+        registry: ProjectWindowRegistry,
+        steps: QuitTeardownSteps = .app,
+        reply: @escaping @MainActor () -> Void
+    ) {
+        steps.takeWindowsOffScreen()
+        let stoppedNativePrograms = registry.tearDownForQuit(intent: intent)
+        let tornDown = ContinuousClock.now
         Task { @MainActor in
-            let started = ContinuousClock.now
-            // Tabs whose session was still being created (or whose restart
-            // waited for the previous program) end what their Create makes;
-            // then every ending is waited for, 8 s in all.
-            await TerminalSession.waitForPersistentLaunches(upTo: .seconds(6))
-            let endsBudget = max(.seconds(8) - (ContinuousClock.now - started), .seconds(2))
-            _ = await PersistentLocalSessions.shared.waitForPendingEnds(timeout: endsBudget)
-            let remaining = .milliseconds(900) - (ContinuousClock.now - started)
-            if remaining > .zero {
-                try? await Task.sleep(for: remaining)
+            await steps.waitForLaunches(.seconds(6))
+            let endsBudget = max(.seconds(8) - (ContinuousClock.now - tornDown), .seconds(2))
+            await steps.waitForEnds(endsBudget)
+            if stoppedNativePrograms {
+                let remaining = ShellProcessController.terminationEscalationDuration - (ContinuousClock.now - tornDown)
+                if remaining > .zero {
+                    await steps.sleep(remaining)
+                }
             }
             reply()
         }
-        // While a quit waits (`.terminateLater`), AppKit runs the run loop in
-        // its modal panel mode. When the quit was asked for from inside a
-        // main-queue block (a main-actor Task or a DispatchQueue.main block
-        // calling `NSApp.terminate`), the main queue, and with it the task
-        // above, cannot run until the reply: only a run loop timer still
-        // fires, and lets the quit through.
-        let deadline = Timer(timeInterval: Self.quitReplyDeadline, repeats: false) { _ in
-            MainActor.assumeIsolated { reply() }
+    }
+
+    /// Answers a quit that waited for a sheet (`.terminateLater`): at once
+    /// when it goes now or was cancelled. A quit that tears down answers
+    /// once its waits are over (`finishQuit`).
+    @MainActor
+    private static func replyToTermination(_ reply: NSApplication.TerminateReply) {
+        switch reply {
+        case .terminateNow: NSApp.reply(toApplicationShouldTerminate: true)
+        case .terminateCancel: NSApp.reply(toApplicationShouldTerminate: false)
+        case .terminateLater: break
+        @unknown default: break
         }
-        RunLoop.main.add(deadline, forMode: .common)
-        RunLoop.main.add(deadline, forMode: .modalPanel)
+    }
+
+    /// Takes `windows` off screen at once for a quit that tears down
+    /// (`tearDownForQuit`), so the app looks gone while it does: project
+    /// windows, Settings, sheets and panels, the key window last (a window
+    /// becoming key activates its project). Ordered out, never closed:
+    /// closing a project window would tear its tabs down with a window
+    /// close's intent. Not the menu bar icon's window; the icon, as the
+    /// Dock's, goes when the app exits.
+    @MainActor
+    static func takeWindowsOffScreen(_ windows: [NSWindow]) {
+        let visible = windows.filter { $0.isVisible && !($0.className.contains("StatusBar")) }
+        for window in visible.filter({ !$0.isKeyWindow }) + visible.filter(\.isKeyWindow) {
+            window.animationBehavior = .none
+            window.orderOut(nil)
+        }
+        // Hands the ordering to the window server now, before the teardown
+        // holds the main thread.
+        CATransaction.flush()
     }
 
     /// The longest a confirmed quit waits for sessions and processes to end.
@@ -273,18 +571,23 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             let plan = ProjectWindowRegistry.shared.launchWindowPlan(
                 hasVisibleWindow: NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
             )
+            var reopened: [String] = []
             switch plan {
             case .reopen(let projectRoots):
-                guard let openProjectWindow else {
+                if let openProjectWindow {
+                    projectRoots.forEach(openProjectWindow)
+                    reopened = projectRoots
+                } else {
                     openDefaultProjectWindow?()
-                    return
                 }
-                projectRoots.forEach(openProjectWindow)
             case .openDefault:
                 openDefaultProjectWindow?()
             case .nothing:
                 break
             }
+            // Once those windows restored their tabs: sessions of closed
+            // windows or tabs that still run.
+            ProjectWindowRegistry.shared.backgroundSessionsNotice?.launchWindowsOpened(expecting: reopened)
         }
     }
 
@@ -312,16 +615,16 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     }
 }
 
-/// The quit confirmation's one answer: the sheet's, or false when the
-/// window it is on closes first (the quit is then cancelled, so AppKit is
-/// never left waiting for a reply to `.terminateLater`). Later answers are
+/// A quit dialog's one answer: the sheet's, or `cancelled` when the window
+/// it is on closes first (the quit is then cancelled, so AppKit is never
+/// left waiting for a reply to `.terminateLater`). Later answers are
 /// ignored.
 @MainActor
-final class QuitConfirmationAnswer {
-    private var answer: (@MainActor (Bool) -> Void)?
+final class QuitConfirmationAnswer<Answer: Sendable> {
+    private var answer: (@MainActor (Answer) -> Void)?
     private var parentClose: NSObjectProtocol?
 
-    init(parent: NSWindow, answer: @escaping @MainActor (Bool) -> Void) {
+    init(parent: NSWindow, cancelled: Answer, answer: @escaping @MainActor (Answer) -> Void) {
         self.answer = answer
         // Held by the notification center until resolved.
         parentClose = NotificationCenter.default.addObserver(
@@ -329,21 +632,57 @@ final class QuitConfirmationAnswer {
             object: parent,
             queue: .main
         ) { _ in
-            MainActor.assumeIsolated { self.resolve(false) }
+            MainActor.assumeIsolated { self.resolve(cancelled) }
         }
     }
 
     var isResolved: Bool { answer == nil }
 
     /// Answers the quit once; later calls do nothing.
-    func resolve(_ confirmed: Bool) {
+    func resolve(_ answered: Answer) {
         guard let answer else { return }
         self.answer = nil
         if let parentClose {
             NotificationCenter.default.removeObserver(parentClose)
             self.parentClose = nil
         }
-        answer(confirmed)
+        answer(answered)
+    }
+}
+
+extension QuitConfirmationAnswer where Answer == Bool {
+    /// "Quit Cherry?": true quits; the window closing first answers false.
+    convenience init(parent: NSWindow, answer: @escaping @MainActor (Bool) -> Void) {
+        self.init(parent: parent, cancelled: false, answer: answer)
+    }
+}
+
+/// How a confirmed quit that tears down leaves the screen and waits
+/// (`CherryAppDelegate.tearDownForQuit`). Tests replace them.
+@MainActor
+struct QuitTeardownSteps {
+    /// Takes every window off screen (`CherryAppDelegate.takeWindowsOffScreen`).
+    var takeWindowsOffScreen: @MainActor () -> Void
+    /// Waits, at most this long, for launches of persistent tabs that end
+    /// what their Create makes (`TerminalSession.waitForPersistentLaunches`).
+    var waitForLaunches: @MainActor (Duration) async -> Void
+    /// Waits, at most this long, for the sessions being ended
+    /// (`PersistentLocalSessions.waitForPendingEnds`), once any whose end
+    /// still waited for an undo no window ended were ended too.
+    var waitForEnds: @MainActor (Duration) async -> Void
+    /// Waits out native tabs' HUP → TERM → KILL escalation.
+    var sleep: @MainActor (Duration) async -> Void
+
+    static var app: QuitTeardownSteps {
+        QuitTeardownSteps(
+            takeWindowsOffScreen: { CherryAppDelegate.takeWindowsOffScreen(NSApp.windows) },
+            waitForLaunches: { await TerminalSession.waitForPersistentLaunches(upTo: $0) },
+            waitForEnds: { timeout in
+                PersistentLocalSessions.shared.endAllDeferred()
+                _ = await PersistentLocalSessions.shared.waitForPendingEnds(timeout: timeout)
+            },
+            sleep: { try? await Task.sleep(for: $0) }
+        )
     }
 }
 
@@ -355,6 +694,8 @@ struct CherryApp: App {
     @StateObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var agentSettings = AgentSettings.shared
     @StateObject private var menuBarAgents = MenuBarAgentsModel()
+    /// Only the count: the list itself would re-evaluate the app's body.
+    @StateObject private var backgroundSessions = BackgroundSessionsModel.shared.summary
     @State private var controlServer: CherryControlServer?
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
@@ -407,6 +748,21 @@ struct CherryApp: App {
         focusedWorkspaceHasActiveSplit ? "Close Pane" : "Close Tab"
     }
 
+    private var detachTabTitle: String {
+        focusedWorkspaceHasActiveSplit ? "Detach Pane" : "Detach Tab"
+    }
+
+    /// Detach Tab is for a tab whose session can keep running without it
+    /// (`SessionCloseCoordinator.canDetach`): never a native tab's.
+    private var canDetachFocusedTab: Bool {
+        guard focusedChromeState?.isShowingTerminalContent != false,
+              let session = focusedWorkspace?.selectedSession
+        else {
+            return false
+        }
+        return SessionCloseCoordinator.canDetach(session)
+    }
+
     var body: some Scene {
         let _ = configureDefaultWindowOpener()
 
@@ -444,6 +800,12 @@ struct CherryApp: App {
         .restorationBehavior(.disabled)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(after: .appSettings) {
+                Button("End Background Sessions…") {
+                    BackgroundSessionsModel.shared.confirmEndAll()
+                }
+                .disabled(backgroundSessions.count == 0)
+            }
             CommandGroup(after: .newItem) {
                 Button("Persistent Sessions…") {
                     keyWindowChromeState?.isHostedSessionsPresented = true
@@ -527,8 +889,20 @@ struct CherryApp: App {
                 Button("Split Right") {
                     keyWindowWorkspace?.splitDuplicateActiveTerminal()
                 }
-                .keyboardShortcut("d")
+                .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(!canSplitFocusedTerminal)
+
+                Button(detachTabTitle) {
+                    guard let workspace = keyWindowWorkspace else { return }
+                    SessionCloseCoordinator.detachSelectedTabOrWindow(
+                        workspace: workspace,
+                        repository: keyWindowRepository,
+                        chromeState: keyWindowChromeState,
+                        window: NSApp.keyWindow
+                    )
+                }
+                .keyboardShortcut("d")
+                .disabled(!canDetachFocusedTab)
 
                 Button(focusedChromeState?.selectedNoteID == nil ? closeTabTitle : "Close Note") {
                     guard let workspace = keyWindowWorkspace else { return }
@@ -599,7 +973,7 @@ struct CherryApp: App {
         }
 
         MenuBarExtra {
-            MenuBarAgentsPanel(model: menuBarAgents)
+            MenuBarAgentsPanel(model: menuBarAgents, background: .shared)
         } label: {
             MenuBarStatusLabel(model: menuBarAgents)
         }
@@ -616,7 +990,7 @@ struct CherryApp: App {
             guard !ProjectWindowRegistry.shared.hasWindow(for: projectRoot) else { return }
             openWindow(id: Self.projectWindowSceneID, value: projectRoot)
         }
-        appDelegate.openDefaultProjectWindow = {
+        let openDefaultProjectWindow: @MainActor @Sendable () -> Void = {
             if let projectRoot = agentSettings.projectRoot(for: nil) {
                 agentSettings.markProjectOpened(projectRoot)
                 guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
@@ -624,6 +998,17 @@ struct CherryApp: App {
             } else {
                 openWindow(id: Self.projectWindowSceneID)
             }
+        }
+        appDelegate.openDefaultProjectWindow = openDefaultProjectWindow
+        // Background Sessions → Open, for a project whose window is closed.
+        ProjectWindowRegistry.shared.projectWindowOpener = { projectRoot in
+            guard let projectRoot else {
+                openDefaultProjectWindow()
+                return
+            }
+            agentSettings.markProjectOpened(projectRoot)
+            guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
+            openWindow(id: Self.projectWindowSceneID, value: projectRoot)
         }
     }
 }

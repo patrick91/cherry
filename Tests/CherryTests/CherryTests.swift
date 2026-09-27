@@ -9585,15 +9585,32 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(items.map(\.id) == ["project:\(matchingProject.root)"])
 }
 
-@Test func appShortcutMonitorRoutesCommandSToSidebarToggle() {
+@Test func appShortcutMonitorRoutesCommandShortcuts() {
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "s",
         modifiers: [.command]
     ) == .toggleSidebar)
+    // ⌘D detaches the tab; ⌘⇧D, whose characters keep the Shift, splits.
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "d",
         modifiers: [.command]
+    ) == .detachSelectedSessionOrWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "D",
+        modifiers: [.command, .shift]
     ) == .splitDuplicate)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "w",
+        modifiers: [.command]
+    ) == .closeSelectedSessionOrWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "D",
+        modifiers: [.command, .shift, .option]
+    ) == nil)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "W",
+        modifiers: [.command, .shift]
+    ) == nil)
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "[",
         modifiers: [.command]
@@ -9605,6 +9622,28 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "s",
         modifiers: [.command, .shift]
+    ) == nil)
+    // Caps Lock is not a held modifier: the shortcuts stay Cherry's, and
+    // Ghostty never gets ⌘D or ⌘⇧D to split its surface.
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "d",
+        modifiers: [.command, .capsLock]
+    ) == .detachSelectedSessionOrWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "D",
+        modifiers: [.command, .shift, .capsLock]
+    ) == .splitDuplicate)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "w",
+        modifiers: [.command, .capsLock]
+    ) == .closeSelectedSessionOrWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "z",
+        modifiers: [.command, .capsLock]
+    ) == .undoClosedTab)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "d",
+        modifiers: [.command, .control, .capsLock]
     ) == nil)
 }
 
@@ -9841,6 +9880,12 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         repository: repository
     ))
     coordinator.closeSelectedSessionOrWindow()
+    // A native shell that has not shown its prompt yet counts as busy, so
+    // its close may ask first: answered Close, the window stays.
+    if let request = chromeState.pendingTabClose {
+        #expect(request.closingWindow == nil)
+        SessionCloseCoordinator.answerTabClose(.close, to: request, chromeState: chromeState)
+    }
 
     #expect(workspace.sessions.isEmpty)
     #expect(otherWorkspace.sessions.map(\.id) == [otherSession.id])
@@ -10522,8 +10567,8 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         allowEmptyWorkspace: true
     )
 
-    #expect(chromeState.pendingAgentCloseSessionID == agent.id)
-    #expect(chromeState.pendingAgentCloseAllowsEmptyWorkspace)
+    #expect(chromeState.pendingTabClose?.sessionID == agent.id)
+    #expect(chromeState.pendingTabClose?.allowEmptyWorkspace == true)
     #expect(workspace.sessions.contains { $0.id == agent.id })
 }
 

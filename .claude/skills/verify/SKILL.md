@@ -37,11 +37,31 @@ directly (or with `open --env`).
   private `HOME` and sockets in a private directory:
   `dir=$(mktemp -d); chmod 700 "$dir"; mkdir "$dir/home"; HOME="$dir/home" CFFIXED_USER_HOME="$dir/home" CHERRY_HOST_SOCKET="$dir/host.sock" CHERRY_CONTROL_SOCKET="$dir/control.sock" dist/CherryDev.app/Contents/MacOS/CherryDev &`
   The daemon's state then goes under that `HOME`, and so do CherryDev's saved tabs. When done,
-  quit CherryDev and run
+  quit CherryDev, wait for its process to exit (a quit that ends sessions or stops native
+  programs hides the windows at once but runs up to 10 s more; `while kill -0 <pid>; do sleep
+  0.2; done`), and run
   `python3 Scripts/cherry_private_host.py stop "$dir" --cli dist/CherryDev.app/Contents/MacOS/cherry`,
   which kills and
   removes every session there, shuts the daemon down, kills leftover holders and adapters, and
   deletes the directory. Its sessions' holders outlive a killed daemon, so never just kill it.
+- Quitting CherryDev (⌘Q, `osascript -e 'quit app "CherryDev"'`) or closing a project window
+  while persistent tabs run asks "Keep N sessions running in the background?" and waits for an
+  answer. For scripted runs, launch with `-sessions.onQuit keep` (or `end`) so it asks nothing:
+  `dist/CherryDev.app/Contents/MacOS/CherryDev -sessions.onQuit keep &` (or
+  `open -n dist/CherryDev.app --args -sessions.onQuit keep`). SIGTERM (`kill <pid>`) also quits
+  without asking and keeps the sessions.
+- ⌘W on a tab whose program is at work (an agent, a command, a busy terminal) asks "Close
+  “<name>”?" (Close, Detach Instead, Cancel) and waits; MCP `close_process` never asks. ⌘D
+  detaches the tab (its session keeps running in the background, with a toast); ⌘⇧D is Split
+  Right. After ⌘W a persistent tab's session is killed only ~6 s later (while its "Closed <name>"
+  toast would stay; paused while CherryDev's window is not key, for a minute at most), or when the window closes or
+  CherryDev quits: check the host's list after that, not at once. ⌘Z (with the terminal or the
+  sidebar focused, not a text field) brings the tab back with the same session.
+- When CherryDev opens while agents, commands or busy terminals of its closed windows or tabs still
+  run on its daemon (not ones kept on purpose, never idle shells), a toast at the bottom of its first
+  project window says so once ("N sessions are still running in the background"; it asks nothing).
+  Launch with `-sessions.backgroundNoticeAtLaunch '<false/>'` to skip it; the menu bar icon's
+  Background sessions list and Cherry › End Background Sessions… show and end them.
 - The CLI can be driven headlessly the same way (`cherry --socket "$dir/host.sock" new|list|attach|kill`);
   `attach --status-file PATH` records how an attachment ended. Also give a headless daemon a private
   `HOME` (`mkdir "$dir/home"; HOME="$dir/home" cherry --socket "$dir/host.sock" …`): the daemon keeps

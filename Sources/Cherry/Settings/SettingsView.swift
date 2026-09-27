@@ -297,7 +297,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: "App chrome, sidebar, worktrees, and theme behavior"
         case .terminal: "Terminal themes, text, cursor, and contrast"
-        case .sessions: "Persistent sessions, closing tabs, and quitting"
+        case .sessions: "Persistent sessions, closing tabs and windows, quitting, and background sessions"
         case .projects: "Workspaces, local features, and identity colors"
         case .agents: "Agent tools and automatic summaries"
         case .mcp: "Install commands and connection status"
@@ -315,8 +315,16 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Words a search finds the page by that its title and subtitle lack.
+    var searchKeywords: String {
+        switch self {
+        case .sessions: "close exit shell"
+        case .general, .terminal, .projects, .agents, .mcp: ""
+        }
+    }
+
     var searchTokens: String {
-        "\(title) \(subtitle) \(rawValue)"
+        "\(title) \(subtitle) \(rawValue) \(searchKeywords)"
     }
 
     static func filtered(by query: String) -> [SettingsPage] {

@@ -109,7 +109,8 @@ groups=(
   MultiplexerSafety     # MultiplexerSafety{,Launch}Tests
   AdapterAwayKeyInput   # AdapterAwayKeyInputTests
   AgentInputSafety      # AgentInputSafetyTests
-  SessionCloseFlow      # SessionCloseFlowTests
+  SessionCloseFlow      # SessionCloseFlow{,Detach,Quit,Toast,Undo}Tests
+  BackgroundSession     # BackgroundSessionsTests
   '[Aa]ppIdentity'      # AppIdentityTests
 )
 

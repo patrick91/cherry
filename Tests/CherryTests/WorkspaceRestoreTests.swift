@@ -267,6 +267,70 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     #expect(await harness.fake.wait { harness.requestIDs("remove") == ["s-ended"] })
 }
 
+@Test @MainActor func aSavedTerminalWhoseShellExitedCleanlyWhileCherryWasClosedIsNotRestoredAndItsSessionIsRemoved() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    workspace.restoredTabLaunchQueue = RestoredTabLaunchQueue()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    let clean = localRecord(title: "Done", sessionID: "s-clean", workingDirectory: project)
+    let failed = localRecord(title: "Failed", sessionID: "s-failed", workingDirectory: project)
+    let agent = localRecord(kind: .agent, title: "Claude", sessionID: "s-agent", agentName: "Claude", workingDirectory: project)
+    let command = localRecord(kind: .command, title: "build", sessionID: "s-command", commandName: "build", workingDirectory: project)
+    // Another app variant's terminal: only attached, never this app's to end.
+    let foreign = localRecord(title: "Theirs", sessionID: "s-foreign", workingDirectory: project)
+    func ended(_ id: String, _ record: WorkspaceSessionRecord, code: UInt32, owner: String = "CherryTests") -> HostedSessionInfo {
+        HostedSessionInfo(id: id, name: record.title, cwd: project, state: .exited, exitCode: code, owner: owner,
+                          tags: [PersistentSessionTag.tab: record.id.uuidString])
+    }
+    harness.fake.sessions = [
+        ended("s-clean", clean, code: 0),
+        ended("s-failed", failed, code: 3),
+        ended("s-agent", agent, code: 0),
+        ended("s-command", command, code: 0),
+        ended("s-foreign", foreign, code: 0, owner: "Cherry Sessions")
+    ]
+    let records = [clean, failed, agent, command, foreign]
+
+    // Its tab would have closed while Cherry ran: it does not come back
+    // (no tab, and its record is not kept), and its session is removed.
+    let result = await harness.restore(records, into: workspace)
+    #expect(result.keptRecordIDs.isEmpty)
+    #expect(result.pendingRecordIDs.isEmpty)
+    #expect(result.sessions.map(\.id) == [failed.id, agent.id, command.id, foreign.id])
+    #expect(await harness.fake.wait { harness.requestIDs("remove") == ["s-clean"] })
+    #expect(harness.requestIDs("kill").isEmpty)
+    // Everything else ended comes back showing how it ended.
+    let tabs = Dictionary(uniqueKeysWithValues: result.sessions.map { ($0.id, $0) })
+    #expect(tabs[failed.id]?.persistentSessionEndedMessage == "Session ended (exit 3)")
+    #expect(tabs[agent.id]?.persistentSessionEndedMessage == "Session ended (exit 0)")
+    #expect(tabs[command.id]?.isPersistentLocalSession == true)
+    #expect(tabs[command.id]?.state == .exited(0))
+    #expect(tabs[foreign.id]?.hostedAttachment?.sessionID == "s-foreign")
+    #expect(tabs[foreign.id]?.hostedAttachmentStatus == .exited(code: 0, signal: nil))
+    // Opened to show their exit: they stay once added.
+    workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(root: project, sessions: records))
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(workspace.sessions.map(\.id) == [failed.id, agent.id, command.id, foreign.id])
+    #expect(harness.requestIDs("remove") == ["s-clean"])
+
+    // With Settings › Sessions keeping such tabs, it comes back as before.
+    harness.settings.value.closeTabsOnCleanExit = false
+    let keeping = harness.workspace()
+    keeping.restoredTabLaunchQueue = RestoredTabLaunchQueue()
+    defer { keeping.closeAllSessions(intent: .windowClosed) }
+    let kept = localRecord(title: "Kept", sessionID: "s-kept", workingDirectory: project)
+    harness.fake.sessions.append(ended("s-kept", kept, code: 0))
+    let keptResult = await harness.restore([kept], into: keeping)
+    #expect(keptResult.sessions.map(\.id) == [kept.id])
+    #expect(keptResult.sessions.first?.persistentSessionEndedMessage == "Session ended (exit 0)")
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(!harness.requestIDs("remove").contains("s-kept"))
+}
+
 @Test @MainActor func aRestoredTabShownBeforeItsTurnAttachesAtOnce() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()

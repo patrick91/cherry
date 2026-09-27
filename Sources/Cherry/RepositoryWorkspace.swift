@@ -111,6 +111,9 @@ final class RepositoryWorkspace: ObservableObject {
     private var persistenceSubscriptions: [ObjectIdentifier: AnyCancellable] = [:]
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
+    /// The registry this repository's window registered with
+    /// (`ProjectWindowRegistry.register`): it names that window.
+    weak var windowRegistry: ProjectWindowRegistry?
     private var pendingStateSaveTask: Task<Void, Never>?
 
     /// The app passes `.userSettings`, `.shared` and
@@ -195,6 +198,7 @@ final class RepositoryWorkspace: ObservableObject {
             lockReason: nil,
             pruneReason: nil
         )]
+        closeTabsAfterCleanExit(in: initialWorkspace)
         observePersistentState(of: initialWorkspace)
     }
 
@@ -541,11 +545,30 @@ final class RepositoryWorkspace: ObservableObject {
     /// quit, duplicate window) stops workspace persistence first, so the file
     /// keeps the tabs saved before it.
     func closeAllSessions(intent: SessionCloseIntent = .windowClosed) {
-        if intent == .appQuit {
+        closeAllSessions(intent: intent) { $0.closeAllSessions(intent: intent) }
+    }
+
+    /// A confirmed quit's teardown (`ProjectWindowRegistry.tearDownForQuit`):
+    /// as `closeAllSessions`, but tabs that only detach are left to the
+    /// app's exit (`TerminalWorkspace.closeSessionsForQuit`). Returns whether
+    /// a native tab's busy program was stopped.
+    func closeSessionsForQuit(intent: SessionCloseIntent) -> Bool {
+        var stoppedNativeProgram = false
+        closeAllSessions(intent: intent) { workspace in
+            stoppedNativeProgram = workspace.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
+        }
+        return stoppedNativeProgram
+    }
+
+    private func closeAllSessions(intent: SessionCloseIntent, closing close: (TerminalWorkspace) -> Void) {
+        if intent.isAppQuit {
             // A copy of the app launched while this quit waits for sessions
             // to end waits for this one instead of running without its
             // saved tabs.
             stateStore?.noteAppQuitting()
+        }
+        if intent.endsLocalSessions {
+            endSavedSessionsNotOpen()
         }
         if intent.tearsDownWorkspace {
             isTearingDown = true
@@ -559,7 +582,7 @@ final class RepositoryWorkspace: ObservableObject {
             orphanScanTask = nil
             orphanScanRetry = nil
         }
-        workspaces.values.forEach { $0.closeAllSessions(intent: intent) }
+        workspaces.values.forEach(close)
         if intent.tearsDownWorkspace {
             // After the workspaces closed: restores under way end the tabs
             // they built with the same intent, and build no more.
@@ -569,11 +592,32 @@ final class RepositoryWorkspace: ObservableObject {
         }
     }
 
-    /// Running tabs that closing everything for `intent` would end (a
-    /// window close by default); persistent tabs that only detach keep
-    /// running and are not counted.
-    func runningProcessCount(endingWith intent: SessionCloseIntent = .windowClosed) -> Int {
-        workspaces.values.reduce(0) { $0 + $1.sessionsWithRunningProcess(endingWith: intent).count }
+    /// What closing every worktree's tabs for `teardown` would do
+    /// (`TerminalWorkspace.teardownSummary`), over the workspaces
+    /// `closeAllSessions` closes. A quit names each session's project; a
+    /// window close names its worktree when more than one of the window's
+    /// worktrees has tabs.
+    func teardownSummary(
+        _ teardown: SessionTeardown,
+        pathDisplayMode: SidebarTerminalPathDisplayMode
+    ) -> SessionTeardownSummary {
+        let withTabs = workspaces.filter { !$0.value.sessions.isEmpty }
+        let order = worktrees.map(\.root)
+        let roots = withTabs.keys.sorted { lhs, rhs in
+            (order.firstIndex(of: lhs) ?? order.count, lhs) < (order.firstIndex(of: rhs) ?? order.count, rhs)
+        }
+        var summary = roots.reduce(SessionTeardownSummary()) { summary, root in
+            guard let workspace = withTabs[root] else { return summary }
+            let worktreeName = worktrees.first { $0.root == root }?.displayName
+                ?? URL(fileURLWithPath: root).lastPathComponent
+            let place: String? = switch teardown {
+            case .quit: repositoryName
+            case .windowClose: withTabs.count > 1 ? worktreeName : nil
+            }
+            return summary + workspace.teardownSummary(teardown, place: place, pathDisplayMode: pathDisplayMode)
+        }
+        summary.savedSessionsNotOpen = savedRecordsWhoseSessionsEndWithTheWindow().count
+        return summary
     }
 
     func root(containing sessionID: UUID) -> String? {
@@ -598,8 +642,28 @@ final class RepositoryWorkspace: ObservableObject {
         workspace.restoredTabLaunchQueue = restoredTabLaunchQueue
         workspaces[root] = workspace
         loadedWorktreeRoots.insert(root)
+        closeTabsAfterCleanExit(in: workspace)
         observePersistentState(of: workspace)
         return workspace
+    }
+
+    /// A terminal tab whose shell exited cleanly closes as ⌘W closes it: on
+    /// the window's last tab, the window closes too. The window is the one
+    /// this repository's chrome state belongs to (the window that claimed
+    /// the project, in the registry it registered with), never another
+    /// window of the same project.
+    private func closeTabsAfterCleanExit(in workspace: TerminalWorkspace) {
+        workspace.closeTabAfterCleanExit = { [weak self] workspace, session in
+            guard let self, !self.isTearingDown else { return }
+            let chromeState = self.chromeState
+            SessionCloseCoordinator.closeTabAfterCleanExit(
+                session,
+                in: workspace,
+                repository: self,
+                chromeState: chromeState,
+                window: chromeState.flatMap { self.windowRegistry?.window(for: $0) }
+            )
+        }
     }
 
     /// Starts the initial worktree's auto-start commands once its saved tabs
@@ -741,6 +805,86 @@ final class RepositoryWorkspace: ObservableObject {
             .filter { seen.insert($0.id).inserted }
     }
 
+    /// Saved tabs of this window that a restore may still bring back: not
+    /// restored yet, still being restored, or kept while their host could
+    /// not be listed. Their sessions are not in the background
+    /// (`BackgroundSessions`). Set-aside tabs are not among them: their
+    /// sessions run unseen until the next launch.
+    func savedRecordsAwaitingRestore() -> [WorkspaceSessionRecord] {
+        guard !isTearingDown else { return [] }
+        let roots = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys)
+        return roots.sorted().flatMap { root in
+            let setAside = setAsideRecordIDs[root] ?? []
+            return savedRecordsNotOpen(root: root).filter { !setAside.contains($0.id) }
+        }
+    }
+
+    /// Whether a restore (or a late host's part of one) or a look for
+    /// orphaned sessions is under way.
+    var isRestoringSessions: Bool {
+        !restoreTasks.isEmpty || !restoreRemainders.isEmpty || orphanScanTask != nil
+    }
+
+    /// Waits until no restore or look for orphaned sessions is under way, or
+    /// until `deadline`: what a window brings back by itself is not taken for
+    /// a session in the background.
+    func waitUntilSessionsRestored(before deadline: ContinuousClock.Instant) async {
+        while isRestoringSessions, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// Shows a session of this app that no open tab shows (Background
+    /// Sessions → Open) in `worktreeRoot`'s workspace, or else the active
+    /// one, and selects its tab:
+    /// - the tab of this window that owns it already (its window's restore
+    ///   brought it back);
+    /// - a session this window may own (`canAdopt`) becomes its tab, with
+    ///   the kind, agent, command and tab id its tags name, the way an
+    ///   orphaned session is adopted: when a tab of that workspace runs the
+    ///   same command, it is set aside (saved, still running) and that
+    ///   command's tab is shown instead;
+    /// - any other session (another client shows it) is attached.
+    @discardableResult
+    func showBackgroundSession(
+        _ launch: PersistentSessionLaunch,
+        worktreeRoot: String?,
+        hosting: PersistentLocalSessions
+    ) -> TerminalSession? {
+        guard !isTearingDown else { return nil }
+        let info = launch.info
+        if let owner = hosting.owningTab(of: info.id), let root = root(containing: owner.id),
+           let workspace = workspaces[root] {
+            workspace.select(owner)
+            return owner
+        }
+        let workspace = worktreeRoot.flatMap { prepareWorkspace(worktreeRoot: $0) } ?? activeWorkspace
+        guard !workspace.isTornDown,
+              let root = workspaces.first(where: { $0.value === workspace })?.key
+        else { return nil }
+        guard hosting.canAdopt(info) else {
+            return workspace.attachHostedSession(launch.attachment, info: info)
+        }
+        let tabID = PersistentLocalSessions.tabID(of: info, owner: hosting.owner).flatMap { id in
+            hosting.hasOpenTab(withID: id) || OpenHostedTabs.shared.hasOpenTab(withID: id)
+                || workspace.session(withID: id) != nil ? nil : id
+        } ?? UUID()
+        let record = OrphanedSessionCriteria.record(for: info, tabID: tabID, hostID: launch.attachment.hostID)
+        let tab = workspace.makeRestoredPersistentSession(launch, record: record, hosting: hosting, deferringLaunch: true)
+        applyRestoreStep(
+            root: root,
+            asked: [],
+            result: WorkspaceRestoreResult(sessions: [tab]),
+            layout: WorktreeStateRecord(root: root, sessions: [record]),
+            workspace: workspace,
+            step: .orphans
+        )
+        let shown = workspace.session(withID: tab.id).flatMap { $0 === tab ? $0 : nil }
+            ?? record.commandName.flatMap { workspace.commandSession(named: $0) }
+        if let shown { workspace.select(shown) }
+        return shown
+    }
+
     /// Forgets `root`'s saved tabs that are not open (its worktree was
     /// removed or no longer exists), ending the sessions of This Mac they
     /// own, and stops the restores still under way for it. Those tabs are
@@ -759,6 +903,29 @@ final class RepositoryWorkspace: ObservableObject {
         if !forgotten.isEmpty {
             backendPolicy.localSessions?.endSessions(ofForgottenTabs: forgotten, recordedIn: stateStore)
         }
+    }
+
+    /// A window close or quit that ends sessions (End Sessions, or
+    /// Settings › Sessions) also ends the sessions of this window's saved
+    /// tabs that no open tab shows: still being restored, kept while their
+    /// host was unavailable, set aside, or in worktrees not restored yet.
+    /// Only sessions this app created for those tabs, as when their
+    /// worktree is removed; they are recorded as sessions to end, so what
+    /// this run cannot end (it quits first) is ended at the next launch.
+    /// The saved tabs themselves stay: the next restore drops them once
+    /// their sessions are gone.
+    private func endSavedSessionsNotOpen() {
+        let records = savedRecordsWhoseSessionsEndWithTheWindow()
+        guard let localSessions = backendPolicy.localSessions, !records.isEmpty else { return }
+        localSessions.endSessions(ofForgottenTabs: records, recordedIn: stateStore)
+    }
+
+    /// The saved tabs no open tab shows that may own a session of This Mac
+    /// (`endSavedSessionsNotOpen`).
+    private func savedRecordsWhoseSessionsEndWithTheWindow() -> [WorkspaceSessionRecord] {
+        guard backendPolicy.localSessions != nil, backendPolicy.hostedLocalTabsFollowSettings else { return [] }
+        let roots = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys)
+        return roots.sorted().flatMap(savedRecordsNotOpen(root:)).filter(\.mayOwnLocalSession)
     }
 
     // MARK: Orphaned sessions
@@ -835,6 +1002,7 @@ final class RepositoryWorkspace: ObservableObject {
                   !forgottenRecordIDs.contains(tabID),
                   localSessions.owningTab(of: info.id) == nil,
                   !localSessions.isEnding(info.id),
+                  !localSessions.isScheduledToEnd(info, hostID: list.hostID),
                   !localSessions.hasOpenTab(withID: tabID),
                   !OpenHostedTabs.shared.hasOpenTab(withID: tabID),
                   let project = OrphanedSessionCriteria.projectRoot(of: info),
@@ -843,6 +1011,17 @@ final class RepositoryWorkspace: ObservableObject {
             found[root, default: []].append((info, OrphanedSessionCriteria.record(for: info, tabID: tabID, hostID: list.hostID)))
         }
         let listing = localSessions.listing(of: list)
+        if backendPolicy.settings().closeTabsOnCleanExit {
+            // A terminal whose shell exited with status 0 would have closed
+            // its tab: its ended session is removed instead of adopted.
+            for (root, orphans) in found {
+                let ended = orphans.filter { $0.record.kind == .terminal && PersistentLocalSessions.endedCleanly($0.info) }
+                guard !ended.isEmpty else { continue }
+                ended.forEach { localSessions.end(listing.attachment($0.info)) }
+                let others = orphans.filter { orphan in !ended.contains { $0.info.id == orphan.info.id } }
+                found[root] = others.isEmpty ? nil : others
+            }
+        }
         for root in found.keys.sorted() {
             guard let orphans = found[root] else { continue }
             let workspace = workspace(for: root)

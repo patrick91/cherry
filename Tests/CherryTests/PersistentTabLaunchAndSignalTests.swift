@@ -236,8 +236,6 @@ private func restoreTerminal(
 
 @Test @MainActor func aQuitThatEndsSessionsWaitsForTheSessionOfATabWhoseCreateWasUnderWayToBeEnded() async throws {
     let harness = try PersistentHarness()
-    // Settings › Sessions › End sessions when quitting.
-    harness.settings.value.endLocalSessionsOnQuit = true
     let held = FakeHeldRequest()
     harness.fake.respond = { request, connection in
         request.op == "create" ? held.hold(request, on: connection) : nil
@@ -249,8 +247,9 @@ private func restoreTerminal(
     }
     let closing = workspace.addSession(title: "Closing")
     #expect(await harness.fake.wait { held.isHeld })
-    // Quit tears the tab down while its Create is under way.
-    workspace.close(closing, allowEmptyWorkspace: true, intent: .appQuit)
+    // A quit answered End Sessions tears the tab down while its Create is
+    // under way.
+    workspace.close(closing, allowEmptyWorkspace: true, intent: .appQuitEndingSessions)
     #expect(workspace.sessions.isEmpty)
     let settled = Recorder(false)
     Task { @MainActor in
@@ -274,7 +273,8 @@ private func restoreTerminal(
 }
 
 @Test @MainActor func aQuitThatKeepsSessionsKeepsTheSessionATabsCreateMakesAfterwardForItsSavedRecord() async throws {
-    // The default: quitting keeps local sessions running.
+    // A quit answered Keep Running (or one that asked nothing) keeps local
+    // sessions running.
     let harness = try PersistentHarness()
     let held = FakeHeldRequest()
     harness.fake.respond = { request, connection in

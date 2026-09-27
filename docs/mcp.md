@@ -90,8 +90,8 @@ opens again. MCP treats them like native tabs:
   ended it, and `start_process` starts it again in a new session.
 - `restart_process` ends the session and starts a new one in the same process
   (same `process_id`).
-- `close_process` ends the session, as the tab's close button does, unless
-  Cherry is set to keep local sessions running after closing a tab.
+- `close_process` ends the session, as the tab's close button does, without
+  asking (the app asks before its own close stops a program at work).
 - The process reports the program's `pid` (the host's child, never
   signalled by Cherry), port tools attribute its listeners to it, and its
   program gets `CHERRY_PROCESS_ID`, so a CherryMCP helper started inside it

@@ -14,6 +14,9 @@ final class ProjectWindowRegistry {
     private var noteStores: [String: WeakNoteStore] = [:]
     private var todoStores: [String: WeakTodoStore] = [:]
     private var chromeStates: [String: WeakChromeState] = [:]
+    /// The project windows (their repository roots) in the order they were
+    /// last active, the most recent last.
+    private var activationOrder: [String] = []
     private var activeProjectRoot: String?
     weak var activeWorkspace: TerminalWorkspace?
     weak var activeNoteStore: ProjectNoteStore?
@@ -31,6 +34,27 @@ final class ProjectWindowRegistry {
     /// it at launch (`installInstanceLockNotice`); tests leave it nil, so
     /// the app's real lock is never taken.
     private(set) var instanceLockNotice: InstanceLockNotice?
+    /// Tells the user, at launch, about this app's sessions still running
+    /// with no tab (`BackgroundSessionsNotice`). The app sets it at launch
+    /// (`installBackgroundSessionsNotice`); tests leave it nil.
+    private(set) var backgroundSessionsNotice: BackgroundSessionsNotice?
+    /// Opens a project window for a root (nil: the default project's), or
+    /// focuses the one open: Background Sessions → Open reopens a closed
+    /// window's project. The app sets it (SwiftUI's `openWindow`); tests
+    /// give their own.
+    var projectWindowOpener: (@MainActor (String?) -> Void)?
+    /// Brings a project window forward (`focus`). Tests replace it, so no
+    /// test window comes on screen or takes focus from the user's apps.
+    var bringWindowForward: @MainActor (NSWindow) -> Void = { window in
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    /// Whether a project window is on screen, not minimized: a toast about
+    /// a window that closed goes only to one the user sees. Tests replace
+    /// it, as their windows never come on screen.
+    var windowIsOnScreen: @MainActor (NSWindow) -> Bool = { window in
+        window.isVisible && !window.isMiniaturized
+    }
     /// Where each project window's frame is saved. The app sets it
     /// (`configureWindowFrames`); tests leave it nil unless they give their
     /// own, so the app's defaults are never written.
@@ -98,10 +122,45 @@ final class ProjectWindowRegistry {
     }
 
     /// A confirmed quit: saves what changed while the confirmation was up,
-    /// then closes every tab with `.appQuit`.
-    func tearDownForQuit() {
+    /// ends the sessions of tabs closed with ⌘W that ⌘Z could still bring
+    /// back (`endClosedTabsAwaitingUndo`), then closes, in every window, the
+    /// tabs whose close does what the app's exit does not
+    /// (`TerminalWorkspace.closeSessionsForQuit`): native tabs, whose
+    /// process trees are stopped, and, for `.appQuitEndingSessions`,
+    /// persistent tabs, whose sessions end. Tabs that only detach
+    /// (`.appQuit` keeps local sessions running) are left to the exit. Used
+    /// where the per-window `windowWillClose` teardown never runs; otherwise
+    /// a SIGHUP-ignoring server would outlive Cherry. Returns whether a
+    /// native tab's busy program was stopped.
+    @discardableResult
+    func tearDownForQuit(intent: SessionCloseIntent = .appQuit) -> Bool {
+        // A copy of the app launched while this quit waits waits for it,
+        // even with no project window open (each repository marks it too).
+        workspaceStateStore?.noteAppQuitting()
         prepareForTermination()
-        closeAllWorkspaces(intent: .appQuit)
+        pruneStaleWindows()
+        // Tabs closed while their close could still be undone end now,
+        // whatever the quit does with the others.
+        endClosedTabsAwaitingUndo()
+        var stoppedNativeProgram = false
+        // Repositories first: they stop saving before their workspaces empty,
+        // and they own worktree workspaces `allWorkspaces()` cannot see yet.
+        for repository in repositories.values.compactMap(\.repository) {
+            stoppedNativeProgram = repository.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
+        }
+        for workspace in allWorkspaces() {
+            stoppedNativeProgram = workspace.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
+        }
+        return stoppedNativeProgram
+    }
+
+    /// Every window's closed tabs that ⌘Z could still bring back go now,
+    /// and those closed with ⌘W end (`ClosedTabHistory.endAll`).
+    func endClosedTabsAwaitingUndo() {
+        pruneStaleWindows()
+        for chromeState in chromeStates.values.compactMap(\.chromeState) {
+            chromeState.closedTabs.endAll()
+        }
     }
 
     private func saveOpenWindowRootsIfChanged(synchronously: Bool = false) {
@@ -125,6 +184,14 @@ final class ProjectWindowRegistry {
         if let window = firstRegisteredProjectWindow() {
             notice.projectWindowDidRegister(window)
         }
+    }
+
+    /// Offers `notice` every project window that registers from now on
+    /// (once: a later call keeps the first). It checks once the launch's
+    /// windows opened (`BackgroundSessionsNotice.launchWindowsOpened`).
+    func installBackgroundSessionsNotice(_ notice: BackgroundSessionsNotice) {
+        guard backgroundSessionsNotice == nil else { return }
+        backgroundSessionsNotice = notice
     }
 
     /// Test seam: saves window changes to `store`, or stops saving them.
@@ -165,28 +232,32 @@ final class ProjectWindowRegistry {
         return repositoryWorkspaces + legacyWorkspaces
     }
 
-    /// Total sessions running a process across all windows that quitting
-    /// would end — drives the quit confirmation. Persistent tabs whose
-    /// sessions a quit keeps (Settings › Sessions) are not counted.
+    /// Total sessions running a process across all windows that closing
+    /// everything with `intent` would end: native tabs, and persistent tabs
+    /// only when `intent` ends their sessions (a quit keeps them by default).
     func runningProcessCount(endingWith intent: SessionCloseIntent = .appQuit) -> Int {
         allWorkspaces().reduce(0) { $0 + $1.sessionsWithRunningProcess(endingWith: intent).count }
     }
 
-    /// Persistent tabs across all windows whose sessions quitting ends
-    /// (Settings › Sessions › End sessions when quitting), running or not.
-    func persistentSessionCountEndedByQuit() -> Int {
-        allWorkspaces().reduce(0) { $0 + $1.persistentSessionsEnded(by: .appQuit).count }
-    }
-
-    /// Tear down every workspace's sessions (killing their processes). Used on
-    /// confirmed app quit, where the per-window `windowWillClose` teardown never
-    /// runs — otherwise a SIGHUP-ignoring server would outlive Cherry.
-    func closeAllWorkspaces(intent: SessionCloseIntent) {
+    /// What quitting would do across every window
+    /// (`RepositoryWorkspace.teardownSummary`), over the workspaces
+    /// `tearDownForQuit` closes; each session is placed by its project.
+    func teardownSummary(pathDisplayMode: SidebarTerminalPathDisplayMode) -> SessionTeardownSummary {
         pruneStaleWindows()
-        // Repositories first: they stop saving before their workspaces empty,
-        // and they own worktree workspaces `allWorkspaces()` cannot see yet.
-        repositories.values.compactMap(\.repository).forEach { $0.closeAllSessions(intent: intent) }
-        allWorkspaces().forEach { $0.closeAllSessions(intent: intent) }
+        let repositorySummary = repositories.values.compactMap(\.repository).reduce(SessionTeardownSummary()) {
+            $0 + $1.teardownSummary(.quit, pathDisplayMode: pathDisplayMode)
+        }
+        // Windows without a repository.
+        let others = workspaces.compactMap { root, entry in
+            repositories[root]?.repository == nil ? entry.workspace : nil
+        }
+        return others.reduce(repositorySummary) { summary, workspace in
+            summary + workspace.teardownSummary(
+                .quit,
+                place: workspace.projectRoot.map(MenuBarAgentPresentation.projectName(projectRoot:)),
+                pathDisplayMode: pathDisplayMode
+            )
+        }
     }
 
     /// Live workspaces paired with the project-root key they're registered under —
@@ -210,6 +281,122 @@ final class ProjectWindowRegistry {
         else { return }
         workspace.select(session)
         chromeState(for: owningRoot)?.selectTerminal()
+    }
+
+    // MARK: Background sessions
+
+    /// The repository of every open project window.
+    var allRepositories: [RepositoryWorkspace] {
+        pruneStaleWindows()
+        return repositories.values.compactMap(\.repository)
+    }
+
+    /// Saved tabs the open windows may still restore
+    /// (`RepositoryWorkspace.savedRecordsAwaitingRestore`).
+    func sessionRecordsAwaitingRestore() -> [WorkspaceSessionRecord] {
+        allRepositories.flatMap { $0.savedRecordsAwaitingRestore() }
+    }
+
+    /// The repository of the project window for `projectRoot` once it has
+    /// registered, polling, or nil after `timeout`.
+    func waitForRepository(projectRoot: String, timeout: Duration = .seconds(10)) async -> RepositoryWorkspace? {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if let repository = repository(for: projectRoot) { return repository }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return repository(for: projectRoot)
+    }
+
+    /// Background Sessions → Open: shows a session of this app that no open
+    /// tab shows. Its project (`cherry.project`, a worktree) names the
+    /// window: the open one, or else the project's window is opened, and its
+    /// restore brings a closed window's session back with its sibling tabs
+    /// and layout. Once that window's restore and look for orphaned
+    /// sessions are done, the session's tab is revealed: the one that shows
+    /// it now, or else it is adopted into that worktree
+    /// (`RepositoryWorkspace.showBackgroundSession`). A session with no
+    /// project, or whose window does not open, goes to the active window.
+    func showBackgroundSession(
+        _ info: HostedSessionInfo,
+        localSessions: PersistentLocalSessions,
+        attachedTabs: OpenHostedTabs = .shared,
+        restoreWait: Duration = .seconds(10)
+    ) async {
+        let worktree = OrphanedSessionCriteria.projectRoot(of: info)
+        var repository = worktree.flatMap { repository(for: $0) }
+        if repository == nil, let worktree,
+           let root = AgentSettings.shared.repositoryRoot(for: worktree), let opener = projectWindowOpener {
+            opener(root)
+            repository = await waitForRepository(projectRoot: root)
+        }
+        if repository == nil {
+            repository = activeProjectRoot.flatMap { self.repository(for: $0) } ?? allRepositories.first
+        }
+        if repository == nil, let opener = projectWindowOpener {
+            opener(nil)
+            let deadline = ContinuousClock.now + .seconds(10)
+            while allRepositories.isEmpty, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            repository = allRepositories.first
+        }
+        guard let repository else { return }
+        _ = focus(projectRoot: worktree.flatMap { repository.contains(worktreeRoot: $0) ? $0 : nil } ?? repository.repositoryRoot)
+        await repository.waitUntilSessionsRestored(before: ContinuousClock.now + restoreWait)
+
+        let hostID = localSessions.control.hostID
+        if let shown = localSessions.owningTab(of: info.id)
+            ?? hostID.flatMap({ attachedTabs.tab(showingSession: info.id, hostID: $0) }) {
+            reveal(shown, repository: repository)
+            return
+        }
+        if localSessions.attachment(for: info) == nil {
+            _ = try? await localSessions.control.connect()
+        }
+        // Gone meanwhile, or going: the window's restore removes it (a
+        // shell that exited cleanly), or End ended it while this waited.
+        guard let current = localSessions.sessionInfo(info.id),
+              let attachment = localSessions.attachment(for: current),
+              !localSessions.isEnding(current.id),
+              !localSessions.isScheduledToEnd(current, hostID: attachment.hostID),
+              let tab = repository.showBackgroundSession(
+                PersistentSessionLaunch(attachment: attachment, info: current),
+                worktreeRoot: worktree,
+                hosting: localSessions
+              )
+        else { return }
+        reveal(tab, repository: repository)
+    }
+
+    /// The workspace of `worktreeRoot` in its project window, which is
+    /// opened again (`projectWindowOpener`) when it closed, then given the
+    /// time its restore takes: where a toast's Reopen attaches a session
+    /// again after its tab closed, perhaps with its window. nil when no
+    /// window shows or opens for it.
+    func workspaceOpeningWindow(
+        worktreeRoot: String,
+        restoreWait: Duration = .seconds(10)
+    ) async -> TerminalWorkspace? {
+        if let repository = repository(for: worktreeRoot) {
+            return repository.prepareWorkspace(worktreeRoot: worktreeRoot) ?? repository.activeWorkspace
+        }
+        if let workspace = workspace(for: worktreeRoot) {
+            return workspace
+        }
+        guard let root = AgentSettings.shared.repositoryRoot(for: worktreeRoot), let opener = projectWindowOpener else {
+            return nil
+        }
+        opener(root)
+        guard let repository = await waitForRepository(projectRoot: root) else { return nil }
+        await repository.waitUntilSessionsRestored(before: ContinuousClock.now + restoreWait)
+        return repository.prepareWorkspace(worktreeRoot: worktreeRoot) ?? repository.activeWorkspace
+    }
+
+    /// Focuses the window and worktree that has `tab`, and selects it.
+    private func reveal(_ tab: TerminalSession, repository: RepositoryWorkspace) {
+        let root = projectRoot(containing: tab.id) ?? repository.repositoryRoot
+        revealSession(id: tab.id, projectRoot: root)
     }
 
     var projectRoots: [String] {
@@ -298,6 +485,36 @@ final class ProjectWindowRegistry {
         return windows[projectRoot]?.window
     }
 
+    /// The repository of the window `chromeState` belongs to.
+    func repository(for chromeState: ProjectWindowChromeState) -> RepositoryWorkspace? {
+        pruneStaleWindows()
+        guard let projectRoot = chromeStates.first(where: { _, weakState in
+            weakState.chromeState === chromeState
+        })?.key else { return nil }
+        return repositories[projectRoot]?.repository
+    }
+
+    /// A project window on screen (`windowIsOnScreen`) other than `window`
+    /// (and the one `chromeState` belongs to), the one active most recently
+    /// first: where a toast goes about a tab whose window closed with it.
+    /// Its workspace is its repository's active one.
+    func mostRecentlyActiveProjectWindow(
+        excluding window: NSWindow?,
+        chromeState excludedChromeState: ProjectWindowChromeState?
+    ) -> (chromeState: ProjectWindowChromeState, workspace: TerminalWorkspace, repository: RepositoryWorkspace?)? {
+        pruneStaleWindows()
+        let roots = activationOrder.reversed() + windows.keys.sorted()
+        for root in roots {
+            guard let candidate = windows[root]?.window, candidate !== window, windowIsOnScreen(candidate),
+                  let chromeState = chromeStates[root]?.chromeState, chromeState !== excludedChromeState,
+                  let workspace = workspaces[root]?.workspace
+            else { continue }
+            let repository = repositories[root]?.repository
+            return (chromeState, repository?.activeWorkspace ?? workspace, repository)
+        }
+        return nil
+    }
+
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
         return noteStores[repositoryRoot(for: projectRoot)]?.noteStore
@@ -311,6 +528,13 @@ final class ProjectWindowRegistry {
     func chromeState(for projectRoot: String) -> ProjectWindowChromeState? {
         pruneStaleWindows()
         return chromeStates[repositoryRoot(for: projectRoot)]?.chromeState
+    }
+
+    /// The chrome state of the project window `window`: where a notice
+    /// about it shows its toast.
+    func chromeState(for window: NSWindow) -> ProjectWindowChromeState? {
+        pruneStaleWindows()
+        return projectRoot(for: window).flatMap { chromeStates[$0]?.chromeState }
     }
 
     @discardableResult
@@ -350,6 +574,7 @@ final class ProjectWindowRegistry {
         workspaces[projectRoot] = WeakWorkspace(workspace)
         if let repository {
             repositories[projectRoot] = WeakRepositoryWorkspace(repository)
+            repository.windowRegistry = self
             updateWorktreeMappings(repositoryRoot: projectRoot, repository: repository)
         }
         if let noteStore {
@@ -373,6 +598,7 @@ final class ProjectWindowRegistry {
         }
         saveOpenWindowRootsIfChanged()
         instanceLockNotice?.projectWindowDidRegister(window)
+        backgroundSessionsNotice?.projectWindowDidRegister(window)
         return true
     }
 
@@ -401,6 +627,7 @@ final class ProjectWindowRegistry {
         noteStores.removeValue(forKey: projectRoot)
         todoStores.removeValue(forKey: projectRoot)
         chromeStates.removeValue(forKey: projectRoot)
+        activationOrder.removeAll { $0 == projectRoot }
         saveOpenWindowRootsIfChanged()
         if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
             activeProjectRoot = nil
@@ -449,8 +676,7 @@ final class ProjectWindowRegistry {
         } else {
             AgentSettings.shared.markProjectOpened(repositoryRoot)
         }
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        bringWindowForward(window)
         return true
     }
 
@@ -629,6 +855,9 @@ final class ProjectWindowRegistry {
         recordsOpening: Bool = true
     ) {
         let effectiveRoot = workspace.projectRoot ?? projectRoot
+        let windowRoot = repositoryRoot(for: projectRoot)
+        activationOrder.removeAll { $0 == windowRoot }
+        activationOrder.append(windowRoot)
         activeProjectRoot = effectiveRoot
         activeWorkspace = workspace
         activeNoteStore = noteStore
@@ -760,6 +989,7 @@ final class ProjectWindowRegistry {
             todoStores.removeValue(forKey: projectRoot)
             chromeStates.removeValue(forKey: projectRoot)
             windowFrameSavers.removeValue(forKey: projectRoot)
+            activationOrder.removeAll { $0 == projectRoot }
             if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
                 activeProjectRoot = nil
                 activeWorkspace = nil
@@ -877,12 +1107,18 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
     @Published var collapsedAgentGroupIDs: Set<UUID> = []
-    @Published var pendingAgentCloseSessionID: UUID?
-    @Published var pendingAgentCloseAllowsEmptyWorkspace = false
+    /// A close waiting for "Close “<name>”?" (`TabCloseAlertPresenterView`).
+    @Published var pendingTabClose: TabCloseRequest?
     @Published var pendingAgentGroupCloseSessionID: UUID?
     @Published var pendingAgentGroupCloseAllowsEmptyWorkspace = false
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
+    /// The window's toast (`ProjectWindowToastOverlay`): observed on its
+    /// own, so a toast coming and going does not re-render the window.
+    let toasts: ProjectWindowToasts
+    /// The tabs a user's close or detach took out of the window that ⌘Z can
+    /// bring back (`ClosedTabHistory`), on the toasts' clock.
+    let closedTabs: ClosedTabHistory
     // Mirrored from ProjectWorkspaceView's scene-scoped sidebar width so the
     // terminal container can predict its post-animation width without
     // reading the AppKit window directly.
@@ -910,6 +1146,17 @@ final class ProjectWindowChromeState: ObservableObject {
 
     /// Test seam for `isCursorActuallyOverLeadingSidebar(width:)`.
     var cursorOverSidebarProbeForTesting: ((CGFloat) -> Bool)?
+
+    /// Tests give toasts a clock and announcer of their own, which the
+    /// closed tabs share.
+    init(toasts: ProjectWindowToasts = ProjectWindowToasts()) {
+        self.toasts = toasts
+        let closedTabs = ClosedTabHistory(clockOf: toasts)
+        self.closedTabs = closedTabs
+        closedTabs.chromeState = self
+        closedTabs.dismissToast = { [weak toasts] id in toasts?.dismiss(id: id) }
+        toasts.hoverDidChange = { [weak closedTabs] id in closedTabs?.setHoveredToast(id) }
+    }
 
     /// Hit-test the real mouse position against the leading sidebar region
     /// of this state's window. The `isCursorOverSidebar` /
@@ -1056,9 +1303,18 @@ final class ProjectWindowChromeState: ObservableObject {
         pendingAgentGroupCloseSessionID = sessionID
     }
 
-    func requestAgentClose(sessionID: UUID, allowEmptyWorkspace: Bool = false) {
-        pendingAgentCloseAllowsEmptyWorkspace = allowEmptyWorkspace
-        pendingAgentCloseSessionID = sessionID
+    /// Asks "Close “<name>”?" before `request`'s close stops its program
+    /// (`SessionCloseCoordinator.close`).
+    func requestTabClose(_ request: TabCloseRequest) {
+        pendingTabClose = request
+    }
+
+    /// A tab close's question is up, unanswered: "Close “<name>”?" or
+    /// "Close Agent Group?". Its answer may detach or end the sessions a
+    /// quit's question would list, so a quit waits for it
+    /// (`ProjectWindowCloseDelegate.windowAskingToClose`).
+    var isAskingToCloseTabs: Bool {
+        pendingTabClose != nil || pendingAgentGroupCloseSessionID != nil
     }
 
     func focusIdleCommand(name: String) {
@@ -1204,6 +1460,7 @@ private final class ProjectWindowBinderView: NSView {
         closeDelegate?.projectRoot = projectRoot
         closeDelegate?.workspace = workspace
         closeDelegate?.repository = repository
+        closeDelegate?.chromeState = chromeState
     }
 
     private func installObserver() {
@@ -1258,18 +1515,97 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     weak var window: NSWindow?
     weak var workspace: TerminalWorkspace?
     weak var repository: RepositoryWorkspace?
+    /// The window's chrome: its closed tabs end with it, and Edit › Undo
+    /// acts on them.
+    weak var chromeState: ProjectWindowChromeState?
     weak var previousDelegate: NSWindowDelegate?
     var projectRoot: String?
+    /// The window's own undo manager, for its text views' typing, in place
+    /// of the one AppKit would make for the window: once this delegate
+    /// answers `windowWillReturnUndoManager`, AppKit asks it every time.
+    private lazy var textUndoManager = UndoManager()
     private var isCloseConfirmed = false
-    private var isPresentingCloseAlert = false
+    /// Its close question ("Keep N sessions running…?" or "Close window?")
+    /// is on screen, unanswered.
+    private(set) var isPresentingCloseAlert = false
     private var shouldCloseAfterSheetEnds = false
     private var closeAfterSheetDetachesTask: Task<Void, Never>?
     private var didCloseWorkspace = false
+    /// Whether the window's tabs close keeping their local sessions or
+    /// ending them, as its confirmation (or the preference) decided.
+    private var closeIntent: SessionCloseIntent?
+    /// Its sessions question was answered Keep Running.
+    private var answeredKeepRunning = false
+
+    /// The window's running sessions (their host session ids) that its
+    /// close keeps in the background because the user chose so: Keep
+    /// Running in its question, or Settings › Sessions keeping them without
+    /// asking. The launch notice does not name them
+    /// (`BackgroundSessionsNotice.noteTold`). Tests replace it.
+    static var sessionsKeptInBackground: @MainActor ([String]) -> Void = { ids in
+        ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold(ids)
+    }
+
+    /// Asks about the window's running local sessions: a sheet on the
+    /// window, answered once. Tests replace it.
+    static var askAboutSessions: @MainActor (
+        SessionTeardownQuestion,
+        NSWindow,
+        @escaping @MainActor (SessionTeardownAnswer, LocalSessionsOnQuit?) -> Void
+    ) -> Void = { question, window, answer in
+        let alert = question.makeAlert()
+        // ViewBridge loads lazily; the alert sheet may be NSRemoteView-backed.
+        RemoteViewCrashGuard.installIfNeeded()
+        alert.beginSheetModal(for: window) { response in
+            MainActor.assumeIsolated {
+                let answered = SessionTeardownQuestion.answer(of: alert, response: response)
+                answer(answered.answer, answered.remember)
+            }
+        }
+    }
+
+    /// "Close window?" for `count` busy programs the close stops, when the
+    /// sessions question does not apply: a sheet on the window. Tests
+    /// replace it.
+    static var confirmStoppingProcesses: @MainActor (
+        NSWindow,
+        Int,
+        @escaping @MainActor (NSApplication.ModalResponse) -> Void
+    ) -> Void = { window, count, answer in
+        let alert = NSAlert()
+        alert.messageText = "Close window?"
+        alert.informativeText = count == 1
+            ? "This window has a running process. It will be stopped."
+            : "This window has \(count) running processes. They will be stopped."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Stop and close")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            Task { @MainActor in answer(response) }
+        }
+    }
 
     init(window: NSWindow) {
         self.window = window
     }
 
+    /// The first of `windows` whose close question is on screen, unanswered
+    /// (`isPresentingCloseAlert`), or the question of a close of its tabs
+    /// (`ProjectWindowChromeState.isAskingToCloseTabs`): a quit waits for
+    /// its answer.
+    static func windowAskingToClose(among windows: [NSWindow]) -> NSWindow? {
+        windows.first { window in
+            guard let delegate = window.delegate as? ProjectWindowCloseDelegate else { return false }
+            return delegate.isPresentingCloseAlert || delegate.chromeState?.isAskingToCloseTabs == true
+        }
+    }
+
+    /// One confirmation at most: the question about the window's running
+    /// local sessions (Keep Running, End Sessions), which also names the
+    /// busy programs the close stops anyway, or else "Close window?" for
+    /// ANY running process the close stops (agents, live commands,
+    /// terminals executing a foreground program), or nothing. Settings ›
+    /// Sessions can keep or end sessions without asking.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard !isCloseConfirmed else { return true }
 
@@ -1277,17 +1613,46 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
             return previousWindowShouldClose(sender)
         }
 
-        // Confirm for ANY running process (agents, live commands, terminals
-        // executing a foreground program) — not just agents. (Product intent is to
-        // later narrow this back to running agents only.)
-        let runningCount = repository?.runningProcessCount(endingWith: .windowClosed)
-            ?? workspace.sessionsWithRunningProcess(endingWith: .windowClosed).count
-        guard runningCount > 0 else {
-            return previousWindowShouldClose(sender)
+        let pathDisplayMode = TerminalSettings.shared.sidebarTerminalPathDisplayMode
+        let summary = repository?.teardownSummary(.windowClose, pathDisplayMode: pathDisplayMode)
+            ?? workspace.teardownSummary(.windowClose, pathDisplayMode: pathDisplayMode)
+        let decision = SessionTeardownConfirmation.decide(
+            summary,
+            preference: workspace.backendPolicy.settings().localSessionsOnQuit,
+            mayAsk: true
+        )
+        switch decision {
+        case .none(let endsSessions):
+            closeIntent = SessionTeardown.windowClose.intent(endingSessions: endsSessions)
+            let shouldClose = previousWindowShouldClose(sender)
+            if !shouldClose { closeIntent = nil }
+            return shouldClose
+        case .confirmStopping(let count, let endsSessions):
+            closeIntent = SessionTeardown.windowClose.intent(endingSessions: endsSessions)
+            presentCloseAlert(for: sender, runningProcessCount: count)
+            return false
+        case .askAboutSessions:
+            let projectName = repository?.repositoryName
+                ?? workspace.projectRoot.map { URL(fileURLWithPath: $0).lastPathComponent }
+            presentSessionsQuestion(
+                SessionTeardownQuestion(teardown: .windowClose, summary: summary, projectName: projectName),
+                for: sender
+            )
+            return false
         }
+    }
 
-        presentCloseAlert(for: sender, runningProcessCount: runningCount)
-        return false
+    /// What Edit › Undo and ⌘Z act on: the window's closed tabs
+    /// (`ClosedTabUndoManager`) while no text view has the keyboard
+    /// (`ClosedTabUndoRouting`), else the window's own undo manager, as
+    /// ever, which text views' typing goes to. Never the previous
+    /// delegate's: AppKit did not ask it before either.
+    func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? {
+        if let closedTabs = chromeState?.closedTabs,
+           ClosedTabUndoRouting.actsOnClosedTabs(firstResponder: window.firstResponder) {
+            return closedTabs.undoManager
+        }
+        return textUndoManager
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -1315,28 +1680,48 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
     private func presentCloseAlert(for window: NSWindow, runningProcessCount: Int) {
         guard !isPresentingCloseAlert else { return }
         isPresentingCloseAlert = true
-
-        let alert = NSAlert()
-        alert.messageText = "Close window?"
-        alert.informativeText = runningProcessCount == 1
-            ? "This window has a running process. It will be stopped."
-            : "This window has \(runningProcessCount) running processes. They will be stopped."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Stop and close")
-        alert.addButton(withTitle: "Cancel")
-
-        alert.beginSheetModal(for: window) { [weak self, weak window] response in
-            Task { @MainActor in
-                guard let self, let window else { return }
-                self.finishCloseAlert(response: response, for: window)
-            }
+        Self.confirmStoppingProcesses(window, runningProcessCount) { [weak self, weak window] response in
+            guard let self, let window else { return }
+            self.finishCloseAlert(response: response, for: window)
         }
     }
 
     func finishCloseAlert(response: NSApplication.ModalResponse, for window: NSWindow) {
         isPresentingCloseAlert = false
-        guard response == .alertFirstButtonReturn else { return }
+        guard response == .alertFirstButtonReturn else {
+            closeIntent = nil
+            return
+        }
 
+        isCloseConfirmed = true
+        closeWorkspaceIfNeeded()
+        shouldCloseAfterSheetEnds = true
+        scheduleCloseAfterSheetDetaches(from: window)
+    }
+
+    private func presentSessionsQuestion(_ question: SessionTeardownQuestion, for window: NSWindow) {
+        guard !isPresentingCloseAlert else { return }
+        isPresentingCloseAlert = true
+        Self.askAboutSessions(question, window) { [weak self, weak window] answer, remember in
+            guard let self, let window else { return }
+            self.finishSessionsQuestion(answer, remember: remember, for: window)
+        }
+    }
+
+    /// The sessions question was answered: Keep Running or End Sessions
+    /// closes the window with that intent, as a confirmed "Close window?"
+    /// does; Cancel leaves it open. "Don't ask again" stores a Keep or End
+    /// answer as the preference. The sessions Keep Running leaves in the
+    /// background are ones the user knows about (`closeWorkspaceIfNeeded`).
+    func finishSessionsQuestion(_ answer: SessionTeardownAnswer, remember: LocalSessionsOnQuit?, for window: NSWindow) {
+        isPresentingCloseAlert = false
+        if let remember {
+            workspace?.backendPolicy.rememberLocalSessionsOnQuit(remember)
+        }
+        guard let intent = SessionTeardown.windowClose.intent(for: answer) else { return }
+        answeredKeepRunning = answer == .keep
+
+        closeIntent = intent
         isCloseConfirmed = true
         closeWorkspaceIfNeeded()
         shouldCloseAfterSheetEnds = true
@@ -1374,15 +1759,59 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         }
     }
 
+    /// Takes a window whose close was decided off screen at once, before
+    /// its tabs are torn down (`closeWorkspaceIfNeeded`), which takes a
+    /// while: each tab's adapter or program stops and its surface is freed
+    /// (about 20 ms a tab). A window whose close question is still going
+    /// away (its sheet is attached) is made transparent instead, as
+    /// ordering it out under the sheet would leave the sheet to AppKit; it
+    /// closes once the sheet detached (`scheduleCloseAfterSheetDetaches`).
+    /// Tests replace it.
+    static var takeOffScreen: @MainActor (NSWindow) -> Void = { window in
+        window.animationBehavior = .none
+        if window.attachedSheet == nil {
+            window.orderOut(nil)
+        } else {
+            window.alphaValue = 0
+            window.ignoresMouseEvents = true
+        }
+        // Hands it to the window server now, before the teardown holds the
+        // main thread.
+        CATransaction.flush()
+    }
+
+    /// Closes the window's tabs with the intent its confirmation decided,
+    /// once the window left the screen (`takeOffScreen`). A window closed
+    /// without it (`window.close()`) follows the preference, and keeps
+    /// sessions when it would ask. Sessions it keeps because the user chose
+    /// so (Keep Running, or the preference keeping them) are ones the user
+    /// knows about (`sessionsKeptInBackground`); those kept only because
+    /// nothing asked are not. Tabs closed earlier that ⌘Z could still bring
+    /// back go with the window: those closed with ⌘W end
+    /// (`ClosedTabHistory.endAll`).
     private func closeWorkspaceIfNeeded() {
         guard !didCloseWorkspace else { return }
         didCloseWorkspace = true
+        if let window {
+            Self.takeOffScreen(window)
+        }
+        chromeState?.closedTabs.endAll()
+        let preference = workspace?.backendPolicy.settings().localSessionsOnQuit
+        let intent = closeIntent ?? SessionTeardown.windowClose.intent(endingSessions: preference == .end)
+        if intent == .windowClosed, answeredKeepRunning || preference == .keep {
+            // Read before the tabs close: a Create under way when the
+            // question was asked may have answered since.
+            let summary = repository?.teardownSummary(.windowClose, pathDisplayMode: .fullPath)
+                ?? workspace?.teardownSummary(.windowClose, pathDisplayMode: .fullPath)
+            let kept = summary?.runningSessions.compactMap(\.hostSessionID) ?? []
+            if !kept.isEmpty { Self.sessionsKeptInBackground(kept) }
+        }
         if let repository {
             // Save the tabs as they are; the teardown itself saves nothing.
             repository.flushPersistentState()
-            repository.closeAllSessions(intent: .windowClosed)
+            repository.closeAllSessions(intent: intent)
         } else {
-            workspace?.closeAllSessions(intent: .windowClosed)
+            workspace?.closeAllSessions(intent: intent)
         }
     }
 

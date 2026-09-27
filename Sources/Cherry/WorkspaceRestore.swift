@@ -353,7 +353,8 @@ private final class ControlPlaneRestore {
                 owns = true
             } else if binding.hostID == list.hostID,
                       let listed = list.sessions.first(where: { $0.id == binding.sessionID }),
-                      !claimed.contains(Self.key(hostID: list.hostID, sessionID: listed.id)) {
+                      !claimed.contains(Self.key(hostID: list.hostID, sessionID: listed.id)),
+                      !isBeingEnded(listed, hostID: list.hostID) {
                 info = listed
                 owns = WorkspaceSessionRestorers.restoresOwning(record, binding: binding, info: listed, owner: localSessions.owner)
             } else if let tagged = taggedSession(for: record.id, in: list) {
@@ -363,7 +364,8 @@ private final class ControlPlaneRestore {
             guard let info else {
                 // Not listed by the host it was saved on: looked for again
                 // (a restarted daemon may not list it yet). A host with
-                // another identity (its state was reset) never will.
+                // another identity (its state was reset) never will. One
+                // listed but being ended is gone already: dropped.
                 if binding.hostID == list.hostID, !list.sessions.contains(where: { $0.id == binding.sessionID }) {
                     missing.append(record)
                 }
@@ -422,6 +424,14 @@ private final class ControlPlaneRestore {
         }
         claimed.insert(Self.key(hostID: listing.list.hostID, sessionID: info.id))
         let attachment = listing.attachment(info)
+        if owning, record.kind == .terminal, PersistentLocalSessions.endedCleanly(info),
+           request.workspace.backendPolicy.settings().closeTabsOnCleanExit {
+            // A terminal whose shell exited with status 0 while Cherry was
+            // closed would have closed its tab: it is not brought back (the
+            // record is dropped), and its ended session is removed.
+            localSessions.end(attachment)
+            return nil
+        }
         if owning {
             return built(request.workspace.makeRestoredPersistentSession(
                 PersistentSessionLaunch(attachment: attachment, info: info),
@@ -439,6 +449,13 @@ private final class ControlPlaneRestore {
         ))
     }
 
+    /// Whether this app is ending the session (Background Sessions → End,
+    /// a close that ended it, a removed worktree's tabs): a tab restored for
+    /// it would outlive it, so it counts as gone.
+    private func isBeingEnded(_ info: HostedSessionInfo, hostID: String) -> Bool {
+        localSessions.isEnding(info.id) || localSessions.isScheduledToEnd(info, hostID: hostID)
+    }
+
     /// The session the record's saved Create started (`launchRequestID`),
     /// when this app created it and nothing shows it as its own yet.
     private func launchedSession(for record: WorkspaceSessionRecord, in list: HostedSessionList) -> HostedSessionInfo? {
@@ -447,6 +464,7 @@ private final class ControlPlaneRestore {
             PersistentLocalSessions.isLaunched(info, byRequest: requestID, owner: localSessions.owner)
                 && !claimed.contains(Self.key(hostID: list.hostID, sessionID: info.id))
                 && localSessions.owningTab(of: info.id) == nil
+                && !isBeingEnded(info, hostID: list.hostID)
         }
     }
 
@@ -459,6 +477,7 @@ private final class ControlPlaneRestore {
                 PersistentLocalSessions.tabID(of: info, owner: localSessions.owner) == tabID
                     && !claimed.contains(Self.key(hostID: list.hostID, sessionID: info.id))
                     && localSessions.owningTab(of: info.id) == nil
+                    && !isBeingEnded(info, hostID: list.hostID)
             }
             .max { lhs, rhs in
                 if lhs.isRunning != rhs.isRunning { return !lhs.isRunning }
@@ -594,6 +613,17 @@ final class OpenHostedTabs {
 
     func hasOpenTab(withID id: UUID) -> Bool {
         tabs.values.contains { $0.session?.id == id }
+    }
+
+    /// The open tab attached to this session of the host `hostID`.
+    func tab(showingSession sessionID: String, hostID: String) -> TerminalSession? {
+        tabs.values.lazy.compactMap(\.session).first { tab in
+            tab.hostedAttachment?.hostID == hostID && tab.hostedAttachment?.sessionID == sessionID
+        }
+    }
+
+    func showsSession(hostID: String, sessionID: String) -> Bool {
+        tab(showingSession: sessionID, hostID: hostID) != nil
     }
 }
 

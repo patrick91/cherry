@@ -244,6 +244,16 @@ final class PersistentLocalSessions {
         init(_ session: TerminalSession) { self.session = session }
     }
 
+    /// A session whose tab a user closed (⌘W) while that close can still be
+    /// undone (`deferEnd`), and how it ends once it cannot.
+    private struct DeferredEnd {
+        /// The tab as saved, recorded as a session to end (`SessionsToEndRecord`).
+        let record: WorkspaceSessionRecord
+        let store: WorkspaceStateStore?
+        /// The tab's usual end (`SessionBackendPolicy.terminateHostedSession`).
+        let end: @MainActor () -> Void
+    }
+
     /// Tabs by the host session their program runs in, while it runs: they
     /// follow its events.
     private var boundTabs: [String: WeakTab] = [:]
@@ -254,9 +264,15 @@ final class PersistentLocalSessions {
     private var creatingCount = 0
     /// Sessions being ended, by session id.
     private var endings: [String: Task<Void, Never>] = [:]
+    /// Sessions whose end waits for their tab's close to be undone or not
+    /// (`deferEnd`), by session id.
+    private var deferredEnds: [String: DeferredEnd] = [:]
     /// Searches for the sessions of forgotten saved tabs under way
     /// (`endSessions(ofForgottenTabs:)`): they keep the connection up.
     private var forgottenTabSearches = 0
+    /// The saved tabs each of those searches ends the sessions of, until it
+    /// ends (`isScheduledToEnd`).
+    private var forgottenTabTargets: [UUID: [WorkspaceSessionRecord]] = [:]
     /// Stores whose sessions to end an earlier run left were taken up in
     /// this run (`resumeEndingSessions(recordedIn:)`).
     private var resumedSessionsToEnd: Set<ObjectIdentifier> = []
@@ -657,6 +673,8 @@ final class PersistentLocalSessions {
         // no helper): a copy that can will end them.
         guard installationProblem() == nil else { return }
         forgottenTabSearches += 1
+        let search = UUID()
+        forgottenTabTargets[search] = targets
         updateLease()
         let deadline = ContinuousClock.now + configuration.forgottenTabsWindow
         let ids = Set(targets.map(\.id))
@@ -680,6 +698,7 @@ final class PersistentLocalSessions {
             }
             guard let self else { return }
             forgottenTabSearches -= 1
+            forgottenTabTargets[search] = nil
             updateLease()
         }
     }
@@ -690,19 +709,42 @@ final class PersistentLocalSessions {
         let listing = listing(of: list)
         var endings: [Task<Void, Never>] = []
         for info in list.sessions where info.owner == owner && owningTab(of: info.id) == nil {
-            let named = records.contains { record in
-                if let binding = record.hosted, binding.owned == true,
-                   binding.hostID == list.hostID, binding.sessionID == info.id {
-                    return true
-                }
-                if let requestID = record.launchRequestID, Self.isLaunched(info, byRequest: requestID, owner: owner) {
-                    return true
-                }
-                return Self.tabID(of: info, owner: owner) == record.id
-            }
+            let named = records.contains { Self.record($0, names: info, hostID: list.hostID, owner: owner) }
             if named { endings.append(end(listing.attachment(info))) }
         }
         return endings
+    }
+
+    /// Whether a search for the sessions of forgotten saved tabs under way
+    /// will end this session (`endSessions(ofForgottenTabs:)`): the
+    /// Background Sessions list leaves it out meanwhile.
+    func isScheduledToEnd(_ info: HostedSessionInfo, hostID: String) -> Bool {
+        guard info.owner == owner, owningTab(of: info.id) == nil else { return false }
+        return forgottenTabTargets.values.contains { records in
+            records.contains { Self.record($0, names: info, hostID: hostID, owner: owner) }
+        }
+    }
+
+    /// Whether a saved tab names this session of `owner`'s on the local
+    /// host `hostID`: its binding when it owned the session (`owned`), or
+    /// any binding with `includingAttached`; the session its saved Create
+    /// started (`launchRequestID`); or one tagged with its tab id.
+    nonisolated static func record(
+        _ record: WorkspaceSessionRecord,
+        names info: HostedSessionInfo,
+        hostID: String,
+        owner: String,
+        includingAttached: Bool = false
+    ) -> Bool {
+        if let binding = record.hosted, binding.host == HostedSessionHost.local.id,
+           includingAttached || binding.owned == true,
+           binding.hostID == hostID, binding.sessionID == info.id {
+            return true
+        }
+        if let requestID = record.launchRequestID, isLaunched(info, byRequest: requestID, owner: owner) {
+            return true
+        }
+        return tabID(of: info, owner: owner) == record.id
     }
 
     // MARK: Tabs and their sessions
@@ -735,12 +777,33 @@ final class PersistentLocalSessions {
         openTabs.values.contains { $0.session?.id == id }
     }
 
+    /// Whether an open tab, in any window, shows this session of the local
+    /// host `hostID` or is about to: the tab that owns it, a tab attached to
+    /// it (`attachedTabs`), the tab it was started for (`cherry.tab`), or a
+    /// tab whose Create or restart started it and has not answered yet (its
+    /// `persistentLaunchRequestID`). Anything else of this app's is in the
+    /// background (`BackgroundSessions`).
+    func isShownByOpenTab(_ info: HostedSessionInfo, hostID: String, attachedTabs: OpenHostedTabs = .shared) -> Bool {
+        if owningTab(of: info.id) != nil || attachedTabs.showsSession(hostID: hostID, sessionID: info.id) {
+            return true
+        }
+        if let tabID = Self.tabID(of: info, owner: owner),
+           hasOpenTab(withID: tabID) || attachedTabs.hasOpenTab(withID: tabID) {
+            return true
+        }
+        guard info.owner == owner, let launchID = Self.launchRequestID(of: info) else { return false }
+        return openTabs.values.contains { $0.session?.persistentLaunchRequestID == launchID }
+    }
+
     /// Whether a tab of this app may own `info`'s session (Persistent
     /// Sessions → Attach): this app variant created it, no client is
-    /// attached to it (another terminal or app may be showing it), and no
-    /// open tab owns it. Anything else is attached without owning it.
+    /// attached to it (another terminal or app may be showing it), no open
+    /// tab owns it, and it is not being ended, now or once its tab's close
+    /// can no longer be undone (a tab would outlive it). Anything else is
+    /// attached without owning it.
     func canAdopt(_ info: HostedSessionInfo) -> Bool {
         instanceUnavailableReason == nil && info.owner == owner && info.clients == 0 && owningTab(of: info.id) == nil
+            && !isEnding(info.id)
     }
 
     /// Follows the session for `session`: its exit, pid and removal. Only
@@ -850,15 +913,90 @@ final class PersistentLocalSessions {
             updateLease()
         }
         endings[binding.sessionID] = task
+        // Ended before its undo window ran out: it waits no more.
+        if let deferred = deferredEnds.removeValue(forKey: binding.sessionID) {
+            forgetRecord(of: deferred, sessionID: binding.sessionID)
+        }
         updateLease()
         return task
     }
 
     var hasPendingEnds: Bool { !endings.isEmpty }
 
-    /// Whether the session is being ended.
+    /// Whether the session is being ended, or will be once its tab's close
+    /// can no longer be undone (`deferEnd`).
     func isEnding(_ sessionID: String) -> Bool {
-        endings[sessionID] != nil
+        endings[sessionID] != nil || deferredEnds[sessionID] != nil
+    }
+
+    // MARK: Ends that wait for an undo
+
+    /// A user closed the tab of `sessionID` (⌘W), and may still undo that
+    /// (`ClosedTabHistory`): the session runs on until `endDeferred` ends it
+    /// with `end` (the tab's usual end), once the undo window ran out, its
+    /// window closed or Cherry quits, or `resumeDeferred` gives it back to
+    /// the tab that comes back. Meanwhile it counts as being ended
+    /// (`isEnding`): Background Sessions, the launch notice, orphan adoption
+    /// and Persistent Sessions → Attach leave it alone. The connection to
+    /// the host stays up. The tab is first recorded in `store` as a session
+    /// to end (`SessionsToEndRecord`), so a launch after Cherry exited
+    /// before ending it ends it (`resumeEndingSessions(recordedIn:)`).
+    func deferEnd(
+        ofSession sessionID: String,
+        record: WorkspaceSessionRecord,
+        recordedIn store: WorkspaceStateStore?,
+        end: @escaping @MainActor () -> Void
+    ) {
+        guard instanceUnavailableReason == nil, endings[sessionID] == nil else {
+            end()
+            return
+        }
+        store?.addSessionsToEnd([record])
+        deferredEnds[sessionID] = DeferredEnd(record: record, store: store, end: end)
+        updateLease()
+    }
+
+    /// Whether some session's end waits for an undo: a quit ends them first.
+    var hasDeferredEnds: Bool { !deferredEnds.isEmpty }
+
+    /// Ends a session whose end waited for an undo, now; nothing when it no
+    /// longer waits. Its record leaves the store once the host no longer
+    /// lists it (else the next launch ends it).
+    func endDeferred(_ sessionID: String) {
+        guard let deferred = deferredEnds.removeValue(forKey: sessionID) else { return }
+        deferred.end()
+        updateLease()
+        forgetRecord(of: deferred, sessionID: sessionID)
+    }
+
+    /// Ends every session whose end waits for an undo (a quit).
+    func endAllDeferred() {
+        for sessionID in deferredEnds.keys.sorted() {
+            endDeferred(sessionID)
+        }
+    }
+
+    /// Its tab's close was undone: the session is not ended, and leaves the
+    /// sessions to end. False when its end did not wait (any more).
+    @discardableResult
+    func resumeDeferred(_ sessionID: String) -> Bool {
+        guard let deferred = deferredEnds.removeValue(forKey: sessionID) else { return false }
+        deferred.store?.removeSessionsToEnd(ids: [deferred.record.id])
+        updateLease()
+        return true
+    }
+
+    /// Drops `deferred`'s record from its store once the session's ending is
+    /// over, when the host no longer lists it.
+    private func forgetRecord(of deferred: DeferredEnd, sessionID: String) {
+        guard let store = deferred.store else { return }
+        let ending = endings[sessionID]
+        let tabID = deferred.record.id
+        Task { @MainActor [weak self] in
+            await ending?.value
+            guard let self, sessionInfo(sessionID) == nil else { return }
+            store.removeSessionsToEnd(ids: [tabID])
+        }
     }
 
     /// Waits until every session being ended is gone, or `timeout` passed.
@@ -999,8 +1137,8 @@ final class PersistentLocalSessions {
 
     private func updateLease() {
         boundTabs = boundTabs.filter { $0.value.session != nil }
-        let needed = creatingCount > 0 || !boundTabs.isEmpty || !endings.isEmpty || !inputChains.isEmpty
-            || forgottenTabSearches > 0
+        let needed = creatingCount > 0 || !boundTabs.isEmpty || !endings.isEmpty || !deferredEnds.isEmpty
+            || !inputChains.isEmpty || forgottenTabSearches > 0
         if needed, lease == nil {
             observeEvents()
             lease = control.retain()
@@ -1089,10 +1227,16 @@ final class PersistentLocalSessions {
 
     /// The status a tab reports for an exited session: its exit code, which
     /// the host sets to 128 + N after signal N.
-    static func exitStatus(of info: HostedSessionInfo) -> Int32 {
+    nonisolated static func exitStatus(of info: HostedSessionInfo) -> Int32 {
         if let exitCode = info.exitCode { return Int32(clamping: exitCode) }
         if let signal = info.exitSignal { return 128 + signal }
         return 0
+    }
+
+    /// Whether the session's program exited by itself with status 0 (not
+    /// a signal, and not an exit whose status is unknown).
+    static func endedCleanly(_ info: HostedSessionInfo) -> Bool {
+        !info.isRunning && info.exitCode == 0 && info.exitSignal == nil
     }
 
     static func tags(for request: PersistentSessionRequest, requestID: UUID) -> [String: String] {

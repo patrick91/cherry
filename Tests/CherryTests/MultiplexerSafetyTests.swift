@@ -594,7 +594,7 @@ private final class WorktreeFixture {
         session("s-orphan-server", tab: orphanCommand, project: root.path, kind: "command", command: "server",
                 createdAt: savedAt.addingTimeInterval(30)),
         // Created before the last save, which did not name it: its tab was
-        // closed on purpose ("Keep running after closing a tab").
+        // detached on purpose (⌘D).
         session("s-closed", tab: closedOnPurpose, project: root.path, createdAt: savedAt.addingTimeInterval(-60)),
         // Another project's, another app's, and one whose creation time is
         // unknown.
@@ -655,6 +655,65 @@ private final class WorktreeFixture {
     // After its default shell, which it opened at once.
     #expect(freshWorkspace.sessions.map(\.id).last == lost)
     #expect(freshWorkspace.sessions.first?.title == "Shell 1")
+}
+
+@Test @MainActor func anOrphanedTerminalThatExitedCleanlyIsRemovedNotAdopted() async throws {
+    let harness = try PersistentHarness()
+    let root = try temporaryDirectory("cherry-orphans-exited")
+    let storeDirectory = try temporaryDirectory("cherry-orphans-exited-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    let savedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let editor = record(title: "Editor", sessionID: "s-editor", root: root.path)
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [editor], selectedSessionID: editor.id)],
+        savedAt: savedAt
+    ))
+    // Opened after the last save, and the app crashed before the next;
+    // then their programs ended (or not).
+    let running = UUID()
+    let clean = UUID()
+    let failed = UUID()
+    let agent = UUID()
+    harness.fake.pendingHolders = 0
+    harness.fake.sessions = [
+        HostedSessionInfo(id: "s-editor", name: "Editor", cwd: root.path, pid: 10, owner: "CherryTests",
+                          tags: [PersistentSessionTag.tab: editor.id.uuidString]),
+        session("s-running", tab: running, project: root.path, createdAt: savedAt.addingTimeInterval(1)),
+        session("s-clean", tab: clean, project: root.path, createdAt: savedAt.addingTimeInterval(2))
+            .exited(code: 0, signal: nil),
+        session("s-failed", tab: failed, project: root.path, createdAt: savedAt.addingTimeInterval(3))
+            .exited(code: 3, signal: nil),
+        session("s-agent", tab: agent, project: root.path, kind: "agent", createdAt: savedAt.addingTimeInterval(4))
+            .exited(code: 0, signal: nil)
+    ]
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    let workspace = repository.activeWorkspace
+    #expect(await harness.fake.wait { workspace.sessions.count == 4 })
+    await repository.waitForPendingRestores()
+    try await Task.sleep(for: .milliseconds(200))
+    // The terminal whose shell exited with status 0 would have closed its
+    // tab: its session is removed instead of adopted.
+    #expect(workspace.sessions.map(\.id) == [editor.id, running, failed, agent])
+    #expect(await harness.fake.wait { harness.requestIDs("remove") == ["s-clean"] })
+    #expect(harness.fake.requests("kill").isEmpty)
+    #expect(workspace.session(withID: failed)?.persistentSessionEndedMessage == "Session ended (exit 3)")
+    #expect(workspace.session(withID: agent)?.persistentSessionEndedMessage == "Session ended (exit 0)")
 }
 
 @Test @MainActor func aNewPersistentTabIsSavedAtOnce() async throws {
@@ -778,12 +837,24 @@ private final class WorktreeFixture {
     #expect(lock.isHeld)
     defer { lock.release() }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces"), instanceLock: lock)
-    let repository = RepositoryWorkspace(projectRoot: directory.path, stateStore: store, autoStartCommands: { _ in [] })
-    repository.closeAllSessions(intent: .windowClosed)
-    #expect(try !String(contentsOf: lock.fileURL, encoding: .utf8).contains(AppInstanceLock.quittingMarker))
-    let quitting = RepositoryWorkspace(projectRoot: directory.path, stateStore: store, autoStartCommands: { _ in [] })
-    quitting.closeAllSessions(intent: .appQuit)
-    #expect(try String(contentsOf: lock.fileURL, encoding: .utf8).contains(AppInstanceLock.quittingMarker))
+    // Closing a window, keeping or ending its sessions, is no quit.
+    for intent in [SessionCloseIntent.windowClosed, .windowClosedEndingSessions] {
+        let repository = RepositoryWorkspace(projectRoot: directory.path, stateStore: store, autoStartCommands: { _ in [] })
+        repository.closeAllSessions(intent: intent)
+        #expect(try !String(contentsOf: lock.fileURL, encoding: .utf8).contains(AppInstanceLock.quittingMarker))
+    }
+    // Every quit marks it, whether it keeps sessions or ends them.
+    for intent in [SessionCloseIntent.appQuit, .appQuitEndingSessions] {
+        let marked = try temporaryDirectory("cherry-instance-quit-mark-\(intent)")
+        defer { try? FileManager.default.removeItem(at: marked) }
+        let markedLock = AppInstanceLock(fileURL: marked.appendingPathComponent("instance.lock"), applicationSupportName: "CherryTests")
+        #expect(markedLock.isHeld)
+        defer { markedLock.release() }
+        let markedStore = WorkspaceStateStore(directory: marked.appendingPathComponent("Workspaces"), instanceLock: markedLock)
+        let quitting = RepositoryWorkspace(projectRoot: marked.path, stateStore: markedStore, autoStartCommands: { _ in [] })
+        quitting.closeAllSessions(intent: intent)
+        #expect(try String(contentsOf: markedLock.fileURL, encoding: .utf8).contains(AppInstanceLock.quittingMarker))
+    }
 }
 
 @Test @MainActor func theSessionsOfForgottenTabsThisRunCouldNotEndAreEndedAtTheNextLaunch() async throws {

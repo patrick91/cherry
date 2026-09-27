@@ -86,12 +86,12 @@ public enum CherryMCPTools {
         ),
         tool(
             "list_processes",
-            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes state (launching, live, exit N, failed = the launch failed or a persistent-session tab could not attach, with failure_message saying why, or disconnected = a persistent-session tab whose attach client stopped while its hosted program may still run; it has no exit_code), agent_activity_state for agents (working, idle, permission = blocked on approval, error), uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn).",
+            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes state (launching, live, exit N, failed = the launch failed or a persistent-session tab could not attach, with failure_message saying why, or disconnected = a persistent-session tab whose attach client stopped while its hosted program may still run; it has no exit_code), agent_activity_state for agents (working, idle, permission = blocked on approval, error), uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
             properties: ["kind": string("Optional process kind filter: terminal, agent, or command.")]
         ),
         tool(
             "get_process_status",
-            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. state is launching, live, exit N, failed (the launch failed, or a persistent-session tab could not attach; failure_message says why), or disconnected (a persistent-session tab whose attach client stopped; the hosted program may still run, so there is no exit_code). For agents, agent_activity_state is working, idle, permission (blocked on approval), or error. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn).",
+            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. state is launching, live, exit N, failed (the launch failed, or a persistent-session tab could not attach; failure_message says why), or disconnected (a persistent-session tab whose attach client stopped; the hosted program may still run, so there is no exit_code). For agents, agent_activity_state is working, idle, permission (blocked on approval), or error. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
             properties: processSelectorProperties(),
             required: []
         ),
@@ -122,7 +122,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "wait_for_process_idle",
-            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval (a notification said so, or its screen shows a permission prompt) and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
+            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval (a notification said so, or its screen shows a permission prompt) and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach; a terminal whose shell exited with status 0 closes by itself, and a wait under way then still returns its last output), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
             properties: idleWaitProperties()
         ),
         tool(
@@ -153,7 +153,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "spawn_process",
-            "Create a terminal, configured agent, or trusted project command process without selecting it. For agent/command, name must match configured Cherry settings. Initial text or raw bytes are delivered once the process has started (a persistent-session tab's session may take a moment to be created); the process is created either way, and sent_bytes is 0 when its first input did not reach it.",
+            "Create a terminal, configured agent, or trusted project command process without selecting it. For agent/command, name must match configured Cherry settings. Initial text or raw bytes are delivered once the process has started (a persistent-session tab's session may take a moment to be created); the process is created either way, and sent_bytes is 0 when its first input did not reach it. A terminal whose shell exits with status 0 closes like any terminal tab.",
             properties: [
                 "kind": string("Process kind: terminal, agent, or command."),
                 "name": string("Configured agent or command name. Not used for terminal."),
@@ -201,7 +201,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "close_process",
-            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy. Closing a local persistent-session tab ends its session, as its close button does, unless Cherry is set to keep local sessions running after closing a tab. Closing a tab attached to a hosted session it does not own only disconnects it; that program keeps running on its host.",
+            "Close one process by process_id or process_name without selecting another UI pane. Parent agents with sub-agents require agent_close_policy. Closing a local persistent-session tab ends its session, as its close button does, without asking. Closing a tab attached to a hosted session it does not own only disconnects it; that program keeps running on its host.",
             properties: processSelectorProperties([
                 "agent_close_policy": string("For parent agents with sub-agents: reject, close_sub_agents, or promote_sub_agents. Defaults to reject.")
             ])

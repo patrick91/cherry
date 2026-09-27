@@ -1120,6 +1120,13 @@ final class TerminalWorkspace: ObservableObject {
     /// Launches restored tabs' attach adapters a few at a time (tests give
     /// a workspace its own).
     var restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared
+    /// Closes a terminal tab whose shell exited with status 0
+    /// (`tabProgramDidExit`). The default keeps a workspace's last tab (it
+    /// has no window to close); a project window's repository replaces it to
+    /// close the window with its last tab, as ⌘W does.
+    var closeTabAfterCleanExit: @MainActor (TerminalWorkspace, TerminalSession) -> Void = { workspace, session in
+        workspace.close(session, intent: .programExited)
+    }
 
     init(
         projectRoot: String? = nil,
@@ -1181,6 +1188,51 @@ final class TerminalWorkspace: ObservableObject {
                 self?.persistentStateChanges.send()
             }
         }
+        for session in sessions where session.programDidExit == nil {
+            session.programDidExit = { [weak self] session in
+                self?.tabProgramDidExit(session)
+            }
+        }
+    }
+
+    /// Whether `session`'s tab closes now that its program ended: a terminal
+    /// (not an attached tab) whose shell exited with status 0 after running
+    /// at least `cleanExitMinimumRunTime` (from when it started, not when
+    /// the tab asked for it: `programStartedAt`), while Settings › Sessions
+    /// closes such tabs. Command and agent tabs stay (their output is the
+    /// point), and so does a shell that failed, so its error stays readable.
+    func closesTabAfterExit(_ session: TerminalSession) -> Bool {
+        guard backendPolicy.settings().closeTabsOnCleanExit,
+              session.kind == .terminal,
+              session.hostedAttachment == nil,
+              session.state == .exited(0),
+              let startedAt = session.programStartedAt,
+              let exitedAt = session.exitedAt
+        else { return false }
+        return exitedAt.timeIntervalSince(startedAt) >= backendPolicy.cleanExitMinimumRunTime
+    }
+
+    /// A tab's program ended by itself (`TerminalSession.programDidExit`):
+    /// a terminal whose shell exited cleanly closes (`closeTabAfterCleanExit`)
+    /// on the next main-loop turn. The exit may be reported from inside
+    /// Ghostty's tick, which must not free the surface it runs for. By then
+    /// the tab may be gone, closed or running again (Restart, MCP
+    /// `start_process`); it then stays as it is.
+    private func tabProgramDidExit(_ session: TerminalSession) {
+        guard closesTabAfterExit(session) else { return }
+        let exitedAt = session.exitedAt
+        DispatchQueue.main.async { [weak self, weak session] in
+            MainActor.assumeIsolated {
+                guard let self, let session,
+                      !self.isTornDown,
+                      self.sessions.contains(where: { $0 === session }),
+                      !session.isRunning,
+                      session.exitedAt == exitedAt,
+                      self.closesTabAfterExit(session)
+                else { return }
+                self.closeTabAfterCleanExit(self, session)
+            }
+        }
     }
 
     /// `id`, unless a tab here already has it: two tabs with one id would
@@ -1218,8 +1270,9 @@ final class TerminalWorkspace: ObservableObject {
 
     /// Running tabs that closing everything for `intent` would end: native
     /// ones, and persistent ones whose close action terminates their session
-    /// (tabs that only detach keep running and are not counted). Drives the
-    /// quit, window-close and worktree-removal confirmations.
+    /// (tabs that only detach, as in a window close or quit that keeps
+    /// sessions running, are not counted). Drives the quit, window-close and
+    /// worktree-removal confirmations.
     func sessionsWithRunningProcess(endingWith intent: SessionCloseIntent) -> [TerminalSession] {
         sessions.filter { session in
             backendPolicy.closeAction(for: session, intent: intent) != .detach && session.hasRunningProcess()
@@ -1232,6 +1285,35 @@ final class TerminalWorkspace: ObservableObject {
         sessions.filter { session in
             session.isPersistentLocalSession && backendPolicy.closeAction(for: session, intent: intent) == .terminate
         }
+    }
+
+    /// What closing everything for `teardown` would do here, for its one
+    /// confirmation: the persistent tabs whose program runs (a Create under
+    /// way included), which its answer keeps running or ends, and the busy
+    /// programs it stops either way or only when it ends sessions. `place`
+    /// names this workspace in the question's list. Probes the process table
+    /// (`hasRunningProcess`), so never from a SwiftUI body.
+    func teardownSummary(
+        _ teardown: SessionTeardown,
+        place: String? = nil,
+        pathDisplayMode: SidebarTerminalPathDisplayMode
+    ) -> SessionTeardownSummary {
+        let ending = teardown.intent(endingSessions: true)
+        let running = persistentSessionsEnded(by: ending).filter(\.isProgramRunning).map { session in
+            SessionTeardownSummary.Session(
+                id: session.id,
+                hostSessionID: session.persistentSession?.sessionID,
+                title: SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode).title,
+                place: place,
+                isBusy: session.hasRunningProcess()
+            )
+        }
+        return SessionTeardownSummary(
+            runningSessions: running.filter(\.isBusy) + running.filter { !$0.isBusy },
+            persistentTabCount: persistentSessionsEnded(by: ending).count,
+            stoppedWhenKeeping: sessionsWithRunningProcess(endingWith: teardown.intent(endingSessions: false)).count,
+            stoppedWhenEnding: sessionsWithRunningProcess(endingWith: ending).count
+        )
     }
 
     var rootAgentSessions: [TerminalSession] {
@@ -2351,8 +2433,47 @@ final class TerminalWorkspace: ObservableObject {
     }
 
     /// Closes every tab. The default is a window teardown; production callers
-    /// name the intent.
+    /// name the intent. Tabs a quit's teardown left to the app's exit
+    /// (`closeSessionsForQuit`) close too.
     func closeAllSessions(intent: SessionCloseIntent = .windowClosed) {
+        let removedSessions = removeAllSessions(intent: intent) + tabsLeftToTheExit
+        tabsLeftToTheExit.removeAll()
+        leavesTabsToTheExit = false
+        removedSessions.forEach { finishClosing($0, intent: intent) }
+    }
+
+    /// A confirmed quit's teardown (`ProjectWindowRegistry.tearDownForQuit`):
+    /// every tab leaves the workspace, as in `closeAllSessions`, but only the
+    /// tabs whose close does what the app's exit does not are closed: native
+    /// tabs, whose process trees are stopped (the exit only hangs up their
+    /// terminals, which a server ignoring SIGHUP outlives), and persistent
+    /// tabs whose sessions `intent` ends. The others (persistent tabs a
+    /// quit keeping sessions leaves running, tabs attached to sessions they
+    /// do not own) are left as they are until the app exits, as a quit that
+    /// tears nothing down leaves them: their attach adapters end with the
+    /// app, their sessions run on in their holders, and their records,
+    /// saved before the teardown, bring them back. A Create under way keeps
+    /// the session it makes, which the tab's record names. Stopping each
+    /// adapter and freeing each surface would only hold the quit up (about
+    /// 20 ms a tab). Returns whether a native tab's program was busy
+    /// (`hasRunningProcess`, as the quit counted it) when it was stopped:
+    /// the quit then waits for its HUP → TERM → KILL escalation. An idle
+    /// shell's HUP goes out at once, and the escalation is not waited for,
+    /// as a quit that tears nothing down does not wait for it either.
+    func closeSessionsForQuit(intent: SessionCloseIntent) -> Bool {
+        leavesTabsToTheExit = true
+        var stoppedNativeProgram = false
+        for session in removeAllSessions(intent: intent) {
+            let action = backendPolicy.closeAction(for: session, intent: intent)
+            stoppedNativeProgram = stoppedNativeProgram || (action == .stop && session.hasRunningProcess())
+            finishClosingForQuit(session, intent: intent, action: action)
+        }
+        return stoppedNativeProgram
+    }
+
+    /// Empties the workspace for closing every tab with `intent`, and
+    /// returns the tabs that were in it.
+    private func removeAllSessions(intent: SessionCloseIntent) -> [TerminalSession] {
         if intent.tearsDownWorkspace {
             isTornDown = true
             resumeCommandRestoreWaiters()
@@ -2364,14 +2485,39 @@ final class TerminalWorkspace: ObservableObject {
         terminalDisplayItems.removeAll()
         terminalSplitGroups.removeAll()
         selectedSessionID = nil
-        removedSessions.forEach { finishClosing($0, intent: intent) }
+        return removedSessions
+    }
+
+    /// Tabs a quit's teardown left to the app's exit (`closeSessionsForQuit`),
+    /// held so that their surfaces are not freed meanwhile.
+    private var tabsLeftToTheExit: [TerminalSession] = []
+    /// A quit's teardown closed the workspace: tabs a restore finishes
+    /// afterwards are left to the exit the same way.
+    private var leavesTabsToTheExit = false
+
+    /// `finishClosing` for a quit's teardown, except for a tab whose close
+    /// only disconnects it (its action detaches, or it is attached to a
+    /// session it does not own): that one is left to the app's exit.
+    private func finishClosingForQuit(_ session: TerminalSession, intent: SessionCloseIntent, action: SessionCloseAction) {
+        guard action == .detach || session.hostedAttachment != nil else {
+            finishClosing(session, intent: intent)
+            return
+        }
+        session.keepSessionUntilExit()
+        tabsLeftToTheExit.append(session)
     }
 
     /// Ends tabs a restore built for this workspace after every tab was
     /// closed, with the intent that closed them (a window close if none did).
     func discardRestoredSessions(_ restoredSessions: [TerminalSession]) {
         let intent = closeAllIntent ?? .windowClosed
-        restoredSessions.forEach { finishClosing($0, intent: intent) }
+        for session in restoredSessions {
+            if leavesTabsToTheExit {
+                finishClosingForQuit(session, intent: intent, action: backendPolicy.closeAction(for: session, intent: intent))
+            } else {
+                finishClosing(session, intent: intent)
+            }
+        }
     }
 
     func closeSelectedSession(intent: SessionCloseIntent = .userClosedTab) {
@@ -2387,29 +2533,252 @@ final class TerminalWorkspace: ObservableObject {
     /// Ends a removed tab's program the way `intent` asks for its backend.
     private func finishClosing(_ session: TerminalSession, intent: SessionCloseIntent) {
         // A persistent tab whose program already ended leaves nothing worth
-        // keeping when someone closes it: its session goes whatever the
-        // settings say.
+        // keeping when someone closes or detaches it, or it closes because
+        // its shell exited: its session goes whatever the intent.
         let removesEndedSession = session.isPersistentLocalSession && !session.isRunning
-            && (intent == .userClosedTab || intent == .mcpClose)
+            && [.userClosedTab, .userDetachedTab, .mcpClose, .programExited].contains(intent)
+        if intent == .programExited {
+            // Its last lines stay readable once its surface and session are
+            // gone, for a wait under way (MCP `wait_for_process_idle`).
+            session.keepContentAfterClosing()
+        }
         // Snapshot and stop the native process tree while its PTY still
         // exists; releasing the bridge first loses the teardown anchor.
         switch backendPolicy.closeAction(for: session, intent: intent) {
         case .stop:
             session.stop()
         case .detach:
+            // A tab the user detached (⌘D, Detach) keeps its own session
+            // running in the background, where they know it is. Not one
+            // whose Create is under way (no session yet), nor one only
+            // attached to a session it does not own.
+            let detachedSessionID = intent == .userDetachedTab && !removesEndedSession
+                && session.isPersistentLocalSession
+                ? session.persistentSession?.sessionID
+                : nil
             // For a hosted tab, stopping ends only its local attach client;
             // a persistent tab still creating its session keeps the one its
             // Create makes (its saved record names it).
             session.stop(keepingSession: !removesEndedSession)
             if removesEndedSession {
-                backendPolicy.terminateHostedSession(session, intent)
+                endHostedSession(of: session, intent: intent)
+            } else if let detachedSessionID {
+                backendPolicy.sessionDetached(detachedSessionID)
             }
         case .terminate:
             session.stop()
-            backendPolicy.terminateHostedSession(session, intent)
+            endHostedSession(of: session, intent: intent)
         }
         session.persistentTabDidClose()
         session.releaseGhosttyBridge()
+    }
+
+    /// Ends a closed persistent tab's session for `intent`; or, while
+    /// `deferringSessionEnds` runs, leaves the session of a tab a user
+    /// closed or detached to its caller.
+    private func endHostedSession(of session: TerminalSession, intent: SessionCloseIntent) {
+        if sessionEndsLeftForUndo != nil, intent == .userClosedTab || intent == .userDetachedTab,
+           session.isPersistentLocalSession, session.persistentSession != nil {
+            sessionEndsLeftForUndo?.append(session)
+        } else {
+            backendPolicy.terminateHostedSession(session, intent)
+        }
+    }
+
+    // MARK: Closed tabs that come back (⌘Z)
+
+    /// While `deferringSessionEnds` runs: the closed tabs whose sessions were
+    /// left to its caller.
+    private var sessionEndsLeftForUndo: [TerminalSession]?
+
+    /// Runs `close`, in which a user's close (`userClosedTab`) of this app's
+    /// own persistent tab only stops the tab's adapter, as a detach does:
+    /// its session, which the close would end (or remove, when its program
+    /// ended), is left to the caller, which ends it once the close can no
+    /// longer be undone (`ClosedTabHistory`, `PersistentLocalSessions.deferEnd`).
+    /// A tab whose Create is under way (no session yet) ends as usual.
+    /// Returns the tabs whose sessions were left.
+    func deferringSessionEnds(_ close: () -> Void) -> [TerminalSession] {
+        let outer = sessionEndsLeftForUndo
+        sessionEndsLeftForUndo = []
+        close()
+        let left = sessionEndsLeftForUndo ?? []
+        sessionEndsLeftForUndo = outer
+        return left
+    }
+
+    /// What undoing a user's close or detach of `session` brings back, read
+    /// before the tab closes (`ClosedTab`): its record, the host session it
+    /// shows and where it is. Nil for a tab no undo brings back: a native
+    /// tab, or a persistent tab whose Create is under way.
+    func closedTab(for session: TerminalSession, name: String) -> ClosedTab? {
+        guard let index = sessions.firstIndex(where: { $0 === session }) else { return nil }
+        let binding: HostedSessionAttachment
+        if let attachment = session.hostedAttachment {
+            binding = attachment
+        } else if session.isPersistentLocalSession, let persistent = session.persistentSession {
+            binding = persistent
+        } else {
+            return nil
+        }
+        var display: ClosedTabPlacement.Display?
+        if let group = splitGroup(containing: session.id),
+           let displayIndex = terminalDisplayItems.firstIndex(of: .split(group.id)) {
+            display = .pane(
+                groupID: group.id,
+                displayIndex: displayIndex,
+                paneIDs: group.paneSessionIDs,
+                widthWeights: group.widthWeights
+            )
+        } else if let displayIndex = terminalDisplayItems.firstIndex(of: .single(session.id)) {
+            display = .standalone(index: displayIndex)
+        }
+        return ClosedTab(
+            record: WorkspaceSessionRecord(session: session, restoredRecord: restoredSessionRecords[session.id]),
+            name: name,
+            binding: binding,
+            ownsSession: session.hostedAttachment == nil,
+            placement: ClosedTabPlacement(
+                sessionIndex: index,
+                display: display,
+                wasSelected: selectedSessionID == session.id,
+                subAgentIDs: session.kind == .agent ? childAgentSessions(of: session).map(\.id) : []
+            )
+        )
+    }
+
+    /// Brings a closed tab back where it was (`ClosedTab`), for undo: a tab
+    /// built as a restore builds one (same id, kind, title, agent, command
+    /// and launch settings) for the same host session, which it attaches to
+    /// again without a Create: its own again for this app's persistent tab,
+    /// else attached. It goes back to its place among the tabs, in the
+    /// sidebar and in its split (`ClosedTabPlacement`), and the sub-agents
+    /// its close promoted become its sub-agents again. A tab here showing
+    /// that session already (Background Sessions → Open brought it back) is
+    /// returned instead; for a tab that owned its session, only a tab that
+    /// owns it (a tab only attached to it leaves it to come back as the
+    /// closed tab's own). Nil when the session is gone, being ended, or
+    /// another tab owns it, when its command runs in another tab now (a
+    /// command runs in one tab per workspace: it was started again), or
+    /// when the workspace was torn down. Not selected.
+    func reopenClosedTab(_ closed: ClosedTab) -> TerminalSession? {
+        guard !isTornDown else { return nil }
+        /// A tab here shows the session as the closed tab did.
+        func showsSession(_ open: TerminalSession) -> Bool {
+            guard let binding = closed.ownsSession ? open.persistentSession : open.hostedSessionBinding else {
+                return false
+            }
+            return binding.hostID == closed.binding.hostID && binding.sessionID == closed.binding.sessionID
+        }
+        if let open = session(withID: closed.record.id) {
+            return showsSession(open) ? open : nil
+        }
+        if let open = sessions.first(where: showsSession) {
+            return open
+        }
+        if closed.record.kind == .command, let name = closed.record.commandName,
+           commandSession(named: name) ?? restoredSession(forCommandNamed: name) != nil {
+            return nil
+        }
+        let tab: TerminalSession
+        if closed.ownsSession {
+            let sessionID = closed.binding.sessionID
+            guard launchBackend == .nativePTY,
+                  let hosting = backendPolicy.localSessions,
+                  hosting.owningTab(of: sessionID) == nil,
+                  !hosting.isEnding(sessionID),
+                  let info = hosting.sessionInfo(sessionID)
+            else { return nil }
+            tab = makeRestoredPersistentSession(
+                PersistentSessionLaunch(attachment: closed.binding, info: info),
+                record: closed.record,
+                hosting: hosting,
+                deferringLaunch: true
+            )
+        } else {
+            let info = closed.binding.host == .local
+                ? backendPolicy.localSessions?.sessionInfo(closed.binding.sessionID)
+                : nil
+            tab = makeRestoredHostedSession(closed.binding, record: closed.record, info: info)
+        }
+        insertClosedTab(tab, record: closed.record, placement: closed.placement)
+        launchRestoredAdapters([tab])
+        return tab
+    }
+
+    /// Puts `tab` at `placement`: at its index among the tabs, its display
+    /// item where it was (a pane goes back into its split group, which is
+    /// made again when only one other pane was left, or when another pane
+    /// of it comes back after it), and its promoted sub-agents under it.
+    private func insertClosedTab(_ tab: TerminalSession, record: WorkspaceSessionRecord, placement: ClosedTabPlacement) {
+        sessions.insert(tab, at: min(placement.sessionIndex, sessions.count))
+        restoredSessionRecords[tab.id] = record
+        if tab.kind == .terminal {
+            switch placement.display {
+            case .standalone(let index):
+                terminalDisplayItems.insert(.single(tab.id), at: min(index, terminalDisplayItems.count))
+            case .pane(let groupID, let displayIndex, let paneIDs, let widthWeights):
+                insertClosedPane(
+                    tab.id, groupID: groupID, displayIndex: displayIndex, paneIDs: paneIDs, widthWeights: widthWeights
+                )
+            case nil:
+                terminalDisplayItems.append(.single(tab.id))
+            }
+        }
+        for childID in placement.subAgentIDs {
+            // Unless another agent took it meanwhile.
+            guard let child = session(withID: childID), child.kind == .agent, child.parentAgentID == nil else { continue }
+            child.setParentAgentID(tab.id)
+        }
+    }
+
+    private func insertClosedPane(
+        _ paneID: UUID,
+        groupID: UUID,
+        displayIndex: Int,
+        paneIDs: [UUID],
+        widthWeights: [Double]
+    ) {
+        /// The weights `panes` had then, as far as they were in the group.
+        func weights(for panes: [UUID]) -> [Double] {
+            let known = panes.map { pane in
+                paneIDs.firstIndex(of: pane).flatMap { widthWeights.indices.contains($0) ? widthWeights[$0] : nil }
+                    ?? 1 / Double(max(paneIDs.count, 1))
+            }
+            return Self.normalizedWidthWeights(known, count: panes.count) ?? TerminalSplitGroup.balancedWeights(count: panes.count)
+        }
+        let later = Set(paneIDs.drop { $0 != paneID }.dropFirst())
+        if let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }) {
+            // Its group is still there: it goes back before the panes that
+            // followed it.
+            var group = terminalSplitGroups[groupIndex]
+            guard group.paneSessionIDs.count < Self.maximumSplitPaneCount else {
+                let after = terminalDisplayItems.firstIndex(of: .split(groupID)).map { $0 + 1 } ?? terminalDisplayItems.count
+                terminalDisplayItems.insert(.single(paneID), at: after)
+                return
+            }
+            let position = group.paneSessionIDs.firstIndex(where: later.contains) ?? group.paneSessionIDs.count
+            group.paneSessionIDs.insert(paneID, at: position)
+            group.widthWeights = weights(for: group.paneSessionIDs)
+            terminalSplitGroups[groupIndex] = group
+            return
+        }
+        if let otherIndex = terminalDisplayItems.firstIndex(where: { item in
+            guard case .single(let other) = item else { return false }
+            return other != paneID && paneIDs.contains(other)
+        }), case .single(let other) = terminalDisplayItems[otherIndex] {
+            // The one pane its close left became a tab of its own: they
+            // are a split again.
+            let panes = paneIDs.filter { $0 == paneID || $0 == other }
+            terminalSplitGroups.append(TerminalSplitGroup(
+                id: groupID, paneSessionIDs: panes, activeSessionID: other, widthWeights: weights(for: panes)
+            ))
+            terminalDisplayItems[otherIndex] = .split(groupID)
+            return
+        }
+        // Its whole group closed: a tab of its own where the group was,
+        // until another of its panes comes back.
+        terminalDisplayItems.insert(.single(paneID), at: min(displayIndex, terminalDisplayItems.count))
     }
 
     func selectPreviousSession(visibleCommandNames: [String]? = nil) {
@@ -2918,6 +3287,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var hasUnacknowledgedAttention = false
     @Published private(set) var currentAttentionScreenTag: TerminalAttentionCorrection?
     @Published private(set) var startedAt: Date?
+    /// When the program the tab runs now started: at its launch
+    /// (`startedAt`), or later, once its persistent session's Create
+    /// answered or the tab ran natively because the session could not
+    /// start. A restored or adopted session keeps the launch's time. What
+    /// `cleanExitMinimumRunTime` is measured from.
+    private(set) var programStartedAt: Date?
     @Published private(set) var exitedAt: Date?
     @Published private(set) var lastOutputAt: Date?
     @Published private(set) var outputVersion = 0
@@ -3185,6 +3560,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Set by the owning workspace: called after a rename, a managed command
     /// edit or a new agent parent, which workspace persistence saves.
     var persistentStateDidChange: (@MainActor () -> Void)?
+    /// Set by the workspace showing the tab: its own program ended by
+    /// itself while the tab followed it (`finishProcessExit`). Never for a
+    /// stop, restart or close (they stop following it first), a program
+    /// that had ended before the tab followed it, or an attached tab's.
+    var programDidExit: (@MainActor (TerminalSession) -> Void)?
     /// True when auto-restart gave up on a crash-looping command (see
     /// `CommandAutoRestartPolicy`); cleared by a manual restart.
     @Published private(set) var isAutoRestartPaused = false
@@ -3207,6 +3587,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let nativeContentDebounceInterval: TimeInterval = 0.12
     private static let nativeContentReadThrottle: TimeInterval = 0.05
     private var nativeContentLines: [String] = []
+    /// The lines a tab closed because its shell exited showed last
+    /// (`keepContentAfterClosing`): what a caller still holding it (MCP
+    /// `wait_for_process_idle`) reads once its surface and session are gone.
+    private var closedTabContentLines: [String]?
     private var isRefreshingNativeContent = false
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
@@ -3548,10 +3932,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// like process listings that poll many sessions. The render signal keeps the
     /// native line model current; this just reads it.
     var listingLineCount: Int {
+        if let closedTabContentLines { return closedTabContentLines.count }
         // Lines read from the host (a persistent tab no surface shows, such
         // as a restored one whose adapter waits) are the ones MCP output
         // numbers, as `lineCount` counts them.
-        readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent)
+        return readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent)
             ? nativeContentLines.count
             : processor.lineCount
     }
@@ -3722,8 +4107,13 @@ final class TerminalSession: ObservableObject, Identifiable {
             if usesNativePTYBackend {
                 // The native session leader can be /usr/bin/login, whose child
                 // is the idle shell itself. Counting its children marks every
-                // terminal busy; Ghostty already tracks the actual prompt.
-                return ghosttyBridgeStorage?.terminalView.needsConfirmQuit ?? false
+                // terminal busy; Ghostty already tracks the actual prompt. It
+                // cannot see a shell without its shell integration at one
+                // (or any shell before its first prompt), though: the PTY's
+                // foreground job settles those.
+                guard let bridge = ghosttyBridgeStorage, bridge.terminalView.needsConfirmQuit else { return false }
+                guard let leader = bridge.nativeSessionLeaderPID() else { return true }
+                return ShellProcessController.nativeShellHasForegroundJob(sessionLeaderPID: leader)
             }
             guard let shellPID = childProcessID else { return false }
             return ShellProcessController.shellHasForegroundProcess(shellPID: shellPID)
@@ -4284,8 +4674,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     /// `keepingSession`: the tab closes detaching from its program
     /// (`SessionCloseAction.detach`: a window close or quit that keeps
-    /// sessions running, or a tab close with Settings › Sessions keeping
-    /// them), which keeps running on its host. A persistent tab whose
+    /// sessions running, or a detach), which keeps running on its host. A persistent tab whose
     /// Create is still under way then keeps the session it makes too: the
     /// tab's saved record names it (`launchRequestID`) and brings it back.
     /// Otherwise (a stop, restart, or a close that ends sessions) that
@@ -4344,7 +4733,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // it by its Create's request id.
                     persistentLaunchClaim?.keepsSession = true
                 } else {
-                    // The session being created is ended when Create answers.
+                    // The session being created is ended when Create answers
+                    // (even if a quit's teardown had left it to the exit).
+                    persistentLaunchClaim?.keepsSession = false
                     persistentLaunchRequestID = nil
                 }
             }
@@ -4425,6 +4816,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentLaunchRequestID = nil
         persistentHosting.end(binding)
         persistentStateDidChange?()
+    }
+
+    /// A quit keeping sessions leaves the tab as it is until the app exits
+    /// (`TerminalWorkspace.closeSessionsForQuit`): a Create under way keeps
+    /// the session it makes, as `stop(keepingSession: true)` would, so the
+    /// quit does not wait for it (`waitForPersistentLaunches`).
+    func keepSessionUntilExit() {
+        persistentLaunchClaim?.keepsSession = true
     }
 
     /// The tab closed (after its close action ran): it no longer owns the
@@ -4823,6 +5222,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             isAutoRestartPaused = false
         }
         startedAt = Date()
+        programStartedAt = startedAt
         exitedAt = nil
         lastOutputAt = nil
         lastHumanInputAt = nil
@@ -4913,6 +5313,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         shellProcess = nil
         hostInputWriter.set(nil)
         childProcessID = nil
+        // The shell starts now, also after a persistent session could not.
+        programStartedAt = Date()
         state = .live
         bumpRevision()
         if let bridge = ghosttyBridgeStorage {
@@ -5009,7 +5411,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let earlierLaunch = persistentLaunchTask
         let restartExitTimeout = hosting.configuration.restartExitTimeout
         let launchKey = UUID()
-        let claim = PersistentLaunchClaim()
+        let claim = PersistentLaunchClaim(tab: self, launchID: launchID, hosting: hosting, creates: adopted == nil)
         persistentLaunchClaim = claim
         defer {
             if let task = persistentLaunchTask {
@@ -5072,11 +5474,34 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// time Create answers, its tab no longer follows it (it closed,
     /// stopped or started again). Shared with the launch's task, which
     /// outlives a closed tab.
+    @MainActor
     private final class PersistentLaunchClaim {
         /// The tab closed detaching from its program (`stop(keepingSession:)`):
         /// the session is left running for the tab's saved record, instead
         /// of ended.
         var keepsSession = false
+        private weak var tab: TerminalSession?
+        private let launchID: UUID
+        let hosting: PersistentLocalSessions
+        /// It sends a Create (else it adopts a session that runs already).
+        private let creates: Bool
+
+        init(tab: TerminalSession, launchID: UUID, hosting: PersistentLocalSessions, creates: Bool) {
+            self.tab = tab
+            self.launchID = launchID
+            self.hosting = hosting
+            self.creates = creates
+        }
+
+        /// The session its Create makes is ended once Create answers: its
+        /// tab no longer follows it (the tab closed, stopped, started again
+        /// or runs natively after the Create took too long; the launch's
+        /// task checks the same) and did not keep it.
+        var endsWhatItCreates: Bool {
+            guard creates, !keepsSession else { return false }
+            guard let tab else { return true }
+            return tab.activeLaunchID != launchID || tab.persistentHosting !== hosting
+        }
     }
 
     /// Every tab's launch still ending a previous session or waiting for
@@ -5088,11 +5513,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Waits until every tab's launch under way that will end what its
     /// Create makes finished (at most `timeout`): quit waits for this, so a
     /// session created for a tab that closed ending its session (a quit
-    /// that ends sessions, a stop) is ended before the app goes, not left
-    /// running with no tab and no saved record. A launch whose tab closed
-    /// keeping its session (a quit that keeps sessions, the default) is not
-    /// waited for: its session runs on, and the tab's saved record brings
-    /// it back at the next launch.
+    /// answered End Sessions, a stop) is ended before the app goes, not
+    /// left running with no tab and no saved record. A launch whose tab
+    /// closed keeping its session (a quit answered Keep Running, or one
+    /// that asked nothing) is not waited for: its session runs on, and the
+    /// tab's saved record brings it back at the next launch.
     static func waitForPersistentLaunches(upTo timeout: Duration) async {
         let deadline = ContinuousClock.now + timeout
         while let (key, entry) = persistentLaunchesInFlight.first(where: { !$0.value.claim.keepsSession }) {
@@ -5101,6 +5526,17 @@ final class TerminalSession: ObservableObject, Identifiable {
             await wait(for: entry.task, upTo: remaining)
             persistentLaunchesInFlight[key] = nil
         }
+    }
+
+    /// Whether a launch on `hosting` still waiting for its Create will end
+    /// the session it makes (`PersistentLaunchClaim.endsWhatItCreates`): a
+    /// tab closed (⌘W) or stopped while its Create was under way. A quit
+    /// that keeps sessions waits for it (`CherryAppDelegate.confirmedQuitPlan`)
+    /// instead of quitting at once: the host would create that session
+    /// after the app exited, with no tab and no saved record to end it, and
+    /// the next launch would adopt it as an orphan.
+    static func hasLaunchesEndingTheirSessions(on hosting: PersistentLocalSessions) -> Bool {
+        persistentLaunchesInFlight.values.contains { $0.claim.hosting === hosting && $0.claim.endsWhatItCreates }
     }
 
     /// A session the host has not started within `creationTimeout` (the
@@ -5136,6 +5572,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     ) {
         let binding = launch.attachment
         persistentSession = binding
+        if startedCurrentProgram {
+            // Its Create answered: the program started now, however long
+            // the host took (a daemon starting cold).
+            programStartedAt = Date()
+        }
         if let requestID = PersistentLocalSessions.launchRequestID(of: hosting.sessionInfo(binding.sessionID) ?? launch.info) {
             persistentLaunchRequestID = requestID
         }
@@ -5174,8 +5615,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         if persistentAdapterDeferred {
             guard latest.isRunning else {
                 // It ended while Cherry was closed: no adapter; the tab shows
-                // the host's final screen and its exit.
-                finishPersistentProgram(status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID)
+                // the host's final screen and its exit, and stays open to
+                // show them.
+                finishPersistentProgram(
+                    status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID, reportsExit: false
+                )
                 return
             }
             // Followed through the host (input, screen, title, bells, exit)
@@ -5194,8 +5638,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         launchPersistentAdapter(binding)
         if !latest.isRunning {
             // It ended already (or a restore found it ended): the adapter
-            // shows its final screen.
-            finishPersistentProgram(status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID)
+            // shows its final screen, and the tab stays open to show it.
+            finishPersistentProgram(
+                status: PersistentLocalSessions.exitStatus(of: latest), launchID: launchID, reportsExit: false
+            )
         }
     }
 
@@ -5262,7 +5708,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         let outcome = consumeHostedLaunchStatus(removingAfter: 0) ?? .disconnected(nil)
         persistentPhase = .reconnecting
         if case .exited(let code, let signal) = outcome {
-            finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 0, launchID: launchID)
+            // An exit without a status is never taken for a clean one.
+            finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 1, launchID: launchID)
             return
         }
         // The host's title and directory are the current ones until an
@@ -5356,8 +5803,8 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     /// The program ended: the same exit handling a native tab gets (agent
     /// idle/error, command auto-restart, attention). The adapter prints the
-    /// final screen and exits by itself.
-    private func finishPersistentProgram(status: Int32, launchID: UUID) {
+    /// final screen and exits by itself. `reportsExit`: see `finishProcessExit`.
+    private func finishPersistentProgram(status: Int32, launchID: UUID, reportsExit: Bool = true) {
         guard activeLaunchID == launchID else { return }
         // A restored tab whose adapter never ran: no surface showed the
         // program, so its final screen comes from the host.
@@ -5371,7 +5818,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             // final screen the host keeps until the tab closes or restarts.
             persistentHosting.unbind(self, from: persistentSession.sessionID)
         }
-        finishProcessExit(status: status, launchID: launchID, appendsExitNotice: !showsHostFinalScreen)
+        finishProcessExit(
+            status: status, launchID: launchID, appendsExitNotice: !showsHostFinalScreen, reportsExit: reportsExit
+        )
         if showsHostFinalScreen, let persistentHosting, let binding = persistentSession {
             showFinalScreen(of: binding) { try await persistentHosting.screen(of: binding) }
         }
@@ -5681,8 +6130,16 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     /// `appendsExitNotice`: a terminal's exit line follows the output; false
     /// when the final screen is still to come (read from the host), which
-    /// then adds it.
-    private func finishProcessExit(status: Int32, launchID: UUID, appendsExitNotice: Bool = true) {
+    /// then adds it. `reportsExit`: tell the workspace (`programDidExit`),
+    /// which may close the tab; false for a program that had ended before
+    /// the tab followed it (a restored or adopted session that ended), whose
+    /// tab was opened to show that exit.
+    private func finishProcessExit(
+        status: Int32,
+        launchID: UUID,
+        appendsExitNotice: Bool = true,
+        reportsExit: Bool = true
+    ) {
         guard activeLaunchID == launchID else { return }
 
         activeLaunchID = nil
@@ -5728,13 +6185,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         scheduleAttentionObservation(event: .processExited)
         bumpRevision()
+        if reportsExit {
+            programDidExit?(self)
+        }
     }
 
     // MARK: Restored tabs (deferred attach)
 
     /// "Session ended (exit N)" for a persistent terminal or agent whose
     /// program ended while its session (and final screen) is still on the
-    /// host; nil otherwise. Closing the tab removes that session.
+    /// host; nil otherwise. Closing the tab removes that session. A terminal
+    /// whose shell exited with status 0 closes instead, unless Settings ›
+    /// Sessions keeps such tabs (`TerminalWorkspace.tabProgramDidExit`).
     var persistentSessionEndedMessage: String? {
         guard isPersistentLocalSession, kind != .command, !isRunning, persistentSession != nil,
               case .exited(let status) = state
@@ -6250,6 +6712,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentLineCount() -> Int {
+        if let closedTabContentLines {
+            return closedTabContentLines.count
+        }
         if readsContentFromHost {
             // Read from the host by `refreshContentFromHostIfNeeded`.
             return nativeContentLines.count
@@ -6262,6 +6727,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
+        if let closedTabContentLines {
+            return Array(closedTabContentLines[range.clamped(to: 0..<closedTabContentLines.count)])
+        }
         if readsContentFromHost {
             return nativeContentSnapshot(range: range)
         }
@@ -6270,6 +6738,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         ensureNativeContentFresh()
         return nativeContentSnapshot(range: range)
+    }
+
+    /// The tab closes because its shell exited (`programExited`): what it
+    /// shows now (its surface's text, or the host's screen as last read)
+    /// stays its lines after its surface and session are gone.
+    func keepContentAfterClosing() {
+        guard closedTabContentLines == nil else { return }
+        closedTabContentLines = contentSnapshot(range: 0..<contentLineCount())
     }
 
     private func nativeContentSnapshot(range: Range<Int>) -> [String] {

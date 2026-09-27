@@ -404,6 +404,29 @@ final class ShellProcessController: @unchecked Sendable {
         return shellGroup > 1 && shell.foregroundProcessGroupID != shellGroup
     }
 
+    /// Whether a native (Ghostty EXEC) terminal's shell runs a job in its
+    /// foreground: the PTY's foreground process group is not the shell's.
+    /// Ghostty's own check (`needsConfirmQuit`) reads the prompt marks of
+    /// its shell integration, so it takes a shell it cannot see at a prompt
+    /// (one without that integration, such as macOS's bash 3.2 or nushell;
+    /// or any shell before its first prompt) for a busy one; this settles
+    /// it. `sessionLeaderPID` is the PTY's session leader: login(1), whose
+    /// child is the shell, or the shell itself.
+    static func nativeShellHasForegroundJob(sessionLeaderPID: pid_t) -> Bool {
+        shellHasForegroundJob(sessionLeaderPID: sessionLeaderPID, in: enumerateProcesses())
+    }
+
+    /// `nativeShellHasForegroundJob` over a process table `snapshot`.
+    static func shellHasForegroundJob(sessionLeaderPID: pid_t, in snapshot: [ProcessSnapshotEntry]) -> Bool {
+        guard let leader = snapshot.first(where: { $0.pid == sessionLeaderPID }),
+              leader.foregroundProcessGroupID > 1
+        else { return false }
+        let shell = leader.name == "login"
+            ? snapshot.first { $0.parentPID == leader.pid } ?? leader
+            : leader
+        return leader.foregroundProcessGroupID != shell.processGroupID
+    }
+
     /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
     /// a libghostty-spawned shell matches the host-managed forkpty launch.
     ///
@@ -516,6 +539,12 @@ final class ShellProcessController: @unchecked Sendable {
         additionalDirs: GhosttyRuntimeResources.terminfoDirectoryURL?.path
     )
 
+    /// How long a stop's HUP → TERM → KILL escalation takes: its KILL goes
+    /// out 700 ms after the HUP, here and in `terminate()`, with room left
+    /// to send it. A quit that stopped native tabs waits this long before
+    /// the app exits, which would cut the escalation short.
+    static let terminationEscalationDuration: Duration = .milliseconds(900)
+
     /// Terminate the entire native-PTY (ghostty EXEC) session anchored at
     /// `anchorPID` — the shell plus every transitive descendant and everything
     /// sharing its controlling terminal — with a HUP → TERM → KILL escalation.
@@ -601,14 +630,18 @@ final class ShellProcessController: @unchecked Sendable {
         return members.filter { $0 > 1 && $0 != excludingPID && getsid($0) != excludingSessionID }
     }
 
-    private struct ProcessSnapshotEntry {
+    struct ProcessSnapshotEntry {
         let pid: pid_t
         let parentPID: pid_t
+        let processGroupID: pid_t
         let controllingTTY: dev_t
         let foregroundProcessGroupID: pid_t
+        /// Its executable's name, cut to 16 characters (`p_comm`).
+        let name: String
     }
 
-    /// One-shot snapshot of every process (pid, ppid, controlling tty) via
+    /// One-shot snapshot of every process (pid, ppid, process group,
+    /// controlling tty and its foreground group, name) via
     /// `sysctl(KERN_PROC_ALL)`. Empty on failure.
     private static func enumerateProcesses() -> [ProcessSnapshotEntry] {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
@@ -625,11 +658,17 @@ final class ShellProcessController: @unchecked Sendable {
         }
         guard result == 0 else { return [] }
         return procs.prefix(fetchedBytes / stride).map { info in
-            ProcessSnapshotEntry(
+            var command = info.kp_proc.p_comm
+            let name = withUnsafeBytes(of: &command) { bytes in
+                String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            return ProcessSnapshotEntry(
                 pid: info.kp_proc.p_pid,
                 parentPID: info.kp_eproc.e_ppid,
+                processGroupID: info.kp_eproc.e_pgid,
                 controllingTTY: info.kp_eproc.e_tdev,
-                foregroundProcessGroupID: info.kp_eproc.e_tpgid
+                foregroundProcessGroupID: info.kp_eproc.e_tpgid,
+                name: name
             )
         }
     }

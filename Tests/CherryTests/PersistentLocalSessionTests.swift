@@ -25,6 +25,9 @@ final class PersistentHarness {
     let settings = Recorder(SessionPersistenceSettings.defaults)
     let configurations = Recorder<[ShellProcessController.Configuration]>([])
     let installationProblem = Recorder<String?>(nil)
+    /// The policy's `cleanExitMinimumRunTime`, for workspaces made after
+    /// it is set.
+    var cleanExitMinimumRunTime: TimeInterval = 1
     let project: URL
     private let suite: String
 
@@ -92,7 +95,11 @@ final class PersistentHarness {
 
     var policy: SessionBackendPolicy {
         let settings = settings
-        return SessionBackendPolicy(settings: { settings.value }, localSessions: hosting)
+        return SessionBackendPolicy(
+            settings: { settings.value },
+            localSessions: hosting,
+            cleanExitMinimumRunTime: cleanExitMinimumRunTime
+        )
     }
 
     func workspace() -> TerminalWorkspace {
@@ -471,21 +478,32 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     harness.fake.connections.last?.push(.event(.changed(busy)))
     #expect(await harness.fake.wait { terminal.hasRunningProcess() })
 
-    // What quitting, closing the window or removing the worktree would end.
-    harness.settings.value.endLocalSessionsOnQuit = false
+    // What quitting, closing the window or removing the worktree would end:
+    // a quit or window close keeping sessions ends none of them.
     #expect(workspace.sessionsWithRunningProcess(endingWith: .appQuit).isEmpty)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .windowClosed).isEmpty)
     #expect(workspace.persistentSessionsEnded(by: .appQuit).isEmpty)
     #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .worktreeRemoved).map(\.id)) == [terminal.id, command.id])
-    harness.settings.value.endLocalSessionsOnQuit = true
-    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .appQuit).map(\.id)) == [terminal.id, command.id])
-    #expect(workspace.persistentSessionsEnded(by: .appQuit).count == 2)
+    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .appQuitEndingSessions).map(\.id)) == [terminal.id, command.id])
+    #expect(workspace.persistentSessionsEnded(by: .appQuitEndingSessions).count == 2)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .duplicateWindowTeardown).isEmpty)
+
+    // What the quit or window-close question says: both run, both busy.
+    for teardown in [SessionTeardown.quit, .windowClose] {
+        let summary = workspace.teardownSummary(teardown, place: "cherry", pathDisplayMode: .repoFocused)
+        #expect(Set(summary.runningSessions.map(\.id)) == [terminal.id, command.id])
+        #expect(summary.runningSessions.allSatisfy { $0.isBusy && $0.place == "cherry" })
+        #expect(Set(summary.runningSessions.compactMap(\.hostSessionID))
+            == Set([terminal, command].compactMap { $0.persistentSession?.sessionID }))
+        #expect(summary.persistentTabCount == 2)
+        #expect(summary.stoppedWhenKeeping == 0)
+        #expect(summary.stoppedWhenEnding == 2)
+    }
 }
 
 // MARK: - Close intents
 
-@Test @MainActor func closingAPersistentTabFollowsTheSessionsSettings() async throws {
+@Test @MainActor func closingAPersistentTabEndsItsSessionAndDetachingKeepsIt() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
     defer {
@@ -507,22 +525,26 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     await harness.hosting.waitForPendingEnds(timeout: .seconds(2))
     #expect(!harness.hosting.hasPendingEnds)
 
-    // Keep running after closing a tab: it only detaches.
-    harness.settings.value.keepLocalSessionsAfterTabClose = true
+    // So does MCP `close_process`, which asks nothing.
+    let (mcpClosed, mcpClosedSession) = try await openTab()
+    workspace.close(mcpClosed, intent: .mcpClose)
+    #expect(await harness.fake.wait { harness.requestIDs("remove").contains(mcpClosedSession) })
+    #expect(harness.requestIDs("kill") == [closedSession, mcpClosedSession])
+
+    // Detaching a tab (⌘D): it only detaches.
     let (kept, keptSession) = try await openTab()
-    workspace.close(kept, intent: .mcpClose)
+    workspace.close(kept, intent: .userDetachedTab)
     try await Task.sleep(for: .milliseconds(200))
     #expect(!harness.requestIDs("kill").contains(keptSession))
     #expect(harness.fake.sessions.contains { $0.id == keptSession && $0.isRunning })
 
     // ... but a tab whose program already ended leaves nothing to keep.
     let (ended, endedSession) = try await openTab()
-    harness.exit(endedSession, code: 0)
-    #expect(await harness.fake.wait { ended.state == .exited(0) })
-    workspace.close(ended)
+    harness.exit(endedSession, code: 2)
+    #expect(await harness.fake.wait { ended.state == .exited(2) })
+    workspace.close(ended, intent: .userDetachedTab)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(endedSession) })
     #expect(!harness.requestIDs("kill").contains(endedSession))
-    harness.settings.value.keepLocalSessionsAfterTabClose = false
 
     // Removing a worktree always ends its sessions.
     let worktree = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: harness.policy)
@@ -532,23 +554,24 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     worktree.closeAllSessions(intent: .worktreeRemoved)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(removedSession) })
 
-    // A window closing or the app quitting keeps them, unless the settings
-    // end them; a discarded duplicate window never does.
-    for (intent, endOnQuit, ends) in [
-        (SessionCloseIntent.windowClosed, false, false),
-        (.appQuit, false, false),
-        (.duplicateWindowTeardown, true, false),
-        (.windowClosed, true, true),
-        (.appQuit, true, true)
+    // A window closing or the app quitting keeps them, unless its answer
+    // (or Settings › Sessions) ends them; a discarded duplicate window never
+    // does. The preference itself changes no close action.
+    harness.settings.value.localSessionsOnQuit = .end
+    for (intent, ends) in [
+        (SessionCloseIntent.windowClosed, false),
+        (.appQuit, false),
+        (.duplicateWindowTeardown, false),
+        (.windowClosedEndingSessions, true),
+        (.appQuitEndingSessions, true)
     ] {
-        harness.settings.value.endLocalSessionsOnQuit = endOnQuit
         let window = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: harness.policy)
         let tab = window.addSession()
         #expect(await harness.waitUntilAttached(tab))
         let sessionID = try #require(tab.persistentSession?.sessionID)
         window.closeAllSessions(intent: intent)
         await harness.hosting.waitForPendingEnds(timeout: .seconds(3))
-        let label = Comment(rawValue: "\(intent) endOnQuit=\(endOnQuit)")
+        let label = Comment(rawValue: "\(intent)")
         #expect(harness.requestIDs("kill").contains(sessionID) == ends, label)
         #expect(harness.requestIDs("remove").contains(sessionID) == ends, label)
         #expect(!tab.isRunning, label)
@@ -807,8 +830,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     let owner = other.addSession(title: "Owner")
     #expect(await harness.waitUntilAttached(owner))
     let endedSession = try #require(owner.persistentSession?.sessionID)
-    harness.exit(endedSession, code: 0)
-    #expect(await harness.fake.wait { owner.state == .exited(0) })
+    harness.exit(endedSession, code: 1)
+    #expect(await harness.fake.wait { owner.state == .exited(1) })
     #expect(harness.hosting.owningTab(of: endedSession) === owner)
     let endedInfo = try #require(harness.hosting.sessionInfo(endedSession))
     #expect(endedInfo.tags[PersistentSessionTag.tab] == owner.id.uuidString)
@@ -819,15 +842,14 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     try await Task.sleep(for: .milliseconds(200))
     #expect(!harness.requestIDs("remove").contains(endedSession))
 
-    // Once a tab closed and kept its session running, the session is this
-    // app's to own again: attached from the sheet, it comes back as that
-    // tab (same id, so its CHERRY_PROCESS_ID still names it).
-    harness.settings.value.keepLocalSessionsAfterTabClose = true
+    // Once a tab detached, keeping its session running, the session is
+    // this app's to own again: attached from the sheet, it comes back as
+    // that tab (same id, so its CHERRY_PROCESS_ID still names it).
     let closing = other.addSession(title: "Kept")
     #expect(await harness.waitUntilAttached(closing))
     let keptSession = try #require(closing.persistentSession?.sessionID)
     let closedID = closing.id
-    other.close(closing)
+    other.close(closing, intent: .userDetachedTab)
     #expect(harness.hosting.owningTab(of: keptSession) == nil)
     #expect(!harness.hosting.hasOpenTab(withID: closedID))
     let keptInfo = try #require(harness.fake.sessions.first { $0.id == keptSession })
@@ -1037,9 +1059,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
         return (tab, try #require(tab.persistentSession?.sessionID))
     }
 
-    harness.settings.value.keepLocalSessionsAfterTabClose = true
     var detached: [String] = []
-    for intent in [SessionCloseIntent.userClosedTab, .mcpClose, .windowClosed, .appQuit, .duplicateWindowTeardown] {
+    for intent in [SessionCloseIntent.userDetachedTab, .windowClosed, .appQuit, .duplicateWindowTeardown] {
         let workspace = harness.workspace()
         let (_, sessionID) = try await open(workspace)
         workspace.closeAllSessions(intent: intent)
@@ -1053,7 +1074,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     detached.append(stoppedSession)
     let (restarted, _) = try await open(workspace)
     #expect(workspace.restart(restarted))
-    #expect(await harness.fake.wait { harness.creates().count == 8 })
+    #expect(await harness.fake.wait { harness.creates().count == 7 })
 
     // A detach hangs up on the tab's own adapter (when its tty is known
     // yet), never on its program.
@@ -1070,14 +1091,14 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     configuration.terminationTimeout = .seconds(1)
     let harness = try PersistentHarness(configuration: configuration)
     defer { harness.cleanUp() }
-    harness.settings.value.endLocalSessionsOnQuit = true
 
+    // End Sessions (or Settings › Sessions ending them).
     let window = harness.workspace()
     let tab = window.addSession()
     #expect(await harness.waitUntilAttached(tab))
     let sessionID = try #require(tab.persistentSession?.sessionID)
-    #expect(window.persistentSessionsEnded(by: .appQuit).map(\.id) == [tab.id])
-    window.closeAllSessions(intent: .appQuit)
+    #expect(window.persistentSessionsEnded(by: .appQuitEndingSessions).map(\.id) == [tab.id])
+    window.closeAllSessions(intent: .appQuitEndingSessions)
     #expect(harness.hosting.hasPendingEnds)
     #expect(await harness.hosting.waitForPendingEnds(timeout: .seconds(3)))
     #expect(harness.requestIDs("kill") == [sessionID])
@@ -1090,7 +1111,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     let stuck = stuckWindow.addSession()
     #expect(await harness.waitUntilAttached(stuck))
     let stuckSession = try #require(stuck.persistentSession?.sessionID)
-    stuckWindow.closeAllSessions(intent: .appQuit)
+    stuckWindow.closeAllSessions(intent: .appQuitEndingSessions)
     let started = ContinuousClock.now
     #expect(await !harness.hosting.waitForPendingEnds(timeout: .milliseconds(300)))
     #expect(ContinuousClock.now - started < .seconds(1))

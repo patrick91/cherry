@@ -255,8 +255,8 @@ final class ParityControlServer {
 
     // Once the program ended, there is no pid to report.
     let sessionID = try #require(tab.persistentSession?.sessionID)
-    harness.exit(sessionID, code: 0)
-    #expect(await harness.fake.wait { tab.state == .exited(0) })
+    harness.exit(sessionID, code: 3)
+    #expect(await harness.fake.wait { tab.state == .exited(3) })
     #expect(tab.programProcessID == nil)
     #expect(try await control.process(tab).pid == nil)
 }
@@ -502,8 +502,8 @@ final class ParityControlServer {
     #expect(await harness.fake.wait { tab.hasUnreadNotification })
     #expect(tab.lastNotification?.body == "passed while reconnecting")
     // After the program ended, its progress is gone.
-    harness.exit(sessionID, code: 0)
-    #expect(await harness.fake.wait { tab.state == .exited(0) })
+    harness.exit(sessionID, code: 3)
+    #expect(await harness.fake.wait { tab.state == .exited(3) })
     #expect(tab.progressReport == nil)
 }
 
@@ -649,8 +649,8 @@ final class ParityControlServer {
 
     // A program that ended takes no input: nothing is sent, and the caller
     // learns so (it used to hear the byte count).
-    harness.exit(sessionID, code: 0)
-    #expect(await harness.fake.wait { tab.state == .exited(0) })
+    harness.exit(sessionID, code: 3)
+    #expect(await harness.fake.wait { tab.state == .exited(3) })
     let inputsBefore = harness.fake.requests("send_input").count
     let ended = try await control.send(.sendProcessInput(.init(processID: tab.id.uuidString, text: "echo late")))
     #expect(ended.error?.code == "process_not_accepting_input")
@@ -662,6 +662,59 @@ final class ParityControlServer {
     ), launchShell: false)
     let disconnected = try await control.send(.sendProcessInput(.init(processID: remote.id.uuidString, text: "ls")))
     #expect(disconnected.error?.code == "process_not_accepting_input")
+}
+
+@Test @MainActor func mcpNoLongerFindsATerminalWhoseShellExitedCleanly() async throws {
+    let harness = try PersistentHarness()
+    harness.cleanExitMinimumRunTime = 0
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let anchor = workspace.addSession(title: "Anchor")
+    #expect(await harness.waitUntilAttached(anchor))
+    func spawn(_ title: String) async throws -> TerminalSession {
+        let spawned = try await control.send(.spawnProcess(.init(kind: "terminal", title: title)))
+        guard case .spawnProcess(let result)? = spawned.result else {
+            throw HostedSessionError.message("Expected spawnProcess, got \(String(describing: spawned))")
+        }
+        let tab = try #require(workspace.sessions.first { $0.id.uuidString == result.process.id })
+        #expect(await harness.waitUntilAttached(tab))
+        return tab
+    }
+
+    // Its shell exited with status 0: the tab closed, and its id no longer
+    // names a process.
+    let done = try await spawn("Done")
+    harness.exit(try #require(done.persistentSession?.sessionID), code: 0)
+    #expect(await harness.fake.wait { !workspace.sessions.contains { $0 === done } })
+    let gone = try await control.send(.getProcessStatus(.init(processID: done.id.uuidString)))
+    #expect(gone.error?.code == "terminal_not_found")
+
+    // Any other exit keeps the tab, which reports it.
+    let failing = try await spawn("Failing")
+    harness.exit(try #require(failing.persistentSession?.sessionID), code: 3)
+    #expect(await harness.fake.wait { failing.state == .exited(3) })
+    #expect(try await control.process(failing).state == "exit 3")
+    let waited = try await control.send(.waitForProcessIdle(.init(
+        processID: failing.id.uuidString, requireNewOutput: false, quietMilliseconds: 0, timeoutMilliseconds: 2_000
+    )))
+    guard case .waitForProcessIdle(let idle)? = waited.result else {
+        Issue.record("Expected waitForProcessIdle, got \(String(describing: waited))")
+        return
+    }
+    #expect(idle.reason == .exited)
+
+    // So does stop_process: the program stopped because it was asked to.
+    let stopped = try await spawn("Stopped")
+    let stop = try await control.send(.stopProcess(.init(processID: stopped.id.uuidString)))
+    #expect(stop.error == nil)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(workspace.sessions.contains { $0 === stopped })
+    #expect(try await control.process(stopped).state == "exit 0")
 }
 
 @Test @MainActor func aSpawnedProcesssFirstInputIsQueuedUntilItsSessionExists() async throws {

@@ -35,9 +35,11 @@ and application data. Your existing Cherry installation is not replaced.
    While it runs from the disk image, its local tabs are ordinary tabs.
 2. Open a project. Its terminal, command and agent tabs run as persistent
    sessions (Settings > Sessions turns this off).
-3. Start a shell command or editor in a tab, then quit $app_name.
+3. Start a shell command or editor in a tab, then quit $app_name and choose
+   Keep Running when it asks about the running sessions.
 4. Open it again: the tab comes back with the original process and terminal
-   state. Closing a tab ends its session unless Settings > Sessions keeps it.
+   state. Closing a tab (Command-W) ends its session; Detach Tab (Command-D)
+   keeps it running in the background.
 5. File > Persistent Sessions (Command-Shift-R) lists the sessions on This Mac
    and on SSH hosts, and creates and attaches to more.
 

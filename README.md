@@ -45,16 +45,50 @@ their screens. Sessions end when the machine reboots. Several terminals can
 attach to one session and type into it; the shared terminal fits the smallest
 one.
 
-**Settings › Sessions** decides what closing does. By default, closing a tab
-ends its session and quitting keeps the sessions for next time; **Keep running
-after closing a tab** leaves a closed tab's session running (attach to it
-again from Persistent Sessions), and **End sessions when quitting** ends them
-when you quit or close a window. Removing a worktree ends its sessions. Turn
-off **Run local terminals as persistent sessions** to run new tabs as ordinary
-native tabs. Tabs are ordinary tabs anyway while the app runs from a disk
-image, has no `cherry` helper, or cannot start a session, and in a second copy
-of the app that shares the first one's app data (Settings › Sessions says
-why). Sessions on SSH hosts always keep running when you close a tab or quit.
+Closing a tab (**Cmd-W**) ends its session, and asks first when that would
+stop a program at work (an agent, a command, or a terminal running a job):
+**Close**, **Detach Instead** or **Cancel**. **Detach Tab** (**Cmd-D**; Split
+Right is **Cmd-Shift-D**) closes the tab and leaves its session running in the
+background; a notice at the bottom of the window says so, with **Reopen** to
+bring it back. **Cmd-Z** (Edit › Undo Close Tab or Undo Detach Tab) brings a
+tab you just closed or detached back where it was, with the same session, for
+as long as its notice ("Closed <name>", with **Undo**) would stay: about 6
+seconds, longer while the pointer rests on it or the window is in the
+background (a minute at most for a closed tab, whose program keeps running
+meanwhile). A closed tab's program stops only once that has passed (or when
+its window closes or Cherry quits). In a text field or the notes editor,
+Cmd-Z undoes typing as usual. Quitting Cherry
+or closing a project window with local sessions still running asks once:
+**Keep Running** (the default) leaves them running and brings their tabs back
+next time, **End Sessions** stops their programs, and **Don't ask again**
+stores the answer in **When quitting or closing a window** (Ask, Keep Running
+or End Sessions). Keeping sessions quits at once unless ordinary (native) tabs
+have programs to stop; otherwise, and when ending sessions, Cherry's windows
+disappear at once, and it stops those programs and ends the sessions before it
+exits (within 10 s). A log out, restart or shut down does not ask about
+sessions and ends none itself (the system then ends them), but warns about
+programs still running in them, as it does for native tabs, and an update keeps them
+without asking. Removing a worktree ends its sessions. A
+terminal tab whose shell exits with status 0 closes by itself, and the window
+closes with its last tab; turn off **Close a tab when its shell exits** to
+keep such tabs. Turn off **Run local terminals as persistent sessions** to
+run new tabs as ordinary native tabs. Tabs are ordinary tabs anyway while the
+app runs from a disk image, has no `cherry` helper, or cannot start a
+session, and in a second copy of the app that shares the first one's app
+data (Settings › Sessions says why). Sessions on SSH hosts always keep running when you close a tab, close a window or quit.
+
+Sessions of windows or tabs you closed that keep running are listed under
+**Background sessions** in the Cherry menu bar icon: click one to show it in a
+tab (its project's window opens again with its other tabs), or hover and click
+**End** twice to stop it (**Remove** for one that already ended). **Cherry →
+End Background Sessions…**, **End All…** in that list and **Settings ›
+Sessions › Background Sessions** end them all after asking. When Cherry opens
+and agents, commands or busy terminals among them still run, a notice at the
+bottom of a window says so once, with **Reopen** and **End…** (its time runs
+only while that window is in front); sessions you kept running when you closed
+their tab or window, and idle shells, are not mentioned. Turn that off with
+**Tell me about background sessions when Cherry opens**. Only Cherry's own sessions are listed there; sessions made with the
+`cherry` CLI or by another app are in Persistent Sessions.
 
 Open **File → Persistent Sessions…** (`Cmd-Shift-R`) to see every session on
 **This Mac** or an SSH destination, and to create, attach to, or terminate

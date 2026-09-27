@@ -6,7 +6,8 @@ import Testing
 // Where the quit confirmation sheet goes, and its one answer
 // (CherryAppDelegate.applicationShouldTerminate): the sheet must sit on a
 // project window the user can see, and a sheet whose window closes first
-// cancels the quit rather than leave AppKit waiting for a reply.
+// cancels the quit rather than leave AppKit waiting for a reply. The same
+// holds for the question about running sessions (SessionCloseFlowQuitTests).
 
 @MainActor
 private func makeWindow() -> NSWindow {
@@ -93,4 +94,21 @@ private func eventually(_ condition: () -> Bool) async -> Bool {
     try? await Task.sleep(for: .milliseconds(100))
     answer.resolve(false)
     #expect(answers.value == [true])
+}
+
+@Test @MainActor func closingTheSessionsQuestionsWindowFirstCancelsTheQuitOnce() async {
+    // "Keep N sessions running in the background?" goes where the quit
+    // confirmation goes, with the same one answer.
+    let parent = makeWindow()
+    let answers = Recorder<[SessionTeardownAnswer]>([])
+    let answer = QuitConfirmationAnswer<SessionTeardownAnswer>(parent: parent, cancelled: .cancel) {
+        answers.value.append($0)
+    }
+
+    parent.close()
+    #expect(await eventually { answers.value == [.cancel] })
+    #expect(answer.isResolved)
+    // End Sessions answered as the sheet ends with its window: ignored.
+    answer.resolve(.end)
+    #expect(answers.value == [.cancel])
 }

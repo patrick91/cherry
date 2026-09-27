@@ -889,7 +889,7 @@ final class WorkspaceRestoreCancellation {
 /// this run belongs to this run's tabs) and after the saved state it would
 /// be missing from (`createdSince`, the last save, to the second): a
 /// session created before that save and missing from it was left running on
-/// purpose (a tab closed with "Keep running after closing a tab").
+/// purpose (a detached tab).
 ///
 /// Without a usable state file:
 /// - When this version moved one aside (another version's, or one that

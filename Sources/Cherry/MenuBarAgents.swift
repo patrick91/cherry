@@ -489,6 +489,8 @@ struct MenuBarStatusLabel: View {
 
 struct MenuBarAgentsPanel: View {
     @ObservedObject var model: MenuBarAgentsModel
+    /// This app's sessions no open tab shows (`BackgroundSessionsModel`).
+    @ObservedObject var background: BackgroundSessionsModel
     @State private var listHeight: CGFloat = 96
 
     // Grow the panel to fit its rows so a handful of agents never scrolls; only once
@@ -497,7 +499,7 @@ struct MenuBarAgentsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if model.groups.isEmpty {
+            if model.groups.isEmpty && background.sessions.isEmpty {
                 Text("No active agents")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
@@ -505,9 +507,17 @@ struct MenuBarAgentsPanel: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 18)
             } else {
+                // Agents and background sessions scroll together, under the one cap.
                 ScrollView {
-                    agentList
-                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !model.groups.isEmpty {
+                            agentList
+                        }
+                        if !background.sessions.isEmpty {
+                            backgroundSection
+                        }
+                    }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
                 }
                 .frame(height: min(listHeight, Self.maxListHeight))
                 .scrollBounceBehavior(.basedOnSize)
@@ -518,6 +528,7 @@ struct MenuBarAgentsPanel: View {
             footer
         }
         .frame(width: 300)
+        .onAppear { background.panelDidAppear() }
     }
 
     private var agentList: some View {
@@ -534,6 +545,41 @@ struct MenuBarAgentsPanel: View {
                 ForEach(group.items) { item in
                     MenuBarAgentRow(item: item) { model.reveal(item) }
                 }
+            }
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 6)
+    }
+
+    // Sessions of closed windows or tabs that keep running: a click shows one in a
+    // tab (reopening its window); End asks inline, never with an alert, which would
+    // take focus and close the panel. End All asks on a project window.
+    private var backgroundSection: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 8) {
+                Text("Background sessions")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button("End All…") {
+                    // After the click: the confirmation may activate a project window,
+                    // which closes this panel.
+                    DispatchQueue.main.async { background.confirmEndAll() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .help("End every background session")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
+            ForEach(background.sessions) { item in
+                MenuBarBackgroundSessionRow(
+                    item: item,
+                    open: { background.open(item) },
+                    end: { background.end(item) }
+                )
             }
         }
         .padding(.top, 2)
@@ -593,6 +639,128 @@ private struct MenuBarAgentRow: View {
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
         .padding(.horizontal, 6)
+    }
+}
+
+// A background session: its kind's glyph, its name and project, and what it does
+// now. Hovering swaps the status for End; a running session's End asks once more
+// inline ("End Session"), an ended one is only removed. The confirmation takes the
+// same spot, so it ignores clicks for a moment: a double click on End is not a yes.
+private struct MenuBarBackgroundSessionRow: View {
+    let item: BackgroundSession
+    let open: () -> Void
+    let end: () -> Void
+    @State private var isHovering = false
+    @State private var isConfirmingEnd = false
+    @State private var confirmationShownAt = Date.distantPast
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: open) {
+                HStack(spacing: 8) {
+                    glyph
+                        .frame(width: 14, height: 14)
+                    Text(item.title)
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(item.projectName)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .layoutPriority(-1)
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show in a tab")
+
+            trailing
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(MenuBarRowHighlight(isActive: isHovering))
+        .onHover { hovering in
+            isHovering = hovering
+            if !hovering { isConfirmingEnd = false }
+        }
+        .padding(.horizontal, 6)
+    }
+
+    @ViewBuilder
+    private var glyph: some View {
+        switch item.kind {
+        case .agent:
+            MenuBarAgentGlyph(agentKey: item.agentKey ?? item.title)
+        case .command:
+            Image(systemName: "play.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        case .terminal:
+            Image(systemName: "terminal")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        if isHovering, item.isRunning {
+            if isConfirmingEnd {
+                Button {
+                    guard BackgroundSessionPresentation.acceptsConfirmation(shownAt: confirmationShownAt) else { return }
+                    end()
+                } label: {
+                    Text("End Session")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color(nsColor: .systemRed)))
+                }
+                .buttonStyle(.plain)
+                .help("End this session: its program stops.")
+            } else {
+                Button {
+                    confirmationShownAt = Date()
+                    isConfirmingEnd = true
+                } label: {
+                    Label("End", systemImage: "xmark.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("End this session: its program stops.")
+            }
+        } else if isHovering {
+            Button("Remove", action: end)
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .help("Remove this ended session and its final screen.")
+        } else {
+            HStack(spacing: 7) {
+                Text(BackgroundSessionPresentation.statusText(of: item))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let color = Self.color(for: BackgroundSessionPresentation.tone(of: item)) {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 7, height: 7)
+                }
+            }
+        }
+    }
+
+    private static func color(for tone: BackgroundSessionPresentation.Tone) -> Color? {
+        switch tone {
+        case .active: Color(nsColor: .systemBlue)
+        case .idle: Color(nsColor: .tertiaryLabelColor)
+        case .ended: nil
+        }
     }
 }
 

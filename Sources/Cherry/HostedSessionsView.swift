@@ -287,8 +287,16 @@ struct HostedSessionsSheet: View {
         controller.sessions.first { $0.id == selectedSessionID }
     }
 
-    private var canAttachSelectedSession: Bool {
+    private var canActOnSelectedSession: Bool {
         !controller.isBusy && controller.loadedHost == selectedHost && selectedSession?.isRunning == true
+    }
+
+    /// Not a session this app is ending: its closed tab's ⌘Z brings it
+    /// back as the tab's own (`BackgroundSessionsModel.isEnding`).
+    private var canAttachSelectedSession: Bool {
+        guard canActOnSelectedSession, let selectedSession else { return false }
+        guard selectedHost == .local, let hostID = controller.hostID else { return true }
+        return !BackgroundSessionsModel.shared.isEnding(selectedSession, hostID: hostID)
     }
 
     var body: some View {
@@ -388,7 +396,7 @@ struct HostedSessionsSheet: View {
 
             HStack {
                 Text(selectedHost == .local
-                    ? "Closing a tab of This Mac follows Settings › Sessions. Terminate stops the session."
+                    ? "Closing a tab ends this app's own sessions and disconnects from the others. Terminate stops the session."
                     : "Closing a tab disconnects it. Terminate stops the hosted process.")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
@@ -400,7 +408,7 @@ struct HostedSessionsSheet: View {
                     .help("Remove this exited session and its retained terminal history")
                 } else {
                     Button("Terminate…", role: .destructive) { terminationCandidate = selectedSession }
-                        .disabled(!canAttachSelectedSession)
+                        .disabled(!canActOnSelectedSession)
                 }
                 Button("Attach & Take Over") { attachSelectedSession(takeover: true) }
                     .disabled(!canAttachSelectedSession)
@@ -498,12 +506,13 @@ struct HostedSessionsSheet: View {
         dismiss()
     }
 
-    /// Marks this app's own sessions: those a tab owns now, and those a tab
-    /// started (kept after the tab closed).
+    /// Marks this app's own sessions: those being ended (their tab closed;
+    /// they cannot be attached), those an open tab shows, those in the
+    /// background (Background Sessions in the menu bar lists them), and the
+    /// others (a window's restore may still bring them back).
     private func ownershipLabel(for session: HostedSessionInfo) -> String? {
-        guard selectedHost == .local, session.owner == PersistentLocalSessions.appOwner else { return nil }
-        if PersistentLocalSessions.shared.owningTab(of: session.id) != nil { return "Open in a tab" }
-        return PersistentLocalSessions.tabID(of: session) != nil ? "From a closed tab" : "This app"
+        guard selectedHost == .local, let hostID = controller.hostID else { return nil }
+        return BackgroundSessionsModel.shared.ownershipLabel(for: session, hostID: hostID)
     }
 }
 

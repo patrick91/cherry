@@ -36,16 +36,32 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case splitDuplicate
         case focusPreviousPane
         case focusNextPane
+        case detachSelectedSessionOrWindow
         case closeSelectedSessionOrWindow
+        case undoClosedTab
         case terminate
         case openSettings
     }
 
+    /// The app shortcut a key press in a project window is, taken here so
+    /// that the terminal never sees it (Ghostty's own ⌘D and ⌘⇧D split its
+    /// surface). `charactersIgnoringModifiers` keeps Shift: ⌘⇧D arrives as
+    /// "D". ⌘Z brings back the window's latest closed or detached tab
+    /// (`ClosedTabHistory`) unless a text view has the keyboard
+    /// (`textHasKeyboard`: the notes editor, a search or name field), whose
+    /// own undo it is then; the terminal program never gets it. Caps Lock,
+    /// and the keypad and function flags AppKit adds to some keys, are not
+    /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab.
     nonisolated static func shortcutAction(
         charactersIgnoringModifiers: String?,
-        modifiers: NSEvent.ModifierFlags
+        modifiers: NSEvent.ModifierFlags,
+        textHasKeyboard: Bool = false
     ) -> ShortcutAction? {
         let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        if modifiers == [.command, .shift] {
+            return charactersIgnoringModifiers?.lowercased() == "d" ? .splitDuplicate : nil
+        }
         guard modifiers == .command else { return nil }
 
         switch charactersIgnoringModifiers?.lowercased() {
@@ -63,13 +79,15 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case "t":
             return .addSession
         case "d":
-            return .splitDuplicate
+            return .detachSelectedSessionOrWindow
         case "[":
             return .focusPreviousPane
         case "]":
             return .focusNextPane
         case "w":
             return .closeSelectedSessionOrWindow
+        case "z":
+            return textHasKeyboard ? nil : .undoClosedTab
         case "q":
             return .terminate
         case ",":
@@ -234,7 +252,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
             guard let action = AppShortcutMonitor.shortcutAction(
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers,
-                modifiers: modifiers
+                modifiers: modifiers,
+                textHasKeyboard: !ClosedTabUndoRouting.actsOnClosedTabs(firstResponder: window?.firstResponder)
             ) else {
                 return false
             }
@@ -283,8 +302,14 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 workspace?.focusPreviousPane()
             case .focusNextPane:
                 workspace?.focusNextPane()
+            case .detachSelectedSessionOrWindow:
+                detachSelectedSessionOrWindow()
             case .closeSelectedSessionOrWindow:
                 closeSelectedSessionOrWindow()
+            case .undoClosedTab:
+                if chromeState?.closedTabs.undoLatest() != true {
+                    NSSound.beep()
+                }
             case .terminate:
                 NSApp.terminate(nil)
             case .openSettings:
@@ -295,6 +320,16 @@ struct AppShortcutMonitor: NSViewRepresentable {
         func closeSelectedSessionOrWindow() {
             guard let workspace else { return }
             SessionCloseCoordinator.closeSelectedTabOrWindow(
+                workspace: workspace,
+                repository: repository,
+                chromeState: chromeState,
+                window: window
+            )
+        }
+
+        func detachSelectedSessionOrWindow() {
+            guard let workspace else { return }
+            SessionCloseCoordinator.detachSelectedTabOrWindow(
                 workspace: workspace,
                 repository: repository,
                 chromeState: chromeState,

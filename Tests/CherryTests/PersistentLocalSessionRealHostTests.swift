@@ -288,7 +288,7 @@ private final class RealLocalHost {
 }
 
 @Test(.enabled(if: realHostEnabled))
-@MainActor func PersistentLocalRealHostClosingEndsTheSessionUnlessKeptAndRestartKeepsTheTab() async throws {
+@MainActor func PersistentLocalRealHostClosingEndsTheSessionDetachingKeepsItAndRestartKeepsTheTab() async throws {
     let host = try await RealLocalHost()
     let workspace = host.workspace()
     do {
@@ -305,17 +305,15 @@ private final class RealLocalHost {
             try await host.hostSession(closedSession) == nil
         }
 
-        // Keep running after closing a tab: the session stays.
-        host.settings.value.keepLocalSessionsAfterTabClose = true
+        // Detaching a tab (⌘D): the session stays.
         let kept = workspace.addSession(title: "Kept")
         try await host.waitFor("the kept tab to attach") { kept.persistentSession != nil && kept.state == .live }
         let keptSession = try #require(kept.persistentSession?.sessionID)
-        workspace.close(kept)
+        workspace.close(kept, intent: .userDetachedTab)
         try await Task.sleep(for: .seconds(1))
         let keptInfo = try #require(try await host.hostSession(keptSession))
         #expect(keptInfo.isRunning)
         #expect(keptInfo.tags[PersistentSessionTag.tab] == kept.id.uuidString)
-        host.settings.value.keepLocalSessionsAfterTabClose = false
 
         // Restart keeps the tab (and its CHERRY_PROCESS_ID) and starts a new
         // session; the old one is gone.
@@ -380,6 +378,90 @@ private final class RealLocalHost {
         await host.tearDown()
         throw error
     }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostAShellThatExitsCleanlyClosesItsTabAndLeavesNoSession() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        let anchor = workspace.addSession(title: "anchor")
+        let terminal = workspace.addSession(title: "bash")
+        host.show(terminal)
+        try await host.waitFor("the tabs to attach") {
+            [anchor, terminal].allSatisfy { $0.persistentSession != nil && $0.state == .live }
+        }
+        terminal.send(text: "echo BASH_$((40 + 2))\n")
+        try await host.waitFor("bash to run the echo") { host.screen(terminal).contains("BASH_42") }
+        let sessionID = try #require(terminal.persistentSession?.sessionID)
+        // Past the minimum run time: a shell that ends at once keeps its tab.
+        let startedAt = try #require(terminal.programStartedAt)
+        let remaining = workspace.backendPolicy.cleanExitMinimumRunTime + 0.2 - Date().timeIntervalSince(startedAt)
+        if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+
+        terminal.send(text: "exit\n")
+        try await host.waitFor("the tab to close") { !workspace.sessions.contains { $0 === terminal } }
+        #expect(terminal.state == .exited(0))
+        #expect(workspace.sessions.map(\.id) == [anchor.id])
+        try await host.waitFor("its session to be removed") { try await host.hostSession(sessionID) == nil }
+        #expect(anchor.isRunning)
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostAWaitUnderWayGetsTheLastOutputOfATabThatClosedOnExit() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    do {
+        let anchor = workspace.addSession(title: "anchor")
+        let terminal = workspace.addSession(title: "shell")
+        host.show(terminal)
+        try await host.waitFor("the tabs to attach") {
+            [anchor, terminal].allSatisfy { $0.persistentSession != nil && $0.state == .live }
+        }
+        terminal.send(text: "echo MARKER_$((40 + 2))\n")
+        try await host.waitFor("the shell to run the echo") { host.screen(terminal).contains("MARKER_42") }
+        // Past the minimum run time: a shell that ends at once keeps its tab.
+        let startedAt = try #require(terminal.programStartedAt)
+        let remaining = workspace.backendPolicy.cleanExitMinimumRunTime + 0.2 - Date().timeIntervalSince(startedAt)
+        if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+
+        // An agent waits on the tab while its shell exits: the tab closes,
+        // and the wait still returns what it showed last.
+        let waiting = Task { @MainActor in
+            try await control.send(.waitForProcessIdle(.init(
+                processID: terminal.id.uuidString, requireNewOutput: true,
+                quietMilliseconds: 10_000, timeoutMilliseconds: 15_000
+            )))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        terminal.send(text: "exit\n")
+        try await host.waitFor("the tab to close") { !workspace.sessions.contains { $0 === terminal } }
+        let response = try await waiting.value
+        guard case .waitForProcessIdle(let idle)? = response.result else {
+            throw HostedSessionError.message("Expected waitForProcessIdle, got \(String(describing: response))")
+        }
+        #expect(idle.reason == .exited)
+        #expect(idle.output.lines.contains { $0.contains("MARKER_42") })
+        // The tab itself is gone.
+        let status = try await control.send(.getProcessStatus(.init(processID: terminal.id.uuidString)))
+        #expect(status.error?.code == "terminal_not_found")
+    } catch {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    control.stop()
     workspace.closeAllSessions(intent: .windowClosed)
     await host.tearDown()
 }
@@ -887,6 +969,52 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         await host.tearDown()
         throw error
     }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostDetachedTabIsInTheBackgroundAndEndingItLeavesNothingOnTheHost() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    let model = BackgroundSessionsModel(
+        localSessions: host.hosting, registry: ProjectWindowRegistry(), presentAlert: { _, _, _ in }
+    )
+    do {
+        let anchor = workspace.addSession(title: "Anchor")
+        try await host.waitFor("the anchor tab to attach") { anchor.persistentSession != nil && anchor.state == .live }
+        model.refresh()
+        #expect(model.sessions.isEmpty)
+
+        // A detached tab (⌘D): its session runs on in the background.
+        let kept = workspace.addSession(title: "Kept")
+        try await host.waitFor("the kept tab to attach") { kept.persistentSession != nil && kept.state == .live }
+        let keptSession = try #require(kept.persistentSession?.sessionID)
+        workspace.close(kept, intent: .userDetachedTab)
+        try await host.waitFor("the kept session to be in the background") {
+            model.refresh()
+            return model.sessions.map(\.id) == [keptSession]
+        }
+        let item = try #require(model.sessions.first)
+        #expect(item.title == "Kept")
+        #expect(item.isRunning)
+        #expect(item.projectRoot != nil)
+
+        // End: the host kills it and removes it; nothing is left of it.
+        let ending = try #require(model.end(item))
+        #expect(model.sessions.isEmpty)
+        await ending.value
+        #expect(try await host.hostSession(keptSession) == nil)
+        model.refresh()
+        #expect(model.sessions.isEmpty)
+        #expect(try await host.hostSession(try #require(anchor.persistentSession?.sessionID))?.isRunning == true)
+    } catch {
+        model.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    model.stop()
     workspace.closeAllSessions(intent: .windowClosed)
     await host.tearDown()
 }

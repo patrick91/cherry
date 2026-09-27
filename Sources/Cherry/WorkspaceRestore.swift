@@ -40,7 +40,12 @@ extension WorkspaceSessionRestorers {
     ///   (`HostControl.holdersRegistered()`, the result's
     ///   `retryWhenAvailable`), or at the next launch. A complete list drops
     ///   it at once. A host that does not report pending holders is listed
-    ///   once more after `disappearanceConfirmationDelay`.
+    ///   once more after `disappearanceConfirmationDelay`. A record the
+    ///   system ended (`WorkspaceRestoreRequest.systemEnds`: a restart or log
+    ///   out while Cherry was closed) comes back as an ended tab instead of
+    ///   being dropped (`makeSystemEndedSession`), and so does a record
+    ///   saved as one (`WorkspaceSessionRecord.systemEnd`), with nothing to
+    ///   ask its host.
     /// - Host unreachable (or This Mac cannot run sessions): the record stays
     ///   saved for the next launch; for This Mac, also until the host comes
     ///   up during this run (`WorkspaceRestoreResult.retryWhenAvailable`).
@@ -137,7 +142,9 @@ private final class ControlPlaneRestore {
     func run(initialWait: Duration) async -> WorkspaceRestoreResult {
         var localRecords: [WorkspaceSessionRecord] = []
         var remoteGroups: [(host: HostedSessionHost, records: [WorkspaceSessionRecord])] = []
-        for record in request.records {
+        // Tabs saved ended by the system come back ended again.
+        let systemEnded = (request.records + request.unboundRecords).filter { $0.systemEnd != nil }
+        for record in request.records where record.systemEnd == nil {
             // A record for a host that is not valid can never come back.
             guard let host = record.hosted?.hostedSessionHost else { continue }
             if host == .local {
@@ -148,8 +155,11 @@ private final class ControlPlaneRestore {
                 remoteGroups.append((host, [record]))
             }
         }
-        let unbound = request.unboundRecords.filter { $0.hosted == nil }
+        let unbound = request.unboundRecords.filter { $0.hosted == nil && $0.systemEnd == nil }
         var parts: [RestorePart] = []
+        if !systemEnded.isEmpty {
+            parts.append(start(Self.ids(systemEnded)) { [self] in await restoreSystemEnded(systemEnded) })
+        }
         if !localRecords.isEmpty || !unbound.isEmpty {
             parts.append(start(Self.ids(localRecords + unbound)) { [self] in
                 await restoreLocal(localRecords, unbound: unbound, lookingAgain: true)
@@ -288,6 +298,51 @@ private final class ControlPlaneRestore {
         })
     }
 
+    // MARK: Ended by the system
+
+    /// Tabs saved ended by the system (`WorkspaceSessionRecord.systemEnd`):
+    /// they come back ended, as they were, unless This Mac's host has a
+    /// session this app started for the tab (`cherry.tab`) since: a Restart
+    /// whose new binding was never saved (the app ended first). That one
+    /// comes back as the tab's own. When the host cannot be listed, the tab
+    /// comes back ended.
+    private func restoreSystemEnded(_ records: [WorkspaceSessionRecord]) async -> WorkspaceRestoreResult {
+        guard !isStopped else { return .keeping(records) }
+        var listing: LocalListing?
+        if localSessions.installationProblem() == nil {
+            listing = try? await localSessions.list()
+        }
+        guard !isStopped else { return .keeping(records) }
+        var result = WorkspaceRestoreResult()
+        for record in records where !isOpen(record.id) {
+            if let listing, let started = taggedSession(for: record.id, in: listing.list) {
+                if let tab = restoreLocalSession(started, for: record, owning: true, listing: listing) {
+                    result.sessions.append(tab)
+                }
+                continue
+            }
+            guard let end = record.systemEnd else { continue }
+            result.sessions.append(built(request.workspace.makeSystemEndedSession(record: record, ended: end)))
+        }
+        return result
+    }
+
+    /// The records of `dropped`, whose sessions `list` (of This Mac, not
+    /// waiting for holders) does not have, that the system ended
+    /// (`WorkspaceRestoreRequest.systemEnds`), as ended tabs; the others
+    /// are dropped.
+    private func systemEndedTabs(of dropped: [WorkspaceSessionRecord], missingFrom list: HostedSessionList) -> [TerminalSession] {
+        guard let systemEnds = request.systemEnds, !isStopped else { return [] }
+        let closesCleanExits = request.workspace.backendPolicy.settings().closeTabsOnCleanExit
+        return dropped.compactMap { record in
+            guard let end = systemEnds.end(of: record, missingFrom: list) else { return nil }
+            // A terminal whose shell had exited with status 0 would have
+            // closed its tab: it stays dropped.
+            if record.kind == .terminal, record.exitStatus == 0, closesCleanExits { return nil }
+            return built(request.workspace.makeSystemEndedSession(record: record, ended: end))
+        }
+    }
+
     // MARK: This Mac
 
     private typealias LocalListing = (list: HostedSessionList, attachment: (HostedSessionInfo) -> HostedSessionAttachment)
@@ -386,6 +441,15 @@ private final class ControlPlaneRestore {
         }
         // Only a tab whose Create was under way names a session to wait for.
         unmatched = unmatched.filter { $0.launchRequestID != nil }
+        // Those dropped now whose sessions the system ended come back ended:
+        // missing ones once no second look is due (this list is complete,
+        // or it is the second look), unmatched ones unless holders are
+        // still expected.
+        let dropsMissing = !list.awaitsHolders && !(lookingAgain && list.pendingHolders == nil)
+        result.sessions += systemEndedTabs(
+            of: (dropsMissing ? missing : []) + (list.awaitsHolders ? [] : unmatched),
+            missingFrom: list
+        )
         if lookingAgain {
             if list.awaitsHolders {
                 let control = localSessions.control

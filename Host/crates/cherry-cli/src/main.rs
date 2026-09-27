@@ -340,6 +340,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     host_id,
                     sessions,
                     pending_holders,
+                    ..
                 } => {
                     let mut text = String::new();
                     if json {

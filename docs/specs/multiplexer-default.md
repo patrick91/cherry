@@ -299,10 +299,21 @@ Relaunch: each project window restores its saved tabs (same tab UUIDs, kinds,
 titles, split layout, selection). Hosted sessions that still run are reattached;
 exited ones show "Session ended (exit N)" with Close/Remove, except that with
 *close on exit* on, a terminal of this app whose shell exited with status 0
-is not restored and its session is removed; missing ones are dropped. Native
-tabs are not restored (their processes are gone), except that auto-start
-commands start as today. Windows that had tabs reopen even when macOS window
-restoration is off.
+is not restored and its session is removed. Missing ones are dropped, except
+this app's own sessions that the system ended while Cherry was closed (a
+restart, shut down, crash or power loss of the Mac, or a log out): their tabs
+come back in their places (order, splits, agent tree, selection) as ended
+tabs with their kind, title, agent, command and last directory, saying "Ended
+when the Mac restarted" or "Ended when you logged out", with **Restart** (a
+new session in the tab's directory with the same launch: the shell, command
+or agent started fresh; no conversation is resumed) and **Close**; the window
+opens no default shell for them, and a toast in each such window says "N tabs
+ended when the Mac restarted" with **Restart All**. Tabs whose sessions this
+app ended on purpose stay dropped. See "Sessions the system ended" under
+[App: persistence and restore](#app-persistence-and-restore) for the rule.
+Native tabs are not restored (their processes are gone), except that
+auto-start commands start as today. Windows that had tabs reopen even when
+macOS window restoration is off.
 
 Fallback: when the local host cannot run (disk image, App Translocation, helper
 missing, daemon start failure, or another copy of the app with the same app
@@ -527,6 +538,13 @@ differs from the design above.
   sends it, even when 0, and it is also the sign that the host knows
   `Screen.max_lines`: a stage-3 host at the same protocol version ignores
   `max_lines`.
+- A daemon that starts drops the manifests of holders that are gone (a
+  holder that exits removes its own, so such a holder was killed: a log out
+  or restart kills them all while no daemon runs) and lists their sessions in
+  `Sessions.lost_sessions` (sorted, left out when empty, for the daemon's
+  lifetime). A session ended on purpose (Kill, Remove, its program's exit)
+  never appears there. An optional field: `PROTOCOL_VERSION` did not change,
+  and an older host sends none.
 - `SessionInfo` gained `alternate_screen` and `kitty_keyboard_flags` (the
   active screen's), `application_cursor_keys` (DECCKM, mode `?1`, which
   libghostty keeps terminal-wide, so a screen switch does not change it; it
@@ -1082,7 +1100,9 @@ differs from the design above.
     `pending_holders` (an older one) is listed once more after
     `disappearanceConfirmationDelay` (2 s); still missing, the record is
     dropped. A local host that now has another identity (its state was
-    reset) drops it at once.
+    reset) drops it at once. Whenever a record of This Mac would be dropped
+    this way, one whose session the system ended comes back as an ended tab
+    instead (next bullet).
   - Unreachable, an SSH host that answers with an identity other than the
     trusted one, or this app cannot run local sessions: the record stays
     saved, and so does a record saved while its Create had not answered
@@ -1096,6 +1116,108 @@ differs from the design above.
     restore listened for it), or after `restoreRetryDelay` (10 s) when the
     list failed on a connection that stayed up. SSH records wait for the
     next launch.
+- **Sessions the system ended** (`SystemEndedSessions`,
+  `WorkspaceRestore.swift` and `WorkspaceStateStore.swift`). A saved tab that
+  owned a session of This Mac (`mayOwnLocalSession`: bound to one it owned,
+  or saved while its Create was under way) whose session a list of the same
+  host identity no longer has, at the moment the record would be dropped
+  (a complete list, or the second look), comes back as an ended tab
+  (`TerminalWorkspace.makeSystemEndedSession`) when this app did not end it
+  on purpose and one of these says the system ended it:
+  1. This Mac booted after an open tab last saved the record (its own
+     `savedAt`, which a record kept while its host could not be listed
+     keeps when it is saved again; else the file's `savedAt`; before
+     `kern.boottime`, in whole seconds): "Ended when the Mac restarted".
+     This covers a crash, a power loss and a forced restart, which run no
+     Cherry code.
+  2. Cherry quit for a log out, restart or shut down after that:
+     `CherryAppDelegate.recordSystemQuit` records such a quit in
+     `Workspaces/system-quits.json` in `applicationWillTerminate`, after the
+     quit's last saves (the newest 32), only when the quit Apple event
+     itself names a log out, restart or shut down (`kAEQuitReason`), not
+     for a quit that only came within 5 minutes of the system announcing
+     one: "Ended when you logged out" (a restart also moved the boot time,
+     rule 1).
+  3. The host lists the session in `lost_sessions` (its holder was killed
+     while no daemon ran, as a log out does even while Cherry is not
+     running), now or in a list this app took earlier:
+     `PersistentLocalSessions` copies every lost session it sees into
+     `Workspaces/lost-sessions.json`, since a daemon forgets them when it
+     restarts: "Ended when you logged out".
+
+  Without any of them (a normal relaunch, a session that ended while the Mac
+  ran) the record is dropped as before. "On purpose" is any of: its session
+  is being ended now (`isEnding`); its tab was in `sessions-to-end.json` when
+  the window opened or is now; or its session is in
+  `Workspaces/ended-sessions.json`, where `PersistentLocalSessions.end`
+  records every session this app ends (a tab's close, End Sessions on a
+  window close or quit, Background Sessions → End, a removed worktree, a
+  clean exit's removal, a restart's previous session) and the Persistent
+  Sessions sheet records Terminate and Remove of This Mac's sessions: a
+  window closed or a quit with End Sessions saved its tabs before ending
+  them, and a closed window's record still names the sessions ended from
+  Background Sessions. Its entries never expire: each write drops the
+  entries no saved state file names any more (`lost-sessions.json` is
+  pruned the same way). A file that cannot be read is moved aside and the
+  list starts again with `lostBefore`: a record saved before then counts as
+  ended on purpose, so the loss drops tabs rather than bringing back ones
+  ended on purpose. A log out, restart or shut down while *on quit* is End
+  Sessions records the sessions ⌘Q would have ended (the open windows'
+  persistent tabs and their saved tabs no open tab shows,
+  `ProjectWindowRegistry.localSessionsEndedByAQuit`) as ended on purpose,
+  so their tabs do not come back, as after ⌘Q. Records attached to
+  sessions they did not own, SSH hosts' records and native tabs are never
+  brought back this way.
+
+  A record saves its program's exit (`exitStatus`) once its host reported
+  the session exited (a persistent tab's exit is saved at once). Such a
+  record is never taken for a session the system ended while it ran: when
+  the rule above holds, it comes back as "Session ended (exit N)" (a
+  terminal whose shell exited with status 0 stays dropped while *close on
+  exit* is on), is saved so, and never restarts by itself (a command whose
+  auto-restart gave up stays stopped; auto-start aside) nor counts in the
+  toast or Restart All.
+
+  The ended tab is built like the tab that saved it (id, kind, title, agent,
+  parent agent, command, launch settings, project) but not launched, in its
+  saved place, split and agent tree; `TerminalSession.systemSessionEnd`
+  says why, and `PersistentSessionEndedBar` shows "Ended when the Mac
+  restarted" (or "…when you logged out") with **Restart** and **Close**, for
+  commands too (instead of `CommandExitStatusBar`). It is a persistent tab
+  with no session (a native one while *persistent* is off): Restart (the
+  bar, the menu, MCP `restart_process` or `start_process`) creates a new
+  session for the same tab id in the tab's saved directory (or where it
+  started, or its project, when that is gone), with the same shell, command
+  or agent command, started fresh; `claude --continue` is not used, since
+  several agents may share a directory. Any start clears `systemSessionEnd`.
+  Until then it is saved with `systemEnd` and no binding
+  (`WorkspaceSessionRecord.systemEnd`; older builds ignore the field and
+  drop the tab), and comes back ended at every launch, whatever the
+  settings, until it restarts or closes, unless This Mac's host has a
+  session this app started for the tab (`cherry.tab`): a Restart whose new
+  binding was never saved (the app ended first) comes back as the tab's
+  own session. A saved ended tab names no tab id for orphan adoption either,
+  so such a session is adopted if the restore did not take it. The window opens no
+  default shell for a worktree that got tabs back, as for any restored tab.
+  A command with auto-start is started in its tab by auto-start, and one
+  with auto-restart restarts by its policy (`showSystemSessionEnd`), as for
+  a restored command whose session ended.
+
+  The first time a window's restores bring such tabs back in a run (not tabs
+  saved ended), a toast (`ProjectWindowToast.systemEndedTabs`, unprompted:
+  its time runs only while its window is key) says "N tabs ended when the
+  Mac restarted" (or "…when you logged out"), with **Restart All**
+  (`RepositoryWorkspace.restartSystemEndedTabs`: each of those tabs still
+  ended) and dismiss; tabs a later step brings back update it. It counts
+  only tabs nothing starts by itself: not those auto-start started (it is
+  shown after auto-start ran) or will start, not commands that restart when
+  they exit, and not those showing an earlier exit.
+
+  They are ended tabs, like "Session ended" ones: they never close by
+  themselves (no program exits), never ask a question on close or quit
+  (nothing runs), cannot detach, and are never background sessions (no
+  session). Closing one ends nothing; it cannot be undone with ⌘Z, since
+  there is no session to bring back (as for native tabs).
 - **Orphan adoption.** Sessions this app created (owner) for a tab
   (`cherry.tab`) in one of the window's worktrees (`cherry.project`) that no
   saved record names are adopted as persistent tabs of that worktree, after
@@ -1399,5 +1521,19 @@ differs from the design above.
   Clear Scrollback on a tab only attached to a session (another app's, the
   CLI's or an SSH host's) leaves that host's history alone. The app does not
   run `cherry restart` by itself.
+- **Sessions the system ended.** A session of this app killed outside it
+  (`cherry kill`, a `kill -9` of its holder while a daemon runs, `cherry
+  shutdown` removing it once ended) is not recorded as ended on purpose: if
+  the Mac then restarts, its saved tab (only a closed window's, whose record
+  still names it) comes back ended. A holder killed while no daemon ran,
+  without a log out, reads as a log out. A save in the second of the boot
+  that came before it cannot be told from one after it (whole seconds), and
+  `kern.boottime` moving after the clock is set could take a save made just
+  after the boot for one before it; both would only bring back an ended tab
+  for a session that is gone. Closing an ended tab cannot be undone. A
+  saved ended tab takes a session started for it only if the host lists it
+  when the restore asks (a restarted daemon whose holders have not
+  registered yet leaves the tab ended). An exit is saved with the next save
+  after the host reports it; a restart within that half second loses it.
 - Nice-to-haves (none blocks): sequence ids on bell and notification events,
   for exact deduplication; per-client sizes in `SessionInfo`.

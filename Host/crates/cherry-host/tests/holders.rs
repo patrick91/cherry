@@ -1246,8 +1246,59 @@ fn a_manifest_naming_a_process_that_is_not_its_holder_is_dropped() {
     host.respawn();
     assert!(!manifest.exists());
     assert_eq!(host.sessions(), []);
+    // Gone without ending: reported lost.
+    assert_eq!(lost_sessions(&host), [id]);
     other.kill().unwrap();
     other.wait().unwrap();
+}
+
+/// The sessions a daemon lists as lost (`Sessions::lost_sessions`).
+fn lost_sessions(host: &Host) -> Vec<String> {
+    match host.call(ClientMessage::List) {
+        ServerMessage::Sessions { lost_sessions, .. } => lost_sessions,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn holders_killed_while_no_daemon_ran_are_reported_lost_and_sessions_ended_on_purpose_are_not() {
+    let mut host = Host::new();
+    let killed = host.create(shell("exec sleep 60"));
+    let ended = host.create(shell("exec sleep 60"));
+    let running = host.create(shell("exec sleep 60"));
+    let killed_holder = holder_of(&host.sandbox, &killed.id);
+    let ended_holder = holder_of(&host.sandbox, &ended.id);
+    // A daemon that started with every holder alive lost nothing.
+    assert_eq!(lost_sessions(&host), Vec::<String>::new());
+    // Ended on purpose: Kill, then Remove; its holder exits and removes
+    // its manifest.
+    host.kill(&ended.id);
+    host.wait(&ended.id, |s| s.state == SessionState::Exited);
+    assert!(matches!(
+        host.call(ClientMessage::Remove {
+            id: ended.id.clone()
+        }),
+        ServerMessage::Ok
+    ));
+    wait_until("the ended session's holder to exit", || {
+        !is_holder(ended_holder)
+    });
+    host.crash();
+    // A log out kills the user's processes, holders included, which then
+    // leave their manifests behind.
+    kill_holder(killed_holder);
+    wait_until("the killed holder to go", || !is_holder(killed_holder));
+    host.respawn();
+    assert_eq!(lost_sessions(&host), [killed.id.as_str()]);
+    assert_eq!(
+        host.adopted()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        [running.id.as_str()]
+    );
+    host.kill(&running.id);
+    host.wait(&running.id, |s| s.state == SessionState::Exited);
 }
 
 #[test]

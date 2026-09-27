@@ -1259,3 +1259,49 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     defer { free(resolved) }
     return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
 }
+
+// MARK: - Quits the system ends sessions after
+
+@Test @MainActor func onlyAPowerOffQuitEventIsRecordedAndOnQuitEndRecordsItsSessionsAsEnded() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-system-quit-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = WorkspaceStateStore(directory: directory)
+    // Only a quit event that names a log out, restart or shut down; not one
+    // without a reason, which counts as a power off only because the system
+    // announced one (a log out another app may have cancelled).
+    for code in [kAELogOut, kAEReallyLogOut, kAEShowRestartDialog, kAEShowShutdownDialog, kAERestart, kAEShutDown] {
+        #expect(CherryAppDelegate.isPowerOffQuit(quitEvent(reason: OSType(code))))
+    }
+    #expect(!CherryAppDelegate.isPowerOffQuit(quitEvent(reason: nil)))
+    #expect(!CherryAppDelegate.isPowerOffQuit(nil))
+
+    let asked = Recorder(0)
+    let ending: () -> [(hostID: String, sessionID: String)] = {
+        asked.value += 1
+        return [(hostID: "host-a", sessionID: "s1")]
+    }
+    let record = WorkspaceSessionRecord(
+        id: UUID(), kind: .terminal, title: "Shell", workingDirectory: "/",
+        hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: "s1", owned: true)
+    )
+    CherryAppDelegate.recordSystemQuit(isPowerOffEvent: false, onQuit: .end, store: store, sessionsEndedByAQuit: ending)
+    #expect(store.loadSystemQuits().isEmpty)
+    #expect(asked.value == 0)
+    // Keep Running (or Ask): the quit is recorded, its sessions are not ended.
+    CherryAppDelegate.recordSystemQuit(isPowerOffEvent: true, onQuit: .keep, store: store, sessionsEndedByAQuit: ending)
+    #expect(store.loadSystemQuits().count == 1)
+    #expect(asked.value == 0)
+    #expect(!store.wasEndedOnPurpose(record))
+    // End Sessions: as after ⌘Q, their tabs do not come back.
+    CherryAppDelegate.recordSystemQuit(isPowerOffEvent: true, onQuit: .end, store: store, sessionsEndedByAQuit: ending)
+    #expect(store.loadSystemQuits().count == 2)
+    #expect(asked.value == 1)
+    #expect(store.wasEndedOnPurpose(record))
+
+    // The launch hands the store to the local sessions, which record what
+    // they end.
+    let localSessions = PersistentLocalSessions(owner: "CherryTests", installationUnavailableReason: { "tests" })
+    #expect(localSessions.endedSessionsStore == nil)
+    CherryAppDelegate.configureSessionRecords(localSessions: localSessions, store: store)
+    #expect(localSessions.endedSessionsStore === store)
+}

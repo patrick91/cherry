@@ -232,6 +232,14 @@ final class PersistentLocalSessions {
 
     let owner: String
     let configuration: Configuration
+    /// Where the sessions this app ends on purpose are recorded
+    /// (`WorkspaceStateStore.addEndedSessions`), so a saved tab that names
+    /// one never comes back as ended by the system. The app sets its store
+    /// at launch; nil records nothing (tests).
+    var endedSessionsStore: WorkspaceStateStore?
+    /// Lost sessions recorded in `endedSessionsStore` during this run (host
+    /// identity + NUL + session id).
+    private var recordedLostSessions: Set<String> = []
     private let makeControl: @MainActor () -> HostControl
     private var controlStorage: HostControl?
     private let installationUnavailableReason: @MainActor () -> String?
@@ -616,6 +624,7 @@ final class PersistentLocalSessions {
     func listing(
         of list: HostedSessionList
     ) -> (list: HostedSessionList, attachment: (HostedSessionInfo) -> HostedSessionAttachment) {
+        noteLostSessions(in: list)
         let control = control
         let executablePath = control.executableURL?.path ?? ""
         let environment = control.loginEnvironment?.environment ?? [:]
@@ -924,11 +933,24 @@ final class PersistentLocalSessions {
     /// holders (`HostControl.listUntilHoldersRegistered`), within
     /// `pendingHoldersWait`: check `isComplete`.
     func completeList(after first: HostedSessionList? = nil) async throws -> HostedSessionList {
-        try await control.listUntilHoldersRegistered(
+        let list = try await control.listUntilHoldersRegistered(
             after: first,
             timeout: configuration.pendingHoldersWait,
             pollInterval: configuration.pendingHoldersPollInterval
         )
+        noteLostSessions(in: list)
+        return list
+    }
+
+    /// Records the sessions the host reports lost (`lostSessionIDs`: their
+    /// holders were killed) in `endedSessionsStore`, the first time this run
+    /// sees them: the host forgets them when its daemon restarts, and a
+    /// window that opens later still needs them (`SystemEndedSessions`).
+    private func noteLostSessions(in list: HostedSessionList) {
+        let fresh = list.lostSessionIDs.filter { !recordedLostSessions.contains("\(list.hostID)\u{0}\($0)") }
+        guard let store = endedSessionsStore, !fresh.isEmpty else { return }
+        recordedLostSessions.formUnion(fresh.map { "\(list.hostID)\u{0}\($0)" })
+        store.addLostSessions(fresh, hostID: list.hostID)
     }
 
     func programState(of binding: HostedSessionAttachment) -> PersistentProgramState {
@@ -954,6 +976,7 @@ final class PersistentLocalSessions {
         unbind(sessionID: binding.sessionID)
         if let ending = endings[binding.sessionID] { return ending }
         guard instanceUnavailableReason == nil else { return Task {} }
+        noteEndedOnPurpose(hostID: binding.hostID, sessionID: binding.sessionID)
         let timeout = timeout ?? configuration.terminationTimeout
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -971,6 +994,13 @@ final class PersistentLocalSessions {
     }
 
     var hasPendingEnds: Bool { !endings.isEmpty }
+
+    /// This app ends this session of This Mac on purpose (`end`, or
+    /// Persistent Sessions → Terminate or Remove): recorded in
+    /// `endedSessionsStore`.
+    func noteEndedOnPurpose(hostID: String, sessionID: String) {
+        endedSessionsStore?.addEndedSessions([(hostID: hostID, sessionID: sessionID)])
+    }
 
     /// Whether the session is being ended, or will be once its tab's close
     /// can no longer be undone (`deferEnd`).

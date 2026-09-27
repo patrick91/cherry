@@ -506,8 +506,26 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(try decode(String(decoding: JSONEncoder().encode(response), as: UTF8.self)) == response)
     let unreported = HostResponse(req: 3, message: .sessions(HostedSessionList(hostID: "h", sessions: [])))
     #expect(try json(JSONEncoder().encode(unreported))["pending_holders"] == nil)
+    #expect(try json(JSONEncoder().encode(unreported))["lost_sessions"] == nil)
     // An exit keeps what identifies the session.
     #expect(info.exited(code: 1, signal: nil).requestID == "r")
+}
+
+@Test func HostControlDecodesTheSessionsWhoseHoldersTheHostFoundKilled() throws {
+    let lost = try decode(#"{"type":"sessions","host_id":"h","sessions":[],"pending_holders":0,"lost_sessions":["s1","s2"]}"#)
+    guard case .sessions(let list) = lost.message else {
+        Issue.record("Expected sessions, got \(lost.message)")
+        return
+    }
+    #expect(list.lostSessionIDs == ["s1", "s2"])
+    #expect(list.isComplete)
+    // Left out by a host with none, and by an older one.
+    let none = try decode(#"{"type":"sessions","host_id":"h","sessions":[],"pending_holders":0}"#)
+    guard case .sessions(let noneList) = none.message else { return }
+    #expect(noneList.lostSessionIDs.isEmpty)
+    let response = HostResponse(req: 4, message: .sessions(list))
+    #expect(try decode(String(decoding: JSONEncoder().encode(response), as: UTF8.self)) == response)
+    #expect(try json(JSONEncoder().encode(response))["lost_sessions"] as? [String] == ["s1", "s2"])
 }
 
 @Test func HostControlDecodesTheProgramsApplicationCursorKeysMode() throws {

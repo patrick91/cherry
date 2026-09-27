@@ -656,6 +656,7 @@ impl Connection {
                     host_id: self.host.id.clone(),
                     sessions,
                     pending_holders,
+                    lost_sessions: self.host.lost.clone(),
                 }
             }
             ClientMessage::Create {

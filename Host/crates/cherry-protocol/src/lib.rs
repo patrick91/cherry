@@ -582,6 +582,15 @@ pub enum ServerMessage {
         /// missing from an older host's list.
         #[serde(default)]
         pending_holders: u32,
+        /// Sessions whose holders were gone when this host started, without
+        /// having ended: each left its manifest behind (it was killed with
+        /// the user's processes at a log out, or by a signal) instead of
+        /// removing it as a holder does when it exits. They are not in
+        /// `sessions`. A session ended on purpose (Kill, Remove, its
+        /// program's exit) is never here. Sorted; for this host's lifetime.
+        /// Left out when empty, and by an older host.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lost_sessions: Vec<String>,
     },
     Created {
         session: SessionInfo,
@@ -2263,11 +2272,13 @@ mod tests {
                 host_id: "h".into(),
                 sessions: vec![session.clone(), exited],
                 pending_holders: 0,
+                lost_sessions: Vec::new(),
             },
             ServerMessage::Sessions {
                 host_id: "h".into(),
                 sessions: Vec::new(),
                 pending_holders: u32::MAX,
+                lost_sessions: vec!["lost-a".into(), "lost-b".into()],
             },
             ServerMessage::Created {
                 session: session.clone(),
@@ -2517,8 +2528,19 @@ mod tests {
                 host_id: "h".into(),
                 sessions: Vec::new(),
                 pending_holders: 2,
+                lost_sessions: Vec::new(),
             }),
             r#"{"type":"sessions","host_id":"h","sessions":[],"pending_holders":2}"#
+        );
+        // Lost sessions only when there are any.
+        assert_eq!(
+            json(&ServerMessage::Sessions {
+                host_id: "h".into(),
+                sessions: Vec::new(),
+                pending_holders: 0,
+                lost_sessions: vec!["s1".into()],
+            }),
+            r#"{"type":"sessions","host_id":"h","sessions":[],"pending_holders":0,"lost_sessions":["s1"]}"#
         );
         // Sent even when 0: its presence tells a host that knows it.
         assert_eq!(
@@ -2526,6 +2548,7 @@ mod tests {
                 host_id: "h".into(),
                 sessions: Vec::new(),
                 pending_holders: 0,
+                lost_sessions: Vec::new(),
             }),
             r#"{"type":"sessions","host_id":"h","sessions":[],"pending_holders":0}"#
         );
@@ -2676,6 +2699,7 @@ mod tests {
                 host_id: "h".into(),
                 sessions: Vec::new(),
                 pending_holders: 0,
+                lost_sessions: Vec::new(),
             }
         );
         assert_eq!(

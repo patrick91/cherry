@@ -78,7 +78,8 @@ private extension PersistentHarness {
         _ records: [WorkspaceSessionRecord],
         unbound: [WorkspaceSessionRecord] = [],
         into workspace: TerminalWorkspace,
-        control: (@MainActor (HostedSessionHost) -> HostControl)? = nil
+        control: (@MainActor (HostedSessionHost) -> HostControl)? = nil,
+        systemEnds: SystemEndedSessions? = nil
     ) async -> WorkspaceRestoreResult {
         let restorer = control.map { WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting, control: $0) } ?? restorer
         return await restorer(WorkspaceRestoreRequest(
@@ -86,7 +87,8 @@ private extension PersistentHarness {
             worktreeRoot: project.path,
             records: records,
             workspace: workspace,
-            unboundRecords: unbound
+            unboundRecords: unbound,
+            systemEnds: systemEnds
         ))
     }
 
@@ -1305,7 +1307,8 @@ private func runGit(_ arguments: [String]) throws {
     let rest = await remainder.value
     #expect(rest.sessions.map(\.id) == [server.id])
     #expect(rest.sessions.first?.persistentSession?.sessionID == "s-server")
-    // A session missing from the complete list is gone: its tab is dropped.
+    // A session missing from the complete list is gone: its tab is dropped
+    // (nothing says the system ended it).
     #expect(rest.keptRecordIDs.isEmpty)
     #expect(rest.pendingRecordIDs.isEmpty)
     #expect(ContinuousClock.now - started < .seconds(10))
@@ -1329,7 +1332,9 @@ private func runGit(_ arguments: [String]) throws {
     var fresh = localRecord(title: "Fresh", sessionID: nil, workingDirectory: project)
     fresh.launchRequestID = UUID().uuidString.lowercased()
 
-    // Complete: no second look.
+    // Complete: no second look. Nothing says the system ended these
+    // sessions (a normal relaunch: no `systemEnds`), so they are dropped;
+    // see aLogOutOrALostHolderBringsTabsBackOnlyOnceNothingMoreIsComing.
     harness.fake.pendingHolders = 0
     let complete = await harness.restore([gone], unbound: [fresh], into: workspace)
     #expect(complete.sessions.isEmpty)
@@ -1547,4 +1552,652 @@ private func runGit(_ arguments: [String]) throws {
     let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path)?.sessions.first)
     #expect(saved.hosted?.sessionID == "s-lost")
     #expect(saved.launchRequestID == requestID)
+}
+
+// MARK: - Sessions the system ended
+
+/// A chrome state whose toasts never go by themselves and reach no VoiceOver.
+@MainActor
+private func quietChromeState() -> ProjectWindowChromeState {
+    ProjectWindowChromeState(toasts: ProjectWindowToasts(
+        schedule: { _, _ in }, announce: { _ in }, voiceOverEnabled: { false }
+    ))
+}
+
+/// Before This Mac's last boot: a state saved then was saved before a restart.
+private func beforeTheLastBoot() throws -> Date {
+    try #require(SystemEndedSessions.currentBootTime()).addingTimeInterval(-3_600)
+}
+
+@Test @MainActor func theSystemEndRuleTakesARestartALogOutOrALostHolderAndNothingElse() {
+    let boot = Date(timeIntervalSince1970: 1_800_000_000.6)
+    func end(savedAt: Date?, quits: [Date] = [], lost: Bool = false) -> SystemSessionEnd? {
+        SystemEndedSessions.end(savedAt: savedAt, bootTime: boot, systemQuits: quits, lostByHost: lost)
+    }
+    // Saved before this boot: the Mac restarted (or shut down, crashed,
+    // lost power) since, whatever else says so.
+    #expect(end(savedAt: boot.addingTimeInterval(-60)) == .restart)
+    #expect(end(savedAt: boot.addingTimeInterval(-60), quits: [boot.addingTimeInterval(-30)], lost: true) == .restart)
+    // Saves keep whole seconds: one in the boot's second is not before it.
+    #expect(end(savedAt: Date(timeIntervalSince1970: 1_800_000_000)) == nil)
+    // Saved since: a quit for a log out after the save, even in its second.
+    let saved = boot.addingTimeInterval(600)
+    #expect(end(savedAt: saved, quits: [saved.addingTimeInterval(120)]) == .logout)
+    #expect(end(savedAt: Date(timeIntervalSince1970: saved.timeIntervalSince1970.rounded(.down)),
+                quits: [saved.addingTimeInterval(0.2)]) == .logout)
+    // A quit before the save says nothing about the sessions it saved.
+    #expect(end(savedAt: saved, quits: [saved.addingTimeInterval(-120)]) == nil)
+    // The host found the holder killed.
+    #expect(end(savedAt: saved, lost: true) == .logout)
+    #expect(end(savedAt: nil, lost: true) == .logout)
+    // Nothing says so: a normal relaunch, or a state that does not say when
+    // it was saved.
+    #expect(end(savedAt: saved) == nil)
+    #expect(end(savedAt: nil, quits: [saved]) == nil)
+    #expect(SystemEndedSessions.end(savedAt: saved, bootTime: nil, systemQuits: [], lostByHost: false) == nil)
+    #expect(SystemEndedSessions.currentBootTime().map { $0 <= Date() } == true)
+}
+
+@Test @MainActor func aRebootBringsTabsBackEndedInTheirPlacesWithoutAShellAndRestartStartsEachKind() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-reboot")
+    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let elsewhere = try canonicalDirectory("cherry-restore-reboot-cwd")
+    let left = localRecord(title: "Left", sessionID: "s-left", workingDirectory: elsewhere.path)
+    let right = localRecord(title: "Right", sessionID: "s-right", workingDirectory: root.path)
+    let lead = localRecord(kind: .agent, title: "Lead", sessionID: "s-lead", agentName: "Claude", workingDirectory: root.path)
+    let helper = localRecord(
+        kind: .agent, title: "Helper", sessionID: "s-helper", agentName: "Codex", parentAgentID: lead.id,
+        workingDirectory: root.path
+    )
+    let web = localRecord(kind: .command, title: "web", sessionID: "s-web", commandName: "web", workingDirectory: root.path)
+    // Still running: a session the restart did not end (another boot's
+    // holder cannot be, but the rule is per tab).
+    let live = localRecord(title: "Live", sessionID: "s-live", workingDirectory: root.path)
+    harness.fake.sessions = [
+        HostedSessionInfo(id: "s-live", name: "Live", cwd: root.path, pid: 70, owner: "CherryTests",
+                          tags: [PersistentSessionTag.tab: live.id.uuidString])
+    ]
+    harness.fake.pendingHolders = 0
+    let splitID = UUID()
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(
+            root: root.path,
+            sessions: [lead, left, helper, web, right, live],
+            displayItems: [WorkspaceDisplayItemRecord(kind: .split, id: splitID), WorkspaceDisplayItemRecord(kind: .single, id: live.id)],
+            splitGroups: [WorkspaceSplitGroupRecord(
+                id: splitID, paneSessionIDs: [left.id, right.id], activeSessionID: right.id, widthWeights: [0.4, 0.6]
+            )],
+            selectedSessionID: right.id,
+            collapsedAgentGroupIDs: [lead.id]
+        )],
+        savedAt: try beforeTheLastBoot()
+    ))
+    let chromeState = quietChromeState()
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer {
+        repository.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        [root, storeDirectory, elsewhere].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
+    await repository.waitForPendingRestores()
+    let workspace = repository.activeWorkspace
+
+    // Every tab back in its place (no default shell), the split, the agent
+    // tree and the selection too.
+    #expect(workspace.sessions.map(\.id) == [lead.id, left.id, helper.id, web.id, right.id, live.id])
+    #expect(workspace.terminalSplitGroups.map(\.paneSessionIDs) == [[left.id, right.id]])
+    #expect(workspace.terminalDisplayItems == [.split(splitID), .single(live.id)])
+    #expect(workspace.selectedSessionID == right.id)
+    #expect(chromeState.collapsedAgentGroupIDs == [lead.id])
+    let tree = workspace.agentSessionTreeSnapshot()
+    #expect(tree.children(of: try #require(workspace.session(withID: lead.id))).map(\.id) == [helper.id])
+    let ended = [lead, left, helper, web, right].map { workspace.session(withID: $0.id) }
+    for (tab, record) in zip(ended, [lead, left, helper, web, right]) {
+        let tab = try #require(tab)
+        #expect(tab.systemSessionEnd == .restart)
+        #expect(!tab.isRunning)
+        #expect(tab.persistentSession == nil)
+        #expect(tab.isPersistentLocalSession)
+        #expect(tab.kind == record.kind)
+        #expect(tab.title == record.title)
+        #expect(tab.agentName == record.agentName)
+        #expect(tab.commandName == record.commandName)
+        #expect(tab.workingDirectory == record.workingDirectory)
+        #expect(tab.persistentSessionEndedMessage == "Ended when the Mac restarted")
+    }
+    let liveTab = try #require(workspace.session(withID: live.id))
+    #expect(liveTab.systemSessionEnd == nil)
+    #expect(liveTab.persistentSession?.sessionID == "s-live")
+    #expect(harness.creates().isEmpty)
+
+    // One toast for the window.
+    let toast = try #require(chromeState.toasts.current)
+    #expect(toast.title == "5 tabs ended when the Mac restarted")
+    #expect(toast.actions.map(\.title) == ["Restart All"])
+    #expect(toast.isUnprompted)
+
+    // Saved as ended, naming no session, until they start again.
+    repository.flushPersistentState()
+    let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path))
+    #expect(saved.sessions.map(\.id) == [lead.id, left.id, helper.id, web.id, right.id, live.id])
+    #expect(saved.sessions.map(\.systemEnd) == [.restart, .restart, .restart, .restart, .restart, nil])
+    #expect(saved.sessions.prefix(5).allSatisfy { $0.hosted == nil && $0.launchRequestID == nil && $0.mayComeBack })
+    #expect(saved.splitGroups.map(\.paneSessionIDs) == [[left.id, right.id]])
+
+    // Restart All: each starts again, fresh, in a new session where it
+    // was, as what it was.
+    chromeState.toasts.performAction(of: toast.id)
+    #expect(await harness.fake.wait(timeout: 8) { harness.creates().count == 5 })
+    func create(_ record: WorkspaceSessionRecord) throws -> FakeControlHelper.Request {
+        try #require(harness.creates().first { ($0.json["tags"] as? [String: String])?[PersistentSessionTag.tab] == record.id.uuidString })
+    }
+    func configuration(_ record: WorkspaceSessionRecord) throws -> ShellProcessController.Configuration {
+        try #require(harness.configurations.value.first { $0.processID == record.id.uuidString })
+    }
+    #expect(try create(left).string("cwd") == elsewhere.path)
+    #expect(try create(right).string("cwd") == root.path)
+    #expect((try create(left).json["tags"] as? [String: String])?[PersistentSessionTag.kind] == "terminal")
+    #expect(try configuration(left).startupCommand == nil)
+    #expect((try create(lead).json["tags"] as? [String: String])?[PersistentSessionTag.agent] == "Claude")
+    #expect(try configuration(lead).startupCommand == "claude")
+    #expect(try configuration(helper).startupCommand == "codex")
+    #expect(try configuration(helper).agentID == helper.id.uuidString)
+    #expect((try create(web).json["tags"] as? [String: String])?[PersistentSessionTag.command] == "web")
+    #expect(try configuration(web).startupCommand == "run-web")
+    #expect(try configuration(web).environment["PORT"] == "8000")
+    for record in [lead, left, helper, web, right] {
+        let tab = try #require(workspace.session(withID: record.id))
+        #expect(await harness.fake.wait { tab.persistentSession != nil && tab.isRunning })
+        #expect(tab.systemSessionEnd == nil)
+        #expect(tab.persistentSessionEndedMessage == nil)
+    }
+    #expect(workspace.sessions.count == 6)
+    // What a log out would record as ended while *on quit* is End Sessions.
+    #expect(Set(repository.localSessionsEndedByAQuit().map(\.sessionID))
+        == Set(workspace.sessions.compactMap { $0.persistentSession?.sessionID }))
+    #expect(repository.localSessionsEndedByAQuit().count == 6)
+    // Saved as the running tabs they are now.
+    repository.flushPersistentState()
+    let resaved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path))
+    #expect(resaved.sessions.allSatisfy { $0.systemEnd == nil && $0.hosted != nil })
+}
+
+@Test @MainActor func aNormalRelaunchStillDropsATabWhoseSessionIsGoneAndOpensTheShell() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-no-reboot")
+    let storeDirectory = try canonicalDirectory("cherry-restore-no-reboot-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let gone = localRecord(title: "Gone", sessionID: "s-gone", workingDirectory: root.path)
+    harness.fake.pendingHolders = 0
+    // Saved in this boot; the only quit for a log out came before it.
+    let savedAt = Date()
+    store.noteSystemQuit(at: savedAt.addingTimeInterval(-600))
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [gone], selectedSessionID: gone.id)],
+        savedAt: savedAt
+    ))
+    let chromeState = quietChromeState()
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer {
+        repository.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
+    await repository.waitForPendingRestores()
+    let workspace = repository.activeWorkspace
+    // Dropped, as before; the window opens its default shell instead.
+    #expect(workspace.session(withID: gone.id) == nil)
+    #expect(workspace.sessions.count == 1)
+    #expect(workspace.sessions.first?.systemSessionEnd == nil)
+    #expect(chromeState.toasts.current == nil)
+    repository.flushPersistentState()
+    let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path))
+    #expect(!saved.sessions.contains { $0.id == gone.id })
+}
+
+@Test @MainActor func tabsWhoseSessionsWereEndedOnPurposeStayDroppedAfterAReboot() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-reboot-purpose")
+    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-purpose-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    let project = root.path
+    // Ended through this app (a close, End Sessions, Background Sessions).
+    let endedHere = localRecord(title: "Ended here", sessionID: "s-ended", workingDirectory: project)
+    // Persistent Sessions → Terminate or Remove.
+    let terminated = localRecord(title: "Terminated", sessionID: "s-terminated", workingDirectory: project)
+    // Closed (⌘W) or forgotten with its worktree: a session still to end.
+    let closed = localRecord(title: "Closed", sessionID: "s-closed", workingDirectory: project)
+    // Only attached to a session it did not own, or never a session at all.
+    let attached = localRecord(title: "Attached", sessionID: "s-attached", owned: false, workingDirectory: project)
+    let native = localRecord(title: "Native", sessionID: nil, workingDirectory: project)
+    // A tab saved while its Create was under way owned what it made.
+    var creating = localRecord(title: "Creating", sessionID: nil, workingDirectory: project)
+    creating.launchRequestID = UUID().uuidString.lowercased()
+    // And one the system ended.
+    let lost = localRecord(title: "Lost", sessionID: "s-lost", workingDirectory: project)
+    // Saved (as a window close or quit with End Sessions saves) before
+    // their sessions were ended.
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: project,
+        worktrees: [WorktreeStateRecord(root: project, sessions: [endedHere, terminated, closed, attached, native, creating, lost])],
+        savedAt: try beforeTheLastBoot()
+    ))
+
+    // `end` records what it ends.
+    harness.hosting.endedSessionsStore = store
+    harness.fake.sessions = [HostedSessionInfo(id: "s-ended", name: "Ended here", cwd: project, pid: 71, owner: "CherryTests")]
+    harness.fake.pendingHolders = 0
+    _ = try await harness.hosting.list()
+    await harness.hosting.end(HostedSessionAttachment(
+        host: .local, hostID: "host-a", sessionID: "s-ended", name: "Ended here",
+        remoteWorkingDirectory: project, executablePath: harness.cli.executable.path
+    )).value
+    #expect(harness.fake.sessions.isEmpty)
+    harness.hosting.noteEndedOnPurpose(hostID: "host-a", sessionID: "s-terminated")
+    store.addSessionsToEnd([closed])
+    store.flush()
+    #expect(store.wasEndedOnPurpose(endedHere))
+    #expect(store.wasEndedOnPurpose(terminated))
+    #expect(store.wasEndedOnPurpose(closed))
+    #expect(!store.wasEndedOnPurpose(lost))
+    // A session of the same id on another host identity is another session.
+    #expect(!store.wasEndedOnPurpose(localRecord(title: "Other", sessionID: "s-ended", hostID: "host-b", workingDirectory: project)))
+
+    let repository = RepositoryWorkspace(
+        projectRoot: project,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    await repository.waitForPendingRestores()
+    let workspace = repository.activeWorkspace
+    #expect(workspace.sessions.map(\.id) == [creating.id, lost.id])
+    #expect(workspace.sessions.allSatisfy { $0.systemSessionEnd == .restart })
+}
+
+@Test @MainActor func aLogOutOrALostHolderBringsTabsBackOnlyOnceNothingMoreIsComing() async throws {
+    var configuration = PersistentHarness.fastConfiguration
+    configuration.disappearanceConfirmationDelay = .milliseconds(200)
+    configuration.pendingHoldersPollInterval = .milliseconds(20)
+    configuration.pendingHoldersWait = .milliseconds(300)
+    let harness = try PersistentHarness(configuration: configuration)
+    let workspace = harness.workspace()
+    workspace.restoredTabLaunchQueue = RestoredTabLaunchQueue()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    let killed = localRecord(title: "Killed", sessionID: "s-killed", workingDirectory: project)
+    let gone = localRecord(title: "Gone", sessionID: "s-gone", workingDirectory: project)
+    let elsewhere = localRecord(title: "Elsewhere", sessionID: "s-elsewhere", hostID: "host-b", workingDirectory: project)
+    let justNow = Date()
+    func evidence(quits: [Date] = []) -> SystemEndedSessions {
+        SystemEndedSessions(savedAt: justNow, bootTime: justNow.addingTimeInterval(-3_600), systemQuits: quits, endedOnPurpose: { _ in false })
+    }
+    // The host found the killed one's holder gone (a log out while Cherry
+    // was not running): it comes back; the other one is dropped, and so is
+    // one saved on a host that now has another identity.
+    harness.fake.lostSessionIDs = ["s-killed"]
+    harness.fake.pendingHolders = 0
+    let lostHolder = await harness.restore([killed, gone, elsewhere], into: workspace, systemEnds: evidence())
+    #expect(lostHolder.sessions.map(\.id) == [killed.id])
+    #expect(lostHolder.sessions.first?.systemSessionEnd == .logout)
+    #expect(lostHolder.sessions.first?.persistentSessionEndedMessage == "Ended when you logged out")
+    #expect(lostHolder.keptRecordIDs.isEmpty)
+    #expect(lostHolder.remainder == nil)
+    WorkspaceRestoreResult.discard(lostHolder, in: workspace)
+
+    // Cherry quit for a log out after the save: every missing one comes back.
+    harness.fake.lostSessionIDs = []
+    let loggedOut = await harness.restore([killed, gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
+    #expect(loggedOut.sessions.map(\.id) == [killed.id, gone.id])
+    #expect(loggedOut.sessions.allSatisfy { $0.systemSessionEnd == .logout })
+    WorkspaceRestoreResult.discard(loggedOut, in: workspace)
+
+    // Without evidence (a normal relaunch) they are dropped.
+    let normal = await harness.restore([killed, gone], into: workspace, systemEnds: evidence())
+    #expect(normal.sessions.isEmpty)
+    #expect(normal.keptRecordIDs.isEmpty)
+
+    // A host that does not report pending holders: only after its second
+    // look, as a dropped tab would be.
+    harness.fake.pendingHolders = nil
+    let older = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
+    #expect(older.sessions.isEmpty)
+    #expect(older.pendingRecordIDs == [gone.id])
+    let olderRest = try await #require(older.remainder).value
+    #expect(olderRest.sessions.map(\.id) == [gone.id])
+    #expect(olderRest.sessions.first?.systemSessionEnd == .logout)
+    WorkspaceRestoreResult.discard(olderRest, in: workspace)
+
+    // Holders still expected when the wait runs out: kept, not ended.
+    harness.fake.pendingHolders = 2
+    let waiting = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
+    let waitingRest = try await #require(waiting.remainder).value
+    #expect(waitingRest.sessions.isEmpty)
+    #expect(waitingRest.keptRecordIDs == [gone.id])
+}
+
+@Test @MainActor func tabsSavedEndedComeBackEndedWithoutAskingOrAToastAndCommandsStartByTheirRules() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-saved-ended")
+    let storeDirectory = try canonicalDirectory("cherry-restore-saved-ended-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    var shell = localRecord(title: "Shell", sessionID: nil, workingDirectory: root.path)
+    shell.systemEnd = .logout
+    // Ended by the reboot now: an auto-start command, and one that restarts
+    // when it exits.
+    let web = localRecord(kind: .command, title: "web", sessionID: "s-web", commandName: "web", workingDirectory: root.path)
+    let worker = localRecord(
+        kind: .command, title: "worker", sessionID: "s-worker", commandName: "worker", restartOnExit: true,
+        workingDirectory: root.path
+    )
+    harness.fake.pendingHolders = 0
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell, web, worker], selectedSessionID: shell.id)],
+        savedAt: try beforeTheLastBoot()
+    ))
+    let chromeState = quietChromeState()
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [ProjectCommandDefinition(name: "web", command: "serve", autoStart: true)] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    repository.autoStartInitialCommandsIfNeeded()
+    repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
+    await repository.waitForPendingRestores()
+    let workspace = repository.activeWorkspace
+    #expect(workspace.sessions.map(\.id) == [shell.id, web.id, worker.id])
+    let shellTab = try #require(workspace.session(withID: shell.id))
+    #expect(shellTab.systemSessionEnd == .logout)
+    #expect(workspace.selectedSessionID == shell.id)
+    // No toast: the tab saved ended was told about before, and the newly
+    // ended commands start by themselves (auto-start, auto-restart).
+    #expect(chromeState.toasts.current == nil)
+    // Auto-start starts its command in its tab; the other restarts by its
+    // policy. Each in a new session for the same tab; nothing is opened.
+    #expect(await harness.fake.wait(timeout: 8) {
+        harness.creates().count == 2
+            && workspace.session(withID: web.id)?.persistentSession != nil
+            && workspace.session(withID: worker.id)?.persistentSession != nil
+    })
+    let tabs = Set(harness.creates().compactMap { ($0.json["tags"] as? [String: String])?[PersistentSessionTag.tab] })
+    #expect(tabs == [web.id.uuidString, worker.id.uuidString])
+    #expect(workspace.sessions.count == 3)
+    #expect(shellTab.systemSessionEnd == .logout)
+    #expect(!shellTab.isRunning)
+    // Restart All has nothing to start.
+    repository.restartSystemEndedTabs()
+    #expect(harness.creates().count == 2)
+
+    // Closing an ended tab ends nothing and cannot be undone: it has no
+    // session to come back to.
+    #expect(workspace.closedTab(for: shellTab, name: "Shell") == nil)
+    workspace.close(shellTab)
+    #expect(workspace.session(withID: shell.id) == nil)
+    #expect(harness.fake.requests("kill").isEmpty)
+}
+
+@Test @MainActor func exitedSessionsComeBackShowingTheirExitAndNeverRestartByThemselves() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-reboot-exited")
+    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-exited-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    // A persistent tab saves its program's exit once its host reports it.
+    let probe = harness.workspace()
+    let tab = probe.addSession(title: "Probe")
+    #expect(await harness.waitUntilAttached(tab))
+    #expect(WorkspaceSessionRecord(session: tab, restoredRecord: nil).exitStatus == nil)
+    let probeSession = try #require(tab.persistentSession?.sessionID)
+    harness.exit(probeSession, code: 3)
+    #expect(await harness.fake.wait { tab.state == .exited(3) })
+    #expect(WorkspaceSessionRecord(session: tab, restoredRecord: nil).exitStatus == 3)
+    probe.closeAllSessions(intent: .windowClosed)
+    harness.fake.sessions = []
+    let createsBefore = harness.creates().count
+    func creates() -> [FakeControlHelper.Request] { Array(harness.creates().dropFirst(createsBefore)) }
+
+    var failed = localRecord(title: "Failed", sessionID: "s-failed", workingDirectory: root.path)
+    failed.exitStatus = 2
+    var clean = localRecord(title: "Clean", sessionID: "s-clean", workingDirectory: root.path)
+    clean.exitStatus = 0
+    // Auto-restart gave up on it before the restart.
+    var paused = localRecord(
+        kind: .command, title: "worker", sessionID: "s-worker", commandName: "worker", restartOnExit: true,
+        workingDirectory: root.path
+    )
+    paused.exitStatus = 1
+    let live = localRecord(title: "Live", sessionID: "s-live", workingDirectory: root.path)
+    harness.fake.pendingHolders = 0
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [failed, clean, paused, live])],
+        savedAt: try beforeTheLastBoot()
+    ))
+    let chromeState = quietChromeState()
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
+    await repository.waitForPendingRestores()
+    let workspace = repository.activeWorkspace
+    // The clean exit would have closed its tab: dropped.
+    #expect(workspace.sessions.map(\.id) == [failed.id, paused.id, live.id])
+    let failedTab = try #require(workspace.session(withID: failed.id))
+    #expect(failedTab.persistentSessionEndedMessage == "Session ended (exit 2)")
+    #expect(failedTab.state == .exited(2))
+    let pausedTab = try #require(workspace.session(withID: paused.id))
+    #expect(pausedTab.persistentSessionEndedMessage == "Session ended (exit 1)")
+    #expect(try #require(workspace.session(withID: live.id)).persistentSessionEndedMessage == "Ended when the Mac restarted")
+    // Only the one that ran counts, and Restart All starts only it.
+    let toast = try #require(chromeState.toasts.current)
+    #expect(toast.title == "1 tab ended when the Mac restarted")
+    try await Task.sleep(for: .milliseconds(700))
+    #expect(creates().isEmpty)
+    chromeState.toasts.performAction(of: toast.id)
+    #expect(await harness.fake.wait { creates().count == 1 })
+    #expect((creates().first?.json["tags"] as? [String: String])?[PersistentSessionTag.tab] == live.id.uuidString)
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(creates().count == 1)
+    #expect(!pausedTab.isRunning)
+    // Saved with their exits, and they come back so again.
+    repository.flushPersistentState()
+    let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path))
+    #expect(saved.sessions.first { $0.id == failed.id }?.exitStatus == 2)
+    #expect(saved.sessions.first { $0.id == failed.id }?.systemEnd == .restart)
+    #expect(saved.sessions.first { $0.id == paused.id }?.exitStatus == 1)
+    repository.closeAllSessions(intent: .windowClosed)
+    let again = harness.workspace()
+    defer { again.closeAllSessions(intent: .windowClosed) }
+    let back = await harness.restore([], unbound: saved.sessions.filter { $0.systemEnd != nil }, into: again)
+    #expect(back.sessions.map { $0.persistentSessionEndedMessage } == ["Session ended (exit 2)", "Session ended (exit 1)"])
+    WorkspaceRestoreResult.discard(back, in: again)
+}
+
+@Test @MainActor func aRecordKeptWhileTheHostWasUnreachableKeepsItsEvidenceWhenSavedAgain() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-reboot-kept")
+    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-kept-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
+    let beforeBoot = try beforeTheLastBoot()
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])],
+        savedAt: beforeBoot
+    ))
+    func open() -> RepositoryWorkspace {
+        RepositoryWorkspace(
+            projectRoot: root.path,
+            backendPolicy: harness.policy,
+            stateStore: store,
+            sessionRestorer: harness.restorer,
+            autoStartCommands: { _ in [] },
+            restoredTabLaunchQueue: RestoredTabLaunchQueue()
+        )
+    }
+    // The first launch after the restart cannot list the host: the record is
+    // kept, and saved again now with the window's other tabs.
+    harness.installationProblem.value = "No helper"
+    let first = open()
+    first.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    await first.waitForPendingRestores()
+    #expect(first.activeWorkspace.session(withID: shell.id) == nil)
+    first.flushPersistentState()
+    let resaved = try #require(store.load(repositoryRoot: first.repositoryRoot))
+    #expect((resaved.savedAt ?? .distantPast) > beforeBoot)
+    let kept = try #require(resaved.worktree(root: root.path)?.sessions.first { $0.id == shell.id })
+    // (Saves keep whole seconds.)
+    #expect(kept.savedAt?.timeIntervalSince1970 == beforeBoot.timeIntervalSince1970.rounded(.down))
+    first.closeAllSessions(intent: .windowClosed)
+
+    // The next launch lists it: the session is gone, and it was last seen
+    // before the restart.
+    harness.installationProblem.value = nil
+    harness.fake.pendingHolders = 0
+    let second = open()
+    defer { second.closeAllSessions(intent: .windowClosed) }
+    second.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    await second.waitForPendingRestores()
+    #expect(second.activeWorkspace.session(withID: shell.id)?.systemSessionEnd == .restart)
+}
+
+@Test @MainActor func aTabSavedEndedTakesTheSessionARestartStartedForItBeforeItsBindingWasSaved() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    workspace.restoredTabLaunchQueue = RestoredTabLaunchQueue()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    var shell = localRecord(title: "Shell", sessionID: nil, workingDirectory: project)
+    shell.systemEnd = .restart
+    var other = localRecord(title: "Other", sessionID: nil, workingDirectory: project)
+    other.systemEnd = .logout
+    // Restart created this one; Cherry ended before it saved the binding.
+    harness.fake.sessions = [HostedSessionInfo(
+        id: "s-restarted", name: "Shell", cwd: project, pid: 90, owner: "CherryTests",
+        tags: [PersistentSessionTag.tab: shell.id.uuidString, PersistentSessionTag.project: project]
+    )]
+    harness.fake.pendingHolders = 0
+    let result = await harness.restore([], unbound: [shell, other], into: workspace)
+    let restarted = try #require(result.sessions.first { $0.id == shell.id })
+    #expect(restarted.systemSessionEnd == nil)
+    #expect(restarted.persistentSession?.sessionID == "s-restarted")
+    #expect(result.sessions.first { $0.id == other.id }?.systemSessionEnd == .logout)
+    WorkspaceRestoreResult.discard(result, in: workspace)
+
+    // Orphan adoption takes it too: a tab saved ended names no session.
+    let saved = RepositoryStateRecord(
+        repositoryRoot: project, activeWorktreeRoot: project,
+        worktrees: [WorktreeStateRecord(root: project, sessions: [shell])],
+        savedAt: Date(timeIntervalSince1970: 1_000)
+    )
+    let criteria = OrphanedSessionCriteria(owner: "CherryTests", savedState: saved, createdBefore: Date())
+    let info = HostedSessionInfo(
+        id: "s-restarted", name: "Shell", cwd: project, owner: "CherryTests",
+        tags: [PersistentSessionTag.tab: shell.id.uuidString, PersistentSessionTag.project: project],
+        createdAt: UInt64(Date().addingTimeInterval(-5).timeIntervalSince1970 * 1_000)
+    )
+    #expect(criteria.orphanTabID(of: info) == shell.id)
+}
+
+@Test @MainActor func lostSessionsTheHostReportedStillCountOnceItsDaemonRestarted() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-restore-lost-recorded")
+    let storeDirectory = try canonicalDirectory("cherry-restore-lost-recorded-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    defer {
+        harness.cleanUp()
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    harness.hosting.endedSessionsStore = store
+    let shell = localRecord(title: "Shell", sessionID: "s-killed", workingDirectory: root.path)
+    // Saved in this boot, with no quit for a log out after it.
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])],
+        savedAt: Date()
+    ))
+    // A list this run took (another window's restore, Background Sessions)
+    // saw the host report the holder killed; the app records it.
+    harness.fake.pendingHolders = 0
+    harness.fake.lostSessionIDs = ["s-killed"]
+    _ = try await harness.hosting.completeList()
+    store.flush()
+    #expect(store.lostSessions(hostID: "host-a") == ["s-killed"])
+    // The daemon restarted since and forgot it; the window opens now.
+    harness.fake.lostSessionIDs = []
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    await repository.waitForPendingRestores()
+    #expect(repository.activeWorkspace.session(withID: shell.id)?.systemSessionEnd == .logout)
 }

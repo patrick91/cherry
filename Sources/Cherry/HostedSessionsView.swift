@@ -16,6 +16,11 @@ final class HostedSessionsController: ObservableObject {
     private let controls: HostControlRegistry
     private let hostStore: HostedSessionHostStore
     private let terminationTimeout: TimeInterval
+    /// A session of This Mac is being terminated or removed on purpose
+    /// (host identity, session id): a saved tab that names it never comes
+    /// back as ended by the system. The app's records it
+    /// (`PersistentLocalSessions.noteEndedOnPurpose`); tests' do nothing.
+    private let noteEndedOnPurpose: @MainActor (String, String) -> Void
     /// Keeps the loaded host's connection (and its live session list) up
     /// while the sheet shows it.
     private var lease: HostControlLease?
@@ -29,11 +34,13 @@ final class HostedSessionsController: ObservableObject {
         controls: HostControlRegistry = .shared,
         hostStore: HostedSessionHostStore = .shared,
         terminationTimeout: TimeInterval = 5,
-        localHostUnavailableReason: String? = HostedSessionInstallation.localHostUnavailableReason()
+        localHostUnavailableReason: String? = HostedSessionInstallation.localHostUnavailableReason(),
+        noteEndedOnPurpose: @escaping @MainActor (String, String) -> Void = { _, _ in }
     ) {
         self.controls = controls
         self.hostStore = hostStore
         self.terminationTimeout = terminationTimeout
+        self.noteEndedOnPurpose = noteEndedOnPurpose
         self.localHostUnavailableReason = localHostUnavailableReason
     }
 
@@ -189,6 +196,7 @@ final class HostedSessionsController: ObservableObject {
         error = nil
         defer { isBusy = false }
         let control = controls.control(for: host)
+        if host == .local { noteEndedOnPurpose(hostID, session.id) }
         do {
             try Task.checkCancellation()
             try await control.terminate(session.id, expectedHostID: hostID)
@@ -238,6 +246,7 @@ final class HostedSessionsController: ObservableObject {
         guard !isBusy, !session.isRunning, loadedHost == host, let hostID else { return }
         isBusy = true
         error = nil
+        if host == .local { noteEndedOnPurpose(hostID, session.id) }
         do {
             try await controls.control(for: host).remove(session.id, expectedHostID: hostID)
         } catch {
@@ -274,7 +283,9 @@ struct HostedSessionsSheet: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject private var hosts = HostedSessionHostStore.shared
-    @StateObject private var controller = HostedSessionsController()
+    @StateObject private var controller = HostedSessionsController(noteEndedOnPurpose: { hostID, sessionID in
+        PersistentLocalSessions.shared.noteEndedOnPurpose(hostID: hostID, sessionID: sessionID)
+    })
     @Environment(\.dismiss) private var dismiss
     @State private var selectedHost = HostedSessionHost.local
     @State private var newHost = ""

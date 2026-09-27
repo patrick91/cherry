@@ -7,7 +7,26 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     var openDefaultProjectWindow: (@MainActor @Sendable () -> Void)?
     var openProjectWindow: (@MainActor @Sendable (String) -> Void)?
     private var isQuitConfirmed = false
+    /// Whether the latest quit to ask to terminate came with a quit Apple
+    /// event naming a log out, restart or shut down (`kAEQuitReason`), not
+    /// only one within `powerOffAnnouncementLifetime` of the system
+    /// announcing one (which a cancelled log out leaves behind).
+    private var lastQuitWasPowerOffEvent = false
     private var didScheduleInitialWindowOpen = false
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            Self.configureSessionRecords(localSessions: .shared, store: .shared)
+        }
+    }
+
+    /// Before any window restores or closes tabs: the sessions this app ends
+    /// on purpose, and those the host reports lost, are recorded in `store`
+    /// (`SystemEndedSessions`).
+    @MainActor
+    static func configureSessionRecords(localSessions: PersistentLocalSessions, store: WorkspaceStateStore) {
+        localSessions.endedSessionsStore = store
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
@@ -100,6 +119,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         guard !isQuitConfirmed else { return .terminateNow }
 
         let reason = MainActor.assumeIsolated { Self.currentQuitReason() }
+        lastQuitWasPowerOffEvent = Self.isPowerOffQuit(NSAppleEventManager.shared().currentAppleEvent)
         if let window = MainActor.assumeIsolated({ Self.windowToAnswerBeforeQuitting(reason: reason, among: NSApp.windows) }) {
             // A window's close question is up, or a tab close's: its answer
             // keeps, detaches or ends sessions, so the quit's own question
@@ -346,7 +366,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         return event.eventClass == AEEventClass(kCoreEventClass) && event.eventID == AEEventID(kAEQuitApplication)
     }
 
-    private nonisolated static func isPowerOffQuit(_ event: NSAppleEventDescriptor?) -> Bool {
+    nonisolated static func isPowerOffQuit(_ event: NSAppleEventDescriptor?) -> Bool {
         guard let event, isQuitEvent(event),
               let reason = event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))
                 ?? event.paramDescriptor(forKeyword: AEKeyword(kAEQuitReason))
@@ -513,6 +533,46 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             }
             reply()
         }
+    }
+
+    /// The quit goes through. For a log out, restart or shut down the
+    /// saved state (flushed when the quit began) records it
+    /// (`WorkspaceStateStore.noteSystemQuit`): the system then ends the
+    /// sessions, and the next launch brings their tabs back ended. Then
+    /// whatever the store still has queued (the sessions ended on purpose)
+    /// is written before the process ends.
+    func applicationWillTerminate(_ notification: Notification) {
+        let isPowerOffEvent = lastQuitWasPowerOffEvent
+        MainActor.assumeIsolated {
+            Self.recordSystemQuit(
+                isPowerOffEvent: isPowerOffEvent,
+                onQuit: TerminalSettings.shared.localSessionsOnQuit,
+                store: .shared,
+                sessionsEndedByAQuit: { ProjectWindowRegistry.shared.localSessionsEndedByAQuit() }
+            )
+        }
+    }
+
+    /// What `applicationWillTerminate` records. Only a quit Apple event
+    /// that names a log out, restart or shut down counts (`isPowerOffEvent`),
+    /// not a quit that merely came soon after the system announced one.
+    /// While *on quit* is End Sessions, the sessions ⌘Q would have ended
+    /// are recorded as ended on purpose first, so their tabs do not come
+    /// back ended, as after ⌘Q. Then the store's queue is flushed.
+    @MainActor
+    static func recordSystemQuit(
+        isPowerOffEvent: Bool,
+        onQuit: LocalSessionsOnQuit,
+        store: WorkspaceStateStore,
+        sessionsEndedByAQuit: () -> [(hostID: String, sessionID: String)]
+    ) {
+        if isPowerOffEvent {
+            if onQuit == .end {
+                store.addEndedSessions(sessionsEndedByAQuit())
+            }
+            store.noteSystemQuit()
+        }
+        store.flush()
     }
 
     /// Answers a quit that waited for a sheet (`.terminateLater`): at once

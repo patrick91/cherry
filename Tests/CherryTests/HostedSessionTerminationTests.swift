@@ -183,3 +183,34 @@ private func terminationController(
     #expect(controller.hostID == "host-a")
     #expect(fake.requests("kill").count == 1)
 }
+
+@Test @MainActor func HostedSessionTerminationRecordsThisMacsSessionsEndedOnPurpose() async throws {
+    let fake = terminationFixture()
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let registry = makeFakeHostControlRegistry(fake, hostStore: store)
+    defer { registry.disconnectAll() }
+    let noted = Recorder<[String]>([])
+    let controller = HostedSessionsController(
+        controls: registry, hostStore: store, localHostUnavailableReason: nil,
+        noteEndedOnPurpose: { noted.value.append("\($0)/\($1)") }
+    )
+    // Terminate and Remove of This Mac's sessions are ended on purpose: a
+    // saved tab naming them never comes back as ended by the system.
+    await controller.refresh(.local)
+    let target = try #require(controller.sessions.first { $0.id == "session-a" })
+    await controller.terminate(target, on: .local)
+    #expect(noted.value == ["host-a/session-a"])
+    let exited = try #require(controller.sessions.first { $0.id == "session-a" })
+    #expect(!exited.isRunning)
+    await controller.remove(exited, on: .local)
+    #expect(noted.value == ["host-a/session-a", "host-a/session-a"])
+    #expect(fake.requests("remove").map { $0.string("id") } == ["session-a"])
+
+    // An SSH host's sessions are not This Mac's.
+    let host = try HostedSessionHost.ssh("devbox")
+    await controller.refresh(host)
+    let remote = try #require(controller.sessions.first { $0.id == "session-b" })
+    await controller.terminate(remote, on: host)
+    #expect(noted.value.count == 2)
+}

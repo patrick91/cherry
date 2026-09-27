@@ -107,6 +107,7 @@ final class FakeControlHelper: @unchecked Sendable {
     private var _screenText = "fake screen"
     private var _screenIsAlternate = false
     private var _pendingHolders: Int?
+    private var _lostSessionIDs: Set<String> = []
     let exitDelay: TimeInterval
 
     init(sessions: [HostedSessionInfo] = [], exitDelay: TimeInterval = 0.05) {
@@ -167,6 +168,13 @@ final class FakeControlHelper: @unchecked Sendable {
     var pendingHolders: Int? {
         get { lock.withLock { _pendingHolders } }
         set { lock.withLock { _pendingHolders = newValue } }
+    }
+
+    /// What `list` reports as `lost_sessions` (holders a restarted daemon
+    /// found gone); empty leaves it out.
+    var lostSessionIDs: Set<String> {
+        get { lock.withLock { _lostSessionIDs } }
+        set { lock.withLock { _lostSessionIDs = newValue } }
     }
 
     var respond: ((Request, Connection) -> Reply?)? {
@@ -269,7 +277,9 @@ final class FakeControlHelper: @unchecked Sendable {
         case "subscribe":
             return .answer(supportsSubscribe ? .ok : .error(code: "unsupported_operation", message: "not supported"))
         case "list":
-            return .answer(.sessions(HostedSessionList(hostID: hostID, sessions: sessions, pendingHolders: pendingHolders)))
+            return .answer(.sessions(HostedSessionList(
+                hostID: hostID, sessions: sessions, pendingHolders: pendingHolders, lostSessionIDs: lostSessionIDs
+            )))
         case "create":
             let session = HostedSessionInfo(
                 id: "session-\(request.string("request_id") ?? "?")",

@@ -98,6 +98,15 @@ final class RepositoryWorkspace: ObservableObject {
     /// from the state loaded when the window opened; nil when this window
     /// saves nothing or runs no local sessions.
     private let orphanCriteria: OrphanedSessionCriteria?
+    /// Which saved tabs whose sessions are gone the system ended (a restart
+    /// or log out while Cherry was closed), from the state loaded when the
+    /// window opened: they come back ended. Nil when this window saves
+    /// nothing or runs no local sessions.
+    private let systemEnds: SystemEndedSessions?
+    /// Tabs this window's restores brought back ended by the system during
+    /// this run, which its toast names and Restart All starts
+    /// (`announceSystemEndedTabs`).
+    private var systemEndedTabs: [WeakSession] = []
     /// Worktrees whose orphaned sessions were looked for (once per run).
     private var orphanScannedRoots: Set<String> = []
     /// Saved tabs forgotten with their worktree during this run, whose
@@ -155,23 +164,49 @@ final class RepositoryWorkspace: ObservableObject {
         let savedState = stateStore?.load(repositoryRoot: root)
         var pendingRecords: [String: WorktreeStateRecord] = [:]
         for record in savedState?.worktrees ?? []
-        where (mayAdoptUnbound ? record.hasRestorableSessions : record.sessions.contains(where: \.isRestorable))
+        where (mayAdoptUnbound
+            ? record.hasRestorableSessions
+            : record.sessions.contains { $0.isRestorable || $0.systemEnd != nil })
             && pendingRecords[record.root] == nil {
+            // Each record says when an open tab last saved it, so saving it
+            // again unchanged (kept for later) keeps that.
+            var record = record
+            record.sessions = record.sessions.map { session in
+                var session = session
+                session.savedAt = session.savedAt ?? savedState?.savedAt
+                return session
+            }
             pendingRecords[record.root] = record
         }
         pendingWorktreeRecords = pendingRecords
         if let stateStore, stateStore.isEnabled, let localSessions = backendPolicy.localSessions {
+            let sessionsToEnd = stateStore.loadSessionsToEnd()
             orphanCriteria = OrphanedSessionCriteria(
                 owner: localSessions.owner,
                 savedState: savedState,
                 // A file this version moved aside still says when it was
                 // saved and which tabs it had.
                 setAside: savedState == nil ? stateStore.setAsideState(repositoryRoot: root) : nil,
-                sessionsToEnd: stateStore.loadSessionsToEnd(),
+                sessionsToEnd: sessionsToEnd,
                 createdBefore: runStartedAt
+            )
+            // As the window opened: ending them (`resumeEndingSessions`)
+            // takes them out of the store once their sessions are gone.
+            let toEndAtOpen = Set(sessionsToEnd.map(\.id))
+            systemEnds = SystemEndedSessions(
+                savedAt: savedState?.savedAt,
+                bootTime: SystemEndedSessions.currentBootTime(),
+                systemQuits: stateStore.loadSystemQuits(),
+                endedOnPurpose: { record in
+                    if toEndAtOpen.contains(record.id) { return true }
+                    if let sessionID = record.hosted?.sessionID, localSessions.isEnding(sessionID) { return true }
+                    return stateStore.wasEndedOnPurpose(record, fallbackSavedAt: savedState?.savedAt)
+                },
+                recordedLostSessions: { stateStore.lostSessions(hostID: $0) }
             )
         } else {
             orphanCriteria = nil
+            systemEnds = nil
         }
 
         let initialWorkspace = TerminalWorkspace(
@@ -920,6 +955,24 @@ final class RepositoryWorkspace: ObservableObject {
         localSessions.endSessions(ofForgottenTabs: records, recordedIn: stateStore)
     }
 
+    /// The sessions of This Mac a quit that ends sessions ends in this
+    /// window (End Sessions, *on quit* = End Sessions): its persistent tabs'
+    /// and those of its saved tabs no open tab shows. A log out, restart or
+    /// shut down records them as ended on purpose while *on quit* is End
+    /// Sessions (`CherryAppDelegate.recordSystemQuit`), so their tabs do
+    /// not come back, as after ⌘Q.
+    func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
+        guard !isTearingDown else { return [] }
+        let open = workspaces.values.flatMap(\.sessions).compactMap { tab -> (hostID: String, sessionID: String)? in
+            guard tab.isPersistentLocalSession, let binding = tab.persistentSession else { return nil }
+            return (binding.hostID, binding.sessionID)
+        }
+        let saved = savedRecordsWhoseSessionsEndWithTheWindow().compactMap { record in
+            record.hosted.map { (hostID: $0.hostID, sessionID: $0.sessionID) }
+        }
+        return open + saved
+    }
+
     /// The saved tabs no open tab shows that may own a session of This Mac
     /// (`endSavedSessionsNotOpen`).
     private func savedRecordsWhoseSessionsEndWithTheWindow() -> [WorkspaceSessionRecord] {
@@ -1080,13 +1133,21 @@ final class RepositoryWorkspace: ObservableObject {
     /// tabs their restore kept for later, plus saved worktrees whose restore
     /// has not finished, unchanged.
     func makeStateRecord() -> RepositoryStateRecord {
+        let now = Date()
         var records = pendingWorktreeRecords
         for (root, workspace) in workspaces
         where records[root] == nil && !workspace.isTornDown && !workspace.sessions.isEmpty {
-            records[root] = workspace.makeStateRecord(
+            var record = workspace.makeStateRecord(
                 root: root,
                 collapsedAgentGroupIDs: collapsedAgentGroupIDs(for: root)
             )
+            // Open tabs: saved now. Kept ones below keep their time.
+            record.sessions = record.sessions.map { session in
+                var session = session
+                session.savedAt = now
+                return session
+            }
+            records[root] = record
         }
         for (root, kept) in keptWorktreeRecords where pendingWorktreeRecords[root] == nil {
             records[root] = records[root]?.merging(kept: kept) ?? kept
@@ -1095,7 +1156,7 @@ final class RepositoryWorkspace: ObservableObject {
             repositoryRoot: repositoryRoot,
             activeWorktreeRoot: activeWorktreeRoot,
             worktrees: records.keys.sorted().compactMap { records[$0] },
-            savedAt: Date()
+            savedAt: now
         )
     }
 
@@ -1214,12 +1275,15 @@ final class RepositoryWorkspace: ObservableObject {
         // binding; the local host may still run its session (tagged with
         // its tab id). Only asked when local tabs run as sessions.
         let mayAdoptUnbound = backendPolicy.localSessions != nil && backendPolicy.prefersPersistentLocalSessions
+        // Tabs saved ended by the system come back ended whatever the
+        // settings.
         let request = WorkspaceRestoreRequest(
             repositoryRoot: repositoryRoot,
             worktreeRoot: root,
             records: record.sessions.filter(\.isRestorable),
             workspace: workspace,
-            unboundRecords: mayAdoptUnbound ? record.sessions.filter { !$0.isRestorable } : []
+            unboundRecords: record.sessions.filter { !$0.isRestorable && (mayAdoptUnbound || $0.systemEnd != nil) },
+            systemEnds: systemEnds
         )
         let asked = Set((request.records + request.unboundRecords).map(\.id))
         let restorer = sessionRestorer
@@ -1344,7 +1408,56 @@ final class RepositoryWorkspace: ObservableObject {
         if step == .initial || (step != .orphans && restoreTasks[root] == nil) {
             runRestoreWaiters(root: root)
         }
+        // Tabs whose sessions the system ended, found now (not saved ended),
+        // once auto-start (the waiters above) started its commands again.
+        let savedEnded = Set(layout.sessions.filter { $0.systemEnd != nil }.map(\.id))
+        announceSystemEndedTabs(result.sessions.filter { tab in
+            !savedEnded.contains(tab.id) && workspace.session(withID: tab.id) === tab
+        }, root: root)
         scheduleStateSave()
+    }
+
+    /// Says in the window's toast that `tabs` came back ended because the
+    /// system ended their sessions ("3 tabs ended when the Mac restarted",
+    /// with Restart All), with those an earlier step of this run brought
+    /// back still ended. Once per run for each tab: tabs saved ended come
+    /// back without a toast.
+    /// Not a tab that starts again by itself: one auto-start started (or
+    /// will, when its worktree is shown), a command that restarts when it
+    /// exits, or one whose program had exited before (it shows that exit,
+    /// and Restart All leaves it).
+    private func announceSystemEndedTabs(_ candidates: [TerminalSession], root: String) {
+        var autoStarted: Set<String>?
+        let tabs = candidates.filter { tab in
+            guard tab.systemSessionEnd != nil, !tab.isRunning, tab.savedExitStatus == nil else { return false }
+            guard tab.kind == .command else { return true }
+            guard !tab.restartOnExit, let name = tab.commandName else { return !tab.restartOnExit }
+            let names = autoStarted ?? Set(autoStartCommands(root).map { AgentToolDefinition.normalizedName($0.name) })
+            autoStarted = names
+            return !names.contains(AgentToolDefinition.normalizedName(name))
+        }
+        guard !tabs.isEmpty, let chromeState else { return }
+        systemEndedTabs = systemEndedTabs.filter { $0.session?.systemSessionEnd != nil && $0.session?.isRunning == false }
+            + tabs.map(WeakSession.init)
+        let ended = systemEndedTabs.compactMap(\.session)
+        guard let end = ended.first?.systemSessionEnd else { return }
+        chromeState.toasts.show(ProjectWindowToast.systemEndedTabs(count: ended.count, end: end) { [weak self] in
+            self?.restartSystemEndedTabs()
+        })
+    }
+
+    /// Restart All: starts again every tab of this window whose session the
+    /// system ended that its toast named and that is still ended.
+    func restartSystemEndedTabs() {
+        guard !isTearingDown else { return }
+        for tab in systemEndedTabs.compactMap(\.session)
+        where tab.systemSessionEnd != nil && !tab.isRunning && tab.savedExitStatus == nil {
+            guard let root = root(containing: tab.id), let workspace = workspaces[root],
+                  workspace.session(withID: tab.id) === tab
+            else { continue }
+            workspace.restart(tab)
+        }
+        systemEndedTabs.removeAll()
     }
 
     /// `keptWorktreeRecords[root]` after a restore step that asked for
@@ -1439,7 +1552,8 @@ final class RepositoryWorkspace: ObservableObject {
             worktreeRoot: root,
             records: retriedRecords.filter(\.isRestorable),
             workspace: workspace,
-            unboundRecords: retriedRecords.filter { !$0.isRestorable }
+            unboundRecords: retriedRecords.filter { !$0.isRestorable },
+            systemEnds: systemEnds
         )
         let restorer = sessionRestorer
         restoreCancellations[root, default: []].append(request.cancellation)
@@ -1592,6 +1706,13 @@ final class RepositoryWorkspace: ObservableObject {
         }
         return "Cherry cannot remove this worktree because " + reasons.joined(separator: ", ") + "."
     }
+}
+
+/// A tab held without keeping it open.
+@MainActor
+private final class WeakSession {
+    weak var session: TerminalSession?
+    init(_ session: TerminalSession) { self.session = session }
 }
 
 /// A workspace's selection at one moment (nil: none).

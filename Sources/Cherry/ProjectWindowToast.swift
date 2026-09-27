@@ -128,6 +128,27 @@ struct ProjectWindowToast: Identifiable {
     }
 }
 
+extension ProjectWindowToast {
+    /// A window's tabs came back ended because the system ended their
+    /// sessions while Cherry was closed (`SystemEndedSessions`): "3 tabs
+    /// ended when the Mac restarted", with Restart All, which starts each
+    /// of them again. It comes by itself, so its time runs only while its
+    /// window is key in the active app.
+    static func systemEndedTabs(
+        count: Int,
+        end: SystemSessionEnd,
+        restartAll: @escaping @MainActor () -> Void
+    ) -> ProjectWindowToast {
+        ProjectWindowToast(
+            name: count == 1 ? "1 tab" : "\(count) tabs",
+            predicate: end.predicate,
+            actions: [ProjectWindowToast.Action(title: "Restart All", perform: restartAll)],
+            isUnprompted: true,
+            symbolName: "power.circle.fill"
+        )
+    }
+}
+
 /// When a toast dismisses itself: once it has been on screen for
 /// `lifetime`, not counting the time the pointer rested on it (nor, for an
 /// unprompted toast or one that pauses while unattended, the time its window

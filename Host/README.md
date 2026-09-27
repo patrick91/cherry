@@ -8,8 +8,9 @@ program and a headless Ghostty terminal, and a daemon (`cherry-host serve`)
 registers the holders and serves the clients. The `cherry` client connects
 locally through a Unix socket or remotely through system SSH. Closing Cherry,
 detaching, losing SSH, and a crash, restart or upgrade of the daemon leave the
-workload running; a reboot of the machine ends it. There is no public network
-listener or relay.
+workload running; a reboot of the machine, or a log out that ends the user's
+processes, ends it (the Mac app then brings its tabs back as ended tabs). There
+is no public network listener or relay.
 
 ## Build and install
 
@@ -745,7 +746,14 @@ stopped by a signal, restarting or being replaced by a newer version: each
 session's holder process keeps its program, PTY, terminal state and pending
 input, and registers with the next daemon. They do not survive a reboot of the
 host, the crash of their own holder (the session is then reported exited with
-code 1), or the operating system killing the user's processes at logout.
+code 1), or the operating system killing the user's processes at logout. A
+holder killed while no daemon runs (a log out or restart kills them all) leaves
+its manifest behind, where a holder that exits removes its own: the next daemon
+drops such manifests and lists their sessions as `lost_sessions` for its
+lifetime, so a client can tell them from sessions that were ended (Kill,
+Remove, or their program's exit), which are never there. The Mac app keeps a
+copy of those it sees, and brings a saved tab whose session is lost back as
+ended ("Ended when you logged out").
 A session's terminal has IUTF8 set (a canonical-mode backspace erases a whole
 UTF-8 character), as native Mac terminals do, and grapheme clustering (mode
 2027) on, as Ghostty does.
@@ -1259,7 +1267,9 @@ attachment traffic: `Attached`, `Output`, `Query`, `Exit`, a paused
 attachment's `Pong`s) carry none. A connection carries at most one
 attachment (`Attach`, `Input`, `Resize`, `Detach`); a control connection
 never attaches. Besides `List` (answered `Sessions{host_id, sessions,
-pending_holders}`), `Create`, `Kill`, `Remove`, `Shutdown`, `Restart`
+pending_holders, lost_sessions}`; `lost_sessions`, left out when empty, names
+the sessions whose holders the daemon found killed when it started, see
+[Lifetime](#lifetime-service-setup-and-updates)), `Create`, `Kill`, `Remove`, `Shutdown`, `Restart`
 (protocol 7: stop as for `Replace`, whatever sessions run, so a new host of
 the same version can start; answered `Ok` once the socket and lock are
 released) and `Ping`, a control connection may send:

@@ -99,6 +99,12 @@ final class ProjectWindowRegistry {
         return .openDefault
     }
 
+    /// The sessions of This Mac a quit that ends sessions would end, in
+    /// every project window (`RepositoryWorkspace.localSessionsEndedByAQuit`).
+    func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
+        repositories.values.compactMap(\.repository).flatMap { $0.localSessionsEndedByAQuit() }
+    }
+
     /// Saves every project's tabs and the open windows now, synchronously.
     func flushWorkspacePersistence() {
         pruneStaleWindows()

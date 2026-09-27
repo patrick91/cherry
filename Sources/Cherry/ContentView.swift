@@ -12319,7 +12319,9 @@ private struct CommandExitStatusBar: View {
     }
 
     private var status: Status? {
-        switch session.state {
+        // A command the system ended says so in PersistentSessionEndedBar.
+        guard session.systemSessionEnd == nil else { return nil }
+        return switch session.state {
         case .launching, .live:
             nil
         case .exited(let code):
@@ -12454,7 +12456,10 @@ private struct PersistentSessionFallbackBar: View {
 // until the tab closes (which removes it) or restarts. Commands show
 // CommandExitStatusBar instead. A terminal whose shell exited with status 0
 // closes instead (TerminalWorkspace.tabProgramDidExit), unless Settings ›
-// Sessions keeps such tabs or it ended within its first second.
+// Sessions keeps such tabs or it ended within its first second. Also a tab
+// of any kind whose session the system ended while Cherry was closed ("Ended
+// when the Mac restarted", TerminalSession.systemSessionEnd): it has no
+// session, and Restart starts its program again.
 private struct PersistentSessionEndedBar: View {
     @ObservedObject var session: TerminalSession
     /// nil when the tab cannot be closed (the workspace's last tab).
@@ -12484,7 +12489,9 @@ private struct PersistentSessionEndedBar: View {
                 .disabled(close == nil)
                 .help(close == nil
                     ? "The last tab in a workspace stays open. Open another tab to close this one."
-                    : "Close this tab and remove its ended session from This Mac's session host")
+                    : session.systemSessionEnd != nil
+                        ? "Close this tab"
+                        : "Close this tab and remove its ended session from This Mac's session host")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

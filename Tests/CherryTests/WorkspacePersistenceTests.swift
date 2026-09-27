@@ -341,6 +341,115 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(leftovers.isEmpty)
 }
 
+@Test func theStoreRecordsSystemQuitsAndSessionsEndedOnPurposeAndTabsTheSystemEnded() throws {
+    let directory = try makeCanonicalTemporaryDirectory("cherry-system-ends")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
+
+    // Quits for a log out, restart or shut down: the newest ones.
+    #expect(store.loadSystemQuits().isEmpty)
+    let first = Date(timeIntervalSince1970: 1_800_000_000)
+    for index in 0..<(SystemQuitsRecord.limit + 3) {
+        store.noteSystemQuit(at: first.addingTimeInterval(TimeInterval(index)))
+    }
+    let quits = store.loadSystemQuits()
+    #expect(quits.count == SystemQuitsRecord.limit)
+    #expect(quits.first == first.addingTimeInterval(3))
+    #expect(quits.last == first.addingTimeInterval(TimeInterval(SystemQuitsRecord.limit + 2)))
+
+    // Sessions ended on purpose, by host identity and session id.
+    let bound = WorkspaceSessionRecord(
+        id: UUID(), kind: .terminal, title: "Shell", workingDirectory: "/repo",
+        hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: "s1", owned: true)
+    )
+    #expect(!store.wasEndedOnPurpose(bound))
+    store.addEndedSessions([(hostID: "host-a", sessionID: "s1"), (hostID: "host-a", sessionID: "s1")])
+    store.flush()
+    #expect(store.wasEndedOnPurpose(bound))
+    var elsewhere = bound
+    elsewhere.hosted?.hostID = "host-b"
+    #expect(!store.wasEndedOnPurpose(elsewhere))
+    // A tab whose session is still to be ended counts too.
+    let closing = WorkspaceSessionRecord(id: UUID(), kind: .terminal, title: "Closing", workingDirectory: "/repo")
+    store.addSessionsToEnd([closing])
+    store.flush()
+    #expect(store.wasEndedOnPurpose(closing))
+    // Never expires: an entry stays while a saved state names its
+    // session, and goes once none does.
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: "/closed", activeWorktreeRoot: "/closed",
+        worktrees: [WorktreeStateRecord(root: "/closed", sessions: [bound])],
+        savedAt: Date(timeIntervalSince1970: 1_000)
+    ))
+    for index in 0..<3 {
+        store.addEndedSessions([(hostID: "host-a", sessionID: "n\(index)")])
+    }
+    store.flush()
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    var ended = try decoder.decode(EndedSessionsRecord.self, from: Data(contentsOf: store.endedSessionsFileURL))
+    // s1 (named by /closed) and the latest; unnamed older ones went.
+    #expect(ended.entries.map(\.sessionID) == ["s1", "n2"])
+    #expect(store.wasEndedOnPurpose(bound))
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: "/closed", activeWorktreeRoot: "/closed", worktrees: []
+    ))
+    store.addEndedSessions([(hostID: "host-a", sessionID: "n3")])
+    store.flush()
+    ended = try decoder.decode(EndedSessionsRecord.self, from: Data(contentsOf: store.endedSessionsFileURL))
+    #expect(ended.entries.map(\.sessionID) == ["n3"])
+
+    // A list that cannot be read fails safe: records saved before it was
+    // lost count as ended on purpose; those saved after are checked again.
+    try Data("{not json".utf8).write(to: store.endedSessionsFileURL)
+    var before = bound
+    before.savedAt = Date().addingTimeInterval(-60)
+    var after = bound
+    after.hosted?.sessionID = "s-after"
+    after.savedAt = Date().addingTimeInterval(60)
+    #expect(store.wasEndedOnPurpose(before))
+    #expect(!store.wasEndedOnPurpose(after))
+    // The loss is kept once the unreadable file was moved aside.
+    #expect(store.wasEndedOnPurpose(before))
+    #expect(try decoder.decode(EndedSessionsRecord.self, from: Data(contentsOf: store.endedSessionsFileURL)).lostBefore != nil)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: store.directory.path).contains { $0.hasPrefix("ended-sessions.json.unreadable-") })
+
+    // Sessions the host reported lost are kept while a saved state names
+    // them, whatever happens to the host.
+    #expect(store.lostSessions(hostID: "host-a").isEmpty)
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: "/closed", activeWorktreeRoot: "/closed",
+        worktrees: [WorktreeStateRecord(root: "/closed", sessions: [bound])]
+    ))
+    store.addLostSessions(["s1", "s-gone"], hostID: "host-a")
+    store.flush()
+    #expect(store.lostSessions(hostID: "host-a") == ["s1", "s-gone"])
+    #expect(store.lostSessions(hostID: "host-b").isEmpty)
+    store.addLostSessions(["s-new"], hostID: "host-a")
+    store.flush()
+    #expect(store.lostSessions(hostID: "host-a") == ["s1", "s-new"])
+
+    // A tab the system ended is saved as such, naming no session, and may
+    // come back; an older build's record has none.
+    var endedTab = WorkspaceSessionRecord(id: UUID(), kind: .agent, title: "Lead", agentName: "Claude", workingDirectory: "/repo")
+    #expect(!endedTab.mayComeBack)
+    endedTab.systemEnd = .restart
+    #expect(endedTab.mayComeBack)
+    #expect(!endedTab.mayOwnLocalSession)
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: "/repo", activeWorktreeRoot: "/repo",
+        worktrees: [WorktreeStateRecord(root: "/repo", sessions: [endedTab])]
+    ))
+    let loaded = try #require(store.load(repositoryRoot: "/repo")?.worktrees.first?.sessions.first)
+    #expect(loaded.systemEnd == .restart)
+    #expect(store.hasSavedTabs(repositoryRoot: "/repo"))
+    #expect(store.load(repositoryRoot: "/repo")?.worktrees.first?.hasRestorableSessions == true)
+    let older = try decoder.decode(WorkspaceSessionRecord.self, from: Data(#"{"id":"\#(UUID().uuidString)","kind":"terminal","title":"T","titleSource":"system","launchEnvironment":{},"workingDirectory":"/","restartOnExit":false}"#.utf8))
+    #expect(older.systemEnd == nil)
+    #expect(SystemSessionEnd.restart.message == "Ended when the Mac restarted")
+    #expect(SystemSessionEnd.logout.message == "Ended when you logged out")
+}
+
 @Test func openProjectWindowListRoundTripsAndReopensOnlyWindowsWithTabs() throws {
     let directory = try makeCanonicalTemporaryDirectory("cherry-open-windows")
     defer { try? FileManager.default.removeItem(at: directory) }

@@ -159,6 +159,14 @@ private final class RealLocalHost {
         }
     }
 
+    /// A log out: the daemon and every holder are killed (the holders with
+    /// SIGKILL, leaving their manifests), then a new daemon starts on the
+    /// same socket and state, as at the next login.
+    func logOut() throws {
+        host.stop()
+        host = try RealHostTestDaemon(executable: daemonExecutable, environment: daemonEnvironment, socket: socket)
+    }
+
     var policy: SessionBackendPolicy {
         let settings = settings
         return SessionBackendPolicy(settings: { settings.value }, localSessions: hosting)
@@ -909,6 +917,103 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         try await host.waitFor("both sessions to be gone") {
             let sessions = try await host.control.list().sessions.map(\.id)
             return !sessions.contains(terminalSession) && !sessions.contains(commandSession)
+        }
+    } catch {
+        await tearDown()
+        throw error
+    }
+    await tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostTabsALogOutEndedComeBackEndedAndRestart() async throws {
+    let host = try await RealLocalHost()
+    let project = host.home.appendingPathComponent("project", isDirectory: true)
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let store = WorkspaceStateStore(directory: host.root.appendingPathComponent("Workspaces", isDirectory: true))
+    let control = host.control
+    let restorer = WorkspaceSessionRestorers.hostedByDefault(localSessions: host.hosting, control: { host in
+        Issue.record("No saved tab names \(host.displayName)")
+        return control
+    })
+    var repositories: [RepositoryWorkspace] = []
+    func makeRepository() -> RepositoryWorkspace {
+        let repository = RepositoryWorkspace(
+            projectRoot: project.path,
+            backendPolicy: host.policy,
+            stateStore: store,
+            sessionRestorer: restorer,
+            autoStartCommands: { _ in [] }
+        )
+        repositories.append(repository)
+        return repository
+    }
+    func tearDown() async {
+        for repository in repositories { repository.closeAllSessions(intent: .windowClosed) }
+        await host.tearDown()
+    }
+    do {
+        // A window with its default shell, and a second tab whose session
+        // is ended on purpose (Kill, Remove) after the state named it; the
+        // app records what it ends.
+        host.hosting.endedSessionsStore = store
+        let first = makeRepository()
+        first.beginRestoringSavedStateIfNeeded(chromeState: nil)
+        await first.waitForPendingRestores()
+        let workspace = first.activeWorkspace
+        let terminal = try #require(workspace.sessions.first)
+        let ended = workspace.addSession(title: "Ended")
+        try await host.waitFor("both sessions") { terminal.persistentSession != nil && ended.persistentSession != nil }
+        let terminalSession = try #require(terminal.persistentSession?.sessionID)
+        let endedSession = try #require(ended.persistentSession?.sessionID)
+        first.flushPersistentState()
+        let savedState = try #require(store.load(repositoryRoot: first.repositoryRoot))
+        workspace.close(ended)
+        try await host.waitFor("the ended session to go") {
+            try await !host.control.list().sessions.contains { $0.id == endedSession }
+        }
+        // Cherry quits keeping its sessions; the state it saved still names
+        // both tabs. Then the user logs out, killing every holder.
+        first.closeAllSessions(intent: .appQuit)
+        store.saveSynchronously(savedState)
+        try host.logOut()
+        // Cherry had quit for the log out too (rule 2): the evidence holds
+        // for every saved tab, and the one ended on purpose still stays
+        // dropped.
+        store.noteSystemQuit()
+
+        // The next login: the host reports the killed holder's session lost
+        // (not the one ended on purpose), and its tab comes back ended, in
+        // place of a new shell.
+        try await host.waitFor("the new daemon to list") {
+            // The connection to the killed daemon fails first.
+            guard let list = try? await host.control.list() else { return false }
+            return list.isComplete && list.lostSessionIDs == [terminalSession]
+        }
+        let second = makeRepository()
+        let chromeState = ProjectWindowChromeState(toasts: ProjectWindowToasts(
+            schedule: { _, _ in }, announce: { _ in }, voiceOverEnabled: { false }
+        ))
+        second.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
+        await second.waitForPendingRestores()
+        let restored = second.activeWorkspace
+        #expect(restored.sessions.map(\.id) == [terminal.id])
+        #expect(restored.session(withID: ended.id) == nil)
+        #expect(store.wasEndedOnPurpose(try #require(savedState.worktree(root: first.initialWorktreeRoot)?.sessions.first { $0.id == ended.id })))
+        let back = try #require(restored.session(withID: terminal.id))
+        #expect(back.systemSessionEnd == .logout)
+        #expect(back.persistentSessionEndedMessage == "Ended when you logged out")
+        #expect(chromeState.toasts.current?.title == "1 tab ended when you logged out")
+
+        // Restart: a new session for the same tab, in its directory.
+        #expect(restored.restart(back))
+        host.show(back)
+        try await host.waitFor("the restarted tab to attach") { back.persistentSession != nil && back.state == .live }
+        #expect(back.persistentSession?.sessionID != terminalSession)
+        #expect(back.systemSessionEnd == nil)
+        back.send(text: "echo BACK_$((6 * 7)) $CHERRY_PROCESS_ID\n")
+        try await host.waitFor("the restarted tab's output") {
+            host.screen(back).contains("BACK_42 \(terminal.id.uuidString)")
         }
     } catch {
         await tearDown()

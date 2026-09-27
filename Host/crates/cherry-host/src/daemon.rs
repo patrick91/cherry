@@ -200,6 +200,11 @@ pub struct Host {
     /// turned away, or are gone: those a `List` reports as pending, however
     /// long they take.
     awaited: Mutex<HashMap<String, paths::Manifest>>,
+    /// Sessions whose holders were gone when this daemon started, without
+    /// having ended: each left its manifest behind (a holder that exits
+    /// removes it), so it was killed, as a log out or restart kills the
+    /// user's processes (`ServerMessage::Sessions::lost_sessions`). Sorted.
+    pub lost: Vec<String>,
     /// Serializes launches with each other and with shutdown.
     pub launches: Mutex<()>,
     pub stopping: AtomicBool,
@@ -714,14 +719,17 @@ pub fn serve(path: &Path) -> Result<()> {
     // its manifest behind, and its PID may belong to another process now.
     let mut expected = HashSet::new();
     let mut awaited = HashMap::new();
+    let mut lost = Vec::new();
     for (manifest_path, manifest) in paths::read_manifests(&state) {
         if !holder_exists(&manifest) {
             let _ = fs::remove_file(manifest_path);
+            lost.push(manifest.id);
         } else if manifest.link_version >= link::MIN_LINK_VERSION {
             expected.insert(manifest.id.clone());
             awaited.insert(manifest.id.clone(), manifest);
         }
     }
+    lost.sort();
     let listener =
         UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -745,6 +753,7 @@ pub fn serve(path: &Path) -> Result<()> {
         expected: Mutex::new(expected),
         expected_changed: Condvar::new(),
         awaited: Mutex::new(awaited),
+        lost,
         launches: Mutex::new(()),
         stopping: AtomicBool::new(false),
         next_lease: AtomicU64::new(1),

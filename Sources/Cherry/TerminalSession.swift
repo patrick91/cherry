@@ -1769,6 +1769,52 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    /// A tab for a saved record whose session the system ended while
+    /// Cherry was closed (a restart or log out, `SystemEndedSessions`),
+    /// built like the tab that saved it (same id, kind, title, agent,
+    /// parent agent, command, launch settings and project) but not
+    /// launched: it shows how its session ended, and Restart starts its
+    /// program again as a new session (a native tab when local tabs do not
+    /// run as persistent sessions), in the tab's last directory, or where
+    /// it started or its project when that is gone. Not added:
+    /// `restoreSessions(_:from:)` adds it with the saved layout.
+    func makeSystemEndedSession(record: WorkspaceSessionRecord, ended end: SystemSessionEnd) -> TerminalSession {
+        let subtitle: String = switch record.kind {
+        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
+        case .agent, .command: record.launchCommand ?? ""
+        }
+        let directory = [record.workingDirectory, record.launchWorkingDirectory, record.projectRoot]
+            .compactMap { $0 }
+            .first { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+            }
+        let hosting = launchBackend == .nativePTY && backendPolicy.prefersPersistentLocalSessions
+            ? backendPolicy.localSessions
+            : nil
+        let session = TerminalSession(
+            id: record.id,
+            title: record.title.nilIfEmpty ?? record.commandName ?? record.agentName ?? "Shell",
+            titleSource: record.title.isEmpty ? .explicit : record.titleSource,
+            subtitle: subtitle,
+            tint: Self.palette[sessions.count % Self.palette.count],
+            workingDirectory: Self.resolvedWorkingDirectory(directory),
+            projectRoot: record.projectRoot,
+            launchShell: false,
+            kind: record.kind,
+            agentName: record.agentName,
+            parentAgentID: record.parentAgentID,
+            commandName: record.commandName,
+            launchCommand: record.launchCommand,
+            launchEnvironment: record.launchEnvironment,
+            restartOnExit: record.restartOnExit,
+            launchBackend: launchBackend,
+            persistentHosting: hosting
+        )
+        session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
+        return session
+    }
+
     private func hostedSession(attachedTo attachment: HostedSessionAttachment) -> TerminalSession? {
         sessions.first {
             $0.hostedSessionBinding?.hostID == attachment.hostID
@@ -3566,6 +3612,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// stop, restart or close (they stop following it first), a program
     /// that had ended before the tab followed it, or an attached tab's.
     var programDidExit: (@MainActor (TerminalSession) -> Void)?
+    /// The system ended this tab's session while Cherry was closed (a
+    /// restart or log out): the tab came back ended, with no session, and
+    /// says so (`PersistentSessionEndedBar`). Any launch (Restart,
+    /// auto-start, auto-restart, MCP) clears it. Saved with the tab
+    /// (`WorkspaceSessionRecord.systemEnd`).
+    @Published private(set) var systemSessionEnd: SystemSessionEnd?
+    /// How the program of a tab the system ended had exited before that
+    /// (`WorkspaceSessionRecord.exitStatus`): the tab shows "Session ended
+    /// (exit N)", and nothing restarts it by itself.
+    private(set) var systemEndExitStatus: Int32?
     /// True when auto-restart gave up on a crash-looping command (see
     /// `CommandAutoRestartPolicy`); cleared by a manual restart.
     @Published private(set) var isAutoRestartPaused = false
@@ -5251,6 +5307,12 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func startShell() {
         resumePersistentHostingAfterFallback()
+        if systemSessionEnd != nil {
+            // Started again: no longer the tab the system ended.
+            systemSessionEnd = nil
+            systemEndExitStatus = nil
+            persistentStateDidChange?()
+        }
         let launchID = UUID()
         activeLaunchID = launchID
         // A restored or adopted session (`persistentSessionToAdopt`, taken
@@ -6280,6 +6342,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         scheduleAttentionObservation(event: .processExited)
         bumpRevision()
+        if isPersistentLocalSession {
+            // Saved with its exit (`savedExitStatus`): a relaunch that finds
+            // the session gone knows it had ended.
+            persistentStateDidChange?()
+        }
         if reportsExit {
             programDidExit?(self)
         }
@@ -6292,11 +6359,53 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// host; nil otherwise. Closing the tab removes that session. A terminal
     /// whose shell exited with status 0 closes instead, unless Settings ›
     /// Sessions keeps such tabs (`TerminalWorkspace.tabProgramDidExit`).
+    ///
+    /// For a tab whose session the system ended while Cherry was closed
+    /// (`systemSessionEnd`), of any kind, what ended it: "Ended when the
+    /// Mac restarted".
     var persistentSessionEndedMessage: String? {
+        if let systemSessionEnd, !isRunning {
+            return systemEndExitStatus.map { HostedAttachmentStatus.exited(code: $0, signal: nil).summary }
+                ?? systemSessionEnd.message
+        }
         guard isPersistentLocalSession, kind != .command, !isRunning, persistentSession != nil,
               case .exited(let status) = state
         else { return nil }
         return HostedAttachmentStatus.exited(code: status, signal: nil).summary
+    }
+
+    /// Shows that the system ended this tab's session while Cherry was
+    /// closed: a tab built for a saved record that is not launched
+    /// (`TerminalWorkspace.makeSystemEndedSession`). A command that
+    /// restarts when it exits restarts by its policy, as a restored command
+    /// whose session ended does.
+    ///
+    /// `exitStatus`: its program had exited before (the saved record's): the
+    /// tab shows that exit, and does not restart by itself (a command whose
+    /// auto-restart gave up stays stopped).
+    func showSystemSessionEnd(_ end: SystemSessionEnd, exitStatus: Int32? = nil) {
+        guard !isRunning else { return }
+        systemSessionEnd = end
+        systemEndExitStatus = exitStatus
+        if let exitStatus {
+            state = .exited(exitStatus)
+            exitCode = exitStatus
+        } else if kind == .command, restartOnExit {
+            scheduleAutoRestartAfterExit()
+        }
+        bumpRevision()
+    }
+
+    /// How this tab's program ended, as its saved record keeps it
+    /// (`WorkspaceSessionRecord.exitStatus`): the exit of this app's own
+    /// persistent tab whose session its host reported exited, or of a tab
+    /// the system ended that had exited before. Nil while it runs, and for
+    /// any other tab.
+    var savedExitStatus: Int32? {
+        guard !isRunning else { return nil }
+        if systemSessionEnd != nil { return systemEndExitStatus }
+        guard isPersistentLocalSession, persistentSession != nil, case .exited(let status) = state else { return nil }
+        return status
     }
 
     /// Whether this restored tab's attach adapter is still to be launched

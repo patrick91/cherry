@@ -168,6 +168,23 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// whose answer (or new binding) was never saved still comes back.
     /// Older builds ignore it.
     var launchRequestID: String?
+    /// The tab's session was ended by the system (a restart or log out)
+    /// while Cherry was closed: it comes back ended, with Restart and
+    /// Close, until it restarts or closes (`SystemEndedSessions`). Such a
+    /// record names no session. Older builds ignore it (and drop the tab).
+    var systemEnd: SystemSessionEnd?
+    /// How the tab's program ended, once its session was known to have
+    /// exited ("Session ended (exit N)"): a relaunch that finds the session
+    /// gone never takes it for one the system ended while it ran. With
+    /// `systemEnd`, the tab comes back showing that exit, and nothing
+    /// restarts it by itself (auto-start aside). Older builds ignore it.
+    var exitStatus: Int32?
+    /// When a tab that was open last saved this record. A record a restore
+    /// kept (its host could not be listed) is saved again unchanged, so
+    /// this still says when its session was last known to run; nil in
+    /// older files, whose `RepositoryStateRecord.savedAt` stands in
+    /// (`SystemEndedSessions`). Older builds ignore it.
+    var savedAt: Date?
 
     init(
         id: UUID,
@@ -184,7 +201,10 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         restartOnExit: Bool = false,
         projectRoot: String? = nil,
         hosted: HostedSessionBindingRecord? = nil,
-        launchRequestID: String? = nil
+        launchRequestID: String? = nil,
+        systemEnd: SystemSessionEnd? = nil,
+        exitStatus: Int32? = nil,
+        savedAt: Date? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -201,6 +221,9 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         self.projectRoot = projectRoot
         self.hosted = hosted
         self.launchRequestID = launchRequestID
+        self.systemEnd = systemEnd
+        self.exitStatus = exitStatus
+        self.savedAt = savedAt
     }
 
     /// A tab whose program can still be running after Cherry quit.
@@ -208,10 +231,11 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         hosted != nil
     }
 
-    /// A restorable tab, or one saved while its session's Create had not
-    /// answered: the local host may have started that session.
+    /// A restorable tab, one saved while its session's Create had not
+    /// answered (the local host may have started that session), or one
+    /// whose session the system ended (it comes back ended).
     var mayComeBack: Bool {
-        hosted != nil || launchRequestID != nil
+        hosted != nil || launchRequestID != nil || systemEnd != nil
     }
 
     /// A saved tab that may own a session of This Mac (a persistent tab,
@@ -263,7 +287,9 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
             hosted: session.hostedSessionBinding.map {
                 HostedSessionBindingRecord($0, owned: session.isPersistentLocalSession)
             },
-            launchRequestID: session.isPersistentLocalSession ? session.persistentLaunchRequestID : nil
+            launchRequestID: session.isPersistentLocalSession ? session.persistentLaunchRequestID : nil,
+            systemEnd: session.systemSessionEnd,
+            exitStatus: session.savedExitStatus
         )
     }
 }
@@ -407,6 +433,80 @@ struct SessionsToEndRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// When Cherry quit for a log out, restart or shut down
+/// (`CherryAppDelegate.QuitReason.powerOff`), oldest first: the sessions
+/// running then ended with the user's processes, so a saved tab whose
+/// session is gone after one, saved before it, was ended by the system
+/// (`SystemEndedSessions`).
+struct SystemQuitsRecord: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+    /// The newest ones kept.
+    static let limit = 32
+
+    var version: Int
+    var quits: [Date]
+
+    init(version: Int = SystemQuitsRecord.currentVersion, quits: [Date]) {
+        self.version = version
+        self.quits = quits
+    }
+}
+
+/// Sessions of This Mac this app ended on purpose, oldest first: a tab's
+/// close, End Sessions, Background Sessions → End, a removed worktree's
+/// tabs, a clean exit's removal, a restart's previous session, or
+/// Persistent Sessions → Terminate or Remove. A saved tab that names one
+/// never comes back as ended by the system (`SystemEndedSessions`), even
+/// after a restart: a closed window's record still names the sessions
+/// ended from Background Sessions, and a window closed or a quit with End
+/// Sessions saved its tabs before ending them. Entries never expire: an
+/// entry goes only once no saved state file names its session.
+struct EndedSessionsRecord: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    struct Entry: Codable, Equatable, Sendable {
+        /// The local host's identity.
+        var hostID: String
+        var sessionID: String
+        var endedAt: Date
+    }
+
+    var version: Int
+    var entries: [Entry]
+    /// The list was lost (its file could not be read) at this time: the
+    /// sessions a record saved before it names may have been ended on
+    /// purpose, so such a record never comes back as ended by the system.
+    var lostBefore: Date?
+
+    init(version: Int = EndedSessionsRecord.currentVersion, entries: [Entry], lostBefore: Date? = nil) {
+        self.version = version
+        self.entries = entries
+        self.lostBefore = lostBefore
+    }
+}
+
+/// Sessions of This Mac whose holders the local host found killed
+/// (`HostedSessionList.lostSessionIDs`), as this app saw them: the host
+/// reports them only until its daemon restarts, and a window may open
+/// later. An entry goes once no saved state file names its session.
+struct LostSessionsRecord: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    struct Entry: Codable, Equatable, Sendable {
+        var hostID: String
+        var sessionID: String
+        var seenAt: Date
+    }
+
+    var version: Int
+    var entries: [Entry]
+
+    init(version: Int = LostSessionsRecord.currentVersion, entries: [Entry]) {
+        self.version = version
+        self.entries = entries
+    }
+}
+
 /// What a project's state file that this version could not use (and moved
 /// aside, `WorkspaceStateStore.load`) said, as far as it can be read: when
 /// it was last saved, and the tabs, sessions and Create requests it named.
@@ -483,6 +583,18 @@ final class WorkspaceStateStore: @unchecked Sendable {
 
     var sessionsToEndFileURL: URL {
         directory.appendingPathComponent("sessions-to-end.json", isDirectory: false)
+    }
+
+    var systemQuitsFileURL: URL {
+        directory.appendingPathComponent("system-quits.json", isDirectory: false)
+    }
+
+    var endedSessionsFileURL: URL {
+        directory.appendingPathComponent("ended-sessions.json", isDirectory: false)
+    }
+
+    var lostSessionsFileURL: URL {
+        directory.appendingPathComponent("lost-sessions.json", isDirectory: false)
     }
 
     /// The app is quitting (its quit may still wait for sessions to end): a
@@ -695,6 +807,180 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
+    // MARK: What ended sessions (SystemEndedSessions)
+
+    /// Cherry quits for a log out, restart or shut down: written at once,
+    /// after the windows' last saves.
+    func noteSystemQuit(at date: Date = Date()) {
+        guard isEnabled else { return }
+        let fileURL = systemQuitsFileURL
+        queue.sync {
+            var quits = readVersionedLocked(
+                SystemQuitsRecord.self, from: fileURL, version: \.version, currentVersion: SystemQuitsRecord.currentVersion
+            )?.quits ?? []
+            quits.append(date)
+            if quits.count > SystemQuitsRecord.limit {
+                quits.removeFirst(quits.count - SystemQuitsRecord.limit)
+            }
+            writeLocked(SystemQuitsRecord(quits: quits), to: fileURL)
+        }
+    }
+
+    /// When Cherry quit for a log out, restart or shut down, oldest first;
+    /// nothing when the store is disabled.
+    func loadSystemQuits() -> [Date] {
+        guard isEnabled else { return [] }
+        let fileURL = systemQuitsFileURL
+        return queue.sync {
+            readVersionedLocked(
+                SystemQuitsRecord.self, from: fileURL, version: \.version, currentVersion: SystemQuitsRecord.currentVersion
+            )?.quits ?? []
+        }
+    }
+
+    /// This app is ending these sessions of This Mac on purpose (the local
+    /// host's identity and the session id): queued ahead of any later save.
+    /// Entries no saved state file names any more are dropped meanwhile.
+    func addEndedSessions(_ sessions: [(hostID: String, sessionID: String)]) {
+        guard isEnabled, !sessions.isEmpty else { return }
+        let fileURL = endedSessionsFileURL
+        let now = Date()
+        queue.async {
+            var record = self.readEndedSessionsLocked(fileURL)
+            let added = Set(sessions.map { Self.key(hostID: $0.hostID, sessionID: $0.sessionID) })
+            let named = self.namedLocalSessionsLocked()
+            record.entries.removeAll { entry in
+                let key = Self.key(hostID: entry.hostID, sessionID: entry.sessionID)
+                return added.contains(key) || !named.contains(key)
+            }
+            var seen = Set<String>()
+            for session in sessions where seen.insert(Self.key(hostID: session.hostID, sessionID: session.sessionID)).inserted {
+                record.entries.append(EndedSessionsRecord.Entry(hostID: session.hostID, sessionID: session.sessionID, endedAt: now))
+            }
+            self.writeLocked(record, to: fileURL)
+        }
+    }
+
+    /// Whether this app ended the session of saved tab `record` on purpose:
+    /// its session is among the ended ones (`addEndedSessions`), or the tab
+    /// is among the forgotten or closed tabs whose sessions are to be ended
+    /// (`SessionsToEndRecord`). Also true when the list of ended sessions
+    /// was lost after the record was saved (`savedAt`, else `fallbackSavedAt`;
+    /// unknown counts as before): what cannot be checked is not brought
+    /// back. False when the store is disabled.
+    func wasEndedOnPurpose(_ record: WorkspaceSessionRecord, fallbackSavedAt: Date? = nil) -> Bool {
+        guard isEnabled else { return false }
+        let endedURL = endedSessionsFileURL
+        let toEndURL = sessionsToEndFileURL
+        return queue.sync {
+            if (readSessionsToEndLocked(toEndURL) ?? []).contains(where: { $0.record.id == record.id }) {
+                return true
+            }
+            let ended = readEndedSessionsLocked(endedURL)
+            if let lostBefore = ended.lostBefore, (record.savedAt ?? fallbackSavedAt ?? .distantPast) <= lostBefore {
+                return true
+            }
+            guard let binding = record.hosted, binding.host == HostedSessionHost.local.id else { return false }
+            return ended.entries.contains { $0.hostID == binding.hostID && $0.sessionID == binding.sessionID }
+        }
+    }
+
+    /// The host `hostID` reported these sessions lost: kept, so a window
+    /// opened after its daemon restarted still knows. Entries no saved state
+    /// file names any more are dropped meanwhile.
+    func addLostSessions(_ sessionIDs: Set<String>, hostID: String) {
+        guard isEnabled, !sessionIDs.isEmpty else { return }
+        let fileURL = lostSessionsFileURL
+        let now = Date()
+        queue.async {
+            var entries = self.readVersionedLocked(
+                LostSessionsRecord.self, from: fileURL, version: \.version, currentVersion: LostSessionsRecord.currentVersion
+            )?.entries ?? []
+            let known = Set(entries.map { Self.key(hostID: $0.hostID, sessionID: $0.sessionID) })
+            let fresh = sessionIDs.sorted().filter { !known.contains(Self.key(hostID: hostID, sessionID: $0)) }
+            guard !fresh.isEmpty else { return }
+            let named = self.namedLocalSessionsLocked()
+            entries.removeAll { !named.contains(Self.key(hostID: $0.hostID, sessionID: $0.sessionID)) }
+            entries += fresh.map { LostSessionsRecord.Entry(hostID: hostID, sessionID: $0, seenAt: now) }
+            self.writeLocked(LostSessionsRecord(entries: entries), to: fileURL)
+        }
+    }
+
+    /// The sessions of host `hostID` its host reported lost, as recorded.
+    func lostSessions(hostID: String) -> Set<String> {
+        guard isEnabled else { return [] }
+        let fileURL = lostSessionsFileURL
+        return queue.sync {
+            let entries = readVersionedLocked(
+                LostSessionsRecord.self, from: fileURL, version: \.version, currentVersion: LostSessionsRecord.currentVersion
+            )?.entries ?? []
+            return Set(entries.filter { $0.hostID == hostID }.map(\.sessionID))
+        }
+    }
+
+    private static func key(hostID: String, sessionID: String) -> String {
+        "\(hostID)\u{0}\(sessionID)"
+    }
+
+    /// Every session of This Mac a saved state file (of this version) names.
+    /// Only on `queue`.
+    private func namedLocalSessionsLocked() -> Set<String> {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
+        var named = Set<String>()
+        for name in names where name.count == 69 && name.hasSuffix(".json")
+            && name.dropLast(5).allSatisfy({ $0.isHexDigit }) {
+            let url = directory.appendingPathComponent(name, isDirectory: false)
+            guard case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: url) else { continue }
+            for worktree in state.worktrees {
+                for session in worktree.sessions {
+                    guard let binding = session.hosted, binding.host == HostedSessionHost.local.id else { continue }
+                    named.insert(Self.key(hostID: binding.hostID, sessionID: binding.sessionID))
+                }
+            }
+        }
+        return named
+    }
+
+    /// The ended sessions. A file this version cannot use is moved aside,
+    /// and the list starts again from then (`lostBefore`), written at once so
+    /// the loss is not forgotten. Only on `queue`.
+    private func readEndedSessionsLocked(_ fileURL: URL) -> EndedSessionsRecord {
+        if case .missing = Self.readFile(EndedSessionsRecord.self, from: fileURL) {
+            return EndedSessionsRecord(entries: [])
+        }
+        if let record = readVersionedLocked(
+            EndedSessionsRecord.self, from: fileURL, version: \.version, currentVersion: EndedSessionsRecord.currentVersion
+        ) {
+            return record
+        }
+        let restarted = EndedSessionsRecord(entries: [], lostBefore: Date())
+        writeLocked(restarted, to: fileURL)
+        return restarted
+    }
+
+    /// A small record file of this version; one this version cannot use is
+    /// moved aside first. Only on `queue`.
+    private func readVersionedLocked<Record: Decodable>(
+        _ type: Record.Type,
+        from fileURL: URL,
+        version: KeyPath<Record, Int>,
+        currentVersion: Int
+    ) -> Record? {
+        switch Self.readFile(type, from: fileURL) {
+        case .missing:
+            return nil
+        case .unusable(let found):
+            setAsideLocked(fileURL, label: found.map { "v\($0)" } ?? "unreadable")
+            return nil
+        case .usable(let record):
+            guard record[keyPath: version] == currentVersion else {
+                setAsideLocked(fileURL, label: "v\(record[keyPath: version])")
+                return nil
+            }
+            return record
+        }
+    }
+
     /// The entries that have not expired; a file this version cannot use is
     /// moved aside first. Only on `queue`.
     private func readSessionsToEndLocked(_ fileURL: URL) -> [SessionsToEndRecord.Entry]? {
@@ -849,6 +1135,130 @@ struct WorkspaceRestoreRequest {
     /// handed back yet (with the workspace's close intent), so no stale tab
     /// goes on owning a session a new window's restore should bring back.
     var cancellation = WorkspaceRestoreCancellation()
+    /// Which records whose session is gone the system ended: they come back
+    /// as ended tabs instead of being dropped. Nil: none does (a restore
+    /// without saved state behind it, tests).
+    var systemEnds: SystemEndedSessions?
+}
+
+// MARK: - Sessions the system ended
+
+/// How the system, not the user or the program, ended a saved tab's session
+/// while Cherry was closed (docs/specs/multiplexer-default.md, "Relaunch").
+enum SystemSessionEnd: String, Codable, Equatable, Sendable {
+    /// This Mac started again since the tab was saved: a restart, a shut
+    /// down, a power loss or a crash.
+    case restart
+    /// The user logged out since: the system ended their processes.
+    case logout
+
+    /// What the ended tab says (`PersistentSessionEndedBar`).
+    var message: String {
+        switch self {
+        case .restart: "Ended when the Mac restarted"
+        case .logout: "Ended when you logged out"
+        }
+    }
+
+    /// The window's toast after its tab count: "3 tabs ended when the Mac
+    /// restarted".
+    var predicate: String {
+        switch self {
+        case .restart: " ended when the Mac restarted"
+        case .logout: " ended when you logged out"
+        }
+    }
+}
+
+/// Decides whether the system ended a saved tab's session while Cherry was
+/// closed. Such a tab comes back ended, in its place, with its kind, title,
+/// agent, command and directory, and Restart starts it again; any other
+/// tab whose session is gone is dropped, as before.
+///
+/// The rule. A saved tab that owned a session of This Mac
+/// (`WorkspaceSessionRecord.mayOwnLocalSession`: bound to one, or saved
+/// while its Create was under way) whose session a complete list of the
+/// same host no longer has, and that this app did not end on purpose
+/// (`endedOnPurpose`: `WorkspaceStateStore.wasEndedOnPurpose`, or being
+/// ended now), was ended by the system when one of these says so:
+/// 1. This Mac booted after the record was last saved by an open tab
+///    (`WorkspaceSessionRecord.savedAt`, else the file's `savedAt`; a
+///    record kept while its host could not be listed keeps its time):
+///    `.restart`. This covers a crash, a power loss and a forced restart,
+///    which run no Cherry code.
+/// 2. Cherry quit for a log out, restart or shut down after that
+///    (`WorkspaceStateStore.noteSystemQuit`): `.logout` (a restart also
+///    moved the boot time, rule 1).
+/// 3. The host found the session's holder killed rather than ended
+///    (`HostedSessionList.lostSessionIDs`: its manifest left behind), now or
+///    when this app last saw it report so (`WorkspaceStateStore.lostSessions`),
+///    as a log out kills the user's processes while Cherry is not running:
+///    `.logout`.
+/// Without any of them (a normal relaunch, a session that ended while the
+/// Mac ran) the tab is dropped. A record whose program had exited before
+/// (`exitStatus`) comes back showing that exit instead, or stays dropped
+/// where *close on exit* would have closed it (a terminal's exit 0).
+@MainActor
+struct SystemEndedSessions {
+    /// When the state the records come from was saved, for a record that
+    /// does not say itself (`WorkspaceSessionRecord.savedAt`, an older
+    /// file's); nil when neither says: then only the host's word counts.
+    var savedAt: Date?
+    /// When This Mac last booted (`currentBootTime()`).
+    var bootTime: Date?
+    /// When Cherry quit for a log out, restart or shut down.
+    var systemQuits: [Date]
+    /// Whether this app ended the record's session on purpose.
+    var endedOnPurpose: @MainActor (WorkspaceSessionRecord) -> Bool
+    /// The sessions of a host (by its identity) that it reported lost
+    /// earlier, as this app recorded them (`WorkspaceStateStore.lostSessions`).
+    var recordedLostSessions: @MainActor (String) -> Set<String> = { _ in [] }
+
+    /// When `record` was last known to run: when an open tab last saved it.
+    func savedAt(of record: WorkspaceSessionRecord) -> Date? {
+        record.savedAt ?? savedAt
+    }
+
+    /// How the system ended `record`'s session, which `list` (complete, of
+    /// the host the record names) does not have; nil when the tab is to be
+    /// dropped. A record whose program had exited (`exitStatus`) comes back
+    /// showing that exit, not as ended by the system.
+    func end(of record: WorkspaceSessionRecord, missingFrom list: HostedSessionList) -> SystemSessionEnd? {
+        guard record.mayOwnLocalSession, !endedOnPurpose(record) else { return nil }
+        let lost = record.hosted.map { binding in
+            binding.hostID == list.hostID
+                && (list.lostSessionIDs.contains(binding.sessionID)
+                    || recordedLostSessions(binding.hostID).contains(binding.sessionID))
+        } ?? false
+        return Self.end(savedAt: savedAt(of: record), bootTime: bootTime, systemQuits: systemQuits, lostByHost: lost)
+    }
+
+    /// The rule's evidence (see the type). Saves keep whole seconds, and so
+    /// does this comparison.
+    nonisolated static func end(
+        savedAt: Date?,
+        bootTime: Date?,
+        systemQuits: [Date],
+        lostByHost: Bool
+    ) -> SystemSessionEnd? {
+        let saved = savedAt.map { $0.timeIntervalSince1970.rounded(.down) }
+        if let saved, let bootTime, saved < bootTime.timeIntervalSince1970.rounded(.down) {
+            return .restart
+        }
+        if let saved, systemQuits.contains(where: { $0.timeIntervalSince1970.rounded(.down) >= saved }) {
+            return .logout
+        }
+        return lostByHost ? .logout : nil
+    }
+
+    /// When This Mac last booted (`kern.boottime`); nil if it cannot say.
+    nonisolated static func currentBootTime() -> Date? {
+        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+        var boot = timeval()
+        var size = MemoryLayout<timeval>.stride
+        guard sysctl(&mib, u_int(mib.count), &boot, &size, nil, 0) == 0, boot.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(boot.tv_sec) + TimeInterval(boot.tv_usec) / 1_000_000)
+    }
 }
 
 /// See `WorkspaceRestoreRequest.cancellation`.
@@ -927,7 +1337,10 @@ struct OrphanedSessionCriteria: Sendable {
         } else {
             createdSince = recovered?.savedAt
         }
-        namedTabIDs = Set(records.filter(\.mayComeBack).map(\.id)).union(sessionsToEnd.map(\.id))
+        // A tab saved ended by the system names no session: one started for
+        // it since (a Restart whose binding was never saved) is its own.
+        namedTabIDs = Set(records.filter { $0.mayComeBack && $0.systemEnd == nil }.map(\.id))
+            .union(sessionsToEnd.map(\.id))
         namedSessionIDs = Set((records + sessionsToEnd).compactMap { record in
             record.hosted.flatMap { $0.host == HostedSessionHost.local.id ? $0.sessionID : nil }
         })

@@ -41,9 +41,14 @@ Linux machine reached over SSH; the `cherry` client attaches to it, and each
 tab's Ghostty surface runs that client. Quitting Cherry, a crash of Cherry, an
 update, losing SSH, and a crash or restart of the host's daemon leave the
 program running; each project window reopens its tabs attached to them, with
-their screens. Sessions end when the machine reboots. Several terminals can
-attach to one session and type into it; the shared terminal fits the smallest
-one.
+their screens. Sessions end when the machine restarts or you log out; their
+tabs still come back, in their places, as ended tabs ("Ended when the Mac
+restarted" or "Ended when you logged out") with **Restart**, which starts the
+shell, command or agent again in the tab's directory, and **Close**. A notice
+in each such window names them, with **Restart All**. Tabs whose sessions you
+ended yourself (closed, End Sessions, Background Sessions → End) stay closed.
+Several terminals can attach to one session and type into it; the shared
+terminal fits the smallest one.
 
 Closing a tab (**Cmd-W**) ends its session, and asks first when that would
 stop a program at work (an agent, a command, or a terminal running a job):

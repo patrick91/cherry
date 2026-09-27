@@ -1430,6 +1430,10 @@ private func runGit(_ arguments: [String]) throws {
     let adopted = try #require(workspace.sessions.first { $0.id == fresh.id })
     #expect(adopted.persistentSession?.sessionID == "s-fresh")
     #expect(workspace.commandSessions.contains { $0.commandName == "worker" && $0.id != worker.id })
+    // The new worker tab exists at once; its Create reaches the host a
+    // moment later (under a loaded full-suite run, after this point).
+    #expect(await harness.fake.wait { createdKinds().filter { $0 == "command" }.count == 1 })
+    try await Task.sleep(for: .milliseconds(200))
     #expect(createdKinds().filter { $0 == "command" }.count == 1)
 }
 

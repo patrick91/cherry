@@ -55,6 +55,10 @@ final class AppInstanceLock: @unchecked Sendable {
     private let lock = NSLock()
     private var resolved: State?
     private var descriptor: Int32 = -1
+    /// Whether the lock has been taken or given up on: read without `lock`,
+    /// which a wait for a quitting holder keeps (`isResolved`).
+    private let resolvedFlag = NSLock()
+    private var resolvedStorage = false
 
     init(
         fileURL: URL,
@@ -86,10 +90,35 @@ final class AppInstanceLock: @unchecked Sendable {
     /// Takes the lock on first use, and answers the same for the rest of the
     /// run.
     var state: State {
+        resolve(onWaiting: nil)
+    }
+
+    /// Whether `state` answers at once: the lock was taken or given up on.
+    /// Never waits.
+    var isResolved: Bool {
+        resolvedFlag.withLock { resolvedStorage }
+    }
+
+    /// Takes the lock (`state`) on a background thread, so a copy launched
+    /// while the holder quits never blocks the main thread for the wait
+    /// (`quittingHolderWait`). `onWaiting` is called once, on some thread,
+    /// when it starts waiting for such a holder (the app shows "Waiting for
+    /// the previous Cherry to finish quitting…", `InstanceLockLaunchWait`).
+    func resolveInBackground(onWaiting: (@Sendable () -> Void)? = nil) async -> State {
+        if isResolved { return state }
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: self.resolve(onWaiting: onWaiting))
+            }
+        }
+    }
+
+    private func resolve(onWaiting: (@Sendable () -> Void)?) -> State {
         lock.withLock {
             if let resolved { return resolved }
-            let state = acquireLocked()
+            let state = acquireLocked(onWaiting: onWaiting)
             resolved = state
+            resolvedFlag.withLock { resolvedStorage = true }
             return state
         }
     }
@@ -125,6 +154,9 @@ final class AppInstanceLock: @unchecked Sendable {
     /// copy launched meanwhile waits for the lock instead of giving up at
     /// once. Nothing when this copy does not hold the lock.
     func markQuitting() {
+        // Not resolved yet (a background wait may hold `lock`): this copy
+        // holds nothing to mark, and must not wait for it here.
+        guard isResolved else { return }
         lock.withLock {
             guard descriptor >= 0 else { return }
             writeOwner(to: descriptor, quitting: true)
@@ -139,10 +171,11 @@ final class AppInstanceLock: @unchecked Sendable {
                 descriptor = -1
             }
             resolved = nil
+            resolvedFlag.withLock { resolvedStorage = false }
         }
     }
 
-    private func acquireLocked() -> State {
+    private func acquireLocked(onWaiting: (@Sendable () -> Void)?) -> State {
         let directory = fileURL.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(
@@ -156,6 +189,7 @@ final class AppInstanceLock: @unchecked Sendable {
             return .unavailable("\(fileURL.path) could not be opened (\(String(cString: strerror(errno)))).")
         }
         let waitDeadline = Date().addingTimeInterval(quittingHolderWait)
+        var onWaiting = onWaiting
         while lockCall(fd, LOCK_EX | LOCK_NB) != 0 {
             let code = errno
             if code == EINTR { continue }
@@ -163,6 +197,8 @@ final class AppInstanceLock: @unchecked Sendable {
                 // A holder that is quitting lets go within seconds.
                 let owner = Self.owner(in: fd)
                 if owner.quitting, Date() < waitDeadline, owner.pid.map(Self.isAlive) ?? true {
+                    onWaiting?()
+                    onWaiting = nil
                     usleep(50_000)
                     continue
                 }
@@ -219,5 +255,57 @@ final class AppInstanceLock: @unchecked Sendable {
         let pid = lines.first.flatMap { pid_t($0) }.flatMap { $0 > 0 ? $0 : nil }
         let quitting = lines.count > 2 && lines[2] == Substring(quittingMarker)
         return (pid, quitting)
+    }
+}
+
+/// Launch waits for the instance lock (`AppInstanceLock`) off the main
+/// thread: a copy launched while the previous one quits (and still ends its
+/// sessions) says "Waiting for the previous Cherry to finish quitting…"
+/// until that copy lets go, and only then reaches the local host, lists
+/// background sessions and opens its windows, which all need to know
+/// whether it holds the lock.
+@MainActor
+enum InstanceLockLaunchWait {
+    /// Shows and hides the waiting message.
+    struct Presenter: Sendable {
+        let show: @MainActor @Sendable (String) -> Void
+        let hide: @MainActor @Sendable () -> Void
+    }
+
+    static func message(applicationName: String) -> String {
+        "Waiting for the previous \(applicationName) to finish quitting…"
+    }
+
+    /// Runs `launch` once `lock` is resolved: at once when it already is,
+    /// else after taking it in the background, with the message shown while
+    /// it waits for a quitting holder.
+    @discardableResult
+    static func run(
+        lock: AppInstanceLock,
+        presenter: Presenter = .app,
+        then launch: @escaping @MainActor () -> Void
+    ) -> Task<Void, Never>? {
+        if lock.isResolved {
+            launch()
+            return nil
+        }
+        @MainActor final class Progress {
+            var resolved = false
+            var shown = false
+        }
+        let progress = Progress()
+        let name = lock.applicationSupportName
+        return Task { @MainActor in
+            _ = await lock.resolveInBackground(onWaiting: {
+                Task { @MainActor in
+                    guard !progress.resolved else { return }
+                    progress.shown = true
+                    presenter.show(message(applicationName: name))
+                }
+            })
+            progress.resolved = true
+            if progress.shown { presenter.hide() }
+            launch()
+        }
     }
 }

@@ -460,7 +460,8 @@ enum HostSessionEvent: Equatable, Sendable {
     /// `value` is a percentage, nil when the program gave none.
     case progress(id: String, state: HostProgressState, value: Int?)
     /// `exitCode` is 128 + the signal number when a signal ended the program.
-    case exited(id: String, exitCode: UInt32, signal: Int32?)
+    /// `end`: why, when the program did not end by itself (`ended_by`).
+    case exited(id: String, exitCode: UInt32, signal: Int32?, end: HostSessionEnd? = nil)
     /// The session list was refreshed after events may have been missed.
     case resync
 
@@ -469,7 +470,7 @@ enum HostSessionEvent: Equatable, Sendable {
         switch self {
         case .added(let session), .changed(let session): session.id
         case .removed(let id), .bell(let id), .notification(let id, _, _), .progress(let id, _, _),
-             .exited(let id, _, _):
+             .exited(let id, _, _, _):
             id
         case .resync: nil
         }
@@ -480,6 +481,8 @@ extension HostSessionEvent: Codable {
     private enum CodingKeys: String, CodingKey {
         case kind, session, id, title, body, state, value, signal
         case exitCode = "exit_code"
+        case endedBy = "ended_by"
+        case holderLog = "holder_log"
     }
 
     /// Thrown for an event kind this version does not know; such events are
@@ -519,7 +522,10 @@ extension HostSessionEvent: Codable {
             self = .exited(
                 id: try container.decode(String.self, forKey: .id),
                 exitCode: try container.decode(UInt32.self, forKey: .exitCode),
-                signal: try container.decodeIfPresent(Int32.self, forKey: .signal)
+                signal: try container.decodeIfPresent(Int32.self, forKey: .signal),
+                end: try container.decodeIfPresent(String.self, forKey: .endedBy).map { reason in
+                    HostSessionEnd(reason: reason, holderLog: try container.decodeIfPresent(String.self, forKey: .holderLog))
+                }
             )
         case "resync":
             self = .resync
@@ -553,11 +559,13 @@ extension HostSessionEvent: Codable {
             try container.encode(id, forKey: .id)
             try container.encode(state, forKey: .state)
             try container.encode(value, forKey: .value)
-        case .exited(let id, let exitCode, let signal):
+        case .exited(let id, let exitCode, let signal, let end):
             try container.encode("exited", forKey: .kind)
             try container.encode(id, forKey: .id)
             try container.encode(exitCode, forKey: .exitCode)
             try container.encode(signal, forKey: .signal)
+            try container.encodeIfPresent(end?.reason, forKey: .endedBy)
+            try container.encodeIfPresent(end?.holderLog, forKey: .holderLog)
         case .resync:
             try container.encode("resync", forKey: .kind)
         }

@@ -35,6 +35,9 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     /// The status its program ended with (128 + N after signal N); nil
     /// while it runs.
     let exitStatus: Int32?
+    /// Its holder died (`HostSessionEnd.holderLost`): `exitStatus` says
+    /// nothing about its program.
+    var hostCrashed = false
     /// Clients attached to it (a terminal outside Cherry).
     let clients: Int
     let createdAt: Date?
@@ -74,6 +77,7 @@ enum BackgroundSessionPresentation {
             foregroundName: info.isBusy ? info.foreground?.name.nilIfEmpty : nil,
             isBusy: info.isBusy,
             exitStatus: info.isRunning ? nil : PersistentLocalSessions.exitStatus(of: info),
+            hostCrashed: !info.isRunning && info.end?.isHolderLost == true,
             clients: info.clients,
             createdAt: info.createdDate
         )
@@ -97,6 +101,7 @@ enum BackgroundSessionPresentation {
     /// "exit N" once ended, "attached" while a client shows it, what a busy
     /// terminal runs, "running" for a command or agent, else "idle".
     static func statusText(of session: BackgroundSession) -> String {
+        if session.hostCrashed { return "host crashed" }
         if let status = session.exitStatus { return "exit \(status)" }
         if session.clients > 0 { return "attached" }
         switch session.kind {
@@ -195,7 +200,11 @@ final class BackgroundSessionsSummary: ObservableObject {
 /// list changed.
 @MainActor
 final class BackgroundSessionsModel: ObservableObject {
-    static let shared = BackgroundSessionsModel(localSessions: .shared, registry: .shared)
+    static let shared = BackgroundSessionsModel(
+        localSessions: .shared,
+        registry: .shared,
+        removeStaleResources: { GhosttyResourceStager.shared.removeStaleCopies(inUse: $0) }
+    )
 
     /// Shows the End All confirmation, on the window it was asked from
     /// (nil: the menu bar panel or the Cherry menu), and reports which
@@ -224,6 +233,47 @@ final class BackgroundSessionsModel: ObservableObject {
     /// Sessions End was asked for that wait for the connection before their
     /// ending starts: out of the list at once.
     private var endsRequested: Set<String> = []
+    /// Sessions in the list that had a bell or notification since they went
+    /// to the background (the panel marks them; the tab that shows one next
+    /// comes up unread, `PersistentLocalSessions.takeUnread`).
+    @Published private(set) var unreadSessionIDs: Set<String> = []
+    /// When each session's notification was last posted
+    /// (`notificationInterval`), and when the latest ones of all sessions
+    /// were (`notificationLimit` per minute).
+    private var lastNotification: [String: Date] = [:]
+    private var recentNotifications: [Date] = []
+    /// The host whose saved unread marks were read into `unreadSessionIDs`.
+    private var unreadLoadedForHost: String?
+    /// How long the list has shown each ended session while the app was
+    /// active and the Mac awake (`endedSessionGrace`), and when it last
+    /// counted.
+    private var endedShownFor: [String: TimeInterval] = [:]
+    private var lastEndedCount: Date?
+    /// Whether the app is active (in front): only then does an ended
+    /// session's time in the list count.
+    private let isAppActive: @MainActor () -> Bool
+    /// A gap between two refreshes longer than this (the Mac slept, the app
+    /// was suspended) does not count.
+    static let endedCountMaximumGap: TimeInterval = 5
+    private let postNotification: @MainActor (BackgroundSessionNotificationContent) -> Void
+    /// Removes the staged Ghostty resources no session uses any more, given
+    /// the copies running sessions name (`cherry.resources`;
+    /// `GhosttyResourceStager.removeStaleCopies`): once per run, from the
+    /// first complete live list. Nil (tests) removes nothing.
+    private let removeStaleResources: (@MainActor (Set<String>) -> Void)?
+    private var removedStaleResources = false
+    private let now: @MainActor () -> Date
+    /// An ended session in the list that no saved tab names is removed once
+    /// the list has shown it this long while the app was active and awake
+    /// (`removeExpiredEndedSessions`).
+    let endedSessionGrace: TimeInterval
+    /// A session's notifications (OSC 9, 777, 99) are posted at most this
+    /// often; one within it only marks the session unread.
+    static let notificationInterval: TimeInterval = 10
+    /// At most this many background notifications a minute, of all
+    /// sessions together.
+    static let notificationLimit = 6
+    static let defaultEndedSessionGrace: TimeInterval = 10 * 60
 
     /// The app uses `shared`; tests inject the local sessions, the windows,
     /// the attached tabs, the settings and the End All confirmation.
@@ -233,14 +283,26 @@ final class BackgroundSessionsModel: ObservableObject {
         attachedTabs: OpenHostedTabs = .shared,
         prefersPersistentLocalSessions: @escaping @MainActor () -> Bool = { TerminalSettings.shared.persistLocalSessions },
         closesTabsOnCleanExit: @escaping @MainActor () -> Bool = { TerminalSettings.shared.closeTabsOnCleanExit },
-        presentAlert: @escaping AlertPresenter = BackgroundSessionsModel.presentOnProjectWindow
+        presentAlert: @escaping AlertPresenter = BackgroundSessionsModel.presentOnProjectWindow,
+        postNotification: @escaping @MainActor (BackgroundSessionNotificationContent) -> Void = {
+            TerminalNotificationCenter.shared.postBackgroundSession($0)
+        },
+        endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
+        now: @escaping @MainActor () -> Date = { Date() },
+        isAppActive: @escaping @MainActor () -> Bool = { NSApp?.isActive ?? false },
+        removeStaleResources: (@MainActor (Set<String>) -> Void)? = nil
     ) {
+        self.isAppActive = isAppActive
+        self.removeStaleResources = removeStaleResources
         self.localSessions = localSessions
         self.registry = registry
         self.attachedTabs = attachedTabs
         self.prefersPersistentLocalSessions = prefersPersistentLocalSessions
         self.closesTabsOnCleanExit = closesTabsOnCleanExit
         self.presentAlert = presentAlert
+        self.postNotification = postNotification
+        self.endedSessionGrace = endedSessionGrace
+        self.now = now
     }
 
     /// Starts following the host (the app: once launched, after the local
@@ -256,6 +318,10 @@ final class BackgroundSessionsModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        // Bells and notifications of sessions no tab follows.
+        localSessions.backgroundSignalHandler = { [weak self] info, signal in
+            self?.backgroundSessionDidSignal(info, signal) ?? false
+        }
         // HostControl publishes on the main actor. Title, directory and
         // foreground changes wait for the next tick.
         eventSubscription = localSessions.control.events.sink { [weak self] event in
@@ -276,6 +342,7 @@ final class BackgroundSessionsModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         eventSubscription = nil
+        localSessions.backgroundSignalHandler = nil
         sessions = []
         summary.update([])
         lease?.release()
@@ -302,9 +369,124 @@ final class BackgroundSessionsModel: ObservableObject {
         if let hostID = control.hostID { knownHostID = hostID }
         var listed = knownHostID.map { backgroundSessions(in: control.sessions, hostID: $0) } ?? []
         listed = removeCleanlyEndedTerminals(listed)
+        listed = removeExpiredEndedSessions(listed)
+        removeStaleResourcesOnce()
         if listed != sessions { sessions = listed }
+        loadSavedUnreadMarks()
+        let unread = unreadSessionIDs.filter { id in listed.contains { $0.id == id } }
+        if unread != unreadSessionIDs { unreadSessionIDs = unread }
         summary.update(listed)
         updateLease()
+    }
+
+    /// Once per run, from a live list that expects no more holders (a host
+    /// that cannot be reached removes nothing): the staged resources no
+    /// running session names are removed, whoever owns the session. While
+    /// a running session of this app names no copy (it predates the tag),
+    /// nothing is removed: which copy it reads cannot be told.
+    private func removeStaleResourcesOnce() {
+        let control = localSessions.control
+        guard !removedStaleResources, let removeStaleResources,
+              localSessions.instanceUnavailableReason == nil,
+              control.state == .connected, control.hostID != nil, !control.expectsHolders
+        else { return }
+        removedStaleResources = true
+        let running = control.sessions.filter(\.isRunning)
+        guard !running.contains(where: { $0.owner == localSessions.owner && $0.tags[PersistentSessionTag.resources] == nil })
+        else { return }
+        removeStaleResources(Set(running.compactMap { $0.tags[PersistentSessionTag.resources]?.nilIfEmpty }))
+    }
+
+    /// Removes the ended sessions of `listed` the list has shown for
+    /// `endedSessionGrace`, counting only while the app is active and the
+    /// Mac awake (refreshes more than `endedCountMaximumGap` apart do not
+    /// count), that no state file names (`WorkspaceStateStore.savedTabsName`,
+    /// set-aside files included: a closed window's tab keeps its session,
+    /// whose restore shows how it ended). Never one marked unread (its bell
+    /// or notification was not seen) or one whose host crashed (the crash is
+    /// worth seeing). Only from a live list, and only with the app's store
+    /// to check (`endedSessionsStore`). The removal is recorded as an end on
+    /// purpose, like End's. Returns the others.
+    private func removeExpiredEndedSessions(_ listed: [BackgroundSession]) -> [BackgroundSession] {
+        let now = now()
+        let ended = Set(listed.filter { !$0.isRunning }.map(\.id))
+        endedShownFor = endedShownFor.filter { ended.contains($0.key) }
+        let elapsed = lastEndedCount.map { now.timeIntervalSince($0) } ?? 0
+        lastEndedCount = now
+        let counts = elapsed > 0 && elapsed <= Self.endedCountMaximumGap && isAppActive()
+        for id in ended {
+            endedShownFor[id, default: 0] += counts ? elapsed : 0
+        }
+        let control = localSessions.control
+        guard !ended.isEmpty, control.state == .connected, let hostID = control.hostID,
+              let store = localSessions.endedSessionsStore
+        else { return listed }
+        var removed = Set<String>()
+        for item in listed where ended.contains(item.id) && !item.hostCrashed && !unreadSessionIDs.contains(item.id) {
+            let id = item.id
+            guard let shown = endedShownFor[id], shown >= endedSessionGrace else { continue }
+            guard let info = control.sessions.first(where: { $0.id == id }), !info.isRunning,
+                  let attachment = localSessions.attachment(for: info), attachment.hostID == hostID
+            else { continue }
+            if store.savedTabsName(info, hostID: hostID, owner: localSessions.owner) {
+                // Checked again after another grace period.
+                endedShownFor[id] = 0
+                continue
+            }
+            localSessions.end(attachment)
+            removed.insert(id)
+        }
+        return listed.filter { !removed.contains($0.id) }
+    }
+
+    /// The unread marks saved for this host's sessions (a bell or
+    /// notification while they were in the background, in an earlier run
+    /// too: `WorkspaceStateStore.unreadSessions`), read once per host.
+    private func loadSavedUnreadMarks() {
+        guard let hostID = knownHostID, unreadLoadedForHost != hostID,
+              let store = localSessions.endedSessionsStore
+        else { return }
+        unreadLoadedForHost = hostID
+        let saved = store.unreadSessions(hostID: hostID).filter { id in sessions.contains { $0.id == id } }
+        if !saved.isSubset(of: unreadSessionIDs) { unreadSessionIDs.formUnion(saved) }
+    }
+
+    /// A bell or notification of `info`'s session, which no tab follows
+    /// (`PersistentLocalSessions.backgroundSignalHandler`): when it is in
+    /// the background, it is marked unread and posted as the app's
+    /// notification, naming the session and its project; clicking it opens
+    /// the session (`open(sessionID:)`). A bell is posted once until the
+    /// session is opened (a session marked unread already posts none); a
+    /// notification at most every `notificationInterval` per session; and
+    /// at most `notificationLimit` a minute of all sessions together. The
+    /// others only mark the session unread. False when it is not in the
+    /// background (a tab may still follow it).
+    func backgroundSessionDidSignal(_ info: HostedSessionInfo, _ signal: PersistentHostSignal) -> Bool {
+        let control = localSessions.control
+        guard let hostID = control.hostID ?? knownHostID,
+              let item = backgroundSessions(in: [info], hostID: hostID).first
+        else { return false }
+        if case .progress = signal { return true }
+        let wasUnread = unreadSessionIDs.contains(info.id)
+        localSessions.noteUnread(hostID: hostID, sessionID: info.id)
+        unreadSessionIDs.insert(info.id)
+        let now = now()
+        switch signal {
+        case .bell:
+            guard !wasUnread else { return true }
+        case .notification:
+            if let last = lastNotification[info.id], now.timeIntervalSince(last) < Self.notificationInterval {
+                return true
+            }
+        case .progress:
+            return true
+        }
+        recentNotifications.removeAll { now.timeIntervalSince($0) >= 60 }
+        guard recentNotifications.count < Self.notificationLimit else { return true }
+        recentNotifications.append(now)
+        lastNotification[info.id] = now
+        postNotification(BackgroundSessionNotificationContent(session: item, signal: signal))
+        return true
     }
 
     /// Ends (removes: nothing runs) the terminals of `listed` whose shell
@@ -424,9 +606,40 @@ final class BackgroundSessionsModel: ObservableObject {
         }
     }
 
+    /// A background session's notification was clicked: shows the session
+    /// as Open does, listing the host first when the connection does not
+    /// know it (the notification may predate this run). Nothing for a
+    /// session that is gone or not this app's.
+    @discardableResult
+    func open(sessionID: String) -> Task<Void, Never> {
+        let registry = registry
+        let localSessions = localSessions
+        let attachedTabs = attachedTabs
+        let mayConnect = mayConnect
+        return Task { @MainActor [weak self] in
+            var info = localSessions.sessionInfo(sessionID)
+            if info == nil, mayConnect {
+                info = try? await localSessions.control.list().sessions.first { $0.id == sessionID }
+            }
+            guard let info, info.owner == localSessions.owner else { return }
+            await registry.showBackgroundSession(info, localSessions: localSessions, attachedTabs: attachedTabs)
+            self?.refresh()
+        }
+    }
+
     @discardableResult
     func end(_ item: BackgroundSession) -> Task<Void, Never>? {
         end(sessionID: item.id)
+    }
+
+    /// Background Sessions › Clear Ended: removes every ended session in the
+    /// list at once (nothing runs in them, so nothing is asked). Recorded as
+    /// ended on purpose, like End: a closed window's saved tab that names
+    /// one is dropped at its restore, never brought back as ended by the
+    /// system.
+    func clearEnded() {
+        refresh()
+        endAll(sessions.filter { !$0.isRunning }.map(\.id))
     }
 
     /// Ends the session when it is still in the background: Kill, wait for
@@ -553,5 +766,124 @@ final class BackgroundSessionsModel: ObservableObject {
     static func endAllParent(askedFrom window: NSWindow?) -> NSWindow? {
         guard let window, window.isVisible, !(window is NSPanel) else { return nil }
         return window
+    }
+}
+
+/// Settings › Projects › Remove Project: a project removed from the library
+/// whose sessions run in the background (no open tab shows them) offers to
+/// end them first, since no window of it opens again by itself to show
+/// them. "Keep Running" removes the project and leaves them in Background
+/// Sessions.
+@MainActor
+enum ProjectRemoval {
+    /// Shows the question and reports which button answered it.
+    typealias AlertPresenter = @MainActor (
+        NSAlert,
+        @escaping @MainActor (NSApplication.ModalResponse) -> Void
+    ) -> Void
+
+    /// The background sessions of the project at `root`: those whose
+    /// project (`cherry.project`, a worktree) belongs to it rather than to
+    /// another of `projectRoots` (the registered projects, `root` among
+    /// them): a worktree the settings know goes to its repository
+    /// (`repositoryRoot`, asked before the project is removed), else the
+    /// longest registered root that contains it wins, so a project nested
+    /// inside another keeps its own sessions.
+    static func backgroundSessions(
+        ofProject root: String,
+        in sessions: [BackgroundSession],
+        projectRoots: [String],
+        repositoryRoot: (String) -> String?
+    ) -> [BackgroundSession] {
+        let registered = Set(projectRoots + [root])
+        return sessions.filter { session in
+            guard let projectRoot = session.projectRoot else { return false }
+            return owningProject(of: projectRoot, among: registered, repositoryRoot: repositoryRoot) == root
+        }
+    }
+
+    /// The registered project a worktree belongs to.
+    static func owningProject(
+        of projectRoot: String,
+        among registered: Set<String>,
+        repositoryRoot: (String) -> String?
+    ) -> String? {
+        if let repository = repositoryRoot(projectRoot), registered.contains(repository) { return repository }
+        return registered
+            .filter { projectRoot == $0 || projectRoot.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }
+            .max { $0.count < $1.count }
+    }
+
+    /// Removes `project` from `settings`, first asking whether to end its
+    /// background sessions when it has any: End Sessions ends them, Keep
+    /// Running keeps them, Cancel removes nothing.
+    static func remove(
+        _ project: CherryProject,
+        settings: AgentSettings,
+        background: BackgroundSessionsModel = .shared,
+        present: AlertPresenter = ProjectRemoval.presentOnKeyWindow
+    ) {
+        background.refresh()
+        let listed = backgroundSessions(
+            ofProject: project.root, in: background.sessions, projectRoots: settings.projects.map(\.root)
+        ) { settings.repositoryRoot(for: $0) }
+        guard !listed.isEmpty else {
+            settings.removeProject(project)
+            return
+        }
+        let ids = listed.map(\.id)
+        let alert = makeAlert(
+            projectName: project.name,
+            running: listed.filter(\.isRunning).count,
+            ended: listed.filter { !$0.isRunning }.count
+        )
+        present(alert) { response in
+            switch response {
+            case .alertFirstButtonReturn:
+                settings.removeProject(project)
+                background.endAll(ids)
+            case .alertSecondButtonReturn:
+                settings.removeProject(project)
+            default:
+                break
+            }
+        }
+    }
+
+    /// "End the N background sessions of <project>?" with End Sessions,
+    /// Keep Running and Cancel.
+    static func makeAlert(projectName: String, running: Int, ended: Int) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        let count = running + ended
+        alert.messageText = count == 1
+            ? "End the background session of “\(projectName)”?"
+            : "End the \(count) background sessions of “\(projectName)”?"
+        let state: String
+        if running == 0 {
+            state = count == 1 ? "Its program already ended." : "Their programs already ended."
+        } else if ended == 0 {
+            state = count == 1 ? "Its program is still running." : "Their programs are still running."
+        } else {
+            state = "\(running) of them \(running == 1 ? "is" : "are") still running."
+        }
+        alert.informativeText = state
+            + " Removing the project does not stop them; Keep Running leaves them in Background Sessions."
+        alert.addButton(withTitle: "End Sessions").hasDestructiveAction = true
+        alert.addButton(withTitle: "Keep Running")
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
+
+    /// A sheet on the Settings window it was asked from, else app-modal.
+    static let presentOnKeyWindow: AlertPresenter = { alert, answer in
+        if let window = BackgroundSessionsModel.endAllParent(askedFrom: NSApp.keyWindow) {
+            RemoteViewCrashGuard.installIfNeeded()
+            alert.beginSheetModal(for: window) { response in
+                MainActor.assumeIsolated { answer(response) }
+            }
+        } else {
+            answer(alert.runModal())
+        }
     }
 }

@@ -48,7 +48,12 @@ shell, command or agent again in the tab's directory, and **Close**. A notice
 in each such window names them, with **Restart All**. Tabs whose sessions you
 ended yourself (closed, End Sessions, Background Sessions → End) stay closed.
 Several terminals can attach to one session and type into it; the shared
-terminal fits the smallest one.
+terminal fits the smallest one. A tab whose session another terminal shows
+too says so in a slim bar at its top ("Also open in 1 other client", or
+"Shown at 80×24 because another client is smaller"), with **Take Over**, and
+its sidebar row shows a shared glyph. If a session's host process crashes,
+its tab says "The session host crashed" (with the log to look at) instead of
+an exit status, and a command is not restarted by itself.
 
 Closing a tab (**Cmd-W**) ends its session, and asks first when that would
 stop a program at work (an agent, a command, or a terminal running a job):
@@ -93,11 +98,23 @@ bottom of a window says so once, with **Reopen** and **End…** (its time runs
 only while that window is in front); sessions you kept running when you closed
 their tab or window, and idle shells, are not mentioned. Turn that off with
 **Tell me about background sessions when Cherry opens**. Only Cherry's own sessions are listed there; sessions made with the
-`cherry` CLI or by another app are in Persistent Sessions.
+`cherry` CLI or by another app are in Persistent Sessions. A bell or
+notification from a background session (an agent that finished or needs
+input) shows as a Cherry notification naming the session and its project
+(a shell's bell only once until you open it, and a few a minute at most);
+click it to open the session, whose tab then shows it unread. **Clear
+Ended** in that list removes the sessions whose programs ended, and ended
+ones that no saved tab brings back are removed by themselves after they
+have been listed for 10 minutes while Cherry was in use (never one you have
+not seen, or one whose host crashed). Removing a project in **Settings › Projects** offers to end its
+background sessions first.
 
 Open **File → Persistent Sessions…** (`Cmd-Shift-R`) to see every session on
 **This Mac** or an SSH destination, and to create, attach to, or terminate
-one. A remote machine needs `cherry-host` on its SSH command `PATH`. Building
+one. Renaming a tab renames its session there and in `cherry list` (an
+agent's session takes the agent's task title); Cherry's own sessions show
+their kind, project and what they run, and one already open in a tab offers
+**Show Tab**. A remote machine needs `cherry-host` on its SSH command `PATH`. Building
 the host, the `cherry` CLI, service setup, updates, the protocol, and current
 limits are documented in [Host/README.md](Host/README.md).
 

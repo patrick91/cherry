@@ -185,6 +185,9 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// older files, whose `RepositoryStateRecord.savedAt` stands in
     /// (`SystemEndedSessions`). Older builds ignore it.
     var savedAt: Date?
+    /// The tab had a bell or notification not seen yet (its unread dot):
+    /// the tab comes back unread. Saved only when true.
+    var hasUnreadNotification: Bool?
 
     init(
         id: UUID,
@@ -204,7 +207,8 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         launchRequestID: String? = nil,
         systemEnd: SystemSessionEnd? = nil,
         exitStatus: Int32? = nil,
-        savedAt: Date? = nil
+        savedAt: Date? = nil,
+        hasUnreadNotification: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -224,6 +228,7 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         self.systemEnd = systemEnd
         self.exitStatus = exitStatus
         self.savedAt = savedAt
+        self.hasUnreadNotification = hasUnreadNotification
     }
 
     /// A tab whose program can still be running after Cherry quit.
@@ -289,7 +294,8 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
             },
             launchRequestID: session.isPersistentLocalSession ? session.persistentLaunchRequestID : nil,
             systemEnd: session.systemSessionEnd,
-            exitStatus: session.savedExitStatus
+            exitStatus: session.savedExitStatus,
+            hasUnreadNotification: session.hasUnreadNotification ? true : nil
         )
     }
 }
@@ -502,6 +508,29 @@ struct LostSessionsRecord: Codable, Equatable, Sendable {
     var entries: [Entry]
 
     init(version: Int = LostSessionsRecord.currentVersion, entries: [Entry]) {
+        self.version = version
+        self.entries = entries
+    }
+}
+
+/// Sessions of This Mac that had a bell or notification while in the
+/// background (no open tab showed them): the tab that shows one next
+/// comes up unread (`PersistentLocalSessions.takeUnread`). Entries older
+/// than `maximumAge` are dropped.
+struct UnreadSessionsRecord: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+    static let maximumAge: TimeInterval = 14 * 24 * 60 * 60
+
+    struct Entry: Codable, Equatable, Sendable {
+        var hostID: String
+        var sessionID: String
+        var since: Date
+    }
+
+    var version: Int
+    var entries: [Entry]
+
+    init(version: Int = UnreadSessionsRecord.currentVersion, entries: [Entry]) {
         self.version = version
         self.entries = entries
     }
@@ -906,6 +935,100 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
+    var unreadSessionsFileURL: URL {
+        directory.appendingPathComponent("unread-sessions.json", isDirectory: false)
+    }
+
+    /// A session in the background had a bell or notification: kept until a
+    /// tab shows it (`takeUnreadSession`).
+    func addUnreadSession(hostID: String, sessionID: String) {
+        guard isEnabled else { return }
+        let fileURL = unreadSessionsFileURL
+        let now = Date()
+        queue.async {
+            var entries = self.readUnreadSessionsLocked(fileURL)
+            guard !entries.contains(where: { $0.hostID == hostID && $0.sessionID == sessionID }) else { return }
+            entries.append(UnreadSessionsRecord.Entry(hostID: hostID, sessionID: sessionID, since: now))
+            self.writeLocked(UnreadSessionsRecord(entries: entries), to: fileURL)
+        }
+    }
+
+    /// Whether the session was marked unread while in the background; the
+    /// mark goes (a tab shows it now).
+    func takeUnreadSession(hostID: String, sessionID: String) -> Bool {
+        guard isEnabled else { return false }
+        let fileURL = unreadSessionsFileURL
+        return queue.sync {
+            var entries = readUnreadSessionsLocked(fileURL)
+            guard let index = entries.firstIndex(where: { $0.hostID == hostID && $0.sessionID == sessionID }) else {
+                return false
+            }
+            entries.remove(at: index)
+            writeLocked(UnreadSessionsRecord(entries: entries), to: fileURL)
+            return true
+        }
+    }
+
+    /// The sessions of host `hostID` marked unread (`addUnreadSession`).
+    func unreadSessions(hostID: String) -> Set<String> {
+        guard isEnabled else { return [] }
+        let fileURL = unreadSessionsFileURL
+        return queue.sync {
+            Set(readUnreadSessionsLocked(fileURL).filter { $0.hostID == hostID }.map(\.sessionID))
+        }
+    }
+
+    /// Only on `queue`.
+    private func readUnreadSessionsLocked(_ fileURL: URL) -> [UnreadSessionsRecord.Entry] {
+        let oldest = Date().addingTimeInterval(-UnreadSessionsRecord.maximumAge)
+        return (readVersionedLocked(
+            UnreadSessionsRecord.self, from: fileURL, version: \.version, currentVersion: UnreadSessionsRecord.currentVersion
+        )?.entries ?? []).filter { $0.since >= oldest }
+    }
+
+    /// Whether a saved tab of any project (open or closed window, or a
+    /// set-aside copy of a state file) names this
+    /// session of `owner`'s on the local host `hostID`, attached or owned
+    /// (`PersistentLocalSessions.record(_:names:hostID:owner:includingAttached:)`):
+    /// such a session is kept for that tab's restore, which shows how it
+    /// ended. True while the store is disabled (nothing can be checked).
+    func savedTabsName(_ info: HostedSessionInfo, hostID: String, owner: String) -> Bool {
+        guard isEnabled else { return true }
+        return queue.sync {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+            // A set-aside copy (`<state file>.<label>-<time>.bak`), which a
+            // build of another version may still restore: any mention of
+            // the session, its tab or its Create keeps it.
+            let mentions = [info.id, PersistentLocalSessions.tabID(of: info, owner: owner)?.uuidString,
+                            PersistentLocalSessions.launchRequestID(of: info)].compactMap { $0?.nilIfEmpty }
+            for name in names where name.hasSuffix(".bak") && name.contains(".json.") {
+                let url = directory.appendingPathComponent(name, isDirectory: false)
+                guard let data = try? Data(contentsOf: url) else { continue }
+                let text = String(decoding: data, as: UTF8.self)
+                if mentions.contains(where: { text.range(of: $0, options: .caseInsensitive) != nil }) { return true }
+            }
+            for name in names where name.count == 69 && name.hasSuffix(".json")
+                && name.dropLast(5).allSatisfy({ $0.isHexDigit }) {
+                let url = directory.appendingPathComponent(name, isDirectory: false)
+                switch Self.readFile(RepositoryStateRecord.self, from: url) {
+                case .missing:
+                    continue
+                case .unusable:
+                    // Cannot tell what it names: keep the session.
+                    return true
+                case .usable(let state):
+                    let named = state.worktrees.contains { worktree in
+                        worktree.sessions.contains { record in
+                            PersistentLocalSessions.record(record, names: info, hostID: hostID, owner: owner, includingAttached: true)
+                        }
+                    }
+                    if named { return true }
+                }
+            }
+            return false
+        }
+    }
+
     /// The sessions of host `hostID` its host reported lost, as recorded.
     func lostSessions(hostID: String) -> Set<String> {
         guard isEnabled else { return [] }
@@ -1024,6 +1147,49 @@ final class WorkspaceStateStore: @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
         if let value = try? decoder.decode(type, from: data) { return .usable(value) }
         return .unusable(version: (try? decoder.decode(VersionOnly.self, from: data))?.version)
+    }
+
+    /// Set-aside files (`<state file>.<label>-<time>.bak`) older than this
+    /// are removed at launch (`pruneSetAsideFiles`), except the newest of
+    /// each state file.
+    static let setAsideFileAge: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Removes old set-aside files in the background: those older than
+    /// `setAsideFileAge`, keeping the newest one of each state file, which
+    /// orphan adoption may still read (`setAsideState`) and a build of
+    /// another version may still be pointed at.
+    func pruneSetAsideFiles(now: Date = Date()) {
+        guard isEnabled else { return }
+        let directory = directory
+        queue.async {
+            Self.pruneSetAsideFiles(in: directory, now: now)
+        }
+    }
+
+    /// `pruneSetAsideFiles`, now; blocking. Returns the names removed.
+    @discardableResult
+    static func pruneSetAsideFiles(in directory: URL, now: Date = Date()) -> [String] {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: directory.path) else { return [] }
+        var byStateFile: [String: [(name: String, modified: Date)]] = [:]
+        for name in names where name.hasSuffix(".bak") {
+            guard let dot = name.range(of: ".json.") else { continue }
+            let stateFile = String(name[..<dot.upperBound].dropLast())
+            let url = directory.appendingPathComponent(name, isDirectory: false)
+            let modified = (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date ?? now
+            byStateFile[stateFile, default: []].append((name, modified))
+        }
+        let cutoff = now.addingTimeInterval(-setAsideFileAge)
+        var removed: [String] = []
+        for files in byStateFile.values {
+            let newestFirst = files.sorted { $0.modified > $1.modified }
+            for file in newestFirst.dropFirst() where file.modified < cutoff {
+                if (try? manager.removeItem(at: directory.appendingPathComponent(file.name, isDirectory: false))) != nil {
+                    removed.append(file.name)
+                }
+            }
+        }
+        return removed.sorted()
     }
 
     /// Moves a file this version cannot use out of the way of the next save,

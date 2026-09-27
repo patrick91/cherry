@@ -4,7 +4,11 @@
 //!
 //! While attached the file holds `{"outcome":"attached","viewport":…,
 //! "reconnecting":…,"exit_code":null,"signal":null,"message":null}`, rewritten
-//! whenever the viewport or reconnecting state changes. The final outcome
+//! whenever the viewport or reconnecting state changes, with `pid` and
+//! `started` (this process's pid and kernel start time, `start_identity`),
+//! so a supervisor can signal this process itself rather than a wrapper
+//! that runs it (SIGUSR1: reconnect now) after checking the pid is still
+//! this process's. The final outcome
 //! replaces it when the command ends. A reader never sees a partial file.
 use serde::Serialize;
 use std::{
@@ -24,6 +28,13 @@ pub struct Status {
     /// attachment is connecting again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconnecting: Option<bool>,
+    /// While attached: this process's pid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// While attached: when this process started, as `start_identity`
+    /// gives it (macOS: `seconds.microseconds`); left out when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<String>,
     pub exit_code: Option<u32>,
     pub signal: Option<i32>,
     pub message: Option<String>,
@@ -54,6 +65,8 @@ impl Status {
             outcome,
             viewport: None,
             reconnecting: None,
+            pid: None,
+            started: None,
             exit_code: None,
             signal: None,
             message,
@@ -73,8 +86,44 @@ impl Status {
         Self {
             viewport: Some(live.viewport),
             reconnecting: Some(live.reconnecting),
+            pid: Some(std::process::id()),
+            started: start_identity(std::process::id() as libc::pid_t),
             ..Self::new(Outcome::Attached, None)
         }
+    }
+}
+
+/// When the process `pid` started, as the kernel keeps it: on macOS
+/// `seconds.microseconds` (`proc_bsdinfo`, the same value `sysctl`'s
+/// `kinfo_proc.kp_proc.p_starttime` gives); on Linux the boot id and the
+/// start time in clock ticks. None when it cannot be read.
+pub fn start_identity(pid: libc::pid_t) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        (libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        ) == size)
+            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.iter().rposition(|&b| b == b')')?;
+        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
+        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
+        Some(format!("{}/{started}", boot.trim()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -252,8 +301,31 @@ mod tests {
                 viewport: true,
                 reconnecting: false
             })),
-            r#"{"outcome":"attached","viewport":true,"reconnecting":false,"exit_code":null,"signal":null,"message":null}"#
+            format!(
+                r#"{{"outcome":"attached","viewport":true,"reconnecting":false,"pid":{},"started":"{}","exit_code":null,"signal":null,"message":null}}"#,
+                std::process::id(),
+                start_identity(std::process::id() as libc::pid_t).unwrap()
+            )
         );
+    }
+
+    #[test]
+    fn the_start_identity_is_the_kernels_and_tells_processes_apart() {
+        let own = start_identity(std::process::id() as libc::pid_t).unwrap();
+        assert_eq!(
+            start_identity(std::process::id() as libc::pid_t).unwrap(),
+            own
+        );
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let other = start_identity(child.id() as libc::pid_t).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(other >= own, "{other} < {own}");
+        assert_ne!(other, own);
+        assert_eq!(start_identity(i32::MAX), None);
     }
 
     #[test]

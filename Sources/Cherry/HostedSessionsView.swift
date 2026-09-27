@@ -367,7 +367,8 @@ struct HostedSessionsSheet: View {
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(session.displayName).fontWeight(.medium)
-                            Text(session.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            Text(HostedSessionRowPresentation.detail(of: session))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
                         if let label = ownershipLabel(for: session) {
@@ -421,13 +422,21 @@ struct HostedSessionsSheet: View {
                     Button("Terminate…", role: .destructive) { terminationCandidate = selectedSession }
                         .disabled(!canActOnSelectedSession)
                 }
-                Button("Attach & Take Over") { attachSelectedSession(takeover: true) }
-                    .disabled(!canAttachSelectedSession)
-                    .help("Open this session here and disconnect every other client attached to it. The session's terminal size then follows this window.")
-                Button("Attach") { attachSelectedSession(takeover: false) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canAttachSelectedSession)
-                    .help("Open this session here. Other attached terminals stay connected and can also type.")
+                if let openTab = tabShowingSelectedSession {
+                    // Already a tab (this window's or another's): show that
+                    // one rather than a second tab of the same session.
+                    Button("Show Tab") { showTab(openTab) }
+                        .buttonStyle(.borderedProminent)
+                        .help("Bring the tab that shows this session to the front")
+                } else {
+                    Button("Attach & Take Over") { attachSelectedSession(takeover: true) }
+                        .disabled(!canAttachSelectedSession)
+                        .help("Open this session here and disconnect every other client attached to it. The session's terminal size then follows this window.")
+                    Button("Attach") { attachSelectedSession(takeover: false) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canAttachSelectedSession)
+                        .help("Open this session here. Other attached terminals stay connected and can also type.")
+                }
             }
 
             Divider()
@@ -501,6 +510,23 @@ struct HostedSessionsSheet: View {
         }
     }
 
+    /// The open tab, in any window, that shows the selected session.
+    private var tabShowingSelectedSession: TerminalSession? {
+        guard let selectedSession, controller.loadedHost == selectedHost, let hostID = controller.hostID else { return nil }
+        return HostedSessionRowPresentation.tabShowing(
+            selectedSession,
+            host: selectedHost,
+            hostID: hostID,
+            localSessions: .shared,
+            attachedTabs: .shared
+        )
+    }
+
+    private func showTab(_ tab: TerminalSession) {
+        dismiss()
+        ProjectWindowRegistry.shared.focusSession(sessionID: tab.id, projectRoot: nil)
+    }
+
     private func attachSelectedSession(takeover: Bool) {
         guard let selectedSession,
               let attachment = controller.attachment(for: selectedSession, on: selectedHost)
@@ -524,6 +550,62 @@ struct HostedSessionsSheet: View {
     private func ownershipLabel(for session: HostedSessionInfo) -> String? {
         guard selectedHost == .local, let hostID = controller.hostID else { return nil }
         return BackgroundSessionsModel.shared.ownershipLabel(for: session, hostID: hostID)
+    }
+}
+
+/// How the Persistent Sessions sheet describes a session, and which open
+/// tab shows it; pure but for the tab lookup, for tests.
+enum HostedSessionRowPresentation {
+    /// The row's second line: what kind of session it is (an agent or a
+    /// command of this app's with its name), its project, and what it does
+    /// now (the program in a shell's foreground, else the title its program
+    /// set); the working directory when none of that is known.
+    static func detail(of info: HostedSessionInfo) -> String {
+        var parts: [String] = []
+        if let kind = info.tags[PersistentSessionTag.kind].flatMap(TerminalSession.SessionKind.init(rawValue:)) {
+            switch kind {
+            case .agent:
+                parts.append(info.tags[PersistentSessionTag.agent]?.nilIfEmpty.map { "Agent: \($0)" } ?? "Agent")
+            case .command:
+                parts.append(info.tags[PersistentSessionTag.command]?.nilIfEmpty.map { "Command: \($0)" } ?? "Command")
+            case .terminal:
+                parts.append("Terminal")
+            }
+        }
+        if let projectRoot = OrphanedSessionCriteria.projectRoot(of: info) {
+            parts.append(BackgroundSessionPresentation.projectName(projectRoot: projectRoot))
+        }
+        if let activity = activity(of: info) {
+            parts.append(activity)
+        }
+        return parts.isEmpty ? info.cwd : parts.joined(separator: " · ")
+    }
+
+    /// The program a shell runs in its foreground, else the title the
+    /// program set (an agent's task, `vim file`); nil once ended or when
+    /// neither is known.
+    static func activity(of info: HostedSessionInfo) -> String? {
+        guard info.isRunning else { return nil }
+        if info.isBusy, let name = info.foreground?.name.nilIfEmpty { return name }
+        return info.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    /// The open tab, in any window, that shows `info`'s session of `host`
+    /// (identity `hostID`): the tab of this app that owns it, or one
+    /// attached to it.
+    @MainActor
+    static func tabShowing(
+        _ info: HostedSessionInfo,
+        host: HostedSessionHost,
+        hostID: String,
+        localSessions: PersistentLocalSessions,
+        attachedTabs: OpenHostedTabs
+    ) -> TerminalSession? {
+        if host == .local, let owner = localSessions.owningTab(of: info.id),
+           owner.persistentSession?.hostID == hostID {
+            return owner
+        }
+        return attachedTabs.tab(showingSession: info.id, hostID: hostID)
     }
 }
 

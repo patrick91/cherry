@@ -122,6 +122,10 @@ fn a_crashed_holder_ends_only_its_own_session() {
     assert_eq!(screen.wait_exit(&mut watcher), (1, None));
     let lost = host.wait(&doomed.id, |s| s.state == SessionState::Exited);
     assert_eq!(lost.exit_code, Some(1));
+    // Status 1 is not the program's: the session says its holder was lost.
+    assert_eq!(lost.ended_by.as_deref(), Some(ended_by::HOLDER_LOST));
+    // This daemon's log is not a file in its state directory.
+    assert_eq!(lost.holder_log, None);
     wait_until(
         "the program to end",
         || !is_live(doomed.pid.unwrap() as i32),
@@ -144,6 +148,98 @@ fn a_crashed_holder_ends_only_its_own_session() {
         .iter()
         .any(|(id, _)| *id == doomed.id));
     assert_eq!(host.sessions().len(), 1);
+}
+
+#[test]
+fn a_crashed_holders_exit_event_says_the_holder_was_lost() {
+    let host = Host::new();
+    let doomed = host.create(shell("exec sleep 60"));
+    let finished = host.create(shell("exit 3"));
+    let mut events = subscribe(&host);
+    host.wait(&finished.id, |s| s.state == SessionState::Exited);
+    unsafe {
+        libc::kill(holder_of(&host.sandbox, &doomed.id), libc::SIGKILL);
+    }
+    let mut exits = Vec::new();
+    while exits.len() < 2 {
+        if let SessionEvent::Exited {
+            id,
+            exit_code,
+            ended_by,
+            ..
+        } = next_event(&mut events)
+        {
+            exits.push((id, exit_code, ended_by));
+        }
+    }
+    assert!(exits.contains(&(finished.id.clone(), 3, None)), "{exits:?}");
+    assert!(
+        exits.contains(&(doomed.id.clone(), 1, Some(ended_by::HOLDER_LOST.into()))),
+        "{exits:?}"
+    );
+    // A program's own exit says nothing of the sort.
+    assert_eq!(host.session(&finished.id).ended_by, None);
+}
+
+#[test]
+fn a_crashed_holders_program_is_ended_even_when_it_ignores_the_hangup() {
+    let host = Host::new();
+    // The leader ignores SIGHUP; its job ignores SIGHUP and SIGTERM, so it
+    // takes SIGKILL. Without its holder both would run on untracked.
+    let session = host.create(shell_in(
+        host.dir(),
+        r#"trap '' HUP TERM
+sleep 600 &
+printf '%d' $! > "$CHERRY_TEST_DIR/job.tmp"
+mv "$CHERRY_TEST_DIR/job.tmp" "$CHERRY_TEST_DIR/job"
+wait
+exec sleep 600"#,
+    ));
+    let leader = session.pid.unwrap() as i32;
+    let job = read_pid(&host.dir().join("job"));
+    let _strays = (Stray::new(leader), Stray::new(job));
+    let holder = holder_of(&host.sandbox, &session.id);
+    unsafe {
+        libc::kill(holder, libc::SIGKILL);
+    }
+    let lost = host.wait(&session.id, |s| s.state == SessionState::Exited);
+    assert_eq!(lost.ended_by.as_deref(), Some(ended_by::HOLDER_LOST));
+    // HUP, TERM 100 ms later and KILL after another 100 ms (the tests'
+    // kill grace).
+    wait_until("the job to be ended", || !is_live(job));
+    wait_until("the leader to be ended", || !is_live(leader));
+}
+
+#[test]
+fn a_holder_that_only_lost_its_link_keeps_its_program() {
+    let host = Host::new();
+    // A program in a session of its own, as a holder starts it, and a
+    // holder (this test) that closes its link but runs on: it may dial
+    // again, so nothing ends its program.
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("600");
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut program = command.spawn().unwrap();
+    let pid = program.id();
+    let _stray = Stray::new(pid as i32);
+    let id = Uuid::new_v4().to_string();
+    let mut session = hello(&id, json!({}));
+    session["session"]["pid"] = json!(pid);
+    let holder = FakeHolder::register(&host, link::VERSION, session);
+    wait_until("the session", || host.sessions().iter().any(|s| s.id == id));
+    drop(holder);
+    let lost = host.wait(&id, |s| s.state == SessionState::Exited);
+    assert_eq!(lost.ended_by.as_deref(), Some(ended_by::HOLDER_LOST));
+    // Past the daemon's wait for the holder to be gone (two seconds).
+    thread::sleep(Duration::from_secs(3));
+    assert!(is_live(pid as i32));
+    program.kill().unwrap();
+    program.wait().unwrap();
 }
 
 #[test]
@@ -1483,6 +1579,8 @@ fn what_a_holder_kept_follows_its_session_to_subscribers() {
             id: id.clone(),
             exit_code: 9,
             signal: None,
+            ended_by: None,
+            holder_log: None,
         },
     ] {
         assert_eq!(next_event(&mut socket), expected);

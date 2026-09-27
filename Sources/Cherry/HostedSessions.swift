@@ -160,6 +160,14 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// The `request_id` of the Create that started the session; nil when
     /// the host does not report it (an older host).
     let requestID: String?
+    /// Why the session ended when its program did not end it by itself:
+    /// `holder_lost` when its holder died (a crash, a kill), so the exit
+    /// status (1) says nothing about the program. Nil while it runs, for an
+    /// ordinary exit, and from an older host.
+    let endedBy: String?
+    /// Where the host logs what its holders report (a holder's panic): the
+    /// file to look at when `endedBy` is `holder_lost`; nil when unknown.
+    let holderLog: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, cwd, command, cols, rows, state, pid, attached, title, pwd, foreground, clients, owner, tags
@@ -171,6 +179,8 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         case applicationCursorKeys = "application_cursor_keys"
         case bracketedPaste = "bracketed_paste"
         case requestID = "request_id"
+        case endedBy = "ended_by"
+        case holderLog = "holder_log"
     }
 
     init(
@@ -196,7 +206,9 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         kittyKeyboardFlags: UInt32? = nil,
         applicationCursorKeys: Bool? = nil,
         bracketedPaste: Bool? = nil,
-        requestID: String? = nil
+        requestID: String? = nil,
+        endedBy: String? = nil,
+        holderLog: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -221,6 +233,8 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         self.applicationCursorKeys = applicationCursorKeys
         self.bracketedPaste = bracketedPaste
         self.requestID = requestID
+        self.endedBy = endedBy
+        self.holderLog = holderLog
     }
 
     init(from decoder: Decoder) throws {
@@ -249,7 +263,9 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             kittyKeyboardFlags: try container.decodeIfPresent(UInt32.self, forKey: .kittyKeyboardFlags),
             applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys),
             bracketedPaste: try container.decodeIfPresent(Bool.self, forKey: .bracketedPaste),
-            requestID: try container.decodeIfPresent(String.self, forKey: .requestID)
+            requestID: try container.decodeIfPresent(String.self, forKey: .requestID),
+            endedBy: try container.decodeIfPresent(String.self, forKey: .endedBy),
+            holderLog: try container.decodeIfPresent(String.self, forKey: .holderLog)
         )
     }
 
@@ -280,6 +296,14 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         try container.encodeIfPresent(applicationCursorKeys, forKey: .applicationCursorKeys)
         try container.encodeIfPresent(bracketedPaste, forKey: .bracketedPaste)
         try container.encodeIfPresent(requestID, forKey: .requestID)
+        try container.encodeIfPresent(endedBy, forKey: .endedBy)
+        try container.encodeIfPresent(holderLog, forKey: .holderLog)
+    }
+
+    /// How the session ended when its program did not end it by itself
+    /// (`endedBy`); nil otherwise.
+    var end: HostSessionEnd? {
+        endedBy.map { HostSessionEnd(reason: $0, holderLog: holderLog) }
     }
 
     var isRunning: Bool { state == .running }
@@ -318,20 +342,45 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
 
     var statusText: String {
         if isRunning { return attached ? "Attached" : "Running" }
+        if end?.isHolderLost == true { return "Host crashed" }
         if let exitSignal { return "Exited (signal \(exitSignal))" }
         if let exitCode { return "Exited (\(exitCode))" }
         return "Exited"
     }
 
     /// This session after the host reported it exited.
-    func exited(code: UInt32, signal: Int32?) -> HostedSessionInfo {
+    func exited(code: UInt32, signal: Int32?, end: HostSessionEnd? = nil) -> HostedSessionInfo {
         HostedSessionInfo(
             id: id, name: name, cwd: cwd, command: command, cols: cols, rows: rows,
             state: .exited, pid: pid, exitCode: code, exitSignal: signal, attached: attached,
             title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
             createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
-            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste, requestID: requestID
+            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste, requestID: requestID,
+            endedBy: end?.reason ?? endedBy, holderLog: end?.holderLog ?? holderLog
         )
+    }
+}
+
+/// Why a session ended when its program did not end it by itself, as the
+/// host reports it (`ended_by`, with `holder_log`, on the session and its
+/// `exited` event).
+struct HostSessionEnd: Equatable, Sendable {
+    /// Its holder died (crashed or was killed): the program was signalled
+    /// (hangup, then terminate, then kill) and the exit status says nothing
+    /// about it.
+    static let holderLost = "holder_lost"
+
+    let reason: String
+    /// Where the host logs what its holders report; nil when unknown.
+    let holderLog: String?
+
+    var isHolderLost: Bool { reason == Self.holderLost }
+
+    /// What a tab says instead of its exit status: "The session host
+    /// crashed", with where to look.
+    var message: String {
+        guard isHolderLost else { return "The session ended (\(reason))" }
+        return "The session host crashed" + (holderLog.map { " (see \($0))" } ?? "")
     }
 }
 
@@ -538,6 +587,68 @@ enum HostedAttachmentStatus: Equatable, Sendable {
 
 /// What a running attach adapter reports in its status file (`outcome`
 /// "attached"): it rewrites the file whenever one of these changes.
+/// An attach adapter's process as its status file names it: its pid and
+/// kernel start time, checked before it is signalled so a pid another
+/// process got since is never signalled.
+struct HostedAdapterProcess: Equatable, Sendable {
+    let pid: Int32
+    /// `cherry attach`'s `start_identity` (`seconds.microseconds` on macOS).
+    let started: String?
+
+    /// When `pid` started, in the adapter's format; nil when it does not
+    /// exist.
+    static func startIdentity(of pid: Int32) -> String? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return "\(info.pbi_start_tvsec)." + String(format: "%06llu", UInt64(info.pbi_start_tvusec))
+    }
+
+    /// Whether `pid` is still the process that wrote the status: its start
+    /// time matches (one without a start time is never trusted).
+    var isCurrent: Bool {
+        guard pid > 1, let started else { return false }
+        return Self.startIdentity(of: pid) == started
+    }
+
+    /// Asks the adapter to reconnect now (SIGUSR1), after checking it is
+    /// still this process. False when it is not, or the signal failed.
+    func requestReconnect() -> Bool {
+        isCurrent && kill(pid, SIGUSR1) == 0
+    }
+}
+
+/// A hosted session's clients and shared screen size, as a tab that shows
+/// it knows them (`TerminalSession.hostSessionSharing`).
+struct HostSessionSharing: Equatable, Sendable {
+    /// Attached clients, the tab's own adapter included.
+    let clients: Int
+    let columns: Int
+    let rows: Int
+}
+
+/// What the slim bar over a shared session's tab says
+/// (`TerminalSession.sharedSessionBar`), with Take Over.
+struct SharedSessionBarState: Equatable {
+    let message: String
+
+    /// `viewport`: the tab's adapter shows a viewport, because another
+    /// client made the session's screen smaller than the tab. Nil when the
+    /// program ended, or no other client shows it.
+    init?(sharing: HostSessionSharing?, viewport: Bool, isRunning: Bool) {
+        guard isRunning else { return nil }
+        if viewport {
+            let size = sharing.map { " at \($0.columns)×\($0.rows)" } ?? " smaller"
+            message = "Shown\(size) because another client is smaller"
+            return
+        }
+        guard let sharing, sharing.clients > 1 else { return nil }
+        let others = sharing.clients - 1
+        message = "Also open in \(others) other \(others == 1 ? "client" : "clients")"
+    }
+}
+
 struct HostedAdapterLiveStatus: Equatable, Sendable {
     /// The adapter shows only a viewport of the session's screen (another
     /// client made it larger than this terminal), so its surface is not
@@ -547,10 +658,19 @@ struct HostedAdapterLiveStatus: Equatable, Sendable {
     /// reconnects by itself; its surface keeps what it last showed, and
     /// the program's output does not reach it meanwhile.
     var reconnecting: Bool
+    /// The adapter process itself (`cherry attach` writes its pid and start
+    /// time), not the login(1) wrapper Ghostty runs it under; nil from an
+    /// adapter that does not say. Not part of the state's equality.
+    var process: HostedAdapterProcess?
 
-    init(viewport: Bool = false, reconnecting: Bool = false) {
+    init(viewport: Bool = false, reconnecting: Bool = false, process: HostedAdapterProcess? = nil) {
         self.viewport = viewport
         self.reconnecting = reconnecting
+        self.process = process
+    }
+
+    static func == (lhs: HostedAdapterLiveStatus, rhs: HostedAdapterLiveStatus) -> Bool {
+        lhs.viewport == rhs.viewport && lhs.reconnecting == rhs.reconnecting
     }
 
     /// Attached and following the program: its surface shows the program
@@ -589,9 +709,11 @@ enum HostedAttachmentStatusFile {
         let message: String?
         let viewport: Bool?
         let reconnecting: Bool?
+        let pid: Int32?
+        let started: String?
 
         enum CodingKeys: String, CodingKey {
-            case outcome, signal, message, viewport, reconnecting
+            case outcome, signal, message, viewport, reconnecting, pid, started
             case exitCode = "exit_code"
         }
     }
@@ -659,7 +781,11 @@ enum HostedAttachmentStatusFile {
         guard let record = try? JSONDecoder().decode(Record.self, from: data), record.outcome == liveOutcome else {
             return nil
         }
-        return HostedAdapterLiveStatus(viewport: record.viewport ?? false, reconnecting: record.reconnecting ?? false)
+        return HostedAdapterLiveStatus(
+            viewport: record.viewport ?? false,
+            reconnecting: record.reconnecting ?? false,
+            process: record.pid.map { HostedAdapterProcess(pid: $0, started: record.started) }
+        )
     }
 
     /// The outcome of an adapter that ended. An unreadable status is only
@@ -749,7 +875,9 @@ final class HostedAdapterStatusWatcher {
     /// Reads the file now (the vnode event, or a caller that wants the
     /// latest state at once).
     func check() {
-        guard source != nil, let status = HostedAttachmentStatusFile.readLive(from: directory), status != latest else {
+        guard source != nil, let status = HostedAttachmentStatusFile.readLive(from: directory),
+              status != latest || status.process != latest?.process
+        else {
             return
         }
         latest = status

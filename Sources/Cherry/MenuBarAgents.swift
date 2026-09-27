@@ -561,6 +561,13 @@ struct MenuBarAgentsPanel: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
+                if background.sessions.contains(where: { !$0.isRunning }) {
+                    Button("Clear Ended") { background.clearEnded() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .help("Remove every background session whose program ended")
+                }
                 Button("End All…") {
                     // After the click: the confirmation may activate a project window,
                     // which closes this panel.
@@ -577,6 +584,7 @@ struct MenuBarAgentsPanel: View {
             ForEach(background.sessions) { item in
                 MenuBarBackgroundSessionRow(
                     item: item,
+                    isUnread: background.unreadSessionIDs.contains(item.id),
                     open: { background.open(item) },
                     end: { background.end(item) }
                 )
@@ -648,6 +656,8 @@ private struct MenuBarAgentRow: View {
 // same spot, so it ignores clicks for a moment: a double click on End is not a yes.
 private struct MenuBarBackgroundSessionRow: View {
     let item: BackgroundSession
+    /// It had a bell or notification since it went to the background.
+    let isUnread: Bool
     let open: () -> Void
     let end: () -> Void
     @State private var isHovering = false
@@ -669,6 +679,12 @@ private struct MenuBarBackgroundSessionRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(-1)
+                    if isUnread {
+                        Circle()
+                            .fill(Color.blue)
+                            .frame(width: 6, height: 6)
+                            .help("Rang its bell or sent a notification")
+                    }
                     Spacer(minLength: 8)
                 }
                 .contentShape(Rectangle())

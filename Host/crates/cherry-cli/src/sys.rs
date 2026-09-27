@@ -13,6 +13,7 @@ use std::{
 
 static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+static RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Set on a thread whose work another thread may abandon (an
@@ -30,6 +31,8 @@ pub fn abandon_when(flag: Arc<AtomicBool>) {
 extern "C" fn handle_signal(signal: libc::c_int) {
     if signal == libc::SIGWINCH {
         RESIZE_PENDING.store(true, Ordering::Relaxed);
+    } else if signal == libc::SIGUSR1 {
+        RECONNECT_REQUESTED.store(true, Ordering::Relaxed);
     } else {
         TERMINATION_SIGNAL.store(signal, Ordering::Relaxed);
     }
@@ -41,6 +44,13 @@ pub fn termination_signal() -> Option<i32> {
         0 => None,
         signal => Some(signal),
     }
+}
+
+/// True once per burst of SIGUSR1: an attachment that is reconnecting
+/// tries again at once (see `attach`); anywhere else it means nothing, and
+/// never ends the process (its default action would).
+pub fn take_reconnect_request() -> bool {
+    RECONNECT_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
 /// True once per burst of SIGWINCH.
@@ -73,6 +83,7 @@ impl SignalGuard {
         let mut guard = Self { saved: Vec::new() };
         for signal in [
             libc::SIGWINCH,
+            libc::SIGUSR1,
             libc::SIGINT,
             libc::SIGTERM,
             libc::SIGHUP,

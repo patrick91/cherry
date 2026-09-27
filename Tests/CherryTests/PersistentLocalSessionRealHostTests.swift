@@ -1178,3 +1178,118 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
     workspace.closeAllSessions(intent: .windowClosed)
     await host.tearDown()
 }
+
+/// The parent of `pid` and its command line, as `ps` reports them.
+private func parentProcess(of pid: pid_t) throws -> (pid: pid_t, command: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-o", "ppid=", "-p", "\(pid)"]
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    process.waitUntilExit()
+    let parent = try #require(pid_t(String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)))
+    let command = Process()
+    command.executableURL = URL(fileURLWithPath: "/bin/ps")
+    command.arguments = ["-o", "command=", "-p", "\(parent)"]
+    let commandOutput = Pipe()
+    command.standardOutput = commandOutput
+    try command.run()
+    command.waitUntilExit()
+    return (parent, String(decoding: commandOutput.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostRenamesReachTheHostAndAHolderThatDiesSaysTheHostCrashed() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        let anchor = workspace.addSession(title: "Anchor")
+        let tab = workspace.addSession(title: "Shell 1")
+        host.show(tab)
+        try await host.waitFor("the tabs to attach") {
+            anchor.persistentSession != nil && anchor.state == .live && tab.persistentSession != nil && tab.state == .live
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+
+        // An explicit rename names the session on its host (`cherry list`).
+        tab.rename(to: "Deploy")
+        try await host.waitFor("the host to list the new name") {
+            try await host.observedSession(sessionID)?.name == "Deploy"
+        }
+
+        // Its holder dies: the program is ended (hangup, terminate, kill)
+        // and the tab says the session host crashed, not "exit 1".
+        let info = try #require(try await host.hostSession(sessionID))
+        let program = try #require(info.pid.map { pid_t(bitPattern: $0) })
+        let holder = try parentProcess(of: program)
+        #expect(holder.command.contains("cherry-host"), Comment(rawValue: holder.command))
+        #expect(holder.command.contains("hold"), Comment(rawValue: holder.command))
+        #expect(kill(holder.pid, SIGKILL) == 0)
+        try await host.waitFor("the tab to say its host crashed", timeout: 20) {
+            tab.hostSessionEnd?.isHolderLost == true && !tab.isRunning
+        }
+        #expect(tab.persistentSessionEndedMessage?.hasPrefix("The session host crashed") == true)
+        let ended = try #require(try await host.observedSession(sessionID))
+        #expect(ended.endedBy == HostSessionEnd.holderLost)
+        try await host.waitFor("the program to be ended", timeout: 20) {
+            kill(program, 0) != 0 && errno == ESRCH
+        }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+/// `ps -o command=` of `pid`.
+private func commandLine(of pid: pid_t) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-o", "command=", "-p", "\(pid)"]
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    process.waitUntilExit()
+    return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostAdapterStatusNamesTheAdapterNotItsLoginWrapper() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        let tab = workspace.addSession(title: "Shell")
+        host.show(tab)
+        try await host.waitFor("the adapter to report itself") {
+            tab.persistentSession != nil && tab.adapterLiveStatus?.process != nil
+        }
+        let process = try #require(tab.adapterLiveStatus?.process)
+        #expect(process.isCurrent)
+        // The surface's own process is login(1) (or whatever wraps the
+        // adapter); the status names `cherry attach` itself.
+        let command = try commandLine(of: process.pid)
+        #expect(command.contains("cherry"), Comment(rawValue: command))
+        #expect(command.contains(" attach "), Comment(rawValue: command))
+        let leader = tab.ghosttyBridge.nativeSessionLeaderPID()
+        #expect(leader != process.pid)
+        // SIGUSR1 to an attached adapter changes nothing: it keeps running.
+        let launch = tab.nativeExecLaunch
+        #expect(process.requestReconnect())
+        try await Task.sleep(for: .seconds(1))
+        #expect(process.isCurrent)
+        #expect(tab.state == .live)
+        #expect(tab.nativeExecLaunch.command == launch.command)
+        tab.send(text: "echo STILL_$((40 + 2))\n")
+        try await host.waitFor("the adapter to still pass input") { host.screen(tab).contains("STILL_42") }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}

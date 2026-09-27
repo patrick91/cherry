@@ -2574,6 +2574,8 @@ mod tests {
             application_cursor_keys: false,
             bracketed_paste: None,
             request_id: None,
+            ended_by: None,
+            holder_log: None,
         };
         let running = SessionEvent::Changed {
             session: session(cherry_protocol::SessionState::Running, None),
@@ -2582,6 +2584,8 @@ mod tests {
             id: "a".into(),
             exit_code: 3,
             signal: None,
+            ended_by: None,
+            holder_log: None,
         };
         let ended = SessionEvent::Changed {
             session: session(cherry_protocol::SessionState::Exited, Some(3)),

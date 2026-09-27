@@ -97,6 +97,9 @@ enum PersistentSessionTag {
     /// The Create request (lowercased UUID) that started the session: finds
     /// a session whose Create answer was lost, and nothing else.
     static let launch = "cherry.launch"
+    /// The staged Ghostty resources copy the session reads
+    /// (`HostedLaunchSpec.resourcesCopy`), kept while any session names it.
+    static let resources = "cherry.resources"
     /// Each value is cut to this many bytes, far inside the host's 16 KiB.
     static let maxValueBytes = 1_024
 }
@@ -234,8 +237,11 @@ final class PersistentLocalSessions {
     let configuration: Configuration
     /// Where the sessions this app ends on purpose are recorded
     /// (`WorkspaceStateStore.addEndedSessions`), so a saved tab that names
-    /// one never comes back as ended by the system. The app sets its store
-    /// at launch; nil records nothing (tests).
+    /// one never comes back as ended by the system; also where sessions in
+    /// the background that had a bell or notification are marked unread
+    /// (`noteUnread`), and what Background Sessions checks before it removes
+    /// an ended session (`WorkspaceStateStore.savedTabsName`). The app sets
+    /// its store at launch; nil records nothing (tests).
     var endedSessionsStore: WorkspaceStateStore?
     /// Lost sessions recorded in `endedSessionsStore` during this run (host
     /// identity + NUL + session id).
@@ -303,6 +309,16 @@ final class PersistentLocalSessions {
     /// Bells and notifications for sessions no tab follows yet, oldest
     /// first (`Configuration.pendingSignalLifetime`).
     private var pendingSignals: [(sessionID: String, signal: PersistentHostSignal, receivedAt: Date)] = []
+    /// Whether a check for pending signals no tab took is scheduled.
+    private var pendingSignalExpiryScheduled = false
+    /// Takes a bell or notification of a session of this app that no tab
+    /// follows, and says whether it did: a session in the background has
+    /// it posted as the app's notification and marked unread
+    /// (`BackgroundSessionsModel.backgroundSessionDidSignal`). One it does
+    /// not take is kept for a tab that follows the session soon (its Create
+    /// answer or its window's restore is still to come) and offered again
+    /// once that wait is over (`pendingSignalLifetime`). Nil drops them then.
+    var backgroundSignalHandler: (@MainActor (HostedSessionInfo, PersistentHostSignal) -> Bool)?
     private var lease: HostControlLease?
     private var eventSubscription: AnyCancellable?
     /// What a new session's terminal reports of its colours and appearance
@@ -570,7 +586,7 @@ final class PersistentLocalSessions {
             cols: min(max(request.columns, 2), 500),
             rows: min(max(request.rows, 1), 200),
             owner: owner,
-            tags: Self.tags(for: request, requestID: requestID),
+            tags: Self.tags(for: request, requestID: requestID, resourcesCopy: spec.resourcesCopy),
             // A program that asks sees the colours of the terminal it is
             // shown in, as in a native tab.
             colors: terminalColors()
@@ -995,6 +1011,19 @@ final class PersistentLocalSessions {
 
     var hasPendingEnds: Bool { !endings.isEmpty }
 
+    /// A bell or notification of this session reached no tab (it is in
+    /// the background): recorded in `endedSessionsStore` (the app's store),
+    /// so the tab that shows it next comes up unread (`takeUnread`).
+    func noteUnread(hostID: String, sessionID: String) {
+        endedSessionsStore?.addUnreadSession(hostID: hostID, sessionID: sessionID)
+    }
+
+    /// Whether the session had a bell or notification while in the
+    /// background (`noteUnread`); the mark goes.
+    func takeUnread(_ binding: HostedSessionAttachment) -> Bool {
+        endedSessionsStore?.takeUnreadSession(hostID: binding.hostID, sessionID: binding.sessionID) ?? false
+    }
+
     /// This app ends this session of This Mac on purpose (`end`, or
     /// Persistent Sessions → Terminate or Remove): recorded in
     /// `endedSessionsStore`.
@@ -1212,6 +1241,25 @@ final class PersistentLocalSessions {
         try await control.screen(binding.sessionID, scrollback: true, maxLines: maxLines, expectedHostID: binding.hostID)
     }
 
+    /// Names the session on its host as its tab is named (an explicit
+    /// rename, or the task title an agent's tab shows), so `cherry list`,
+    /// Background Sessions and the Persistent Sessions sheet show that name
+    /// rather than the one it was created with. Cut to the host's limit
+    /// (`maxSessionNameBytes`). A failure is only logged: the next rename
+    /// or bind sends it again.
+    @discardableResult
+    func rename(_ binding: HostedSessionAttachment, to name: String) -> Task<Void, Never> {
+        let name = Self.truncated(name, toBytes: Self.maxSessionNameBytes)
+        let control = control
+        return Task { @MainActor in
+            do {
+                try await control.update(binding.sessionID, name: name, expectedHostID: binding.hostID)
+            } catch {
+                fputs("Cherry: could not rename session \(binding.sessionID): \(Self.errorMessage(error))\n", stderr)
+            }
+        }
+    }
+
     /// Clears the history above the session's screen on its host (Clear
     /// Scrollback, MCP `clear_output`): reads of its screen (`screen(of:)`)
     /// and an adapter that attaches no longer bring it back.
@@ -1244,14 +1292,16 @@ final class PersistentLocalSessions {
 
     private func handle(_ event: HostSessionEvent) {
         switch event {
-        case .exited(let id, let exitCode, _):
-            boundTab(for: id)?.persistentProgramDidExit(sessionID: id, status: Int32(clamping: exitCode))
+        case .exited(let id, let exitCode, _, let end):
+            boundTab(for: id)?.persistentProgramDidExit(
+                sessionID: id, status: Int32(clamping: exitCode), end: end ?? sessionInfo(id)?.end
+            )
         case .added(let info), .changed(let info):
             guard let tab = boundTab(for: info.id) else { return }
             if info.isRunning {
                 tab.persistentSessionDidChange(info)
             } else {
-                tab.persistentProgramDidExit(sessionID: info.id, status: Self.exitStatus(of: info))
+                tab.persistentProgramDidExit(sessionID: info.id, status: Self.exitStatus(of: info), end: info.end)
             }
         case .removed(let id):
             // A running session is removed only after it exited, which the
@@ -1266,7 +1316,7 @@ final class PersistentLocalSessions {
                     if info.isRunning {
                         tab.persistentSessionDidChange(info)
                     } else {
-                        tab.persistentProgramDidExit(sessionID: id, status: Self.exitStatus(of: info))
+                        tab.persistentProgramDidExit(sessionID: id, status: Self.exitStatus(of: info), end: info.end)
                     }
                 } else if control.state == .connected {
                     tab.persistentSessionMayHaveDisappeared(sessionID: id)
@@ -1283,8 +1333,11 @@ final class PersistentLocalSessions {
 
     /// A bell, notification or progress report for the tab following the
     /// session, which shows it unless its attach adapter passes the same to
-    /// its surface (`TerminalSession.persistentHostDidSignal`). Kept a while
-    /// when no tab follows the session yet.
+    /// its surface (`TerminalSession.persistentHostDidSignal`). A bell or
+    /// notification of a session in the background is posted as the app's
+    /// notification (`backgroundSignalHandler`). Otherwise kept a while for
+    /// the tab that follows the session next, and offered to the handler
+    /// again once no tab took it.
     private func deliver(_ signal: PersistentHostSignal, toSession sessionID: String) {
         if let tab = boundTab(for: sessionID) {
             tab.persistentHostDidSignal(signal)
@@ -1297,16 +1350,58 @@ final class PersistentLocalSessions {
                 guard entry.sessionID == sessionID, case .progress = entry.signal else { return false }
                 return true
             }
+        } else if offerToBackground(signal, ofSession: sessionID) {
+            return
         }
         pendingSignals.append((sessionID, signal, Date()))
         if pendingSignals.count > configuration.pendingSignalLimit {
             pendingSignals.removeFirst(pendingSignals.count - configuration.pendingSignalLimit)
         }
+        schedulePendingSignalExpiry()
     }
 
+    /// Hands a bell or notification of this app's session to
+    /// `backgroundSignalHandler`; true when it took it.
+    private func offerToBackground(_ signal: PersistentHostSignal, ofSession sessionID: String) -> Bool {
+        guard let backgroundSignalHandler, let info = sessionInfo(sessionID), info.owner == owner else { return false }
+        return backgroundSignalHandler(info, signal)
+    }
+
+    /// Once the oldest pending signal's wait is over, those no tab took are
+    /// offered to the background handler, then dropped.
+    private func schedulePendingSignalExpiry() {
+        guard !pendingSignalExpiryScheduled, let oldest = pendingSignals.first?.receivedAt else { return }
+        pendingSignalExpiryScheduled = true
+        let delay = max(0, oldest.addingTimeInterval(configuration.pendingSignalLifetime).timeIntervalSinceNow) + 0.05
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingSignalExpiryScheduled = false
+                self.dropExpiredPendingSignals()
+                self.schedulePendingSignalExpiry()
+            }
+        }
+    }
+
+    /// Drops the pending signals whose wait is over, offering the bells and
+    /// notifications among them to the background handler first (at most
+    /// one of each kind per session: the tab would have shown them once).
     private func dropExpiredPendingSignals() {
         let oldest = Date().addingTimeInterval(-configuration.pendingSignalLifetime)
+        let expired = pendingSignals.filter { $0.receivedAt < oldest }
+        guard !expired.isEmpty else { return }
         pendingSignals.removeAll { $0.receivedAt < oldest }
+        var offered = Set<String>()
+        for entry in expired {
+            let key: String
+            switch entry.signal {
+            case .progress: continue
+            case .bell: key = "\(entry.sessionID)\u{0}bell"
+            case .notification(let title, let body): key = "\(entry.sessionID)\u{0}\(title)\u{0}\(body)"
+            }
+            guard offered.insert(key).inserted else { continue }
+            _ = offerToBackground(entry.signal, ofSession: entry.sessionID)
+        }
     }
 
     // MARK: Helpers
@@ -1325,7 +1420,7 @@ final class PersistentLocalSessions {
         !info.isRunning && info.exitCode == 0 && info.exitSignal == nil
     }
 
-    static func tags(for request: PersistentSessionRequest, requestID: UUID) -> [String: String] {
+    static func tags(for request: PersistentSessionRequest, requestID: UUID, resourcesCopy: String? = nil) -> [String: String] {
         var tags = [
             PersistentSessionTag.tab: request.tabID.uuidString,
             PersistentSessionTag.kind: request.kind.rawValue,
@@ -1334,6 +1429,7 @@ final class PersistentLocalSessions {
         if let agentName = request.agentName?.nilIfEmpty { tags[PersistentSessionTag.agent] = agentName }
         if let commandName = request.commandName?.nilIfEmpty { tags[PersistentSessionTag.command] = commandName }
         if let projectRoot = request.projectRoot?.nilIfEmpty { tags[PersistentSessionTag.project] = projectRoot }
+        if let resourcesCopy = resourcesCopy?.nilIfEmpty { tags[PersistentSessionTag.resources] = resourcesCopy }
         return tags.mapValues { truncated($0, toBytes: PersistentSessionTag.maxValueBytes) }
     }
 

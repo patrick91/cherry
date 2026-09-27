@@ -321,7 +321,9 @@ exit 3"#,
         [SessionEvent::Exited {
             id: id.clone(),
             exit_code: 3,
-            signal: None
+            signal: None,
+            ended_by: None,
+            holder_log: None,
         }]
     );
     // The change that says so follows the exit, never passes it.

@@ -43,20 +43,68 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         MainActor.assumeIsolated {
             Self.startLaunchHousekeeping()
         }
-        // Reach the local session host now, in the background, so the first
-        // persistent tabs do not wait for its helper, login environment and
-        // daemon to start.
         MainActor.assumeIsolated {
-            SessionBackendPolicy.userSettings.persistentHostingForNewTab()?.warmUp()
-            // The menu bar's Background Sessions list; it starts no host.
-            BackgroundSessionsModel.shared.start()
+            Self.finishLaunchingAfterInstanceLock(lock: .shared, store: .shared) {
+                // Reach the local session host now, in the background, so
+                // the first persistent tabs do not wait for its helper,
+                // login environment and daemon to start.
+                SessionBackendPolicy.userSettings.persistentHostingForNewTab()?.warmUp()
+                // The menu bar's Background Sessions list; it starts no host.
+                BackgroundSessionsModel.shared.start()
+                DispatchQueue.main.async {
+                    NSApp.activate(ignoringOtherApps: true)
+                    Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
+                    self.scheduleDefaultWindowOpenIfNeeded()
+                }
+            }
         }
+    }
 
-        DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
-            self.scheduleDefaultWindowOpenIfNeeded()
+    /// Everything that needs to know whether this copy holds the instance
+    /// lock waits for it off the main thread (`InstanceLockLaunchWait`: a
+    /// copy launched while the previous one quits says so meanwhile), then
+    /// runs in this order: old set-aside state files are pruned (`store`,
+    /// which asks the lock), then `launch` (the warm-up, Background
+    /// Sessions, the first windows). Nothing here touches the lock on the
+    /// main thread before it is resolved.
+    @MainActor
+    @discardableResult
+    static func finishLaunchingAfterInstanceLock(
+        lock: AppInstanceLock,
+        store: WorkspaceStateStore,
+        presenter: InstanceLockLaunchWait.Presenter? = nil,
+        then launch: @escaping @MainActor () -> Void
+    ) -> Task<Void, Never>? {
+        InstanceLockLaunchWait.run(lock: lock, presenter: presenter ?? .app) {
+            // Old copies of state files this version could not use.
+            store.pruneSetAsideFiles()
+            launch()
         }
+    }
+
+    /// What a Dock click does (`applicationShouldHandleReopen`).
+    enum ReopenAction: Equatable {
+        /// Bring the first project window forward.
+        case focusProjectWindow
+        /// Open the default project window.
+        case openDefaultWindow
+        /// The launch still waits for the instance lock and opens the
+        /// windows itself once it has it: opening one now would load saved
+        /// tabs on the main thread while the lock is not resolved.
+        case waitForLaunch
+    }
+
+    static func reopenAction(lockResolved: Bool, hasProjectWindow: Bool) -> ReopenAction {
+        guard lockResolved else { return .waitForLaunch }
+        return hasProjectWindow ? .focusProjectWindow : .openDefaultWindow
+    }
+
+    /// A quit asked while the launch still waits for the instance lock
+    /// terminates at once: no window opened, nothing of this copy's is
+    /// saved or ended yet, and asking the lock now would block the main
+    /// thread until the previous copy quits.
+    static func quitsAtOnce(lockResolved: Bool) -> Bool {
+        !lockResolved
     }
 
     /// Launch work that never holds up the first window: stops the SSH
@@ -85,7 +133,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         let projectWindow = MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.firstRegisteredProjectWindow()
         }
-        if let projectWindow {
+        let action = Self.reopenAction(lockResolved: AppInstanceLock.shared.isResolved, hasProjectWindow: projectWindow != nil)
+        if action == .waitForLaunch {
+            // The launch opens the windows once it has the lock.
+        } else if let projectWindow {
             projectWindow.makeKeyAndOrderFront(nil)
         } else {
             let openDefaultProjectWindow = openDefaultProjectWindow
@@ -112,6 +163,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if Self.quitsAtOnce(lockResolved: AppInstanceLock.shared.isResolved) { return .terminateNow }
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.markCurrentActiveProjectOpened()
         }
@@ -665,8 +717,16 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         let userInfo = response.notification.request.content.userInfo
         let sessionIDString = userInfo["sessionID"] as? String
         let projectRoot = userInfo["projectRoot"] as? String
+        let backgroundSessionID = userInfo[BackgroundSessionNotificationContent.sessionIDKey] as? String
 
         await MainActor.run {
+            if let backgroundSessionID {
+                TerminalNotificationCenter.shared.handleResponse(
+                    userInfo: [BackgroundSessionNotificationContent.sessionIDKey: backgroundSessionID],
+                    backgroundSessions: .shared
+                )
+                return
+            }
             TerminalNotificationCenter.shared.handleResponse(
                 sessionIDString: sessionIDString,
                 projectRoot: projectRoot

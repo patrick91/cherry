@@ -904,7 +904,7 @@ final class HostControl: ObservableObject {
             guard before != session else { continue }
             publish(.changed(session))
             if before.isRunning, !session.isRunning {
-                publish(.exited(id: session.id, exitCode: session.exitCode ?? 0, signal: session.exitSignal))
+                publish(.exited(id: session.id, exitCode: session.exitCode ?? 0, signal: session.exitSignal, end: session.end))
             }
         }
         if announcesResyncAfterNextList {
@@ -949,10 +949,10 @@ final class HostControl: ObservableObject {
         case .removed(let id):
             noteSessionEvent(id)
             sessions.removeAll { $0.id == id }
-        case .exited(let id, let code, let signal):
+        case .exited(let id, let code, let signal, let end):
             noteSessionEvent(id)
             if let index = sessions.firstIndex(where: { $0.id == id }), sessions[index].isRunning {
-                sessions[index] = sessions[index].exited(code: code, signal: signal)
+                sessions[index] = sessions[index].exited(code: code, signal: signal, end: end)
             }
         case .bell, .notification, .progress:
             break

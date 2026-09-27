@@ -1,6 +1,7 @@
 //! Enumerate and signal live members of a PTY's kernel session. Never use
 //! persisted PIDs: members are found by session ID while the unreaped leader
 //! keeps that ID reserved.
+use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
@@ -102,6 +103,118 @@ pub fn kill_session(leader: libc::pid_t) {
         signal_members(leader, live_members(leader), libc::SIGSTOP);
     }
     signal_session(leader, libc::SIGKILL);
+}
+
+/// A process as it was while its session's holder was linked: its PID and
+/// when it started (`start_identity`), so that a process that got the PID
+/// later is not taken for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    pub pid: libc::pid_t,
+    pub started: Option<String>,
+}
+
+impl Recorded {
+    pub fn of(pid: libc::pid_t) -> Self {
+        Self {
+            pid,
+            started: start_identity(pid),
+        }
+    }
+
+    /// Whether the PID exists (a zombie included).
+    fn exists(&self) -> bool {
+        self.pid > 0 && unsafe { libc::kill(self.pid, 0) } == 0
+    }
+
+    /// Whether the PID now belongs to another process (unless that cannot
+    /// be told).
+    fn reused(&self) -> bool {
+        match (&self.started, start_identity(self.pid)) {
+            (Some(recorded), Some(current)) => *recorded != current,
+            _ => false,
+        }
+    }
+
+    /// Whether the recorded process still runs.
+    pub fn runs(&self) -> bool {
+        self.exists() && !self.reused() && !is_zombie(self.pid)
+    }
+}
+
+/// How long `end_abandoned_session` waits for a holder whose link broke to
+/// be gone; one that still runs after it keeps its session.
+pub const HOLDER_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// End what is left of a session whose holder is gone (it crashed or was
+/// killed): the program, and any job that ignored the hangup the closed
+/// terminal sent, would otherwise run on untracked. First waits up to
+/// `HOLDER_EXIT_WAIT` for the holder to be gone; a holder that still runs
+/// keeps its session (it dials the daemon again), and nothing is signalled.
+/// Then sends SIGHUP, SIGTERM after `grace` and SIGKILL after another (with
+/// SIGCONT after the first two, so stopped jobs act on them) to the live
+/// members of the program's kernel session: the processes whose session ID
+/// is the recorded leader's PID. The kernel does not give that PID to
+/// another process while a member still uses it as its session ID, and
+/// nothing is signalled once the PID belongs to another process that
+/// started later (`Recorded`). Returns the last signal sent, None when
+/// nothing was left to signal. Blocks: run it on a thread of its own.
+pub fn end_abandoned_session(
+    holder: &Recorded,
+    leader: &Recorded,
+    grace: Duration,
+) -> Option<libc::c_int> {
+    let deadline = Instant::now() + HOLDER_EXIT_WAIT;
+    while holder.runs() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let members = || -> Vec<libc::pid_t> {
+        if leader.pid <= 1 || (leader.exists() && leader.reused()) {
+            return Vec::new();
+        }
+        live_members(leader.pid)
+    };
+    let mut sent = None;
+    for signal in [libc::SIGHUP, libc::SIGTERM, libc::SIGKILL] {
+        let listed = members();
+        if listed.is_empty() {
+            return sent;
+        }
+        if signal == libc::SIGKILL {
+            // As `kill_session`: stopped first, so none forks a
+            // replacement during the sweep.
+            for _ in 0..2 {
+                signal_listed(leader.pid, &members(), libc::SIGSTOP);
+            }
+            signal_listed(leader.pid, &members(), libc::SIGKILL);
+            return Some(signal);
+        }
+        signal_listed(leader.pid, &listed, signal);
+        sent = Some(signal);
+        let until = Instant::now() + grace;
+        while Instant::now() < until && !members().is_empty() {
+            std::thread::sleep(Duration::from_millis(20).min(grace));
+        }
+    }
+    sent
+}
+
+/// Signal the listed members of `leader`'s session, each only if it still
+/// is one right before (its PID may have a new owner since the listing).
+fn signal_listed(leader: libc::pid_t, members: &[libc::pid_t], signal: libc::c_int) {
+    for &pid in members {
+        if unsafe { libc::getsid(pid) } == leader {
+            unsafe {
+                libc::kill(pid, signal);
+                if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+                    libc::kill(pid, libc::SIGCONT);
+                }
+            }
+        }
+    }
 }
 
 /// How `waitid` says a child ended (`si_code`). The values are the same on

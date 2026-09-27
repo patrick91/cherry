@@ -146,3 +146,42 @@ final class InstanceLockNotice {
         alert.beginSheetModal(for: window, completionHandler: nil)
     }
 }
+
+extension InstanceLockLaunchWait.Presenter {
+    /// A small window in the middle of the screen with a spinner and the
+    /// message, while a copy launched during the previous one's quit waits.
+    static var app: InstanceLockLaunchWait.Presenter {
+        @MainActor final class Holder {
+            var window: NSWindow?
+        }
+        let holder = Holder()
+        return InstanceLockLaunchWait.Presenter(
+            show: { message in
+                let spinner = NSProgressIndicator()
+                spinner.style = .spinning
+                spinner.controlSize = .small
+                spinner.startAnimation(nil)
+                let label = NSTextField(labelWithString: message)
+                label.font = .systemFont(ofSize: 13)
+                let stack = NSStackView(views: [spinner, label])
+                stack.orientation = .horizontal
+                stack.spacing = 10
+                stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+                let window = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 420, height: 60),
+                    styleMask: [.titled], backing: .buffered, defer: false
+                )
+                window.isReleasedWhenClosed = false
+                window.title = "Cherry"
+                window.contentView = stack
+                window.center()
+                window.makeKeyAndOrderFront(nil)
+                holder.window = window
+            },
+            hide: {
+                holder.window?.orderOut(nil)
+                holder.window = nil
+            }
+        )
+    }
+}

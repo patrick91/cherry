@@ -9709,6 +9709,14 @@ private struct SidebarTabRow: View {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 
+            if rowState.isShared {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.5))
+                    .help("Its session is also open in another client")
+                    .accessibilityLabel("Shared session")
+            }
+
             Circle()
                 .fill(Color(nsColor: rowState.tint))
                 .frame(width: 7, height: 7)
@@ -9780,6 +9788,8 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
     @Published private(set) var hasUnacknowledgedAttention: Bool
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
+    /// Its session is shared with other clients (`TerminalSession.sharedSessionBar`).
+    @Published private(set) var isShared = false
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -9894,6 +9904,15 @@ private final class SidebarTabRowState: ObservableObject {
             .sink { [weak self] environment in
                 Task { @MainActor [weak self] in
                     self?.nixShellEnvironment = environment
+                }
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest3(session.$hostSessionSharing, session.$adapterLiveStatus, session.$state)
+            .sink { [weak self, weak session] _ in
+                Task { @MainActor [weak self, weak session] in
+                    let shared = session?.sharedSessionBar != nil
+                    if self?.isShared != shared { self?.isShared = shared }
                 }
             }
             .store(in: &cancellables)
@@ -12058,6 +12077,10 @@ private struct TerminalSceneView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
 
+            SharedSessionBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .padding(.top, 8)
+
             PersistentSessionEndedBar(session: session, close: closeHostedSession.map { close in { close(session) } })
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
@@ -12325,7 +12348,9 @@ private struct CommandExitStatusBar: View {
         case .launching, .live:
             nil
         case .exited(let code):
-            if session.isAutoRestartPaused {
+            if let end = session.hostSessionEnd {
+                Status(text: session.restartOnExit ? "\(end.message); not restarted" : end.message, isFailure: true)
+            } else if session.isAutoRestartPaused {
                 Status(text: "Keeps failing — auto-restart paused", isFailure: true)
             } else if code == 0 {
                 Status(text: "Command exited", isFailure: false)
@@ -12447,6 +12472,42 @@ private struct PersistentSessionFallbackBar: View {
             .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
             .frame(maxWidth: 460)
             .projectWindowToastObstacle()
+        }
+    }
+}
+
+// A tab whose hosted session other clients show too: a slim bar at the top
+// says it is shown at the size a smaller client gives it (the adapter shows a
+// viewport), or how many other clients have it open, with Take Over, which
+// disconnects them so the session follows this tab's size.
+private struct SharedSessionBar: View {
+    @ObservedObject var session: TerminalSession
+
+    var body: some View {
+        if let bar = session.sharedSessionBar {
+            HStack(spacing: 8) {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Text(bar.message)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Button("Take Over") {
+                    session.takeOverSharedSession()
+                }
+                .controlSize(.mini)
+                .help("Disconnect the other clients, so the session follows this tab's size")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(.regularMaterial, in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
+            }
+            .frame(maxWidth: 460)
         }
     }
 }

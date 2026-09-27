@@ -32,7 +32,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_CONNECTIONS: usize = 128;
+/// How many connections the daemon serves at once: well above
+/// `connection::MAX_SESSIONS`, since every session can have an attachment or
+/// two, a control connection and its holder's link at the same time. The
+/// connection after that gets `Error{too_many_connections}` and is closed.
+/// `CHERRY_HOST_MAX_CONNECTIONS` overrides it for tests.
+pub const MAX_CONNECTIONS: usize = 1024;
+const _: () = assert!(MAX_CONNECTIONS >= 6 * crate::connection::MAX_SESSIONS);
+/// How long writing the refusal to a connection over the limit may take.
+const OVER_LIMIT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Timestamps of the socket and its directory are refreshed this often, so
 /// age-based tmp cleaners never consider them stale.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -87,6 +95,8 @@ pub struct Config {
     pub kill_grace: Duration,
     /// How often the socket's timestamps are refreshed.
     pub touch_interval: Duration,
+    /// How many connections are served at once (`MAX_CONNECTIONS`).
+    pub max_connections: usize,
     /// How long a client keeps lending its agent after its last connection.
     pub agent_grace: Duration,
     /// How long requests wait for the holders a starting daemon expects
@@ -114,6 +124,11 @@ pub fn config() -> &'static Config {
             input_wait: millis("CHERRY_HOST_INPUT_WAIT_MS").unwrap_or(INPUT_WAIT),
             kill_grace: millis("CHERRY_HOST_KILL_GRACE_MS").unwrap_or(Duration::from_secs(2)),
             touch_interval: millis("CHERRY_HOST_TOUCH_INTERVAL_MS").unwrap_or(TOUCH_INTERVAL),
+            max_connections: std::env::var("CHERRY_HOST_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|&limit| limit > 0)
+                .unwrap_or(MAX_CONNECTIONS),
             agent_grace: millis("CHERRY_HOST_AGENT_GRACE_MS").unwrap_or(AGENT_RELEASE_GRACE),
             holder_wait: millis("CHERRY_HOST_HOLDER_WAIT_MS").unwrap_or(HOLDER_WAIT),
             stall_timeout: millis("CHERRY_HOST_STALL_TIMEOUT_MS").unwrap_or(STALL_TIMEOUT),
@@ -191,6 +206,11 @@ pub struct Host {
     pub socket_dir: PathBuf,
     /// The state directory: identity, lock, log and session manifests.
     pub state: PathBuf,
+    /// The log this daemon, and the holders it starts, write to (their
+    /// stderr), when it is a file: `host.log` in the state directory for a
+    /// daemon `cherry-host start` started. None when stderr goes elsewhere
+    /// (the journal of a systemd unit, a terminal).
+    pub log_path: Option<PathBuf>,
     pub registry: Mutex<Registry>,
     /// Sessions whose holders have manifests but have not registered with
     /// this daemon yet, and are still waited for.
@@ -741,11 +761,13 @@ pub fn serve(path: &Path) -> Result<()> {
     let (stop, stopped) = UnixStream::pair()?;
     stop.set_nonblocking(true)?;
     let (agents_wake, agents_woken) = mpsc::sync_channel(1);
+    let log_path = stderr_log(&state);
     let host = Arc::new(Host {
         id,
         socket: path.to_path_buf(),
         socket_dir,
         state,
+        log_path,
         registry: Mutex::new(Registry {
             sessions: HashMap::new(),
             receipts: Receipts::default(),
@@ -825,6 +847,34 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     }
 }
 
+/// Tell a connection over the limit why it is closed, before its `Hello`
+/// is read (an `Error` frame, which every version decodes), without waiting
+/// on it for long: the accept loop runs this.
+fn refuse_over_limit(mut stream: UnixStream, limit: usize, over_limit: &mut Diagnostics) {
+    over_limit.report(format_args!(
+        "refused a connection: already serving {limit} connections"
+    ));
+    let _ = stream.set_write_timeout(Some(OVER_LIMIT_WRITE_TIMEOUT));
+    let _ = cherry_protocol::write_frame(
+        &mut stream,
+        &ServerMessage::error(
+            cherry_protocol::error_code::TOO_MANY_CONNECTIONS,
+            format!("cherry-host already serves {limit} connections; try again later"),
+        ),
+    );
+}
+
+/// `host.log` in the state directory when it is this process's stderr.
+fn stderr_log(state: &Path) -> Option<PathBuf> {
+    let path = state.join("host.log");
+    let file = fs::metadata(&path).ok()?;
+    let mut stderr: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr) } != 0 {
+        return None;
+    }
+    (stderr.st_dev as u64 == file.dev() && stderr.st_ino as u64 == file.ino()).then_some(path)
+}
+
 /// Rate-limited diagnostics for the host log.
 #[derive(Default)]
 struct Diagnostics {
@@ -861,6 +911,8 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
     // still be accepted and closed instead of waking poll() forever.
     let mut reserve = File::open("/dev/null").ok();
     let mut diagnostics = Diagnostics::default();
+    // Their own, so that other trouble never hides them.
+    let mut over_limit = Diagnostics::default();
     let interval = config().touch_interval;
     let mut next_touch = Instant::now() + interval;
     while !host.stopping.load(Ordering::SeqCst) {
@@ -904,7 +956,7 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
         }
         loop {
             match listener.accept() {
-                Ok((stream, _)) => admit(stream, host, &mut diagnostics),
+                Ok((stream, _)) => admit(stream, host, &mut diagnostics, &mut over_limit),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error)
                     if matches!(
@@ -937,14 +989,21 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
     }
 }
 
-fn admit(stream: UnixStream, host: &Arc<Host>, diagnostics: &mut Diagnostics) {
+fn admit(
+    stream: UnixStream,
+    host: &Arc<Host>,
+    diagnostics: &mut Diagnostics,
+    over_limit: &mut Diagnostics,
+) {
     if cherry_protocol::verify_peer(&stream).is_err() {
         return;
     }
     // A client's frames, or a holder's link (see `connection`).
     cherry_protocol::priority::grow_send_buffer(stream.as_raw_fd());
-    if host.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+    let limit = config().max_connections;
+    if host.connections.fetch_add(1, Ordering::SeqCst) >= limit {
         host.connections.fetch_sub(1, Ordering::SeqCst);
+        refuse_over_limit(stream, limit, over_limit);
         return;
     }
     // Counted from the accept on: a client's next connection is then known

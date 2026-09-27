@@ -45,7 +45,7 @@ struct ProjectSettingsPane: View {
                         .buttonStyle(.plain)
                         .contextMenu {
                             Button("Remove Project", role: .destructive) {
-                                settings.removeProject(project)
+                                ProjectRemoval.remove(project, settings: settings)
                             }
                         }
 
@@ -118,7 +118,7 @@ struct ProjectDetailSettingsPane: View {
                         .settingsProminentGlassButtonStyle()
 
                         Button("Remove", role: .destructive) {
-                            settings.removeProject(project)
+                            ProjectRemoval.remove(project, settings: settings)
                         }
                         .settingsGlassButtonStyle()
                     }

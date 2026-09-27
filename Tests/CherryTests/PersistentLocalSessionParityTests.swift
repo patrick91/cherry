@@ -1801,3 +1801,177 @@ private final class LostInputPart: @unchecked Sendable {
     ), info: HostedSessionInfo(id: "remote-1", name: "Remote", cwd: "/srv", pid: 99))
     #expect(remote.programProcessID == nil)
 }
+
+// MARK: - Follow-ups: a reconnecting adapter, shared sessions, lost answers
+
+/// A process that records each SIGUSR1 it gets in `marker`, standing in
+/// for an attach adapter that reconnects.
+private func startSignalRecorder(marker: URL) throws -> Process {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", "trap 'echo usr1 >> \"$0\"' USR1; while :; do sleep 0.05; done", marker.path]
+    try process.run()
+    return process
+}
+
+@Test @MainActor func reconnectNowSignalsTheAdapterItsStatusNamesAndRelaunchesWhenItCannot() async throws {
+    let harness = try PersistentHarness(configuration: parityConfiguration())
+    let workspace = harness.workspace()
+    let marker = harness.project.appendingPathComponent("usr1.log")
+    let adapter = try startSignalRecorder(marker: marker)
+    defer {
+        adapter.terminate()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Worker")
+    #expect(await harness.waitUntilAttached(tab))
+    try await harness.confirmAttached(tab)
+    let launch = tab.nativeExecLaunch
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    let call = try #require(harness.attachCalls.last { $0.contains("attach \(sessionID) ") })
+    let file = try harness.statusFile(of: call)
+    let started = try #require(HostedAdapterProcess.startIdentity(of: adapter.processIdentifier))
+    func report(pid: Int32, started: String) throws {
+        try HostedSessionFakeCLI.writeStatus(
+            #"{"outcome":"attached","viewport":false,"reconnecting":true,"pid":\#(pid),"started":"\#(started)","exit_code":null,"signal":null,"message":null}"#,
+            to: file
+        )
+    }
+    // The adapter (as `cherry attach` does) names itself in its status: the
+    // process Ghostty runs is login(1), which does not pass signals on.
+    try report(pid: adapter.processIdentifier, started: started)
+    #expect(await harness.fake.wait { tab.adapterLiveStatus?.process?.pid == adapter.processIdentifier })
+    #expect(await harness.fake.wait { tab.state == .disconnected && tab.isAdapterReconnecting })
+
+    // Reconnect Now (and Start, and MCP start_process, which take the same
+    // path) signals that process, and keeps the adapter and its surface.
+    #expect(tab.reconnectHostedSession())
+    #expect(await harness.fake.wait {
+        (try? String(contentsOf: marker, encoding: .utf8))?.contains("usr1") == true
+    })
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(harness.attachCalls.count == 1)
+    #expect(tab.nativeExecLaunch.command == launch.command)
+
+    // A pid that another process has now (its start time differs) is never
+    // signalled: a new adapter is launched instead, as before.
+    try report(pid: adapter.processIdentifier, started: "1.000001")
+    #expect(await harness.fake.wait { tab.adapterLiveStatus?.process?.started == "1.000001" })
+    #expect(!(tab.adapterLiveStatus?.process?.isCurrent ?? true))
+    let signals = (try? String(contentsOf: marker, encoding: .utf8)) ?? ""
+    #expect(tab.reconnectHostedSession())
+    #expect(await harness.fake.wait { harness.attachCalls.count == 2 })
+    #expect((try? String(contentsOf: marker, encoding: .utf8)) ?? "" == signals)
+    #expect(tab.nativeExecLaunch.command != launch.command)
+}
+
+@Test @MainActor func aTakeoverReplacesAReconnectingAdapter() async throws {
+    let harness = try PersistentHarness(configuration: parityConfiguration())
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Worker")
+    #expect(await harness.waitUntilAttached(tab))
+    try await harness.confirmAttached(tab, reconnecting: true)
+    #expect(await harness.fake.wait { tab.state == .disconnected })
+    #expect(tab.reconnectHostedSession(takeover: true))
+    #expect(await harness.fake.wait { harness.attachCalls.count == 2 })
+    #expect(harness.attachCalls.last?.contains("--takeover") == true)
+}
+
+@Test func theSharedSessionBarSaysHowTheSessionIsShared() {
+    #expect(SharedSessionBarState(sharing: nil, viewport: false, isRunning: true) == nil)
+    #expect(SharedSessionBarState(
+        sharing: HostSessionSharing(clients: 1, columns: 120, rows: 40), viewport: false, isRunning: true
+    ) == nil)
+    #expect(SharedSessionBarState(
+        sharing: HostSessionSharing(clients: 2, columns: 120, rows: 40), viewport: false, isRunning: true
+    )?.message == "Also open in 1 other client")
+    #expect(SharedSessionBarState(
+        sharing: HostSessionSharing(clients: 4, columns: 120, rows: 40), viewport: false, isRunning: true
+    )?.message == "Also open in 3 other clients")
+    #expect(SharedSessionBarState(
+        sharing: HostSessionSharing(clients: 2, columns: 80, rows: 24), viewport: true, isRunning: true
+    )?.message == "Shown at 80×24 because another client is smaller")
+    #expect(SharedSessionBarState(
+        sharing: HostSessionSharing(clients: 2, columns: 80, rows: 24), viewport: true, isRunning: false
+    ) == nil)
+}
+
+@Test @MainActor func aTabWhoseSessionOtherClientsShowSaysSoAndCanTakeItOver() async throws {
+    let harness = try PersistentHarness(configuration: parityConfiguration())
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Worker")
+    #expect(await harness.waitUntilAttached(tab))
+    try await harness.confirmAttached(tab)
+    #expect(tab.sharedSessionBar == nil)
+
+    // Another terminal attached (`cherry attach`): two clients.
+    harness.push(.changed(try harness.info(tab, clients: 2)))
+    #expect(await harness.fake.wait { tab.sharedSessionBar?.message == "Also open in 1 other client" })
+
+    // It is smaller: this tab shows a viewport of the 80×24 screen.
+    let viewport = HostedSessionInfo(
+        id: try #require(tab.persistentSession?.sessionID), name: tab.title, cwd: harness.project.path,
+        cols: 80, rows: 24, pid: 42, clients: 2, owner: "CherryTests",
+        tags: [PersistentSessionTag.tab: tab.id.uuidString]
+    )
+    harness.push(.changed(viewport))
+    try await harness.confirmAttached(tab, viewport: true)
+    #expect(tab.sharedSessionBar?.message == "Shown at 80×24 because another client is smaller")
+
+    // Take Over: a new adapter that disconnects the others.
+    #expect(tab.takeOverSharedSession())
+    #expect(await harness.fake.wait { harness.attachCalls.count == 2 })
+    #expect(harness.attachCalls.last?.contains("--takeover") == true)
+
+    // Alone again: no bar.
+    harness.push(.changed(try harness.info(tab, clients: 1)))
+    try await harness.confirmAttached(tab)
+    #expect(await harness.fake.wait { tab.sharedSessionBar == nil })
+}
+
+@Test @MainActor func mcpInputWhoseHostAnswerWasLostSaysItMayHaveBeenTyped() async throws {
+    let harness = try PersistentHarness(configuration: parityConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Worker")
+    #expect(await harness.waitUntilAttached(tab))
+    // Its adapter reconnects: MCP input goes through the host.
+    try await harness.confirmAttached(tab, reconnecting: true)
+    // The host takes the request, and the connection drops before it
+    // answers.
+    harness.fake.respond = { @Sendable request, _ in
+        request.op == "send_input" ? .exit(stderr: nil) : nil
+    }
+    let sent = try await control.send(.sendProcessInput(.init(processID: tab.id.uuidString, text: "make deploy")))
+    #expect(harness.fake.requests("send_input").count >= 1)
+    #expect(sent.error?.code == "input_maybe_delivered")
+    #expect(sent.error?.message.contains("may or may not have reached the program") == true)
+    #expect(sent.error?.message.contains("nothing was sent") == false)
+
+    // The error for the part of longer input, and after an agent's text.
+    typealias Failure = TerminalSession.ControlInputError
+    let long = CherryControlServer.inputError(
+        for: Failure.maybeDelivered("connection lost"), processName: "Worker", totalBytes: 100_000
+    )
+    #expect(long.code == "input_maybe_delivered")
+    #expect(long.message.contains("of which only the first 65536 were sent"), Comment(rawValue: long.message))
+    let enter = CherryControlServer.inputError(
+        for: Failure.maybeDelivered("connection lost"), processName: "Claude", totalBytes: 1, alreadySent: 5
+    )
+    #expect(enter.code == "input_maybe_delivered")
+    #expect(enter.message.hasPrefix("The text (5 bytes) was typed into process 'Claude'; the Enter that submits it was sent"))
+}

@@ -2328,6 +2328,17 @@ final class CherryControlServer: @unchecked Sendable {
                 code: "input_not_delivered",
                 message: "Input for process '\(name)' did not reach its program; nothing was sent: \(reason)"
             )
+        case .maybeDelivered(let reason):
+            let what = alreadySent > 0
+                ? "The text (\(alreadySent) bytes) was typed into process '\(name)'; the Enter that submits it was sent"
+                : "Input for process '\(name)' (\(totalBytes) bytes"
+                    + (totalBytes > HostProtocol.maxInputBytes ? ", of which only the first \(HostProtocol.maxInputBytes) were sent" : "")
+                    + ") was sent"
+            return CherryControlError(
+                code: "input_maybe_delivered",
+                message: what + ", but its host's answer was lost, so it may or may not have reached the program: \(reason). "
+                    + "Check its output before sending it again."
+            )
         }
     }
 

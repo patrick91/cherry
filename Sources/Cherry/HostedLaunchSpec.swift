@@ -45,6 +45,15 @@ struct HostedLaunchSpec: Equatable, Sendable {
     /// the same path. The host rejects a directory that does not exist.
     let workingDirectory: String
 
+    /// The staged Ghostty resources copy the session reads (its content
+    /// hash, `GhosttyStagedResources`): the `cherry.resources` tag, which
+    /// keeps that copy from being removed while the session runs.
+    var resourcesCopy: String? {
+        guard let directory = environment["GHOSTTY_RESOURCES_DIR"]?.nilIfEmpty else { return nil }
+        let name = URL(fileURLWithPath: directory).deletingLastPathComponent().lastPathComponent
+        return GhosttyResourceStaging.isCopyName(name) ? name : nil
+    }
+
     /// The shell layer between the host and the user's login shell.
     static let launchShell = "/bin/bash"
     /// Native tabs' login(1) wrapper, which hosted sessions leave out.
@@ -808,6 +817,62 @@ enum GhosttyResourceStaging {
         return lstat(path, &status) == 0 && status.st_mode & S_IFMT == S_IFDIR
     }
 
+    /// Copies other than the current one that no running session names are
+    /// kept this long after their last use at least (`staleCopies`): a
+    /// generous margin for sessions the list does not show yet.
+    static let staleCopyAge: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Whether `name` is a copy's directory name (its content hash).
+    static func isCopyName(_ name: String) -> Bool {
+        name.count == 32 && name.allSatisfy(\.isHexDigit)
+    }
+
+    /// Marks `staged` as used now (its modification time).
+    static func noteUse(of staged: GhosttyStagedResources) {
+        utimes(staged.rootDirectory, nil)
+    }
+
+    /// The copies in `baseDirectory` no session uses any more: not
+    /// `current`, not named by a running session (`inUse`: the
+    /// `cherry.resources` tags of every running session the host lists,
+    /// whoever owns it) and last used (`noteUse`) more than `staleCopyAge`
+    /// ago. A copy's sessions read it for their whole life (TERMINFO, shell
+    /// integration). The caller asks only with a complete live list in
+    /// which every running session of this app is tagged.
+    static func staleCopies(
+        in baseDirectory: URL,
+        current: String?,
+        inUse: Set<String>,
+        now: Date = Date(),
+        fileManager: FileManager = .default
+    ) -> [URL] {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: baseDirectory.path) else { return [] }
+        let cutoff = now.addingTimeInterval(-staleCopyAge)
+        return names.sorted().compactMap { name in
+            guard name != current, !inUse.contains(name), !name.hasPrefix("."), isCopyName(name) else { return nil }
+            let url = baseDirectory.appendingPathComponent(name, isDirectory: true)
+            guard isDirectory(url.path),
+                  let modified = (try? fileManager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                  modified < cutoff
+            else { return nil }
+            return url
+        }
+    }
+
+    /// Removes `staleCopies`, each moved aside first so no half-deleted copy
+    /// is ever at a copy's path.
+    static func removeStaleCopies(
+        in baseDirectory: URL,
+        current: String?,
+        inUse: Set<String>,
+        now: Date = Date(),
+        fileManager: FileManager = .default
+    ) {
+        for url in staleCopies(in: baseDirectory, current: current, inUse: inUse, now: now, fileManager: fileManager) {
+            moveAside(url.path, ifDirectory: true, in: baseDirectory, fileManager: fileManager)
+        }
+    }
+
     /// Best effort, on every stage: assemblies, replacement files and moved
     /// entries an interrupted stage left.
     private static func removeLeftovers(in baseDirectory: URL, fileManager: FileManager) {
@@ -856,16 +921,35 @@ final class GhosttyResourceStager: @unchecked Sendable {
         }
     }
 
+    /// Removes the staged copies no session uses any more
+    /// (`GhosttyResourceStaging.staleCopies`), in the background: `inUse`
+    /// are the copies the running sessions name. Leaves everything alone
+    /// before this process staged its own copy.
+    func removeStaleCopies(inUse: Set<String>) {
+        let baseDirectory = baseDirectory
+        queue.async {
+            guard let staged = self.staged else { return }
+            GhosttyResourceStaging.removeStaleCopies(
+                in: baseDirectory,
+                current: URL(fileURLWithPath: staged.rootDirectory).lastPathComponent,
+                inUse: inUse
+            )
+        }
+    }
+
     private func resolveOnQueue() throws -> GhosttyStagedResources {
         // Checked in full once per process; a copy deleted while the app
-        // runs is staged again.
+        // runs is staged again. Each use marks the copy used
+        // (`removeStaleCopies`).
         if let staged,
            FileManager.default.fileExists(atPath: staged.resourcesDirectory),
            FileManager.default.fileExists(atPath: staged.terminfoDirectory) {
+            GhosttyResourceStaging.noteUse(of: staged)
             return staged
         }
         guard let source = source() else { throw GhosttyResourceStagingError.resourcesMissing }
         let result = try GhosttyResourceStaging.stage(source, into: baseDirectory)
+        GhosttyResourceStaging.noteUse(of: result)
         staged = result
         return result
     }

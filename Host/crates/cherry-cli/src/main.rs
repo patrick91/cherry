@@ -353,8 +353,11 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     } else {
                         for session in sessions {
                             text.push_str(&format!(
-                                "{}\t{}\t{:?}\t{}\n",
-                                session.id, session.name, session.state, session.cwd
+                                "{}\t{}\t{}\t{}\n",
+                                session.id,
+                                session.name,
+                                listed_state(&session),
+                                session.cwd
                             ));
                         }
                     }
@@ -664,6 +667,18 @@ fn replace(transport: &mut Transport, version: u32) -> Result<()> {
 }
 
 /// Like print!, but a closed stdout is an error rather than a panic.
+/// A session's state as `cherry list` prints it: `Running` or `Exited`,
+/// and `Exited (the session host crashed)` when its holder was lost rather
+/// than its program ending (`SessionInfo::ended_by`).
+fn listed_state(session: &SessionInfo) -> String {
+    match session.ended_by.as_deref() {
+        Some(cherry_protocol::ended_by::HOLDER_LOST) => {
+            format!("{:?} (the session host crashed)", session.state)
+        }
+        _ => format!("{:?}", session.state),
+    }
+}
+
 fn print(text: &str) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -837,6 +852,20 @@ pub(crate) fn validate_host(value: &str) -> std::result::Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_says_when_a_session_host_crashed() {
+        let session: SessionInfo = serde_json::from_str(
+            r#"{"id":"s","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"exited","pid":null,"exit_code":1,"attached":false,"exit_signal":null}"#,
+        )
+        .unwrap();
+        assert_eq!(listed_state(&session), "Exited");
+        let lost = SessionInfo {
+            ended_by: Some(cherry_protocol::ended_by::HOLDER_LOST.into()),
+            ..session
+        };
+        assert_eq!(listed_state(&lost), "Exited (the session host crashed)");
+    }
     use std::path::Path;
     use transport::{remote_gateway_command, unstable_location, FrameDecoder};
 

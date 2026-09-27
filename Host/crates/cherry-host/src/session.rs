@@ -12,12 +12,12 @@ use crate::{
     holder::LINK_FD,
     link::{self, kind, Frame},
     outbox::{Outbox, Output, Pacing, Push, PACE_STEP},
-    paths, screen,
+    paths, processes, screen,
     signals::{self, Wake},
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_attached_frame, encode_frame, error_code, priority, valid_size, AttachReason,
+    encode_attached_frame, encode_frame, ended_by, error_code, priority, valid_size, AttachReason,
     ForegroundProcess, ProgressState, ServerMessage, SessionEvent, SessionInfo, SessionState,
     MAX_SCREEN_TEXT_BYTES, MAX_SNAPSHOT_BYTES,
 };
@@ -548,6 +548,8 @@ fn session_event(id: &str, event: link::Event) -> Option<SessionEvent> {
             id,
             exit_code,
             signal,
+            ended_by: None,
+            holder_log: None,
         },
     })
 }
@@ -627,12 +629,20 @@ impl Session {
         stream.set_nonblocking(true)?;
         let link::HolderHello {
             id,
+            holder_pid,
             session,
             offset,
             events,
             receipt,
-            ..
         } = hello;
+        // Taken while the holder is linked, so that what is left of the
+        // program after a crash of the holder is ended (see `lost`), and no
+        // process that got one of their PIDs later.
+        let holder = processes::Recorded::of(holder_pid as libc::pid_t);
+        let leader = session
+            .pid
+            .filter(|_| session.running)
+            .map(|pid| processes::Recorded::of(pid as libc::pid_t));
         let exit =
             (!session.running).then(|| (session.exit_code.unwrap_or(1), session.exit_signal));
         let info = Arc::new(Mutex::new(SessionInfo {
@@ -667,6 +677,8 @@ impl Session {
             bracketed_paste: session.bracketed_paste,
             // The holder keeps the Create's receipt for the next daemon.
             request_id: receipt.map(|receipt| receipt.request_id),
+            ended_by: None,
+            holder_log: None,
         }));
         let (wake, wake_rx) = Wake::pair()?;
         let (tx, rx) = mpsc::sync_channel(64);
@@ -717,6 +729,8 @@ impl Session {
             pacer: None,
             pace_until: None,
             pace_idle: None,
+            holder,
+            leader,
         };
         let exited = exit.is_some();
         let events = events
@@ -1018,6 +1032,11 @@ struct Worker {
     /// From when the pacer counts as taking nothing, should another client
     /// take output (see `stalled_out`), while the session has others.
     pace_idle: Option<Instant>,
+    /// The holder process, as it was when it registered.
+    holder: processes::Recorded,
+    /// The program's process (its session leader), as it was when the
+    /// holder registered; None for a session that had exited by then.
+    leader: Option<processes::Recorded>,
 }
 
 impl Worker {
@@ -2225,23 +2244,34 @@ impl Worker {
         })
     }
 
-    /// The session has exited (or its holder is gone).
-    fn exited(&mut self, exit_code: u32, signal: Option<i32>) {
+    /// The session has exited (or its holder is gone: `ended_by`).
+    fn exited(&mut self, exit_code: u32, signal: Option<i32>, ended_by: Option<&str>) {
         if self.exit.is_some() {
             return;
         }
         self.exit = Some((exit_code, signal));
+        let ended_by = ended_by.map(str::to_string);
+        let holder_log = ended_by.as_ref().and_then(|_| {
+            self.host
+                .log_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
         {
             let mut info = self.info();
             info.state = SessionState::Exited;
             info.exit_code = Some(exit_code);
             info.exit_signal = signal;
             info.foreground = None;
+            info.ended_by = ended_by.clone();
+            info.holder_log = holder_log.clone();
         }
         self.host.publish(SessionEvent::Exited {
             id: self.id.clone(),
             exit_code,
             signal,
+            ended_by,
+            holder_log,
         });
         self.changed();
         // No later resync can reach a client that is lagging now (its queue
@@ -2343,7 +2373,7 @@ impl Worker {
             }
             kind::EXITED => {
                 if let Ok(exited) = frame.meta::<link::Exited>() {
-                    self.exited(exited.exit_code, exited.signal);
+                    self.exited(exited.exit_code, exited.signal, None);
                 }
             }
             kind::INFO => {
@@ -2352,7 +2382,9 @@ impl Worker {
                 }
             }
             kind::EVENT => match frame.meta::<link::Event>() {
-                Ok(link::Event::Exited { exit_code, signal }) => self.exited(exit_code, signal),
+                Ok(link::Event::Exited { exit_code, signal }) => {
+                    self.exited(exit_code, signal, None)
+                }
                 Ok(event) => {
                     if let Some(event) = session_event(&self.id, event) {
                         self.host.publish(event);
@@ -2587,14 +2619,50 @@ impl Worker {
                 Request::Replace { .. } | Request::Resync { .. } => {}
             }
         }
-        // It ended as a hangup would have ended it; how is unknown.
-        self.exited(1, None);
+        if self.running() {
+            self.end_abandoned_program();
+        }
+        // How the program ended is unknown: the status says 1, and
+        // `ended_by` that the holder was lost, not the program's exit.
+        self.exited(1, None, Some(ended_by::HOLDER_LOST));
         if final_screen {
             self.announce_exit();
         }
         // Attaches get what is left: an empty screen and the exit.
         while let Some(command) = self.waiting.pop_front() {
             self.handle(command);
+        }
+    }
+
+    /// End, on a thread of its own, what the lost holder left running of
+    /// the program: the closed terminal sent it a hangup, which a job may
+    /// ignore (see `processes::end_abandoned_session`).
+    fn end_abandoned_program(&self) {
+        let Some(leader) = self.leader.clone() else {
+            return;
+        };
+        let holder = self.holder.clone();
+        let id = self.id.clone();
+        let grace = daemon::config().kill_grace;
+        let spawned = thread::Builder::new()
+            .name("cherry-abandoned".into())
+            .spawn(move || {
+                match processes::end_abandoned_session(&holder, &leader, grace) {
+                    Some(signal) => daemon::log(format_args!(
+                        "session {id}: ended what its lost holder left running (last signal {signal})"
+                    )),
+                    None if holder.runs() => daemon::log(format_args!(
+                        "session {id}: its holder {} still runs without a link; its program is left to it",
+                        holder.pid
+                    )),
+                    None => {}
+                }
+            });
+        if let Err(error) = spawned {
+            daemon::log(format_args!(
+                "session {}: cannot end what its lost holder left running: {error}",
+                self.id
+            ));
         }
     }
 

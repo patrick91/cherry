@@ -50,7 +50,8 @@ use std::{
         process::CommandExt,
     },
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::OnceLock,
+    time::{Duration, Instant, SystemTime},
 };
 
 /// The descriptor a new holder finds its first link on.
@@ -137,6 +138,7 @@ const FOREGROUND_CHECKS: [Duration; 3] = [
 /// `cherry-host hold`: take the `Launch` on descriptor 3, start the session
 /// and hold it until it has exited and been removed.
 pub fn hold(socket: &Path) -> Result<()> {
+    install_panic_hook();
     // Its threads (its loop and its terminal's, see `terminal_thread`) run
     // at interactive priority while a client is attached
     // (`link::Attended`), and at the default class otherwise; the program it
@@ -166,6 +168,7 @@ pub fn hold(socket: &Path) -> Result<()> {
         bail!("expected a launch, not a link frame of kind {}", frame.kind);
     }
     let launch: link::Launch = frame.meta()?;
+    let _ = SESSION.set(launch.id.clone());
     let (cwd, env) = link::parse_launch_data(&frame.data)?;
     let holder = match Holder::start(socket, launch, &cwd, &env, stream.try_clone()?) {
         Ok(holder) => holder,
@@ -185,6 +188,68 @@ pub fn hold(socket: &Path) -> Result<()> {
     drop(stream);
     holder.run();
     Ok(())
+}
+
+/// The session this holder holds, once its launch was read: for its panic
+/// report.
+static SESSION: OnceLock<String> = OnceLock::new();
+
+/// Log a panic of this holder (to its stderr, the daemon's log when a
+/// `cherry-host start` started the daemon) with when it happened, the
+/// session and the build, then report it as Rust does. The daemon then
+/// reports the session as ended by `holder_lost`.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log(panic_report(
+            SESSION.get().map(String::as_str),
+            SystemTime::now(),
+            &info.to_string(),
+        ));
+        default(info);
+    }));
+}
+
+/// The line a holder's panic hook logs.
+fn panic_report(session: Option<&str>, at: SystemTime, panic: &str) -> String {
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(
+        "holder of session {} (pid {}) panicked at {}; build cherry-host {} (link {}, protocol {}, {executable}): {panic}",
+        session.unwrap_or("(not launched yet)"),
+        std::process::id(),
+        utc_timestamp(at),
+        env!("CARGO_PKG_VERSION"),
+        link::LINK_VERSION,
+        cherry_protocol::PROTOCOL_VERSION,
+    )
+}
+
+/// `at` as an ISO 8601 UTC timestamp to the millisecond.
+fn utc_timestamp(at: SystemTime) -> String {
+    let since = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since.as_secs();
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60,
+        since.subsec_millis()
+    )
 }
 
 fn size(cols: u16, rows: u16) -> PtySize {
@@ -1988,6 +2053,32 @@ fn dial(socket: &Path) -> io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_report_names_the_time_the_session_and_the_build() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_000_000_123);
+        assert_eq!(utc_timestamp(at), "2026-09-21T14:13:20.123Z");
+        assert_eq!(
+            utc_timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00.000Z"
+        );
+        let report = panic_report(Some("3f6c"), at, "panicked at src/x.rs:1:2:\nboom");
+        assert!(
+            report.starts_with(&format!(
+                "holder of session 3f6c (pid {}) panicked at 2026-09-21T14:13:20.123Z; build cherry-host {} (link {}, protocol {},",
+                std::process::id(),
+                env!("CARGO_PKG_VERSION"),
+                link::LINK_VERSION,
+                cherry_protocol::PROTOCOL_VERSION
+            )),
+            "{report}"
+        );
+        assert!(
+            report.ends_with("): panicked at src/x.rs:1:2:\nboom"),
+            "{report}"
+        );
+        assert!(panic_report(None, at, "p").contains("session (not launched yet)"));
+    }
 
     fn bytes(pending: &PendingInput) -> Vec<u8> {
         pending

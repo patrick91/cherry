@@ -1653,6 +1653,7 @@ final class TerminalWorkspace: ObservableObject {
         if let control {
             session.attachedHostControlProvider = { _ in control }
         }
+        if record.hasUnreadNotification == true { session.markUnread() }
         guard deferringLaunch, launchShell else { return session }
         if let info, !info.isRunning {
             session.showEndedHostedSession(
@@ -1745,7 +1746,7 @@ final class TerminalWorkspace: ObservableObject {
         case .terminal: "\(ShellProcessController.defaultShellName) login shell"
         case .agent, .command: record.launchCommand ?? ""
         }
-        return TerminalSession(
+        let session = TerminalSession(
             id: record.id,
             title: record.title.nilIfEmpty ?? launch.info.displayName,
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
@@ -1767,6 +1768,8 @@ final class TerminalWorkspace: ObservableObject {
             adoptingPersistentSession: launch,
             deferredLaunch: deferringLaunch
         )
+        if record.hasUnreadNotification == true { session.markUnread() }
+        return session
     }
 
     /// A tab for a saved record whose session the system ended while
@@ -1812,6 +1815,7 @@ final class TerminalWorkspace: ObservableObject {
             persistentHosting: hosting
         )
         session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
+        if record.hasUnreadNotification == true { session.markUnread() }
         return session
     }
 
@@ -3395,6 +3399,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// the program exits: the host keeps its final screen until the tab
     /// closes or restarts. Saved with the workspace.
     @Published private(set) var persistentSession: HostedSessionAttachment?
+    /// How many clients its host reports attached to the tab's session (its
+    /// own adapter included) and the size of the session's shared screen;
+    /// nil when the tab shows no hosted session or the host did not say.
+    @Published private(set) var hostSessionSharing: HostSessionSharing?
+    /// Its session's holder died (`HostSessionEnd.holderLost`): the tab says
+    /// "The session host crashed" (with the log) instead of its exit status,
+    /// and a command that restarts on exit is not restarted by it. Cleared
+    /// by the next launch.
+    @Published private(set) var hostSessionEnd: HostSessionEnd?
+    /// The name the tab's session has on its host, as far as the tab knows
+    /// (`syncHostSessionName`).
+    private var hostSessionName: String?
+    /// An agent's task title waiting to reach its host.
+    private var hostSessionNameSync: DispatchWorkItem?
     private var persistentPhase: PersistentPhase = .idle
     /// A running or exited session the next launch attaches to instead of
     /// creating one (a restored or adopted tab).
@@ -3677,7 +3695,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionNotificationGate = TerminalAttentionNotificationGate()
     private var currentAttentionScreenTagObservationID: UUID?
     private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
-    private var agentTurnState: TerminalAttentionTurnState = .notStarted
+    /// Where the agent's current turn stands (read by tests).
+    private(set) var agentTurnState: TerminalAttentionTurnState = .notStarted
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
     private var isOutputPausedForBackgroundThrottle = false
@@ -4403,6 +4422,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         /// may or may not have; the rest was not sent. Resending all of it
         /// would type the first part twice.
         case partiallyDelivered(deliveredBytes: Int, reason: String, unconfirmedBytes: Int = 0)
+        /// A persistent tab's host may have typed the input: it was sent,
+        /// and the host's answer was lost (a transport failure after the
+        /// request went out; input longer than one host request: its first
+        /// part's). Nothing after that part was sent.
+        case maybeDelivered(String)
     }
 
     /// Input on behalf of MCP, as `send(data:)` (`raw` false) or
@@ -4608,6 +4632,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// is not "nothing was sent".
     private static func controlInputError(_ error: Error) -> ControlInputError {
         if let error = error as? ControlInputError { return error }
+        if let error = error as? HostedSessionError, error.isTransportFailure {
+            return .maybeDelivered(inputFailureReason(error))
+        }
         if let partial = error as? HostInputPartiallyDelivered {
             return .partiallyDelivered(
                 deliveredBytes: partial.deliveredBytes,
@@ -4709,6 +4736,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         bumpRevision()
     }
 
+    /// A bell or notification the user has not seen reached this tab's
+    /// program while no tab showed it (its saved record, or its session in
+    /// the background): the tab shows it unread.
+    func markUnread() {
+        guard !hasUnreadNotification else { return }
+        hasUnreadNotification = true
+        bumpRevision()
+        persistentStateDidChange?()
+    }
+
     func clearUnreadNotification() {
         guard hasUnreadNotification || lastNotification != nil else { return }
         hasUnreadNotification = false
@@ -4774,6 +4811,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let trimmedTitle else {
             clearExplicitTitle()
             persistentStateDidChange?()
+            syncHostSessionName(title)
             return
         }
 
@@ -4781,6 +4819,44 @@ final class TerminalSession: ObservableObject, Identifiable {
         titleSource = .explicit
         bumpRevision()
         persistentStateDidChange?()
+        syncHostSessionName(title)
+    }
+
+    /// An agent's task title reaches its session's host name this long
+    /// after it last changed.
+    static let hostSessionNameDelay: TimeInterval = 1
+
+    /// Names this tab's persistent session on its host `name` (an explicit
+    /// rename, or clearing one), so the host's list (`cherry list`,
+    /// Background Sessions, the Persistent Sessions sheet) names it as the
+    /// tab does. Only a session this tab owns; nothing when the host has
+    /// that name already. A tab whose session is still being created sends
+    /// it once bound (`bindPersistentSession`).
+    private func syncHostSessionName(_ name: String) {
+        hostSessionNameSync?.cancel()
+        hostSessionNameSync = nil
+        guard isPersistentLocalSession, let persistentHosting, let persistentSession,
+              let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        else { return }
+        // As the host keeps it: a long name is not sent again at each bind.
+        let name = PersistentLocalSessions.truncated(trimmed, toBytes: PersistentLocalSessions.maxSessionNameBytes)
+        guard name != hostSessionName else { return }
+        hostSessionName = name
+        persistentHosting.rename(persistentSession, to: name)
+    }
+
+    /// The task title an agent's tab shows changed: it names the session on
+    /// its host once it has settled (`hostSessionNameDelay`), unless the
+    /// user named the tab.
+    private func scheduleHostSessionNameSync() {
+        guard isPersistentLocalSession, titleSource == .automatic else { return }
+        hostSessionNameSync?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.titleSource == .automatic else { return }
+            self.syncHostSessionName(self.title)
+        }
+        hostSessionNameSync = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hostSessionNameDelay, execute: work)
     }
 
     /// `keepingSession`: the tab closes detaching from its program
@@ -4875,6 +4951,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if isPersistentLocalSession {
             // The tab no longer follows the program (it may keep running).
             hostedProgramProcessID = nil
+            hostSessionSharing = nil
             progressReport = nil
             forgetHostContent()
         } else if hostedAttachment != nil {
@@ -4971,6 +5048,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func noteAttachedLocalSession(_ info: HostedSessionInfo) {
         guard let hostedAttachment, info.id == hostedAttachment.sessionID else { return }
         attachedSessionInfo = info
+        noteHostSessionSharing(info)
         guard hostedAttachment.host == .local else { return }
         attachedLocalProgramProcessID = info.isRunning ? info.pid.map { Int32(bitPattern: $0) } : nil
         if isRunning, hostedAttachmentStatus == .active {
@@ -5307,6 +5385,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func startShell() {
         resumePersistentHostingAfterFallback()
+        if hostSessionEnd != nil { hostSessionEnd = nil }
         if systemSessionEnd != nil {
             // Started again: no longer the tab the system ended.
             systemSessionEnd = nil
@@ -5707,6 +5786,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             persistentLaunchRequestID = requestID
         }
         hosting.bind(self, to: binding.sessionID)
+        // A bell or notification of its session while it was in the
+        // background (`BackgroundSessionsModel.backgroundSessionDidSignal`).
+        if hosting.takeUnread(binding) { markUnread() }
         persistentStateDidChange?()
         // Input sent while the session was created, in order, before the
         // adapter attaches. MCP's callers learn whether the host took it;
@@ -5735,9 +5817,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         // current, the Create answer may not be.
         let latest = hosting.sessionInfo(binding.sessionID) ?? launch.info
         hostedProgramProcessID = latest.isRunning ? latest.pid.map { Int32(bitPattern: $0) } : nil
+        noteHostSessionSharing(latest)
         // A restored or adopted session's program set its title and
         // directory before this tab followed it.
         applyHostReportedTitleAndDirectory(of: latest, resynchronizing: true)
+        // A name the user or the agent gave the tab (before its Create
+        // answered, or while Cherry was closed) reaches the host.
+        hostSessionName = latest.name
+        if titleSource != .system {
+            syncHostSessionName(title)
+        }
         if persistentAdapterDeferred {
             guard latest.isRunning else {
                 // It ended while Cherry was closed: no adapter; the tab shows
@@ -5930,11 +6019,27 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentReconnect = nil
     }
 
+    /// Asks the tab's attach adapter, which reconnects by itself, to try
+    /// again now (SIGUSR1: `cherry attach` starts its next attempt at once
+    /// and resets its backoff). The adapter process is the one its status
+    /// file names (`HostedAdapterProcess`: pid and start time, checked
+    /// first), never the login(1) wrapper the surface runs it under, which
+    /// does not pass the signal on. False when the adapter does not report
+    /// reconnecting, names no process, or the signal could not be sent: the
+    /// caller then launches a new adapter. Tests replace it.
+    var pokeReconnectingAdapter: @MainActor (TerminalSession) -> Bool = { session in
+        guard let status = session.adapterLiveStatus, status.reconnecting, let process = status.process else { return false }
+        return process.requestReconnect()
+    }
+
     /// Reconnect Now, Start on a command whose adapter reconnects, MCP
     /// `start_process`, or taking the session over from its other clients:
-    /// launch the adapter now. An adapter that runs is replaced only when
-    /// the tab still shows it is disconnected (it has not reported itself
-    /// attached since, or it reconnects by itself) or for a takeover.
+    /// launch the adapter now. An adapter that reconnects by itself (its
+    /// status says so) is kept, with its surface and screen, and asked to
+    /// try again at once (`pokeReconnectingAdapter`); only a takeover
+    /// replaces it. Any other adapter that runs is replaced only when the
+    /// tab still shows it is disconnected (it has not reported itself
+    /// attached since) or for a takeover.
     private func reconnectPersistentAdapterNow(takeover: Bool) -> Bool {
         guard let persistentHosting,
               let launchID = activeLaunchID,
@@ -5948,6 +6053,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             return true
         case .attached:
             guard takeover || state == .disconnected else { return false }
+            if !takeover, adapterLiveStatus?.reconnecting == true, pokeReconnectingAdapter(self) {
+                persistentReconnectFailures = 0
+                return true
+            }
             cancelPersistentReconnect()
             hostedTakeoverForNextLaunch = takeover
             persistentReconnectFailures = 0
@@ -5961,8 +6070,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The program ended: the same exit handling a native tab gets (agent
     /// idle/error, command auto-restart, attention). The adapter prints the
     /// final screen and exits by itself. `reportsExit`: see `finishProcessExit`.
-    private func finishPersistentProgram(status: Int32, launchID: UUID, reportsExit: Bool = true) {
+    private func finishPersistentProgram(
+        status: Int32,
+        launchID: UUID,
+        reportsExit: Bool = true,
+        end: HostSessionEnd? = nil
+    ) {
         guard activeLaunchID == launchID else { return }
+        // The host's own report of how it ended (its holder died), else
+        // what the list says of the session.
+        let end = end ?? persistentSession.flatMap { persistentHosting?.sessionInfo($0.sessionID)?.end }
+        if let end, end.isHolderLost, hostSessionEnd != end {
+            hostSessionEnd = end
+            fputs("Cherry: tab \(id.uuidString): \(end.message)\n", stderr)
+        }
         // A restored tab whose adapter never ran: no surface showed the
         // program, so its final screen comes from the host.
         let showsHostFinalScreen = persistentAdapterDeferred
@@ -5984,12 +6105,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     /// The host reported the program exited (`PersistentLocalSessions`).
-    func persistentProgramDidExit(sessionID: String, status: Int32) {
+    /// `end`: the host ended it (its holder died, `HostSessionEnd`).
+    func persistentProgramDidExit(sessionID: String, status: Int32, end: HostSessionEnd? = nil) {
         guard persistentSession?.sessionID == sessionID,
               let launchID = activeLaunchID,
               persistentPhase != .creating
         else { return }
-        finishPersistentProgram(status: status, launchID: launchID)
+        finishPersistentProgram(status: status, launchID: launchID, end: end)
     }
 
     /// The host changed what it reports about the running program: its pid,
@@ -5997,6 +6119,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// adapter does not pass them to its surface.
     func persistentSessionDidChange(_ info: HostedSessionInfo) {
         guard persistentSession?.sessionID == info.id, isRunning, persistentPhase != .creating else { return }
+        noteHostSessionSharing(info)
         let pid = info.pid.map { Int32(bitPattern: $0) }
         if hostedProgramProcessID != pid {
             hostedProgramProcessID = pid
@@ -6004,6 +6127,30 @@ final class TerminalSession: ObservableObject, Identifiable {
         // What the host reports up to the adapter's attach still applies:
         // the snapshot the adapter gets carries no title or directory.
         applyHostReportedTitleAndDirectory(of: info, resynchronizing: false)
+    }
+
+    private func noteHostSessionSharing(_ info: HostedSessionInfo) {
+        let sharing = info.isRunning ? HostSessionSharing(clients: info.clients, columns: info.cols, rows: info.rows) : nil
+        if hostSessionSharing != sharing { hostSessionSharing = sharing }
+    }
+
+    /// The slim bar that says the tab's session is shared: shown at the
+    /// size another, smaller client gives it, or also open in other
+    /// clients; nil when it is this tab's alone (`SharedSessionBarState`).
+    var sharedSessionBar: SharedSessionBarState? {
+        guard isPersistentLocalSession || hostedAttachment != nil else { return nil }
+        return SharedSessionBarState(
+            sharing: hostSessionSharing,
+            viewport: adapterLiveStatus?.viewport == true,
+            isRunning: isRunning
+        )
+    }
+
+    /// Takes the tab's session over from its other clients (the shared bar's
+    /// Take Over): its screen then follows this tab's size.
+    @discardableResult
+    func takeOverSharedSession() -> Bool {
+        reconnectHostedSession(takeover: true)
     }
 
     /// Takes the title and directory the host reports for the program when
@@ -6332,12 +6479,18 @@ final class TerminalSession: ObservableObject, Identifiable {
             rawOutputStore.append(hideCursor)
             processor.ingestTestingData(hideCursor)
             if kind == .command, restartOnExit {
-                scheduleAutoRestartAfterExit()
+                if let hostSessionEnd {
+                    // Not the command's own failure: restarting it would
+                    // hide the crash. Its bar says so, with Restart.
+                    fputs("Cherry: command tab \(id.uuidString) is not restarted: \(hostSessionEnd.message)\n", stderr)
+                } else {
+                    scheduleAutoRestartAfterExit()
+                }
             }
         } else if appendsExitNotice {
             processor.appendPlainLines([
                 "",
-                "[shell exited with status \(status)]"
+                hostSessionEnd.map { "[\($0.message)]" } ?? "[shell exited with status \(status)]"
             ])
         }
         scheduleAttentionObservation(event: .processExited)
@@ -6371,6 +6524,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard isPersistentLocalSession, kind != .command, !isRunning, persistentSession != nil,
               case .exited(let status) = state
         else { return nil }
+        if let hostSessionEnd { return hostSessionEnd.message }
         return HostedAttachmentStatus.exited(code: status, signal: nil).summary
     }
 
@@ -6466,7 +6620,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func handleDeferredHostEvent(_ event: HostSessionEvent, control: HostControl?) {
         guard hostedLaunchDeferred else { return }
         switch event {
-        case .exited(_, let exitCode, let signal):
+        case .exited(_, let exitCode, let signal, _):
             showEndedHostedSession(exitCode: Int32(clamping: exitCode), signal: signal, control: control)
         case .added(let info), .changed(let info):
             guard info.isRunning else {
@@ -7713,6 +7867,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             title = nextTitle
             titleSource = .automatic
             didChange = true
+            scheduleHostSessionNameSync()
         }
         return didChange
     }
@@ -7795,6 +7950,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         cancelAgentIdleConfirmation()
         if source == .workingMarker || source == .titleSpinner {
             lastStrongWorkingEvidenceAt = Date()
+            // An agent this tab follows rather than started (restored or
+            // adopted) that shows it is at work is in a turn submitted
+            // before the tab followed it: its end is a finished turn, which
+            // notifies like one this tab saw submitted.
+            if agentTurnState == .notStarted, !startedCurrentProgram {
+                agentTurnState = .active
+            }
         }
         return setAgentActivityState(.working, source: source)
     }

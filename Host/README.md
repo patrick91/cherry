@@ -119,8 +119,12 @@ encoding applies instead and never sends them as `ESC O x`; always false for
 a session whose holder predates holder link version 4, so false can also mean
 unknown), `bracketed_paste` (whether the program turned on bracketed paste,
 mode 2004; left out when unknown: for a session whose holder predates holder
-link version 7) and `request_id` (the request ID of the `new` that created
-it).
+link version 7), `request_id` (the request ID of the `new` that created
+it), and, for a session that ended because its holder was lost rather than
+because its program exited, `ended_by` (`holder_lost`) and `holder_log` (the
+host log the holder wrote to, `host.log` in the state directory, when the
+daemon's stderr is that file); both are left out otherwise. The plain `list`
+prints such a session's state as `Exited (the session host crashed)`.
 
 `kill` explicitly terminates the workload (see
 [Lifetime](#lifetime-service-setup-and-updates)). `remove` only removes an
@@ -251,7 +255,17 @@ Attaching to a session from inside that same session is refused.
   does, and runs ssh in batch mode (`-o BatchMode=yes -o ConnectTimeout=10`),
   so it cannot prompt. What ssh, or a host started to reconnect, prints never
   reaches the screen once the session shows; its last line goes into the
-  message.
+  message. SIGUSR1 asks a reconnecting `attach` to try again now (the Mac
+  app's Reconnect Now, and its Start or MCP `start_process` on a
+  reconnecting tab): the next attempt runs at once and the reconnection
+  starts over, a new 30-second window from the signal and the backoff from
+  250 ms; one that comes during an attempt applies when that attempt fails.
+  While attached, and in every other `cherry` command, SIGUSR1 is ignored
+  and never ends the process. The live status names the process to signal:
+  `pid` and `started` (its kernel start time, `seconds.microseconds` on
+  macOS), so a supervisor that runs `attach` under a wrapper such as
+  login(1) signals the attachment itself, and only while that pid is still
+  it.
 
   It never reconnects after the program exited, a takeover, a detach or a
   host error, and it stops at once, with outcome `disconnected`, when
@@ -745,8 +759,21 @@ Sessions survive app exit, SSH disconnection, and the daemon crashing, being
 stopped by a signal, restarting or being replaced by a newer version: each
 session's holder process keeps its program, PTY, terminal state and pending
 input, and registers with the next daemon. They do not survive a reboot of the
-host, the crash of their own holder (the session is then reported exited with
-code 1), or the operating system killing the user's processes at logout. A
+host, the crash of their own holder, or the operating system killing the
+user's processes at logout. When a session's holder crashes or is killed
+while a daemon runs, the session is reported exited with code 1 and
+`ended_by: "holder_lost"` (with `holder_log`, see `list --json`), in `List`
+and in its `exited` event. The daemon then ends what is left of the program:
+once the holder is gone (it waits up to 2 seconds; a holder that only lost
+its link and still runs keeps its program, and dials again), it sends
+SIGHUP, then SIGTERM and SIGKILL, each after the kill grace (2 s), to the
+processes whose session ID is the program's recorded PID, and to the program
+itself only while its PID still belongs to the process recorded when the
+holder registered (its start time). So a program that ignores the hangup of
+its closed terminal does not run on untracked. A holder that panics logs the
+time (UTC), the session, its PID and its build (version, holder link and
+protocol versions, executable) to its stderr, the daemon's log, before it
+ends. A
 holder killed while no daemon runs (a log out or restart kills them all) leaves
 its manifest behind, where a holder that exits removes its own: the next daemon
 drops such manifests and lists their sessions as `lost_sessions` for its
@@ -1126,8 +1153,12 @@ cherry-host.service` also moves the daemon to it.
 
 ## Bounds and terminal fidelity
 
-The daemon allows 128 sessions, including retained exited sessions, and 128
-concurrent connections. Remove exited sessions to free session slots. It keeps
+The daemon allows 128 sessions, including retained exited sessions, and 1024
+concurrent connections (each session may have attachments, control
+connections and its holder's link at once). A connection over that limit is
+sent `Error{too_many_connections}` before its `Welcome` and closed, and the
+daemon logs it (at most once every 5 seconds, with how many it did not log).
+Remove exited sessions to free session slots. It keeps
 up to 4096 creation receipts for idempotent retries; the least recently used is
 evicted first, and removing a session removes its receipts. Scrollback has a
 1 MiB budget per terminal; there is no permanent output journal or recovery of
@@ -1276,7 +1307,9 @@ released) and `Ping`, a control connection may send:
 
 - `Subscribe`, answered `Ok`; the host then pushes `Event{event}`: `added`,
   `changed` (any session field), `removed`, `bell`, `notification`
-  (`title`, `body`), `progress` (`state`, `value`), `exited`, and `resync`
+  (`title`, `body`), `progress` (`state`, `value`), `exited` (`exit_code`,
+  `signal`, and `ended_by` and `holder_log` as in `list --json` when its
+  holder was lost), and `resync`
   (the subscriber fell behind and should list again). A subscriber's queue
   is bounded and keeps only the latest `changed` of each session. A
   subscribed connection is exempt from the idle limit but pings like an
@@ -1343,8 +1376,10 @@ a terminal whose replies it reads as input. The host sends no queries to a
 client that sets it false. Errors carry a code: `version_mismatch`,
 `request_failed`, `taken_over`, `replaced` (protocol 5: a newer attachment
 of the same `client_id` replaced this one), `resize_failed`, `snapshot_failed`,
-`unsupported_operation`, `unknown_session` (no session has that ID), or
-`not_running` (the session has exited). `resize_failed`, and
+`unsupported_operation`, `unknown_session` (no session has that ID),
+`not_running` (the session has exited), or `too_many_connections` (sent
+instead of the `Welcome` to a connection over the host's limit, which is then
+closed). `resize_failed`, and
 `snapshot_failed` for a replacement snapshot, do not end an attachment;
 `snapshot_failed` in reply to `Attach` means the attach failed. The
 definitions are in [cherry-protocol](crates/cherry-protocol/src/lib.rs).
@@ -1430,7 +1465,8 @@ Tests shorten the host's timing with `CHERRY_HOST_*_MS` variables read when
 `List` and requests naming a session wait for the holders a restarted daemon
 expects, 1000 ms by default, and `STALL_TIMEOUT`, how long a client that
 takes none of its output holds a session's output back at most, 2000 ms by
-default), and the CLI's with `CHERRY_CLI_*_MS`
+default; `CHERRY_HOST_MAX_CONNECTIONS` lowers the connection limit), and the
+CLI's with `CHERRY_CLI_*_MS`
 (`CONNECT_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`,
 `ESCAPE_WAIT`, `GRID_WAIT`, `RESIZE_COALESCE`, `DETACH_WAIT`, `REPORT_WAIT`,
 `CLOSED_WAIT`, `QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects),

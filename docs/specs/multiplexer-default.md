@@ -291,6 +291,52 @@ that went to the background without a choice (orphans, a Create that
 answered after its tab closed, a command a restore set aside, a window closed
 without its question) are named. *background notice* turns it off.
 
+A bell or notification of a background session is posted as the app's own
+notification, naming the session and its project ("<name>", "<project> · in
+the background", the program's text, "Terminal bell" for a shell's bell or
+"This agent may need your attention." for an agent's), and clicking it opens
+the session as **Open** does. A session's bell is posted once, then only
+marks it unread until it is opened; its notifications at most every 10 s;
+and at most 6 a minute are posted for all background sessions together (the
+others only mark their sessions unread). One
+that arrives while an open tab may still follow the session (its Create
+answer or its window's restore is still to come) waits 30 s for that tab and
+is posted then if none took it. The session's row shows a blue dot, and the
+tab that shows it next (Open, a restore, the Persistent Sessions sheet)
+comes up unread (`Workspaces/unread-sessions.json`, which also brings the
+list's dots back at the next launch); a tab's unread dot is also saved with
+it, so a restored or reopened tab keeps it. The panel's
+**Clear Ended** removes every ended session in the list at once (nothing
+asked: nothing runs). An ended session the list has shown for 10 minutes
+of time Cherry was active (in front, the Mac awake: refreshes more than 5 s
+apart do not count) that no state file names (any project's, open window
+or closed, and set-aside `.bak` copies) is removed by itself; one a closed
+window's saved tab names stays for that window's restore, which shows how
+it ended. One marked unread, or whose host crashed, is never removed by
+itself. Both removals are recorded as
+ends on purpose, like **End**. Settings › Projects › **Remove Project** for
+a project with background sessions asks "End the N background sessions of
+“<project>”?" (**End Sessions**, **Keep Running**, Cancel) first. A session
+belongs to the registered project its worktree's repository is, else to the
+longest registered root that contains it, so a project nested in the one
+removed keeps its sessions.
+
+The name a tab has reaches its session's host (`Update`): an explicit rename
+at once (clearing it sends the tab's name again), and an agent's task title
+once it has not changed for a second; `cherry list`, Background Sessions and
+File › Persistent Sessions show it. That sheet's rows say what each of this
+app's sessions is: its kind (Terminal, Agent: <agent>, Command: <command>),
+its project and what it does now (the program in a shell's foreground, else
+the title its program set). For a session a tab already shows, in any
+window, the sheet offers **Show Tab** instead of Attach.
+
+A tab whose session other clients show too (a `cherry attach` in another
+terminal) has a slim bar at its top: "Also open in N other clients", or,
+while its adapter shows a viewport because another client is smaller,
+"Shown at C×R because another client is smaller", with **Take Over**
+(`reconnectHostedSession(takeover:)`: the others are disconnected and the
+session follows this tab's size). Its sidebar row shows a shared glyph.
+
 Quit/close confirmations use the host-reported foreground process for hosted
 tabs (busy = foreground process group differs from the session leader's, or the
 tab is a running command/agent), exactly as native tabs use their PTY today.
@@ -515,7 +561,22 @@ differs from the design above.
   daemon-to-holder `ClearHistory`, and `Launch.colors`. On Linux a daemon starts holders from its own image
   (`/proc/self/exe`); on macOS from its executable's path, which after an
   app update is the new build, so `Launch` fields are additive too.
-- A crashed holder reports its session exited with code 1. Exited sessions
+- A crashed holder reports its session exited with code 1, and says why:
+  `ended_by: "holder_lost"` on `SessionInfo` and the `exited` event, with
+  `holder_log` (the daemon's `host.log`, where holders' stderr goes, when
+  the daemon's stderr is that file). The app shows "The session host
+  crashed (see <log>)" instead of "Session ended (exit 1)", `cherry list`
+  says "Exited (the session host crashed)", and a command that restarts on
+  exit is not restarted by it (its bar says "…; not restarted", with
+  Restart). The daemon then ends the program the holder left behind: once
+  the holder process is gone (up to 2 s; one that only lost its link dials
+  again and is left alone), SIGHUP to every live process in the program's
+  session (it runs under `setsid`, so its jobs are included), SIGTERM after
+  the kill grace, then SIGKILL, on a thread of its own; nothing is sent when
+  the leader's pid now belongs to another process (its start time
+  differs). A holder that panics logs one line first (the session, pid, UTC
+  time and build: package, link and protocol versions and its executable),
+  then the default report. Exited sessions
   survive daemon restarts until Remove. `Shutdown` still refuses while
   sessions run, and ends the holders of exited ones. `Replace` from a newer
   client always hands every session to the successor; the replaced daemon
@@ -708,8 +769,11 @@ differs from the design above.
   reports it as `input_partially_delivered` ("Only the first N of M bytes
   …"): when the host refused the part, the rest was not sent; when its
   answer was lost, those bytes may or may not have been typed and only the
-  bytes after them were not sent. A lost answer to the first part is still
-  `input_not_delivered` (see [Not done yet](#not-done-yet)).
+  bytes after them were not sent. A lost answer to input of at most 64 KiB,
+  or to the first part of longer input (`HostedSessionError.transport`), is
+  `input_maybe_delivered` ("… was sent, but its host's answer was lost, so it
+  may or may not have reached the program"); `input_not_delivered` still
+  means nothing was sent.
 - SSH master: one that dies within 60 s of coming up is restarted after a
   delay that doubles each time (1 s up to 60 s); one that stayed up at least
   60 s starts over at 1 s. Masters are signalled only while not yet reaped.
@@ -733,6 +797,15 @@ differs from the design above.
   the session's `request_id` (or else `cherry.launch`) to end a session whose
   Create answer was lost, and to find the session of a record saved before
   its Create answered. The owner is `CherryAppIdentity.applicationSupportName`.
+- A session's name is the tab's name at its Create, then whatever the tab
+  sends with `Update` (`PersistentLocalSessions.rename`, cut to 256 bytes):
+  an explicit rename (`TerminalSession.rename`) at once, and an agent's
+  automatic title (`titleSource` `.automatic`) 1 s after its last change
+  (`hostSessionNameDelay`); a title the program set for a shell is not sent.
+  A tab bound to a session whose host name differs from the name it was
+  given (renamed while its Create was under way, or while Cherry was
+  closed) sends it once bound. A failed `Update` is logged; the next rename
+  sends it again.
 
 ### App: hosted-by-default tabs
 
@@ -815,7 +888,17 @@ differs from the design above.
   errors turn them off.
 - A persistent tab's surface runs its attach adapter, which reconnects by
   itself; the app launches a new adapter (backoff 0.25 s to 8 s) only when
-  one exits, and shows the reconnect bar once an adapter has reported
+  one exits. **Reconnect Now**, a sidebar Start and MCP `start_process` on a
+  tab whose adapter reports `reconnecting` keep that adapter (and its
+  surface) and send it SIGUSR1 (`pokeReconnectingAdapter`), which makes
+  `cherry attach` try again at once, with a new 30 s window and its backoff
+  from the start; only a takeover replaces it. The signal goes to the
+  process the adapter's status file names (`pid`, with its kernel start
+  time `started`, checked first: `HostedAdapterProcess`), never to the
+  surface's own process, login(1), which does not pass it on. When the
+  status names no process, the pid now belongs to another one, or the
+  signal fails, a new adapter is launched as before. The app shows the reconnect
+  bar once an adapter has reported
   `reconnecting` for 2 s. The adapter's live status file alone (read through
   kqueue on the launch's private directory) says whether it is attached,
   paints a viewport, or reconnects: only `attached` resets the reconnect
@@ -1039,7 +1122,16 @@ differs from the design above.
   escalation's KILL (at 700 ms) goes out before the exit. It replies to
   macOS within 10 s either way. The instance lock is marked quitting
   (`noteAppQuitting`) before the teardown, so a copy launched meanwhile
-  waits for this one.
+  waits for this one. That wait runs off the main thread
+  (`AppInstanceLock.resolveInBackground`): at launch
+  (`InstanceLockLaunchWait`) the local host's warm-up, Background Sessions
+  and the first windows wait for the lock, and a small window says "Waiting
+  for the previous Cherry to finish quitting…" while the previous copy
+  quits. A copy whose lock is taken at once shows nothing. Pruning old
+  set-aside state files runs after the wait too. While it runs, nothing on
+  the main thread asks the lock: a Dock click opens no window (the launch
+  opens them), ⌘Q quits at once (nothing of this copy's was opened or
+  saved), and `markQuitting` does nothing.
 - **MCP and agents.** MCP input to an agent is checked against its current
   screen first (read from its session host when no surface shows it). While
   the screen shows a tool-permission prompt, input is refused with
@@ -1048,6 +1140,10 @@ differs from the design above.
   agent's screen cannot be read from its host. Cherry presses Enter on an
   agent's startup or trust prompt only for an agent its tab just launched,
   never for a restored, adopted or attached agent, or on a permission menu.
+  A restored or adopted agent (one its tab did not start) whose screen or
+  title shows it is at work (a working marker, a title spinner) is taken to
+  be in a turn submitted before the tab followed it (`agentTurnState`
+  `.active`), so its end notifies as a finished turn does.
   `wait_for_process_idle` returns `permission`, and `agent_activity_state` is
   `permission`, whenever the screen shows a permission prompt. MCP client
   timeouts: `spawn_process` with kind `command` waits `wait_ms` + 30 s,
@@ -1058,6 +1154,19 @@ differs from the design above.
   come from the host is the host's line count.
 
 ### App: persistence and restore
+
+- Housekeeping: at launch, state files this version set aside
+  (`<file>.<label>-<time>.bak`) older than 30 days are removed, keeping the
+  newest of each (`WorkspaceStateStore.pruneSetAsideFiles`). Each launch
+  spec's use of the staged Ghostty resources marks that copy used (its
+  modification time), and each session's Create tags it with its copy
+  (`cherry.resources`, the content hash). Once per run, from the first
+  complete live list (nothing while the host cannot be listed or still
+  expects holders), the copies other than this build's that no running
+  session names, whoever owns it, and that were last used more than 30
+  days ago are removed (`GhosttyResourceStaging.staleCopies`). While a
+  running session of this app names no copy (it was created before the
+  tag), nothing is removed.
 
 - `WorkspaceStateStore` keeps one JSON file per repository (version 1). It
   saves 500 ms after changes, except that a newly opened persistent tab is
@@ -1408,13 +1517,6 @@ differs from the design above.
 
 ### Not done yet
 
-- **MCP input whose first answer was lost.** When the host's answer to
-  input of at most 64 KiB, or to the first 64 KiB part of longer input, is
-  lost (a transport failure after it was sent), MCP answers
-  `input_not_delivered` ("nothing was sent"), although the host may have
-  typed that part (`PersistentLocalSessions.sendInput` says so). Fixing it
-  needs a decision on what `input_not_delivered` promises, or a new error
-  code.
 - **DECCKM of older holders.** A holder older than link version 4 never
   reports DECCKM, so its session reads `application_cursor_keys` false for
   its whole life, even under an updated daemon, and the app cannot tell off
@@ -1443,9 +1545,6 @@ differs from the design above.
   once with the message above.
 - Permission-prompt detection recognizes phrases from numbered menus only,
   so unnumbered prompt formats are not caught.
-- An explicit **Reconnect Now**, MCP `start_process` or a sidebar Start on a
-  persistent tab shown `.disconnected` still launches a new adapter (a new
-  surface), even while the old one reconnects by itself.
 - An attached SSH tab whose host control is not connected reports alternate
   screen false and keyboard flags 0 once its adapter runs; it does not open a
   connection just to follow modes. A kept command record whose holder stays
@@ -1453,13 +1552,18 @@ differs from the design above.
   the rest of the run.
 - The earlier run's sessions to end are resumed when the first project
   window opens, not at app start, and a copy that cannot reach the host
-  (disk image, no helper) records them but does not look for them. A copy
-  launched while the lock's holder quits blocks its main thread at the
-  first lock check for up to 12 s (the launch's warm-up of the local host
-  checks the lock on the main thread).
+  (disk image, no helper) records them but does not look for them. The
+  launch's own lock check waits off the main thread; something else that
+  asks for the lock before it is resolved (a deep link opening a window
+  during that wait) still waits for it on the main thread.
 - **Background sessions.** A terminal in the background whose shell exits
-  with status 0 stays listed as `exit 0` (with Remove) until its window's
-  next restore removes it; nothing removes it by itself meanwhile. After a
+  with status 0 while a closed window's saved tab names it stays listed as
+  `exit 0` (with Remove) until that window's next restore removes it. The
+  10-minute removal of ended sessions counts from when this run's list
+  first showed them, not from their exit (the host does not report when a
+  session exited). Notifications of background sessions are not tested
+  with the system's notification center (their content, the click's Open
+  and the unread marks are). After a
   relaunch, a linked worktree's repository is known only once its window
   opened (no `cherry.repository` tag): Open for such a session opens a
   window for the worktree itself. Saved tabs of a worktree an open window

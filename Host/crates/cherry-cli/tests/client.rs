@@ -5451,10 +5451,26 @@ fn live(reconnecting: bool) -> impl Fn(&serde_json::Value) -> bool {
     move |status| status["outcome"] == "attached" && status["reconnecting"] == reconnecting
 }
 
-/// The live state has exactly the fields the app reads.
+/// The live state has exactly the fields the app reads: the attachment's
+/// own pid and start time (which the app checks before it signals it)
+/// besides its state.
 fn assert_live(status: &serde_json::Value, viewport: bool, reconnecting: bool) {
+    assert!(
+        status["pid"].as_u64().is_some_and(|pid| pid > 1),
+        "{status}"
+    );
+    assert!(
+        status["started"]
+            .as_str()
+            .is_some_and(|started| !started.is_empty()),
+        "{status}"
+    );
+    let mut status = status.clone();
+    let object = status.as_object_mut().unwrap();
+    object.remove("pid");
+    object.remove("started");
     assert_eq!(
-        status,
+        &status,
         &serde_json::json!({
             "outcome": "attached",
             "viewport": viewport,
@@ -7408,4 +7424,66 @@ fn without_a_copy_the_client_asks_the_host_for_one_to_paint_a_viewport() {
     screen.feed(&received);
     assert!(screen.screen_text().unwrap().contains("FIRST LIVE MORE"));
     server.join().unwrap();
+}
+
+#[test]
+fn sigusr1_makes_a_reconnecting_attachment_try_again_at_once_and_is_ignored_while_attached() {
+    let (directory, listener, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let mut child = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .env("CHERRY_CLI_RECONNECT_WINDOW_MS", "20000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let first = accept_attach(listener.try_clone().unwrap(), session(), b"");
+    wait_for_status(&status, live(false));
+    // Attached: nothing happens, and the process lives on (SIGUSR1 would
+    // end it by default).
+    unsafe {
+        libc::kill(pid, libc::SIGUSR1);
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "{}",
+        stderr_of(&mut child)
+    );
+    assert!(live(false)(&read_status(&status)));
+    drop(first);
+    // Attempts that fail (the host goes away after the Hello) until the
+    // backoff reaches its 2 s at most: 0, 250, 500, 1000 ms, then 2000.
+    for _ in 0..4 {
+        let mut failing = accept_raw(listener.try_clone().unwrap());
+        assert!(matches!(
+            read_client(&mut failing),
+            Some(ClientMessage::Hello { .. })
+        ));
+    }
+    // Asked to reconnect now, it does not wait out the 2 s.
+    thread::sleep(Duration::from_millis(100));
+    let asked = Instant::now();
+    unsafe {
+        libc::kill(pid, libc::SIGUSR1);
+    }
+    let mut stream = accept(listener.try_clone().unwrap());
+    assert!(
+        asked.elapsed() < Duration::from_millis(1200),
+        "{:?}",
+        asked.elapsed()
+    );
+    reattach(&mut stream, (DEFAULT_COLS, DEFAULT_ROWS), 0, b"");
+    wait_for_status(&status, live(false));
+    exit_session(&mut stream, 7);
+    assert_eq!(
+        wait(&mut child).code(),
+        Some(7),
+        "{}",
+        stderr_of(&mut child)
+    );
 }

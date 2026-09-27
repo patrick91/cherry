@@ -22,6 +22,14 @@
 //! reaches the screen; its last line goes into the message if the
 //! attachment gives up.
 //!
+//! SIGUSR1 asks a reconnecting attachment to try again now (the app's
+//! Reconnect Now, a Start, MCP `start_process`, instead of a second
+//! adapter): its next attempt runs at once, and the reconnection starts over
+//! (a new `RECONNECT_WINDOW` from the signal, the backoff from its start).
+//! One that comes during an attempt applies once that attempt fails. While
+//! attached, or anywhere else in `cherry`, SIGUSR1 is ignored; it never ends
+//! the process.
+//!
 //! Input is never sent twice, and never sent blind. What the lost connection
 //! had not delivered is dropped with it, since the host may or may not have
 //! queued it. Terminal input typed while reconnecting is discarded, with a
@@ -546,6 +554,8 @@ impl Attachment<'_> {
                     )?);
                 }
             }
+            // Only a reconnecting attachment acts on SIGUSR1.
+            let _ = sys::take_reconnect_request();
             if sys::take_resize() && connection.resize_at.is_none() {
                 // The first resize after a pause goes at once; those within
                 // RESIZE_COALESCE of the last one sent go as one, after it.
@@ -1014,12 +1024,21 @@ impl Attachment<'_> {
         streak: &mut Streak,
     ) -> Result<Reconnected> {
         let window = timing().reconnect_window;
-        let deadline = streak.since + window;
+        let mut deadline = streak.since + window;
         let mut next_attempt = Instant::now() + streak.delay;
         let mut noticed = false;
         loop {
             interrupted()?;
             let now = Instant::now();
+            // SIGUSR1 (the app's Reconnect Now): the next attempt runs at
+            // once, and the reconnection starts over, its window and
+            // backoff included. One that comes during an attempt applies
+            // when the attempt fails.
+            if sys::take_reconnect_request() && now < deadline {
+                *streak = Streak::new(now);
+                deadline = now + window;
+                next_attempt = now;
+            }
             if now >= deadline {
                 return Err(match &streak.failure {
                     Some(failure) if !window.is_zero() => anyhow!(

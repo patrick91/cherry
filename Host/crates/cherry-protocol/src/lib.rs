@@ -192,6 +192,20 @@ pub mod error_code {
     pub const UNKNOWN_SESSION: &str = "unknown_session";
     /// The session has exited, so it takes no input.
     pub const NOT_RUNNING: &str = "not_running";
+    /// The host already serves as many connections as it takes
+    /// (`cherry-host`'s `MAX_CONNECTIONS`); it sends this before the
+    /// `Welcome` and closes the connection. Try again later.
+    pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
+}
+
+/// Why a session ended other than by its program exiting
+/// (`SessionInfo::ended_by`, `SessionEvent::Exited::ended_by`).
+pub mod ended_by {
+    /// The session's holder (`cherry-host hold`) went away while the
+    /// program ran: it crashed or was killed. Its exit status (1) is not
+    /// the program's; the host then ends what is left of the program (SIGHUP,
+    /// then SIGTERM, then SIGKILL).
+    pub const HOLDER_LOST: &str = "holder_lost";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +277,15 @@ pub struct SessionInfo {
     /// host restarts; None for a session whose host did not record it.
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Why the session ended, when its program's exit did not end it
+    /// ([`ended_by`]): `holder_lost` when its holder crashed. None while
+    /// it runs, and for a normal exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<String>,
+    /// With `ended_by`: the host log that holds what the holder wrote
+    /// (its panic, if it panicked), when the host writes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_log: Option<String>,
 }
 
 /// The colours a session's terminal reports (`ClientMessage::Create`'s
@@ -739,6 +762,12 @@ pub enum SessionEvent {
         /// 128 + signal number when the process was killed by a signal.
         exit_code: u32,
         signal: Option<i32>,
+        /// As `SessionInfo::ended_by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_by: Option<String>,
+        /// As `SessionInfo::holder_log`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder_log: Option<String>,
     },
     /// This subscriber fell behind and missed events: list the sessions
     /// again.
@@ -2111,6 +2140,8 @@ mod tests {
             application_cursor_keys: true,
             bracketed_paste: Some(true),
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
+            ended_by: None,
+            holder_log: None,
         }
     }
 
@@ -2260,6 +2291,15 @@ mod tests {
                 id: "s".into(),
                 exit_code: 137,
                 signal: Some(9),
+                ended_by: None,
+                holder_log: None,
+            },
+            SessionEvent::Exited {
+                id: "s".into(),
+                exit_code: 1,
+                signal: None,
+                ended_by: Some(ended_by::HOLDER_LOST.into()),
+                holder_log: Some("/state/host.log".into()),
             },
             SessionEvent::Resync,
         ];
@@ -2499,9 +2539,23 @@ mod tests {
                         id: "s".into(),
                         exit_code: 130,
                         signal: Some(2),
+                        ended_by: None,
+                        holder_log: None,
                     },
                 },
                 r#"{"type":"event","event":{"kind":"exited","id":"s","exit_code":130,"signal":2}}"#,
+            ),
+            (
+                ServerMessage::Event {
+                    event: SessionEvent::Exited {
+                        id: "s".into(),
+                        exit_code: 1,
+                        signal: None,
+                        ended_by: Some(ended_by::HOLDER_LOST.into()),
+                        holder_log: Some("/state/host.log".into()),
+                    },
+                },
+                r#"{"type":"event","event":{"kind":"exited","id":"s","exit_code":1,"signal":null,"ended_by":"holder_lost","holder_log":"/state/host.log"}}"#,
             ),
             (
                 ServerMessage::Event {
@@ -2655,6 +2709,21 @@ mod tests {
             ..session_info()
         };
         assert!(json(&off).contains(r#""bracketed_paste":false"#));
+        // Why it ended: left out unless a holder was lost.
+        let normal = json(&session_info());
+        assert!(!normal.contains("ended_by") && !normal.contains("holder_log"));
+        let lost = SessionInfo {
+            state: SessionState::Exited,
+            exit_code: Some(1),
+            ended_by: Some(ended_by::HOLDER_LOST.into()),
+            holder_log: Some("/state/host.log".into()),
+            ..session_info()
+        };
+        assert!(json(&lost).contains(r#""ended_by":"holder_lost","holder_log":"/state/host.log""#));
+        assert_eq!(
+            serde_json::from_str::<SessionInfo>(&json(&lost)).unwrap(),
+            lost
+        );
     }
 
     #[test]

@@ -1732,3 +1732,86 @@ fn the_socket_and_its_directory_stay_fresh_for_tmp_cleaners() {
         })
     });
 }
+
+#[test]
+fn a_connection_over_the_limit_is_told_why_and_the_log_says_so_once() {
+    let sandbox = Sandbox::new();
+    let log = sandbox.path().join("stderr.log");
+    let mut host = Host::launch_with_stderr(
+        sandbox,
+        &[("CHERRY_HOST_MAX_CONNECTIONS", "2")],
+        None,
+        Stdio::from(File::create(&log).unwrap()),
+    );
+    let _held = (host.connect(), host.connect());
+    // Every one after that gets an Error before its Welcome, and is closed.
+    for _ in 0..3 {
+        let mut refused = UnixStream::connect(&host.socket).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        match read_frame::<_, ServerMessage>(&mut refused) {
+            Ok(Some(ServerMessage::Error { code, message })) => {
+                assert_eq!(code, error_code::TOO_MANY_CONNECTIONS);
+                assert!(message.contains("2 connections"), "{message}");
+            }
+            other => panic!("expected the refusal, not {other:?}"),
+        }
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut refused),
+            Ok(None) | Err(_)
+        ));
+    }
+    // One line for the burst, not one per connection.
+    let text = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches("refused a connection: already serving 2 connections")
+            .count(),
+        1,
+        "{text}"
+    );
+    // A slot that frees up is used again.
+    drop(_held);
+    wait_until("a connection to be served again", || {
+        quiet_connect(&host.socket).is_some()
+    });
+    let _ = host.child.kill();
+}
+
+#[test]
+fn a_session_whose_holder_crashed_names_the_log_the_holder_wrote_to() {
+    let sandbox = Sandbox::new();
+    let started = sandbox.command("start").status().unwrap();
+    assert!(started.success());
+    let _daemon = Started(sandbox.socket.clone());
+    let mut socket = quiet_connect(&sandbox.socket).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send(
+        &mut socket,
+        &create_request(Uuid::new_v4().to_string(), shell("exec sleep 60")),
+    );
+    let session = match receive(&mut socket) {
+        ServerMessage::Created { session } => session,
+        other => panic!("create failed: {other:?}"),
+    };
+    let _stray = Stray::new(session.pid.unwrap() as i32);
+    unsafe {
+        libc::kill(holder_of(&sandbox, &session.id), libc::SIGKILL);
+    }
+    let log = sandbox.state_dir().join("host.log");
+    wait_until("the session to end", || {
+        let mut socket = quiet_connect(&sandbox.socket).unwrap();
+        send(&mut socket, &ClientMessage::List);
+        let ServerMessage::Sessions { sessions, .. } = receive(&mut socket) else {
+            return false;
+        };
+        sessions.iter().any(|s| {
+            s.id == session.id
+                && s.state == SessionState::Exited
+                && s.ended_by.as_deref() == Some(ended_by::HOLDER_LOST)
+                && s.holder_log.as_deref() == Some(log.to_str().unwrap())
+        })
+    });
+}

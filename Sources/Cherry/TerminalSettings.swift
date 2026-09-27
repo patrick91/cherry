@@ -206,9 +206,15 @@ final class PersistentSessionsStatus: ObservableObject {
     /// sentences like `HostedSessionInstallation.localHostUnavailableReason()`.
     /// Nil while local sessions can run. `PersistentLocalSessions` sets it.
     @Published var localSessionsUnavailableReason: String?
+    /// Why the latest tab whose session could not start runs natively (the
+    /// host's rejection, such as its session limit, or no answer in time),
+    /// until a session starts again. Also set for a rejection that leaves
+    /// new tabs persistent. `PersistentLocalSessions.noteLaunchFailure` sets it.
+    @Published var lastLaunchFailure: String?
 
-    init(localSessionsUnavailableReason: String? = nil) {
+    init(localSessionsUnavailableReason: String? = nil, lastLaunchFailure: String? = nil) {
         self.localSessionsUnavailableReason = localSessionsUnavailableReason
+        self.lastLaunchFailure = lastLaunchFailure
     }
 }
 
@@ -494,6 +500,26 @@ final class TerminalSettings: ObservableObject {
             foreground: theme.foreground,
             selectionBackground: theme.selectionBackground,
             palette: theme.palette
+        )
+    }
+
+    /// What a persistent session's terminal reports to its program of its
+    /// colours (OSC 10, 11 and 12) and appearance (`CSI ? 996 n`): the
+    /// terminal theme for `colorScheme`, as the tab's surface shows it.
+    /// Nil when the theme's colours are not `#rrggbb` (the host then
+    /// reports its defaults).
+    func hostTerminalColors(for colorScheme: ColorScheme) -> HostTerminalColors? {
+        let theme = switch colorScheme {
+        case .light:
+            terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
+        default:
+            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
+        }
+        return HostTerminalColors(
+            foreground: theme.foreground,
+            background: theme.background,
+            cursor: theme.cursorColor.flatMap(HostTerminalColors.normalized),
+            dark: colorScheme != .light
         )
     }
 

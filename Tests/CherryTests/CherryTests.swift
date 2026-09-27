@@ -11734,6 +11734,16 @@ private func serviceRecord(
     #expect(String(decoding: data, as: UTF8.self) == "\u{1B}[200~one\ntwo\u{1B}[201~")
 }
 
+@Test func pastedTextCannotEndItsBracketOrCarryControlKeys() async throws {
+    // A paste that ends the bracket itself would type the rest as keys.
+    let hostile = "echo safe\u{1B}[201~rm -rf ~\n"
+    let bracketed = String(decoding: TerminalInputEncoder.pastedTextData(hostile, bracketedPasteMode: true), as: UTF8.self)
+    #expect(bracketed == "\u{1B}[200~echo safe [201~rm -rf ~\n\u{1B}[201~")
+    // As Ghostty and xterm: control characters become spaces, in either mode.
+    let controls = String(decoding: TerminalInputEncoder.pastedTextData("a\u{03}b\u{15}c\u{7F}d\u{00}e\tf"), as: UTF8.self)
+    #expect(controls == "a b c d e\tf")
+}
+
 @Test func pasteboardTextUsesBracketedPasteMode() async throws {
     let pasteboard = NSPasteboard(name: .init("CherryTests.TextPaste.\(UUID().uuidString)"))
     pasteboard.clearContents()

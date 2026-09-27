@@ -307,7 +307,7 @@ final class FakeControlHelper: @unchecked Sendable {
             return .answer(.ok)
         case "ping":
             return .answer(.pong)
-        case "send_input", "update":
+        case "send_input", "update", "clear_history":
             return .answer(.ok)
         case "screen":
             var text = lock.withLock { _screenText }

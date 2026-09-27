@@ -292,7 +292,7 @@ fn viewport_paints_only_active_screen_and_updates_from_canonical_state() {
 #[test]
 fn modes_round_trip_onto_a_dirty_renderer() {
     let mut source = term(20, 5);
-    source.feed(b"\x1b[?1h\x1b[?5h\x1b[?7l\x1b[?12h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?2027h\x1b[?2031h\x1b[?66h\x1b[20h\x1b[?1007l\x1b[?2048h\x1b[4h\x1b[?6h\x1b[?69h\x1b[?25l\x1b[>4;2m\x1b[?1049h\x1b[>1u\x1b[>5u");
+    source.feed(b"\x1b[?1h\x1b[?5h\x1b[?7l\x1b[?12h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?2027l\x1b[?2031h\x1b[?66h\x1b[20h\x1b[?1007l\x1b[?2048h\x1b[4h\x1b[?6h\x1b[?69h\x1b[?25l\x1b[>4;2m\x1b[?1049h\x1b[>1u\x1b[>5u");
     let modes = source.modes().unwrap();
     assert!(!contains(&modes, b"2048"), "{modes:?}");
     assert!(!private_modes(&modes)
@@ -328,7 +328,7 @@ fn modes_round_trip_onto_a_dirty_renderer() {
     assert!(!renderer.alternate);
     // Modes whose default comes from the user's terminal keep the value the
     // session last had away from libghostty's default.
-    assert_eq!(renderer.modes, ["?1007l", "?2027h"]);
+    assert_eq!(renderer.modes, ["?1007l", "?2027l"]);
     assert_eq!(renderer.kitty_flags, 0);
     assert!(!renderer.state.contains("␛[>4;2m"));
 }
@@ -1106,9 +1106,9 @@ fn modes_leave_the_users_terminal_defaults_alone() {
     }
     // Ones the session changed are sent.
     let mut source = term(20, 5);
-    source.feed(b"\x1b[?8h\x1b[?1007l\x1b[?1036l\x1b[?2027h");
+    source.feed(b"\x1b[?8h\x1b[?1007l\x1b[?1036l\x1b[?2027l");
     let modes = source.modes().unwrap();
-    for sent in ["\x1b[?8h", "\x1b[?1007l", "\x1b[?1036l", "\x1b[?2027h"] {
+    for sent in ["\x1b[?8h", "\x1b[?1007l", "\x1b[?1036l", "\x1b[?2027l"] {
         assert!(contains(&modes, sent.as_bytes()), "{sent:?} in {modes:?}");
     }
     assert!(!contains(&modes, b"?1035"), "{modes:?}");
@@ -1846,4 +1846,153 @@ fn modes_read_as_the_terminal_holds_them() {
         .modes
         .contains(&"?1h".to_string()));
     assert!(restored(&terminal).mode(1, false).unwrap());
+}
+
+#[test]
+fn grapheme_clustering_is_on_by_default_and_a_reset_keeps_it() {
+    let mut terminal = term(20, 5);
+    assert!(terminal.mode(2027, false).unwrap());
+    terminal.feed(b"\x1b[?2027l");
+    assert!(!terminal.mode(2027, false).unwrap());
+    // RIS restores this terminal's default, as Ghostty's does.
+    terminal.feed(b"\x1bc");
+    assert!(terminal.mode(2027, false).unwrap());
+    // A session's own choice travels with its snapshot either way.
+    terminal.feed(b"\x1b[?2027l");
+    assert!(!restored(&terminal).mode(2027, false).unwrap());
+    terminal.feed(b"\x1b[?2027h");
+    assert!(restored(&terminal).mode(2027, false).unwrap());
+}
+
+#[test]
+fn emoji_rows_restore_aligned_into_a_terminal_with_grapheme_clustering_on() {
+    // What the app's terminal (Ghostty, grapheme clustering on) makes of
+    // these rows: a ZWJ family, a flag, a skin tone and a combining accent
+    // are one cluster each, two cells wide (the accent one), so the marker
+    // after each lands where the tab's own terminal puts it.
+    let rows: [(&str, u16); 4] = [
+        ("👨\u{200d}👩\u{200d}👧|", 2),
+        ("🇯🇵|", 2),
+        ("👍🏽|", 2),
+        ("e\u{301}|", 1),
+    ];
+    for (row, marker) in rows {
+        let mut original = term(20, 4);
+        original.feed(row.as_bytes());
+        assert_eq!(
+            original.cursor().unwrap().x,
+            marker + 1,
+            "{row:?} as the host's terminal lays it out"
+        );
+        // Replayed into a renderer with grapheme clustering on (a snapshot
+        // on reattach), every cell lines up, and so does what follows.
+        let mut copy = restored(&original);
+        assert_eq!(copy.cursor().unwrap().x, marker + 1, "{row:?}");
+        assert_same(&original, &copy);
+        feed_both(&mut original, &mut copy, "after 🍒\r\n".as_bytes());
+        assert_same(&original, &copy);
+    }
+    // Several such rows in the history, restored in one snapshot.
+    let mut original = term(12, 3);
+    for _ in 0..6 {
+        original.feed("👨\u{200d}👩\u{200d}👧 🇯🇵 👍🏽 é|\r\n".as_bytes());
+    }
+    let copy = restored(&original);
+    assert_same(&original, &copy);
+    assert!(copy.mode(2027, false).unwrap());
+}
+
+#[test]
+fn colour_queries_report_the_colours_the_terminal_was_given() {
+    let mut terminal = term(20, 5);
+    // The defaults: light grey on black, dark.
+    let replies = terminal.feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b[?996n");
+    let replies = String::from_utf8(replies).unwrap();
+    assert!(
+        replies.contains("\x1b]10;rgb:e5e5/e5e5/e5e5"),
+        "{replies:?}"
+    );
+    assert!(
+        replies.contains("\x1b]11;rgb:0000/0000/0000"),
+        "{replies:?}"
+    );
+    assert!(
+        replies.contains("\x1b]12;rgb:e5e5/e5e5/e5e5"),
+        "{replies:?}"
+    );
+    assert!(replies.contains("\x1b[?997;1n"), "{replies:?}");
+
+    terminal
+        .set_colors(Colors {
+            foreground: [0x1f, 0x23, 0x28],
+            background: [0xff, 0xfe, 0xfd],
+            cursor: [0x12, 0x34, 0x56],
+            light: true,
+        })
+        .unwrap();
+    let replies = terminal.feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b[?996n");
+    let replies = String::from_utf8(replies).unwrap();
+    assert!(
+        replies.contains("\x1b]10;rgb:1f1f/2323/2828"),
+        "{replies:?}"
+    );
+    assert!(
+        replies.contains("\x1b]11;rgb:ffff/fefe/fdfd"),
+        "{replies:?}"
+    );
+    assert!(
+        replies.contains("\x1b]12;rgb:1212/3434/5656"),
+        "{replies:?}"
+    );
+    assert!(replies.contains("\x1b[?997;2n"), "{replies:?}");
+    // A reset keeps them: they are the terminal's defaults.
+    let replies = terminal.feed(b"\x1bc\x1b]11;?\x07\x1b[?996n");
+    let replies = String::from_utf8(replies).unwrap();
+    assert!(
+        replies.contains("\x1b]11;rgb:ffff/fefe/fdfd"),
+        "{replies:?}"
+    );
+    assert!(replies.contains("\x1b[?997;2n"), "{replies:?}");
+}
+
+#[test]
+fn clearing_history_keeps_the_screen_and_an_unfinished_sequence() {
+    let mut terminal = term(20, 3);
+    terminal.feed(&numbered(10));
+    terminal.feed(b"$ \x1b[3");
+    assert!(!terminal.inspect().unwrap().history.is_empty());
+    let screen = terminal.inspect().unwrap().active;
+    assert!(terminal.clear_history().unwrap());
+    let cleared = terminal.inspect().unwrap();
+    assert!(cleared.history.is_empty(), "{:?}", cleared.history);
+    assert_eq!(cleared.active, screen);
+    assert!(!terminal.screen_text().unwrap().contains("output line 0"));
+    // The SGR the output had begun still applies once it ends.
+    terminal.feed(b"1mred");
+    let row = terminal.inspect().unwrap().active[2].clone();
+    assert!(row.contains("red") && !row.contains("1mred"), "{row:?}");
+    let mut plain = term(20, 3);
+    plain.feed(b"\r\n\r\n$ \x1b[31mred");
+    assert_eq!(row, plain.inspect().unwrap().active[2]);
+    // A snapshot carries no history now.
+    assert!(restored(&terminal).inspect().unwrap().history.is_empty());
+    // New output scrolls into a history of its own.
+    terminal.feed(&numbered(5));
+    assert!(!terminal.inspect().unwrap().history.is_empty());
+
+    // A UTF-8 character split across the clear (`─` is E2 94 80) is not
+    // broken: the history goes once the output completes it.
+    let mut terminal = term(20, 3);
+    terminal.feed(&numbered(10));
+    terminal.feed(b"$ a\xe2\x94");
+    assert!(!terminal.clear_history().unwrap());
+    terminal.feed(b"\x80b");
+    let cleared = terminal.inspect().unwrap();
+    assert!(cleared.history.is_empty(), "{:?}", cleared.history);
+    let mut plain = term(20, 3);
+    plain.feed(&numbered(10));
+    plain.feed("$ a─b".as_bytes());
+    assert_eq!(cleared.active, plain.inspect().unwrap().active);
+    assert_eq!(terminal.cursor().unwrap().x, plain.cursor().unwrap().x);
+    assert!(!terminal.screen_text().unwrap().contains('\u{fffd}'));
 }

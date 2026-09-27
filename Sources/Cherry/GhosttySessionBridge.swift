@@ -473,7 +473,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         observeSettingsChanges()
     }
 
-    private static func resolvedColorScheme() -> ColorScheme {
+    static func resolvedColorScheme() -> ColorScheme {
         // Cherry sets its OWN appearance (`.preferredColorScheme(...)`), so honor
         // that first — a user on Dark with a Light system would otherwise get a
         // light background baked into a background-spawned agent's surface, which
@@ -487,7 +487,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
            style.lowercased().contains("dark") {
             return .dark
         }
-        return NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
+        // No application object (a test process): dark, the terminal default.
+        guard let app = NSApp else { return .dark }
+        return app.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
     }
 
     func attach(to container: GhosttyTerminalContainerView) {
@@ -2404,6 +2406,9 @@ final class GhosttyTerminalContainerView: NSView {
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
     private var allowsAutoFocus = true
+    /// Where ⌘V takes what Cherry types itself (the host-managed surface, or
+    /// a persistent tab whose attach adapter is away). Tests use their own.
+    var pasteboard: NSPasteboard = .general
     private var isActivePane = true
     private var activatePane: (() -> Void)?
     private var pendingTerminalFocus = false
@@ -3185,8 +3190,8 @@ final class GhosttyTerminalContainerView: NSView {
 
         if isPasteShortcut(event),
            let pasteData = TerminalPasteboardContent.pasteData(
-               from: .general,
-               bracketedPasteMode: activeSession.usesBracketedPasteMode
+               from: pasteboard,
+               bracketing: activeSession.bracketsPaste
            ) {
             activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: pasteData)
@@ -3279,9 +3284,11 @@ final class GhosttyTerminalContainerView: NSView {
         }
         let data: Data
         if isPasteShortcut(event) {
+            // Bracketed as the host reports the program's mode: the
+            // surface, which would know it, is not taking input now.
             guard let pasteData = TerminalPasteboardContent.pasteData(
-                from: .general,
-                bracketedPasteMode: activeSession.usesBracketedPasteMode
+                from: pasteboard,
+                bracketing: activeSession.bracketsPaste
             ) else { return false }
             data = pasteData
         } else if let encoded = HostRoutedKeyEncoder.data(

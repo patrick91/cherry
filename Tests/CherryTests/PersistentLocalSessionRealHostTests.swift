@@ -24,7 +24,7 @@ private final class RealLocalHost {
     let observer: HostControl
     let hosting: PersistentLocalSessions
     let settings: Box
-    private var host: Process
+    private var host: RealHostTestDaemon
     private let daemonExecutable: URL
     private let daemonEnvironment: [String: String]
     private let socket: URL
@@ -81,7 +81,7 @@ private final class RealLocalHost {
         daemonEnvironment["XDG_STATE_HOME"] = nil
         self.daemonEnvironment = daemonEnvironment
         daemonExecutable = binaries.appendingPathComponent("cherry-host")
-        host = try Self.startDaemon(daemonExecutable, environment: daemonEnvironment)
+        host = try RealHostTestDaemon(executable: daemonExecutable, environment: daemonEnvironment, socket: socket)
 
         func makeControl() throws -> HostControl {
             HostControl(
@@ -146,24 +146,17 @@ private final class RealLocalHost {
         #expect(FileManager.default.fileExists(atPath: socket.path))
     }
 
-    private static func startDaemon(_ executable: URL, environment: [String: String]) throws -> Process {
-        let host = Process()
-        host.executableURL = executable
-        host.arguments = ["serve"]
-        host.environment = environment
-        host.standardInput = FileHandle.nullDevice
-        host.standardOutput = FileHandle.nullDevice
-        host.standardError = FileHandle.standardError
-        try host.run()
-        return host
-    }
-
     /// The daemon crashes (SIGKILL) and a new one starts on the same socket
     /// and state: the sessions' holders keep them running and register again.
     func restartDaemon() async throws {
-        kill(host.processIdentifier, SIGKILL)
-        host.waitUntilExit()
-        host = try Self.startDaemon(daemonExecutable, environment: daemonEnvironment)
+        host.crash()
+        do {
+            host = try RealHostTestDaemon(executable: daemonExecutable, environment: daemonEnvironment, socket: socket)
+        } catch {
+            // No daemon to stop them with the rest: the holders go now.
+            RealHostTestDaemon.endHolders(of: socket)
+            throw error
+        }
     }
 
     var policy: SessionBackendPolicy {
@@ -225,14 +218,9 @@ private final class RealLocalHost {
         }
         control.disconnect()
         observer.disconnect()
-        if host.isRunning { host.terminate() }
-        host.waitUntilExit()
-        // A holder is never the daemon's child: end any this test left.
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-KILL", "-f", "hold --socket \(socket.path)"]
-        try? pkill.run()
-        pkill.waitUntilExit()
+        // The daemon, and any holder this test left (a holder is never the
+        // daemon's child).
+        host.stop()
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -556,6 +544,73 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let resolvedSecond = String(cString: resolved)
         free(resolved)
         #expect(nextInfo.cwd == resolvedSecond)
+    } catch {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    control.stop()
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostReportsBracketedPasteAndClearsItsHistoryOnClearScrollback() async throws {
+    var configuration = PersistentLocalSessions.Configuration()
+    // Once lost, the adapter stays lost for the test.
+    configuration.reconnectDelay = (120, 120)
+    let host = try await RealLocalHost(configuration: configuration)
+    let workspace = host.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    do {
+        let tab = workspace.addSession(title: "Paste")
+        host.show(tab)
+        try await host.waitFor("the tab to attach to its session") {
+            tab.persistentSession != nil && tab.state == .live && tab.usesNativePTYBackendAdapterAttached
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        #expect(try await host.hostSession(sessionID)?.bracketedPaste != nil)
+
+        // A program that turns bracketed paste on, waits, turns it off.
+        // (A marker computed by the shell, so the typed line does not show it.)
+        tab.send(text: "seq 1 300 | sed 's/^/HISTORY_/'; printf '\\033[?2004h'; echo MODE_$((1+1))ON; read -r a; "
+            + "printf '\\033[?2004l'; echo MODE_$((1+1))OFF; read -r b; echo PASTE_$((1+1))DONE\n")
+        try await host.waitFor("the program to turn bracketed paste on") {
+            try await processOutput(control, tab).contains("MODE_2ON")
+        }
+        try await host.waitFor("the host to report bracketed paste on") {
+            try await host.observedSession(sessionID)?.bracketedPaste == true
+        }
+        try await host.waitFor("the tab to follow the host's report") { tab.usesBracketedPasteMode }
+        #expect(tab.bracketsPaste("one\ntwo\n"))
+        tab.send(text: "\n")
+        try await host.waitFor("the program to turn bracketed paste off") {
+            try await processOutput(control, tab).contains("MODE_2OFF")
+        }
+        try await host.waitFor("the host to report bracketed paste off") {
+            try await host.observedSession(sessionID)?.bracketedPaste == false
+        }
+        try await host.waitFor("the tab to follow the host's report") { !tab.usesBracketedPasteMode }
+        #expect(!tab.bracketsPaste("one\ntwo\n"))
+
+        // Without an adapter, output comes from the host, history first.
+        try await loseAdapter(of: tab, host: host)
+        try await host.waitFor("the history through the host") {
+            try await processOutput(control, tab).contains("HISTORY_1")
+        }
+        // Clear Scrollback clears the host's copy too: MCP no longer
+        // reads it, and neither would the next adapter.
+        await tab.clearScrollback()?.value
+        let screen = try await host.hosting.screen(of: try #require(tab.persistentSession))
+        #expect(!screen.text.contains("HISTORY_1\n"), Comment(rawValue: screen.text))
+        #expect(screen.text.contains("MODE_2OFF"), Comment(rawValue: screen.text))
+        let lines = try await processOutput(control, tab)
+        #expect(!lines.contains("HISTORY_1"), Comment(rawValue: lines.joined(separator: "\n")))
+        tab.send(text: "\n")
+        try await host.waitFor("the program to go on") {
+            try await processOutput(control, tab).contains("PASTE_2DONE")
+        }
     } catch {
         control.stop()
         workspace.closeAllSessions(intent: .windowClosed)

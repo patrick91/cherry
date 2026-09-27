@@ -664,6 +664,82 @@ final class ParityControlServer {
     #expect(disconnected.error?.code == "process_not_accepting_input")
 }
 
+@Test @MainActor func clearingAPersistentTabsOutputClearsItsHostsHistoryToo() async throws {
+    let harness = try PersistentHarness(configuration: parityConfiguration(attemptsBeforeDisconnected: 0))
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Worker")
+    #expect(await harness.waitUntilAttached(tab))
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    try await harness.loseAdapter(of: tab)
+    // Its output comes from the host: history and screen.
+    let history = (1...40).map { "old line \($0)" }
+    harness.fake.screenText = (history + ["$ "]).joined(separator: "\n")
+    func output() async throws -> [String] {
+        let output = try await control.send(.getProcessOutput(.init(processID: tab.id.uuidString)))
+        guard case .getProcessOutput(let lines)? = output.result else {
+            Issue.record("Expected getProcessOutput, got \(String(describing: output))")
+            return []
+        }
+        return lines.lines
+    }
+    #expect(try await output().first == "old line 1")
+    // The host drops its history when asked (as `cherry-host` does).
+    harness.fake.respond = { request, _ in
+        if request.op == "clear_history" { harness.fake.screenText = "$ " }
+        return nil
+    }
+
+    // MCP clear_output asks the host before it answers.
+    let cleared = try await control.send(.clearOutput(.init(terminalID: tab.id.uuidString)))
+    #expect(cleared.error == nil)
+    guard case .clearOutput(let clearedResult)? = cleared.result else {
+        Issue.record("Expected clearOutput, got \(String(describing: cleared))")
+        return
+    }
+    #expect(clearedResult.cleared)
+    #expect(clearedResult.hostKeptHistory == nil)
+    #expect(harness.requestIDs("clear_history") == [sessionID])
+    let lines = try await output()
+    #expect(!lines.contains { $0.hasPrefix("old line") }, Comment(rawValue: lines.joined(separator: "\n")))
+    let search = try await control.send(.searchProcessOutput(.init(processID: tab.id.uuidString, query: "old line")))
+    guard case .searchProcessOutput(let matches)? = search.result else {
+        Issue.record("Expected searchProcessOutput, got \(String(describing: search))")
+        return
+    }
+    #expect(matches.matches.isEmpty)
+
+    // Clear Scrollback (⌘K) too.
+    #expect(tab.clearScrollback() != nil)
+    #expect(await harness.fake.wait { harness.requestIDs("clear_history") == [sessionID, sessionID] })
+
+    // A host that keeps the history (the alternate screen shows, or an older
+    // holder): the caller hears so, not that it was cleared.
+    harness.fake.respond = { request, _ in
+        request.op == "clear_history"
+            ? .answer(.error(code: "request_failed", message: "session \(sessionID) shows its alternate screen, which has no history"))
+            : nil
+    }
+    let kept = try await control.send(.clearOutput(.init(terminalID: tab.id.uuidString)))
+    guard case .clearOutput(let keptResult)? = kept.result else {
+        Issue.record("Expected clearOutput, got \(String(describing: kept))")
+        return
+    }
+    #expect(!keptResult.cleared)
+    #expect(keptResult.hostKeptHistory?.contains("alternate screen") == true)
+    harness.fake.respond = nil
+    // A native tab has no host to ask.
+    harness.settings.value.persistLocalSessions = false
+    let native = workspace.addSession(title: "Native")
+    #expect(!native.isPersistentLocalSession)
+    #expect(native.clearScrollback() == nil)
+}
+
 @Test @MainActor func mcpNoLongerFindsATerminalWhoseShellExitedCleanly() async throws {
     let harness = try PersistentHarness()
     harness.cleanExitMinimumRunTime = 0

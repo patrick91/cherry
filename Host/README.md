@@ -116,7 +116,10 @@ keys, DECCKM `ESC[?1h`, so unmodified arrows, Home and End go as `ESC O x`
 in legacy key encoding; while `kitty_keyboard_flags` is not 0 the kitty
 encoding applies instead and never sends them as `ESC O x`; always false for
 a session whose holder predates holder link version 4, so false can also mean
-unknown) and `request_id` (the request ID of the `new` that created it).
+unknown), `bracketed_paste` (whether the program turned on bracketed paste,
+mode 2004; left out when unknown: for a session whose holder predates holder
+link version 7) and `request_id` (the request ID of the `new` that created
+it).
 
 `kill` explicitly terminates the workload (see
 [Lifetime](#lifetime-service-setup-and-updates)). `remove` only removes an
@@ -126,7 +129,13 @@ screen, then exits with its exit code. `shutdown` stops the daemon and is
 refused while any session is running; it also ends the holders of exited
 sessions. When it returns, the daemon has already removed its socket and
 released its lock, so a new daemon can start at once. `start` starts the local
-daemon without doing anything else.
+daemon without doing anything else. `restart` (local only) replaces the local
+daemon with this `cherry`'s `cherry-host` whatever sessions run (it refuses,
+and leaves the daemon running, when it finds no cherry-host it could start): the old
+daemon makes way as for an update (below), its sessions carry on in their
+holders, and the new one adopts them. Use it when an update of the same
+protocol version replaced or removed the running daemon's executable, which
+then starts new sessions from whatever build is installed, or none.
 
 `cherry control` connects as `list` does (starting a host, or replacing one
 that speaks an older protocol, when needed) and then relays protocol frames
@@ -737,6 +746,9 @@ session's holder process keeps its program, PTY, terminal state and pending
 input, and registers with the next daemon. They do not survive a reboot of the
 host, the crash of their own holder (the session is then reported exited with
 code 1), or the operating system killing the user's processes at logout.
+A session's terminal has IUTF8 set (a canonical-mode backspace erases a whole
+UTF-8 character), as native Mac terminals do, and grapheme clustering (mode
+2027) on, as Ghostty does.
 
 While no daemon runs, holders keep their sessions running and keep answering
 the terminal queries the host answers. They keep bells, notifications,
@@ -840,7 +852,8 @@ Running sessions keep the holders, and so the code, of the build that created
 them until they are removed; new sessions run the new build. A daemon speaks
 every holder link version a live holder may use, and a session reports only
 what its holder knows (one whose holder predates `application_cursor_keys`
-lists it as false).
+lists it as false, one that predates `bracketed_paste` leaves it out, and
+one that predates `ClearHistory` answers it `unsupported_operation`).
 
 A replacement only replaces the intended host: when the client expects an
 identity (`--expected-host-id`, or the host an attachment reconnects to), a
@@ -1170,7 +1183,10 @@ and colour queries for the palette, foreground, background, and cursor (OSC 4,
 10–12, 21). It also keeps the report modes it answers itself, in-band resize
 (2048) and 2033, away from renderers: neither live output, snapshots, nor
 viewport mode enables them there. Size replies use nominal 8×16 pixel
-cells; colour replies use fixed dark defaults. Kitty graphics reach renderers
+cells. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
+(`CSI ?996n`) use the colours and appearance `Create` named (`colors`; the
+Mac app passes its terminal theme for the appearance it shows), or light
+grey on black and dark without them. Kitty graphics reach renderers
 with `q=2`, so only the host replies. Other queries (status reports such as
 `CSI ?6n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/19–21 t` and size
 reports with extra parameters, ANSI mode requests, DECREQTPARM, DECRQPSR,
@@ -1219,7 +1235,7 @@ are ignored (the `Attached` header's too), so a field can be added without
 breaking an older peer. The client opens with
 `Hello{version}`, and the host answers every `Hello`, whatever its version,
 with `Welcome{version, host_id}` carrying its own version and identity. The
-current version is 6. Normal operation needs the same version on both sides.
+current version is 7. Normal operation needs the same version on both sides.
 When they differ, the client disconnects or, only when the host's version is
 lower, sends `Replace`, which the host answers `Ok` once it has stopped
 listening and released its socket and lock, and then exits (see
@@ -1228,6 +1244,11 @@ listening and released its socket and lock, and then exits (see
 `Ok`, `Error` and the gateway's `CHERRY-GATEWAY <version>` line keep their
 shapes in every version. Hosts before version 4 answer a `Hello` of another
 version with `version_mismatch` instead of a `Welcome`.
+
+Once the versions match, a JSON request the host cannot decode is answered
+with an `Error` carrying its `req` (`unsupported_operation` for an unknown
+`op`, `request_failed` for fields it cannot take), and the connection carries
+on (protocol 7; an older host closes the connection).
 
 Any request may carry `"req": <u64>`, which the host echoes on its reply, so
 one connection can have several requests in flight. The host answers every
@@ -1238,8 +1259,10 @@ attachment traffic: `Attached`, `Output`, `Query`, `Exit`, a paused
 attachment's `Pong`s) carry none. A connection carries at most one
 attachment (`Attach`, `Input`, `Resize`, `Detach`); a control connection
 never attaches. Besides `List` (answered `Sessions{host_id, sessions,
-pending_holders}`), `Create`, `Kill`, `Remove`, `Shutdown` and `Ping`, a
-control connection may send:
+pending_holders}`), `Create`, `Kill`, `Remove`, `Shutdown`, `Restart`
+(protocol 7: stop as for `Replace`, whatever sessions run, so a new host of
+the same version can start; answered `Ok` once the socket and lock are
+released) and `Ping`, a control connection may send:
 
 - `Subscribe`, answered `Ok`; the host then pushes `Event{event}`: `added`,
   `changed` (any session field), `removed`, `bell`, `notification`
@@ -1258,10 +1281,25 @@ control connection may send:
   sends `pending_holders` in `Sessions`; an older one ignores `max_lines`.
 - `Update{id, name, tags}`: rename a session or replace its tags; answered
   `Ok`.
+- `ClearHistory{id}` (protocol 7): clear the history above the session's
+  screen, as `ED 3` would where the output read so far ends (an unfinished
+  escape sequence in that output is kept, and completes as it would have;
+  a half-written UTF-8 character delays the erase until the output
+  completes it); answered `Ok` once the holder did. `Screen` with
+  `scrollback` and every later attachment then show none of it; clients
+  already attached keep what their terminals show. It is refused with
+  `request_failed` while the alternate screen shows (which has no history;
+  the primary screen's is kept), or while the session's holder is not
+  connected, and with `unsupported_operation` for a holder older than link
+  version 7.
 
 `Create` carries `request_id`, `name`, `cwd`, `command`, `env`, `cols`,
-`rows`, and optionally `owner` (at most 256 bytes) and `tags` (at most 64,
-keys of 1 to 128 bytes, 16 KiB in all).
+`rows`, and optionally `owner` (at most 256 bytes), `tags` (at most 64,
+keys of 1 to 128 bytes, 16 KiB in all) and `colors` (protocol 7:
+`{"foreground", "background", "cursor", "dark"}`, colours as `#rrggbb`, the
+cursor the foreground's when left out; what the session's terminal reports
+to its program, see above). Like the size, `colors` is not part of what a
+retry with the same `request_id` must repeat.
 
 An attached client must accept a replacement `Attached` snapshot at any time
 (reasons `attach`, `resize`, `resync`) and resume output at its offset. A
@@ -1349,7 +1387,7 @@ selects every test in the files named after it. `real-host` sets
 private `HOME`; a skipped test fails the run. Without `--skip-build` it builds
 the Swift tests first, and for `real-host` the Rust helpers too.
 
-The 13 ignored `real_host` tests run the `cherry` that `cargo test` builds
+The 16 ignored `real_host` tests run the `cherry` that `cargo test` builds
 and the `cherry-host` beside it (hence `cargo build --bins` first; set
 `CHERRY_TEST_HOST` to use another), each daemon with a private socket and a
 temporary `HOME`. They cover shared attachment and takeover, only the

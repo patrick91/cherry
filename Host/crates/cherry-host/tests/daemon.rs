@@ -362,6 +362,7 @@ fn auto_started_daemons_give_sessions_a_clean_environment() {
             rows: 24,
             owner: None,
             tags: BTreeMap::new(),
+            colors: None,
         },
     );
     let session = match receive(&mut socket) {

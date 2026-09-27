@@ -1,6 +1,6 @@
 import Foundation
 
-/// Protocol v6 between Cherry and a session host (Host/crates/cherry-protocol),
+/// Protocol v7 between Cherry and a session host (Host/crates/cherry-protocol),
 /// as `cherry control` relays it on its standard input and output.
 ///
 /// A frame is a 4-byte big-endian length followed by that many bytes. A body
@@ -16,7 +16,9 @@ enum HostProtocol {
     /// v6: attachment traffic (output, input, queries and snapshots) travels
     /// in binary frames instead of base64 in JSON. The app's control
     /// connection speaks the same JSON messages as in v5.
-    static let version: UInt32 = 6
+    /// v7: `ClearHistory`, `Create`'s `colors`, and `SessionInfo`'s
+    /// `bracketed_paste`.
+    static let version: UInt32 = 7
     static let maxFrameBytes = 16 * 1_024 * 1_024
     /// The most bytes one `SendInput` carries.
     static let maxInputBytes = 64 * 1_024
@@ -308,6 +310,43 @@ struct HostCreateRequest: Equatable, Sendable {
     /// The app variant creating the session.
     var owner: String?
     var tags: [String: String] = [:]
+    /// What the session's terminal reports of its colours and appearance to
+    /// the program (OSC 10, 11, 12 and `CSI ? 996 n`); nil for the host's
+    /// defaults (light grey on black, dark).
+    var colors: HostTerminalColors?
+}
+
+/// `TerminalColors`: the colours a session's terminal reports, as
+/// `#rrggbb`.
+struct HostTerminalColors: Equatable, Sendable, Encodable {
+    var foreground: String
+    var background: String
+    var cursor: String?
+    var dark: Bool
+
+    /// Nil unless every colour is `#rrggbb` (the host would refuse the
+    /// Create otherwise).
+    init?(foreground: String, background: String, cursor: String? = nil, dark: Bool) {
+        let normalized = [foreground, background, cursor ?? foreground].map(Self.normalized)
+        guard let foreground = normalized[0], let background = normalized[1], let cursorColor = normalized[2] else {
+            return nil
+        }
+        self.foreground = foreground
+        self.background = background
+        self.cursor = cursor == nil ? nil : cursorColor
+        self.dark = dark
+    }
+
+    /// `#rrggbb` (lowercase) for `#rrggbb`, `rrggbb` or `#rgb`; nil otherwise.
+    static func normalized(_ color: String) -> String? {
+        var hex = color.trimmingCharacters(in: .whitespaces)
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        if hex.count == 3 { hex = hex.map { "\($0)\($0)" }.joined() }
+        // ASCII only, as the host reads it: `isHexDigit` also takes
+        // fullwidth digits and letters.
+        guard hex.count == 6, hex.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return nil }
+        return "#" + hex.lowercased()
+    }
 }
 
 /// The requests the control plane sends. Attachment requests (attach, input,
@@ -326,6 +365,8 @@ enum HostClientMessage: Equatable, Sendable {
     /// included when `scrollback`); nil for all of it.
     case screen(id: String, scrollback: Bool, maxLines: Int? = nil)
     case update(id: String, name: String?, tags: [String: String]?)
+    /// Clears the history above the session's screen (v7).
+    case clearHistory(id: String)
 
     var op: String {
         switch self {
@@ -340,6 +381,7 @@ enum HostClientMessage: Equatable, Sendable {
         case .sendInput: "send_input"
         case .screen: "screen"
         case .update: "update"
+        case .clearHistory: "clear_history"
         }
     }
 }
@@ -350,7 +392,7 @@ struct HostRequest: Encodable, Equatable, Sendable {
     var message: HostClientMessage
 
     private enum CodingKeys: String, CodingKey {
-        case op, req, version, id, name, cwd, command, env, cols, rows, owner, tags, data, scrollback
+        case op, req, version, id, name, cwd, command, env, cols, rows, owner, tags, data, scrollback, colors
         case requestID = "request_id"
         case maxLines = "max_lines"
     }
@@ -374,7 +416,9 @@ struct HostRequest: Encodable, Equatable, Sendable {
             try container.encode(create.rows, forKey: .rows)
             try container.encodeIfPresent(create.owner, forKey: .owner)
             try container.encode(create.tags, forKey: .tags)
-        case .kill(let id), .remove(let id):
+            // Left out without colours, so the host keeps its defaults.
+            try container.encodeIfPresent(create.colors, forKey: .colors)
+        case .kill(let id), .remove(let id), .clearHistory(let id):
             try container.encode(id, forKey: .id)
         case .sendInput(let id, let data):
             try container.encode(id, forKey: .id)

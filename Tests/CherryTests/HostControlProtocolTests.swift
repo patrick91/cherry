@@ -85,6 +85,55 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(anonymousBody["req"] == nil)
 }
 
+@Test func HostControlEncodesProtocol7Requests() throws {
+    #expect(HostProtocol.version == 7)
+    #expect(try body(of: HostRequest(req: 9, message: .clearHistory(id: "s")))
+        == (try json(#"{"op":"clear_history","req":9,"id":"s"}"#)))
+    // A Create carries the colours its terminal reports, as #rrggbb.
+    let colors = try #require(HostTerminalColors(foreground: "#1F2328", background: "fff", dark: false))
+    var create = HostCreateRequest(requestID: UUID(), name: "n", cwd: "/", owner: nil, tags: [:])
+    create.colors = colors
+    let sent = try body(of: HostRequest(req: 1, message: .create(create)))
+    #expect(sent["colors"] as? NSDictionary == ["foreground": "#1f2328", "background": "#ffffff", "dark": false])
+    let withCursor = try #require(HostTerminalColors(foreground: "#e5e5e5", background: "#000000", cursor: "#FF8800", dark: true))
+    create.colors = withCursor
+    let cursorSent = try body(of: HostRequest(req: 1, message: .create(create)))
+    #expect((cursorSent["colors"] as? NSDictionary)?["cursor"] as? String == "#ff8800")
+    // Without them the field is left out.
+    create.colors = nil
+    #expect(try body(of: HostRequest(req: 1, message: .create(create)))["colors"] == nil)
+    // Colours the host would refuse are not sent at all.
+    #expect(HostTerminalColors(foreground: "rgb(1,2,3)", background: "#000000", dark: true) == nil)
+    #expect(HostTerminalColors(foreground: "#000000", background: "#00000", dark: true) == nil)
+    #expect(HostTerminalColors(foreground: "#000000", background: "#000000", cursor: "blue", dark: true) == nil)
+    // Fullwidth digits and letters are hex digits to Swift, not to the host.
+    #expect(HostTerminalColors(foreground: "#１２３４５６", background: "#000000", dark: true) == nil)
+    #expect(HostTerminalColors(foreground: "#ａｂｃ", background: "#000000", dark: true) == nil)
+}
+
+@Test func HostControlDecodesTheProgramsBracketedPasteMode() throws {
+    let on = try decode("""
+    {"type":"event","event":{"kind":"changed","session":{"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,
+     "state":"running","pid":9,"bracketed_paste":true}}}
+    """)
+    guard case .event(.changed(let info)) = on.message else {
+        Issue.record("Expected a changed event, got \(on.message)")
+        return
+    }
+    #expect(info.bracketedPaste == true)
+    // A host or holder that does not report it: unknown, not off.
+    let older = try decode("""
+    {"type":"sessions","host_id":"h","sessions":[
+     {"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"running"}]}
+    """)
+    guard case .sessions(let list) = older.message else { return }
+    #expect(list.sessions.first?.bracketedPaste == nil)
+    let reported = HostedSessionInfo(id: "s", name: "n", cwd: "/", bracketedPaste: false)
+    #expect(try json(JSONEncoder().encode(reported))["bracketed_paste"] as? Bool == false)
+    #expect(try json(JSONEncoder().encode(HostedSessionInfo(id: "s", name: "n", cwd: "/")))["bracketed_paste"] == nil)
+    #expect(reported.exited(code: 0, signal: nil).bracketedPaste == false)
+}
+
 @Test func HostControlBase64MatchesTheHostsStandardPaddedAlphabet() throws {
     // Vectors from the host's base64_bytes (standard alphabet, padded).
     let vectors: [(bytes: [UInt8], text: String)] = [

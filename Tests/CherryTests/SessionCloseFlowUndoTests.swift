@@ -736,13 +736,18 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     }
     let anchor = workspace.addSession(title: "Anchor")
     #expect(await harness.waitUntilAttached(anchor))
-    // The worker's session becomes the tab it was started for.
+    // The worker's session becomes the tab it was started for, a command.
     let worker = workspace.attachHostedSession(try #require(harness.hosting.attachment(for: closedInfo)), info: closedInfo)
     #expect(worker.id == closedTabID)
     #expect(worker.isPersistentLocalSession)
+    #expect(worker.kind == .command)
     #expect(await harness.waitUntilAttached(worker))
 
+    // Closing a running command asks first; the answer is Close.
     SessionCloseCoordinator.close(worker, in: workspace, chromeState: chromeState, registry: registry)
+    if let request = chromeState.pendingTabClose {
+        SessionCloseCoordinator.answerTabClose(.close, to: request, chromeState: chromeState)
+    }
     #expect(workspace.session(withID: closedTabID) == nil)
     #expect(harness.hosting.isEnding("s-closed"))
 

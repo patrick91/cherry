@@ -2053,11 +2053,18 @@ public struct SearchOutputMatch: Codable, Equatable, Sendable {
 
 public struct ClearOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
+    /// False when the tab was cleared but its host kept the session's
+    /// history (`hostKeptHistory` says why): MCP output read through the
+    /// host, and the next attach adapter, may still show it.
     public let cleared: Bool
+    /// Why a persistent tab's host kept its history; absent when it cleared
+    /// it, or the tab has no host.
+    public let hostKeptHistory: String?
 
-    public init(terminalID: String, cleared: Bool) {
+    public init(terminalID: String, cleared: Bool, hostKeptHistory: String? = nil) {
         self.terminalID = terminalID
         self.cleared = cleared
+        self.hostKeptHistory = hostKeptHistory
     }
 }
 

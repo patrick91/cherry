@@ -189,6 +189,7 @@ fn create(
         rows: 24,
         owner: None,
         tags: BTreeMap::new(),
+        colors: None,
     })
 }
 
@@ -739,6 +740,215 @@ exec sleep 60"#,
 }
 
 #[test]
+fn a_request_the_host_cannot_decode_is_answered_and_the_connection_carries_on() {
+    use std::io::Write;
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let raw = |control: &mut Control, body: &str| {
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body.as_bytes());
+        control.socket.write_all(&frame).unwrap();
+        let Response { req, message } = loop {
+            let response: Response = read_frame(&mut control.socket).unwrap().unwrap();
+            if !matches!(response.message, ServerMessage::Event { .. }) {
+                break response;
+            }
+        };
+        (req, message)
+    };
+    // A newer client's request.
+    let (req, message) = raw(&mut control, r#"{"op":"teleport","req":41,"id":"s"}"#);
+    assert_eq!(req, Some(41));
+    assert_eq!(error(message).0, error_code::UNSUPPORTED_OPERATION);
+    // A known request with a field it cannot take (a colour that is not
+    // ASCII hex).
+    let (req, message) = raw(
+        &mut control,
+        r##"{"op":"create","req":42,"request_id":"6f1a2b3c-4d5e-4f60-8172-8394a5b6c7d8","name":"n","cwd":"/tmp","command":["sh"],"cols":80,"rows":24,"colors":{"foreground":"#１２３４５６","background":"#000000","dark":true}}"##,
+    );
+    assert_eq!(req, Some(42));
+    assert_eq!(error(message).0, error_code::REQUEST_FAILED);
+    // The same connection still serves.
+    assert!(matches!(
+        control.call(ClientMessage::List),
+        ServerMessage::Sessions { .. }
+    ));
+}
+
+#[test]
+fn subscribers_hear_bracketed_paste_turn_on_and_off() {
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let dir = host.dir();
+    let (on, off) = (dir.join("on"), dir.join("off"));
+    let session = host.create(shell(&format!(
+        r#"stty -echo
+while [ ! -e '{on}' ]; do sleep 0.02; done
+printf '\033[?2004h'
+while [ ! -e '{off}' ]; do sleep 0.02; done
+printf '\033[?2004l'
+exec sleep 60"#,
+        on = on.display(),
+        off = off.display(),
+    )));
+    let id = session.id.clone();
+    // Known, and off, from the start.
+    assert_eq!(session.bracketed_paste, Some(false));
+    touch(&on);
+    control.events_until("bracketed paste on", |event| {
+        matches!(event, SessionEvent::Changed { session } if session.id == id
+            && session.bracketed_paste == Some(true))
+    });
+    assert_eq!(host.session(&id).bracketed_paste, Some(true));
+    // Attached clients are told too.
+    let (_attached, attached, ..) = host.attach(&id, 80, 24);
+    assert_eq!(attached.bracketed_paste, Some(true));
+    touch(&off);
+    control.events_until("bracketed paste off", |event| {
+        matches!(event, SessionEvent::Changed { session } if session.id == id
+            && session.bracketed_paste == Some(false))
+    });
+    host.kill(&id);
+}
+
+#[test]
+fn clearing_history_leaves_the_screen_and_no_history_for_reads_and_reattaches() {
+    let host = Host::new();
+    let dir = host.dir();
+    let more = dir.join("more");
+    let session = host.create(shell(&format!(
+        r#"stty -echo
+i=1; while [ $i -le 60 ]; do printf 'line %d\n' $i; i=$((i+1)); done
+printf 'prompt> '
+while [ ! -e '{more}' ]; do sleep 0.02; done
+printf '\nafter 1\nafter 2\n'
+exec sleep 60"#,
+        more = more.display(),
+    )));
+    let id = session.id.clone();
+    let (history, ..) = screen_when(&host, &id, true, |text| text.contains("prompt>"));
+    assert!(history.starts_with("line 1\n"), "{history}");
+    assert_eq!(
+        host.call(ClientMessage::ClearHistory { id: id.clone() }),
+        ServerMessage::Ok
+    );
+    // The screen stays; the history above it is gone.
+    let (text, row, col, _) = screen_when(&host, &id, true, |text| !text.contains("line 1\n"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 24, "{text}");
+    assert_eq!(
+        (lines[0], lines[23], row, col),
+        ("line 38", "prompt>", 23, 8)
+    );
+    // A client that attaches now is sent no history either.
+    let (_socket, _, offset, snapshot) = host.attach(&id, 80, 24);
+    let screen = Screen::new(80, 24, offset, &snapshot);
+    let shown = screen.terminal.inspect().unwrap();
+    assert!(shown.history.is_empty(), "{:?}", shown.history);
+    assert!(screen.text().contains("line 38"));
+    // Later output scrolls into a history of its own.
+    touch(&more);
+    let (text, ..) = screen_when(&host, &id, true, |text| text.contains("after 2"));
+    assert!(text.starts_with("line 38\n"), "{text}");
+    // An unknown session is refused.
+    let (code, _) = error(host.call(ClientMessage::ClearHistory {
+        id: "no-such-session".into(),
+    }));
+    assert_eq!(code, error_code::UNKNOWN_SESSION);
+    host.kill(&id);
+
+    // On the alternate screen nothing is cleared, and the client hears so.
+    let full = host.create(shell(
+        "stty -echo; i=1; while [ $i -le 60 ]; do printf 'under %d\\n' $i; i=$((i+1)); done; printf '\\033[?1049hFULL'; exec sleep 60",
+    ));
+    screen_when(&host, &full.id, false, |text| text.contains("FULL"));
+    let (code, message) = error(host.call(ClientMessage::ClearHistory {
+        id: full.id.clone(),
+    }));
+    assert_eq!(code, error_code::REQUEST_FAILED);
+    assert!(message.contains("alternate screen"), "{message}");
+    host.kill(&full.id);
+}
+
+#[test]
+fn the_terminal_reports_the_colours_and_appearance_the_create_named() {
+    let host = Host::new();
+    let dir = host.dir().to_path_buf();
+    // The program asks its terminal (the holder answers these itself)
+    // and keeps the answers, and its terminal's settings.
+    let script = |name: &str| {
+        let out = dir.join(name);
+        format!(
+            r#"stty -echo -icanon min 0 time 20
+stty -a > '{out}.stty'
+printf '\033]10;?\007\033]11;?\007\033]12;?\007\033[?996n'
+dd bs=256 count=1 of='{out}.tmp' 2>/dev/null
+mv '{out}.tmp' '{out}'
+exec sleep 60"#,
+            out = out.display(),
+        )
+    };
+    let colored = |name: &str, colors: Option<TerminalColors>| {
+        created(host.call(ClientMessage::Create {
+            request_id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            cwd: "/tmp".into(),
+            command: shell(&script(name)),
+            env: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            owner: None,
+            tags: BTreeMap::new(),
+            colors,
+        }))
+    };
+    let light = colored(
+        "light",
+        Some(TerminalColors {
+            foreground: Rgb([0x1f, 0x23, 0x28]),
+            background: Rgb([0xff, 0xfe, 0xfd]),
+            cursor: None,
+            dark: false,
+        }),
+    );
+    let plain = colored("plain", None);
+    let answers = |name: &str| {
+        let path = dir.join(name);
+        wait_until(&format!("{name}'s answers"), || path.exists());
+        fs::read_to_string(&path).unwrap()
+    };
+    // As named: light, the cursor in the foreground's colour.
+    let reply = answers("light");
+    for expected in [
+        "\x1b]10;rgb:1f1f/2323/2828",
+        "\x1b]11;rgb:ffff/fefe/fdfd",
+        "\x1b]12;rgb:1f1f/2323/2828",
+        "\x1b[?997;2n",
+    ] {
+        assert!(reply.contains(expected), "{expected:?} in {reply:?}");
+    }
+    // Without colours: light grey on black, dark.
+    let reply = answers("plain");
+    for expected in [
+        "\x1b]10;rgb:e5e5/e5e5/e5e5",
+        "\x1b]11;rgb:0000/0000/0000",
+        "\x1b[?997;1n",
+    ] {
+        assert!(reply.contains(expected), "{expected:?} in {reply:?}");
+    }
+    // The terminal erases whole UTF-8 characters (IUTF8).
+    for name in ["light", "plain"] {
+        let stty = fs::read_to_string(dir.join(format!("{name}.stty"))).unwrap();
+        assert!(
+            stty.split_whitespace().any(|flag| flag == "iutf8"),
+            "{name}: {stty}"
+        );
+    }
+    host.kill(&light.id);
+    host.kill(&plain.id);
+}
+
+#[test]
 fn sessions_are_renamed_and_retagged_and_keep_it_across_daemons() {
     let mut host = Host::new();
     let tags = BTreeMap::from([("tab".to_string(), "t1".to_string())]);
@@ -752,6 +962,7 @@ fn sessions_are_renamed_and_retagged_and_keep_it_across_daemons() {
         rows: 24,
         owner: Some("tester".into()),
         tags: tags.clone(),
+        colors: None,
     }));
     let id = session.id.clone();
     let mut control = Control::subscribe(&host);

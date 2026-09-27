@@ -880,15 +880,55 @@ fn untrusted_socket(socket: &Path, error: io::Error) -> anyhow::Error {
 /// when `quiet` (an attachment's terminal shows a session), only its last
 /// line into the error when it fails.
 pub fn start_local_host(socket: &Path, deadline: Option<Instant>, quiet: bool) -> Result<()> {
+    start_local_host_from(&host_executable()?, socket, deadline, quiet)
+}
+
+/// The cherry-host `start_local_host` would run, found and checked now:
+/// `CHERRY_HOST_PATH`, the one beside this `cherry` (refused on a
+/// translocated or read-only volume), or the first on `PATH`. An error
+/// when there is none that could be run, so a caller can refuse to stop
+/// the running host (`cherry restart`) when it could not start another.
+pub fn runnable_host_executable() -> Result<PathBuf> {
+    let executable = host_executable()?;
+    let runnable = |path: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    if executable.components().count() > 1 {
+        if runnable(&executable) {
+            return Ok(executable);
+        }
+        bail!("{} is not an executable cherry-host", executable.display());
+    }
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join(&executable))
+        .find(|path| runnable(path))
+        .with_context(|| {
+            format!(
+                "no {} to start: install cherry-host beside cherry, on PATH, or set CHERRY_HOST_PATH",
+                executable.display()
+            )
+        })
+}
+
+/// `start_local_host` with the cherry-host to run.
+pub fn start_local_host_from(
+    executable: &Path,
+    socket: &Path,
+    deadline: Option<Instant>,
+    quiet: bool,
+) -> Result<()> {
     let limit = Instant::now() + RPC_TIMEOUT;
     let deadline = deadline.map_or(limit, |deadline| deadline.min(limit));
     // Connecting again after a Replace may find the time already spent.
     if Instant::now() >= deadline {
         bail!("timed out starting cherry-host");
     }
-    let executable = host_executable()?;
     // The daemon outlives this command; never keep the caller's directory busy.
-    let mut child = Command::new(&executable)
+    let mut child = Command::new(executable)
         .args(["start", "--socket"])
         .arg(socket)
         .current_dir("/")

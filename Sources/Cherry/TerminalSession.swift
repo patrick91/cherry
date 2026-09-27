@@ -1551,9 +1551,12 @@ final class TerminalWorkspace: ObservableObject {
     /// shows and no open tab owns (`PersistentLocalSessions.canAdopt`)
     /// becomes this workspace's own persistent tab (`isPersistentLocalSession`)
     /// when the workspace runs local tabs in the host: it then closes and
-    /// restarts like one. Everything else, including another app's or the
-    /// CLI's sessions, is attached (`hostedAttachment`): closing the tab only
-    /// disconnects it. `info` is the session as listed, when known.
+    /// restarts like one, and keeps the kind, agent and command its tags
+    /// name (`OrphanedSessionCriteria.record`), as Background Sessions ›
+    /// Open and an orphan's adoption do. Everything else, including another
+    /// app's or the CLI's sessions, is attached (`hostedAttachment`):
+    /// closing the tab only disconnects it. `info` is the session as
+    /// listed, when known.
     @discardableResult
     func attachHostedSession(
         _ attachment: HostedSessionAttachment,
@@ -1579,12 +1582,21 @@ final class TerminalWorkspace: ObservableObject {
             // program's CHERRY_PROCESS_ID names that id.
             let startedFor = PersistentLocalSessions.tabID(of: info, owner: hosting.owner)
                 .flatMap { hosting.hasOpenTab(withID: $0) ? nil : $0 }
-            let session = makeAdoptedPersistentSession(
+            // Adopted as an orphan is (`OrphanedSessionCriteria.record`):
+            // with the kind, agent and command its tags name, so an agent
+            // stays one (MCP's permission-prompt guard) and the next save
+            // keeps what it runs.
+            var record = OrphanedSessionCriteria.record(
+                for: info, tabID: unusedSessionID(startedFor ?? id), hostID: attachment.hostID
+            )
+            if record.title.isEmpty { record.title = attachment.name.nilIfEmpty ?? info.displayName }
+            if record.projectRoot == nil { record.projectRoot = projectRoot }
+            let session = makeRestoredPersistentSession(
                 PersistentSessionLaunch(attachment: attachment, info: info),
-                id: unusedSessionID(startedFor ?? id),
+                record: record,
                 hosting: hosting,
-                takeover: takeover,
-                launchShell: launchShell
+                launchShell: launchShell,
+                takeover: takeover
             )
             sessions.append(session)
             terminalDisplayItems.append(.single(session.id))
@@ -1702,32 +1714,6 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
-    /// A persistent tab for a session of This Mac that no tab created: a
-    /// terminal named after the session, in the directory it reported.
-    private func makeAdoptedPersistentSession(
-        _ launch: PersistentSessionLaunch,
-        id: UUID,
-        hosting: PersistentLocalSessions,
-        takeover: Bool,
-        launchShell: Bool
-    ) -> TerminalSession {
-        let workingDirectory = launch.info.localWorkingDirectory ?? launch.info.cwd
-        return TerminalSession(
-            id: id,
-            title: launch.attachment.name.nilIfEmpty ?? launch.info.displayName,
-            titleSource: .explicit,
-            subtitle: "\(ShellProcessController.defaultShellName) login shell",
-            tint: Self.palette[sessions.count % Self.palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: projectRoot,
-            launchShell: launchShell,
-            launchBackend: launchBackend,
-            hostedTakeover: takeover,
-            persistentHosting: hosting,
-            adoptingPersistentSession: launch
-        )
-    }
-
     /// A persistent tab for a saved record whose session the local host
     /// still has (running or exited), built like the tab that saved it:
     /// same id, kind, title, launch settings and project. Not added:
@@ -1745,7 +1731,8 @@ final class TerminalWorkspace: ObservableObject {
         record: WorkspaceSessionRecord,
         hosting: PersistentLocalSessions,
         launchShell: Bool = true,
-        deferringLaunch: Bool = false
+        deferringLaunch: Bool = false,
+        takeover: Bool = false
     ) -> TerminalSession {
         guard hosting.owningTab(of: launch.attachment.sessionID) == nil else {
             return makeRestoredHostedSession(
@@ -1775,6 +1762,7 @@ final class TerminalWorkspace: ObservableObject {
             launchEnvironment: record.launchEnvironment,
             restartOnExit: record.restartOnExit,
             launchBackend: launchBackend,
+            hostedTakeover: takeover,
             persistentHosting: hosting,
             adoptingPersistentSession: launch,
             deferredLaunch: deferringLaunch
@@ -3341,8 +3329,21 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Nil for a native tab and for one attached to a session from
     /// Persistent Sessions without adopting it (`hostedAttachment`). Cleared
     /// when the host could not start the program: the tab then runs it
-    /// natively.
+    /// natively, and `persistentFallbackHosting` keeps it for the next
+    /// launch.
     private(set) var persistentHosting: PersistentLocalSessions?
+    /// The host of a tab that was to run as a persistent session and runs
+    /// natively because the host could not start it (`persistentLaunchFailed`).
+    /// Its next launch (Restart, a command's restart, the fallback bar's
+    /// Retry) tries the host again: always for Retry, otherwise while the
+    /// host takes new tabs (`canHostNewTabs`).
+    private var persistentFallbackHosting: PersistentLocalSessions?
+    /// Why this tab runs natively instead of as a persistent session (the
+    /// host's rejection, or no answer in time), for the tab's fallback bar;
+    /// nil once it runs in the host again.
+    @Published private(set) var persistentFallbackReason: String?
+    /// The next launch tries the host even while it takes no new tabs.
+    private var persistentRetryRequested = false
     /// The host session the tab's program runs in. Set once Create answers
     /// (or a restore adopts a session), replaced by a restart, and kept after
     /// the program exits: the host keeps its final screen until the tab
@@ -3975,8 +3976,32 @@ final class TerminalSession: ObservableObject, Identifiable {
         return application && (info.kittyKeyboardFlags ?? 0) == 0
     }
 
+    /// Whether the program turned on bracketed paste: as its host reports
+    /// it for a hosted tab (`HostedSessionInfo.bracketedPaste`; the surface
+    /// parses the mode for the adapter, not for Cherry), else as parsed from
+    /// its output. False while a hosted tab's host does not report it.
     var usesBracketedPasteMode: Bool {
-        processor.usesBracketedPasteMode
+        hostReportedSessionInfo?.bracketedPaste ?? processor.usesBracketedPasteMode
+    }
+
+    /// Whether a paste of `text` that Cherry types for the program (a
+    /// persistent tab's ⌘V while its attach adapter is away, or the
+    /// host-managed surface's) is wrapped in `ESC [ 200 ~` … `ESC [ 201 ~`.
+    /// A tab whose program runs in a host (persistent or attached) follows
+    /// its host's report (`usesBracketedPasteMode`). When the host cannot
+    /// tell (a session whose holder predates holder link 7), a paste that
+    /// holds a line break is bracketed anyway, a trade-off: shells, editors
+    /// and agents at their prompts turn the mode on, and to one that did,
+    /// an unbracketed paste is typed lines, each run as it arrives. To a
+    /// program that did not, the markers arrive as input: `cat > file`
+    /// writes them into the file, and a vi-mode line editor takes the ESC
+    /// as a key. A single line is left as it is.
+    func bracketsPaste(_ text: String) -> Bool {
+        guard persistentHosting != nil || hostedAttachment != nil else {
+            return processor.usesBracketedPasteMode
+        }
+        if let reported = hostReportedSessionInfo?.bracketedPaste { return reported }
+        return text.contains { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }
     }
 
     var mouseState: TerminalMouseState {
@@ -4575,8 +4600,38 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.discardPendingOutput()
     }
 
-    func clearScrollback() {
+    /// Clear Scrollback (⌘K) and MCP `clear_output`: the tab's screen and
+    /// history, and for a persistent tab its host's copy of the history too
+    /// (`clearHostHistory`), which reads through the host (MCP output and
+    /// search) and the next attach adapter would otherwise bring back.
+    /// Returns the host's clear, for a caller that waits for it: nil when
+    /// the host cleared it, else why it kept it.
+    @discardableResult
+    func clearScrollback() -> Task<String?, Never>? {
         clearScrollback(preservingTerminalState: true)
+        return clearHostHistory()
+    }
+
+    /// Asks a persistent tab's host to clear its session's history
+    /// (`ClearHistory`). The screen read from the host before is forgotten,
+    /// and a read under way no longer applies. When the host keeps it (the
+    /// alternate screen shows, the session's holder predates holder link 7
+    /// or is not connected now, or the host cannot be reached), the task
+    /// says why, and that is logged.
+    private func clearHostHistory() -> Task<String?, Never>? {
+        guard let persistentHosting, let binding = persistentSession else { return nil }
+        forgetHostContent()
+        let tabID = id
+        return Task { @MainActor in
+            do {
+                try await persistentHosting.clearHistory(of: binding)
+                return nil
+            } catch {
+                let reason = (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+                fputs("Cherry: the host kept the history of tab \(tabID.uuidString): \(reason)\n", stderr)
+                return reason
+            }
+        }
     }
 
     private func clearScrollback(preservingTerminalState: Bool) {
@@ -5195,6 +5250,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func startShell() {
+        resumePersistentHostingAfterFallback()
         let launchID = UUID()
         activeLaunchID = launchID
         // A restored or adopted session (`persistentSessionToAdopt`, taken
@@ -5451,8 +5507,15 @@ final class TerminalSession: ObservableObject, Identifiable {
                     launch = try await hosting.create(request, configuration: configuration)
                 }
             } catch {
-                guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else { return }
-                self.persistentLaunchFailed(error, launchID: launchID)
+                guard let self, self.activeLaunchID == launchID else { return }
+                if self.persistentHosting === hosting {
+                    self.persistentLaunchFailed(error, launchID: launchID)
+                } else if self.persistentFallbackHosting === hosting, self.persistentFallbackReason != nil {
+                    // It already runs natively (no answer in time); the
+                    // host's own reason, arriving late, says more.
+                    self.persistentFallbackReason = PersistentLocalSessions.launchFailureReason(error)
+                    hosting.noteLaunchFailure(error)
+                }
                 return
             }
             guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else {
@@ -5544,7 +5607,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// the tab runs its program natively, and a session Create returns later
     /// is ended.
     private func schedulePersistentCreationDeadline(_ launchID: UUID, hosting: PersistentLocalSessions) {
-        let timeout = hosting.configuration.creationTimeout
+        // Longer while this app's other Creates wait ahead of it.
+        let timeout = hosting.creationDeadline
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self,
                   self.activeLaunchID == launchID,
@@ -5671,10 +5735,14 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     /// The host could not start the program: this tab runs it natively, as
     /// new tabs do until the host works again (Settings › Sessions says why).
+    /// The tab says so (`persistentFallbackReason`: its fallback bar) and
+    /// keeps its host, so Restart or the bar's Retry tries it again.
     private func persistentLaunchFailed(_ error: Error, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
         persistentHosting?.noteLaunchFailure(error)
         fputs("Cherry: tab \(id.uuidString) runs natively; its persistent session could not start: \(error.localizedDescription)\n", stderr)
+        persistentFallbackHosting = persistentHosting
+        persistentFallbackReason = PersistentLocalSessions.launchFailureReason(error)
         persistentHosting = nil
         persistentPhase = .idle
         persistentSession = nil
@@ -5691,6 +5759,33 @@ final class TerminalSession: ObservableObject, Identifiable {
             bridge.sendNativeInput(data)
             delivery?.resolve(.success(()))
         }
+    }
+
+    /// The fallback bar's Retry: starts the tab's program again as a
+    /// persistent session (ending the one that runs natively), even while
+    /// the host takes no new tabs (`canHostNewTabs`).
+    @discardableResult
+    func retryPersistentSession() -> Bool {
+        guard persistentHosting == nil, persistentFallbackHosting != nil else { return false }
+        persistentRetryRequested = true
+        defer { persistentRetryRequested = false }
+        return restart()
+    }
+
+    /// A tab running natively after its persistent session could not start
+    /// runs in the host again at its next launch: when asked to
+    /// (`retryPersistentSession`), or when the host takes new tabs.
+    private func resumePersistentHostingAfterFallback() {
+        guard persistentHosting == nil,
+              let hosting = persistentFallbackHosting,
+              launchBackend == .nativePTY,
+              hostedAttachment == nil,
+              persistentRetryRequested || hosting.canHostNewTabs()
+        else { return }
+        persistentFallbackHosting = nil
+        persistentFallbackReason = nil
+        persistentHosting = hosting
+        persistentStateDidChange?()
     }
 
     /// The adapter ended. Its outcome says whether the program did; if not,

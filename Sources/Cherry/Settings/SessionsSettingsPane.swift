@@ -27,6 +27,13 @@ struct SessionsSettingsPane: View {
                 SettingsCard {
                     SessionsUnavailableRow(reason: reason)
                 }
+            } else if let failure = status.lastLaunchFailure {
+                SettingsCard {
+                    SessionsUnavailableRow(
+                        title: "A tab is not a persistent session",
+                        detail: "\(failure) It runs as a regular terminal; Retry on the tab, or restart it, to try again."
+                    )
+                }
             }
 
             SettingsCard("Tabs") {
@@ -136,7 +143,19 @@ extension SessionsSettingsPane {
 }
 
 private struct SessionsUnavailableRow: View {
-    let reason: String
+    let title: String
+    let detail: String
+
+    init(reason: String) {
+        title = "Local sessions are unavailable"
+        detail = "\(reason) New tabs run as regular terminals until then."
+    }
+
+    /// A tab's session could not start (`PersistentSessionsStatus.lastLaunchFailure`).
+    init(title: String, detail: String) {
+        self.title = title
+        self.detail = detail
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -145,11 +164,11 @@ private struct SessionsUnavailableRow: View {
                 .font(.system(size: 15))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("Local sessions are unavailable")
+                Text(title)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.primary)
 
-                Text("\(reason) New tabs run as regular terminals until then.")
+                Text(detail)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)

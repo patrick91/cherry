@@ -12054,6 +12054,10 @@ private struct TerminalSceneView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
 
+            PersistentSessionFallbackBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
             PersistentSessionEndedBar(session: session, close: closeHostedSession.map { close in { close(session) } })
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
@@ -12389,6 +12393,47 @@ private struct PersistentSessionReconnectBar: View {
                     session.reconnectHostedSession()
                 }
                 .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+            .frame(maxWidth: 460)
+            .projectWindowToastObstacle()
+        }
+    }
+}
+
+// A tab that was to run as a persistent session and runs natively because the
+// host could not start it (it rejected the Create, or did not answer in
+// time): its program ends with Cherry. Retry starts it again in the host
+// (ending the program that runs natively); Restart does too once the host
+// takes new tabs.
+private struct PersistentSessionFallbackBar: View {
+    @ObservedObject var session: TerminalSession
+
+    var body: some View {
+        if let reason = session.persistentFallbackReason {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.orange)
+
+                Text("Not a persistent session: \(reason)")
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(reason)
+
+                Button("Retry") {
+                    session.retryPersistentSession()
+                }
+                .controlSize(.small)
+                .help("Start this tab's program again as a persistent session. The program running now ends.")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

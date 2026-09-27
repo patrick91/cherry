@@ -113,6 +113,73 @@ private func keyDown(
     #expect(typedThroughHost(harness) == ["y"])
 }
 
+@Test @MainActor func aPasteWhileTheAdapterIsAwayIsBracketedAsTheHostReportsTheProgramsMode() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("CherryTests.\(UUID().uuidString)"))
+    container.pasteboard = pasteboard
+    defer {
+        pasteboard.releaseGlobally()
+        container.detachActiveSession()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(tab))
+    container.configure(with: tab, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
+    let call = try #require(harness.attachCalls.first)
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    // The adapter reconnects by itself: ⌘V goes through the host.
+    try HostedSessionFakeCLI.writeStatus(
+        HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: try harness.statusFile(of: call)
+    )
+    #expect(await harness.fake.wait { tab.keyboardInputGoesThroughHost })
+    func report(bracketedPaste: Bool?) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(HostedSessionInfo(
+            id: sessionID, name: "Shell", cwd: harness.project.path, pid: 64, owner: "CherryTests",
+            tags: [PersistentSessionTag.tab: tab.id.uuidString], bracketedPaste: bracketedPaste
+        ))))
+    }
+    func paste(_ text: String) throws -> Bool {
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        return container.sendKeyThroughHostWhileAdapterIsAway(
+            try keyDown("v", keyCode: 9, modifiers: .command)
+        )
+    }
+    let script = "echo one\necho two\n"
+
+    // The shell at its prompt turned bracketed paste on: the lines arrive
+    // as one paste, not run one by one.
+    report(bracketedPaste: true)
+    #expect(await harness.fake.wait { tab.usesBracketedPasteMode })
+    #expect(try paste(script))
+    #expect(await harness.fake.wait {
+        typedThroughHost(harness) == ["\u{1B}[200~echo one\necho two\n\u{1B}[201~"]
+    })
+
+    // A program that has it off gets the text as it is.
+    report(bracketedPaste: false)
+    #expect(await harness.fake.wait { !tab.usesBracketedPasteMode })
+    #expect(try paste(script))
+    #expect(await harness.fake.wait { typedThroughHost(harness).last == script })
+
+    // A holder that does not report it (older than holder link 7): a paste
+    // of several lines is bracketed anyway, a single line is not.
+    report(bracketedPaste: nil)
+    #expect(await harness.fake.wait {
+        harness.hosting.sessionInfo(sessionID).map { $0.bracketedPaste == nil } == true
+    })
+    #expect(try paste(script))
+    #expect(await harness.fake.wait {
+        typedThroughHost(harness).last == "\u{1B}[200~echo one\necho two\n\u{1B}[201~"
+    })
+    #expect(try paste("just a word"))
+    #expect(await harness.fake.wait { typedThroughHost(harness).last == "just a word" })
+}
+
 @Test func keysForTheHostWhileAnAdapterIsAwayAreEncodedAsATerminalWould() {
     func encode(
         _ characters: String,

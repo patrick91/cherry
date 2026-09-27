@@ -483,14 +483,14 @@ after a mismatch), `Replace`, `Ok`, `Error{code, message}`.
 
 ## Implementation notes
 
-What exists on `codex/persistent-sessions` (2026-09-25), and where it
+What exists on `codex/persistent-sessions` (2026-09-27), and where it
 differs from the design above.
 
 ### Host and protocol
 
 - The daemon (`cherry-host serve`) and one holder per session
   (`cherry-host hold --socket …`, link on fd 3, never the daemon's child) are
-  implemented as designed. The holder link is at `LINK_VERSION` 4, and a
+  implemented as designed. The holder link is at `LINK_VERSION` 7, and a
   daemon speaks every version from 1. Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
@@ -499,7 +499,9 @@ differs from the design above.
   `SCREEN_LINES_VERSION`, `Screen` carries `max_lines`) and `Refused` (a
   daemon that will never serve a holder, with `retry`). All of them are
   additive; version 4 adds only `application_cursor_keys` (in `Info` and
-  the hello's session). On Linux a daemon starts holders from its own image
+  the hello's session), and version 7 adds `bracketed_paste` there (left
+  out by older holders, which the daemon then reports as unknown), the
+  daemon-to-holder `ClearHistory`, and `Launch.colors`. On Linux a daemon starts holders from its own image
   (`/proc/self/exe`); on macOS from its executable's path, which after an
   app update is the new build, so `Launch` fields are additive too.
 - A crashed holder reports its session exited with code 1. Exited sessions
@@ -530,7 +532,9 @@ differs from the design above.
   libghostty keeps terminal-wide, so a screen switch does not change it; it
   selects `ESC O x` for unmodified arrows, Home and End only in legacy key
   encoding, as the kitty encoding sends them as CSI whatever DECCKM says),
-  and `request_id` (the Create's, from the receipt the holder keeps). The
+  `bracketed_paste` (protocol 7: mode 2004, `None` and left out for a
+  session whose holder predates link version 7), and `request_id` (the
+  Create's, from the receipt the holder keeps). The
   holder hello carries all of them, so they survive daemon crashes,
   restarts and Replace, and they are kept after exit; a `changed` event
   follows every change of a mode, including a DECCKM-only one. A holder
@@ -541,6 +545,24 @@ differs from the design above.
   At most 8 kinds of `Screen` request wait on one holder, with at most 64
   callers each; beyond that the answer is `request_failed` at once ("the
   session's holder is not answering").
+- Protocol 7 (additive; the version changed so that an updated app
+  replaces a daemon that does not know the new requests): `ClearHistory{id}`
+  clears the history above a session's screen on its holder, as ED 3 at the
+  offset read so far (`Terminal::clear_history` keeps an unfinished escape
+  sequence), so `Screen` and later attachments no longer show it
+  (`unsupported_operation` for a holder older than link 7); `Create.colors`
+  (`#rrggbb` foreground, background and optional cursor, and `dark`), which
+  the holder's terminal reports for OSC 10, 11 and 12 and `CSI ?996n`
+  instead of light grey on black, dark (not part of the retry
+  fingerprint); `SessionInfo.bracketed_paste`; and `Restart`, which makes
+  the daemon stop as for `Replace` whatever sessions run, so `cherry restart`
+  can start this build's daemon after an update of the same protocol
+  replaced or removed the running one's executable.
+- The holder's terminal matches the tab's Ghostty: grapheme clustering
+  (2027) is on by default (`GHOSTTY_TERMINAL_OPT_MODE_DEFAULT`, so RIS keeps
+  it), snapshots set 2027 on or off before their content, and `modes()` and
+  `refresh()` send it only when the session turned it off. The session's
+  PTY has IUTF8 set.
 - An attach or resync whose snapshot the holder answered after the grid
   changed (it shows the old size) is followed at once by an
   `Attached{reason: resize}` at the current grid, so clients can see
@@ -594,6 +616,16 @@ differs from the design above.
 
 ### CLI
 
+- `cherry restart` (local only) first finds the cherry-host it will start
+  (`CHERRY_HOST_PATH`, beside `cherry`, or on `PATH`; not a translocated or
+  read-only copy) and refuses, leaving the host running, when there is
+  none; then it sends `Restart` and starts that daemon, which adopts the
+  running sessions from their holders.
+- A negotiated connection answers a JSON request the host cannot decode
+  (an unknown `op`: `unsupported_operation`; fields it cannot take, such as
+  a colour that is not ASCII `#rrggbb`: `request_failed`) with an `Error`,
+  with its `req`, and carries on; before protocol 7 it closed the
+  connection unanswered.
 - `cherry control`, `--ssh-control-path`, `new --env/--owner/--tag` and
   auto-upgrade through `Replace` are implemented. One 30 s deadline covers
   connecting (which includes starting a local host and a Replace). The app
@@ -690,8 +722,58 @@ differs from the design above.
   *Run local terminals as persistent sessions* is on and the host can run
   them. Otherwise, and for 30 s after the host could not start a session,
   tabs run natively and Settings › Sessions says why. A tab whose session is
-  not created within 8 s runs natively, and a session created after that is
-  ended.
+  not created within 14 s (`creationTimeout`, longer than the host's 10 s
+  wait for a new holder, so a holder that fails to start is reported by the
+  host's rejection) runs natively, and a session created after that is
+  ended. A tab that runs natively because the host rejected its Create (the
+  128-session limit, a holder that failed to start, a daemon whose
+  executable was removed) or did not answer in time says so in a bar at the
+  bottom of its pane ("Not a persistent session: <reason>", with Retry;
+  `PersistentSessionFallbackBar`, `TerminalSession.persistentFallbackReason`),
+  and Settings › Sessions shows the latest such reason
+  (`PersistentSessionsStatus.lastLaunchFailure`) until a session starts
+  again. The tab keeps its host (`persistentFallbackHosting`): Restart, or a
+  command's restart, runs it in the host again once the host takes new tabs,
+  and Retry does at once (`retryPersistentSession`).
+- A session adopted from the Persistent Sessions sheet
+  (`TerminalWorkspace.attachHostedSession`, and a toast's Reopen of a
+  session its tab did not own) gets the record its tags give
+  (`OrphanedSessionCriteria.record`, title source `.system`) and is built by
+  `makeRestoredPersistentSession`, as Background Sessions › Open and the
+  orphan scan do: an agent stays an agent (MCP's permission-prompt guard
+  applies) and a command keeps its command, and the next save keeps them.
+- A Create carries the app's terminal theme for the appearance it shows
+  (`PersistentLocalSessions.appTerminalColors`,
+  `TerminalSettings.hostTerminalColors`), so a program that asks for its
+  terminal's colours or appearance sees the tab's.
+- ⌘V typed while a persistent tab's adapter is away is bracketed as the
+  host reports the program's mode (`TerminalSession.bracketsPaste`,
+  `usesBracketedPasteMode` prefers the host's `bracketed_paste` for hosted
+  tabs). When the host cannot tell (a holder older than link 7), a paste
+  with a line break is bracketed anyway, a trade-off: programs at a prompt
+  turn the mode on, and an unbracketed paste would run there line by line,
+  but a program that did not gets the markers as input (`cat > file` writes
+  them, a vi-mode line editor takes the ESC as a key); a single line goes as
+  it is. Pasted text never carries ESC or the other bytes Ghostty's paste
+  encoder replaces with a space (NUL, BS, ENQ, EOT, DEL and the line
+  discipline's control characters), so a paste cannot end its own bracket
+  with `ESC [ 201 ~`. (Holding the paste for the adapter was rejected: it
+  would arrive later, after whatever the user typed meanwhile, and the
+  surface learns the mode only from the adapter's repaint.)
+- Clear Scrollback (⌘K) and MCP `clear_output` on a persistent tab also send
+  `ClearHistory`, and forget the screen read from the host; `clear_output`
+  answers once the host did, so MCP output and search read after it no
+  longer have the history, and neither does the next attach adapter. The
+  holder answers how it went (`HistoryCleared`): `clear_output` says
+  `cleared: false` with the host's reason (`hostKeptHistory`) when the
+  alternate screen shows, the holder predates link 7, is not connected, or
+  failed. A UTF-8 character the output left half written is never broken:
+  the holder's erase then waits for the output that completes it.
+- The daemon runs Creates one at a time, so a tab waits for its session
+  `creationTimeout` once for itself and once for each of this app's
+  Creates still ahead of it (`PersistentLocalSessions.creationDeadline`). A
+  host's rejection that arrives after the tab gave up replaces the
+  timeout's reason in its bar.
 - **Scoping, one copy per identity.** The first copy of the app takes
   `Application Support/<identity>/instance.lock` (`flock`, released by the
   kernel when it exits) for its whole run. A second copy with the same
@@ -761,7 +843,7 @@ differs from the design above.
   F1, F2 and F4 `CSI P/Q/S` and F3 `CSI 13 ~`. Input-method composition,
   F13 and above and ⌘ shortcuts are not sent (see
   [Not done yet](#not-done-yet)). MCP input to a session being created
-  waits up to 16 s, then is reported undelivered; it goes as sent, since
+  waits up to 22 s, then is reported undelivered; it goes as sent, since
   the program has set no key mode yet.
 - MCP input the host types (a persistent tab without a live adapter, or an
   attached tab whose adapter has not launched or reconnects) has its
@@ -1305,5 +1387,17 @@ differs from the design above.
   (`test-packaged-app`, `test-mcp-concurrency`,
   `perf-run-emulator-comparison` with a real Cherry) were not run in this
   round.
+- A tab that fell back to native (`persistentFallbackReason`) is saved as a
+  native tab: its program ends with the app, and it comes back at the next
+  launch only if Retry or a restart got it a session first. The colours a
+  session reports are the theme's when it was created; a later change of
+  appearance or theme does not reach it: the host keeps answering OSC 10,
+  11 and 12 and `CSI ?996n` (with `CSI ?997;1n` or `;2n`) from the colours
+  it was created with, and sends no colour-scheme change notification
+  (`CSI ?997;…n` for mode 2031) of its own. `ClearHistory` clears
+  nothing on the alternate screen (like ED 3 and Ghostty's own clear), and
+  Clear Scrollback on a tab only attached to a session (another app's, the
+  CLI's or an SSH host's) leaves that host's history alone. The app does not
+  run `cherry restart` by itself.
 - Nice-to-haves (none blocks): sequence ids on bell and notification events,
   for exact deduplication; per-client sizes in `SessionInfo`.

@@ -1,7 +1,7 @@
 //! What a session's terminal shows, read without changing it: the screen as
 //! text (`Screen`), and the terminal state clients follow in `SessionInfo`
-//! (the alternate screen, the kitty keyboard flags and application cursor
-//! keys).
+//! (the alternate screen, the kitty keyboard flags, application cursor keys
+//! and bracketed paste).
 use anyhow::Result;
 use cherry_protocol::MAX_SCREEN_TEXT_BYTES;
 use cherry_vt::Terminal;
@@ -25,6 +25,9 @@ pub struct TerminalState {
     /// DECCKM (mode `?1`): in legacy key encoding (no kitty keyboard
     /// flags), cursor keys send `ESC O x` rather than `ESC [ x`.
     pub application_cursor_keys: bool,
+    /// Bracketed paste (mode `?2004`): a paste is wrapped in `ESC [ 200 ~`
+    /// and `ESC [ 201 ~`.
+    pub bracketed_paste: bool,
 }
 
 /// What `terminal` has of the state clients follow; None if it cannot be
@@ -36,10 +39,11 @@ pub struct TerminalState {
 /// `ESC[?1049h ESC[?1049l ESC[?1047l ESC[?47l`, sets the mode that entered
 /// the alternate screen right after that when it is active, and ends by
 /// popping every kitty keyboard entry (`ESC[<8u`) and, when the flags are
-/// not 0, setting them (`ESC[=<flags>;1u`). DECCKM is read as a mode. It is
-/// cheap (a few microseconds), and read only after output that holds an
-/// escape sequence, since nothing else changes any of them (DECCKM changes
-/// with `CSI ? 1 h` / `l` and resets). A test pins the shape against
+/// not 0, setting them (`ESC[=<flags>;1u`). DECCKM and bracketed paste are
+/// read as modes. It is cheap (a few microseconds), and read only after
+/// output that holds an escape sequence, since nothing else changes any of
+/// them (DECCKM changes with `CSI ? 1 h` / `l` and resets, bracketed paste
+/// with `CSI ? 2004 h` / `l` and resets). A test pins the shape against
 /// `Terminal::inspect`.
 pub fn terminal_state(terminal: &Terminal) -> Option<TerminalState> {
     let (alternate_screen, kitty_keyboard_flags) = parse_terminal_state(&terminal.modes().ok()?)?;
@@ -47,6 +51,7 @@ pub fn terminal_state(terminal: &Terminal) -> Option<TerminalState> {
         alternate_screen,
         kitty_keyboard_flags,
         application_cursor_keys: terminal.mode(1, false).ok()?,
+        bracketed_paste: terminal.mode(2004, false).ok()?,
     })
 }
 
@@ -263,6 +268,13 @@ mod tests {
             // Resets.
             b"\x1b[?1h\x1bc",
             b"\x1b[?1h\x1b[!p",
+            // Bracketed paste, whichever screen shows, and its resets.
+            b"\x1b[?2004h",
+            b"\x1b[?2004h\x1b[?2004l",
+            b"\x1b[?2004h\x1b[?1049h",
+            b"\x1b[?1049h\x1b[?2004h\x1b[?1049l",
+            b"\x1b[?2004h\x1bc",
+            b"\x1b[?2004h\x1b[!p",
         ] {
             let terminal = terminal(20, 5, output);
             let inspection = terminal.inspect().unwrap();
@@ -272,6 +284,7 @@ mod tests {
                     alternate_screen: inspection.alternate,
                     kitty_keyboard_flags: u32::from(inspection.kitty_flags),
                     application_cursor_keys: inspection.modes.iter().any(|mode| mode == "?1h"),
+                    bracketed_paste: inspection.modes.iter().any(|mode| mode == "?2004h"),
                 }),
                 "{:?}",
                 String::from_utf8_lossy(output)

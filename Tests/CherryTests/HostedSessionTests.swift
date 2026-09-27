@@ -1393,14 +1393,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     helperEnvironment["XDG_STATE_HOME"] = nil
     func quote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-    let host = Process()
-    host.executableURL = hostURL
-    host.arguments = ["serve"]
-    host.environment = helperEnvironment
-    host.standardInput = FileHandle.nullDevice
-    host.standardOutput = FileHandle.nullDevice
-    host.standardError = FileHandle.standardError
-    try host.run()
+    let host = try RealHostTestDaemon(executable: hostURL, environment: helperEnvironment, socket: socket)
     let workspace = TerminalWorkspace(createInitialSession: false)
     let secondWorkspace = TerminalWorkspace(createInitialSession: false)
     let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
@@ -1421,8 +1414,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
         secondWindow.close()
         // The test owns this isolated child and daemon; never touch a global host.
         if let pid = ownedChildPID, getsid(pid) == pid { Darwin.kill(-pid, SIGKILL) }
-        if host.isRunning { host.terminate() }
-        host.waitUntilExit()
+        host.stop()
     }
 
     func waitFor(_ description: String, _ predicate: () async throws -> Bool) async throws {

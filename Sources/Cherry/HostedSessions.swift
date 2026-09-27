@@ -151,6 +151,12 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// host does not report it (an older host); false also from a session
     /// whose holder does not report it.
     let applicationCursorKeys: Bool?
+    /// Whether the program turned on bracketed paste (DECSET 2004, as
+    /// shells, editors and agents do at their prompts): a paste is then
+    /// wrapped in `ESC [ 200 ~` and `ESC [ 201 ~`. Nil when it is not
+    /// known: from a host older than protocol 7, or for a session whose
+    /// holder predates holder link 7.
+    let bracketedPaste: Bool?
     /// The `request_id` of the Create that started the session; nil when
     /// the host does not report it (an older host).
     let requestID: String?
@@ -163,6 +169,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         case alternateScreen = "alternate_screen"
         case kittyKeyboardFlags = "kitty_keyboard_flags"
         case applicationCursorKeys = "application_cursor_keys"
+        case bracketedPaste = "bracketed_paste"
         case requestID = "request_id"
     }
 
@@ -188,6 +195,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         alternateScreen: Bool? = nil,
         kittyKeyboardFlags: UInt32? = nil,
         applicationCursorKeys: Bool? = nil,
+        bracketedPaste: Bool? = nil,
         requestID: String? = nil
     ) {
         self.id = id
@@ -211,6 +219,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         self.alternateScreen = alternateScreen
         self.kittyKeyboardFlags = kittyKeyboardFlags
         self.applicationCursorKeys = applicationCursorKeys
+        self.bracketedPaste = bracketedPaste
         self.requestID = requestID
     }
 
@@ -239,6 +248,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             alternateScreen: try container.decodeIfPresent(Bool.self, forKey: .alternateScreen),
             kittyKeyboardFlags: try container.decodeIfPresent(UInt32.self, forKey: .kittyKeyboardFlags),
             applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys),
+            bracketedPaste: try container.decodeIfPresent(Bool.self, forKey: .bracketedPaste),
             requestID: try container.decodeIfPresent(String.self, forKey: .requestID)
         )
     }
@@ -268,6 +278,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         try container.encodeIfPresent(alternateScreen, forKey: .alternateScreen)
         try container.encodeIfPresent(kittyKeyboardFlags, forKey: .kittyKeyboardFlags)
         try container.encodeIfPresent(applicationCursorKeys, forKey: .applicationCursorKeys)
+        try container.encodeIfPresent(bracketedPaste, forKey: .bracketedPaste)
         try container.encodeIfPresent(requestID, forKey: .requestID)
     }
 
@@ -319,7 +330,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             state: .exited, pid: pid, exitCode: code, exitSignal: signal, attached: attached,
             title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
             createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
-            applicationCursorKeys: applicationCursorKeys, requestID: requestID
+            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste, requestID: requestID
         )
     }
 }

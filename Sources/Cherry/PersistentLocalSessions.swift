@@ -146,8 +146,13 @@ final class PersistentLocalSessions {
         var reconnectAttemptsBeforeDisconnected = 5
         /// A tab whose session the host has not started after this long
         /// (the helper, the daemon or the login environment hangs) runs its
-        /// program natively; a session created later is ended.
-        var creationTimeout: TimeInterval = 8
+        /// program natively; a session created later is ended. Once for
+        /// each Create of this app still waiting ahead of it
+        /// (`creationDeadline`). Longer than
+        /// the host's own wait for a new holder (`LAUNCH_TIMEOUT` in
+        /// cherry-host, 10 s), so a holder that fails to start is reported
+        /// by the host's rejection, with its reason, before this runs out.
+        var creationTimeout: TimeInterval = 14
         /// Create is sent again (same request ID and spec) this many times
         /// after its answer was lost, beyond `HostControl.create`'s own retry.
         var lostCreateRetries = 2
@@ -195,7 +200,7 @@ final class PersistentLocalSessions {
         /// at most to reach the program (the end of a previous session,
         /// then `creationTimeout`, after which the tab runs natively and
         /// takes it); then it is dropped and reported undelivered.
-        var queuedInputTimeout: TimeInterval = 16
+        var queuedInputTimeout: TimeInterval = 22
         /// How long a read of a tab's lines waits for the host's screen; the
         /// tab's last lines are used meanwhile.
         var hostScreenWait: Duration = .seconds(2)
@@ -262,6 +267,14 @@ final class PersistentLocalSessions {
     /// a session is the open one that names it (`owningTab(of:)`).
     private var openTabs: [ObjectIdentifier: WeakTab] = [:]
     private var creatingCount = 0
+
+    /// How long a tab waits for the session it is about to create
+    /// (`creationTimeout`) when this app already waits for `creatingCount`
+    /// others: the daemon starts one holder at a time, so each Create
+    /// ahead may take its own `creationTimeout` first.
+    var creationDeadline: TimeInterval {
+        configuration.creationTimeout * Double(creatingCount + 1)
+    }
     /// Sessions being ended, by session id.
     private var endings: [String: Task<Void, Never>] = [:]
     /// Sessions whose end waits for their tab's close to be undone or not
@@ -284,6 +297,15 @@ final class PersistentLocalSessions {
     private var pendingSignals: [(sessionID: String, signal: PersistentHostSignal, receivedAt: Date)] = []
     private var lease: HostControlLease?
     private var eventSubscription: AnyCancellable?
+    /// What a new session's terminal reports of its colours and appearance
+    /// (`HostCreateRequest.colors`).
+    private let terminalColors: @MainActor () -> HostTerminalColors?
+
+    /// The app's terminal theme for the appearance it shows now, as a tab's
+    /// surface draws it.
+    static func appTerminalColors() -> HostTerminalColors? {
+        TerminalSettings.shared.hostTerminalColors(for: GhosttySessionBridge.resolvedColorScheme())
+    }
 
     init(
         owner: String = PersistentLocalSessions.appOwner,
@@ -292,9 +314,11 @@ final class PersistentLocalSessions {
         launchSpec: @escaping LaunchSpecBuilder = PersistentLocalSessions.preparedLaunchSpec,
         status: PersistentSessionsStatus = .shared,
         instanceLock: AppInstanceLock? = nil,
+        terminalColors: @escaping @MainActor () -> HostTerminalColors? = PersistentLocalSessions.appTerminalColors,
         configuration: Configuration = Configuration()
     ) {
         self.owner = owner
+        self.terminalColors = terminalColors
         makeControl = control
         self.installationUnavailableReason = installationUnavailableReason
         self.launchSpec = launchSpec
@@ -445,12 +469,31 @@ final class PersistentLocalSessions {
     /// natively for a while (`unavailableRetryInterval`) and Settings ›
     /// Sessions says why. A rejection of that one request (say, a directory
     /// the host cannot use) affects only its tab.
+    ///
+    /// Either way Settings › Sessions shows the latest failure
+    /// (`PersistentSessionsStatus.lastLaunchFailure`) until a session
+    /// starts again.
     func noteLaunchFailure(_ error: Error) {
+        let failure = Self.launchFailureReason(error)
+        if status.lastLaunchFailure != failure {
+            status.lastLaunchFailure = failure
+        }
         guard Self.meansHostUnavailable(error) else { return }
-        let message = (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
-        let reason = "The local session host could not start a session: \(message)"
+        let reason = "The local session host could not start a session: \(Self.errorMessage(error))"
         launchFailure = (reason, Date().addingTimeInterval(configuration.unavailableRetryInterval))
         publish(instanceUnavailableReason ?? installationCheck?.reason ?? reason)
+    }
+
+    /// Why a tab's session could not start, as its fallback bar and
+    /// Settings › Sessions say it: the host's own message for a rejection
+    /// (the session limit, a holder that failed to start, a daemon whose
+    /// executable was removed), else what went wrong reaching it.
+    nonisolated static func launchFailureReason(_ error: Error) -> String {
+        errorMessage(error)
+    }
+
+    private nonisolated static func errorMessage(_ error: Error) -> String {
+        (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
     }
 
     /// Whether a failed Create says the local host cannot run sessions now:
@@ -468,6 +511,9 @@ final class PersistentLocalSessions {
     }
 
     private func noteLaunchSucceeded() {
+        if status.lastLaunchFailure != nil {
+            status.lastLaunchFailure = nil
+        }
         guard launchFailure != nil else { return }
         launchFailure = nil
         publish(instanceUnavailableReason ?? installationCheck?.reason)
@@ -516,7 +562,10 @@ final class PersistentLocalSessions {
             cols: min(max(request.columns, 2), 500),
             rows: min(max(request.rows, 1), 200),
             owner: owner,
-            tags: Self.tags(for: request, requestID: requestID)
+            tags: Self.tags(for: request, requestID: requestID),
+            // A program that asks sees the colours of the terminal it is
+            // shown in, as in a native tab.
+            colors: terminalColors()
         )
         var retries = 0
         var answerWasLost = false
@@ -1131,6 +1180,13 @@ final class PersistentLocalSessions {
     /// only its last this many lines.
     func screen(of binding: HostedSessionAttachment, maxLines: Int? = nil) async throws -> HostScreenText {
         try await control.screen(binding.sessionID, scrollback: true, maxLines: maxLines, expectedHostID: binding.hostID)
+    }
+
+    /// Clears the history above the session's screen on its host (Clear
+    /// Scrollback, MCP `clear_output`): reads of its screen (`screen(of:)`)
+    /// and an adapter that attaches no longer bring it back.
+    func clearHistory(of binding: HostedSessionAttachment) async throws {
+        try await control.clearHistory(binding.sessionID, expectedHostID: binding.hostID)
     }
 
     // MARK: Events

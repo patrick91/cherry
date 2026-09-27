@@ -13,13 +13,13 @@ use crate::{
     daemon::{self, Host},
     environment, link,
     outbox::Outbox,
-    session::{Command, Launch, Session},
+    session::{ClearOutcome, Command, Launch, Session},
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
-    encode_frame, error_code, priority, read_frame, write_frame, ClientMessage, Message, Request,
-    Response, ServerMessage, SessionEvent, SessionState, MAX_CLIENT_ID_BYTES, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION,
+    encode_frame, error_code, priority, read_frame, read_frame_body, undecodable_request,
+    write_frame, ClientMessage, Message, Request, Response, ServerMessage, SessionEvent,
+    SessionState, MAX_CLIENT_ID_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -433,9 +433,22 @@ impl Connection {
                 stream: &self.stream,
                 timeout: self.read_timeout,
             };
-            let (message, req) = match read_frame::<_, Request>(&mut reader) {
-                Ok(Some(Request { message, req })) => (message, req),
+            let body = match read_frame_body(&mut reader) {
+                Ok(Some(body)) => body,
                 Ok(None) | Err(_) => return,
+            };
+            let (message, req) = match Request::decode_body(&body) {
+                Ok(Request { message, req }) => (message, req),
+                Err(error) => {
+                    // A request this host does not know, or cannot take, is
+                    // answered and the connection carries on; anything else
+                    // that does not decode ends it.
+                    let Some(answer) = undecodable_request(&body, &error) else {
+                        return;
+                    };
+                    self.reply(answer.req, answer.message);
+                    continue;
+                }
             };
             // Whatever answers an attachment's requests is attachment traffic.
             let req = req.filter(|_| !message.belongs_to_attachment());
@@ -655,7 +668,40 @@ impl Connection {
                 rows,
                 owner,
                 tags,
-            } => self.create(request_id, name, cwd, command, env, cols, rows, owner, tags)?,
+                colors,
+            } => self.create(
+                request_id, name, cwd, command, env, cols, rows, owner, tags, colors,
+            )?,
+            ClientMessage::ClearHistory { id } => {
+                let session = self.session(&id)?;
+                let (ack, acknowledged) = mpsc::sync_channel(1);
+                session
+                    .send(Command::ClearHistory { ack })
+                    .map_err(|_| self.gone(&id))?;
+                match acknowledged.recv_timeout(REQUEST_TIMEOUT) {
+                    Ok(ClearOutcome::Cleared) => ServerMessage::Ok,
+                    Ok(ClearOutcome::Removed) => return Err(unknown_session(&id)),
+                    Ok(ClearOutcome::AlternateScreen) => bail!(
+                        "session {id} shows its alternate screen, which has no history; the primary screen's history was kept"
+                    ),
+                    Ok(ClearOutcome::NotLinked) => bail!(
+                        "session {id}'s holder is not connected to this host right now, so its history was kept"
+                    ),
+                    Ok(ClearOutcome::Failed(why)) => {
+                        bail!("session {id}'s holder could not clear its history: {why}")
+                    }
+                    Ok(ClearOutcome::Unsupported) => {
+                        return Err(refused(
+                            error_code::UNSUPPORTED_OPERATION,
+                            format!(
+                                "session {id} runs in a holder too old to clear its history; a session started by this version can"
+                            ),
+                        ))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
+                }
+            }
             ClientMessage::Attach {
                 id,
                 cols,
@@ -794,6 +840,20 @@ impl Connection {
                 self.host.publish(SessionEvent::Removed { id });
                 ServerMessage::Ok
             }
+            ClientMessage::Restart => {
+                {
+                    // After any launch in progress, and before any other.
+                    let _launch = self.host.launches.lock().unwrap_or_else(|e| e.into_inner());
+                    self.host.stop();
+                }
+                daemon::log(format_args!(
+                    "restarting at a client's request; exiting, and leaving the sessions to the next host"
+                ));
+                // Once the socket is gone and the lock is free, as for
+                // `Replace`: the client starts the next host right away.
+                self.host.wait_until_released(FLUSH_TIMEOUT);
+                ServerMessage::Ok
+            }
             ClientMessage::Shutdown => {
                 stop_without_sessions(&self.host)?;
                 // Acknowledge once the socket is gone and the lock is free:
@@ -881,6 +941,7 @@ impl Connection {
         rows: u16,
         owner: Option<String>,
         tags: BTreeMap<String, String>,
+        colors: Option<cherry_protocol::TerminalColors>,
     ) -> Result<ServerMessage> {
         Uuid::parse_str(&request_id).context("request_id must be a UUID")?;
         if name.len() > 256 || cwd.len() > 4096 {
@@ -894,7 +955,8 @@ impl Connection {
         }
         cherry_protocol::check_tags(&tags).map_err(anyhow::Error::msg)?;
         // The size is attachment state, not part of what was launched: a
-        // retry from a resized terminal is still the same request.
+        // retry from a resized terminal is still the same request. So are
+        // the colours (the app's appearance may change between tries).
         let fingerprint = serde_json::to_string(&(&name, &cwd, &command, &env, &owner, &tags))?;
         if let Some(created) = self.receipt(&request_id, &fingerprint)? {
             return Ok(created);
@@ -931,6 +993,7 @@ impl Connection {
                 owner,
                 tags,
                 agent_link: self.host.agent_link(),
+                colors,
                 receipt: link::Receipt {
                     request_id: request_id.clone(),
                     fingerprint: fingerprint.clone(),

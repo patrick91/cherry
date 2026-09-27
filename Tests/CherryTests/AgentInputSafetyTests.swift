@@ -296,6 +296,82 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     #expect(typed(harness) == ["hello", "\r"])
 }
 
+// MARK: - A kept agent adopted from File › Persistent Sessions
+
+@Test @MainActor func anAgentAdoptedFromThePersistentSessionsSheetStaysAnAgentAndItsPromptIsGuarded() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    // A kept agent (its tab detached) that no tab shows: the sheet adopts it.
+    let tabID = UUID()
+    let listed = HostedSessionInfo(
+        id: "session-kept-agent", name: "Claude", cwd: harness.project.path, pid: 62, owner: "CherryTests",
+        tags: [
+            PersistentSessionTag.tab: tabID.uuidString,
+            PersistentSessionTag.kind: "agent",
+            PersistentSessionTag.agent: "Claude",
+            PersistentSessionTag.project: harness.project.path
+        ]
+    )
+    harness.fake.sessions = [listed]
+    harness.fake.screenText = claudeBashPermissionScreen
+    _ = try await harness.control.list()
+    let attachment = try #require(harness.hosting.attachment(for: listed))
+
+    let agent = workspace.attachHostedSession(attachment, info: listed)
+    #expect(agent.isPersistentLocalSession)
+    #expect(agent.id == tabID)
+    #expect(agent.kind == .agent)
+    #expect(agent.agentName == "Claude")
+    #expect(agent.titleSource == .system)
+    #expect(await harness.waitUntilAttached(agent))
+    #expect(harness.creates().isEmpty)
+    // What the next save writes keeps it an agent.
+    let saved = try #require(workspace.makeStateRecord(root: harness.project.path, collapsedAgentGroupIDs: [])
+        .sessions.first { $0.id == tabID })
+    #expect(saved.kind == .agent)
+    #expect(saved.agentName == "Claude")
+
+    // MCP never answers its permission prompt.
+    let sent = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "y", submit: true
+    )))
+    #expect(sent.error?.code == "agent_awaiting_permission")
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(typed(harness).isEmpty)
+}
+
+@Test @MainActor func aCommandAdoptedFromThePersistentSessionsSheetKeepsItsCommand() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let listed = HostedSessionInfo(
+        id: "session-kept-command", name: "dev", cwd: harness.project.path, pid: 63, owner: "CherryTests",
+        tags: [
+            PersistentSessionTag.tab: UUID().uuidString,
+            PersistentSessionTag.kind: "command",
+            PersistentSessionTag.command: "dev"
+        ]
+    )
+    harness.fake.sessions = [listed]
+    _ = try await harness.control.list()
+    let command = workspace.attachHostedSession(try #require(harness.hosting.attachment(for: listed)), info: listed)
+    #expect(command.isPersistentLocalSession)
+    #expect(command.kind == .command)
+    #expect(command.commandName == "dev")
+    #expect(workspace.commandSession(named: "dev") === command)
+    // No project tag: the tab belongs to the workspace's project.
+    #expect(command.projectRoot == workspace.projectRoot)
+}
+
 // MARK: - Recognizing permission prompts
 
 @Test func permissionPromptsAreRecognizedAndStartupPromptsAreNot() {

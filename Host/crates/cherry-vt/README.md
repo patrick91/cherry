@@ -17,8 +17,16 @@ those two modes. The host also takes the queries it leaves unanswered out of
 that stream and sends each to one attached client to answer (see the
 [host guide](../../README.md#bounds-and-terminal-fidelity)).
 Size queries use the session's rows/columns and nominal 8×16 pixel cells.
-Color queries currently report a fixed dark default (light gray foreground,
-black background); synchronizing the desktop theme to the host is deferred.
+Color queries (OSC 10, 11 and 12) and the color-scheme query (`CSI ?996n`)
+report the colors `set_colors` gave (the host passes those its `Create`
+named), by default light gray on black and dark; a reset keeps them.
+Grapheme clustering (mode 2027) is on by default, as in Ghostty, and a reset
+(RIS) turns it back on: cell widths of emoji, flags and ZWJ sequences then
+match the app's terminal, into which snapshots are replayed.
+`clear_history` clears the history above the screen as `ED 3` would, keeping
+an unfinished escape sequence the output left (its continuation is fed again
+after the erase); when the output left a UTF-8 character half written, the
+erase waits for the `feed` that completes it (it returns false then).
 XTGETTCAP `TN` (the terminfo name) is answered only after
 `set_terminfo_name`, with the name given (the program's TERM).
 
@@ -129,7 +137,9 @@ and per-cell hyperlinks):
   value of 0 and the stack of an inactive alternate screen, so later pops and
   screen switches see the same flags. Unfinished UTF-8/control continuations
   come last.
-- Grapheme clustering (2027) is set before content so cell widths match.
+- Grapheme clustering (2027) is set, on or off, before content so cell
+  widths match whatever the receiver's default. `refresh()` sends it only
+  when the session turned it off.
 
 `refresh()` brings a terminal of the same size that already holds this
 terminal's history (a renderer that followed the session, or a fresh one) to
@@ -178,8 +188,9 @@ For a physical terminal whose size differs from the canonical grid:
   settings rather than the VT standard (DECARM 8, which libghostty defaults
   to off and does not implement, alternate scroll 1007, the Meta and Alt key
   modes 1035, 1036 and 1039, grapheme clustering 2027) are never reset: they
-  are set only while the session has them away from libghostty's default, as
-  its own output would set them. One the session sets back to that default
+  are set only while the session has them away from this terminal's default
+  (libghostty's, with grapheme clustering on), as its own output would set
+  them. One the session sets back to that default
   keeps the value last sent. Insert, origin and left/right margin modes,
   margins and character sets are forced to their defaults, because frames
   paint at absolute positions. Cursor visibility and synchronized output are

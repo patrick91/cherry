@@ -1530,6 +1530,110 @@ fn an_attachment_reconnects_by_itself_after_the_daemon_is_killed_and_restarted()
     host.wait_for_detached_running(id, &created["pid"]);
 }
 
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn restart_replaces_the_daemon_and_keeps_its_running_sessions() {
+    /// Kills whatever daemon serves the socket when the test ends, however
+    /// it ends: the one `restart` starts is not the test's child.
+    struct Daemons(PathBuf);
+    impl Drop for Daemons {
+        fn drop(&mut self) {
+            for (pid, command) in processes_using(&self.0) {
+                if command.contains(" serve ") {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    let mut host = Host::start();
+    // Dropped before `host`, whose cleanup then ends the holders.
+    let _daemons = Daemons(host.socket.clone());
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--name",
+        "Kept",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec sleep 60",
+    ]);
+    let id = created["id"].as_str().unwrap().to_owned();
+    let daemons = |host: &Host| -> Vec<i32> {
+        processes_using(&host.socket)
+            .into_iter()
+            .filter(|(_, command)| command.contains(" serve "))
+            .map(|(pid, _)| pid)
+            .collect()
+    };
+    assert_eq!(daemons(&host), [host.child.id() as i32]);
+    // No cherry-host could be started (this command's CHERRY_HOST_PATH
+    // names nothing): the restart is refused, and the host keeps running.
+    let refused = host.command().arg("restart").output().unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("refusing to restart"), "{stderr}");
+    assert!(host.child.try_wait().unwrap().is_none());
+    assert_eq!(daemons(&host), [host.child.id() as i32]);
+    // The new daemon is this build's, with the test's private state.
+    let output = host
+        .command()
+        .arg("restart")
+        .env("CHERRY_HOST_PATH", host_binary())
+        .env("HOME", &host.home)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The old daemon exited; another serves the same socket and state.
+    let old = host.child.wait().unwrap();
+    assert!(old.success(), "{old}");
+    let now = daemons(&host);
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_ne!(now[0], host.child.id() as i32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = loop {
+        let listing = host.json(&["list", "--json"]);
+        assert_eq!(listing["host_id"].as_str(), host.host_id.as_deref());
+        if let Some(session) = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id.as_str())
+        {
+            break session.clone();
+        }
+        assert!(Instant::now() < deadline, "the session was not adopted");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["pid"], created["pid"], "the program was restarted");
+    // Leave nothing behind: the new daemon is not the test's child.
+    host.end_sessions();
+    let stopped = host.command().arg("shutdown").status().unwrap();
+    assert!(stopped.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !daemons(&host).is_empty() {
+        assert!(Instant::now() < deadline, "the new daemon did not stop");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Restart is local only.
+    let remote = host
+        .command()
+        .args(["--host", "example", "restart"])
+        .output()
+        .unwrap();
+    assert!(!remote.status.success());
+    assert!(String::from_utf8_lossy(&remote.stderr).contains("local only"));
+}
+
 /// Read a client's terminal (the PTY master) at `rate` bytes a second (as
 /// fast as it comes: None) until `stop` is set, noting when each read came
 /// and how much it took.

@@ -88,6 +88,9 @@ pub struct Launch {
     /// The `Create` it answers, kept by the holder so that a daemon adopting
     /// the session keeps retries idempotent.
     pub receipt: link::Receipt,
+    /// What the session's terminal reports of its colours (see
+    /// `link::Launch`).
+    pub colors: Option<cherry_protocol::TerminalColors>,
 }
 
 pub struct Session {
@@ -134,6 +137,11 @@ pub enum Command {
         max_lines: Option<u32>,
         reply: SyncSender<ServerMessage>,
     },
+    /// Clear the history above the session's screen
+    /// (`ClientMessage::ClearHistory`), where the output read so far ends.
+    ClearHistory {
+        ack: SyncSender<ClearOutcome>,
+    },
     /// Rename or retag the session; acknowledged once applied (true), or
     /// once found removed (false).
     Update {
@@ -163,6 +171,24 @@ pub enum Command {
     Remove {
         ack: SyncSender<()>,
     },
+}
+
+/// How a `Command::ClearHistory` went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearOutcome {
+    /// The holder cleared it.
+    Cleared,
+    /// The alternate screen shows, which has no history of its own; the
+    /// primary screen's is kept.
+    AlternateScreen,
+    /// The session was removed.
+    Removed,
+    /// Its holder is older than link version 7.
+    Unsupported,
+    /// No holder is connected now (it is gone, or the link dropped).
+    NotLinked,
+    /// The holder could not; why.
+    Failed(String),
 }
 
 /// Input accepted from connections but not yet written to the PTY (the
@@ -541,6 +567,7 @@ impl Session {
             tags,
             agent_link,
             receipt,
+            colors,
         } = launch;
         if !valid_size(cols, rows) {
             bail!("terminal size must be 2–500 columns and 1–200 rows");
@@ -576,6 +603,7 @@ impl Session {
             state_dir: host.state.to_string_lossy().into_owned(),
             kill_grace_ms: daemon::config().kill_grace.as_millis() as u64,
             receipt: Some(receipt),
+            colors,
         };
         let (stream, hello) = start_holder(&host.socket, &launch, &cwd, &env)?;
         let version = hello.version;
@@ -635,6 +663,8 @@ impl Session {
             // Off from a holder older than link version 4, which never
             // reports it.
             application_cursor_keys: session.application_cursor_keys,
+            // Unknown from a holder older than link version 7.
+            bracketed_paste: session.bracketed_paste,
             // The holder keeps the Create's receipt for the next daemon.
             request_id: receipt.map(|receipt| receipt.request_id),
         }));
@@ -923,6 +953,10 @@ enum Request {
         max_lines: Option<u32>,
         whole: bool,
         replies: Vec<SyncSender<ServerMessage>>,
+    },
+    /// A `ClearHistory` waiting for the holder's `HistoryCleared`.
+    ClearHistory {
+        ack: SyncSender<ClearOutcome>,
     },
 }
 
@@ -1557,6 +1591,29 @@ impl Worker {
                 max_lines,
                 reply,
             } => self.screen(scrollback, max_lines, reply),
+            Command::ClearHistory { ack } => {
+                let outcome = match &self.link {
+                    _ if self.removed => Some(ClearOutcome::Removed),
+                    None => Some(ClearOutcome::NotLinked),
+                    Some(link) if link.version < link::CLEAR_HISTORY_VERSION => {
+                        Some(ClearOutcome::Unsupported)
+                    }
+                    Some(_) => {
+                        let req = self.next_req;
+                        if self.tell(link::encode(kind::CLEAR_HISTORY, &link::Req { req }, &[])) {
+                            self.next_req += 1;
+                            self.requests
+                                .insert(req, Request::ClearHistory { ack: ack.clone() });
+                            None
+                        } else {
+                            Some(ClearOutcome::NotLinked)
+                        }
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    let _ = ack.send(outcome);
+                }
+            }
             Command::Update { name, tags, ack } => {
                 let applied = !self.removed;
                 if applied {
@@ -2136,6 +2193,11 @@ impl Worker {
             Request::Detach { ack } => {
                 let _ = ack.send(());
             }
+            Request::ClearHistory { ack } => {
+                let _ = ack.send(ClearOutcome::Failed(
+                    "the session's holder answered with a snapshot".into(),
+                ));
+            }
             // Not a snapshot's: answered on its own (`screen_text`).
             Request::Screen { replies, .. } => {
                 let error = ServerMessage::error(
@@ -2240,6 +2302,9 @@ impl Worker {
             if let Some(application) = update.application_cursor_keys {
                 info.application_cursor_keys = application;
             }
+            if let Some(bracketed) = update.bracketed_paste {
+                info.bracketed_paste = Some(bracketed);
+            }
             *info != before
         };
         if changed {
@@ -2295,6 +2360,19 @@ impl Worker {
                 }
                 Err(_) => {}
             },
+            kind::HISTORY_CLEARED => {
+                if let Ok(reply) = frame.meta::<link::HistoryCleared>() {
+                    if let Some(Request::ClearHistory { ack }) = self.requests.remove(&reply.req) {
+                        let _ = ack.send(match reply.outcome.as_str() {
+                            "cleared" => ClearOutcome::Cleared,
+                            "alternate_screen" => ClearOutcome::AlternateScreen,
+                            _ => ClearOutcome::Failed(
+                                reply.error.unwrap_or_else(|| reply.outcome.clone()),
+                            ),
+                        });
+                    }
+                }
+            }
             kind::SCREEN_REPLY => {
                 if let Ok(reply) = frame.meta::<link::ScreenReply>() {
                     if let Some(Request::Screen {
@@ -2502,6 +2580,9 @@ impl Worker {
                         let _ = reply.send(error.clone());
                     }
                 }
+                Request::ClearHistory { ack } => {
+                    let _ = ack.send(ClearOutcome::NotLinked);
+                }
                 Request::Final { .. } => final_screen = true,
                 Request::Replace { .. } | Request::Resync { .. } => {}
             }
@@ -2548,6 +2629,9 @@ impl Worker {
                     for reply in replies {
                         let _ = reply.send(error.clone());
                     }
+                }
+                Request::ClearHistory { ack } => {
+                    let _ = ack.send(ClearOutcome::Removed);
                 }
                 _ => {}
             }

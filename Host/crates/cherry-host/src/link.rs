@@ -72,6 +72,18 @@
 //!   (see `session::Worker::pace`); `null` lifts it. A holder without a daemon
 //!   reads freely. An older holder is never sent it, and is never held
 //!   back: its slow clients lag and are resynchronized instead.
+//! - Version 7 adds bracketed paste (DECSET 2004), as a field:
+//!   `bracketed_paste` in `Info` and in the hello's session, which a daemon
+//!   takes as unknown from an older holder; and, daemon to holder,
+//!   `ClearHistory{req}`: the holder clears its terminal's history as
+//!   `ED 3` would at that point of the output it has read, and answers
+//!   `HistoryCleared{req, outcome}` (`cleared`, `alternate_screen`: it
+//!   shows the alternate screen, which ED 3 leaves alone, or `failed`). An
+//!   older holder is never sent it (the client that asked is told the
+//!   session cannot).
+//!   `Launch` gains `colors`, the colours and appearance its terminal
+//!   reports to the program; a holder that does not know it reports its
+//!   defaults.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -85,7 +97,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 6;
+pub const LINK_VERSION: u16 = 7;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
@@ -94,6 +106,9 @@ pub const SCREEN_LINES_VERSION: u16 = 3;
 pub const RESIZED_SNAPSHOT_VERSION: u16 = 5;
 /// The oldest link version whose holders take `Pace`.
 pub const PACE_VERSION: u16 = 6;
+/// The oldest link version whose holders report bracketed paste and take
+/// `ClearHistory`.
+pub const CLEAR_HISTORY_VERSION: u16 = 7;
 /// The oldest link version this daemon adopts holders of.
 pub const MIN_LINK_VERSION: u16 = 1;
 /// Frames are at most this long (an 8 MiB snapshot, and room to spare).
@@ -119,6 +134,8 @@ pub mod kind {
     pub const EVENT: u8 = 10;
     /// Version 2.
     pub const SCREEN_REPLY: u8 = 11;
+    /// Version 7.
+    pub const HISTORY_CLEARED: u8 = 12;
 
     pub const LAUNCH: u8 = 64;
     pub const INPUT: u8 = 65;
@@ -137,6 +154,8 @@ pub mod kind {
     pub const ATTENDED: u8 = 75;
     /// Version 6.
     pub const PACE: u8 = 76;
+    /// Version 7.
+    pub const CLEAR_HISTORY: u8 = 77;
 
     /// The link version that introduced a daemon-to-holder kind.
     pub fn since(kind: u8) -> u16 {
@@ -144,6 +163,7 @@ pub mod kind {
             SCREEN | UPDATE => 2,
             ATTENDED => 5,
             PACE => 6,
+            CLEAR_HISTORY => super::CLEAR_HISTORY_VERSION,
             _ => 1,
         }
     }
@@ -465,6 +485,10 @@ pub struct SessionState {
     /// Version 4: whether cursor keys are in application mode (DECCKM).
     #[serde(default)]
     pub application_cursor_keys: bool,
+    /// Version 7: whether bracketed paste (DECSET 2004) is on; None from an
+    /// older holder, which never reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
 }
 
 /// The `Create` that made a session, so that a daemon adopting it keeps
@@ -542,6 +566,11 @@ pub struct Launch {
     pub kill_grace_ms: u64,
     #[serde(default)]
     pub receipt: Option<Receipt>,
+    /// The colours and appearance the session's terminal reports to its
+    /// program (`cherry_protocol::ClientMessage::Create`'s `colors`); None
+    /// for the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colors: Option<cherry_protocol::TerminalColors>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -668,6 +697,17 @@ pub struct ScreenRequest {
     pub max_lines: Option<u32>,
 }
 
+/// Holder to daemon, version 7: how a `ClearHistory` went.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct HistoryCleared {
+    pub req: u64,
+    /// `cleared` (also when the erase waits for the output to finish a
+    /// UTF-8 character), `alternate_screen` or `failed`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// The data is the screen as UTF-8 text.
 #[derive(Serialize, Deserialize)]
 pub struct ScreenReply {
@@ -715,6 +755,9 @@ pub struct Info {
     /// Version 4: whether cursor keys are in application mode (DECCKM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_cursor_keys: Option<bool>,
+    /// Version 7: whether bracketed paste (DECSET 2004) is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
 }
 
 impl Info {
@@ -896,8 +939,18 @@ mod tests {
         let info: Info = serde_json::from_str(r#"{"application_cursor_keys":false}"#).unwrap();
         assert_eq!(info.application_cursor_keys, Some(false));
         assert!(!info.is_empty());
+        // Version 7's, likewise.
+        assert_eq!(
+            serde_json::to_string(&Info {
+                bracketed_paste: Some(true),
+                ..Info::default()
+            })
+            .unwrap(),
+            r#"{"bracketed_paste":true}"#
+        );
         let old: Info = serde_json::from_str(r#"{"alternate_screen":true}"#).unwrap();
         assert_eq!(old.application_cursor_keys, None);
+        assert_eq!(old.bracketed_paste, None);
         let old: SessionState = serde_json::from_str(
             r#"{"name":"n","cwd":"/","command":[],"cols":80,"rows":24,"running":true,"pid":7}"#,
         )
@@ -906,9 +959,10 @@ mod tests {
             (
                 old.alternate_screen,
                 old.kitty_keyboard_flags,
-                old.application_cursor_keys
+                old.application_cursor_keys,
+                old.bracketed_paste
             ),
-            (false, 0, false)
+            (false, 0, false, None)
         );
         let request: ScreenRequest =
             serde_json::from_str(r#"{"req":1,"scrollback":true}"#).unwrap();
@@ -944,6 +998,25 @@ mod tests {
         assert!(decoded.meta::<Attended>().unwrap().attached);
         let later: Attended = serde_json::from_str(r#"{"attached":false,"clients":2}"#).unwrap();
         assert!(!later.attached);
+    }
+
+    #[test]
+    fn history_is_cleared_and_colours_launched_only_from_version_7() {
+        assert_eq!(kind::since(kind::CLEAR_HISTORY), CLEAR_HISTORY_VERSION);
+        const { assert!(LINK_VERSION >= CLEAR_HISTORY_VERSION) };
+        let launch = r#"{"id":"s","name":"n","command":["sh"],"cols":80,"rows":24,"created_at":1,"state_dir":"/tmp","kill_grace_ms":500}"#;
+        let old: Launch = serde_json::from_str(launch).unwrap();
+        assert_eq!(old.colors, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("colors"));
+        let with: Launch = serde_json::from_str(&launch.replace(
+            r#""kill_grace_ms":500"#,
+            r##""kill_grace_ms":500,"colors":{"foreground":"#000000","background":"#ffffff","dark":false}"##,
+        ))
+        .unwrap();
+        assert_eq!(
+            with.colors.map(|colors| (colors.background, colors.dark)),
+            Some((cherry_protocol::Rgb([255, 255, 255]), false))
+        );
     }
 
     #[test]

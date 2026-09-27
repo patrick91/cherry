@@ -406,9 +406,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.alternate_screen,
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
+            info.bracketed_paste,
             info.request_id.clone()
         ),
-        (false, 0, false, None)
+        (false, 0, false, None, None)
     );
     let old_id = old.id.clone();
     thread::scope(|scope| {
@@ -456,13 +457,17 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
         );
         client.join().unwrap();
     });
-    // What version 1 cannot do: read its screen, or keep a new name for
-    // the next daemon (this one keeps it).
+    // What version 1 cannot do: read its screen, clear its history, or
+    // keep a new name for the next daemon (this one keeps it).
     match host.call(ClientMessage::Screen {
         id: old.id.clone(),
         scrollback: false,
         max_lines: None,
     }) {
+        ServerMessage::Error { code, .. } => assert_eq!(code, error_code::UNSUPPORTED_OPERATION),
+        other => panic!("{other:?}"),
+    }
+    match host.call(ClientMessage::ClearHistory { id: old.id.clone() }) {
         ServerMessage::Error { code, .. } => assert_eq!(code, error_code::UNSUPPORTED_OPERATION),
         other => panic!("{other:?}"),
     }
@@ -521,6 +526,7 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
                 "alternate_screen": true,
                 "kitty_keyboard_flags": 7,
                 "application_cursor_keys": true,
+                "bracketed_paste": true,
             }, "receipt": {"request_id": request_id, "fingerprint": "f", "extra": 1}}),
         ),
     );
@@ -546,9 +552,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.alternate_screen,
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
+            info.bracketed_paste,
             info.request_id.as_deref()
         ),
-        (true, 7, true, Some(request_id.as_str()))
+        (true, 7, true, Some(true), Some(request_id.as_str()))
     );
     new.send(
         link::INFO,
@@ -568,6 +575,37 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
         b"",
     );
     host.wait(&new.id, |s| !s.application_cursor_keys);
+    new.send(link::INFO, newer, json!({"bracketed_paste": false}), b"");
+    let changed = host.wait(&new.id, |s| s.bracketed_paste == Some(false));
+    assert!(!changed.application_cursor_keys);
+    // It is asked to clear its history, and the client hears how that went.
+    let new_id = new.id.clone();
+    thread::scope(|scope| {
+        let cleared = scope.spawn(|| host.call(ClientMessage::ClearHistory { id: new_id.clone() }));
+        let request = new.expect(link::CLEAR_HISTORY);
+        new.send(
+            link::HISTORY_CLEARED,
+            newer,
+            json!({"req": request.meta["req"], "outcome": "cleared"}),
+            b"",
+        );
+        assert_eq!(cleared.join().unwrap(), ServerMessage::Ok);
+        let kept = scope.spawn(|| host.call(ClientMessage::ClearHistory { id: new_id.clone() }));
+        let request = new.expect(link::CLEAR_HISTORY);
+        new.send(
+            link::HISTORY_CLEARED,
+            newer,
+            json!({"req": request.meta["req"], "outcome": "alternate_screen"}),
+            b"",
+        );
+        match kept.join().unwrap() {
+            ServerMessage::Error { code, message } => {
+                assert_eq!(code, error_code::REQUEST_FAILED);
+                assert!(message.contains("alternate screen"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    });
     host.kill(&new.id);
     new.expect(link::KILL);
     drop(new);
@@ -1116,6 +1154,32 @@ fn replacing_the_daemon_hands_its_sessions_to_the_next_one() {
     screen.wait_text(&mut socket, "ECHO:REATTACHED");
     assert_eq!(host.session(&finished.id).exit_code, Some(4));
     fs::metadata(&host.socket).unwrap();
+}
+
+#[test]
+fn a_restart_hands_running_sessions_to_the_next_daemon_of_the_same_version() {
+    let mut host = Host::new();
+    let session = echo(&host);
+    let finished = host.create(shell("exit 5"));
+    host.wait(&finished.id, |s| s.state == SessionState::Exited);
+    // Shutdown refuses while a session runs; Restart does not.
+    match host.call(ClientMessage::Shutdown) {
+        ServerMessage::Error { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(host.call(ClientMessage::Restart), ServerMessage::Ok);
+    // The client starts the next daemon at once.
+    host.respawn();
+    assert!(host.wait_retired().iter().all(|status| status.success()));
+    let sessions = host.adopted();
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    let adopted = sessions.iter().find(|s| s.id == session.id).unwrap();
+    assert_eq!(
+        (adopted.state, adopted.pid),
+        (SessionState::Running, session.pid)
+    );
+    assert_eq!(host.session(&finished.id).exit_code, Some(5));
+    echoes(&host, &session.id, "RESTARTED");
 }
 
 #[test]

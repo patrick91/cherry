@@ -44,7 +44,10 @@
 //! request after a mismatch, or a `Replace` from a client speaking a lower
 //! version, is answered with `Error{version_mismatch}`. Either way the
 //! connection then closes; a frame the host cannot decode closes it
-//! unanswered. A host speaking a higher version is reported, never replaced.
+//! unanswered. Once the versions match (protocol 7), a JSON request it
+//! cannot decode is answered with an `Error` instead (`unsupported_operation`
+//! for an unknown `op`, `request_failed` for fields it cannot take; see
+//! [`undecodable_request`]) and the connection carries on. A host speaking a higher version is reported, never replaced.
 //!
 //! ## Frozen forever
 //!
@@ -108,7 +111,7 @@ use std::{
 
 pub mod priority;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 /// The environment variable in which the CLI tells a remote
 /// `cherry-host gateway` which host identity it expects
 /// (`--expected-host-id`, or the host an attachment reconnects to). The
@@ -249,10 +252,53 @@ pub struct SessionInfo {
     /// False from a host, or a session's holder, that does not report it.
     #[serde(default)]
     pub application_cursor_keys: bool,
+    /// Whether the program turned on bracketed paste (DECSET 2004), as the
+    /// host's terminal has it: a paste is then wrapped in `ESC [ 200 ~` and
+    /// `ESC [ 201 ~`, so the program takes it as text rather than typed
+    /// lines. None when it is not known: from a host older than protocol 7,
+    /// or for a session whose holder predates link version 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
     /// The `request_id` of the `Create` that made the session. It survives
     /// host restarts; None for a session whose host did not record it.
     #[serde(default)]
     pub request_id: Option<String>,
+}
+
+/// The colours a session's terminal reports (`ClientMessage::Create`'s
+/// `colors`), each as `#rrggbb`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalColors {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    /// The foreground's when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Rgb>,
+    /// A dark colour scheme rather than a light one.
+    pub dark: bool,
+}
+
+/// A colour, `#rrggbb` in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb(pub [u8; 3]);
+
+impl Serialize for Rgb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let [r, g, b] = self.0;
+        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
+    }
+}
+
+impl<'de> Deserialize<'de> for Rgb {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let hex = text
+            .strip_prefix('#')
+            .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| serde::de::Error::custom(format!("not a #rrggbb colour: {text:?}")))?;
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).unwrap_or(0);
+        Ok(Self([channel(0), channel(2), channel(4)]))
+    }
 }
 
 /// The process group in the foreground of a session's terminal.
@@ -365,6 +411,15 @@ pub enum ClientMessage {
         /// and `MAX_TAG_BYTES`.
         #[serde(default)]
         tags: BTreeMap<String, String>,
+        /// The colours and appearance the session's terminal reports to its
+        /// program (OSC 10, 11 and 12 queries, and the colour-scheme query
+        /// `CSI ? 996 n`): the client's own terminal's, so a program that
+        /// asks sees the terminal it is shown in. Without them (or from a
+        /// host older than protocol 7, which ignores them) the host reports
+        /// light grey on black, dark. Not part of what a retry must repeat
+        /// (like the size).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        colors: Option<TerminalColors>,
     },
     Attach {
         id: String,
@@ -420,6 +475,13 @@ pub enum ClientMessage {
     },
     /// A host with live sessions refuses shutdown.
     Shutdown,
+    /// Make way for a new host of this version (protocol 7), as `Replace`
+    /// does for a newer one: the host stops accepting connections, releases
+    /// its socket and lock, answers `Ok` and exits, whatever sessions run.
+    /// They carry on in their holders, which register with the host started
+    /// next (`cherry restart` starts it). For a host whose executable was
+    /// replaced or removed by an update of the same protocol.
+    Restart,
     /// Push `ServerMessage::Event`s on this connection from now on; answered
     /// `Ok`. See the crate documentation.
     Subscribe,
@@ -444,6 +506,15 @@ pub enum ClientMessage {
         scrollback: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_lines: Option<u32>,
+    },
+    /// Clear the history above a session's screen (protocol 7), as `ED 3`
+    /// (`CSI 3 J`) would at this point of its output: snapshots, `Screen`
+    /// and every later attachment show none of it. Answered `Ok`;
+    /// `Error{unsupported_operation}` for a session whose holder predates
+    /// link version 7. Attached clients keep the history their own
+    /// terminals show.
+    ClearHistory {
+        id: String,
     },
     /// Rename a session or replace its tags (the whole map); answered `Ok`.
     /// A field left out is kept.
@@ -1331,6 +1402,16 @@ pub fn frame_length(word: [u8; 4]) -> io::Result<usize> {
 }
 
 pub fn read_frame<R: Read, T: Message>(reader: &mut R) -> io::Result<Option<T>> {
+    match read_frame_body(reader)? {
+        Some(bytes) => T::decode_body(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// A frame's body (what follows its length word), undecoded; None at end
+/// of file. For a reader that answers a frame it cannot decode (see
+/// `RequestProblem`).
+pub fn read_frame_body<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     loop {
         match reader.read(&mut header[..1]) {
@@ -1344,7 +1425,37 @@ pub fn read_frame<R: Read, T: Message>(reader: &mut R) -> io::Result<Option<T>> 
     let len = frame_length(header)?;
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
-    T::decode_body(&bytes).map(Some)
+    Ok(Some(bytes))
+}
+
+/// What a host answers a JSON request of a negotiated connection that it
+/// cannot decode (protocol 7): an unknown `op` (a newer client's request)
+/// is `unsupported_operation`, a known one with fields it cannot take
+/// `request_failed`, each with the frame's `req` when that is a number. The
+/// connection carries on. None for a body that is no JSON object with an
+/// `op`, which ends the connection unanswered.
+pub fn undecodable_request(body: &[u8], error: &io::Error) -> Option<Response> {
+    if !is_json(body) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let op = value.get("op")?.as_str()?.to_string();
+    let req = value.get("req").and_then(serde_json::Value::as_u64);
+    let unknown = serde_json::from_value::<ClientMessage>(serde_json::json!({ "op": op }))
+        .err()
+        .is_some_and(|error| error.to_string().contains("unknown variant"));
+    let message = if unknown {
+        ServerMessage::error(
+            error_code::UNSUPPORTED_OPERATION,
+            format!("this host (protocol {PROTOCOL_VERSION}) does not know the request {op:?}"),
+        )
+    } else {
+        ServerMessage::error(
+            error_code::REQUEST_FAILED,
+            format!("malformed {op} request: {error}"),
+        )
+    };
+    Some(Response::new(req, message))
 }
 
 /// Terminal bytes inside JSON messages (`SendInput`) travel as standard
@@ -1989,6 +2100,7 @@ mod tests {
             alternate_screen: true,
             kitty_keyboard_flags: 31,
             application_cursor_keys: true,
+            bracketed_paste: Some(true),
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
         }
     }
@@ -2009,6 +2121,24 @@ mod tests {
                 rows: 200,
                 owner: Some("com.example.cherry".into()),
                 tags: BTreeMap::from([("tab".into(), "6d1f".into())]),
+                colors: None,
+            },
+            ClientMessage::Create {
+                request_id: "d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3c".into(),
+                name: "light".into(),
+                cwd: "/".into(),
+                command: Vec::new(),
+                env: BTreeMap::new(),
+                cols: 80,
+                rows: 24,
+                owner: None,
+                tags: BTreeMap::new(),
+                colors: Some(TerminalColors {
+                    foreground: Rgb([0x1f, 0x23, 0x28]),
+                    background: Rgb([0xff, 0xff, 0xff]),
+                    cursor: None,
+                    dark: false,
+                }),
             },
             ClientMessage::Attach {
                 id: "s".into(),
@@ -2068,6 +2198,8 @@ mod tests {
                 name: None,
                 tags: None,
             },
+            ClientMessage::ClearHistory { id: "s".into() },
+            ClientMessage::Restart,
         ]
     }
 
@@ -2378,7 +2510,7 @@ mod tests {
             added.starts_with(r#"{"type":"event","event":{"kind":"added","session":{"id":"3f6c","#)
         );
         assert!(added.contains(
-            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
+            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"bracketed_paste":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
         ), "{added}");
         assert_eq!(
             json(&ServerMessage::Sessions {
@@ -2409,6 +2541,100 @@ mod tests {
     }
 
     #[test]
+    fn requests_that_cannot_be_decoded_are_answered_not_dropped() {
+        let error = io::Error::new(io::ErrorKind::InvalidData, "bad");
+        let answer = |body: &str| undecodable_request(body.as_bytes(), &error);
+        match answer(r#"{"op":"teleport","req":7,"id":"s"}"#) {
+            Some(Response {
+                req: Some(7),
+                message: ServerMessage::Error { code, .. },
+            }) => assert_eq!(code, error_code::UNSUPPORTED_OPERATION),
+            other => panic!("{other:?}"),
+        }
+        let colors = r##"{"op":"create","req":8,"request_id":"r","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"colors":{"foreground":"#ｅ5e5e5","background":"#000000","dark":true}}"##;
+        match answer(colors) {
+            Some(Response {
+                req: Some(8),
+                message: ServerMessage::Error { code, .. },
+            }) => assert_eq!(code, error_code::REQUEST_FAILED),
+            other => panic!("{other:?}"),
+        }
+        // No req, or not a JSON request at all.
+        assert!(matches!(
+            answer(r#"{"op":"teleport"}"#),
+            Some(Response { req: None, .. })
+        ));
+        assert!(answer("{not json").is_none());
+        assert!(answer(r#"{"type":"ok"}"#).is_none());
+        assert!(undecodable_request(&[2, 1, 2], &error).is_none());
+    }
+
+    #[test]
+    fn protocol_7_messages_have_these_shapes() {
+        assert_eq!(
+            json(&ClientMessage::ClearHistory { id: "s".into() }),
+            r#"{"op":"clear_history","id":"s"}"#
+        );
+        assert_eq!(json(&ClientMessage::Restart), r#"{"op":"restart"}"#);
+        let create = |colors| ClientMessage::Create {
+            request_id: "r".into(),
+            name: "n".into(),
+            cwd: "/".into(),
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            owner: None,
+            tags: BTreeMap::new(),
+            colors,
+        };
+        assert_eq!(
+            json(&create(Some(TerminalColors {
+                foreground: Rgb([0x1f, 0x23, 0x28]),
+                background: Rgb([0xff, 0xfe, 0x0a]),
+                cursor: Some(Rgb([0, 0x80, 0xff])),
+                dark: false,
+            }))),
+            r##"{"op":"create","request_id":"r","name":"n","cwd":"/","command":[],"env":{},"cols":80,"rows":24,"owner":null,"tags":{},"colors":{"foreground":"#1f2328","background":"#fffe0a","cursor":"#0080ff","dark":false}}"##
+        );
+        // Left out without colours, so an older host sees what it knows.
+        assert!(!json(&create(None)).contains("colors"));
+        let colors: TerminalColors = serde_json::from_str(
+            r##"{"foreground":"#E5E5E5","background":"#000000","dark":true}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            colors,
+            TerminalColors {
+                foreground: Rgb([0xe5, 0xe5, 0xe5]),
+                background: Rgb([0, 0, 0]),
+                cursor: None,
+                dark: true,
+            }
+        );
+        for bad in [
+            "\"e5e5e5\"",
+            "\"#e5e5\"",
+            "\"#gggggg\"",
+            "\"#e5e5e5e5\"",
+            "7",
+        ] {
+            assert!(serde_json::from_str::<Rgb>(bad).is_err(), "{bad}");
+        }
+        // Unknown until the holder reports it: left out, and read as None.
+        let unknown = SessionInfo {
+            bracketed_paste: None,
+            ..session_info()
+        };
+        assert!(!json(&unknown).contains("bracketed_paste"));
+        let off = SessionInfo {
+            bracketed_paste: Some(false),
+            ..session_info()
+        };
+        assert!(json(&off).contains(r#""bracketed_paste":false"#));
+    }
+
+    #[test]
     fn create_metadata_and_new_session_fields_are_optional() {
         let create = serde_json::from_str::<ClientMessage>(
             r#"{"op":"create","request_id":"r","name":"n","cwd":"/","command":[],"cols":80,"rows":24}"#,
@@ -2416,7 +2642,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             create,
-            ClientMessage::Create { owner: None, ref tags, ref env, .. } if tags.is_empty() && env.is_empty()
+            ClientMessage::Create { owner: None, ref tags, ref env, colors: None, .. } if tags.is_empty() && env.is_empty()
         ));
         let info = serde_json::from_str::<SessionInfo>(
             r#"{"id":"s","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"exited","pid":null,"exit_code":0,"attached":false,"exit_signal":null}"#,
@@ -2435,9 +2661,10 @@ mod tests {
                 info.alternate_screen,
                 info.kitty_keyboard_flags,
                 info.application_cursor_keys,
+                info.bracketed_paste,
                 info.request_id
             ),
-            (false, 0, false, None)
+            (false, 0, false, None, None)
         );
         // What a host of an earlier stage sends.
         assert_eq!(

@@ -427,7 +427,7 @@ final class ProjectWindowToasts: ObservableObject {
 
 /// The floating bars at the bottom of a terminal pane
 /// (`CommandExitStatusBar`, `PersistentSessionReconnectBar`,
-/// `PersistentSessionEndedBar`): the window's toast rises above them, so it
+/// `PersistentSessionFallbackBar`, `PersistentSessionEndedBar`): the window's toast rises above them, so it
 /// never hides their buttons.
 struct ProjectWindowToastObstacles: PreferenceKey {
     static let defaultValue: [Anchor<CGRect>] = []

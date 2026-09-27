@@ -2572,6 +2572,7 @@ mod tests {
             alternate_screen: false,
             kitty_keyboard_flags: 0,
             application_cursor_keys: false,
+            bracketed_paste: None,
             request_id: None,
         };
         let running = SessionEvent::Changed {

@@ -25,6 +25,10 @@ final class PersistentHarness {
     let settings = Recorder(SessionPersistenceSettings.defaults)
     let configurations = Recorder<[ShellProcessController.Configuration]>([])
     let installationProblem = Recorder<String?>(nil)
+    /// What new sessions' terminals report of their colours.
+    let terminalColors = Recorder<HostTerminalColors?>(
+        HostTerminalColors(foreground: "#e5e5e5", background: "#101010", dark: true)
+    )
     /// The policy's `cleanExitMinimumRunTime`, for workspaces made after
     /// it is set.
     var cleanExitMinimumRunTime: TimeInterval = 1
@@ -60,6 +64,7 @@ final class PersistentHarness {
         let control = control
         let configurations = configurations
         let installationProblem = installationProblem
+        let terminalColors = terminalColors
         hosting = PersistentLocalSessions(
             owner: "CherryTests",
             control: { control },
@@ -79,6 +84,7 @@ final class PersistentHarness {
                 ))
             },
             status: status,
+            terminalColors: { terminalColors.value },
             configuration: configuration
         )
     }
@@ -1273,6 +1279,168 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     fake.respond = nil
     fake.launchFailure = nil
     #expect(await harness.fake.wait(timeout: 5) { harness.requestIDs("remove").contains(unreachableSession) })
+}
+
+@Test @MainActor func aSessionsTerminalReportsTheColoursAndAppearanceOfTheAppsTheme() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    harness.terminalColors.value = HostTerminalColors(
+        foreground: "#1f2328", background: "#ffffff", cursor: "#0969da", dark: false
+    )
+    let tab = workspace.addSession()
+    #expect(await harness.waitUntilAttached(tab))
+    let create = try #require(harness.creates().last)
+    let colors = try #require(create.json["colors"] as? [String: Any])
+    #expect(colors["foreground"] as? String == "#1f2328")
+    #expect(colors["background"] as? String == "#ffffff")
+    #expect(colors["cursor"] as? String == "#0969da")
+    #expect(colors["dark"] as? Bool == false)
+    // The app's own theme, for the appearance it shows.
+    let settings = TerminalSettings.shared
+    let dark = try #require(settings.hostTerminalColors(for: .dark))
+    let light = try #require(settings.hostTerminalColors(for: .light))
+    #expect(dark.dark && !light.dark)
+    #expect(dark.background == HostTerminalColors.normalized(settings.ghosttyThemeColors(for: .dark).background))
+    #expect(light.foreground == HostTerminalColors.normalized(settings.ghosttyThemeColors(for: .light).foreground))
+}
+
+@Test @MainActor func aTabWhoseCreateTheHostRejectsSaysSoAndRestartTriesTheHostAgain() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let limit = "host session limit reached (128 including exited sessions; remove finished sessions)"
+    harness.fake.respond = { request, _ in
+        request.op == "create" ? .answer(.error(code: "request_failed", message: limit)) : nil
+    }
+    let tab = workspace.addSession()
+    #expect(tab.isPersistentLocalSession)
+    #expect(await harness.fake.wait { !tab.isPersistentLocalSession })
+    #expect(tab.state == .live)
+    #expect(tab.isRunning)
+    // The tab and Settings › Sessions say why; a rejection of one request
+    // leaves new tabs persistent.
+    #expect(tab.persistentFallbackReason?.contains(limit) == true)
+    #expect(harness.status.lastLaunchFailure?.contains(limit) == true)
+    #expect(harness.status.localSessionsUnavailableReason == nil)
+    #expect(harness.hosting.canHostNewTabs())
+
+    // Restart tries the host again, and the tab is persistent once it can.
+    harness.fake.respond = nil
+    #expect(tab.restart())
+    #expect(tab.isPersistentLocalSession)
+    #expect(await harness.waitUntilAttached(tab))
+    #expect(tab.persistentFallbackReason == nil)
+    #expect(harness.status.lastLaunchFailure == nil)
+    #expect(harness.creates().count == 2)
+    // Its saved record names the session, so it comes back after a relaunch.
+    let record = try #require(workspace.makeStateRecord(root: harness.project.path, collapsedAgentGroupIDs: [])
+        .sessions.first { $0.id == tab.id })
+    #expect(record.isRestorable)
+}
+
+@Test @MainActor func retryStartsAFallbackTabInTheHostEvenWhileNewTabsRunNatively() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    // The helper cannot start the host: new tabs run natively for a while.
+    harness.fake.launchFailure = "cherry-host could not start"
+    let tab = workspace.addSession()
+    #expect(await harness.fake.wait { !tab.isPersistentLocalSession })
+    #expect(tab.persistentFallbackReason?.contains("cherry-host could not start") == true)
+    #expect(!harness.hosting.canHostNewTabs())
+    // Restart follows the host's state: still native, still marked.
+    harness.fake.launchFailure = nil
+    #expect(tab.restart())
+    #expect(!tab.isPersistentLocalSession)
+    #expect(tab.persistentFallbackReason != nil)
+    // Retry asks the host at once.
+    #expect(tab.retryPersistentSession())
+    #expect(tab.isPersistentLocalSession)
+    #expect(await harness.waitUntilAttached(tab))
+    #expect(tab.persistentFallbackReason == nil)
+    #expect(!tab.retryPersistentSession())
+}
+
+@Test @MainActor func aTabWaitsLongerForItsSessionWhileItsOtherCreatesAreAhead() async throws {
+    var configuration = PersistentHarness.fastConfiguration
+    configuration.creationTimeout = 0.6
+    let harness = try PersistentHarness(configuration: configuration)
+    // The host answers no Create for now (it starts holders one at a time,
+    // and one hangs).
+    harness.fake.respond = { request, _ in request.op == "create" ? .silence : nil }
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let first = workspace.addSession()
+    #expect(await harness.fake.wait { harness.creates().count == 1 })
+    let second = workspace.addSession()
+    #expect(await harness.fake.wait { harness.creates().count == 2 })
+    // The first gives up after its timeout; the second, behind it, waits
+    // twice as long.
+    #expect(await harness.fake.wait(timeout: 3) { !first.isPersistentLocalSession })
+    #expect(second.isPersistentLocalSession)
+    #expect(await harness.fake.wait(timeout: 3) { !second.isPersistentLocalSession })
+    #expect(second.persistentFallbackReason?.contains("did not start a session") == true)
+
+    // Their Creates answer (resent after the answers were lost), and the
+    // sessions they made are ended: no launch is left for a later test's
+    // quit to wait for.
+    harness.fake.respond = nil
+    let settled = ContinuousClock.now
+    await TerminalSession.waitForPersistentLaunches(upTo: .seconds(30))
+    #expect(ContinuousClock.now - settled < .seconds(30))
+
+}
+
+@Test @MainActor func aHostsReasonThatArrivesAfterATabGaveUpIsTheOneItShows() async throws {
+    var configuration = PersistentHarness.fastConfiguration
+    configuration.creationTimeout = 0.3
+    let harness = try PersistentHarness(configuration: configuration)
+    let held = FakeHeldRequest()
+    harness.fake.respond = { request, connection in
+        request.op == "create" ? held.hold(request, on: connection) : nil
+    }
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    // A Create the host rejects after the tab gave up: its reason replaces
+    // the timeout's.
+    let late = workspace.addSession()
+    #expect(await harness.fake.wait { held.isHeld })
+    #expect(await harness.fake.wait(timeout: 3) { !late.isPersistentLocalSession })
+    held.answer(.error(code: "request_failed", message: "the session's holder exited before starting the session"))
+    #expect(await harness.fake.wait { late.persistentFallbackReason?.contains("holder exited") == true })
+}
+
+@Test func theAppWaitsForASessionLongerThanTheHostWaitsForItsHolder() throws {
+    // Host/crates/cherry-host/src/session.rs: `LAUNCH_TIMEOUT`, how long the
+    // daemon waits for a new holder. The app must wait longer, or a holder
+    // that fails to start is reported as a timeout instead of the host's
+    // rejection with its reason.
+    let source = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Host/crates/cherry-host/src/session.rs")
+    let text = try String(contentsOf: source, encoding: .utf8)
+    let match = try #require(text.firstMatch(of: /const LAUNCH_TIMEOUT: Duration = Duration::from_secs\((\d+)\);/))
+    let hostTimeout = try #require(TimeInterval(String(match.1)))
+    let configuration = PersistentLocalSessions.Configuration()
+    #expect(configuration.creationTimeout >= hostTimeout + 2)
+    // Input queued meanwhile outlives the wait for the session.
+    #expect(configuration.queuedInputTimeout > configuration.creationTimeout)
 }
 
 @Test @MainActor func aTabWhoseSessionTheHostDoesNotStartInTimeRunsNativelyAndALateSessionIsEnded() async throws {

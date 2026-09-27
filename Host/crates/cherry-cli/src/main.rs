@@ -68,6 +68,11 @@ enum Action {
     Start,
     /// Stop the host daemon; refused while it owns any running sessions.
     Shutdown,
+    /// Restart the local host daemon, whatever sessions run: they carry on
+    /// in their holders, and the new daemon (this cherry's cherry-host)
+    /// adopts them. For a daemon whose executable an update replaced or
+    /// removed.
+    Restart,
     /// List sessions on the selected host.
     List {
         #[arg(long)]
@@ -146,9 +151,11 @@ impl Action {
             Action::List { .. } => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
             Action::Control => Kind::Control,
-            Action::Shutdown | Action::New { .. } | Action::Kill { .. } | Action::Remove { .. } => {
-                Kind::Mutation
-            }
+            Action::Shutdown
+            | Action::Restart
+            | Action::New { .. }
+            | Action::Kill { .. }
+            | Action::Remove { .. } => Kind::Mutation,
         }
     }
 
@@ -261,6 +268,23 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         )?;
         return Ok(0);
     }
+    // Where to start the next host once this one made way.
+    let restart_socket = match cli.command {
+        Action::Restart if cli.host.is_some() => {
+            bail!("restart is local only");
+        }
+        Action::Restart => {
+            // Found and checked before the running host is asked to stop:
+            // one that cannot be started would leave no host at all.
+            let executable = transport::runnable_host_executable()
+                .context("refusing to restart the host; it keeps running")?;
+            Some((
+                transport::local_socket_path(cli.socket.as_deref())?,
+                executable,
+            ))
+        }
+        _ => None,
+    };
     if let Action::Attach { id, .. } = &cli.command {
         if std::env::var_os("CHERRY_SESSION_ID").is_some_and(|current| current == id.as_str()) {
             bail!("refusing to attach session {id} from inside itself: its output would feed back into its own input");
@@ -300,6 +324,14 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         Action::Shutdown => {
             transport.send(&ClientMessage::Shutdown)?;
             expect_ok(transport, "shutdown acknowledgement")
+        }
+        Action::Restart => {
+            transport.send(&ClientMessage::Restart)?;
+            expect_ok(transport, "restart acknowledgement")?;
+            *slot = None;
+            let (socket, executable) = restart_socket.expect("a restart's socket");
+            transport::start_local_host_from(&executable, &socket, None, false)?;
+            Ok(0)
         }
         Action::List { json } => {
             transport.send(&ClientMessage::List)?;
@@ -355,6 +387,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                 rows: DEFAULT_ROWS,
                 owner,
                 tags: tags.into_iter().collect(),
+                colors: None,
             })?;
             match transport.receive(RPC_TIMEOUT)? {
                 ServerMessage::Created { session } => {

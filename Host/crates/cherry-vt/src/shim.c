@@ -23,9 +23,17 @@ static bool terminal_size(GhosttyTerminal term, void *userdata, GhosttySizeRepor
         && !ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ROWS, &out->rows);
 }
 
+// The head of Rust's `Callbacks`, which is every callback's userdata.
+typedef void (*CherryEventFn)(void *userdata, const void *event);
+typedef struct {
+    CherryEventFn event;
+    // The appearance the colour-scheme query (CSI ? 996 n) reports.
+    bool light;
+} CherryCallbacks;
+
 static bool terminal_color_scheme(GhosttyTerminal term, void *userdata, GhosttyColorScheme *out) {
-    (void)term; (void)userdata;
-    *out = GHOSTTY_COLOR_SCHEME_DARK;
+    (void)term;
+    *out = ((const CherryCallbacks *)userdata)->light ? GHOSTTY_COLOR_SCHEME_LIGHT : GHOSTTY_COLOR_SCHEME_DARK;
     return true;
 }
 
@@ -54,13 +62,6 @@ typedef struct {
     int32_t state;        // progress state (GhosttyTerminalProgressState)
     int32_t progress;     // progress percentage, -1 when omitted
 } CherryEvent;
-
-typedef void (*CherryEventFn)(void *userdata, const CherryEvent *event);
-
-// The head of Rust's `Callbacks`, which is every callback's userdata.
-typedef struct {
-    CherryEventFn event;
-} CherryCallbacks;
 
 static void emit_event(void *userdata, const CherryEvent *event) {
     ((const CherryCallbacks *)userdata)->event(userdata, event);
@@ -145,7 +146,25 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &background);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &foreground);
+    // Grapheme clustering on, as Ghostty's own default, also after a reset
+    // (RIS): cell widths then match the app's terminal, which a snapshot
+    // replays the rows into.
+    GhosttyTerminalModeConfig graphemes = { .mode = ghostty_mode_new(2027, false), .value = true };
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
     if (rc) { ghostty_terminal_free(*out); *out = NULL; }
+    return rc;
+}
+
+// The default foreground, background and cursor colours, which OSC 10, 11
+// and 12 queries report.
+int cherry_vt_set_colors(GhosttyTerminal term, const uint8_t foreground[3],
+                         const uint8_t background[3], const uint8_t cursor[3]) {
+    GhosttyColorRgb fg = { .r = foreground[0], .g = foreground[1], .b = foreground[2] };
+    GhosttyColorRgb bg = { .r = background[0], .g = background[1], .b = background[2] };
+    GhosttyColorRgb cur = { .r = cursor[0], .g = cursor[1], .b = cursor[2] };
+    int rc = ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg);
+    if (!rc) rc = ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg);
+    if (!rc) rc = ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cur);
     return rc;
 }
 

@@ -377,11 +377,21 @@ enum TerminalInputEncoder {
         return Data("\u{1B}[Z".utf8)
     }
 
+    /// Bytes a paste never carries, replaced by a space in either mode, as
+    /// Ghostty (`input/paste.zig`) and xterm do: ESC (so a paste cannot end
+    /// its own bracket with `ESC [ 201 ~` and type the rest as keys), NUL,
+    /// BS, ENQ, EOT, DEL, and the line discipline's control characters
+    /// (Ctrl-C, -\\, -U, -Z, -Q, -S, -W, -V, -R, -O).
+    static let pasteStrippedBytes: Set<UInt8> = [
+        0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F,
+        0x03, 0x1C, 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F,
+    ]
+
     static func pastedTextData(_ text: String, bracketedPasteMode: Bool = false) -> Data {
         let normalizedText = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        let textData = Data(normalizedText.utf8)
+        let textData = Data(normalizedText.utf8.map { pasteStrippedBytes.contains($0) ? 0x20 : $0 })
         guard bracketedPasteMode else { return textData }
 
         var data = Data("\u{1B}[200~".utf8)
@@ -527,6 +537,29 @@ enum TerminalPasteboardContent {
     static var defaultImageDirectory: URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("CherryPastedImages", isDirectory: true)
+    }
+
+    /// The paste, wrapped in bracketed-paste markers when `bracketing`
+    /// says so for the text that is pasted (the pasteboard's text, a URL,
+    /// or the path of a pasted image, as `pasteData(from:bracketedPasteMode:)`
+    /// takes them).
+    static func pasteData(
+        from pasteboard: NSPasteboard,
+        bracketing: (String) -> Bool
+    ) -> Data? {
+        let text: String
+        if let string = pasteboard.string(forType: .string), !string.isEmpty {
+            text = string
+        } else if let urlText = urlPasteText(from: pasteboard) {
+            text = urlText
+        } else if let imageURL = pastedImageFileURL(
+            from: pasteboard, imageDirectory: defaultImageDirectory, imageID: UUID()
+        ) {
+            text = shellEscaped(imageURL.path)
+        } else {
+            return nil
+        }
+        return TerminalInputEncoder.pastedTextData(text, bracketedPasteMode: bracketing(text))
     }
 
     static func pasteData(

@@ -36,10 +36,12 @@ struct RawEvent {
 }
 
 /// Every Ghostty callback's userdata. shim.c reads `event`, which must stay
-/// the first field, to hand events over.
+/// the first field, to hand events over, and `light` (`CherryCallbacks`).
 #[repr(C)]
 struct Callbacks {
     event: EventFn,
+    /// The colour-scheme query (CSI ? 996 n) reports light rather than dark.
+    light: bool,
     /// PTY replies, taken by `feed` and `resize`.
     replies: Vec<u8>,
     events: events::Pending,
@@ -74,6 +76,12 @@ unsafe extern "C" {
     fn cherry_vt_string(term: Handle, which: i32, ptr: *mut *const u8, len: *mut usize) -> i32;
     fn cherry_vt_info(term: Handle, out: *mut Info) -> i32;
     fn cherry_vt_set_terminfo_name(term: Handle, name: *const u8, len: usize) -> i32;
+    fn cherry_vt_set_colors(
+        term: Handle,
+        foreground: *const u8,
+        background: *const u8,
+        cursor: *const u8,
+    ) -> i32;
     fn cherry_vt_mode(term: Handle, value: u16, ansi: bool, on: *mut bool) -> i32;
     fn cherry_vt_clone(term: Handle, out: *mut Handle) -> i32;
     fn cherry_vt_stream_rows(
@@ -172,7 +180,8 @@ const MODES: &[(u16, bool, bool)] = &[
     (1045, false, false),
     (2004, false, false),
     (2026, false, false),
-    (2027, false, false),
+    // On by default here (`cherry_vt_new`), as in Ghostty.
+    (2027, false, true),
     (2031, false, false),
     (5522, false, false),
 ];
@@ -186,9 +195,10 @@ fn frame_mode(value: u16, ansi: bool) -> bool {
 /// Modes whose default comes from the user's terminal settings, not from the
 /// VT standard: DECARM (8, which libghostty defaults to off and does not
 /// implement), alternate scroll (1007), the Meta and Alt key modes (1035,
-/// 1036, 1039) and grapheme clustering (2027). They are never reset to
-/// libghostty's default; they are sent only while the session has them away
-/// from it, as the session's own output would.
+/// 1036, 1039) and grapheme clustering (2027, which `cherry_vt_new` turns
+/// on, as Ghostty does). They are never reset to this terminal's default;
+/// they are sent only while the session has them away from it, as the
+/// session's own output would.
 fn user_default_mode(value: u16, ansi: bool) -> bool {
     !ansi && matches!(value, 8 | 1007 | 1035 | 1036 | 1039 | 2027)
 }
@@ -294,9 +304,34 @@ pub struct Terminal {
     // C retains this address as every callback's userdata, so it is a heap
     // allocation of its own, freed after the terminal (see Drop).
     callbacks: NonNull<Callbacks>,
+    /// `clear_history` waits for the output to finish a UTF-8 character.
+    history_clear_pending: bool,
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 unsafe impl Send for Terminal {}
+
+/// What a terminal reports of its colours (`Terminal::set_colors`), as
+/// RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: [u8; 3],
+    /// A light colour scheme rather than a dark one.
+    pub light: bool,
+}
+
+impl Default for Colors {
+    /// Light grey on black, dark.
+    fn default() -> Self {
+        Self {
+            foreground: [229, 229, 229],
+            background: [0, 0, 0],
+            cursor: [229, 229, 229],
+            light: false,
+        }
+    }
+}
 
 /// Where the cursor is, read in place (`Terminal::cursor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +370,7 @@ impl Terminal {
         ensure!(cols > 0 && rows > 0, "terminal dimensions must be positive");
         let callbacks = NonNull::from(Box::leak(Box::new(Callbacks {
             event,
+            light: false,
             replies: Vec::new(),
             events: events::Pending::default(),
         })));
@@ -361,6 +397,7 @@ impl Terminal {
             cols,
             rows,
             callbacks,
+            history_clear_pending: false,
             _not_sync: PhantomData,
         })
     }
@@ -376,6 +413,10 @@ impl Terminal {
     /// events it caused wait for `take_events`.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         write(self.handle.as_ptr(), bytes);
+        if self.history_clear_pending {
+            // Once the character it waited for is complete (or dropped).
+            let _ = self.try_clear_history();
+        }
         // A reset (RIS) clears the title and working directory without a
         // callback: report whatever the events have not.
         for (which, event) in [(TITLE, VtEvent::Title as fn(_) -> _), (PWD, VtEvent::Pwd)] {
@@ -461,6 +502,70 @@ impl Terminal {
         )
     }
 
+    /// Clear the history above the screen, as ED 3 (`CSI 3 J`) would at
+    /// this point of the output, without disturbing what the output left
+    /// unfinished. An unfinished escape sequence or string is taken aside
+    /// (its continuation), ended with CAN, and fed again after the erase,
+    /// so the output that follows completes it as it would have. A UTF-8
+    /// character the output left half written cannot be ended that way
+    /// (it would become U+FFFD): the erase then waits for the output that
+    /// completes it, and happens in the `feed` that does (false: waiting).
+    /// Like ED 3, it clears the history of the screen that shows: none on
+    /// the alternate screen. An error, and nothing cleared, when the
+    /// unfinished sequence is too long to keep (see `snapshot`).
+    pub fn clear_history(&mut self) -> Result<bool> {
+        self.history_clear_pending = true;
+        self.try_clear_history()
+    }
+
+    fn try_clear_history(&mut self) -> Result<bool> {
+        let handle = self.handle.as_ptr();
+        let continuation = match allocated(|ptr, len| unsafe {
+            ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
+        }) {
+            Ok(continuation) => continuation,
+            Err(error) => {
+                self.history_clear_pending = false;
+                return Err(error);
+            }
+        };
+        // In the middle of a UTF-8 character (a lead or continuation byte
+        // first: every sequence starts with a C0 control, ESC among them).
+        if continuation.first().is_some_and(|&byte| byte >= 0x80) {
+            return Ok(false);
+        }
+        self.history_clear_pending = false;
+        if continuation.is_empty() {
+            write(handle, b"\x1b[3J");
+        } else {
+            write(handle, b"\x18\x1b[3J");
+            write(handle, &continuation);
+        }
+        // Neither the erase nor an unfinished sequence has a reply.
+        self.callbacks().replies.clear();
+        Ok(true)
+    }
+
+    /// The colours and appearance the terminal reports to the program: the
+    /// default foreground, background and cursor colours (OSC 10, 11 and 12
+    /// queries) and whether its colour scheme is light or dark (CSI ? 996 n).
+    /// A new terminal reports `Colors::default()`.
+    pub fn set_colors(&mut self, colors: Colors) -> Result<()> {
+        check(
+            unsafe {
+                cherry_vt_set_colors(
+                    self.handle.as_ptr(),
+                    colors.foreground.as_ptr(),
+                    colors.background.as_ptr(),
+                    colors.cursor.as_ptr(),
+                )
+            },
+            "colors",
+        )?;
+        self.callbacks().light = colors.light;
+        Ok(())
+    }
+
     /// Repaint the canonical active grid at the upper left of a physical
     /// terminal of another size. Content only: every row is painted at an
     /// absolute position over a cleared line, then the cursor position,
@@ -509,9 +614,9 @@ impl Terminal {
     /// visibility 2033) to the host. Modes whose default comes from the
     /// user's terminal settings (DECARM 8, alternate scroll 1007, Meta and
     /// Alt keys 1035, 1036 and 1039, grapheme clustering 2027) are not reset:
-    /// they are set only while the session has them away from libghostty's
-    /// default, so a session that never touches them leaves the user's
-    /// settings alone. One the session sets back to that default keeps the
+    /// they are set only while the session has them away from this
+    /// terminal's default (libghostty's, but grapheme clustering on), so a
+    /// session that never touches them leaves the user's settings alone. One the session sets back to that default keeps the
     /// value last sent.
     ///
     /// The receiver's primary screen keeps its cursor: the screen switches
@@ -810,8 +915,12 @@ impl Terminal {
             b"\x18\x1bc".to_vec()
         };
         // Grapheme clustering decides cell widths while content is replayed.
-        if mode(handle, 2027, false)? {
-            out.extend_from_slice(b"\x1b[?2027h");
+        // After a snapshot's reset it is set either way, whatever the
+        // receiver's default; a refresh, which leaves the receiver's user
+        // defaults alone, turns it off only for a session that did.
+        let graphemes = mode(handle, 2027, false)?;
+        if !refresh || !graphemes {
+            push_mode(&mut out, 2027, false, graphemes);
         }
         // Kitty keyboard stacks can only be read by popping them, so they
         // are read from a copy, which also provides the primary screen under

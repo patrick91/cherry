@@ -196,6 +196,33 @@ fn size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+/// What the terminal reports of its colours, from a `Launch`'s.
+fn terminal_colors(colors: cherry_protocol::TerminalColors) -> cherry_vt::Colors {
+    cherry_vt::Colors {
+        foreground: colors.foreground.0,
+        background: colors.background.0,
+        cursor: colors.cursor.unwrap_or(colors.foreground).0,
+        light: !colors.dark,
+    }
+}
+
+/// Turn on IUTF8 on the session's terminal, as Terminal.app, iTerm2 and
+/// Ghostty do: the line discipline then erases a whole UTF-8 character on
+/// backspace in canonical mode (`cat`, `read`), not its last byte.
+fn set_iutf8(fd: libc::c_int) -> io::Result<()> {
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        termios.c_iflag |= libc::IUTF8;
+        if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Start the session's program on a new PTY. Returns the master and the
 /// session leader.
 fn spawn(
@@ -226,6 +253,7 @@ fn spawn(
         .open(&tty)
         .with_context(|| format!("opening {}", tty.display()))?;
     drop(pair.slave);
+    set_iutf8(slave.as_raw_fd()).context("setting IUTF8 on the session's terminal")?;
     let mut child = std::process::Command::new(&command[0]);
     child
         .args(&command[1..])
@@ -676,6 +704,7 @@ impl Holder {
             state_dir,
             kill_grace_ms,
             receipt,
+            colors,
         } = launch;
         if !valid_size(cols, rows) {
             bail!("terminal size must be 2–500 columns and 1–200 rows");
@@ -683,7 +712,11 @@ impl Holder {
         if command.is_empty() {
             bail!("no command to launch");
         }
-        let terminal = Terminal::new(cols, rows, screen::SCROLLBACK_BYTES)?;
+        let mut terminal = Terminal::new(cols, rows, screen::SCROLLBACK_BYTES)?;
+        // What the program is told of its terminal's colours: the app's.
+        if let Some(colors) = colors {
+            terminal.set_colors(terminal_colors(colors))?;
+        }
         // Before the child exists, so its exit always wakes us.
         let child_exits = signals::child_exits().context("installing the child-exit handler")?;
         let (master, pid) = spawn(&command, cwd, env, cols, rows)?;
@@ -729,6 +762,7 @@ impl Holder {
                 alternate_screen: false,
                 kitty_keyboard_flags: 0,
                 application_cursor_keys: false,
+                bracketed_paste: Some(false),
             },
             receipt,
             master: Some(master),
@@ -1145,8 +1179,9 @@ impl Holder {
         }
     }
 
-    /// Whether the alternate screen shows, the kitty keyboard flags and
-    /// application cursor keys: the daemon is told when they change.
+    /// Whether the alternate screen shows, the kitty keyboard flags,
+    /// application cursor keys and bracketed paste: the daemon is told when
+    /// they change.
     fn terminal_state(&mut self, now: screen::TerminalState) {
         if self.state.alternate_screen != now.alternate_screen {
             self.state.alternate_screen = now.alternate_screen;
@@ -1159,6 +1194,10 @@ impl Holder {
         if self.state.application_cursor_keys != now.application_cursor_keys {
             self.state.application_cursor_keys = now.application_cursor_keys;
             self.info.application_cursor_keys = Some(now.application_cursor_keys);
+        }
+        if self.state.bracketed_paste != Some(now.bracketed_paste) {
+            self.state.bracketed_paste = Some(now.bracketed_paste);
+            self.info.bracketed_paste = Some(now.bracketed_paste);
         }
     }
 
@@ -1306,6 +1345,40 @@ impl Holder {
         screen
     }
 
+    /// Clear the terminal's history (`link::kind::CLEAR_HISTORY`), as ED 3
+    /// would where the output read so far ends: snapshots and the screen
+    /// as text then show none of it. The program's output is left alone.
+    fn clear_history(&mut self, req: u64) {
+        let cleared = self.terminal.call(|terminal| {
+            // ED 3 clears the history of the screen that shows.
+            if terminal.cursor().is_ok_and(|cursor| cursor.alternate) {
+                return Ok(None);
+            }
+            terminal.clear_history().map(Some)
+        });
+        self.collect_terminal();
+        let (outcome, error) = match cleared {
+            Ok(Some(_)) => ("cleared", None),
+            Ok(None) => ("alternate_screen", None),
+            Err(error) => {
+                log(format_args!(
+                    "session {}: clearing its history failed: {error:#}",
+                    self.id
+                ));
+                ("failed", Some(format!("{error:#}")))
+            }
+        };
+        self.send(link::encode(
+            kind::HISTORY_CLEARED,
+            &link::HistoryCleared {
+                req,
+                outcome: outcome.into(),
+                error,
+            },
+            &[],
+        ));
+    }
+
     /// Serve one frame from the daemon; whether that took work (a
     /// snapshot, the screen as text: see `pump_link`).
     fn handle(&mut self, frame: Frame) -> bool {
@@ -1432,6 +1505,12 @@ impl Holder {
                 if let Ok(pace) = frame.meta::<link::Pace>() {
                     self.limit = pace.limit;
                 }
+            }
+            kind::CLEAR_HISTORY => {
+                if let Ok(request) = frame.meta::<link::Req>() {
+                    self.clear_history(request.req);
+                }
+                return true;
             }
             kind::REFUSED => self.refused(frame.meta().unwrap_or(link::Refused {
                 reason: "no reason given".into(),

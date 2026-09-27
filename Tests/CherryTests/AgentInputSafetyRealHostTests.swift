@@ -21,7 +21,7 @@ private final class PrivateLocalHost {
     let home: URL
     let control: HostControl
     let hosting: PersistentLocalSessions
-    private let host: Process
+    private let host: RealHostTestDaemon
     private let socket: URL
 
     init() async throws {
@@ -54,14 +54,9 @@ private final class PrivateLocalHost {
             base: ProcessInfo.processInfo.environment, login: helperVariables
         )
         daemonEnvironment["XDG_STATE_HOME"] = nil
-        host = Process()
-        host.executableURL = binaries.appendingPathComponent("cherry-host")
-        host.arguments = ["serve"]
-        host.environment = daemonEnvironment
-        host.standardInput = FileHandle.nullDevice
-        host.standardOutput = FileHandle.nullDevice
-        host.standardError = FileHandle.standardError
-        try host.run()
+        host = try RealHostTestDaemon(
+            executable: binaries.appendingPathComponent("cherry-host"), environment: daemonEnvironment, socket: socket
+        )
 
         control = HostControl(
             host: .local,
@@ -143,13 +138,8 @@ private final class PrivateLocalHost {
             }
         }
         control.disconnect()
-        if host.isRunning { host.terminate() }
-        host.waitUntilExit()
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-KILL", "-f", "hold --socket \(socket.path)"]
-        try? pkill.run()
-        pkill.waitUntilExit()
+        // The daemon, and any holder this test left.
+        host.stop()
         try? FileManager.default.removeItem(at: root)
     }
 }

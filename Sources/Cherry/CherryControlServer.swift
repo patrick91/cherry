@@ -826,8 +826,12 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .searchOutput(searchOutput(for: session, request: request)))
         case .clearOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            session.clearScrollback()
-            return .init(result: .clearOutput(.init(terminalID: session.id.uuidString, cleared: true)))
+            // A persistent tab's host clears its copy before this answers,
+            // so the output read next no longer has it; or says why not.
+            let kept = await session.clearScrollback()?.value ?? nil
+            return .init(result: .clearOutput(.init(
+                terminalID: session.id.uuidString, cleared: kept == nil, hostKeptHistory: kept
+            )))
         case .restartTerminal(let request):
             let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
             try restartProcess(session, in: sessionWorkspace)

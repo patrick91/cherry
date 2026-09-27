@@ -659,6 +659,7 @@ pub fn create_request(request_id: String, command: Vec<String>) -> ClientMessage
         rows: 24,
         owner: None,
         tags: BTreeMap::new(),
+        colors: None,
     }
 }
 
@@ -912,6 +913,7 @@ pub mod link {
     pub const INFO: u8 = 9;
     pub const EVENT: u8 = 10;
     pub const SCREEN_REPLY: u8 = 11;
+    pub const HISTORY_CLEARED: u8 = 12;
     pub const LAUNCH: u8 = 64;
     pub const INPUT: u8 = 65;
     pub const DISCARD_LEASE: u8 = 66;
@@ -925,8 +927,9 @@ pub mod link {
     pub const REFUSED: u8 = 74;
     pub const ATTENDED: u8 = 75;
     pub const PACE: u8 = 76;
+    pub const CLEAR_HISTORY: u8 = 77;
     /// What this build's daemon and holders speak.
-    pub const VERSION: u16 = 6;
+    pub const VERSION: u16 = 7;
 
     #[derive(Debug)]
     pub struct Frame {

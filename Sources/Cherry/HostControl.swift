@@ -1253,6 +1253,14 @@ final class HostControl: ObservableObject {
         }
     }
 
+    /// Clears the history above the session's screen (its host's copy: what
+    /// `screen(scrollback:)` reads and what an adapter that attaches is
+    /// sent). Throws `.rejected(unsupported_operation)` for a session whose
+    /// holder predates holder link 7.
+    func clearHistory(_ id: String, expectedHostID: String? = nil) async throws {
+        try expectOK(try await request(.clearHistory(id: id), expectedHostID: expectedHostID))
+    }
+
     /// Renames the session or replaces its tags; nil keeps a field.
     func update(
         _ id: String,

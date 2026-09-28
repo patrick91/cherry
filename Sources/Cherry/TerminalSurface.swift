@@ -659,7 +659,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
         containerView.configure(
             with: session,
             colorScheme: context.environment.colorScheme,
-            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
+            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented && chromeState.projectSwitcherPresentation == nil,
             isActivePane: isActivePane,
             usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
             onActivate: { onActivate(session.id) }
@@ -676,7 +676,7 @@ struct TerminalSurfaceView: NSViewRepresentable {
         nsView.configure(
             with: session,
             colorScheme: context.environment.colorScheme,
-            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented,
+            allowsAutoFocus: isActivePane && !chromeState.isCommandPalettePresented && chromeState.projectSwitcherPresentation == nil,
             isActivePane: isActivePane,
             usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
             onActivate: { onActivate(session.id) }

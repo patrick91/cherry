@@ -31,6 +31,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
     enum ShortcutAction: Equatable {
         case selectVisibleSidebarItem(Int)
         case presentCommandPalette
+        case toggleProjectSwitcher
         case toggleSidebar
         case addSession
         case splitDuplicate
@@ -74,6 +75,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
             return .selectVisibleSidebarItem(number)
         case "p":
             return .presentCommandPalette
+        case "o":
+            return .toggleProjectSwitcher
         case "s":
             return .toggleSidebar
         case "t":
@@ -292,6 +295,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 selectVisibleSidebarItem(number: number)
             case .presentCommandPalette:
                 chromeState?.presentCommandPalette()
+            case .toggleProjectSwitcher:
+                chromeState?.toggleProjectSwitcher()
             case .toggleSidebar:
                 chromeState?.toggleSidebar()
             case .addSession:

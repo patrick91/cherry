@@ -67,6 +67,11 @@ final class ProjectWindowRegistry {
     /// (tests inject their own, never the real devices.json).
     var remoteProjectIsKnown: @MainActor (String) -> Bool = { _ in false }
 
+    /// Where each project window's last activation is recorded, for the
+    /// project switcher's Recent section (`ProjectRecencyStore`). The app
+    /// sets it at launch; tests leave it nil or give their own.
+    var projectRecency: ProjectRecencyStore?
+
     /// The app uses `shared`; tests make their own.
     init() {}
 
@@ -430,6 +435,25 @@ final class ProjectWindowRegistry {
             $0.repository?.worktrees.map(\.root) ?? []
         }
         return Array(Set(repositoryRoots + Array(workspaces.keys))).sorted()
+    }
+
+    /// Each open project window, by its key (`canonicalProjectRoot`), with
+    /// how many tabs its loaded workspaces hold and how many of its agents
+    /// are working (the project switcher's status line).
+    func openProjectWindowStatuses() -> [String: ProjectSwitcherModel.OpenStatus] {
+        pruneStaleWindows()
+        var statuses: [String: ProjectSwitcherModel.OpenStatus] = [:]
+        for (root, weakWindow) in windows where weakWindow.window != nil {
+            let loaded = repositories[root]?.repository?.allLoadedWorkspaces()
+                ?? workspaces[root]?.workspace.map { [$0] } ?? []
+            var status = ProjectSwitcherModel.OpenStatus(tabs: 0, workingAgents: 0)
+            for workspace in loaded {
+                status.tabs += workspace.sessions.count
+                status.workingAgents += workspace.agentSessions.filter { $0.agentActivityState == .working }.count
+            }
+            statuses[root] = status
+        }
+        return statuses
     }
 
     func canonicalProjectRoot(for projectRoot: String) -> String {
@@ -893,6 +917,7 @@ final class ProjectWindowRegistry {
         let windowRoot = repositoryRoot(for: projectRoot)
         activationOrder.removeAll { $0 == windowRoot }
         activationOrder.append(windowRoot)
+        projectRecency?.markOpened(windowRoot)
         activeProjectRoot = effectiveRoot
         activeWorkspace = workspace
         activeNoteStore = noteStore
@@ -1121,6 +1146,18 @@ private final class WeakChromeState {
     }
 }
 
+/// How the project switcher is shown in a window (`ProjectSwitcherStyle`;
+/// the menu style is an `NSMenu`, `projectSwitcherMenuRequest`).
+enum ProjectSwitcherPresentation: Equatable {
+    /// The palette over the window.
+    case palette
+    /// The Macs sidebar, anchored to the title-bar picker.
+    case sidebarPopover
+    /// The Macs sidebar over the window: the picker is hidden with the
+    /// sidebar, so there is nothing to anchor to.
+    case sidebarOverlay
+}
+
 /// A device a sheet is about (`ProjectWindowChromeState.addProjectDevice`).
 struct RemoteDeviceReference: Identifiable, Equatable {
     let id: UUID
@@ -1162,6 +1199,10 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var pendingAgentGroupCloseAllowsEmptyWorkspace = false
     @Published var focusedIdleCommandName: String?
     @Published var commandPaletteFocusRequest = 0
+    /// The project switcher shown now (nil: none, or its menu).
+    @Published var projectSwitcherPresentation: ProjectSwitcherPresentation?
+    /// Bumped to open the menu-style switcher from the picker (⌘O).
+    @Published var projectSwitcherMenuRequest = 0
     /// The window's toast (`ProjectWindowToastOverlay`): observed on its
     /// own, so a toast coming and going does not re-render the window.
     let toasts: ProjectWindowToasts
@@ -1258,8 +1299,35 @@ final class ProjectWindowChromeState: ObservableObject {
     }
 
     func presentCommandPalette() {
+        projectSwitcherPresentation = nil
         isCommandPalettePresented = true
         commandPaletteFocusRequest &+= 1
+    }
+
+    /// Whether the title-bar picker is on screen (it slides away with a
+    /// hidden sidebar).
+    var isProjectPickerVisible: Bool {
+        !isSidebarHidden || isSidebarRevealed
+    }
+
+    /// Opens the project switcher in `style` (the picker button, ⌘O), or
+    /// closes the one shown. The Macs sidebar is a popover on the picker,
+    /// or over the window while the picker is hidden.
+    func toggleProjectSwitcher(style: ProjectSwitcherStyle = .current()) {
+        if projectSwitcherPresentation != nil {
+            projectSwitcherPresentation = nil
+            return
+        }
+        switch style {
+        case .menu:
+            projectSwitcherMenuRequest &+= 1
+        case .palette:
+            isCommandPalettePresented = false
+            projectSwitcherPresentation = .palette
+        case .sidebar:
+            isCommandPalettePresented = false
+            projectSwitcherPresentation = isProjectPickerVisible ? .sidebarPopover : .sidebarOverlay
+        }
     }
 
     func presentNewWorktree() {

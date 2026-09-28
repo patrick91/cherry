@@ -273,6 +273,24 @@ struct ContentView: View {
                 .zIndex(2_000)
             }
 
+            if let presentation = chromeState.projectSwitcherPresentation, presentation != .sidebarPopover {
+                ProjectSwitcherOverlay(
+                    presentation: presentation,
+                    currentProjectKey: repository.repositoryRoot,
+                    actions: ProjectSwitcherActions(
+                        settings: AgentSettings.shared,
+                        chromeState: chromeState,
+                        openProject: openProject,
+                        openSettings: { openSettings() }
+                    ),
+                    dismiss: {
+                        chromeState.projectSwitcherPresentation = nil
+                        restoreTerminalFocus()
+                    }
+                )
+                .zIndex(2_010)
+            }
+
             if PrototypeFeatureFlags.isIconDebugEnabled,
                chromeState.isIconDebugOverlayPresented {
                 SidebarIconDebugOverlay(
@@ -4209,11 +4227,13 @@ private struct CommandPaletteOverlay: View {
     }
 }
 
-private struct CommandPaletteSearchField: NSViewRepresentable {
+struct CommandPaletteSearchField: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
     let focusRequest: Int
     let onSubmit: () -> Void
+    var fontSize: CGFloat = 17
+    var accessibilityLabel = "Command Palette Search"
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, onSubmit: onSubmit)
@@ -4248,7 +4268,7 @@ private struct CommandPaletteSearchField: NSViewRepresentable {
 
     private func configure(_ textField: NSTextField) {
         textField.placeholderString = placeholder
-        textField.font = .systemFont(ofSize: 17)
+        textField.font = .systemFont(ofSize: fontSize)
         textField.isBordered = false
         textField.isBezeled = false
         textField.drawsBackground = false
@@ -4260,7 +4280,7 @@ private struct CommandPaletteSearchField: NSViewRepresentable {
         textField.lineBreakMode = .byTruncatingTail
         textField.cell?.sendsActionOnEndEditing = false
         textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        textField.setAccessibilityLabel("Command Palette Search")
+        textField.setAccessibilityLabel(accessibilityLabel)
     }
 
     @MainActor
@@ -4319,7 +4339,7 @@ private struct CommandPaletteSearchField: NSViewRepresentable {
     }
 }
 
-private final class CommandPaletteSearchTextField: NSTextField {
+final class CommandPaletteSearchTextField: NSTextField {
     var onMoveToWindow: ((CommandPaletteSearchTextField) -> Void)?
 
     override var acceptsFirstResponder: Bool {
@@ -4532,7 +4552,7 @@ private struct CommandPaletteSectionHeader: View {
     }
 }
 
-private struct CommandPaletteFooterHint: View {
+struct CommandPaletteFooterHint: View {
     let key: String
     let label: String
 
@@ -4556,7 +4576,7 @@ private struct CommandPaletteFooterHint: View {
     }
 }
 
-private struct CommandPaletteSurface: ViewModifier {
+struct CommandPaletteSurface: ViewModifier {
     let usesGlass: Bool
     let cornerRadius: CGFloat
     let colorScheme: ColorScheme
@@ -4599,7 +4619,7 @@ private struct CommandPaletteEmptyRow: View {
     }
 }
 
-private struct CommandPaletteKeyMonitor: NSViewRepresentable {
+struct CommandPaletteKeyMonitor: NSViewRepresentable {
     let handle: (NSEvent) -> Bool
     let onScroll: () -> Void
 
@@ -4616,7 +4636,7 @@ private struct CommandPaletteKeyMonitor: NSViewRepresentable {
     }
 }
 
-private final class CommandPaletteKeyMonitorView: NSView {
+final class CommandPaletteKeyMonitorView: NSView {
     var handle: ((NSEvent) -> Bool)?
     var onScroll: (() -> Void)?
     private var monitor: Any?
@@ -6732,7 +6752,7 @@ private struct TitlebarProjectPicker: View {
         // label, so neither `.onHover` nor an NSTrackingArea overlay fire.
         // A plain Button has no such interference — we present an NSMenu
         // programmatically on click.
-        Button(action: presentMenu) {
+        Button(action: { chromeState.toggleProjectSwitcher() }) {
             HStack(spacing: Self.titleSpacing) {
                 if palette.showsProjectAccent {
                     Circle()
@@ -6757,6 +6777,19 @@ private struct TitlebarProjectPicker: View {
         .buttonStyle(.plain)
         .background(TitlebarProjectMenuAnchor(ref: anchorRef))
         .help(projectTitle)
+        .accessibilityLabel("Project: \(projectTitle)")
+        .accessibilityHint("Opens the project switcher (⌘O)")
+        .popover(isPresented: sidebarPopoverBinding, arrowEdge: .bottom) {
+            ProjectSwitcherMacsSidebar(
+                currentProjectKey: repository.repositoryRoot,
+                actions: switcherActions,
+                dismiss: { chromeState.projectSwitcherPresentation = nil }
+            )
+        }
+        .onChange(of: chromeState.projectSwitcherMenuRequest) { _, _ in
+            // Not inside SwiftUI's update: the menu runs its own loop.
+            DispatchQueue.main.async { presentMenu() }
+        }
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 isHovering = hovering
@@ -6778,6 +6811,26 @@ private struct TitlebarProjectPicker: View {
         }
     }
 
+    private var sidebarPopoverBinding: Binding<Bool> {
+        Binding(
+            get: { chromeState.projectSwitcherPresentation == .sidebarPopover },
+            set: { isPresented in
+                if !isPresented, chromeState.projectSwitcherPresentation == .sidebarPopover {
+                    chromeState.projectSwitcherPresentation = nil
+                }
+            }
+        )
+    }
+
+    private var switcherActions: ProjectSwitcherActions {
+        ProjectSwitcherActions(
+            settings: settings,
+            chromeState: chromeState,
+            openProject: openProject,
+            openSettings: openSettings
+        )
+    }
+
     private func presentMenu() {
         let controller = TitlebarProjectMenuController(
             makeModel: makeMenuModel,
@@ -6793,7 +6846,7 @@ private struct TitlebarProjectPicker: View {
         // `popUp(positioning:at:in:)` is synchronous: actions fire before
         // the call returns, so the controller (which keeps the targets)
         // lives long enough.
-        if let anchor = anchorRef.view {
+        if let anchor = anchorRef.view, chromeState.isProjectPickerVisible {
             let bounds = anchor.bounds
             let point: NSPoint = anchor.isFlipped
                 ? NSPoint(x: bounds.minX, y: bounds.maxY + 4)
@@ -6827,27 +6880,7 @@ private struct TitlebarProjectPicker: View {
                 )
             }
         let store = RemoteDeviceStore.shared
-        let devices = store.devices.map { device -> TitlebarProjectMenuModel.Device in
-            guard let host = device.host else {
-                return .init(device: device, state: .offline(reason: "Its SSH destination is not valid."), sessions: [])
-            }
-            let control = HostControlRegistry.shared.control(for: host)
-            if control.state == .connected { store.noteSeen(device.id) }
-            // Not connected: what a look that starts nothing found.
-            let peek = control.state == .connected ? nil : RemoteDevicePeeks.shared.result(for: host)
-            let peeked = control.state == .connected ? nil : RemoteDevicePeeks.shared.list(for: host)
-            return .init(
-                device: device,
-                state: RemoteDeviceConnectionState(
-                    control: control.state, sessionCount: control.sessions.count, lastSeen: device.lastSeen, peek: peek
-                ),
-                sessions: peeked?.sessions ?? control.sessions,
-                bundledBuild: RemoteHostHelpers.cachedAppBuild
-            )
-        }
-        // Read once in the background: the next menu offers Update Session
-        // Host… for a device whose install is older.
-        if !store.devices.isEmpty { RemoteHostHelpers.preloadApp() }
+        let devices = TitlebarProjectMenuModel.liveDevices(store: store)
         return TitlebarProjectMenuModel(
             worktrees: worktrees,
             projects: projects,
@@ -6858,7 +6891,6 @@ private struct TitlebarProjectPicker: View {
     }
 
     private func performMenuAction(_ action: TitlebarProjectMenuModel.Action) {
-        let store = RemoteDeviceStore.shared
         switch action {
         case .activateWorktree(let root):
             _ = repository.activate(worktreeRoot: root, chromeState: chromeState)
@@ -6866,60 +6898,8 @@ private struct TitlebarProjectPicker: View {
             isNewWorktreePresented = true
         case .manageWorktrees:
             isWorktreeManagerPresented = true
-        case .openProject(let root):
-            if let project = settings.projects.first(where: { $0.root == root }) { openProject(project) }
-        case .addProject:
-            chooseProjectRoot()
-        case .editProjects:
-            openSettings()
-        case .openDeviceProject(let deviceID, let path):
-            openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: path).key))
-        case .openDeviceHome(let deviceID):
-            guard let home = store.device(id: deviceID)?.homeDirectory else { return }
-            openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: home).key))
-        case .openDeviceSessions(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return }
-            chromeState.hostedSessionsInitialHost = host
-            chromeState.isHostedSessionsPresented = true
-        case .addDeviceProject(let deviceID):
-            chromeState.addProjectDevice = RemoteDeviceReference(id: deviceID)
-        case .hideDeviceProject(let deviceID, let path):
-            store.hideProject(path: path, on: deviceID)
-        case .reconnectDevice(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return }
-            RemoteDevicePeeks.shared.retry(host)
-            let control = HostControlRegistry.shared.control(for: host)
-            if case .waitingToReconnect = control.state {
-                control.reconnectNow()
-            } else {
-                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-            }
-        case .trustDeviceIdentity(let deviceID):
-            RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
-        case .updateDeviceHost(let deviceID):
-            RemoteDeviceUpdatePresenter.present(deviceID: deviceID, store: store)
-        case .setUpDeviceMCP(let deviceID):
-            RemoteMCPSetupPresenter.present(deviceID: deviceID, store: store)
-        case .renameDevice(let deviceID):
-            RemoteDeviceAlerts.rename(deviceID, store: store)
-        case .removeDevice(let deviceID):
-            RemoteDeviceAlerts.confirmRemove(deviceID, store: store)
-        case .addMac:
-            chromeState.isAddDevicePresented = true
-        }
-    }
-
-    private func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        settings.addProject(path: url.path)
-        if let project = settings.selectedProject(for: url.path) {
-            openProject(project)
+        default:
+            switcherActions.perform(action)
         }
     }
 

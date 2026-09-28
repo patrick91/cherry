@@ -830,6 +830,7 @@ struct CherryApp: App {
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
+    @AppStorage(ProjectSwitcherStyle.defaultsKey) private var projectSwitcherStyle = ProjectSwitcherStyle.defaultStyle
 
     init() {
         RemoteViewCrashGuard.installIfNeeded()
@@ -839,6 +840,8 @@ struct CherryApp: App {
         }
         ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
         ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
+        // The project switcher's Recent section.
+        ProjectWindowRegistry.shared.projectRecency = .shared
     }
 
     // Menu actions resolve their target from the key window, not the
@@ -944,6 +947,11 @@ struct CherryApp: App {
                 .disabled(backgroundSessions.count == 0)
             }
             CommandGroup(after: .newItem) {
+                Button("Open Project…") {
+                    keyWindowChromeState?.toggleProjectSwitcher()
+                }
+                .keyboardShortcut("o")
+                .disabled(focusedChromeState == nil)
                 Button("Persistent Sessions…") {
                     keyWindowChromeState?.isHostedSessionsPresented = true
                 }
@@ -1016,6 +1024,17 @@ struct CherryApp: App {
                     keyWindowChromeState?.toggleProjectTabsPrototype()
                 }
                 .disabled(focusedChromeState == nil)
+
+                Divider()
+
+                Picker("Project Switcher", selection: $projectSwitcherStyle) {
+                    ForEach(ProjectSwitcherStyle.allCases) { style in
+                        Text("Project Switcher: \(style.title)").tag(style)
+                    }
+                }
+                .pickerStyle(.inline)
+
+                Divider()
 
                 Button("New Tab") {
                     keyWindowWorkspace?.addSession()

@@ -8,7 +8,8 @@ import Testing
 /// check` here) and runs until signalled; `-O check` succeeds while the
 /// socket exists; `-O exit` stops the master. Behaviour switches are files:
 /// `master-fails` (printed to stderr by a master that exits 255, as BatchMode
-/// does when it cannot authenticate) and `check-fails`.
+/// does when it cannot authenticate), `check-fails` and `exit-slow` (`-O
+/// exit` takes half a second, as over a slow link).
 private struct FakeSSH {
     let directory: URL
     let executable: URL
@@ -57,6 +58,7 @@ private struct FakeSSH {
             printf 'Control socket connect(%s): No such file or directory\\n' "$path" >&2
             exit 255 ;;
           exit)
+            if [ -f "$dir/exit-slow" ]; then /bin/sleep 0.5; fi
             if [ -f "$path.pid" ]; then kill -TERM "$(cat "$path.pid")"
             elif [ -f "$dir/master-pid" ]; then kill -TERM "$(cat "$dir/master-pid")"; fi
             printf 'Exit request sent.\\n' >&2
@@ -263,6 +265,26 @@ private func eventually(
     #expect(ssh.masterCalls.count == 3)
     afterQuit.release()
     again.release()
+}
+
+@Test func HostSSHMasterLeasedAgainWhileItsIdleStopRunsIsWaitedForAndStartedAgain() async throws {
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let manager = ssh.manager()
+    try ssh.write("exit-slow", "")
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    lease.release()
+    // The idle stop runs its (slow) `ssh -O exit`: the master is stopping.
+    #expect(await eventually { manager.status(of: "devbox")?.phase == .stopping })
+    // A lease taken now (a port forward, a control connection) waits for
+    // the master's next start rather than finding no connection.
+    let again = manager.acquire("devbox", environment: [:])
+    #expect(await manager.waitUntilUp("devbox") == path)
+    #expect(manager.status(of: "devbox")?.phase == .up)
+    #expect(ssh.masterCalls.count == 2)
+    again.release()
+    #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
 }
 
 @Test func HostSSHMasterThatCannotAuthenticateLeavesSSHToItsUsers() async throws {

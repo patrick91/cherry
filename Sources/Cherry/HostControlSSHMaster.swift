@@ -336,7 +336,11 @@ final class HostSSHMasterManager: @unchecked Sendable {
     }
 
     /// The control path once the master is up; nil when it fails, is not
-    /// starting, or does not come up within `timeout`.
+    /// starting, or does not come up within `timeout`. A master that is
+    /// stopping (idle) while something needs it again is started again as
+    /// soon as it exited (`exited`), so that start is waited for too: a
+    /// lease taken while the idle stop's `ssh -O exit` runs must not find
+    /// no connection.
     func waitUntilUp(_ destination: String, timeout: TimeInterval? = nil) async -> String? {
         let id = UUID()
         let timeout = timeout ?? configuration.startTimeout
@@ -346,6 +350,9 @@ final class HostSSHMasterManager: @unchecked Sendable {
                 switch master.phase {
                 case .up: return .some(master.controlPath)
                 case .starting:
+                    master.waiters[id] = continuation
+                    return .none
+                case .stopping where master.isNeeded && !isShutDown:
                     master.waiters[id] = continuation
                     return .none
                 case .stopped, .waitingToRestart, .stopping: return .some(nil)
@@ -584,7 +591,6 @@ final class HostSSHMasterManager: @unchecked Sendable {
                 master.failures = 0
             }
             master.upSince = nil
-            resumeWaitersLocked(master, with: nil)
             master.phase = .stopped
             if master.shard > 1, previous == .starting {
                 // A shard that never came up: no more shards for a while,
@@ -592,8 +598,12 @@ final class HostSSHMasterManager: @unchecked Sendable {
                 shardBackoff[master.destination] = Date().addingTimeInterval(configuration.shardRetryDelay)
                 master.reserved = false
             }
+            // Stopped while something needed it again: started again at
+            // once, and whoever waits for it (`waitUntilUp`) waits for
+            // that start.
+            if master.isNeeded, previous == .stopping, let start = beginStartLocked(master) { return start }
+            resumeWaitersLocked(master, with: nil)
             guard master.isNeeded else { return nil }
-            if previous == .stopping { return beginStartLocked(master) }
             // Never up: it could not connect or log in, and trying on a timer
             // would only add failed logins (which the server may count).
             guard previous == .up else { return nil }

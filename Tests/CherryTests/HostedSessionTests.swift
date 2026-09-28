@@ -1417,13 +1417,71 @@ private func fixtureSession() throws -> HostedSessionInfo {
         host.stop()
     }
 
-    func waitFor(_ description: String, _ predicate: () async throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(10)
+    // The tabs under test, whose state a timeout reports.
+    var watched: [(name: String, session: TerminalSession)] = []
+    // What the host lists, once its control connection exists.
+    var hostSessions: () async -> [String] = { [] }
+    let started = Date()
+    var steps: [String] = []
+    func describe(_ session: TerminalSession) -> String {
+        let bridge = session.ghosttyBridge
+        let view = bridge.terminalView
+        let screen = bridge.readNativeScreenText().map {
+            $0.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                .suffix(6).joined(separator: " | ")
+        }
+        // No tty: the surface never spawned its child. Else what runs on
+        // it: login(1) still starting, or `cherry attach` connecting.
+        let tty = view.ttyName
+        let processes = tty.map { tty -> String in
+            let ps = Process()
+            ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+            ps.arguments = ["-o", "pid=,stat=,etime=,command=", "-t", (tty as NSString).lastPathComponent]
+            let pipe = Pipe()
+            ps.standardOutput = pipe
+            ps.standardError = FileHandle.nullDevice
+            guard (try? ps.run()) != nil else { return "ps failed" }
+            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            ps.waitUntilExit()
+            return output.split(separator: "\n").map { String($0.trimmingCharacters(in: .whitespaces).prefix(160)) }
+                .joined(separator: " / ")
+        }
+        return "status \(String(describing: session.hostedAttachmentStatus)), "
+            + "adapter \(String(describing: session.adapterLiveStatus)), "
+            + "child pid \(String(describing: session.childProcessID)), "
+            + "view in window \(view.window != nil) bounds \(view.bounds.size), "
+            + "tty \(tty ?? "none") running [\(processes ?? "")], "
+            + "screen \(screen.map { "\"\($0)\"" } ?? "unreadable (no surface)")"
+    }
+    // Each surface launch runs `cherry attach` (a debug build) through
+    // Ghostty's login(1) wrapper, which connects, attaches and repaints
+    // before Ghostty's IO thread parses it. On a loaded machine login(1)
+    // alone can take seconds: under 16 CPU hogs and `taskpolicy -c
+    // background` one was seen still starting (ps state U) after 48 s, and on a
+    // 3-core CI runner (whose jobs are QoS-clamped) this first launch once
+    // took over 10 s while the whole test usually takes 2 s. Steps that wait
+    // for a surface launch get `launchTimeout`; a timeout says what the tab,
+    // its tty and the host were doing.
+    let launchTimeout: TimeInterval = 30
+    func waitFor(
+        _ description: String, timeout: TimeInterval = 10, _ predicate: () async throws -> Bool
+    ) async throws {
+        let stepStart = Date()
+        let deadline = stepStart.addingTimeInterval(timeout)
         while Date() < deadline {
-            if try await predicate() { return }
+            if try await predicate() {
+                steps.append(String(format: "%@ %.1fs", description, Date().timeIntervalSince(stepStart)))
+                return
+            }
             try await Task.sleep(for: .milliseconds(25))
         }
-        throw HostedSessionError.message("Timed out waiting for \(description)")
+        let tabs = watched.map { "\($0.name): \(describe($0.session))" }.joined(separator: "; ")
+        let hosted = await hostSessions()
+        throw HostedSessionError.message(
+            "Timed out waiting for \(description) after \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s "
+                + "(\(String(format: "%.1f", Date().timeIntervalSince(started)))s into the test; earlier steps: "
+                + "\(steps.joined(separator: ", "))). Tabs: \(tabs.isEmpty ? "none" : tabs). Host sessions: \(hosted)"
+        )
     }
     try await waitFor("isolated host socket") { FileManager.default.fileExists(atPath: socket.path) }
     // The app's control plane: `cherry control` over the isolated socket.
@@ -1437,6 +1495,9 @@ private func fixtureSession() throws -> HostedSessionInfo {
         localHostUnavailableReason: nil
     )
     defer { control.disconnect() }
+    hostSessions = {
+        (try? await control.list().sessions.map { "\($0.id) attached \($0.attached) running \($0.isRunning)" }) ?? ["unlisted"]
+    }
     let initialList = try await control.list()
     // The host keeps its identity in the private HOME.
     let stateRoot = home.appendingPathComponent("Library/Application Support/cherry-host", isDirectory: true)
@@ -1474,16 +1535,18 @@ private func fixtureSession() throws -> HostedSessionInfo {
         environment: helperVariables
     )
     let session = workspace.attachHostedSession(attachment)
+    watched.append(("first", session))
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
     window.orderFrontRegardless()
-    try await waitFor("native Ghostty to render the host snapshot") {
+    try await waitFor("native Ghostty to render the host snapshot", timeout: launchTimeout) {
         session.ghosttyBridge.readNativeScreenText()?.contains("ALTERNATE_SNAPSHOT") == true
     }
     #expect(session.usesNativePTYBackend)
     let secondSession = secondWorkspace.attachHostedSession(attachment)
+    watched.append(("second", secondSession))
     secondContainer.configure(with: secondSession, colorScheme: .dark, allowsAutoFocus: false)
     secondWindow.orderFrontRegardless()
-    try await waitFor("second native Ghostty to share the alternate screen") {
+    try await waitFor("second native Ghostty to share the alternate screen", timeout: launchTimeout) {
         secondSession.ghosttyBridge.readNativeScreenText()?.contains("ALTERNATE_SNAPSHOT") == true
     }
     #expect(secondSession !== session)
@@ -1496,7 +1559,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     }
     session.reconnectHostedSession()
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
-    try await waitFor("native Ghostty to render the reattached snapshot") {
+    try await waitFor("native Ghostty to render the reattached snapshot", timeout: launchTimeout) {
         session.ghosttyBridge.readNativeScreenText()?.contains("ALTERNATE_SNAPSHOT") == true
     }
     #expect(session.ghosttyBridge.terminalView.window === window)

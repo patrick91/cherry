@@ -613,6 +613,12 @@ private final class NoLocalServices: ServiceDetecting {
         #expect(manager.status(of: "other")?.leases == 1)
         #expect(manager.status(of: "racing")?.leases == 0)
     } catch {
+        // Which master was not up, and why (a `noConnection` is one that
+        // failed, stopped or was stopping when a forward asked for it).
+        let racing = String(describing: manager.status(of: "racing"))
+        let other = String(describing: manager.status(of: "other"))
+        let sshLog = String(contents(log).suffix(2_000))
+        Issue.record("\(error): masters racing \(racing), other \(other); ssh log: \(sshLog)")
         await cleanUp()
         throw error
     }

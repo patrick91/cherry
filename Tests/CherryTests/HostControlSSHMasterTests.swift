@@ -138,7 +138,7 @@ private func eventually(
         "-M", "-N", "-T",
         "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "ControlPath=/t/cherry-ssh-1/abc",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ClearAllForwardings=yes",
-        "-o", "RemoteCommand=none", "-o", "PermitLocalCommand=no", "-o", "BatchMode=yes",
+        "-o", "GatewayPorts=no", "-o", "RemoteCommand=none", "-o", "PermitLocalCommand=no", "-o", "BatchMode=yes",
         "--", "me@devbox",
     ])
     #expect(HostSSHMasterManager.commandArguments("check", destination: "devbox", controlPath: "/t/s") == [

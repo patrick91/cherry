@@ -257,7 +257,7 @@ struct MacOSServiceDetector: ServiceDetecting {
         "http://localhost:\(port)"
     }
 
-    private static func protocolGuess(port: Int) -> String? {
+    static func protocolGuess(port: Int) -> String? {
         let commonHTTPPorts: Set<Int> = [80, 3000, 3001, 4200, 5000, 5173, 5174, 8000, 8080, 8081, 8888]
         return commonHTTPPorts.contains(port) ? "http" : nil
     }

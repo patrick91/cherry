@@ -12,7 +12,7 @@ import GhosttyKit
     import AppKit
 #endif
 
-private enum TerminalCallbacks {
+enum TerminalCallbacks {
     static func wakeup(userdata: UnsafeMutableRawPointer?) {
         guard let userdata else { return }
         let controller = Unmanaged<TerminalController>.fromOpaque(userdata)
@@ -37,11 +37,31 @@ private enum TerminalCallbacks {
         let bridge = Unmanaged<TerminalCallbackBridge>
             .fromOpaque(bridgePtr)
             .takeUnretainedValue()
+        if action.tag == GHOSTTY_ACTION_OPEN_URL {
+            // Answered now: true keeps Ghostty from opening it itself. A
+            // click is handled on the main thread; anywhere else Ghostty
+            // opens it as before.
+            guard Thread.isMainThread else { return false }
+            return MainActor.assumeIsolated { openURL(action, bridge: bridge) }
+        }
         terminalRunOnMain {
             bridge.handleAction(action)
         }
 
         return false
+    }
+
+    /// Ghostty's `open_url` action: whether the surface's delegate opens
+    /// the URL itself (`TerminalSurfaceOpenURLDelegate`); false leaves it
+    /// to Ghostty, which opens it with the system's handler.
+    @MainActor
+    static func openURL(_ action: ghostty_action_s, bridge: TerminalCallbackBridge) -> Bool {
+        guard action.tag == GHOSTTY_ACTION_OPEN_URL else { return false }
+        let link = action.action.open_url
+        guard link.len > 0, let buffer = link.url,
+              let url = String(data: Data(bytes: buffer, count: Int(link.len)), encoding: .utf8)
+        else { return false }
+        return bridge.handleOpenURL(url)
     }
 
     static func closeSurface(
@@ -94,11 +114,11 @@ private enum TerminalCallbacks {
             let string = UIPasteboard.general.string
         #elseif canImport(AppKit)
             var string = NSPasteboard.general.string(forType: .string)
-            // No text but an image on the clipboard (e.g. a screenshot pasted with
-            // Cmd+V): write it to a temp file and paste its path so agents attach it.
-            if string == nil,
-               let path = TerminalPasteboardImage.temporaryFilePath(from: .general) {
-                string = TerminalPasteboardImage.escapedForInput(path)
+            // No text but an image on the clipboard (a screenshot pasted
+            // from the menu, or read by OSC 52): the delegate saves it and
+            // says what to paste for it (its file's path).
+            if string == nil, Thread.isMainThread {
+                string = MainActor.assumeIsolated { bridge.pastedImageText(from: .general) }
             }
         #endif
 

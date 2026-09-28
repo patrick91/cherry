@@ -330,6 +330,10 @@ final class HostControl: ObservableObject {
         var pendingHolderRelistInterval: Duration = .milliseconds(500)
         var pendingHolderRelists = 20
         var pendingHolderSlowRelistInterval: Duration = .seconds(5)
+        /// Whether connecting may start the host's daemon (or replace one
+        /// of an older protocol); false runs `cherry control --no-start`,
+        /// which fails when none of this version runs.
+        var startsHost = true
     }
 
     let host: HostedSessionHost
@@ -491,6 +495,7 @@ final class HostControl: ObservableObject {
     /// connection try the login shell again at once (an explicit refresh).
     @discardableResult
     func connect(retryingLoginEnvironment: Bool = false) async throws -> HostControlConnection {
+        try checkNotShutDown()
         if let connection, state == .connected { return connection }
         if let connectAttempt { return try await connectAttempt.value }
         reconnectTask?.cancel()
@@ -566,6 +571,24 @@ final class HostControl: ObservableObject {
         masterLease = nil
     }
 
+    /// Ends this control for good: a connection attempt under way is
+    /// cancelled and its helper stopped once it launched, the connection is
+    /// closed, and nothing connects again (every request fails). For a
+    /// teardown that must leave nothing running (a test's fake Mac).
+    func shutdown() {
+        isShutDown = true
+        connectAttempt?.cancel()
+        disconnect()
+    }
+
+    private(set) var isShutDown = false
+
+    private func checkNotShutDown() throws {
+        if isShutDown {
+            throw HostedSessionError.unavailable("This connection to the session host was shut down.")
+        }
+    }
+
     /// Reconnects, trusting whatever identity the host now reports (an
     /// explicit user decision after a mismatch).
     func trustNewIdentity(retryingLoginEnvironment: Bool = false) async throws {
@@ -610,6 +633,7 @@ final class HostControl: ObservableObject {
         }
         executableURL = client.executableURL
         let capture = await client.resolvedLoginEnvironment(retryingNow: retryingLoginEnvironment)
+        try checkNotShutDown()
         loginEnvironment = capture
         let environment = HostedSessionLoginEnvironment.helperEnvironment(
             base: ProcessInfo.processInfo.environment, login: capture?.environment
@@ -618,6 +642,7 @@ final class HostControl: ObservableObject {
         if let destination = host.sshDestination {
             if masterLease == nil { masterLease = masters.acquire(destination, environment: environment) }
             controlPath = await masters.waitUntilUp(destination, timeout: configuration.masterStartTimeout)
+            try checkNotShutDown()
         }
         // Trust on first use, per SSH destination. This Mac is never pinned:
         // the helper only accepts this user's own local host. The helper
@@ -629,7 +654,7 @@ final class HostControl: ObservableObject {
             executableURL: client.executableURL,
             arguments: host.arguments(sshControlPath: controlPath)
                 + Self.expectedHostIDArguments(trusted)
-                + ["control"],
+                + ["control"] + (configuration.startsHost ? [] : ["--no-start"]),
             environment: environment
         )
         let launcher = launcher
@@ -640,6 +665,14 @@ final class HostControl: ObservableObject {
             throw HostedSessionError.unavailable(
                 "Could not start the cherry session client: \(error.localizedDescription)"
             )
+        }
+        if isShutDown {
+            // Shut down while the helper started: it ends before it
+            // connects.
+            Darwin.close(channel.input)
+            Darwin.close(channel.output)
+            channel.finish()
+            try checkNotShutDown()
         }
         let connection = try HostControlConnection(channel: channel)
         self.connection = connection
@@ -728,6 +761,10 @@ final class HostControl: ObservableObject {
     }
 
     private func scheduleReconnect(after error: HostedSessionError) {
+        guard !isShutDown else {
+            state = .failed(error)
+            return
+        }
         reconnectFailures += 1
         state = .waitingToReconnect(error)
         let initial = configuration.reconnectDelay.initial

@@ -293,7 +293,8 @@ enum TerminalSearchArrowDirection {
 @MainActor
 final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, TerminalSurfaceBellDelegate,
     TerminalSurfaceGridResizeDelegate, TerminalSurfaceScrollbarDelegate, TerminalSurfacePointerDelegate,
-    TerminalSurfaceLinkHoverDelegate, TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
+    TerminalSurfaceLinkHoverDelegate, TerminalSurfaceOpenURLDelegate, TerminalSurfacePastedImageDelegate,
+    TerminalSurfaceSearchDelegate, TerminalSurfaceHostInputDelegate,
     TerminalSurfaceScrollInputDelegate, TerminalSurfaceClipboardConfirmationDelegate,
     TerminalSurfaceTitleDelegate, TerminalSurfaceWorkingDirectoryDelegate,
     TerminalSurfaceNotificationDelegate, TerminalSurfaceChildExitDelegate,
@@ -981,6 +982,14 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidHoverLink(_ url: String?) {
         hoveredLink = url
         updateTerminalPointerStyle()
+    }
+
+    /// A click on a URL. In a tab of another Mac, a URL of that Mac's
+    /// loopback opens through a forward of its port (`RemoteURLOpening`);
+    /// anything else is Ghostty's to open.
+    func terminalShouldHandleOpenURL(_ url: String) -> Bool {
+        guard let session = proxy.session else { return false }
+        return RemoteURLOpening.open(url, for: session, window: terminalView.window)
     }
 
     func terminalDidRequestSearch(_ request: TerminalSearchStartRequest) {
@@ -2401,19 +2410,75 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 extension GhosttySessionBridge {
     /// Files pasted or dropped on a tab whose program runs on another Mac
     /// (docs/specs/remote-devices.md, phase 3): asked about, copied there
-    /// and their paths there inserted. False when it is not such a tab or
-    /// it carries no files (the default paste or drop then runs).
+    /// and their paths there inserted; an image pasted or dropped there is
+    /// copied without asking. False when it is not such a tab or it carries
+    /// no files or image (the default paste or drop then runs).
     func handleRemoteFiles(_ pasteboard: NSPasteboard, isPaste: Bool) -> Bool {
         guard let session = proxy.session else { return false }
         return RemoteFileDropCoordinator.handle(
             pasteboard, for: session, isPaste: isPaste, window: terminalView.window
-        ) { [weak self, weak session] text in
-            guard let self, let session else { return }
-            if session.keyboardInputGoesThroughHost || !self.isNativePTYBacked {
-                session.send(data: Data(text.utf8))
-            } else {
-                self.terminalView.sendText(text)
-            }
+        ) { [weak self] text in
+            self?.insertPastedText(text)
+        }
+    }
+
+    /// ⌘V: files and images into a tab of another Mac
+    /// (`handleRemoteFiles`); an image alone into a tab of This Mac, as its
+    /// saved file's path (`LocalImagePaste`). False for anything else
+    /// (text, files on This Mac): the surface pastes it.
+    func handlePaste(_ pasteboard: NSPasteboard) -> Bool {
+        guard let session = proxy.session else { return false }
+        if let hosting = session.persistentHosting, !hosting.profile.isThisMac {
+            return handleRemoteFiles(pasteboard, isPaste: true)
+        }
+        return LocalImagePaste.handle(pasteboard) { [weak self] text in
+            self?.insertPastedText(text)
+        }
+    }
+
+    /// An image the surface pastes by itself (Edit › Paste, a context
+    /// menu, an OSC 52 read) or has dropped on it: in a tab of This Mac, its
+    /// saved file's quoted path (`LocalImagePaste`, as ⌘V); in a tab of
+    /// another Mac nothing now, and the copy's path there once it is copied
+    /// (`handleRemoteFiles`).
+    func terminalText(forImageOn pasteboard: NSPasteboard) -> String? {
+        guard let session = proxy.session else { return nil }
+        if let hosting = session.persistentHosting, !hosting.profile.isThisMac {
+            _ = handleRemoteFiles(pasteboard, isPaste: true)
+            return nil
+        }
+        var text: String?
+        LocalImagePaste.handle(pasteboard) { text = $0 }
+        return text
+    }
+
+    /// Ctrl+V with an image in an agent tab of another Mac
+    /// (`RemoteClipboardImagePaste`): the image goes to that Mac's
+    /// clipboard first, then the key.
+    func handleRemoteClipboardImagePaste(_ pasteboard: NSPasteboard, replay: @escaping @MainActor (NSEvent) -> Void) -> Bool {
+        guard let session = proxy.session else { return false }
+        return RemoteClipboardImagePaste.handle(
+            pasteboard, for: session, window: terminalView.window,
+            sendControlV: { [weak session] in
+                // Encoded for the program's keyboard mode by the surface
+                // (or the host while the adapter is away).
+                session?.send(data: Data([0x16]))
+            },
+            insert: { [weak self] text in self?.insertPastedText(text) },
+            replay: replay
+        )
+    }
+
+    /// Pastes `text` into the tab as the tab pastes: through the surface
+    /// (which brackets it while the program asks for it), or, when the
+    /// host takes the tab's input now, bracketed as the host reports the
+    /// program's mode (`TerminalSession.bracketsPaste`).
+    func insertPastedText(_ text: String) {
+        guard let session = proxy.session, session.acceptsInput else { return }
+        if session.keyboardInputGoesThroughHost || !isNativePTYBacked {
+            session.send(data: TerminalInputEncoder.pastedTextData(text, bracketedPasteMode: session.bracketsPaste(text)))
+        } else {
+            terminalView.sendText(text)
         }
     }
 }
@@ -3203,9 +3268,35 @@ final class GhosttyTerminalContainerView: NSView {
             else {
                 return false
             }
-            // Files pasted into a tab of another Mac are copied there.
-            if isPasteShortcut(event), activeBridge?.handleRemoteFiles(pasteboard, isPaste: true) == true {
+            switch Self.nativeKeyRoute(
+                modifiers: event.modifierFlags,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                holdsKeys: activeSession.map { RemoteClipboardImagePaste.holdsKeys(for: $0.id) } ?? false
+            ) {
+            case .hold:
+                // A Ctrl+V's image is on its way to another Mac: keys typed
+                // meanwhile follow its Ctrl+V.
+                if let activeSession { RemoteClipboardImagePaste.hold(event, for: activeSession.id) }
                 return true
+            case .paste:
+                // Files and images pasted into a tab of another Mac are
+                // copied there; an image pasted into one of This Mac is
+                // saved and its path pasted.
+                if activeBridge?.handlePaste(pasteboard) == true { return true }
+            case .controlV:
+                // Ctrl+V with an image in an agent tab of another Mac: the
+                // image goes to that Mac's clipboard first.
+                if let activeBridge,
+                   activeBridge.handleRemoteClipboardImagePaste(pasteboard, replay: { [weak self, weak activeBridge] held in
+                       guard let self, let activeBridge else { return }
+                       if !self.sendKeyThroughHostWhileAdapterIsAway(held) {
+                           activeBridge.terminalView.keyDown(with: held)
+                       }
+                   }) {
+                    return true
+                }
+            case .other:
+                break
             }
             return sendKeyThroughHostWhileAdapterIsAway(event)
         }
@@ -3344,16 +3435,47 @@ final class GhosttyTerminalContainerView: NSView {
         return true
     }
 
-    private func isPasteShortcut(_ event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard modifiers.contains(.command),
-              !modifiers.contains(.control),
-              !modifiers.contains(.option),
-              event.charactersIgnoringModifiers?.lowercased() == "v" else {
-            return false
-        }
+    /// Ctrl+V alone (no Command, Option or Shift).
+    /// What the key monitor does with a key typed into a native surface
+    /// (the default tabs, whose surface owns their input) before the surface
+    /// sees it.
+    enum NativeKeyRoute: Equatable {
+        /// A Ctrl+V's image paste is under way in the tab: held until it
+        /// is done (Command shortcuts still reach the menu).
+        case hold
+        /// ⌘V: files and images are Cherry's to paste.
+        case paste
+        /// Ctrl+V: an image may go to another Mac's clipboard first.
+        case controlV
+        case other
+    }
 
-        return true
+    static func nativeKeyRoute(
+        modifiers: NSEvent.ModifierFlags,
+        charactersIgnoringModifiers: String?,
+        holdsKeys: Bool
+    ) -> NativeKeyRoute {
+        if holdsKeys, !modifiers.contains(.command) { return .hold }
+        if isPasteShortcut(modifiers: modifiers, charactersIgnoringModifiers: charactersIgnoringModifiers) { return .paste }
+        if isControlV(modifiers: modifiers, charactersIgnoringModifiers: charactersIgnoringModifiers) { return .controlV }
+        return .other
+    }
+
+    /// Ctrl+V alone (no Command, Option or Shift).
+    static func isControlV(modifiers: NSEvent.ModifierFlags, charactersIgnoringModifiers: String?) -> Bool {
+        modifiers.intersection([.command, .control, .option, .shift]) == .control
+            && charactersIgnoringModifiers?.lowercased() == "v"
+    }
+
+    /// ⌘V (with or without Shift; not with Control or Option).
+    static func isPasteShortcut(modifiers: NSEvent.ModifierFlags, charactersIgnoringModifiers: String?) -> Bool {
+        let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        return modifiers.contains(.command) && !modifiers.contains(.control) && !modifiers.contains(.option)
+            && charactersIgnoringModifiers?.lowercased() == "v"
+    }
+
+    private func isPasteShortcut(_ event: NSEvent) -> Bool {
+        Self.isPasteShortcut(modifiers: event.modifierFlags, charactersIgnoringModifiers: event.charactersIgnoringModifiers)
     }
 
     private func requestTerminalFocus() {

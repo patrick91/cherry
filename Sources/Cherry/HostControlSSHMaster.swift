@@ -155,6 +155,12 @@ final class HostSSHMasterManager: @unchecked Sendable {
         shard == 1 ? destination : "\(destination)#\(shard)"
     }
 
+    /// Posted (object: the manager) when a destination's first master
+    /// exited: forwards made through it (`RemotePortForwards`) went with
+    /// it. `userInfo[destinationKey]` is the destination.
+    static let masterDidStopNotification = Notification.Name("CherrySSHMasterDidStop")
+    static let destinationKey = "destination"
+
     let configuration: Configuration
     private let lock = NSLock()
     private var masters: [String: Master] = [:]
@@ -602,7 +608,13 @@ final class HostSSHMasterManager: @unchecked Sendable {
             return nil
         }
         if let restart { launch(restart.0, generation: restart.1) }
-        if master.shard == 1 { balanceShards(of: master.destination) }
+        if master.shard == 1 {
+            balanceShards(of: master.destination)
+            NotificationCenter.default.post(
+                name: Self.masterDidStopNotification, object: self,
+                userInfo: [Self.destinationKey: master.destination]
+            )
+        }
     }
 
     private func restartIfNeeded(_ master: Master, after generation: Int) {
@@ -690,6 +702,9 @@ final class HostSSHMasterManager: @unchecked Sendable {
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "ClearAllForwardings=yes",
+            // Forwards asked for later (`RemotePortForwards`) never listen
+            // beyond the loopback, whatever the user's ssh config says.
+            "-o", "GatewayPorts=no",
             "-o", "RemoteCommand=none",
             "-o", "PermitLocalCommand=no",
             "-o", "BatchMode=yes",

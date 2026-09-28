@@ -26,6 +26,8 @@ final class CherryControlServer: @unchecked Sendable {
     private let openProjectProvider: @MainActor (String) -> Void
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
+    /// Services of tabs of other Macs (docs/specs/remote-devices.md, phase 4a).
+    private let remoteServiceDetector: any RemoteServiceDetecting
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
     private var listenFileDescriptor: Int32 = -1
@@ -39,7 +41,8 @@ final class CherryControlServer: @unchecked Sendable {
         chromeState: ProjectWindowChromeState? = nil,
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
-        serviceDetector: any ServiceDetecting = MacOSServiceDetector()
+        serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
+        remoteServiceDetector: (any RemoteServiceDetecting)? = nil
     ) {
         self.workspace = workspace
         self.noteStore = noteStore
@@ -67,6 +70,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.openProjectProvider = { _ in }
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
+        self.remoteServiceDetector = remoteServiceDetector ?? DeviceServiceDetector()
         self.socketURL = socketURL
     }
 
@@ -100,7 +104,8 @@ final class CherryControlServer: @unchecked Sendable {
         openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
-        serviceDetector: any ServiceDetecting = MacOSServiceDetector()
+        serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
+        remoteServiceDetector: (any RemoteServiceDetecting)? = nil
     ) {
         self.workspace = nil
         self.noteStore = nil
@@ -118,6 +123,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.openProjectProvider = openProjectProvider
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
+        self.remoteServiceDetector = remoteServiceDetector ?? DeviceServiceDetector()
         self.socketURL = socketURL
     }
 
@@ -1465,19 +1471,49 @@ final class CherryControlServer: @unchecked Sendable {
     private func detectedServices(
         workspace: TerminalWorkspace,
         sessions: [TerminalSession],
-        includeUnattributed: Bool
+        includeUnattributed: Bool,
+        forwardingRemotePorts: Bool = false
     ) async throws -> [ServiceRecord] {
-        let inspectable = sessions.map { session in
+        func inspectable(_ session: TerminalSession, rootPID: Int32?) -> InspectableProcess {
             InspectableProcess(
                 id: session.id.uuidString,
                 name: processName(for: session),
                 kind: session.kind.rawValue,
-                rootPID: session.programProcessID,
+                rootPID: rootPID,
                 commandName: session.commandName,
                 agentName: session.agentName
             )
         }
-        return try await serviceDetector.detectServices(processes: inspectable, includeUnattributed: includeUnattributed)
+        // Tabs of other Macs: their Mac says which ports their programs
+        // listen on, and the ports are forwarded here (never a local pid).
+        let onOtherMacs = sessions.filter { $0.persistentHosting?.profile.isThisMac == false }
+        let local = sessions.filter { $0.persistentHosting?.profile.isThisMac != false }
+        let remote: [RemoteInspectableProcess] = onOtherMacs.compactMap { session in
+            guard let hosting = session.persistentHosting, let pid = session.remoteProgramProcessID else { return nil }
+            return RemoteInspectableProcess(
+                process: inspectable(session, rootPID: nil),
+                tabID: session.id,
+                host: hosting.profile.host,
+                machine: hosting.profile.displayName,
+                remotePID: pid
+            )
+        }
+        var records: [ServiceRecord] = []
+        if !local.isEmpty || includeUnattributed {
+            records = try await serviceDetector.detectServices(
+                processes: local.map { inspectable($0, rootPID: $0.programProcessID) },
+                includeUnattributed: includeUnattributed
+            )
+        }
+        if !remote.isEmpty {
+            do {
+                records += try await remoteServiceDetector.detectServices(processes: remote, forwarding: forwardingRemotePorts)
+            } catch where !local.isEmpty || includeUnattributed {
+                // This Mac's services are still worth reporting.
+                SessionLog.error("services of tabs of other Macs: \(error.localizedDescription)")
+            }
+        }
+        return records
     }
 
     @MainActor
@@ -1493,10 +1529,13 @@ final class CherryControlServer: @unchecked Sendable {
 
         var lastCandidates: [ServiceRecord] = []
         repeat {
+            // Probing a service of another Mac over HTTP needs it here:
+            // only then is its port forwarded.
             let candidates = try await detectedServices(
                 workspace: workspace,
                 sessions: sessions,
-                includeUnattributed: includeUnattributed
+                includeUnattributed: includeUnattributed,
+                forwardingRemotePorts: request.probeHTTP ?? false
             )
             .filter { service in
                 request.port.map { $0 == service.port } ?? true

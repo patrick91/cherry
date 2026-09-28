@@ -28,12 +28,24 @@
 #                 of its sessions: at most the number in DIR/max-sessions
 #                 (default 10) run at once, as sshd's MaxSessions, and one
 #                 more fails with "Session open refused by peer" (255).
+#                 `-O forward -L SPEC` and `-O cancel -L SPEC` on a running
+#                 master succeed and append "forward|cancel PATH SPEC" to
+#                 DIR/forwards (nothing listens: the loopback test makes a
+#                 real forward); with DIR/forward-fails a forward fails as
+#                 ssh does when its local port is taken.
 # and in DIR/hosts/NAME:
 #   offline   ssh: connect to host NAME port 22: Connection timed out (255)
 #   hostkey   Host key verification failed. (255)
 #   denied    NAME: Permission denied (publickey). (255)
 #   arch      its contents (e.g. x86_64) are the architecture `uname -m`
 #             and `uname -sm` report there (a stand-in `uname`)
+#   no-gui    its `osascript` stand-in fails as osascript does over SSH
+#             with nobody logged in there
+# Every fake Mac has that `osascript` stand-in first on its PATH, so the
+# real one (which would set this Mac's clipboard) never runs: `set the
+# clipboard to (read (POSIX file "P") as «class PNGf»)` copies P to
+# clipboard.png there, `clipboard info for «class PNGf»` reports it, and
+# each script is logged to osascript-calls there.
 #
 # What cherry-host a fake Mac has (CHERRY_FAKE_REMOTE_HOST at setup):
 #   link      (the default) cherry and cherry-host on its PATH, linked to the
@@ -51,8 +63,10 @@
 # alias). An unknown NAME: Could not resolve hostname (255). Every call is logged
 # to DIR/calls.
 #
-# stop ends the daemons and holders serving DIR's sockets (matched by their
-# private socket paths, never by name) and removes nothing else.
+# stop makes the shim refuse every further connection (DIR/stopped), then
+# ends the daemons and holders serving DIR's sockets (matched by their
+# private socket paths, never by name), again until none is left, and
+# removes nothing else.
 set -eu
 
 usage() {
@@ -137,6 +151,31 @@ echo "security: SecKeychainCopySettings: User interaction is not allowed." >&2
 exit 36
 EOF
       chmod 700 "$host/bin/scutil" "$host/bin/security"
+      # osascript: never the real one (it would set this Mac's clipboard).
+      cat > "$host/bin/osascript" <<EOF
+#!/bin/sh
+host='$quoted_host'
+EOF
+      cat >> "$host/bin/osascript" <<'EOF'
+[ "${1-}" = -e ] || { echo "osascript stand-in: only -e SCRIPT" >&2; exit 2; }
+printf '%s\n' "$2" >> "$host/osascript-calls"
+if [ -f "$host/no-gui" ]; then
+  echo "0:0: execution error: An error of type -10810 has occurred. (-10810)" >&2
+  exit 1
+fi
+case "$2" in
+  "set the clipboard to (read (POSIX file "*)
+    path=$(printf '%s' "$2" | /usr/bin/sed -n 's/.*POSIX file "\([^"]*\)".*/\1/p')
+    [ -f "$path" ] || { echo "0:0: execution error: File not found. (-43)" >&2; exit 1; }
+    /bin/cp "$path" "$host/clipboard.png" ;;
+  "clipboard info for "*)
+    if [ -f "$host/clipboard.png" ]; then
+      printf '«class PNGf», %s\n' "$(/usr/bin/wc -c < "$host/clipboard.png" | /usr/bin/tr -d ' ')"
+    fi ;;
+  *) echo "osascript stand-in: unknown script" >&2; exit 1 ;;
+esac
+EOF
+      chmod 700 "$host/bin/osascript"
     done
     quoted=$(printf "%s" "$dir" | sed "s/'/'\\\\''/g")
     cat > "$dir/bin/ssh" <<EOF
@@ -145,10 +184,15 @@ dir='$quoted'
 EOF
     cat >> "$dir/bin/ssh" <<'EOF'
 printf '%s\n' "$*" >> "$dir/calls"
+if [ -f "$dir/stopped" ]; then
+  echo "fake-remote-mac: this fake Mac was stopped" >&2
+  exit 255
+fi
 destination=
 master=no
 control=
 path=
+spec=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; destination=${1-}; [ $# -gt 0 ] && shift; break ;;
@@ -163,7 +207,8 @@ while [ $# -gt 0 ]; do
       shift
       case "${1-}" in ControlPath=*) path=${1#ControlPath=} ;; esac ;;
     -oControlPath=*) path=${1#-oControlPath=} ;;
-    -[BbcDEeFIiJLlmpQRSWw]) shift ;;
+    -L) shift; spec=${1-} ;;
+    -[BbcDEeFIiJlmpQRSWw]) shift ;;
     -*) ;;
     *) destination=$1; shift; break ;;
   esac
@@ -176,6 +221,15 @@ if [ -n "$control" ]; then
     check) [ -n "$path" ] && [ -e "$path" ] && exit 0
            echo "Control socket connect($path): No such file or directory" >&2; exit 255 ;;
     exit) [ -f "$path.pid" ] && kill -TERM "$(/bin/cat "$path.pid")"; echo "Exit request sent." >&2; exit 0 ;;
+    forward|cancel)
+      if [ -z "$path" ] || [ ! -f "$path.pid" ]; then
+        echo "Control socket connect($path): No such file or directory" >&2; exit 255
+      fi
+      if [ "$control" = forward ] && [ -f "$dir/forward-fails" ]; then
+        echo "mux_client_forward: forwarding request failed: Port forwarding failed" >&2; exit 255
+      fi
+      printf '%s %s %s\n' "$control" "$path" "$spec" >> "$dir/forwards"
+      exit 0 ;;
     *) exit 255 ;;
   esac
 fi
@@ -254,17 +308,38 @@ EOF
     echo "$dir/bin"
     ;;
   stop)
+    # From now on the shim refuses every connection (a tombstone), so a
+    # connection attempt still under way cannot start a daemon again.
+    [ -d "$dir" ] && : > "$dir/stopped"
     # Stand-in masters (DIR/masters) of this DIR, by the pid each wrote.
     for pidfile in "$dir"/*.pid "$dir"/*/*.pid; do
       [ -f "$pidfile" ] || continue
       kill -TERM "$(cat "$pidfile")" 2>/dev/null || true
     done
     [ -d "$dir/hosts" ] || exit 0
-    for host in "$dir"/hosts/*; do
-      [ -d "$host" ] || continue
-      socket="$host/host.sock"
-      pkill -TERM -f "serve --socket $socket" 2>/dev/null || true
-      pkill -KILL -f "hold --socket $socket" 2>/dev/null || true
+    # The daemons and holders serving DIR's sockets, until none has been
+    # seen for half a second (a gateway that was already running may start
+    # one late); TERM first, KILL after 3 seconds; 10 seconds at most.
+    quiet=0
+    tries=0
+    while [ "$quiet" -lt 5 ] && [ "$tries" -lt 100 ]; do
+      found=0
+      for host in "$dir"/hosts/*; do
+        [ -d "$host" ] || continue
+        socket="$host/host.sock"
+        if pgrep -f "serve --socket $socket" >/dev/null 2>&1 || pgrep -f "hold --socket $socket" >/dev/null 2>&1; then
+          found=1
+          if [ "$tries" -lt 30 ]; then
+            pkill -TERM -f "serve --socket $socket" 2>/dev/null || true
+          else
+            pkill -KILL -f "serve --socket $socket" 2>/dev/null || true
+          fi
+          pkill -KILL -f "hold --socket $socket" 2>/dev/null || true
+        fi
+      done
+      if [ "$found" = 1 ]; then quiet=0; else quiet=$((quiet + 1)); fi
+      tries=$((tries + 1))
+      /bin/sleep 0.1
     done
     ;;
   *)

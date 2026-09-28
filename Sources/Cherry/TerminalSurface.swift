@@ -534,32 +534,38 @@ enum TerminalInputEncoder {
 }
 
 enum TerminalPasteboardContent {
+    /// Where a pasted image is written (`PastedImageStore`).
     static var defaultImageDirectory: URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("CherryPastedImages", isDirectory: true)
+        PastedImageStore.defaultDirectory
     }
 
     /// The paste, wrapped in bracketed-paste markers when `bracketing`
-    /// says so for the text that is pasted (the pasteboard's text, a URL,
-    /// or the path of a pasted image, as `pasteData(from:bracketedPasteMode:)`
-    /// takes them).
+    /// says so for the text that is pasted: the pasteboard's text, a URL,
+    /// or the path of a pasted image (saved to `imageDirectory`, quoted as
+    /// `PastedImage.quoted`).
     static func pasteData(
         from pasteboard: NSPasteboard,
+        imageDirectory: URL = defaultImageDirectory,
         bracketing: (String) -> Bool
     ) -> Data? {
-        let text: String
-        if let string = pasteboard.string(forType: .string), !string.isEmpty {
-            text = string
-        } else if let urlText = urlPasteText(from: pasteboard) {
-            text = urlText
-        } else if let imageURL = pastedImageFileURL(
-            from: pasteboard, imageDirectory: defaultImageDirectory, imageID: UUID()
-        ) {
-            text = shellEscaped(imageURL.path)
-        } else {
-            return nil
-        }
+        guard let text = pasteText(from: pasteboard, imageDirectory: imageDirectory) else { return nil }
         return TerminalInputEncoder.pastedTextData(text, bracketedPasteMode: bracketing(text))
+    }
+
+    /// What a paste of `pasteboard` types: its text, else its URLs (file
+    /// URLs as escaped paths), else the quoted path of its image written
+    /// to `imageDirectory`. Nil when it has none of these.
+    static func pasteText(from pasteboard: NSPasteboard, imageDirectory: URL = defaultImageDirectory) -> String? {
+        if let string = pasteboard.string(forType: .string), !string.isEmpty {
+            return string
+        }
+        if let urlText = urlPasteText(from: pasteboard) {
+            return urlText
+        }
+        if let imageURL = pastedImageFileURL(from: pasteboard, imageDirectory: imageDirectory) {
+            return PastedImage.quoted(imageURL.path)
+        }
+        return nil
     }
 
     static func pasteData(
@@ -583,6 +589,7 @@ enum TerminalPasteboardContent {
         from pasteboard: NSPasteboard,
         imageDirectory: URL = defaultImageDirectory,
         imageID: UUID = UUID(),
+        now: Date = Date(),
         bracketedPasteMode: Bool = false
     ) -> Data? {
         if let urlText = urlPasteText(from: pasteboard) {
@@ -595,13 +602,14 @@ enum TerminalPasteboardContent {
         guard let imageURL = pastedImageFileURL(
             from: pasteboard,
             imageDirectory: imageDirectory,
-            imageID: imageID
+            imageID: imageID,
+            now: now
         ) else {
             return nil
         }
 
         return TerminalInputEncoder.pastedTextData(
-            shellEscaped(imageURL.path),
+            PastedImage.quoted(imageURL.path),
             bracketedPasteMode: bracketedPasteMode
         )
     }
@@ -617,21 +625,16 @@ enum TerminalPasteboardContent {
             .joined(separator: " ")
     }
 
+    /// The pasteboard's image written as a PNG to `imageDirectory`
+    /// (`PastedImageStore`); nil when it has none.
     static func pastedImageFileURL(
         from pasteboard: NSPasteboard,
         imageDirectory: URL = defaultImageDirectory,
-        imageID: UUID = UUID()
+        imageID: UUID = UUID(),
+        now: Date = Date()
     ) -> URL? {
-        guard let pngData = pngData(from: pasteboard) else { return nil }
-
-        do {
-            try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
-            let url = imageDirectory.appendingPathComponent("cherry-paste-\(imageID.uuidString).png")
-            try pngData.write(to: url, options: .atomic)
-            return url
-        } catch {
-            return nil
-        }
+        guard let pngData = PastedImage.pngData(from: pasteboard) else { return nil }
+        return try? PastedImageStore.save(pngData, in: imageDirectory, now: now, id: imageID)
     }
 
     static func shellEscaped(_ value: String) -> String {
@@ -640,28 +643,6 @@ enum TerminalPasteboardContent {
             result = result.replacingOccurrences(of: String(character), with: "\\\(character)")
         }
         return result
-    }
-
-    private static func pngData(from pasteboard: NSPasteboard) -> Data? {
-        if let data = pasteboard.data(forType: .png) {
-            return data
-        }
-        if let data = pasteboard.data(forType: .tiff),
-           let image = NSImage(data: data) {
-            return pngData(from: image)
-        }
-        if let image = NSImage(pasteboard: pasteboard) {
-            return pngData(from: image)
-        }
-        return nil
-    }
-
-    private static func pngData(from image: NSImage) -> Data? {
-        guard let tiffData = image.tiffRepresentation,
-              let representation = NSBitmapImageRep(data: tiffData) else {
-            return nil
-        }
-        return representation.representation(using: .png, properties: [:])
     }
 }
 

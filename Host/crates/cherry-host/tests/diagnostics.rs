@@ -305,6 +305,42 @@ fn version_json_names_the_protocol_build_and_platform() {
 }
 
 #[test]
+fn ports_json_reports_what_a_process_tree_listens_on_without_starting_a_host() {
+    let sandbox = Sandbox::new();
+    // This test's process listens; its pid roots the tree asked about.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let pid = std::process::id();
+    let report = json_of(
+        sandbox
+            .command("ports")
+            .arg("--json")
+            .arg(pid.to_string())
+            .arg("999999999"),
+    );
+    assert_eq!(report["version"], 1);
+    let processes = report["processes"].as_array().unwrap();
+    assert_eq!(processes.len(), 2);
+    assert_eq!(processes[0]["pid"], pid);
+    assert_eq!(processes[0]["alive"], true);
+    if report.get("error").is_none() {
+        assert!(
+            processes[0]["ports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|found| found["port"] == port && found["pid"] == pid),
+            "{report}"
+        );
+    }
+    // A pid that is gone.
+    assert_eq!(processes[1]["alive"], false);
+    assert_eq!(processes[1]["ports"].as_array().unwrap().len(), 0);
+    // Nothing was started.
+    assert!(!sandbox.socket.exists());
+}
+
+#[test]
 fn status_json_describes_the_host_at_the_socket_without_starting_or_replacing_one() {
     // No host: said so, and none is started.
     let sandbox = Sandbox::new();

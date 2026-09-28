@@ -32,6 +32,17 @@ worktrees. The sliders button opens a temporary dogfooding panel for tuning the
 swipe trigger distance and settle duration. Quick flicks can commit below the
 distance threshold based on their velocity.
 
+### Pasting images
+
+A terminal takes text only. Pasting (**Cmd-V**) an image with no text on the
+clipboard (a screenshot, an image copied in a browser: PNG, TIFF, HEIC)
+into any tab saves it as a PNG in `~/Library/Caches/Cherry/Pasted
+Images/` and pastes its path (quoted, and bracketed while the program asks
+for bracketed paste), which agents such as Claude Code and Codex attach.
+Images there are removed a week later. Text wins when the clipboard has
+text too, and files copied in Finder paste as before. Edit › Paste and
+dropping image data do the same.
+
 ## Persistent Sessions
 
 Local terminal, command and agent tabs run as persistent sessions by default.
@@ -193,7 +204,22 @@ commands are read there (read-only: a command you edit is saved on this Mac
 only), auto-start and restart on exit as usual, and **Open in** offers the
 editors that reach it over SSH (VS Code and Cursor through Remote - SSH,
 Zed). Pasting or dropping files into its tab asks first and copies them to
-a temporary folder on that Mac, then inserts the paths they have there. Its
+a temporary folder on that Mac, then inserts the paths they have there; a
+pasted image is copied there without asking and the path of the copy
+pasted. **Ctrl-V** with an image in an agent tab there, while the agent is
+in front (Claude Code reads the clipboard of the Mac it runs on), copies the
+image there, puts it on that Mac's clipboard and then sends Ctrl-V; keys
+typed meanwhile follow it. When that Mac's clipboard cannot be set (nobody
+is logged in there), the copy's path is pasted instead; when the image
+cannot be copied, Ctrl-V goes on anyway; a notice says why either way. A
+`localhost` link in its tab (Cmd-click) opens through a port forwarded from
+that Mac over its SSH connection to `127.0.0.1` on this Mac ("Forwarded from
+Studio"). Cherry's MCP tools (`get_process_ports`, `services_list`,
+`wait_for_bound_port`) report the ports its programs listen on there,
+naming the Mac (`machine`, `remoteURL`); they forward nothing, except
+`wait_for_bound_port` with `probe_http`, which forwards the port it probes
+(`url` is then the forwarded one). Forwards end when their tab or window
+closes. Its
 sessions no tab shows are listed under its name in Background Sessions
 (while Cherry is connected to it, or while the menu is open; looking at a
 Mac, there or in the project picker, never starts its session host), and

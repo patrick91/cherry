@@ -11809,15 +11809,19 @@ private func serviceRecord(
     defer {
         try? FileManager.default.removeItem(at: directory)
     }
-    let imageID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000123"))
+    let imageID = try #require(UUID(uuidString: "ABCDEF12-0000-0000-0000-000000000123"))
+    let now = Date()
     let data = try #require(TerminalPasteboardContent.nonTextPasteData(
         from: pasteboard,
         imageDirectory: directory,
-        imageID: imageID
+        imageID: imageID,
+        now: now
     ))
-    let path = directory.appendingPathComponent("cherry-paste-\(imageID.uuidString).png").path
+    // `PastedImageStore`'s name: its time and the id's first 8.
+    let path = directory.appendingPathComponent(PastedImageStore.fileName(at: now, id: imageID)).path
+    #expect(path.hasSuffix("-abcdef12.png"))
 
-    #expect(String(decoding: data, as: UTF8.self) == TerminalPasteboardContent.shellEscaped(path))
+    #expect(String(decoding: data, as: UTF8.self) == PastedImage.quoted(path))
     #expect(FileManager.default.fileExists(atPath: path))
 }
 

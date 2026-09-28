@@ -205,6 +205,8 @@ pub fn follow_log_file(path: PathBuf) {
 }
 
 /// The file `fd` writes to, as (device, inode).
+// `st_dev` is an i32 on macOS and a u64 on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     (unsafe { libc::fstat(fd, &mut stat) } == 0).then_some((stat.st_dev as u64, stat.st_ino as u64))
@@ -1226,7 +1228,10 @@ fn stderr_log(state: &Path) -> Option<PathBuf> {
     if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr) } != 0 {
         return None;
     }
-    (stderr.st_dev as u64 == file.dev() && stderr.st_ino as u64 == file.ino()).then_some(path)
+    // `st_dev` is an i32 on macOS and a u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let same = stderr.st_dev as u64 == file.dev() && stderr.st_ino as u64 == file.ino();
+    same.then_some(path)
 }
 
 /// Rate-limited diagnostics for the host log.

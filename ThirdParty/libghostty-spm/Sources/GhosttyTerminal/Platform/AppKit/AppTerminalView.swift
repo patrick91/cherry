@@ -174,8 +174,9 @@
                 options: [.urlReadingFileURLsOnly: true]
             ) as? [URL], !urls.isEmpty {
                 text = urls.map { TerminalPasteboardImage.escapedForInput($0.path) }.joined(separator: " ")
-            } else if let path = TerminalPasteboardImage.temporaryFilePath(from: pasteboard) {
-                text = TerminalPasteboardImage.escapedForInput(path)
+            } else if pasteboard.string(forType: .string) == nil,
+                      let imageText = (delegate as? any TerminalSurfacePastedImageDelegate)?.terminalText(forImageOn: pasteboard) {
+                text = imageText
             } else if let string = pasteboard.string(forType: .string) {
                 text = string
             } else {

@@ -127,14 +127,14 @@ public enum CherryMCPTools {
         ),
         tool(
             "get_process_ports",
-            "Return localhost TCP services associated with one Cherry process. Unattributed listeners are hidden unless include_unattributed is true.",
+            "Return localhost TCP services associated with one Cherry process. Unattributed listeners are hidden unless include_unattributed is true. For a process on another Mac (a device tab) its Mac reports the ports: machine names the Mac and remoteURL is the URL there; nothing is forwarded by listing, so url is the URL there unless the port is already forwarded to This Mac (forwardedFrom names the Mac, url is the forwarded URL). wait_for_bound_port with probe_http forwards the port it probes.",
             properties: processSelectorProperties([
                 "include_unattributed": boolean("Whether to include localhost listeners not attributed to the selected Cherry process. Defaults to false.")
             ])
         ),
         tool(
             "services_list",
-            "List localhost TCP services for active Cherry processes without changing the Cherry UI. Unattributed listeners are hidden unless include_unattributed is true.",
+            "List localhost TCP services for active Cherry processes without changing the Cherry UI. Unattributed listeners are hidden unless include_unattributed is true. For a process on another Mac (a device tab) its Mac reports the ports: machine names the Mac and remoteURL is the URL there; nothing is forwarded by listing, so url is the URL there unless the port is already forwarded to This Mac (forwardedFrom names the Mac, url is the forwarded URL). wait_for_bound_port with probe_http forwards the port it probes.",
             properties: [
                 "kind": string("Optional process kind filter: terminal, agent, or command."),
                 "include_unattributed": boolean("Whether to include localhost listeners not attributed to Cherry processes. Defaults to false.")
@@ -142,7 +142,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "wait_for_bound_port",
-            "Wait for one matching localhost TCP service. Returns ambiguous_service if multiple services match; narrow with process_id, process_name, or port. HTTP probing only happens when probe_http is true.",
+            "Wait for one matching localhost TCP service. Returns ambiguous_service if multiple services match; narrow with process_id, process_name, or port. HTTP probing only happens when probe_http is true; for a process on another Mac, probing forwards its port over SSH to This Mac (url is then the forwarded URL).",
             properties: processSelectorProperties([
                 "port": integer("Optional TCP port to wait for."),
                 "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 10000, max 60000."),

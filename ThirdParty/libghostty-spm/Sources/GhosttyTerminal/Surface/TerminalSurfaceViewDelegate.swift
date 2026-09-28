@@ -134,6 +134,27 @@ public protocol TerminalSurfaceLinkHoverDelegate: TerminalSurfaceViewDelegate {
     func terminalDidHoverLink(_ url: String?)
 }
 
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+
+    /// An image on a pasteboard the surface pastes or has dropped on it
+    /// (no text, no file URLs): terminals take text, so the delegate saves
+    /// it and returns what to type for it (its file's quoted path), or nil
+    /// to paste nothing.
+    @MainActor
+    public protocol TerminalSurfacePastedImageDelegate: TerminalSurfaceViewDelegate {
+        func terminalText(forImageOn pasteboard: NSPasteboard) -> String?
+    }
+#endif
+
+/// Opening a URL the user clicked (Ghostty's `open_url` action).
+@MainActor
+public protocol TerminalSurfaceOpenURLDelegate: TerminalSurfaceViewDelegate {
+    /// True when the delegate opens (or otherwise handles) `url`; false
+    /// leaves it to Ghostty, which opens it with the system's handler.
+    func terminalShouldHandleOpenURL(_ url: String) -> Bool
+}
+
 public struct TerminalSearchStartRequest: Sendable, Equatable {
     public let query: String?
 

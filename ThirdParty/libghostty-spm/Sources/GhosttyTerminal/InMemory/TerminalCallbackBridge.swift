@@ -7,6 +7,9 @@
 
 import Foundation
 import GhosttyKit
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+#endif
 
 /// Dispatches C runtime callbacks to a ``TerminalSurfaceViewDelegate``.
 ///
@@ -180,6 +183,20 @@ final class TerminalCallbackBridge {
                 "callback action=\(TerminalDebugLog.describe(action.tag))"
             )
         }
+    }
+
+    #if canImport(AppKit) && !canImport(UIKit)
+        /// What to paste for an image on `pasteboard`: the delegate's
+        /// (`TerminalSurfacePastedImageDelegate`), else nothing.
+        func pastedImageText(from pasteboard: NSPasteboard) -> String? {
+            (delegate as? any TerminalSurfacePastedImageDelegate)?.terminalText(forImageOn: pasteboard)
+        }
+    #endif
+
+    /// Whether the delegate handles a click on `url` itself.
+    func handleOpenURL(_ url: String) -> Bool {
+        TerminalDebugLog.log(.actions, "callback action=open_url url=\(TerminalDebugLog.describe(url))")
+        return (delegate as? any TerminalSurfaceOpenURLDelegate)?.terminalShouldHandleOpenURL(url) ?? false
     }
 
     func handleClose(processAlive: Bool) {

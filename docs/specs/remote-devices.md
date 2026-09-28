@@ -1,13 +1,14 @@
 # Devices: projects on your other Macs
 
 Status: phase 0 (groundwork), phase 1 (devices and remote project
-windows), phase 2 (Add Mac… installs the session host) and phase 3 (parity:
+windows), phase 2 (Add Mac… installs the session host), phase 3 (parity:
 worktrees, cherry.toml, shell integration, editors, background sessions,
-dropped files, master shards) implemented on `codex/persistent-sessions`;
-the rest of phase 3's plan (MCP for remote agents, previews, ports and
-services) and phase 4 are the plan. Phases 1–3 as built, and where they
-differ from the plan below, are in *Phase 1 as built*, *Phase 2 as built*
-and *Phase 3 as built*. Builds on
+dropped files, master shards) and phase 4a (ports, URLs and forwards for
+device tabs, and pasted images) implemented on `codex/persistent-sessions`;
+MCP for remote agents and the rest of phase 4 are the plan. Phases 1–4a as
+built, and where they differ from the plan below, are in *Phase 1 as
+built*, *Phase 2 as built*, *Phase 3 as built* and *Phase 4a as built*.
+Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
 [remote-session-host.md](remote-session-host.md) (SSH transport, gateway,
@@ -705,9 +706,9 @@ Deviations from the plan below:
 
 - Host services are not additive protocol requests over the control
   connection: `project-info` and git run as one-shot ssh commands over the
-  master (the control protocol is unchanged). Process metadata, ports,
-  service discovery, MCP for remote agents (`ssh -R`) and previews are not
-  built.
+  master (the control protocol is unchanged). Ports, service discovery and
+  forwards came in phase 4a (below); process metadata and MCP for remote
+  agents (`ssh -R`) are not built.
 - Zed opens through its `zed://ssh/` hotlink rather than its CLI (see
   above).
 - Dropped files go to a new temporary folder on the device, never the
@@ -717,6 +718,159 @@ Deviations from the plan below:
   the launch notice naming devices (phase 4 in the plan) are done here.
 - Settings › Sessions shows each device's connection state, not a
   per-device `PersistentSessionsStatus`.
+
+## Phase 4a as built
+
+What exists (`Sources/Cherry/RemotePorts.swift`, `PastedImages.swift`,
+the Ctrl+V and image parts of `RemoteFileDrop.swift`,
+`Host/crates/cherry-host/src/ports.rs`, the `open_url` delegate in the
+vendored `libghostty-spm`):
+
+- **`cherry-host ports --json PID…`** (Rust, shipped with the install): for
+  each pid (at most 256) whether it runs and the TCP ports it and its
+  descendants listen on (`{version: 1, processes: [{pid, alive, ports:
+  [{port, host, pid, command}]}], error?}`), from `ps -axo pid=,ppid=` and,
+  on macOS, `lsof -nP -a -p <tree> -iTCP -sTCP:LISTEN -F pcnPT` (on Linux,
+  `/proc/net/tcp{,6}` and each member's `/proc/<pid>/fd`); what cannot be
+  read is said in `error`. It reads only and never starts or talks to a
+  daemon. Chosen over a new control request because the control protocol is
+  shared with the device's own Cherry (rule 7): a one-shot over the master,
+  like `project-info`, needs no protocol bump and works with any daemon of
+  this protocol; the pid it takes is the session's `SessionInfo.pid`, which
+  the host already reports (`TerminalSession.remoteProgramProcessID`: only
+  for this, never as a pid of This Mac, rule 4). `RemotePortScanner` runs it
+  in a `sh -s` script over the device's ssh (the master's ControlPath while
+  it is up), versioned; an older cherry-host without it says to update it.
+- **Forwards** (`RemotePortForwards`): `ssh -o ControlPath=<master> -O
+  forward -L 127.0.0.1:<local>:<host>:<port> -- <dest>` on the device's
+  first master. The master's `ClearAllForwardings=yes` clears only forwards
+  given at its start and does not refuse these (checked against a real sshd
+  by the loopback test), so no dedicated forwarding master is needed. The
+  forward listens on This Mac's IPv4 loopback only: the bind address is
+  explicit and masters run with `GatewayPorts=no`, whatever the user's ssh
+  config says. The local port is one free there (ssh has no port 0 for `-L`
+  through a master), tried again up to three times when ssh says it was
+  taken meanwhile. The remote side is `localhost` (sshd there tries each
+  address), `127.0.0.1` or `::1` when the service listens only there. One
+  forward per device port, shared by the tabs that asked for it; a lease
+  keeps the master running while the device has forwards or one is being
+  made. A tab's forwards are released when it closes (`finishClosing`, so a
+  window's close releases them too; a quit stops the masters, and the
+  forwards with them) and cancelled (`-O cancel`) once no tab needs them; a
+  forward that finishes after its tab closed is cancelled as soon as it is
+  made (releases are counted per tab, so a tab brought back by ⌘Z can ask
+  again). When the master exits (`HostSSHMasterManager.masterDidStopNotification`)
+  its forwards are dropped, since they went with it. `RemotePortForwards.shared`
+  is made only when a forward is first asked for.
+- **Links** (`RemoteURLOpening`): libghostty-spm's `open_url` action now asks
+  the surface's delegate first (`TerminalSurfaceOpenURLDelegate`, through
+  `TerminalCallbacks.openURL`; true keeps Ghostty from opening it, false
+  leaves it to Ghostty as before). In a device tab, a click on an `http` or
+  `https` URL of that Mac's loopback (`localhost`, an IPv4 literal of
+  127.0.0.0/8 or `0.0.0.0` as `inet_pton` reads it, `[::1]`, `[::]`; a name
+  such as `127.evil.example` is not the loopback; no port is 80 or 443)
+  forwards that port and opens the URL at `127.0.0.1:<local>` (where the
+  forward listens; path, query and fragment kept) in the browser, with a
+  toast "Forwarded from Studio" ("localhost:3000 on Studio opens here as
+  127.0.0.1:52011."); a failure says so and opens nothing. Other URLs, and
+  every URL in a tab of This Mac, open as before.
+- **MCP** (`DeviceServiceDetector`): `get_process_ports`, `services_list`
+  and `wait_for_bound_port` give a device tab's services from its Mac
+  (`CherryControlServer` sends only This Mac's tabs to the lsof detector),
+  one record per port with `machine` (the Mac) and `remoteURL` (the URL
+  there), `pid` nil. Listing forwards nothing: `url` is the URL there,
+  unless the port is forwarded already (a clicked link), when it is the
+  forwarded URL and `forwardedFrom` names the Mac. Only an explicit probe
+  (`wait_for_bound_port` with `probe_http`) forwards the port it probes, so
+  the probe reaches it; `forwardError` says why a port could not be
+  forwarded. When every device asked fails and there is nothing else to
+  report, the call fails with the reason.
+- **Pasted images** (every tab): ⌘V with image data (PNG, TIFF, HEIC, JPEG
+  or anything NSImage reads) and no text or file URLs saves a PNG in
+  `~/Library/Caches/<identity>/Pasted Images/<yyyyMMdd-HHmmss>-<8 hex>.png`
+  (`PastedImageStore`; files older than 7 days are removed whenever one is
+  written) and pastes its path, single-quoted when it is not simple (the
+  folder's name has a space), through the tab's paste: the surface brackets
+  it as the program asks, and while the host takes the tab's input it is
+  bracketed as the host reports (`bracketsPaste`). File URLs come first
+  (Finder puts the files' names on the pasteboard as text too), then text,
+  then an image: This Mac's tabs paste files and text as before. The key
+  monitor handles ⌘V before the surface; what the surface pastes by itself
+  (Edit › Paste, a context menu, an OSC 52 read, a drop) asks the same
+  delegate for an image (`TerminalSurfacePastedImageDelegate`), so it too
+  is saved in the cache and quoted alike (the vendored copy no longer
+  writes its own temporary files). In a device tab the image is copied
+  there (`RemoteFileCopier`, the phase 3 scp path, into a new `mktemp -d`
+  folder) without asking (it is not one of the user's files; Finder files
+  still ask) and the copy's path pasted; a dropped image is inserted as
+  dropped paths are.
+- **Ctrl+V in a device agent tab** (`RemoteClipboardImagePaste`; an agent
+  tab, or a tab whose agent Cherry recognised, while the agent itself is in
+  the foreground there: the host's foreground process group leader is named
+  after a known agent, or in an agent tab is the tab's own program) with an
+  image alone on This Mac's pasteboard: the image is copied there, then
+  `osascript -e 'set the clipboard to (read (POSIX file "…") as «class
+  PNGf»)'` runs there over ssh and `clipboard info for «class PNGf»` checks
+  it; then Ctrl+V is sent (encoded for the program's keyboard mode). The
+  key is never lost: when the copy fails, or the whole takes longer than 15
+  s, Ctrl+V goes on anyway with a toast ("The image was not copied to
+  Studio"); when only the clipboard there cannot be set (nobody logged in
+  there, no osascript) the copy's path is pasted instead and a toast says
+  why ("Pasted the image’s path on Studio"). Keys typed meanwhile are held
+  by the key monitor and sent after it, in order (Command shortcuts are
+  not). Other Ctrl+V go on as keys. The foreground check sees the process
+  group's leader only: an editor the agent runs in its own process group is
+  not told apart.
+- **Tests.** `RemoteDevicePasteAndPortsTests` (a pasted image's path,
+  quoting and bracketing, TIFF converted, text winning, Finder file URLs
+  with their names unchanged here and offered for copying there, pruning,
+  the clipboard script and its outcomes, the foreground check, the key
+  monitor's routing of ⌘V, Ctrl+V and held keys, `ports` answers and
+  failures, forward arguments bound to the loopback and `GatewayPorts=no`,
+  loopback URLs (and names that only look like them) and their forwarded
+  form, the new `ServiceRecord` fields, Ghostty's `open_url` asking the
+  delegate and a tab of This Mac leaving it to Ghostty),
+  `HostControlShutdownTests` (`shutdown()` stopping an attempt whose helper
+  is launching, and never connecting again; `startsHost` false running
+  `control --no-start`) and `RemoteDeviceRealHostPortsAndPasteTests` through
+  `Scripts/fake-remote-mac` (an image copied there without a question and
+  its path pasted, an offline Mac reported; Ctrl+V setting the fake Mac's
+  clipboard through its `osascript` stand-in with keys held meanwhile sent
+  after it, pasting the path with a toast when osascript fails (`no-gui`),
+  sending Ctrl+V anyway when the copy fails or its deadline passes; a web
+  server in a device tab found by `cherry-host ports`, reported by MCP
+  labelled and not forwarded, forwarded by a click and then reported so,
+  forwarded by an HTTP probe, a failed forward said, the forwards cancelled
+  when the tab closes; a forward shared, released, cancelled and dropped
+  when its master stops; a forward finished after its tab closed cancelled,
+  and another Mac's lease kept meanwhile; the fake Mac's stop refusing
+  connections and ending a daemon started while it ran). The fake Mac
+  gained an `osascript` stand-in on every fake Mac's PATH (so the real one
+  never runs), stand-in `-O forward`/`-O cancel`, and a stop that leaves a
+  tombstone the shim refuses and repeats until nothing of it runs.
+  `Scripts/test-remote-mac-loopback`'s sshd allows local forwards to its
+  loopback, and its run of `RemoteDeviceRealHostForwardsAPortThroughTheSSHMaster`
+  fetches a page through a real forward. Rust: `ports` unit tests (lsof
+  and `/proc/net/tcp` parsing, process trees, this process's own port),
+  `ports_json_reports_what_a_process_tree_listens_on_without_starting_a_host`,
+  and `control --no-start` parsing.
+- **Test teardown.** A fake Mac's teardown shuts its controls down for good
+  (`HostControl.shutdown()`, which also stops an attempt whose helper is
+  starting) before `fake-remote-mac stop`; a test whose fake Mac has no
+  daemon of its own and needs none connects with `cherry control
+  --no-start` (`HostControl.Configuration.startsHost`), so no daemon
+  outlives it.
+
+Deviations from the plan below:
+
+- Ports are a one-shot `cherry-host ports` over the master, not a control
+  request (see above).
+- Cherry has no in-app web preview: "previews" are the browser the
+  forwarded URL opens in, and the app has no port list of its own beyond
+  MCP's services: a detected port opens through a click on its link, or
+  MCP's probe.
+- Forwards are made when a link is clicked or an MCP HTTP probe needs one,
+  never ahead of time nor by listing.
 
 ## Phase 1: devices and remote project windows (the plan)
 

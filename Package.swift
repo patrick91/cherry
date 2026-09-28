@@ -62,6 +62,8 @@ let package = Package(
                 "CherryControl",
                 "CherryMCP",
                 .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "GhosttyKit", package: "libghostty-spm"),
+                .product(name: "GhosttyTerminal", package: "libghostty-spm"),
             ],
             resources: [
                 .copy("Fixtures")

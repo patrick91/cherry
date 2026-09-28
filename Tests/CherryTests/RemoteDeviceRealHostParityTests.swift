@@ -603,7 +603,9 @@ private func hostName() -> String {
         // The device answers and its control connects: its project is read,
         // and its commands start.
         mac.set("offline", false)
-        _ = try await control.list()
+        // A list may join an attempt the window's lease started while the
+        // Mac was offline, which fails: list until one connects.
+        try await mac.waitFor("the control to connect") { (try? await control.list()) != nil }
         try await mac.waitFor("the project to be read") { repository.remoteProjectLoaded }
         try await mac.waitFor("the auto-started command") {
             repository.activeWorkspace.commandSession(named: "server")?.persistentSession != nil
@@ -632,7 +634,9 @@ private func hostName() -> String {
             deviceID: mac.deviceID, deviceName: "Studio", destination: mac.name,
             remoteHostPath: nil, homeDirectory: nil, shell: { shell }, recordHome: { recorded.append($0) }
         )
-        let control = mac.makeControl()
+        // No daemon there, and none needed: the window's control never
+        // starts one (it would outlive the test).
+        let control = mac.makeControl(startsHost: false)
         let repository = deviceWindow(mac, hosting: mac.makeHosting(control: control), access: access, autoStartCommands: { _ in [] })
         let destination = ProjectLocation.launchPath(forKey: try await repository.managedWorktreeDestination(branchName: "b"))
         // Under the device's home, never next to the project.

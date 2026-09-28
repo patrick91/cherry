@@ -159,7 +159,12 @@ enum Action {
     /// Connect to the host and relay protocol frames between standard input
     /// and output until either side closes, for Cherry. Standard output
     /// starts with the host's Welcome; send requests, not Hello.
-    Control,
+    Control {
+        /// Never start a host, nor replace one speaking an older protocol:
+        /// when none of this version runs, say so and fail.
+        #[arg(long)]
+        no_start: bool,
+    },
     /// Describe the host daemon: its pid, uptime, build and protocol, its
     /// socket, state directory and log, its sessions and connections against
     /// their limits, its holders, and the build each session's holder runs.
@@ -192,7 +197,7 @@ impl Action {
             Action::Start => Kind::Start,
             Action::List { .. } | Action::Status { .. } | Action::Doctor => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
-            Action::Control => Kind::Control,
+            Action::Control { .. } => Kind::Control,
             Action::Shutdown
             | Action::Restart { .. }
             | Action::New { .. }
@@ -212,7 +217,7 @@ impl Action {
                 ..
             } | Action::New { .. }
                 | Action::Attach { .. }
-                | Action::Control
+                | Action::Control { no_start: false }
         )
     }
 }
@@ -370,7 +375,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     // A client using sessions lends its agent to them while connected.
     let links_agent = matches!(
         cli.command,
-        Action::New { .. } | Action::Attach { .. } | Action::Control
+        Action::New { .. } | Action::Attach { .. } | Action::Control { .. }
     );
     let target = Target {
         host: cli.host.as_deref(),
@@ -578,7 +583,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             )?;
             attached(status, outcome)
         }
-        Action::Control => {
+        Action::Control { .. } => {
             transport.clear_deadline();
             control::relay(transport, host_id, host_build)
         }
@@ -1985,7 +1990,15 @@ mod tests {
             "control",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Action::Control));
+        assert!(matches!(cli.command, Action::Control { no_start: false }));
+        assert!(cli.command.starts_host());
+        let looking =
+            Cli::try_parse_from(["cherry", "--host", "studio", "control", "--no-start"]).unwrap();
+        assert!(matches!(
+            looking.command,
+            Action::Control { no_start: true }
+        ));
+        assert!(!looking.command.starts_host());
         assert_eq!(
             cli.ssh_control_path.as_deref(),
             Some(Path::new("/tmp/cherry-501/%h"))

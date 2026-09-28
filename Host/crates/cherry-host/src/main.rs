@@ -6,6 +6,7 @@ mod launch;
 mod link;
 mod outbox;
 mod paths;
+mod ports;
 mod processes;
 mod project_info;
 mod report;
@@ -72,6 +73,16 @@ enum Action {
         /// The folders, absolute (or relative to the current directory).
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+    },
+    /// The TCP ports the process trees of these pids listen on (a
+    /// session's program and what it started), for a Cherry on another Mac
+    /// that forwards them. Reads only; never starts or talks to a host.
+    Ports {
+        #[arg(long)]
+        json: bool,
+        /// Process ids of this machine (at most 256).
+        #[arg(required = true)]
+        pids: Vec<i32>,
     },
     /// Hold one session for the daemon (started by the daemon, with its
     /// link on descriptor 3).
@@ -153,6 +164,29 @@ fn run() -> Result<()> {
                         None => "",
                     };
                     println!("{}: {what}{toml}", project.path);
+                }
+            }
+            Ok(())
+        }
+        Action::Ports { json, pids } => {
+            let report = ports::report(&pids);
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                if let Some(error) = &report.error {
+                    println!("the listening sockets could not be read: {error}");
+                }
+                for process in &report.processes {
+                    let ports = process
+                        .ports
+                        .iter()
+                        .map(|listener| format!("{}:{}", listener.host, listener.port))
+                        .collect::<Vec<_>>();
+                    match (process.alive, ports.is_empty()) {
+                        (false, _) => println!("{}: not running", process.pid),
+                        (true, true) => println!("{}: no listening ports", process.pid),
+                        (true, false) => println!("{}: {}", process.pid, ports.join(", ")),
+                    }
                 }
             }
             Ok(())

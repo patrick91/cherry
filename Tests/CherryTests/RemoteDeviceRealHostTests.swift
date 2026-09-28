@@ -147,7 +147,11 @@ final class FakeRemoteMac {
     }
 
     /// This Mac's control connection to the device, through the shim.
-    func makeControl(configuration: HostControl.Configuration = .fastTests) -> HostControl {
+    /// `startsHost`: whether connecting may start a daemon there (false for
+    /// a test that owns none and needs none: `cherry control --no-start`).
+    func makeControl(configuration: HostControl.Configuration = .fastTests, startsHost: Bool = true) -> HostControl {
+        var configuration = configuration
+        configuration.startsHost = startsHost
         let cli = cli
         let bin = bin
         let localHome = root.appendingPathComponent("local-home").path
@@ -334,7 +338,9 @@ final class FakeRemoteMac {
                 try? await their.terminate(session.id)
             }
         }
-        for control in controls { control.disconnect() }
+        // For good: an attempt still under way must not start a daemon
+        // after the stop below.
+        for control in controls { control.shutdown() }
         daemon?.stop()
         daemon = nil
         let repository = URL(fileURLWithPath: #filePath)

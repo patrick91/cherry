@@ -645,6 +645,9 @@ can parse every outcome; without `--json`, `status` prints one line. Cherry's
 Add Mac check runs them on the other machine
 ([remote-devices.md](../docs/specs/remote-devices.md)).
 
+`cherry control --no-start` relays like `control` but, like `list
+--no-start`, never starts or replaces a host.
+
 `cherry list --json --no-start` lists without ever starting a host or
 replacing one of an older protocol (through `cherry-host gateway --no-start`
 with `--host`): when none of this version runs it says "no cherry-host is
@@ -665,6 +668,22 @@ from `PATH`. Git runs only for `rev-parse` and `worktree list`; it reads
 at most 64 paths, never starts or talks to a daemon and changes nothing. It
 ships with the cherry-host Cherry installs, so its answer's format follows
 the app; an older cherry-host without it makes the app say to update it.
+
+`cherry-host ports --json PID…` says which TCP ports the process trees of
+these pids of this machine listen on (a session's program, `SessionInfo.pid`,
+and everything it started), for a Cherry on another Mac that forwards them
+(docs/specs/remote-devices.md, phase 4a), in one round trip over its SSH
+master: `{"version":1,"processes":[{"pid":123,"alive":true,"ports":[{"port":
+3000,"host":"127.0.0.1","pid":130,"command":"node"}]}]}`. A pid that is gone
+is `alive: false` with no ports; `host` is the address listened on (`*` for
+every address). It reads the process table (`ps`) and, on macOS, `lsof
+-a -p <tree> -iTCP -sTCP:LISTEN`, on Linux `/proc`; when those cannot be
+read it says why in `error` (and reports no ports). At most 256 pids; it
+never starts or talks to a daemon and changes nothing. Like `project-info`
+it runs as a one-shot command over the master rather than as a request on
+the control connection, so the protocol (and a daemon another app shares)
+is unchanged, and an older cherry-host without it makes the app say to
+update it.
 
 `--socket /absolute/private/path/host.sock` selects a separate host (its own
 daemon and state directory); with `--host`, that path is on the remote machine.
@@ -1762,6 +1781,26 @@ with "Session open refused by peer". The device tests of phase 3 run git
 worktrees, `cherry-host project-info`, cherry.toml commands (auto-start,
 restart on exit), the installed terminfo and zsh integration (OSC 7 reaching
 the tab), `scp -O` of dropped files and SSH master shards through it.
+Every fake Mac has an `osascript` stand-in first on its `PATH` (never the
+real one, which would set this Mac's clipboard): it copies the image a
+`set the clipboard to (read (POSIX file "…") as «class PNGf»)` names to
+`clipboard.png` there and reports it to `clipboard info for «class PNGf»`,
+and fails as over SSH without a GUI session when a file named `no-gui` is
+there. `fake-remote-mac stop` leaves a tombstone (`DIR/stopped`) that the
+shim refuses from then on, and ends the daemons and holders of DIR's sockets
+again until none has been seen for half a second, so a connection attempt
+under way cannot leave a daemon behind; the tests' teardown also shuts its
+controls down for good first (`HostControl.shutdown()`), and a fake Mac
+with no daemon of its test's own connects with `cherry control --no-start`. A stand-in master answers `-O forward -L SPEC` and `-O cancel -L
+SPEC` by logging them to `forwards` (with `forward-fails`, a forward fails
+as when its local port is taken). The tests of phase 4a copy a pasted image
+there and paste its path, put it on the clipboard there for Ctrl-V (and
+fall back to its path when osascript fails, or send Ctrl-V anyway when the
+copy fails), run a web server in a tab there, find its port with
+`cherry-host ports`, report it through MCP labelled with the Mac and not
+forwarded, open its URL through a forward, forward it for an HTTP probe,
+and cancel the forwards when the tab closes (or when their tab closed while
+they were being made).
 `Scripts/test-remote-mac-loopback` checks the same over real SSH to this Mac
 without admin rights: a private `sshd` on 127.0.0.1 run as you (with
 `MaxSessions 3`), with its own keys and a forced command that sets a private
@@ -1772,7 +1811,13 @@ Swift tests first unless `--skip-build`; `--no-install` leaves it out), then
 `cherry --host` through the installed cherry-host, then
 `RemoteDeviceRealHostShardsSSHMastersAboveTheChannelCap`: the app's master
 manager opens a second master once the first has its sessions, where sshd
-refuses a fourth session on the first. `Scripts/test-session-suites`
+refuses a fourth session on the first, and
+`RemoteDeviceRealHostForwardsAPortThroughTheSSHMaster`: its sshd allows local
+forwards to its own loopback only (`AllowTcpForwarding local`, `PermitOpen`),
+and a page served on the "remote" side is fetched through `ssh -O forward` on
+a master started as the app starts them (`ClearAllForwardings=yes`, which
+does not refuse forwards asked for later), then `-O cancel` and the master's
+end take the forward away. `Scripts/test-session-suites`
 without `--skip-build` builds the Swift tests first, and for `real-host` the
 Rust helpers too.
 

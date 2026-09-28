@@ -1318,6 +1318,17 @@ public struct ServiceRecord: Codable, Equatable, Sendable {
     public let lastSeenAt: Date
     public let commandName: String?
     public let agentName: String?
+    /// The Mac the service runs on when it is not This Mac (a tab of
+    /// another Mac, docs/specs/remote-devices.md phase 4a); nil for This Mac.
+    public let machine: String?
+    /// The service's URL on that Mac (`url` is then the forwarded one here).
+    public let remoteURL: String?
+    /// The Mac the service was forwarded from ("Studio"): `url` is a port
+    /// of This Mac's loopback forwarded over SSH to it.
+    public let forwardedFrom: String?
+    /// Why a service of another Mac could not be forwarded (`url` is then
+    /// its URL there).
+    public let forwardError: String?
 
     public init(
         processID: String?,
@@ -1332,8 +1343,16 @@ public struct ServiceRecord: Codable, Equatable, Sendable {
         readiness: ServiceReadiness,
         lastSeenAt: Date,
         commandName: String?,
-        agentName: String?
+        agentName: String?,
+        machine: String? = nil,
+        remoteURL: String? = nil,
+        forwardedFrom: String? = nil,
+        forwardError: String? = nil
     ) {
+        self.machine = machine
+        self.remoteURL = remoteURL
+        self.forwardedFrom = forwardedFrom
+        self.forwardError = forwardError
         self.processID = processID
         self.processName = processName
         self.kind = kind

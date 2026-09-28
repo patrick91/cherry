@@ -2653,6 +2653,8 @@ final class TerminalWorkspace: ObservableObject {
             endHostedSession(of: session, intent: intent)
         }
         session.persistentTabDidClose()
+        // Ports of another Mac forwarded for it (`RemotePortForwards`).
+        RemotePortForwards.existing?.release(owner: session.id)
         session.releaseGhosttyBridge()
     }
 
@@ -3671,6 +3673,21 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// the host's events (`HostControl.currentSession`), which keep it
     /// current; a report from before (its modes may have changed since)
     /// never applies.
+    /// The program's pid on the other Mac a device tab runs on
+    /// (`SessionInfo.pid`), only to ask that Mac which ports it listens on
+    /// (`RemotePortScanner`): never a pid of This Mac (rule 4 of
+    /// docs/specs/remote-devices.md). Nil for This Mac's tabs.
+    var remoteProgramProcessID: Int32? {
+        guard let persistentHosting, !persistentHosting.profile.isThisMac,
+              let pid = hostReportedSessionInfo?.pid
+        else { return nil }
+        return Int32(bitPattern: pid)
+    }
+
+    /// What the tab's host last reported of its running session (its
+    /// foreground program, modes); nil while it does not run there.
+    var hostReportedSession: HostedSessionInfo? { hostReportedSessionInfo }
+
     private var hostReportedSessionInfo: HostedSessionInfo? {
         if let persistentHosting {
             guard isRunning, persistentPhase != .creating,

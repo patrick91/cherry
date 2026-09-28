@@ -18,8 +18,12 @@ use std::{
 pub enum Probe {
     /// Nothing is listening.
     Absent,
-    /// A host speaking this protocol version.
-    Ready,
+    /// A host speaking this protocol version: its identity, and its build
+    /// when it said which.
+    Ready {
+        host_id: String,
+        build: Option<String>,
+    },
     /// A host speaking this older protocol version, which makes way for
     /// this one when asked (`Replace`), and its identity.
     Older { version: u32, host_id: String },
@@ -77,9 +81,11 @@ pub fn probe(path: &Path) -> Result<Probe> {
         return Ok(Probe::Unresponsive(error.to_string()));
     }
     Ok(match read_frame::<_, ServerMessage>(&mut stream) {
-        Ok(Some(ServerMessage::Welcome { version, .. })) if version == PROTOCOL_VERSION => {
-            Probe::Ready
-        }
+        Ok(Some(ServerMessage::Welcome {
+            version,
+            host_id,
+            build,
+        })) if version == PROTOCOL_VERSION => Probe::Ready { host_id, build },
         // Only a host speaking protocol 4 or later welcomes a Hello of
         // another version, and every one of them makes way when asked.
         Ok(Some(ServerMessage::Welcome {
@@ -175,7 +181,7 @@ fn not_running(path: &Path) -> anyhow::Error {
 
 /// Ask whoever listens at `path`, without creating anything: without its
 /// directory the socket never existed, and nothing listens.
-fn probe_existing(path: &Path) -> Result<Probe> {
+pub fn probe_existing(path: &Path) -> Result<Probe> {
     let dir = paths::socket_parent(path)?;
     if matches!(fs::symlink_metadata(dir), Err(error) if error.kind() == io::ErrorKind::NotFound) {
         return Ok(Probe::Absent);
@@ -187,7 +193,7 @@ fn probe_existing(path: &Path) -> Result<Probe> {
 /// neither starts nor replaces one.
 fn serving(path: &Path, found: Probe) -> Result<()> {
     match found {
-        Probe::Ready => Ok(()),
+        Probe::Ready { .. } => Ok(()),
         Probe::Absent => Err(not_running(path)),
         Probe::Older { version, .. } => Err(older_version(path, version)),
         Probe::OtherVersion { version, .. } => Err(other_version(path, version)),

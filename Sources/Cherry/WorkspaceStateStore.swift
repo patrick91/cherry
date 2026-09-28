@@ -247,8 +247,26 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// which closing or a worktree removal ends): bound to a local session
     /// it did not only attach to, or saved while its Create was under way.
     var mayOwnLocalSession: Bool {
-        guard let binding = hosted else { return launchRequestID != nil }
-        return binding.host == HostedSessionHost.local.id && binding.owned != false
+        mayOwnSession(on: .local)
+    }
+
+    /// A saved tab that may own a session of `host`: bound to one of its
+    /// sessions it did not only attach to, or (This Mac only, until records
+    /// name the host a Create went to) saved while its Create was under
+    /// way. A binding to another Mac's host counts only when it says it
+    /// owned the session: bindings saved before `owned` existed were SSH
+    /// attachments.
+    func mayOwnSession(on host: HostedSessionHost) -> Bool {
+        guard let binding = hosted else { return host == .local && launchRequestID != nil }
+        guard binding.host == host.id else { return false }
+        return host == .local ? binding.owned != false : binding.owned == true
+    }
+
+    /// A saved tab that owned a session of another Mac's host (a device's
+    /// tab, docs/specs/remote-devices.md).
+    var ownsRemoteSession: Bool {
+        guard let binding = hosted else { return false }
+        return binding.host != HostedSessionHost.local.id && binding.owned == true
     }
 
     /// Only what finds the session this tab ran (its id, binding and
@@ -1361,7 +1379,12 @@ enum SystemSessionEnd: String, Codable, Equatable, Sendable {
 ///    as a log out kills the user's processes while Cherry is not running:
 ///    `.logout`.
 /// Without any of them (a normal relaunch, a session that ended while the
-/// Mac ran) the tab is dropped. A record whose program had exited before
+/// Mac ran) the tab is dropped.
+///
+/// A saved tab that owned a session of another Mac's host (a device's tab,
+/// `WorkspaceSessionRecord.ownsRemoteSession`) says nothing about This
+/// Mac's boot or quits: only its host's word counts (rule 3: that host
+/// reported the session lost, now or earlier). A record whose program had exited before
 /// (`exitStatus`) comes back showing that exit instead, or stays dropped
 /// where *close on exit* would have closed it (a terminal's exit 0).
 @MainActor
@@ -1390,12 +1413,17 @@ struct SystemEndedSessions {
     /// dropped. A record whose program had exited (`exitStatus`) comes back
     /// showing that exit, not as ended by the system.
     func end(of record: WorkspaceSessionRecord, missingFrom list: HostedSessionList) -> SystemSessionEnd? {
-        guard record.mayOwnLocalSession, !endedOnPurpose(record) else { return nil }
+        let remote = record.ownsRemoteSession
+        guard record.mayOwnLocalSession || remote, !endedOnPurpose(record) else { return nil }
         let lost = record.hosted.map { binding in
             binding.hostID == list.hostID
                 && (list.lostSessionIDs.contains(binding.sessionID)
                     || recordedLostSessions(binding.hostID).contains(binding.sessionID))
         } ?? false
+        if remote {
+            // This Mac's boot time and quits are not that Mac's.
+            return Self.end(savedAt: nil, bootTime: nil, systemQuits: [], lostByHost: lost)
+        }
         return Self.end(savedAt: savedAt(of: record), bootTime: bootTime, systemQuits: systemQuits, lostByHost: lost)
     }
 
@@ -1545,11 +1573,17 @@ struct OrphanedSessionCriteria: Sendable {
         info.tags[PersistentSessionTag.project]?.nilIfEmpty
     }
 
-    /// A record for an adopted session: the tab it was started for, with
-    /// what its tags and the host tell (kind, agent, command, project,
-    /// name and directory). What only a saved record knows (launch command
-    /// and settings, parent agent, layout) is not there.
-    static func record(for info: HostedSessionInfo, tabID: UUID, hostID: String) -> WorkspaceSessionRecord {
+    /// A record for an adopted session of `host` (This Mac by default): the
+    /// tab it was started for, with what its tags and the host tell (kind,
+    /// agent, command, project, name and directory). What only a saved
+    /// record knows (launch command and settings, parent agent, layout) is
+    /// not there.
+    static func record(
+        for info: HostedSessionInfo,
+        tabID: UUID,
+        hostID: String,
+        host: HostedSessionHost = .local
+    ) -> WorkspaceSessionRecord {
         let kind = info.tags[PersistentSessionTag.kind].flatMap(TerminalSession.SessionKind.init(rawValue:)) ?? .terminal
         return WorkspaceSessionRecord(
             id: tabID,
@@ -1561,7 +1595,7 @@ struct OrphanedSessionCriteria: Sendable {
             workingDirectory: info.cwd,
             projectRoot: projectRoot(of: info),
             hosted: HostedSessionBindingRecord(
-                host: HostedSessionHost.local.id, hostID: hostID, sessionID: info.id,
+                host: host.id, hostID: hostID, sessionID: info.id,
                 remoteWorkingDirectory: info.cwd, owned: true
             ),
             launchRequestID: PersistentLocalSessions.launchRequestID(of: info)

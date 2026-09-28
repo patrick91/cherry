@@ -1,4 +1,5 @@
 import Foundation
+import CherryControl
 
 struct AgentToolDefinition: Codable, Equatable, Identifiable {
     var name: String
@@ -201,6 +202,16 @@ struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
     }
 
     func resolvedWorkingDirectory(projectRoot: String) -> String {
+        let location = ProjectLocation(key: projectRoot)
+        if location.isRemote {
+            // On another Mac: resolved against the project's path there, and
+            // never looked for on this Mac (its host refuses a directory
+            // that does not exist).
+            let trimmed = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return location.path }
+            if trimmed.hasPrefix("/") || trimmed == "~" || trimmed.hasPrefix("~/") { return trimmed }
+            return (location.path as NSString).appendingPathComponent(trimmed)
+        }
         let normalized = Self.absoluteWorkingDirectoryPath(workingDirectory, projectRoot: projectRoot)
         guard !normalized.isEmpty else { return projectRoot }
         var isDirectory: ObjCBool = false
@@ -952,7 +963,7 @@ final class AgentSettings: ObservableObject {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
         let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
         let validatedCommand = try ProjectCommandConfiguration.validated([
-            command.withPortableWorkingDirectory(projectRoot: checkoutRoot)
+            command.withPortableWorkingDirectory(projectRoot: ProjectLocation.launchPath(forKey: checkoutRoot))
         ]).first!
         switch storage {
         case .local:
@@ -1260,9 +1271,14 @@ final class AgentSettings: ObservableObject {
     private static var validDirectoryCache: [String: (expires: TimeInterval, root: String)] = [:]
     private static let validDirectoryCacheLifetime: TimeInterval = 5
 
+    /// The canonical root for `path`: an existing local directory,
+    /// standardised, or a project on another Mac by its key
+    /// (`ProjectLocation`), which is never looked for on this Mac's disk.
     static func validDirectory(_ path: String) -> String? {
         let normalized = normalizedPath(path)
         guard !normalized.isEmpty else { return nil }
+        let location = ProjectLocation(key: normalized)
+        if location.isRemote { return location.key }
         let now = ProcessInfo.processInfo.systemUptime
         if let cached = validDirectoryCache[normalized], now < cached.expires {
             return cached.root
@@ -1302,7 +1318,19 @@ enum CherryProjectFile {
     }
 
     static func exists(projectRoot: String) -> Bool {
-        FileManager.default.fileExists(atPath: fileURL(projectRoot: projectRoot).path)
+        guard !ProjectLocation.isRemoteKey(projectRoot) else { return false }
+        return FileManager.default.fileExists(atPath: fileURL(projectRoot: projectRoot).path)
+    }
+
+    /// A project on another Mac (a `ProjectLocation` key) has its
+    /// cherry.toml there: this Mac neither reads nor writes one for it
+    /// (docs/specs/remote-devices.md, phase 3).
+    struct RemoteProjectFileError: LocalizedError {
+        var errorDescription: String? { "cherry.toml of a project on another Mac cannot be changed from here yet." }
+    }
+
+    private static func requireLocal(_ projectRoot: String) throws {
+        if ProjectLocation.isRemoteKey(projectRoot) { throw RemoteProjectFileError() }
     }
 
     // The load accessors run inside SwiftUI body evaluation on every render
@@ -1327,6 +1355,7 @@ enum CherryProjectFile {
 
     @MainActor
     private static func parsed(projectRoot: String) -> ParsedFile {
+        guard !ProjectLocation.isRemoteKey(projectRoot) else { return ParsedFile() }
         let url = fileURL(projectRoot: projectRoot)
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         let modificationDate = attributes?[.modificationDate] as? Date
@@ -1377,6 +1406,7 @@ enum CherryProjectFile {
 
     @MainActor
     static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
+        try requireLocal(projectRoot)
         defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
@@ -1399,6 +1429,7 @@ enum CherryProjectFile {
 
     @MainActor
     static func writeAppearanceSettings(_ appearance: ProjectAppearanceSettings, projectRoot: String) throws {
+        try requireLocal(projectRoot)
         defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
@@ -1443,6 +1474,7 @@ enum CherryProjectFile {
 
     @MainActor
     private static func writeCommands(_ commands: [ProjectCommandDefinition], projectRoot: String) throws {
+        try requireLocal(projectRoot)
         defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""

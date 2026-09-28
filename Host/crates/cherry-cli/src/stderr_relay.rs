@@ -27,6 +27,11 @@ const MAX_REPORT_LINE: usize = 4096;
 const MAX_REPORTS: usize = 16;
 /// While quiet, the latest lines kept, each at most `MAX_REPORT_LINE` bytes.
 const MAX_HELD: usize = 4;
+/// What ssh says when the master connection it was told to use (a
+/// ControlPath) refused a new session: the server's `MaxSessions` (10 by
+/// default) is reached on that connection. ssh then gives up rather than
+/// connecting directly.
+pub const MUX_SESSION_REFUSED: &str = "Session open refused by peer";
 
 #[derive(Default)]
 struct State {
@@ -35,6 +40,9 @@ struct State {
     held: VecDeque<String>,
     /// ssh closed its standard error.
     closed: bool,
+    /// ssh said its master connection refused the session
+    /// (`MUX_SESSION_REFUSED`).
+    mux_refused: bool,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -55,6 +63,7 @@ impl StderrRelay {
             .spawn(move || {
                 let mut filter = ReportFilter::default();
                 let mut line = Vec::new();
+                let mut refusal = RefusalWatch::default();
                 let mut buffer = [0u8; 4096];
                 loop {
                     let n = match source.read(&mut buffer) {
@@ -63,6 +72,9 @@ impl StderrRelay {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     };
+                    if refusal.feed(&buffer[..n]) {
+                        note_mux_refusal(&state);
+                    }
                     let (passed, reports) = filter.feed(&buffer[..n]);
                     let quiet = silenced.load(Ordering::Relaxed);
                     publish(&state, &passed, reports, quiet, &mut line, false);
@@ -97,6 +109,18 @@ impl StderrRelay {
         std::mem::take(&mut state.reports)
     }
 
+    /// Whether ssh said its master connection refused the session
+    /// (`MUX_SESSION_REFUSED`), first waiting up to `timeout` until it said
+    /// so or closed its standard error.
+    pub fn mux_refused(&self, timeout: Duration) -> bool {
+        let (lock, changed) = &*self.shared;
+        let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !state.mux_refused && !state.closed)
+            .unwrap_or_else(|error| error.into_inner());
+        state.mux_refused
+    }
+
     /// The last line a quiet relay held, or else the last report, first
     /// waiting up to `timeout` until ssh closed its standard error: ssh may
     /// explain why it ended just after its output ended.
@@ -107,6 +131,39 @@ impl StderrRelay {
             .wait_timeout_while(state, timeout, |state| !state.closed)
             .unwrap_or_else(|error| error.into_inner());
         state.held.back().or(state.reports.last()).cloned()
+    }
+}
+
+fn note_mux_refusal(shared: &Shared) {
+    let (lock, changed) = &**shared;
+    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+    state.mux_refused = true;
+    changed.notify_all();
+}
+
+/// Looks for `MUX_SESSION_REFUSED` in ssh's standard error, line by line.
+#[derive(Default)]
+struct RefusalWatch {
+    line: Vec<u8>,
+}
+
+impl RefusalWatch {
+    /// True when `bytes` complete (or hold) a line saying it.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut found = false;
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.line.clear();
+                continue;
+            }
+            if self.line.len() < MAX_REPORT_LINE {
+                self.line.push(byte);
+            }
+            if byte == b'r' && self.line.ends_with(MUX_SESSION_REFUSED.as_bytes()) {
+                found = true;
+            }
+        }
+        found
     }
 }
 
@@ -231,6 +288,18 @@ mod tests {
         passed.extend(bytes);
         reports.extend(lines);
         (passed, reports)
+    }
+
+    #[test]
+    fn a_master_refusing_the_session_is_noticed_across_reads() {
+        let mut watch = RefusalWatch::default();
+        assert!(!watch.feed(b"Warning: Permanently added 'studio'\n"));
+        assert!(
+            !watch.feed(b"mux_client_request_session: session request failed: Session open ref")
+        );
+        assert!(watch.feed(b"used by peer\r\n"));
+        let mut watch = RefusalWatch::default();
+        assert!(!watch.feed(b"channel 3: open failed: administratively prohibited\n"));
     }
 
     #[test]

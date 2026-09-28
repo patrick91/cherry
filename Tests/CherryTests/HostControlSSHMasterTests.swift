@@ -160,6 +160,29 @@ private func eventually(
     #expect(!attachment.arguments(statusFile: URL(fileURLWithPath: "/tmp/x/status.json")).contains("--ssh-control-path"))
 }
 
+@Test func HostedSessionHostArgumentsNameTheRemoteCherryHostWhenItIsNotOnThePath() throws {
+    // A Mac Cherry installed cherry-host on: the device store says where.
+    let paths = HostedRemoteHostPaths { destination in
+        destination == "studio" ? "~/Library/Application Support/Cherry/bin/cherry-host" : nil
+    }
+    let studio = try HostedSessionHost.ssh("studio")
+    #expect(studio.arguments(sshControlPath: "/t/cp", remoteHostPaths: paths) == [
+        "--host", "studio", "--ssh-control-path", "/t/cp",
+        "--remote-host-path", "~/Library/Application Support/Cherry/bin/cherry-host",
+    ])
+    #expect(studio.arguments(sshControlPath: nil, remoteHostPaths: paths) == [
+        "--host", "studio", "--remote-host-path", "~/Library/Application Support/Cherry/bin/cherry-host",
+    ])
+    // Other destinations, and This Mac, use the cherry-host on the PATH.
+    #expect(try HostedSessionHost.ssh("devbox").arguments(sshControlPath: nil, remoteHostPaths: paths) == ["--host", "devbox"])
+    #expect(HostedSessionHost.local.arguments(sshControlPath: nil, remoteHostPaths: paths).isEmpty)
+    // The resolver can change (a device is added or updated).
+    paths.setResolver { _ in "/opt/cherry/cherry-host" }
+    #expect(studio.arguments(sshControlPath: nil, remoteHostPaths: paths).suffix(2) == ["--remote-host-path", "/opt/cherry/cherry-host"])
+    paths.setResolver { _ in "" }
+    #expect(studio.arguments(sshControlPath: nil, remoteHostPaths: paths) == ["--host", "studio"])
+}
+
 @Test func HostSSHMasterStartsIsSharedAndStopsWhenNothingNeedsIt() async throws {
     let ssh = try FakeSSH()
     defer { ssh.cleanUp() }
@@ -402,6 +425,72 @@ private func eventually(
     #expect(fake.requests("ping").count >= 2)
     #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
     #expect(manager.status(of: "devbox")?.leases == 0)
+}
+
+@Test func HostSSHMasterSharesAtMostMaxChannelsPerMasterAdapterLaunches() async throws {
+    // sshd's MaxSessions is 10 by default: the control helper and one-off
+    // commands need room beside the adapters.
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let manager = ssh.manager()
+    #expect(manager.configuration.maxChannelsPerMaster == 8)
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    for index in 1...8 {
+        #expect(manager.controlPath(forLaunch: "/tmp/launch-\(index)", destination: "devbox") == path)
+    }
+    // Full: the next adapter uses its own ssh, and holds nothing.
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == nil)
+    #expect(manager.status(of: "devbox")?.launches == 8)
+    // A launch that has its channel keeps it.
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-3", destination: "devbox") == path)
+    // Room again once one ends.
+    manager.endLaunch("/tmp/launch-1")
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == path)
+    #expect(manager.status(of: "devbox")?.launches == 8)
+    for index in 2...9 { manager.endLaunch("/tmp/launch-\(index)") }
+    lease.release()
+    #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
+}
+
+@Test func HostSSHMasterAnAdapterOverTheCapSharesTheMasterWhenItRelaunchesIntoAFreeSlot() async throws {
+    // Each launch of a tab's adapter registers afresh (a new status file
+    // directory): the relaunch after its reconnect window gives up, or a
+    // Reconnect, takes a slot that freed meanwhile.
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let manager = ssh.manager()
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    let attachment = HostedSessionAttachment(
+        host: try .ssh("devbox"), hostID: "host-a", sessionID: "s", name: "S", remoteWorkingDirectory: "~",
+        executablePath: "/c"
+    )
+    var launches: [URL] = []
+    func launch() throws -> [String] {
+        let directory = try HostedAttachmentStatusFile.makeLaunchDirectory(in: ssh.directory)
+        launches.append(directory)
+        return attachment.arguments(statusFile: HostedAttachmentStatusFile.statusFileURL(in: directory), masters: manager)
+    }
+    for _ in 1...8 { #expect(try launch().contains(path)) }
+    // The ninth runs its own ssh, and holds no slot.
+    let over = try launch()
+    #expect(!over.contains("--ssh-control-path"))
+    #expect(manager.status(of: "devbox")?.launches == 8)
+    // Its relaunch while the master is still full: its own ssh again.
+    HostedAttachmentStatusFile.removeLaunchDirectory(launches[8], after: 0, masters: manager)
+    #expect(!(try launch()).contains("--ssh-control-path"))
+    // A tab's adapter ends: the next relaunch takes the free slot.
+    HostedAttachmentStatusFile.removeLaunchDirectory(launches[9], after: 0, masters: manager)
+    HostedAttachmentStatusFile.removeLaunchDirectory(launches[0], after: 0, masters: manager)
+    #expect(manager.status(of: "devbox")?.launches == 7)
+    let relaunched = try launch()
+    #expect(Array(relaunched.prefix(4)) == ["--host", "devbox", "--ssh-control-path", path])
+    #expect(manager.status(of: "devbox")?.launches == 8)
+    for directory in launches { HostedAttachmentStatusFile.removeLaunchDirectory(directory, after: 0, masters: manager) }
+    #expect(manager.status(of: "devbox")?.launches == 0)
+    lease.release()
+    #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
 }
 
 @Test func HostSSHMasterKeepsOnlyAdapterLaunchesThatStillRun() async throws {

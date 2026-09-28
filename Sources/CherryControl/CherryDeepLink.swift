@@ -49,8 +49,14 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         CherryDeepLink(projectRoot: projectRoot, kind: .terminal, targetID: terminalID.uuidString).absoluteString
     }
 
+    /// The SHA-256 of the project's key: a local root standardised, a
+    /// remote project's key (`ProjectLocation`) as it is, never resolved
+    /// as a path relative to the current directory.
     public static func projectKey(forProjectRoot projectRoot: String) -> String {
-        let path = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
+        let location = ProjectLocation(key: projectRoot)
+        let path = location.isRemote
+            ? location.key
+            : URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
         let digest = SHA256.hash(data: Data(path.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }

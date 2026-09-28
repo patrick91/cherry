@@ -963,6 +963,8 @@ final class RepositoryWorkspace: ObservableObject {
     /// not come back, as after ⌘Q.
     func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
         guard !isTearingDown else { return [] }
+        // Open persistent tabs of any host (a device's too): recorded by
+        // host identity, so This Mac's and each device's stay apart.
         let open = workspaces.values.flatMap(\.sessions).compactMap { tab -> (hostID: String, sessionID: String)? in
             guard tab.isPersistentLocalSession, let binding = tab.persistentSession else { return nil }
             return (binding.hostID, binding.sessionID)

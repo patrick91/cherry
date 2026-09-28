@@ -7,6 +7,7 @@ mod link;
 mod outbox;
 mod paths;
 mod processes;
+mod report;
 mod screen;
 mod session;
 mod signals;
@@ -47,6 +48,19 @@ enum Action {
         #[arg(long)]
         no_start: bool,
     },
+    /// Describe this cherry-host: its protocol, build, system and
+    /// architecture, and the oldest macOS it runs on.
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Say whether a cherry-host answers at the socket, and its protocol,
+    /// build and identity. Only says Hello: never starts, replaces or
+    /// changes a host.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
     /// Hold one session for the daemon (started by the daemon, with its
     /// link on descriptor 3).
     #[command(hide = true)]
@@ -74,6 +88,40 @@ fn run() -> Result<()> {
                 .ok()
                 .filter(|id| !id.is_empty());
             launch::gateway(&path, !no_start, expected.as_deref())
+        }
+        Action::Version { json } => {
+            let report = report::version();
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!(
+                    "cherry-host {} (build {}), protocol {}, {} {}{}",
+                    report.version,
+                    report.build,
+                    report.protocol,
+                    report.os,
+                    report.arch,
+                    report
+                        .min_macos
+                        .map(|version| format!(", macOS {version} or later"))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        Action::Status { json } => {
+            // A socket that cannot be trusted or reached is reported too,
+            // so that a client always gets JSON it can read.
+            let report = match launch::probe_existing(&path) {
+                Ok(probe) => report::status(probe),
+                Err(error) => report::status_error(&error),
+            };
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", report::status_line(&report));
+            }
+            Ok(())
         }
         Action::Hold => {
             daemon::set_log_role(daemon::Role::Holder);

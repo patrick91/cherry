@@ -99,8 +99,11 @@ final class ProjectWindowRegistry {
         return .openDefault
     }
 
-    /// The sessions of This Mac a quit that ends sessions would end, in
-    /// every project window (`RepositoryWorkspace.localSessionsEndedByAQuit`).
+    /// The sessions a quit that ends sessions would end, in every project
+    /// window (`RepositoryWorkspace.localSessionsEndedByAQuit`): the open
+    /// persistent tabs' of every host (`PersistentHostingRegistry`: This
+    /// Mac's and each device's; they are recorded by host identity), and
+    /// the saved tabs' of This Mac.
     func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
         repositories.values.compactMap(\.repository).flatMap { $0.localSessionsEndedByAQuit() }
     }

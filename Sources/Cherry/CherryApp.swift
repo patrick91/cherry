@@ -538,12 +538,15 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     static func confirmedQuitPlan(
         _ intent: SessionCloseIntent,
         registry: ProjectWindowRegistry,
-        localSessions: PersistentLocalSessions? = .shared
+        localSessions: PersistentLocalSessions? = .shared,
+        remoteHostings: [PersistentHostSessions] = PersistentHostingRegistry.shared.remote
     ) -> SessionQuitPlan {
-        let endingSessions = localSessions.map { hosting in
+        // Every host this app runs tabs on: This Mac's and each device's.
+        let hostings = (localSessions.map { [$0] } ?? []) + remoteHostings
+        let endingSessions = hostings.contains { hosting in
             hosting.hasPendingEnds || hosting.hasDeferredEnds
                 || TerminalSession.hasLaunchesEndingTheirSessions(on: hosting)
-        } ?? false
+        }
         return SessionQuitPlan.confirmed(
             intent,
             nativeProgramsStopped: registry.runningProcessCount(endingWith: .appQuit),
@@ -798,8 +801,9 @@ struct QuitTeardownSteps {
             takeWindowsOffScreen: { CherryAppDelegate.takeWindowsOffScreen(NSApp.windows) },
             waitForLaunches: { await TerminalSession.waitForPersistentLaunches(upTo: $0) },
             waitForEnds: { timeout in
-                PersistentLocalSessions.shared.endAllDeferred()
-                _ = await PersistentLocalSessions.shared.waitForPendingEnds(timeout: timeout)
+                // This Mac's and every device's.
+                PersistentHostingRegistry.shared.endAllDeferred()
+                _ = await PersistentHostingRegistry.shared.waitForPendingEnds(timeout: timeout)
             },
             sleep: { try? await Task.sleep(for: $0) }
         )

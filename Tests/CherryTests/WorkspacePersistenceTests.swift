@@ -1747,3 +1747,10 @@ struct WorkspaceRegistryPersistenceTests {
         #expect(recorderA.terminated.isEmpty)
     }
 }
+
+@Test func aProjectOnAnotherMacHasItsOwnStateFileNotThatOfTheSamePathHere() {
+    let key = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
+    #expect(WorkspaceStateStore.stateFileName(repositoryRoot: key)
+        != WorkspaceStateStore.stateFileName(repositoryRoot: "/Users/me/app"))
+    #expect(WorkspaceStateStore.stateFileName(repositoryRoot: key) == WorkspaceStateStore.stateFileName(repositoryRoot: key))
+}

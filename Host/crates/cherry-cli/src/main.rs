@@ -37,6 +37,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `--ssh-control-path` is at most this long, so that it fits a Unix socket
 /// address (104 bytes on macOS) with room to spare.
 const MAX_SSH_CONTROL_PATH_BYTES: usize = 100;
+/// The longest `--remote-host-path` accepted.
+const MAX_REMOTE_HOST_PATH_BYTES: usize = 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +61,11 @@ struct Cli {
     /// absolute path of at most 100 bytes.
     #[arg(long, global = true, value_parser = validate_ssh_control_path)]
     ssh_control_path: Option<PathBuf>,
+    /// With --host: the cherry-host the remote machine runs, when it is not
+    /// on the remote login shell's PATH. An absolute path, or `~/…` for one
+    /// under the remote home directory.
+    #[arg(long, global = true, value_parser = validate_remote_host_path)]
+    remote_host_path: Option<String>,
     #[command(subcommand)]
     command: Action,
 }
@@ -197,6 +204,12 @@ impl Cli {
             return Err(Cli::command().error(
                 ErrorKind::MissingRequiredArgument,
                 "--ssh-control-path needs --host",
+            ));
+        }
+        if self.remote_host_path.is_some() && self.host.is_none() {
+            return Err(Cli::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "--remote-host-path needs --host",
             ));
         }
         if let Action::New { tags, .. } = &self.command {
@@ -340,6 +353,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         host: cli.host.as_deref(),
         socket: cli.socket.as_deref(),
         ssh_control_path: cli.ssh_control_path.as_deref(),
+        remote_host_path: cli.remote_host_path.as_deref(),
     };
     // One limit for all of it, replacing a host and connecting again
     // included; an attachment may wait for ssh to prompt instead.
@@ -619,9 +633,12 @@ fn connect(
             "the cherry-host speaking protocol {version} was asked to make way, but no cherry-host speaking protocol {PROTOCOL_VERSION} could be reached"
         )
     };
+    // A master connection that refuses the session (it has as many as the
+    // server allows) is not used again: this connects directly, once.
+    let mut target = *target;
     loop {
         let connected = Transport::connect(
-            target,
+            &target,
             mode,
             starts_host,
             links_agent,
@@ -662,6 +679,11 @@ fn connect(
                 continue;
             }
             (Ok(Greeting::Older { version }), _) => version,
+            (Err(_), _) if target.ssh_control_path.is_some() && transport.mux_session_refused() => {
+                *slot = None;
+                target.ssh_control_path = None;
+                continue;
+            }
             (Err(error), None) => return Err(error),
             (Err(error), Some(previous)) => return Err(error.context(made_way(previous))),
         };
@@ -959,6 +981,26 @@ pub(crate) fn validate_ssh_control_path(value: &str) -> std::result::Result<Path
     Ok(PathBuf::from(value))
 }
 
+/// The remote cherry-host: an absolute path, or `~/…` under the remote home
+/// directory (see `transport::remote_host_word`), of at most
+/// `MAX_REMOTE_HOST_PATH_BYTES`, without control characters, backslashes
+/// (which fish reads as escapes even inside single quotes) or `!` (which
+/// csh and tcsh expand as history even inside single quotes).
+pub(crate) fn validate_remote_host_path(value: &str) -> std::result::Result<String, String> {
+    let rest = value.strip_prefix("~/").or_else(|| value.strip_prefix('/'));
+    if rest.is_none_or(str::is_empty)
+        || value.len() > MAX_REMOTE_HOST_PATH_BYTES
+        || value
+            .chars()
+            .any(|c| c.is_control() || c == '\\' || c == '!')
+    {
+        return Err(format!(
+            "expected an absolute path or ~/PATH of at most {MAX_REMOTE_HOST_PATH_BYTES} bytes, without control characters, backslashes or '!'"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 pub(crate) fn validate_host(value: &str) -> std::result::Result<String, String> {
     if value.is_empty()
         || value.starts_with('-')
@@ -1021,43 +1063,164 @@ mod tests {
     #[test]
     fn remote_command_quotes_socket_as_one_shell_argument() {
         assert_eq!(
-            remote_gateway_command(None, true, None).unwrap(),
+            remote_gateway_command(None, true, None, None).unwrap(),
             "cherry-host gateway"
         );
         assert_eq!(
-            remote_gateway_command(None, false, None).unwrap(),
+            remote_gateway_command(None, false, None, None).unwrap(),
             "cherry-host gateway --no-start"
         );
         let socket = Path::new("/tmp/it's $HOME; $(oops)");
         assert_eq!(
-            remote_gateway_command(Some(socket), true, None).unwrap(),
+            remote_gateway_command(Some(socket), true, None, None).unwrap(),
             "cherry-host gateway --socket '/tmp/it'\\''s $HOME; $(oops)'"
         );
         assert_eq!(
-            remote_gateway_command(Some(socket), false, None).unwrap(),
+            remote_gateway_command(Some(socket), false, None, None).unwrap(),
             "cherry-host gateway --no-start --socket '/tmp/it'\\''s $HOME; $(oops)'"
         );
+    }
+
+    #[test]
+    fn remote_command_runs_the_given_cherry_host_as_one_word_every_shell_expands() {
+        // Under the remote home: `"$HOME"/'…'`, which sh, bash, zsh and fish
+        // expand alike; the rest is quoted, spaces and quotes included.
+        assert_eq!(
+            remote_gateway_command(None, true, None, Some("~/.cherry/bin/cherry-host")).unwrap(),
+            "\"$HOME\"/'.cherry/bin/cherry-host' gateway"
+        );
+        assert_eq!(
+            remote_gateway_command(
+                Some(Path::new("/tmp/h.sock")),
+                false,
+                Some("id"),
+                Some("~/Cherry's things/$(x) `y`/cherry-host"),
+            )
+            .unwrap(),
+            "env CHERRY_EXPECTED_HOST_ID='id' \"$HOME\"/'Cherry'\\''s things/$(x) `y`/cherry-host' gateway --no-start --socket '/tmp/h.sock'"
+        );
+        // Anything else is quoted as it is: a `~` elsewhere is not expanded.
+        assert_eq!(
+            remote_gateway_command(None, true, None, Some("/opt/cherry host/cherry-host")).unwrap(),
+            "'/opt/cherry host/cherry-host' gateway"
+        );
+        assert!(remote_gateway_command(None, true, None, Some("~/a\\b")).is_err());
+        assert!(remote_gateway_command(None, true, None, Some("~/a\0b")).is_err());
+        // csh and tcsh expand history (`!`) even inside single quotes.
+        assert!(remote_gateway_command(None, true, None, Some("~/a!b")).is_err());
+        assert!(remote_gateway_command(None, true, None, Some("/a!!/cherry-host")).is_err());
+    }
+
+    #[test]
+    fn remote_host_path_words_run_the_same_file_in_sh_bash_zsh_csh_tcsh_and_fish() {
+        // Each available shell, with HOME set to a directory with a space
+        // and a quote in its name, runs the word as a command.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().join("it's home");
+        let directory = home.join("Cherry's bin $(x)");
+        std::fs::create_dir_all(&directory).unwrap();
+        let program = directory.join("cherry host");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'ran %s' \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let word = transport::remote_host_word("~/Cherry's bin $(x)/cherry host").unwrap();
+        let mut ran = 0;
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "/usr/bin/fish",
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+        ] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let output = std::process::Command::new(shell)
+                .args(["-c", &format!("{word} gateway")])
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "ran gateway",
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ran += 1;
+        }
+        assert!(ran >= 1);
+    }
+
+    #[test]
+    fn remote_host_path_is_absolute_or_under_home_and_needs_host() {
+        for good in [
+            "/usr/local/bin/cherry-host",
+            "~/.cherry/bin/cherry-host",
+            "~/a b/c'd",
+        ] {
+            assert_eq!(
+                validate_remote_host_path(good).as_deref(),
+                Ok(good),
+                "{good:?}"
+            );
+        }
+        for bad in [
+            "",
+            "~",
+            "~/",
+            "/",
+            "cherry-host",
+            "~user/bin/cherry-host",
+            "/a\nb",
+            "/a\\b",
+            "~/bin!/cherry-host",
+        ] {
+            assert!(validate_remote_host_path(bad).is_err(), "{bad:?}");
+        }
+        let error = Cli::try_parse_from(["cherry", "--remote-host-path", "/x/cherry-host", "list"])
+            .and_then(Cli::validate)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--remote-host-path needs --host"),
+            "{error}"
+        );
+        let cli = Cli::try_parse_from([
+            "cherry",
+            "control",
+            "--host",
+            "studio",
+            "--remote-host-path",
+            "~/bin/cherry-host",
+        ])
+        .and_then(Cli::validate)
+        .unwrap();
+        assert_eq!(cli.remote_host_path.as_deref(), Some("~/bin/cherry-host"));
     }
 
     #[test]
     fn remote_command_passes_the_expected_host_identity_in_the_environment() {
         let id = "0f0e8a52-0b5c-4d4b-9f8e-0c1d2e3f4a5b";
         assert_eq!(
-            remote_gateway_command(None, true, Some(id)).unwrap(),
+            remote_gateway_command(None, true, Some(id), None).unwrap(),
             format!("env CHERRY_EXPECTED_HOST_ID='{id}' cherry-host gateway")
         );
         assert_eq!(
-            remote_gateway_command(Some(Path::new("/tmp/h.sock")), false, Some(id)).unwrap(),
+            remote_gateway_command(Some(Path::new("/tmp/h.sock")), false, Some(id), None).unwrap(),
             format!(
                 "env CHERRY_EXPECTED_HOST_ID='{id}' cherry-host gateway --no-start --socket '/tmp/h.sock'"
             )
         );
         // Whatever identity a host welcomed an attachment with stays one word.
         assert_eq!(
-            remote_gateway_command(None, true, Some("it's $(odd)")).unwrap(),
+            remote_gateway_command(None, true, Some("it's $(odd)"), None).unwrap(),
             "env CHERRY_EXPECTED_HOST_ID='it'\\''s $(odd)' cherry-host gateway"
         );
-        assert!(remote_gateway_command(None, true, Some("a\0b")).is_err());
+        assert!(remote_gateway_command(None, true, Some("a\0b"), None).is_err());
     }
 
     fn frame(message: &ServerMessage) -> Vec<u8> {

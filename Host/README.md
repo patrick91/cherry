@@ -414,6 +414,29 @@ and keep your agent forwarding settings. `kill`, `remove`, and `shutdown` run
 `cherry-host gateway --no-start`. `attach` may prompt and allows 120 seconds
 for the handshake.
 
+When the remote machine's `cherry-host` is not on its login shell's `PATH`
+(Cherry installs one under the remote home for a device,
+[remote-devices.md](../docs/specs/remote-devices.md)), `--remote-host-path
+PATH` (global, needs `--host`) runs that one instead: an absolute path is
+passed single-quoted (`'/opt/cherry/cherry-host' gateway`), and `~/…` as
+`"$HOME"/'…'` (`"$HOME"/'Library/Application Support/Cherry/bin/cherry-host'
+gateway`), which sh, bash, zsh and fish all expand to the path under the
+remote home, and so do csh and tcsh. A path with a backslash, a `!` or a
+control character is refused (fish reads `\'` as an escape even inside
+single quotes, and csh and tcsh expand `!` as history there). The Mac app passes it
+for a destination its device list gives a path for
+(`HostedRemoteHostPaths`).
+
+An SSH server allows a limited number of sessions on one connection
+(`MaxSessions`, 10 by default). When ssh reports that the master connection
+at `--ssh-control-path` refused a session (`Session open refused by peer`)
+before the gateway's preamble arrived, the client connects again once,
+directly, without the ControlPath. The Mac app shares one master among at
+most 8 attach adapters per destination
+(`HostSSHMasterManager.Configuration.maxChannelsPerMaster`), leaving room
+for its control connection and one-off commands; further adapters run their
+own ssh.
+
 When the client expects a particular host identity (`--expected-host-id`, or
 the host an attachment reconnects to), the remote command is
 `env CHERRY_EXPECTED_HOST_ID='ID' cherry-host gateway …`. The Mac app passes
@@ -479,6 +502,25 @@ volume (such as a mounted disk image), because sessions would stop working when
 that location goes away; move the app to `/Applications` or set
 `CHERRY_HOST_PATH`. On Linux a sibling on a read-only file system is started
 normally, so read-only system directories work.
+
+`cherry-host version --json` prints what the executable is, without
+touching any daemon: `{"protocol":7,"build":"…","version":"0.1.0",
+"os":"macos","arch":"aarch64","min_macos":"11.0"}` (`min_macos` is null on
+Linux). `cherry-host status --json [--socket PATH]` says whether a daemon
+answers at the socket, from one Hello, and never starts, replaces or changes
+one: `{"running":true,"state":"ready","protocol":7,"build":"…",
+"host_id":"…"}`; `state` is `absent` (`running` false and the rest null),
+`ready`, `older` (an older protocol, which `list`, `new`, `attach` and
+`control` would replace), `other` (a newer protocol, or one too old to
+replace), `unresponsive` (with `error`), or `error` when the socket could
+not be checked at all: its directory is not private to this user, another
+account listens on it, or connecting failed otherwise (`running` false, the
+rest null, and `error` saying why, for example `{"running":false,
+"state":"error",…,"error":"refusing to use /tmp/x/host.sock: …"}`). Both
+always print JSON with `--json` and exit 0 whatever they report, so a client
+can parse every outcome; without `--json`, `status` prints one line. Cherry's
+Add Mac check runs them on the other machine
+([remote-devices.md](../docs/specs/remote-devices.md)).
 
 `--socket /absolute/private/path/host.sock` selects a separate host (its own
 daemon and state directory); with `--host`, that path is on the remote machine.

@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 
 struct KnownEditor: Identifiable, Equatable, Sendable {
     let id: String
@@ -120,7 +121,10 @@ struct ExternalEditorLauncher {
         self.openHandler = openHandler
     }
 
+    /// A project on another Mac (a `ProjectLocation` key) is not opened:
+    /// its folder is not on this Mac (docs/specs/remote-devices.md, phase 3).
     func open(projectRoot: String, with editor: InstalledEditor) {
+        guard !ProjectLocation.isRemoteKey(projectRoot) else { return }
         openHandler(URL(fileURLWithPath: projectRoot, isDirectory: true), editor.appURL)
     }
 }

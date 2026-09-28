@@ -187,8 +187,15 @@ struct SessionBackendPolicy {
     /// Where a new local tab runs its program: the local host, when the
     /// settings prefer persistent sessions and it can run them now; nil for
     /// a native tab. When the host cannot, `PersistentSessionsStatus` says why.
+    ///
+    /// Another Mac's host (a device's window, docs/specs/remote-devices.md)
+    /// is always it, whatever the setting and whether or not it can host
+    /// now: its tabs never run natively on This Mac, a tab that cannot
+    /// start there says so.
     func persistentHostingForNewTab() -> PersistentLocalSessions? {
-        guard let localSessions, prefersPersistentLocalSessions else { return nil }
+        guard let localSessions else { return nil }
+        guard localSessions.profile.allowsNativeFallback else { return localSessions }
+        guard prefersPersistentLocalSessions else { return nil }
         return localSessions.canHostNewTabs() ? localSessions : nil
     }
 

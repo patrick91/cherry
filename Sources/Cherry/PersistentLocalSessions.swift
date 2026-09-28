@@ -104,8 +104,57 @@ enum PersistentSessionTag {
     static let maxValueBytes = 1_024
 }
 
-/// Runs Cherry's local terminal, command and agent tabs as persistent
-/// sessions in the local cherry-host (docs/specs/multiplexer-default.md):
+/// Which host a `PersistentHostSessions` runs its tabs' programs on, and
+/// what that means for them (docs/specs/remote-devices.md).
+struct PersistentHostProfile: Sendable {
+    var host: HostedSessionHost
+    /// How messages name the machine: "This Mac", or a device's name.
+    var displayName: String
+    /// A tab whose session cannot start may run its program natively on
+    /// This Mac instead. Never for another Mac's host: such a tab fails,
+    /// saying why, with Retry.
+    var allowsNativeFallback: Bool
+    /// The host runs on this Mac: the pids and directories it reports are
+    /// this Mac's (MCP caller routing, port detection, cwd seeding).
+    var isThisMac: Bool
+    /// The names the host's machine goes by, which its programs' directory
+    /// reports (OSC 7) may name (`HostedSessionInfo.workingDirectory(onMachineNamed:)`).
+    var machineNames: @Sendable () -> Set<String>
+
+    /// This Mac's own host.
+    static let thisMac = PersistentHostProfile(
+        host: .local,
+        displayName: HostedSessionHost.local.displayName,
+        allowsNativeFallback: true,
+        isThisMac: true,
+        machineNames: { HostedReportedDirectory.thisMacNames() }
+    )
+
+    /// Another Mac's host, reached over SSH at `host`.
+    static func remote(host: HostedSessionHost, displayName: String, machineNames: Set<String> = []) -> PersistentHostProfile {
+        PersistentHostProfile(
+            host: host,
+            displayName: displayName,
+            allowsNativeFallback: false,
+            isThisMac: false,
+            machineNames: { machineNames }
+        )
+    }
+
+    /// "the local session host", "the session host on Studio".
+    var hostPhrase: String {
+        isThisMac ? "the local session host" : "the session host on \(displayName)"
+    }
+}
+
+/// This Mac's host runs its tabs as `PersistentHostSessions` too; the old
+/// name stays for the code that only ever deals with This Mac.
+typealias PersistentLocalSessions = PersistentHostSessions
+
+/// Runs Cherry's terminal, command and agent tabs as persistent sessions in
+/// one cherry-host: This Mac's (`shared`, docs/specs/multiplexer-default.md)
+/// or another Mac's over SSH (`remote(…)`, docs/specs/remote-devices.md).
+/// Originally only the local cherry-host (docs/specs/multiplexer-default.md):
 /// creates their sessions through the local host's `HostControl`, follows
 /// their programs (exit, pid, busy, title, directory, bells, notifications,
 /// progress) through its events, ends them for close intents that
@@ -118,7 +167,7 @@ enum PersistentSessionTag {
 /// Nothing here blocks the main actor: the helper, the daemon and the login
 /// environment are reached through `HostControl`'s helper process.
 @MainActor
-final class PersistentLocalSessions {
+final class PersistentHostSessions {
     /// Builds a tab's Create argv, environment and working directory from
     /// its launch configuration and the captured login environment.
     typealias LaunchSpecBuilder = @MainActor (
@@ -221,9 +270,54 @@ final class PersistentLocalSessions {
         /// were recorded in a store (`SessionsToEndRecord`); the Persistent
         /// Sessions sheet shows them meanwhile.
         var forgottenTabsWindow: Duration = .seconds(300)
+
+        /// Another Mac's host: its Create goes over SSH (a login, maybe a
+        /// daemon to start there), so a tab waits longer before it says
+        /// the session could not start.
+        static var remote: Configuration {
+            var configuration = Configuration()
+            configuration.creationTimeout = 45
+            return configuration
+        }
     }
 
-    static let shared = PersistentLocalSessions(instanceLock: .shared)
+    static let shared = PersistentHostSessions(instanceLock: .shared)
+
+    /// A device's hosting (docs/specs/remote-devices.md): tabs never fall
+    /// back to a native shell, sessions are created with this
+    /// installation's own owner (`remoteOwner`), so the other Mac's own
+    /// Cherry never adopts them, and they launch with `RemoteLaunchSpec`.
+    static func remote(
+        profile: PersistentHostProfile,
+        installationID: UUID,
+        remoteShell: String = RemoteLaunchSpec.defaultRemoteShell,
+        control: (@MainActor () -> HostControl)? = nil,
+        installationUnavailableReason: @escaping @MainActor () -> String? = PersistentHostSessions.remoteInstallationUnavailableReason,
+        status: PersistentSessionsStatus = PersistentSessionsStatus(),
+        instanceLock: AppInstanceLock? = .shared,
+        terminalColors: @escaping @MainActor () -> HostTerminalColors? = PersistentHostSessions.appTerminalColors,
+        configuration: Configuration = .remote
+    ) -> PersistentHostSessions {
+        let host = profile.host
+        return PersistentHostSessions(
+            profile: profile,
+            owner: remoteOwner(installationID: installationID),
+            control: control ?? { HostControlRegistry.shared.control(for: host) },
+            installationUnavailableReason: installationUnavailableReason,
+            launchSpec: RemoteLaunchSpec.builder(remoteShell: remoteShell),
+            status: status,
+            instanceLock: instanceLock,
+            terminalColors: terminalColors,
+            configuration: configuration
+        )
+    }
+
+    /// Who creates this installation's sessions on other Macs:
+    /// `<app identity>@<installation id>`. Never `appOwner`, which the
+    /// other Mac's own Cherry (of the same identity) adopts as its own.
+    nonisolated static func remoteOwner(installationID: UUID) -> String {
+        "\(appOwner)@\(installationID.uuidString)"
+    }
 
     /// The host keeps a session name to this many bytes (Update's limit).
     static let maxSessionNameBytes = 256
@@ -234,6 +328,8 @@ final class PersistentLocalSessions {
     nonisolated static var appOwner: String { CherryAppIdentity.current.applicationSupportName }
 
     let owner: String
+    /// The host and what it means for its tabs (This Mac, or a device).
+    let profile: PersistentHostProfile
     let configuration: Configuration
     /// Where the sessions this app ends on purpose are recorded
     /// (`WorkspaceStateStore.addEndedSessions`), so a saved tab that names
@@ -332,15 +428,17 @@ final class PersistentLocalSessions {
     }
 
     init(
-        owner: String = PersistentLocalSessions.appOwner,
+        profile: PersistentHostProfile = .thisMac,
+        owner: String = PersistentHostSessions.appOwner,
         control: @escaping @MainActor () -> HostControl = { HostControlRegistry.shared.control(for: .local) },
-        installationUnavailableReason: @escaping @MainActor () -> String? = PersistentLocalSessions.localInstallationUnavailableReason,
-        launchSpec: @escaping LaunchSpecBuilder = PersistentLocalSessions.preparedLaunchSpec,
+        installationUnavailableReason: @escaping @MainActor () -> String? = PersistentHostSessions.localInstallationUnavailableReason,
+        launchSpec: @escaping LaunchSpecBuilder = PersistentHostSessions.preparedLaunchSpec,
         status: PersistentSessionsStatus = .shared,
         instanceLock: AppInstanceLock? = nil,
-        terminalColors: @escaping @MainActor () -> HostTerminalColors? = PersistentLocalSessions.appTerminalColors,
+        terminalColors: @escaping @MainActor () -> HostTerminalColors? = PersistentHostSessions.appTerminalColors,
         configuration: Configuration = Configuration()
     ) {
+        self.profile = profile
         self.owner = owner
         self.terminalColors = terminalColors
         makeControl = control
@@ -381,6 +479,24 @@ final class PersistentLocalSessions {
         } catch {
             return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// This app cannot reach other Macs' hosts: no `cherry` helper (it runs
+    /// here, and runs ssh). Unlike This Mac's, a disk image copy can: the
+    /// sessions do not outlive anything of this app's bundle.
+    static func remoteInstallationUnavailableReason() -> String? {
+        do {
+            _ = try HostedSessionClient.installed()
+            return nil
+        } catch {
+            return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Where a session's program says it is, when that is on the host's
+    /// machine (never another machine's report).
+    func reportedWorkingDirectory(of info: HostedSessionInfo) -> String? {
+        info.workingDirectory(onMachineNamed: profile.machineNames())
     }
 
     /// Runs this app's own launch spec preparation (staged Ghostty resources,
@@ -503,7 +619,7 @@ final class PersistentLocalSessions {
             status.lastLaunchFailure = failure
         }
         guard Self.meansHostUnavailable(error) else { return }
-        let reason = "The local session host could not start a session: \(Self.errorMessage(error))"
+        let reason = "\(Self.capitalizedFirst(profile.hostPhrase)) could not start a session: \(Self.errorMessage(error))"
         launchFailure = (reason, Date().addingTimeInterval(configuration.unavailableRetryInterval))
         publish(instanceUnavailableReason ?? installationCheck?.reason ?? reason)
     }
@@ -572,7 +688,7 @@ final class PersistentLocalSessions {
         let control = control
         try await control.connect()
         guard let hostID = control.hostID, let executable = control.executableURL else {
-            throw HostedSessionError.unavailable("The connection to the local session host was lost.")
+            throw HostedSessionError.unavailable("The connection to \(profile.hostPhrase) was lost.")
         }
         let loginEnvironment = control.loginEnvironment?.environment
         let spec = await launchSpec(launch, loginEnvironment)
@@ -614,7 +730,7 @@ final class PersistentLocalSessions {
         noteLaunchSucceeded()
         return PersistentSessionLaunch(
             attachment: HostedSessionAttachment(
-                host: .local,
+                host: profile.host,
                 hostID: hostID,
                 sessionID: info.id,
                 name: info.name,
@@ -644,9 +760,10 @@ final class PersistentLocalSessions {
         let control = control
         let executablePath = control.executableURL?.path ?? ""
         let environment = control.loginEnvironment?.environment ?? [:]
+        let host = profile.host
         return (list, { info in
             HostedSessionAttachment(
-                host: .local,
+                host: host,
                 hostID: list.hostID,
                 sessionID: info.id,
                 name: info.name,
@@ -663,7 +780,7 @@ final class PersistentLocalSessions {
         let control = control
         guard let hostID = control.hostID, let executable = control.executableURL else { return nil }
         return HostedSessionAttachment(
-            host: .local,
+            host: profile.host,
             hostID: hostID,
             sessionID: info.id,
             name: info.name,
@@ -692,7 +809,7 @@ final class PersistentLocalSessions {
                     && self.owningTab(of: info.id) == nil
                     && self.endings[info.id] == nil {
                     self.end(HostedSessionAttachment(
-                        host: .local,
+                        host: profile.host,
                         hostID: hostID,
                         sessionID: info.id,
                         name: info.name,
@@ -723,7 +840,8 @@ final class PersistentLocalSessions {
     /// (`resumeEndingSessions(recordedIn:)`).
     func endSessions(ofForgottenTabs records: [WorkspaceSessionRecord], recordedIn store: WorkspaceStateStore? = nil) {
         guard instanceUnavailableReason == nil else { return }
-        let targets = records.filter(\.mayOwnLocalSession)
+        let host = profile.host
+        let targets = records.filter { $0.mayOwnSession(on: host) }
         guard !targets.isEmpty else { return }
         store?.addSessionsToEnd(targets)
         searchAndEndSessions(ofForgottenTabs: targets, recordedIn: store)
@@ -737,7 +855,8 @@ final class PersistentLocalSessions {
         guard instanceUnavailableReason == nil,
               resumedSessionsToEnd.insert(ObjectIdentifier(store)).inserted
         else { return }
-        let records = store.loadSessionsToEnd().filter(\.mayOwnLocalSession)
+        let host = profile.host
+        let records = store.loadSessionsToEnd().filter { $0.mayOwnSession(on: host) }
         guard !records.isEmpty else { return }
         searchAndEndSessions(ofForgottenTabs: records, recordedIn: store)
     }
@@ -783,7 +902,9 @@ final class PersistentLocalSessions {
         let listing = listing(of: list)
         var endings: [Task<Void, Never>] = []
         for info in list.sessions where info.owner == owner && owningTab(of: info.id) == nil {
-            let named = records.contains { Self.record($0, names: info, hostID: list.hostID, owner: owner) }
+            let named = records.contains {
+                Self.record($0, names: info, hostID: list.hostID, owner: owner, host: profile.host)
+            }
             if named { endings.append(end(listing.attachment(info))) }
         }
         return endings
@@ -795,22 +916,24 @@ final class PersistentLocalSessions {
     func isScheduledToEnd(_ info: HostedSessionInfo, hostID: String) -> Bool {
         guard info.owner == owner, owningTab(of: info.id) == nil else { return false }
         return forgottenTabTargets.values.contains { records in
-            records.contains { Self.record($0, names: info, hostID: hostID, owner: owner) }
+            records.contains { Self.record($0, names: info, hostID: hostID, owner: owner, host: profile.host) }
         }
     }
 
-    /// Whether a saved tab names this session of `owner`'s on the local
-    /// host `hostID`: its binding when it owned the session (`owned`), or
-    /// any binding with `includingAttached`; the session its saved Create
-    /// started (`launchRequestID`); or one tagged with its tab id.
+    /// Whether a saved tab names this session of `owner`'s on `host`
+    /// (This Mac by default), whose identity is `hostID`: its binding when
+    /// it owned the session (`owned`), or any binding with
+    /// `includingAttached`; the session its saved Create started
+    /// (`launchRequestID`); or one tagged with its tab id.
     nonisolated static func record(
         _ record: WorkspaceSessionRecord,
         names info: HostedSessionInfo,
         hostID: String,
         owner: String,
+        host: HostedSessionHost = .local,
         includingAttached: Bool = false
     ) -> Bool {
-        if let binding = record.hosted, binding.host == HostedSessionHost.local.id,
+        if let binding = record.hosted, binding.host == host.id,
            includingAttached || binding.owned == true,
            binding.hostID == hostID, binding.sessionID == info.id {
             return true
@@ -1434,7 +1557,7 @@ final class PersistentLocalSessions {
     }
 
     /// The tab id a session of this app's was started for, from its tags.
-    nonisolated static func tabID(of info: HostedSessionInfo, owner: String = PersistentLocalSessions.appOwner) -> UUID? {
+    nonisolated static func tabID(of info: HostedSessionInfo, owner: String = PersistentHostSessions.appOwner) -> UUID? {
         guard info.owner == owner else { return nil }
         return info.tags[PersistentSessionTag.tab].flatMap(UUID.init(uuidString:))
     }
@@ -1452,6 +1575,10 @@ final class PersistentLocalSessions {
         info.owner == owner && launchRequestID(of: info) == requestID.lowercased()
     }
 
+    static func capitalizedFirst(_ text: String) -> String {
+        text.prefix(1).uppercased() + text.dropFirst()
+    }
+
     /// `text` cut to at most `limit` UTF-8 bytes, on a character boundary.
     static func truncated(_ text: String, toBytes limit: Int) -> String {
         guard text.utf8.count > limit else { return text }
@@ -1464,5 +1591,62 @@ final class PersistentLocalSessions {
             bytes += size
         }
         return result
+    }
+}
+
+/// Every host this app runs persistent tabs on: This Mac's (`local`,
+/// always) and each device's (docs/specs/remote-devices.md), which the
+/// device store registers. App-wide steps that used to assume This Mac
+/// alone (a quit ending the sessions whose ends wait for an undo, and
+/// waiting for the ends under way) go through all of them.
+@MainActor
+final class PersistentHostingRegistry {
+    static let shared = PersistentHostingRegistry(local: .shared)
+
+    let local: PersistentHostSessions
+    private var remoteByHostID: [String: PersistentHostSessions] = [:]
+
+    init(local: PersistentHostSessions) {
+        self.local = local
+    }
+
+    /// Other Macs' hostings, in a stable order.
+    var remote: [PersistentHostSessions] {
+        remoteByHostID.keys.sorted().compactMap { remoteByHostID[$0] }
+    }
+
+    var all: [PersistentHostSessions] { [local] + remote }
+
+    /// Adds (or replaces) the hosting of another Mac's host.
+    func register(_ hosting: PersistentHostSessions) {
+        precondition(!hosting.profile.isThisMac, "This Mac's hosting is the registry's `local`")
+        remoteByHostID[hosting.profile.host.id] = hosting
+    }
+
+    func unregister(_ host: HostedSessionHost) {
+        remoteByHostID[host.id] = nil
+    }
+
+    func hosting(for host: HostedSessionHost) -> PersistentHostSessions? {
+        host == local.profile.host ? local : remoteByHostID[host.id]
+    }
+
+    /// Ends, on every host, the sessions whose end waits for an undo (a
+    /// quit).
+    func endAllDeferred() {
+        for hosting in all { hosting.endAllDeferred() }
+    }
+
+    /// Waits until no host has a session being ended, or `timeout` passed.
+    /// True when none is left.
+    @discardableResult
+    func waitForPendingEnds(timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        var done = true
+        for hosting in all {
+            let remaining = deadline - ContinuousClock.now
+            done = await hosting.waitForPendingEnds(timeout: max(remaining, .zero)) && done
+        }
+        return done
     }
 }

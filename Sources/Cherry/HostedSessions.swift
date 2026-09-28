@@ -31,10 +31,43 @@ struct HostedSessionHost: Codable, Hashable, Identifiable, Sendable {
         arguments(sshControlPath: sshDestination.flatMap { HostSSHMasterManager.shared.controlPathIfUp(for: $0) })
     }
 
-    /// `sshControlPath` is ignored for This Mac.
-    func arguments(sshControlPath: String?) -> [String] {
+    /// `sshControlPath` is ignored for This Mac. `remoteHostPaths` says
+    /// where the destination's cherry-host is when it is not on its login
+    /// shell's PATH (a Mac Cherry installed it on,
+    /// docs/specs/remote-devices.md): `--remote-host-path`.
+    func arguments(sshControlPath: String?, remoteHostPaths: HostedRemoteHostPaths = .shared) -> [String] {
         guard let sshDestination else { return [] }
-        return ["--host", sshDestination] + (sshControlPath.map { ["--ssh-control-path", $0] } ?? [])
+        return ["--host", sshDestination]
+            + (sshControlPath.map { ["--ssh-control-path", $0] } ?? [])
+            + (remoteHostPaths.path(for: sshDestination).map { ["--remote-host-path", $0] } ?? [])
+    }
+}
+
+/// Where each SSH destination's cherry-host is, when it is not
+/// `cherry-host` on the remote login shell's PATH: an absolute path, or
+/// `~/…` under the remote home (`cherry --remote-host-path`). The device
+/// store sets the resolver (docs/specs/remote-devices.md); until then no
+/// destination has one. Thread-safe: arguments are built off the main actor.
+final class HostedRemoteHostPaths: @unchecked Sendable {
+    static let shared = HostedRemoteHostPaths()
+
+    typealias Resolver = @Sendable (_ sshDestination: String) -> String?
+
+    private let lock = NSLock()
+    private var resolver: Resolver
+
+    init(resolver: @escaping Resolver = { _ in nil }) {
+        self.resolver = resolver
+    }
+
+    func setResolver(_ resolver: @escaping Resolver) {
+        lock.withLock { self.resolver = resolver }
+    }
+
+    /// The destination's cherry-host path, or nil for the one on its PATH.
+    func path(for sshDestination: String) -> String? {
+        let resolver = lock.withLock { self.resolver }
+        return resolver(sshDestination)?.nilIfEmpty
     }
 }
 

@@ -1070,3 +1070,55 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
     let staged = try await stager.resolve()
     #expect(spec.environment["TERMINFO"] == staged.terminfoDirectory)
 }
+
+// MARK: - RemoteLaunchSpec (docs/specs/remote-devices.md)
+
+@Test func remoteLaunchSpecCarriesTheTabNotThisMac() {
+    let key = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
+    let processID = UUID().uuidString
+    let terminal = ShellProcessController.Configuration(
+        shellPath: "/opt/homebrew/bin/fish",
+        workingDirectory: "/Users/me/app/web",
+        projectRoot: key,
+        processID: processID,
+        environment: [
+            "PORT": "8000", "PATH": "/local/bin", "HOME": "/Users/local", "CHERRY_CONTROL_SOCKET": "/tmp/cherry.sock",
+            "ZDOTDIR": "/local/zdotdir", "GHOSTTY_RESOURCES_DIR": "/Applications/Cherry.app/x", "SSH_AUTH_SOCK": "/tmp/agent",
+            "TERMINFO": "/local/terminfo", "CHERRY_STARTUP_COMMAND": "echo local"
+        ],
+        term: ShellProcessController.ghosttyTerm,
+        initialSize: TerminalViewportSize(columns: 80, rows: 24)
+    )
+    let locale = ["LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "PATH": "/login/bin", "HOME": "/Users/local", "TMPDIR": "/var/x"]
+    let spec = RemoteLaunchSpec.make(for: terminal, remoteShell: "/bin/zsh", localeEnvironment: locale)
+    // The host runs the other Mac's account's login shell, in the path there.
+    #expect(spec.argv.isEmpty)
+    #expect(spec.workingDirectory == "/Users/me/app/web")
+    #expect(spec.environment == [
+        "TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "Cherry", "CHERRY_TERM_PROGRAM": "Cherry",
+        "INSIDE_CHERRY": "1", "CHERRY_PROJECT_ROOT": "/Users/me/app", "CHERRY_PROCESS_ID": processID,
+        "PORT": "8000", "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"
+    ])
+    for key in ["PATH", "HOME", "CHERRY_CONTROL_SOCKET", "SSH_AUTH_SOCK", "TMPDIR", "ZDOTDIR", "TERMINFO", "SHELL"] {
+        #expect(spec.environment[key] == nil, "\(key)")
+    }
+    #expect(spec.resourcesCopy == nil)
+
+    // An agent (or a command) runs its line in the other Mac's login shell.
+    let agent = ShellProcessController.Configuration(
+        shellPath: "/opt/homebrew/bin/fish",
+        workingDirectory: "/Users/me/app",
+        projectRoot: key,
+        processID: processID,
+        agentID: processID,
+        term: ShellProcessController.ghosttyTerm,
+        initialSize: TerminalViewportSize(columns: 80, rows: 24),
+        startupCommand: "claude --resume 'it''s'"
+    )
+    let agentSpec = RemoteLaunchSpec.make(for: agent, remoteShell: "/bin/bash", localeEnvironment: [:])
+    #expect(agentSpec.argv == ["/bin/bash", "-l", "-c", "claude --resume 'it''s'"])
+    #expect(agentSpec.environment["CHERRY_AGENT_ID"] == processID)
+    #expect(agentSpec.environment["CHERRY_STARTUP_COMMAND"] == nil)
+    // A shell the device did not report: macOS's default.
+    #expect(RemoteLaunchSpec.make(for: agent, remoteShell: "", localeEnvironment: [:]).argv.first == "/bin/zsh")
+}

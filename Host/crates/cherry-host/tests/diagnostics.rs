@@ -280,3 +280,78 @@ fn a_running_daemon_moves_a_long_log_aside_and_its_holders_follow() {
         .unwrap()
         .contains("its manifest is gone"));
 }
+
+fn json_of(command: &mut std::process::Command) -> serde_json::Value {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn version_json_names_the_protocol_build_and_platform() {
+    let sandbox = Sandbox::new();
+    let report = json_of(sandbox.command("version").arg("--json"));
+    assert_eq!(report["protocol"], PROTOCOL_VERSION);
+    assert_eq!(report["build"], BUILD);
+    assert_eq!(report["arch"], std::env::consts::ARCH);
+    assert_eq!(report["os"], std::env::consts::OS);
+    assert_eq!(report["min_macos"].is_string(), cfg!(target_os = "macos"));
+    // Nothing was started.
+    assert!(!sandbox.socket.exists());
+}
+
+#[test]
+fn status_json_describes_the_host_at_the_socket_without_starting_or_replacing_one() {
+    // No host: said so, and none is started.
+    let sandbox = Sandbox::new();
+    let report = json_of(sandbox.command("status").arg("--json"));
+    assert_eq!(report["running"], false);
+    assert_eq!(report["state"], "absent");
+    assert!(report["host_id"].is_null());
+    assert!(!sandbox.socket.exists());
+
+    let host = Host::new();
+    let report = json_of(host.sandbox.command("status").arg("--json"));
+    assert_eq!(report["running"], true);
+    assert_eq!(report["state"], "ready");
+    assert_eq!(report["protocol"], PROTOCOL_VERSION);
+    assert_eq!(report["build"], BUILD);
+    assert_eq!(report["host_id"], host.host_id());
+    // The same daemon still serves, with no session made.
+    let after = status(&host);
+    assert_eq!(after.pid, host.child.id());
+    assert_eq!(after.sessions, 0);
+}
+
+#[test]
+fn status_json_reports_a_socket_it_cannot_trust_as_json_and_exits_0() {
+    // A socket directory other accounts can read: never trusted, and said
+    // so as JSON, so a client probing a machine can read why.
+    let sandbox = Sandbox::new();
+    let shared = sandbox.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = std::process::Command::new(&sandbox.bin)
+        .args(["status", "--json", "--socket"])
+        .arg(shared.join("host.sock"))
+        .env("HOME", &sandbox.home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["running"], false);
+    assert_eq!(report["state"], "error");
+    assert!(report["host_id"].is_null());
+    let error = report["error"].as_str().unwrap();
+    assert!(error.contains(&shared.display().to_string()), "{error}");
+    assert!(!shared.join("host.sock").exists());
+}

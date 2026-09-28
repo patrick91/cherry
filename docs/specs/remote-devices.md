@@ -1,0 +1,328 @@
+# Devices: projects on your other Macs
+
+Status: phase 0 (groundwork) implemented on `codex/persistent-sessions`;
+phases 1 to 4 are the plan. Builds on
+[multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
+holder-per-session host, close intents, restore) and
+[remote-session-host.md](remote-session-host.md) (SSH transport, gateway,
+host identity). User-facing host behaviour is in
+[Host/README.md](../../Host/README.md).
+
+## Goal
+
+The user's other Macs ("devices") appear in the title bar's project picker
+(`ContentView` `TitlebarProjectPicker.presentMenu`) next to This Mac's
+projects. Picking a device's project opens a project window whose terminals,
+agents and commands run on that Mac, in its `cherry-host`, over SSH. The
+window looks and behaves like a local one: tabs survive Cherry quitting on
+either Mac, come back on relaunch, and a tab that cannot start says so
+instead of running anything locally.
+
+**Add Mac…** (phase 2) checks the other Mac over SSH and installs the
+`cherry` and `cherry-host` that match this Cherry there.
+
+Cherry may run on the other Mac too. Both apps then share that Mac's daemon
+(the default socket, `/tmp/cherry-host-$UID/host.sock`), so nothing here may
+disturb the other app: its sessions, its daemon's protocol, its adoption
+rules.
+
+Out of scope for now: Linux devices in the picker (the host runs there, the
+flow is Mac-first), editing remote files, a remote file browser beyond
+choosing a project folder, remote previews without SSH port forwarding.
+
+## Vocabulary
+
+- **Device**: another Mac this Cherry reaches over SSH. It has a stable
+  `deviceID` (a UUID this Cherry assigns), a display name, an SSH
+  destination (an OpenSSH alias or `user@host`), the path of its
+  `cherry-host` when it is not on the remote PATH, the host identity it
+  answered with (pinned, as `HostedSessionHostStore` pins SSH hosts), its
+  machine names (for OSC 7 reports), its home directory and login shell.
+- **Project location** (`ProjectLocation`, `Sources/CherryControl`):
+  `.local(path)` or `.remote(deviceID:path)`. Its **key** is what every
+  store, registry and link keys a project on: the path itself for a local
+  project (unchanged, so existing state keeps working) and
+  `device:<lowercased uuid>:<absolute path>` for a remote one. A key never
+  collides with a local path: local roots are absolute (`/…`).
+- **Launch root**: the path on the machine that runs a window's tabs. For a
+  local window it is the project root; for a remote one, the location's
+  path. Only launch and remote-command code uses it.
+- **Hosting** (`PersistentHostSessions`): runs one host's persistent tabs.
+  `.shared` is This Mac's; each device gets its own.
+
+## Rules every phase keeps
+
+1. **Keys, not paths.** A remote project's root is its key everywhere a
+   project is identified: `ProjectWindowRegistry`, `WorkspaceStateStore`
+   (`sha256(key).json`), notes and todos (`ProjectNoteStore`,
+   `ProjectTodoStore`: `sha256(key).json`), `CherryDeepLink.projectKey`
+   (the SHA-256 of the key, never of a path resolved against the current
+   directory), `AgentSettings` (projects, commands, overrides, hidden and
+   last active worktrees). No code treats a remote key as a local path: no
+   `FileManager` check, no `URL(fileURLWithPath:)` standardisation, no
+   `cherry.toml` read or write, no `NSWorkspace` open.
+2. **Never run a remote tab locally.** A remote hosting has
+   `allowsNativeFallback = false`: a Create the host rejects, a host that
+   cannot be reached, and a creation that takes longer than its deadline all
+   leave the tab failed ("Couldn't start on <Mac>: <reason>", Retry), never
+   a local shell. `SessionBackendPolicy.persistentHostingForNewTab` returns
+   a remote hosting whatever the *persistent sessions* setting says and
+   whether or not it can host now.
+3. **Distinct owner.** Sessions this Cherry creates on a device carry the
+   owner `<app identity>@<installation id>` (`PersistentHostSessions.remoteOwner`,
+   for example `Cherry@6F1C…`), never the bare app identity. The other Mac's
+   own Cherry (owner `Cherry`) therefore never adopts them: its restore,
+   orphan scan, Background Sessions and `canAdopt` treat another owner as
+   foreign, and its Persistent Sessions sheet shows them as another app's.
+   Likewise this Cherry never adopts the other Mac's own sessions on that
+   Mac: they are attached, not owned.
+4. **No local process identity.** A remote session's `SessionInfo.pid` is a
+   pid on another machine: `hostedProgramProcessID` stays nil
+   (`isThisMac = false`), so MCP caller routing, `lsof` port detection and
+   busy checks never look at a local process with that number.
+5. **Remote directories are the host's.** A remote tab's working directory
+   comes from `HostedSessionInfo.workingDirectory(onMachineNamed:)` with the
+   device's machine names, never `localWorkingDirectory`; a new tab starts
+   in the selected tab's directory or the launch root without checking that
+   it exists locally (the host refuses a directory that does not exist).
+6. **This Mac's evidence is not the device's.** `SystemEndedSessions`
+   applies this Mac's boot time and log out/restart quits only to This Mac's
+   records. A remote record whose session is gone comes back ended only when
+   that host reported the session lost (`lost_sessions`, recorded in
+   `Workspaces/lost-sessions.json` by host identity); otherwise it is
+   dropped.
+7. **Protocol compatibility on a shared daemon.** A client replaces a daemon
+   speaking an older protocol (`Replace`) and never one speaking a newer
+   one. On a device whose own Cherry.app runs the daemon, the `cherry-host`
+   this Cherry uses there must speak the same protocol as that app, or one
+   of the two apps is locked out. Phase 2 checks this before installing and
+   before every connection (`cherry-host status --json`).
+8. **SSH channels are limited.** sshd allows 10 sessions per connection
+   (`MaxSessions`). One master connection per destination
+   (`HostSSHMasterManager`) carries at most
+   `Configuration.maxChannelsPerMaster` (8) adapter launches; further
+   adapters use their own ssh. The CLI connects again without the
+   ControlPath when a master refuses a session ("Session open refused by
+   peer").
+
+## Phase 0: groundwork (done)
+
+No user-visible change for local tabs. What exists:
+
+- **`ProjectLocation`** (`Sources/CherryControl/ProjectLocation.swift`): the
+  key type, parsing (`init(key:)`), `isRemoteKey`, `launchPath(forKey:)`.
+  `CherryDeepLink.projectKey(forProjectRoot:)` hashes a remote key as it is.
+  `AgentSettings.validDirectory` accepts a remote key without touching the
+  file system, and `CherryProjectFile` never reads or writes `cherry.toml`
+  for one (loads are empty, writes throw). `ExternalEditorLauncher.open`
+  does nothing for a remote key.
+- **`TerminalWorkspace.launchRoot`** next to `projectRoot` (the key). New
+  tabs, agents and commands start in the launch root; the key is kept
+  unchanged (a remote key is not resolved as a local directory).
+- **`PersistentHostSessions`** (was `PersistentLocalSessions`, which stays as
+  a type alias for This Mac's code): a `PersistentHostProfile` says which
+  host (`HostedSessionHost`), its display name, whether a failed tab may run
+  natively, whether it is This Mac, and the machine names its directory
+  reports use. `.shared` is This Mac's (`.thisMac` profile, owner = the app
+  identity, 14 s creation timeout). `PersistentHostSessions.remote(…)` makes
+  a device's: owner `remoteOwner`, `Configuration.remote` (45 s creation
+  timeout), `RemoteLaunchSpec` launches, its own `PersistentSessionsStatus`,
+  and a control connection from `HostControlRegistry.shared.control(for:
+  .ssh(destination))`. Attachments, lost-Create cleanup, forgotten-tab
+  searches and `record(_:names:…)` use the hosting's host, not `.local`.
+  `PersistentHostingRegistry.shared` lists every hosting; a quit ends the
+  deferred ends and waits for the pending ends of all of them
+  (`QuitTeardownSteps.app`, `CherryAppDelegate.confirmedQuitPlan`).
+- **Installation id** (`CherryInstallation`): `Application
+  Support/<identity>/installation.json` (`{id, machine}`), written
+  atomically, made or replaced only by the copy holding the instance lock
+  (another copy reads it, or has none). `machine` is the SHA-256 of This
+  Mac's `IOPlatformUUID`: a folder copied to another Mac (Migration
+  Assistant) gets a new id there, so it never claims the first Mac's
+  sessions on a shared device. Not in UserDefaults.
+- **New tabs in a device window** start in the selected tab's
+  host-reported directory when that tab runs on the same hosting, else in
+  the launch root (rule 5); a local tab's directory never seeds them.
+- **SSH master over the cap**: an adapter launched while its master has 8
+  launches runs its own ssh for as long as it runs (reconnects reuse its
+  arguments). Every launch registers afresh, so a relaunch (after its
+  reconnect window, or Reconnect) takes a slot that freed meanwhile.
+- **Tabs on a remote hosting** (`TerminalSession`): a failed launch leaves
+  the tab `.failed("Couldn't start on <Mac>: <reason>")` with
+  `persistentLaunchFailureReason` set and its hosting kept, so Restart (and
+  `retryPersistentSession`) try the same host again; queued MCP input is
+  reported undelivered. No pid is taken from the host. The creation deadline
+  is the hosting's. The working directory is not checked locally.
+  `reportsLocalWorkingDirectory` is false.
+- **`RemoteLaunchSpec`**: a terminal's Create has argv `[]` (the host runs
+  the account's `$SHELL -l`); a command or agent runs
+  `[remoteShell, "-l", "-c", line]`. Environment: `TERM=xterm-256color`,
+  `COLORTERM=truecolor`, the tab's identity (`CHERRY_PROCESS_ID`,
+  `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` = the remote path,
+  `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the command's
+  own variables, and `LANG`/`LC_*`; never `PATH`, `HOME`, `SHELL`, the
+  control socket (`CHERRY_CONTROL_SOCKET`), Ghostty resources, the zsh
+  bootstrap or anything else that names a local file. `cwd` is the remote
+  path.
+- **Restore rules**: `SystemEndedSessions` uses only the host's lost
+  sessions for a record owned on another host (it comes back as `.logout`,
+  like a local lost holder; phase 1 words it for the device: "Ended when
+  <Mac> restarted or you logged out there");
+  `OrphanedSessionCriteria.record(for:tabID:hostID:host:)` records the host.
+  `WorkspaceSessionRecord.mayOwnSession(on:)` generalises
+  `mayOwnLocalSession`.
+- **CLI**: `cherry --remote-host-path PATH` (global, needs `--host`): the
+  remote gateway command runs that cherry-host. `~/…` is sent as
+  `"$HOME"/'…'`, which sh, bash, zsh and fish expand alike; any other path
+  is single-quoted. Backslashes are refused (fish reads `\'` inside single
+  quotes), and so is `!` (csh and tcsh expand history inside single
+  quotes). `HostedSessionHost.arguments(sshControlPath:)` appends it from
+  `HostedRemoteHostPaths.shared` (the device store sets its resolver in
+  phase 1).
+- **`cherry-host version --json`**: `{protocol, build, version, os, arch,
+  min_macos}`. **`cherry-host status --json [--socket P]`**: `{running,
+  state, protocol, build, host_id}` from one Hello (`launch::probe`); it
+  never starts, replaces or changes a host. A socket it cannot check (not
+  private, another account's, unreachable) is `state: "error"` with an
+  `error` field; with `--json` it always prints JSON and exits 0.
+- **SSH channel cap**: `HostSSHMasterManager.Configuration.maxChannelsPerMaster
+  = 8`; `controlPath(forLaunch:)` returns nil when the master is full. The
+  CLI retries once without its ControlPath when ssh reports "Session open
+  refused by peer" before the gateway preamble.
+
+## Phase 1: devices and remote project windows
+
+No Add Mac yet: devices are added from a hidden debug menu or `defaults`
+for development, with a working SSH alias and a `cherry-host` already on
+the device.
+
+1. **Device store** (`DeviceStore`, `Application Support/<app>/devices.json`,
+   one writer: the instance-lock holder). Fields as in *Vocabulary*, plus
+   `installedHostPath` and `lastProbe` (the phase 2 probe's result). It sets
+   `HostedRemoteHostPaths.shared`'s resolver and registers one
+   `PersistentHostSessions.remote(…)` per device in
+   `PersistentHostingRegistry.shared` (keyed by device id; removing a device
+   ends nothing on it, and unregisters its hosting once no window uses it).
+   The installation id (`CherryInstallation`, done in phase 0) is kept
+   next to it in `installation.json`, so the remote owner stays the same
+   across launches.
+2. **Picker.** `TitlebarProjectPicker.presentMenu` lists, after This Mac's
+   projects, one section per device with its recent projects (their keys in
+   `AgentSettings.projects`) and **Open Folder on <Mac>…**, which lists
+   directories through the device's host (a new protocol request, `ListDir`,
+   additive, or `cherry list-dir` over the control connection; not SFTP).
+   A device that cannot be reached shows its projects disabled with the
+   reason.
+3. **Remote windows.** `RepositoryWorkspace` for a remote key: no git or
+   worktree scan (a single worktree whose root is the key), its
+   `SessionBackendPolicy.localSessions` is the device's hosting, restore
+   uses `WorkspaceSessionRestorers.hostedByDefault(localSessions: device
+   hosting, …)`, and the orphan scan runs against that host with the
+   remote owner. `TerminalWorkspace.launchRoot` is the remote path.
+   Sidebar path labels use the device's home directory
+   (`SidebarTerminalPathFormatter` takes `homeDirectory`). Ghostty ignores
+   an OSC 7 that names another machine, so while the adapter passes a
+   remote tab's signals through, its directory still comes from the host's
+   `changed` events (`hostReportedWorkingDirectory`); restoring and
+   system-ended tabs (`makeSystemEndedSession`) must not check directories
+   on this Mac either. Notes and todos
+   work unchanged (keyed by the key). Open in editor is hidden (phase 3).
+4. **Failure UI.** A failed remote tab shows a bar like
+   `PersistentSessionFallbackBar`: "Couldn't start on <Mac>: <reason>" with
+   **Retry** (`retryPersistentSession`), never "Not a persistent session".
+   Settings › Sessions shows each device's `PersistentSessionsStatus`.
+5. **Records.** `WorkspaceSessionRecord` gains `hostKey` (the
+   `HostedSessionHost.id` a record without a binding was being created on),
+   so a remote tab saved while its Create was under way is looked for on
+   its device, not This Mac. `mayOwnLocalSession` stays This Mac's;
+   `mayOwnSession(on:)` is used per hosting (forgotten tabs, quits).
+6. **Close and quit.** Remote tabs are owned: ⌘W ends the session (after
+   the undo window), ⌘D detaches, `restart` recreates with the same tab id.
+   Quitting or closing a window keeps them by default; **End Sessions** ends
+   them too (the question counts them with This Mac's, "N sessions on 2
+   Macs"). A log out, restart or shut down of *this* Mac ends nothing on a
+   device. `ProjectWindowRegistry.localSessionsEndedByAQuit` records every
+   hosting's sessions (they are keyed by host identity already).
+7. **Tests.** A `RemotePersistentHarness` (a fake SSH `HostControl`, the fake
+   attach CLI) runs a remote window end to end: create, restart, restore,
+   the failure bar, no local fallback, MCP input and screen through
+   `SendInput`/`Screen`, and a quit that keeps and one that ends. Session
+   suites are named after a group in `Scripts/test-session-suites`
+   (`RemoteDevice`, added then).
+
+## Phase 2: Add Mac…
+
+1. **Probe** (`DeviceProbe`, all through the user's `ssh`, BatchMode first,
+   then interactively in a sheet's terminal if keys are not set up):
+   `uname -sm; sw_vers -productVersion; echo "$HOME"; echo "$SHELL";
+   hostname`, then `command -v cherry-host`, the known install locations
+   (`~/Library/Application Support/Cherry/bin/cherry-host`, and
+   `/Applications/Cherry.app/Contents/MacOS/cherry-host`, the other Mac's
+   own Cherry), each with `cherry-host version --json`, and
+   `cherry-host status --json` for the daemon on the default socket.
+2. **Decide.**
+   - The device's own Cherry.app runs a daemon of this protocol: use that
+     app's `cherry-host` (same protocol; builds may differ, and neither app
+     hands the daemon over to the other's build: handover is local-only).
+   - It runs a daemon of another protocol: refuse, and say which Cherry to
+     update ("Update Cherry on <Mac> (protocol 6) or here (protocol 7)").
+     Never install a newer `cherry-host` that would `Replace` the other
+     app's daemon from under it.
+   - No daemon and no Cherry.app, or only an older install of ours:
+     install.
+3. **Install.** Copy this app's `cherry` and `cherry-host`
+   (`Contents/MacOS`) for the device's architecture (universal builds, or
+   refuse on a mismatch; `min_macos` from `version --json` checked against
+   `sw_vers`) to `~/Library/Application Support/Cherry/bin/` through
+   `ssh … 'umask 077; mkdir -p …; cat > ….tmp && mv ….tmp …'`, verify with
+   `version --json` (protocol and build must match), `xattr -d
+   com.apple.quarantine` is not needed (not downloaded). Record the path
+   (`~/…` form) as the device's host path. No `sudo`, no PATH edits, no
+   launchd agent.
+4. **Pin.** The first `cherry control` pins the host identity
+   (`HostedSessionHostStore`); a later identity change is refused as for
+   any SSH host.
+5. **Updates.** When this Cherry updates and its protocol changes, a device
+   whose own Cherry.app is older is marked out of date (not replaced); one
+   with only our install is reinstalled on next use, after its sessions are
+   checked (the new daemon adopts holders: sessions survive).
+
+## Phase 3: remote project parity
+
+Host services over the control connection (additive protocol requests):
+`cherry.toml` read and write, git status and worktrees, process metadata
+and listening ports, service discovery, file and image paste (transfer then
+insert the remote path). MCP for remote agents: forward the app's control
+socket with `ssh -R` to a per-session socket and set `CHERRY_CONTROL_SOCKET`
+to it (never the local path). Previews through SSH local forwards the app
+manages. Open in editor through the editor's remote support (Zed, VS Code
+Remote SSH) when installed.
+
+## Phase 4: attention and background
+
+Bells, notifications and agent activity from device sessions in the menu
+bar and Background Sessions (per device), unread marks across launches,
+and the launch notice naming devices' background sessions. The host keeps
+signals while no app is connected (already so), so a device's agents report
+even after this Mac slept.
+
+## Testing and safety
+
+- Tests never reach a real SSH host: the fake `ssh` scripts in
+  `Host/crates/cherry-cli/tests/client.rs` and the fake `cherry control`
+  (`FakeControlHelper`) stand in. The ignored `ssh_host` suite and
+  `Scripts/test-host-ssh` exercise real SSH against disposable hosts only.
+- Every test daemon runs on a private socket with a private `HOME`; nothing
+  touches the user's daemon at `/tmp/cherry-host-$UID`.
+- The phase 0 tests: `ProjectLocationTests` (key round trip, no collision
+  with the same local path, deep link keys), `HostControlSSHMasterTests`
+  (remote host path arguments, the channel cap, a relaunch taking a freed
+  slot), `AppIdentityInstallationTests` (the installation id's file, the
+  instance lock, another Mac), `PersistentLocalSessionRemoteTests` (no
+  native fallback, no pid, distinct owner, deadline message, new tabs'
+  directory), `HostedLaunchSpecTests` (`RemoteLaunchSpec`
+  carries no local `PATH`, `HOME` or control socket),
+  `WorkspaceRestoreTests` (remote records ignore this Mac's boot), and the
+  Rust `remote_gateway_command`, `remote_host_path`, mux refusal, `version`
+  and `status --json` (including a socket it cannot trust) tests, and the
+  quoting run through sh, bash, zsh, csh, tcsh and fish where installed.

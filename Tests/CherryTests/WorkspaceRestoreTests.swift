@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import Combine
 import Foundation
 import Testing
@@ -2217,4 +2218,68 @@ private func beforeTheLastBoot() throws -> Date {
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
     #expect(repository.activeWorkspace.session(withID: shell.id)?.systemSessionEnd == .logout)
+}
+
+// MARK: - Tabs of another Mac's host (docs/specs/remote-devices.md)
+
+@Test @MainActor func aRemoteTabsGoneSessionIgnoresThisMacsBootAndQuitsAndTrustsOnlyItsHost() throws {
+    let key = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
+    let studio = try HostedSessionHost.ssh("studio")
+    func remoteRecord(_ sessionID: String, owned: Bool? = true) -> WorkspaceSessionRecord {
+        WorkspaceSessionRecord(
+            id: UUID(), kind: .terminal, title: "Remote", titleSource: .system,
+            workingDirectory: "/Users/me/app", projectRoot: key,
+            hosted: HostedSessionBindingRecord(host: studio.id, hostID: "host-studio", sessionID: sessionID, owned: owned)
+        )
+    }
+    let remote = remoteRecord("s-remote")
+    let local = localRecord(title: "Local", sessionID: "s-local", workingDirectory: "/tmp")
+    #expect(remote.ownsRemoteSession && !remote.mayOwnLocalSession)
+    #expect(remote.mayOwnSession(on: studio) && !remote.mayOwnSession(on: .local))
+    #expect(local.mayOwnSession(on: .local) && !local.mayOwnSession(on: studio))
+    // An SSH attachment saved before `owned` was recorded is not owned.
+    #expect(!remoteRecord("s-old", owned: nil).mayOwnSession(on: studio))
+    #expect(!remoteRecord("s-old", owned: nil).ownsRemoteSession)
+
+    // This Mac booted, and quit for a log out, after both were saved.
+    let saved = Date().addingTimeInterval(-600)
+    let evidence = SystemEndedSessions(
+        savedAt: saved, bootTime: saved.addingTimeInterval(60),
+        systemQuits: [saved.addingTimeInterval(30)], endedOnPurpose: { _ in false }
+    )
+    let localList = HostedSessionList(hostID: "host-a", sessions: [])
+    #expect(evidence.end(of: local, missingFrom: localList) == .restart)
+    // That says nothing about the other Mac: the remote tab is dropped...
+    let remoteList = HostedSessionList(hostID: "host-studio", sessions: [])
+    #expect(evidence.end(of: remote, missingFrom: remoteList) == nil)
+    // ...unless its own host reported the session lost, now or earlier.
+    let lostNow = HostedSessionList(hostID: "host-studio", sessions: [], lostSessionIDs: ["s-remote"])
+    #expect(evidence.end(of: remote, missingFrom: lostNow) == .logout)
+    var recorded = evidence
+    recorded.recordedLostSessions = { $0 == "host-studio" ? ["s-remote"] : [] }
+    #expect(recorded.end(of: remote, missingFrom: remoteList) == .logout)
+    // Another identity's report of the same session id says nothing.
+    let otherHost = HostedSessionList(hostID: "host-other", sessions: [], lostSessionIDs: ["s-remote"])
+    #expect(evidence.end(of: remote, missingFrom: otherHost) == nil)
+    // Ended on purpose: never the system's.
+    var onPurpose = evidence
+    onPurpose.endedOnPurpose = { _ in true }
+    #expect(onPurpose.end(of: remote, missingFrom: lostNow) == nil)
+}
+
+@Test func anAdoptedSessionsRecordNamesTheHostItRunsOn() throws {
+    let studio = try HostedSessionHost.ssh("studio")
+    let info = HostedSessionInfo(
+        id: "s1", name: "Shell", cwd: "/Users/me/app", owner: "Cherry@x",
+        tags: [PersistentSessionTag.kind: "agent", PersistentSessionTag.agent: "Claude"]
+    )
+    let remote = OrphanedSessionCriteria.record(for: info, tabID: UUID(), hostID: "host-studio", host: studio)
+    #expect(remote.hosted?.host == studio.id)
+    #expect(remote.hosted?.owned == true)
+    #expect(remote.ownsRemoteSession)
+    #expect(remote.kind == .agent)
+    // This Mac by default, as before.
+    let local = OrphanedSessionCriteria.record(for: info, tabID: UUID(), hostID: "host-a")
+    #expect(local.hosted?.host == HostedSessionHost.local.id)
+    #expect(local.mayOwnLocalSession)
 }

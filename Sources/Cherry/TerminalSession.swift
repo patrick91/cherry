@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import Combine
 import Darwin
 import Foundation
@@ -1102,7 +1103,15 @@ final class TerminalWorkspace: ObservableObject {
             clearUnreadNotificationForSelectedSession()
         }
     }
+    /// The project's key (`ProjectLocation`): its directory for a project
+    /// on This Mac, `device:<uuid>:<path>` for one on another Mac. What
+    /// identifies the project; never a directory to start in by itself.
     let projectRoot: String?
+    /// Where new tabs start on the machine that runs them: the project's
+    /// directory there (`ProjectLocation.launchPath(forKey:)`).
+    var launchRoot: String? {
+        projectRoot.map(ProjectLocation.launchPath(forKey:))
+    }
     let backendPolicy: SessionBackendPolicy
     private let launchBackend: TerminalSessionLaunchBackend
     /// Fires for changes workspace persistence saves that the published
@@ -1136,7 +1145,10 @@ final class TerminalWorkspace: ObservableObject {
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
         backendPolicy: SessionBackendPolicy = .native
     ) {
-        self.projectRoot = projectRoot.map(Self.resolvedWorkingDirectory)
+        // A project on another Mac keeps its key: it is not a directory here.
+        self.projectRoot = projectRoot.map { root in
+            ProjectLocation.isRemoteKey(root) ? ProjectLocation(key: root).key : Self.resolvedWorkingDirectory(root)
+        }
         self.launchBackend = launchBackend
         self.backendPolicy = backendPolicy
         guard createInitialSession else {
@@ -1147,7 +1159,7 @@ final class TerminalWorkspace: ObservableObject {
         }
         let firstSession = Self.makeSession(
             index: 1,
-            workingDirectory: self.projectRoot,
+            workingDirectory: self.projectRoot.map(ProjectLocation.launchPath(forKey:)),
             projectRoot: self.projectRoot,
             launchBackend: launchBackend,
             persistentHosting: launchBackend == .nativePTY ? backendPolicy.persistentHostingForNewTab() : nil
@@ -1166,7 +1178,7 @@ final class TerminalWorkspace: ObservableObject {
         guard isEmpty else { return }
         let firstSession = Self.makeSession(
             index: 1,
-            workingDirectory: projectRoot,
+            workingDirectory: launchRoot,
             projectRoot: projectRoot,
             launchBackend: launchBackend,
             persistentHosting: persistentHostingForNewTab()
@@ -1490,10 +1502,16 @@ final class TerminalWorkspace: ObservableObject {
         // to the project root rather than the process home directory. A tab
         // of This Mac's host (persistent, or attached to a local session)
         // seeds it like a native one; an SSH host's directory never seeds a
-        // local shell.
-        let resolvedWorkingDirectory = workingDirectory
-            ?? selectedSession.flatMap { $0.reportsLocalWorkingDirectory ? $0.workingDirectory : nil }
-            ?? projectRoot
+        // local shell. In a device's window (docs/specs/remote-devices.md,
+        // rule 5) only a tab of the same host seeds it, with the directory
+        // that host reported; otherwise the tab starts in the launch root.
+        let hosting = persistentHostingForNewTab()
+        let inheritedWorkingDirectory: String? = if let hosting, !hosting.profile.isThisMac {
+            selectedSession.flatMap { $0.persistentHosting === hosting ? $0.workingDirectory.nilIfEmpty : nil }
+        } else {
+            selectedSession.flatMap { $0.reportsLocalWorkingDirectory ? $0.workingDirectory : nil }
+        }
+        let resolvedWorkingDirectory = workingDirectory ?? inheritedWorkingDirectory ?? launchRoot
         let session = Self.makeSession(
             id: unusedSessionID(id),
             index: sessions.count + 1,
@@ -1501,7 +1519,7 @@ final class TerminalWorkspace: ObservableObject {
             workingDirectory: resolvedWorkingDirectory,
             projectRoot: projectRoot,
             launchBackend: launchBackend,
-            persistentHosting: persistentHostingForNewTab()
+            persistentHosting: hosting
         )
         sessions.append(session)
         if displayAsStandalone {
@@ -1534,7 +1552,8 @@ final class TerminalWorkspace: ObservableObject {
             id: unusedSessionID(id),
             index: agentSessions.count + 1,
             agent: agent,
-            workingDirectory: projectRoot,
+            workingDirectory: ProjectLocation.launchPath(forKey: projectRoot),
+            projectRoot: projectRoot,
             title: title,
             parentAgentID: normalizedParentAgentID,
             launchBackend: launchBackend,
@@ -1746,7 +1765,9 @@ final class TerminalWorkspace: ObservableObject {
                 deferringLaunch: deferringLaunch, following: deferringLaunch ? hosting.control : nil
             )
         }
-        let workingDirectory = launch.info.localWorkingDirectory ?? record.workingDirectory
+        let workingDirectory = (hosting.profile.isThisMac
+            ? launch.info.localWorkingDirectory
+            : hosting.reportedWorkingDirectory(of: launch.info)) ?? record.workingDirectory
         let subtitle: String = switch record.kind {
         case .terminal: "\(ShellProcessController.defaultShellName) login shell"
         case .agent, .command: record.launchCommand ?? ""
@@ -1757,7 +1778,10 @@ final class TerminalWorkspace: ObservableObject {
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
             subtitle: subtitle,
             tint: Self.palette[sessions.count % Self.palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            workingDirectory: Self.startingDirectory(
+                hosting.profile.isThisMac ? workingDirectory : workingDirectory ?? launch.info.cwd.nilIfEmpty,
+                hosting: hosting
+            ),
             projectRoot: record.projectRoot,
             launchShell: launchShell,
             kind: record.kind,
@@ -2165,7 +2189,7 @@ final class TerminalWorkspace: ObservableObject {
     func installPreviewAgentTree() -> [TerminalSession] {
         guard agentSessions.isEmpty else { return [] }
 
-        let workingDirectory = projectRoot ?? NSHomeDirectory()
+        let workingDirectory = launchRoot ?? NSHomeDirectory()
         var previewSessions: [TerminalSession] = []
 
         func appendPreviewAgent(
@@ -3146,11 +3170,21 @@ final class TerminalWorkspace: ObservableObject {
             titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: "\(ShellProcessController.defaultShellName) login shell",
             tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            workingDirectory: Self.startingDirectory(workingDirectory, hosting: persistentHosting),
             projectRoot: projectRoot,
             launchBackend: launchBackend,
             persistentHosting: persistentHosting
         )
+    }
+
+    /// Where a new tab starts: an existing directory of This Mac (else the
+    /// home directory), or, for a tab of another Mac's host, the path as
+    /// given (that host refuses one that does not exist; `~` without one).
+    private static func startingDirectory(_ path: String?, hosting: PersistentLocalSessions?) -> String {
+        if let hosting, !hosting.profile.isThisMac {
+            return path?.nilIfEmpty ?? "~"
+        }
+        return resolvedWorkingDirectory(path)
     }
 
     private static func makeAgentSession(
@@ -3158,6 +3192,7 @@ final class TerminalWorkspace: ObservableObject {
         index: Int,
         agent: AgentToolDefinition,
         workingDirectory: String,
+        projectRoot: String,
         title requestedTitle: String?,
         parentAgentID: UUID?,
         launchBackend: TerminalSessionLaunchBackend,
@@ -3173,8 +3208,8 @@ final class TerminalWorkspace: ObservableObject {
             titleSource: explicitTitle == nil ? .system : .explicit,
             subtitle: agent.commandLine,
             tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: workingDirectory,
+            workingDirectory: Self.startingDirectory(workingDirectory, hosting: persistentHosting),
+            projectRoot: projectRoot,
             kind: .agent,
             agentName: agent.name,
             parentAgentID: parentAgentID,
@@ -3198,7 +3233,7 @@ final class TerminalWorkspace: ObservableObject {
             title: command.name.isEmpty ? "Command \(index)" : command.name,
             subtitle: command.commandLine,
             tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
+            workingDirectory: Self.startingDirectory(workingDirectory, hosting: persistentHosting),
             projectRoot: projectRoot,
             kind: .command,
             commandName: command.name,
@@ -3404,6 +3439,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Retry) tries the host again: always for Retry, otherwise while the
     /// host takes new tabs (`canHostNewTabs`).
     private var persistentFallbackHosting: PersistentLocalSessions?
+    /// Why this tab's program could not start on another Mac's host, which
+    /// never falls back to a native shell (`failPersistentLaunchWithoutFallback`):
+    /// "Couldn't start on <Mac>: <reason>". Nil once it starts again.
+    @Published private(set) var persistentLaunchFailureReason: String?
+    /// The launch that failed that way, whose Create may still answer with
+    /// the host's own reason.
+    private var persistentFailedLaunchID: UUID?
     /// Why this tab runs natively instead of as a persistent session (the
     /// host's rejection, or no answer in time), for the tab's fallback bar;
     /// nil once it runs in the host again.
@@ -4165,7 +4207,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// native or persistent tab, or one attached to a local session. A tab
     /// attached to an SSH host's session keeps its home directory.
     var reportsLocalWorkingDirectory: Bool {
-        hostedAttachment.map { $0.host == .local } ?? true
+        if persistentHosting?.profile.isThisMac == false { return false }
+        return hostedAttachment.map { $0.host == .local } ?? true
     }
 
     /// The process id of the tab's program: its shell's session leader for
@@ -5573,6 +5616,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// adapter in the surface. Until then the tab is `.launching` and input
     /// is queued. When the host cannot start it, the tab runs natively.
     private func startPersistentLaunch(_ launchID: UUID, hosting: PersistentLocalSessions) {
+        persistentFailedLaunchID = nil
+        if persistentLaunchFailureReason != nil { persistentLaunchFailureReason = nil }
         persistentPhase = .creating
         persistentReconnectFailures = 0
         persistentReconnectMisses = 0
@@ -5640,9 +5685,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         // last one was deleted): the program starts where the tab started,
         // or in the project, instead.
         let configuration = shellLaunchConfiguration(
-            workingDirectory: [workingDirectory, launchWorkingDirectory, projectRoot]
-                .compactMap { $0 }
-                .first(where: Self.isExistingDirectory) ?? NSHomeDirectory()
+            workingDirectory: hosting.profile.isThisMac
+                ? [workingDirectory, launchWorkingDirectory, projectRoot]
+                    .compactMap { $0 }
+                    .first(where: Self.isExistingDirectory) ?? NSHomeDirectory()
+                // Another Mac's directories are not looked for here: its
+                // host refuses one that does not exist.
+                : [workingDirectory, launchWorkingDirectory, projectRoot.map(ProjectLocation.launchPath(forKey:))]
+                    .compactMap { $0?.nilIfEmpty }
+                    .first ?? "~"
         )
         let earlierLaunch = persistentLaunchTask
         let restartExitTimeout = hosting.configuration.restartExitTimeout
@@ -5687,7 +5738,14 @@ final class TerminalSession: ObservableObject, Identifiable {
                     launch = try await hosting.create(request, configuration: configuration)
                 }
             } catch {
-                guard let self, self.activeLaunchID == launchID else { return }
+                guard let self else { return }
+                if self.persistentFailedLaunchID == launchID, self.persistentHosting === hosting {
+                    // It failed already (no answer in time); the host's own
+                    // reason, arriving late, says more.
+                    self.showPersistentLaunchFailure(error, hosting: hosting)
+                    return
+                }
+                guard self.activeLaunchID == launchID else { return }
                 if self.persistentHosting === hosting {
                     self.persistentLaunchFailed(error, launchID: launchID)
                 } else if self.persistentFallbackHosting === hosting, self.persistentFallbackReason != nil {
@@ -5797,7 +5855,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             else { return }
             self.persistentLaunchFailed(
                 HostedSessionError.unavailable(
-                    "The local session host did not start a session within \(Int(timeout)) seconds."
+                    "\(PersistentHostSessions.capitalizedFirst(hosting.profile.hostPhrase)) did not start a session within \(Int(timeout)) seconds."
                 ),
                 launchID: launchID
             )
@@ -5855,7 +5913,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         // Events may have arrived before the binding: the host's list is
         // current, the Create answer may not be.
         let latest = hosting.sessionInfo(binding.sessionID) ?? launch.info
-        hostedProgramProcessID = latest.isRunning ? latest.pid.map { Int32(bitPattern: $0) } : nil
+        // Only This Mac's pid: another Mac's would name some unrelated local
+        // process to MCP caller routing and port detection.
+        hostedProgramProcessID = latest.isRunning && hosting.profile.isThisMac
+            ? latest.pid.map { Int32(bitPattern: $0) }
+            : nil
         noteHostSessionSharing(latest)
         // A restored or adopted session's program set its title and
         // directory before this tab followed it.
@@ -5929,6 +5991,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// keeps its host, so Restart or the bar's Retry tries it again.
     private func persistentLaunchFailed(_ error: Error, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
+        if let hosting = persistentHosting, !hosting.profile.allowsNativeFallback {
+            failPersistentLaunchWithoutFallback(error, launchID: launchID, hosting: hosting)
+            return
+        }
         persistentHosting?.noteLaunchFailure(error)
         SessionLog.error("tab \(id.uuidString) runs natively; its persistent session could not start: \(error.localizedDescription)")
         persistentFallbackHosting = persistentHosting
@@ -5951,11 +6017,50 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Another Mac's host could not start the program: nothing runs on This
+    /// Mac instead (docs/specs/remote-devices.md). The tab ends failed,
+    /// saying why ("Couldn't start on <Mac>: <reason>",
+    /// `persistentLaunchFailureReason`), and keeps its host, so Restart and
+    /// Retry (`retryPersistentSession`) try it again. Input queued for the
+    /// program is reported undelivered. A session a Create makes after this
+    /// is ended (the launch no longer runs).
+    private func failPersistentLaunchWithoutFallback(_ error: Error, launchID: UUID, hosting: PersistentLocalSessions) {
+        SessionLog.error("tab \(id.uuidString) could not start on \(hosting.profile.displayName): \(error.localizedDescription)")
+        activeLaunchID = nil
+        persistentFailedLaunchID = launchID
+        persistentPhase = .idle
+        persistentSession = nil
+        persistentLaunchRequestID = nil
+        processor.endLaunch(launchID)
+        showPersistentLaunchFailure(error, hosting: hosting)
+        let queued = pendingPersistentInput
+        pendingPersistentInput.removeAll()
+        let reason = persistentLaunchFailureReason ?? error.localizedDescription
+        for (_, delivery) in queued {
+            delivery?.resolve(.failure(ControlInputError.notDelivered(reason)))
+        }
+        persistentStateDidChange?()
+    }
+
+    private func showPersistentLaunchFailure(_ error: Error, hosting: PersistentLocalSessions) {
+        hosting.noteLaunchFailure(error)
+        let reason = "Couldn't start on \(hosting.profile.displayName): \(PersistentHostSessions.launchFailureReason(error))"
+        persistentLaunchFailureReason = reason
+        state = .failed(reason)
+        bumpRevision()
+    }
+
     /// The fallback bar's Retry: starts the tab's program again as a
     /// persistent session (ending the one that runs natively), even while
-    /// the host takes no new tabs (`canHostNewTabs`).
+    /// the host takes no new tabs (`canHostNewTabs`). For a tab of another
+    /// Mac's host that failed to start (`persistentLaunchFailureReason`),
+    /// tries that host again.
     @discardableResult
     func retryPersistentSession() -> Bool {
+        if persistentHosting?.profile.allowsNativeFallback == false {
+            guard persistentLaunchFailureReason != nil, !isRunning else { return false }
+            return restart()
+        }
         guard persistentHosting == nil, persistentFallbackHosting != nil else { return false }
         persistentRetryRequested = true
         defer { persistentRetryRequested = false }
@@ -6159,7 +6264,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     func persistentSessionDidChange(_ info: HostedSessionInfo) {
         guard persistentSession?.sessionID == info.id, isRunning, persistentPhase != .creating else { return }
         noteHostSessionSharing(info)
-        let pid = info.pid.map { Int32(bitPattern: $0) }
+        // Another Mac's pid names no process here.
+        let pid = persistentHosting?.profile.isThisMac == false ? nil : info.pid.map { Int32(bitPattern: $0) }
         if hostedProgramProcessID != pid {
             hostedProgramProcessID = pid
         }
@@ -6192,6 +6298,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         reconnectHostedSession(takeover: true)
     }
 
+    /// The directory `info` reports on its own machine: This Mac's for a
+    /// tab of This Mac's host, the device's for another Mac's
+    /// (`PersistentHostSessions.reportedWorkingDirectory(of:)`).
+    private func hostReportedWorkingDirectory(of info: HostedSessionInfo) -> String? {
+        if let persistentHosting, !persistentHosting.profile.isThisMac {
+            return persistentHosting.reportedWorkingDirectory(of: info)
+        }
+        return info.localWorkingDirectory
+    }
+
     /// Takes the title and directory the host reports for the program when
     /// they changed since its last report, unless the attach adapter passes
     /// them to the surface (which reports them itself, in order with the
@@ -6205,7 +6321,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         var didChange = false
         if resynchronizing || info.pwd != lastHostReportedDirectory {
             lastHostReportedDirectory = info.pwd
-            if !passesThrough, let path = info.localWorkingDirectory {
+            if !passesThrough, let path = hostReportedWorkingDirectory(of: info) {
                 if workingDirectory != path {
                     workingDirectory = path
                     didChange = true

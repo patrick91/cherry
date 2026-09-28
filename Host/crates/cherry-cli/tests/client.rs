@@ -4692,6 +4692,122 @@ fn control_over_ssh_relays_what_follows_the_gateway_preamble_and_forwards_the_ag
 }
 
 #[test]
+fn a_master_connection_that_refuses_the_session_is_passed_over_for_a_direct_one() {
+    // sshd allows 10 sessions per connection by default (MaxSessions); a
+    // full master makes ssh refuse the session and exit. The CLI then
+    // connects again without the ControlPath.
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("stream.2"),
+        [
+            format!("CHERRY-GATEWAY {PROTOCOL_VERSION}\n").into_bytes(),
+            welcome("remote"),
+            encoded(&ServerMessage::Pong),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    script(
+        &directory.path().join("ssh"),
+        &format!(
+            "d='{}'\nn=$(( $(/bin/cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > \"$d/count\"\nprintf '%s\\n' \"$@\" > \"$d/arguments.$n\"\nif [ \"$n\" = 1 ]; then echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; fi\n/bin/cat \"$d/stream.$n\"\n/bin/cat > /dev/null\n",
+            directory.path().display()
+        ),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args([
+            "--host",
+            "devbox",
+            "--ssh-control-path",
+            "/tmp/cherry-cp/h",
+            "control",
+        ])
+        .env("PATH", directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&encoded(&ClientMessage::Ping))
+        .unwrap();
+    let output = Collected::new(child.stdout.take().unwrap());
+    assert!(wait(&mut child).success(), "{}", stderr_of(&mut child));
+    assert_eq!(
+        output.all(),
+        [welcome("remote"), encoded(&ServerMessage::Pong)].concat()
+    );
+    let first = std::fs::read_to_string(directory.path().join("arguments.1")).unwrap();
+    let second = std::fs::read_to_string(directory.path().join("arguments.2")).unwrap();
+    assert!(first.contains("ControlPath=/tmp/cherry-cp/h\n"), "{first}");
+    assert!(!second.contains("ControlPath"), "{second}");
+    assert!(second.contains("ControlMaster=no\n"), "{second}");
+    assert!(!directory.path().join("arguments.3").exists());
+}
+
+#[test]
+fn a_refused_session_without_a_control_path_is_not_tried_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let count = directory.path().join("count");
+    script(
+        &directory.path().join("ssh"),
+        &format!(
+            "echo x >> '{}'\necho 'mux_client_request_session: session request failed: Session open refused by peer' >&2\nexit 255\n",
+            count.display()
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args(["--host", "devbox", "list"])
+        .env("PATH", directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read_to_string(&count).unwrap(), "x\n");
+}
+
+#[test]
+fn remote_host_path_reaches_the_gateway_command_of_every_ssh() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("arguments");
+    script(
+        &directory.path().join("ssh"),
+        "printf '%s\\n' \"$@\" > \"$CHERRY_TEST_SSH_LOG\"\nexit 1\n",
+    );
+    for (arguments, gateway) in [
+        (&["list", "--json"][..], "gateway"),
+        (&["attach", "S"], "gateway"),
+        (&["control"], "gateway"),
+        (&["kill", "S"], "gateway --no-start"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args([
+                "--host",
+                "studio",
+                "--remote-host-path",
+                "~/Library/Application Support/Cherry's/cherry-host",
+            ])
+            .args(arguments)
+            .env("PATH", directory.path())
+            .env("CHERRY_TEST_SSH_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.ends_with(&format!(
+                "--\nstudio\n\"$HOME\"/'Library/Application Support/Cherry'\\''s/cherry-host' {gateway}\n"
+            )),
+            "{arguments:?}: {logged}"
+        );
+    }
+}
+
+#[test]
 fn control_fails_once_writes_to_the_host_fail_after_relaying_what_it_sent() {
     // A connection whose far end stops taking bytes but never ends what it
     // sends: after the Hello, this ssh closes its input and keeps its output

@@ -69,6 +69,9 @@ pub struct Target<'a> {
     /// With `host`: the ControlPath of an SSH master connection that every
     /// ssh this command runs uses when one listens there.
     pub ssh_control_path: Option<&'a Path>,
+    /// With `host`: the remote cherry-host (`--remote-host-path`), when it
+    /// is not `cherry-host` on the remote login shell's PATH.
+    pub remote_host_path: Option<&'a str>,
 }
 
 /// What the connection is for, which decides how long connecting may take
@@ -187,6 +190,7 @@ impl Transport {
                     mode,
                     auto_start,
                     expected_host_id,
+                    target.remote_host_path,
                 )?
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -280,6 +284,18 @@ impl Transport {
             .as_ref()
             .filter(|relay| relay.is_quiet())
             .and_then(|relay| relay.last_line(wait))
+    }
+
+    /// Whether ssh said the master connection it was told to use refused
+    /// the session (`stderr_relay::MUX_SESSION_REFUSED`): the connection
+    /// has as many sessions as the server allows. Only before the gateway
+    /// preamble, when nothing reached the remote machine.
+    pub fn mux_session_refused(&self) -> bool {
+        self.decoder.awaiting_preamble()
+            && self
+                .stderr
+                .as_ref()
+                .is_some_and(|relay| relay.mux_refused(SSH_TAIL_WAIT))
     }
 
     /// The bytes received but not yet decoded, which the next frames start
@@ -722,6 +738,7 @@ pub fn ssh_command(
     mode: Mode,
     starts_host: bool,
     expected_host_id: Option<&str>,
+    remote_host_path: Option<&str>,
 ) -> Result<Command> {
     crate::validate_host(host).map_err(anyhow::Error::msg)?;
     let alive = format!("ServerAliveInterval={}", HEARTBEAT_INTERVAL.as_secs());
@@ -763,6 +780,7 @@ pub fn ssh_command(
         socket,
         starts_host,
         expected_host_id,
+        remote_host_path,
     )?);
     Ok(ssh)
 }
@@ -783,10 +801,14 @@ pub fn ssh_control_path_option(path: &Path) -> Result<String> {
 /// so that any login shell runs it: a cherry-host of another version
 /// ignores the variable, where it would refuse an option it does not know
 /// before its preamble could say what it is.
+///
+/// `remote_host_path` runs that cherry-host instead of the one on the remote
+/// PATH (see `remote_host_word`).
 pub fn remote_gateway_command(
     socket: Option<&Path>,
     starts_host: bool,
     expected_host_id: Option<&str>,
+    remote_host_path: Option<&str>,
 ) -> Result<String> {
     let mut command = String::new();
     if let Some(id) = expected_host_id {
@@ -799,7 +821,11 @@ pub fn remote_gateway_command(
             shell_quote(id)
         ));
     }
-    command.push_str("cherry-host gateway");
+    match remote_host_path {
+        Some(path) => command.push_str(&remote_host_word(path)?),
+        None => command.push_str("cherry-host"),
+    }
+    command.push_str(" gateway");
     if !starts_host {
         command.push_str(" --no-start");
     }
@@ -813,6 +839,22 @@ pub fn remote_gateway_command(
         command.push_str(&format!(" --socket {}", shell_quote(path)));
     }
     Ok(command)
+}
+
+/// The remote cherry-host as one word for the remote login shell: `~/…` as
+/// `"$HOME"/'…'`, which sh, bash, zsh, csh, tcsh and fish all expand to the path under
+/// the home directory (a quoted `~` is never expanded, and fish has no
+/// `${HOME}`), and anything else quoted as it is. A backslash is refused:
+/// fish reads `\'` and `\\` as escapes even inside single quotes; so is
+/// `!`, which csh and tcsh expand (history) even inside single quotes.
+pub fn remote_host_word(path: &str) -> Result<String> {
+    if path.contains(['\0', '\\', '!']) {
+        bail!("the remote cherry-host path must not contain a NUL byte, a backslash or '!'");
+    }
+    Ok(match path.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", shell_quote(rest)),
+        None => shell_quote(path),
+    })
 }
 
 /// `text` as one word for the remote shell.

@@ -53,6 +53,24 @@ final class HostSSHMasterManager: @unchecked Sendable {
         /// after the initial delay again; one that dies sooner waits twice
         /// as long as the previous restart did.
         var stableUptime: TimeInterval = 60
+        /// Attach adapter launches that share one master at most. sshd
+        /// allows 10 sessions per connection by default (`MaxSessions`), and
+        /// the control helper and one-off commands (list, kill) need one
+        /// each.
+        ///
+        /// Over the cap: `controlPath(forLaunch:)` returns nil and registers
+        /// nothing, so that adapter runs its own ssh (its own connection
+        /// and login, which may prompt in its tab, as without a master) for
+        /// as long as it runs, reconnects included: `cherry attach`
+        /// reconnects with the arguments it was launched with. Launches
+        /// are counted, not tabs: every launch of a tab's adapter (a
+        /// relaunch after its reconnect window, a Reconnect) is registered
+        /// afresh, so one that starts while a slot is free shares the
+        /// master again. Nothing moves a running adapter onto the master
+        /// when a slot frees. `cherry` also connects directly when a
+        /// master refuses a session anyway (a server with a lower
+        /// `MaxSessions`).
+        var maxChannelsPerMaster = 8
     }
 
     enum Phase: Equatable, Sendable {
@@ -150,14 +168,19 @@ final class HostSSHMasterManager: @unchecked Sendable {
     }
 
     /// For an attach adapter launch (named by `launch`): the control path
-    /// while the master is up, and the launch then keeps it running until
-    /// `endLaunch`. Nil otherwise, and the adapter uses its own ssh. Asking
+    /// while the master is up and has room for it (`maxChannelsPerMaster`
+    /// launches), and the launch then keeps it running until `endLaunch`.
+    /// Nil otherwise, and the adapter uses its own ssh. Asking
     /// again for the same launch is harmless. `isLive` says whether the
     /// launch still runs; it is checked under the manager's lock, so a launch
     /// that ended (and whose `endLaunch` already ran) is never kept again.
     func controlPath(forLaunch launch: String, destination: String, isLive: () -> Bool = { true }) -> String? {
         lock.withLock {
             guard let master = masters[destination], master.phase == .up, isLive() else { return nil }
+            // Full: this launch connects on its own.
+            guard master.launches.contains(launch) || master.launches.count < configuration.maxChannelsPerMaster else {
+                return nil
+            }
             master.launches.insert(launch)
             master.idleStop?.cancel()
             master.idleStop = nil

@@ -55,9 +55,11 @@ Both cherry and cherry-host are included inside:
 Local persistent sessions work without a separate command-line installation.
 
 For another Mac, choose Add Mac… in the project picker: once key-based SSH
-login works, it checks that Mac and installs this app's cherry and
-cherry-host there (in ~/Library/Application Support/cherry-host/bin; both
-are universal, for Apple silicon and Intel Macs alike). For any other SSH
+login works, it checks that Mac and installs this app's cherry,
+cherry-host and CherryMCP there (in ~/Library/Application
+Support/cherry-host/bin; all universal, for Apple silicon and Intel Macs
+alike). Set Up Cherry MCP on <Mac>… in its menu lets Claude Code and
+Codex there use Cherry's MCP tools in its tabs. For any other SSH
 host, put cherry-host on that machine's SSH command PATH and add its SSH
 alias in Persistent Sessions. The portable host can also be built for Linux
 from the source repository.
@@ -78,7 +80,7 @@ EOF
 
 codesign --verify --deep --strict "$stage/$app_name.app"
 # The helpers Cherry installs on the user's other Macs cover both kinds.
-"$root/Scripts/check-helper-archs" "$stage/$app_name.app/Contents/MacOS/cherry" "$stage/$app_name.app/Contents/MacOS/cherry-host"
+"$root/Scripts/check-helper-archs" "$stage/$app_name.app/Contents/MacOS/cherry" "$stage/$app_name.app/Contents/MacOS/cherry-host" "$stage/$app_name.app/Contents/MacOS/CherryMCP"
 "$root/Scripts/test-packaged-app" "$stage/$app_name.app"
 hdiutil create -volname "$app_name" -srcfolder "$stage" -format UDZO -ov "$output"
 hdiutil verify "$output"

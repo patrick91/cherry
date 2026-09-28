@@ -3,11 +3,11 @@
 Status: phase 0 (groundwork), phase 1 (devices and remote project
 windows), phase 2 (Add Mac… installs the session host), phase 3 (parity:
 worktrees, cherry.toml, shell integration, editors, background sessions,
-dropped files, master shards) and phase 4a (ports, URLs and forwards for
-device tabs, and pasted images) implemented on `codex/persistent-sessions`;
-MCP for remote agents and the rest of phase 4 are the plan. Phases 1–4a as
-built, and where they differ from the plan below, are in *Phase 1 as
-built*, *Phase 2 as built*, *Phase 3 as built* and *Phase 4a as built*.
+dropped files, master shards), phase 4a (ports, URLs and forwards for
+device tabs, and pasted images) and phase 4b (Cherry MCP for agents running
+on another Mac) implemented on `codex/persistent-sessions`; the rest of
+phase 4 is the plan. Phases 1–4b as built, and where they differ from the
+plan below, are in *Phase 1 as built* … *Phase 4b as built*.
 Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
@@ -168,9 +168,10 @@ No user-visible change for local tabs. What exists:
   `COLORTERM=truecolor`, the tab's identity (`CHERRY_PROCESS_ID`,
   `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` = the remote path,
   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the command's
-  own variables, and `LANG`/`LC_*`; never `PATH`, `HOME`, `SHELL`, the
-  control socket (`CHERRY_CONTROL_SOCKET`), Ghostty resources, the zsh
-  bootstrap or anything else that names a local file. `cwd` is the remote
+  own variables, and `LANG`/`LC_*`; never `PATH`, `HOME`, `SHELL`, This
+  Mac's control socket, Ghostty resources, the zsh bootstrap or anything
+  else that names a local file. (Phase 4b sets `CHERRY_CONTROL_SOCKET` to
+  the socket forwarded to the device, never This Mac's path.) `cwd` is the remote
   path.
 - **Restore rules**: `SystemEndedSessions` uses only the host's lost
   sessions for a record owned on another host (it comes back as `.logout`,
@@ -707,8 +708,8 @@ Deviations from the plan below:
 - Host services are not additive protocol requests over the control
   connection: `project-info` and git run as one-shot ssh commands over the
   master (the control protocol is unchanged). Ports, service discovery and
-  forwards came in phase 4a (below); process metadata and MCP for remote
-  agents (`ssh -R`) are not built.
+  forwards came in phase 4a, MCP for remote agents in phase 4b (below);
+  process metadata is not built.
 - Zed opens through its `zed://ssh/` hotlink rather than its CLI (see
   above).
 - Dropped files go to a new temporary folder on the device, never the
@@ -871,6 +872,276 @@ Deviations from the plan below:
   MCP's probe.
 - Forwards are made when a link is clicked or an MCP HTTP probe needs one,
   never ahead of time nor by listing.
+
+## Phase 4b as built
+
+Cherry MCP for agents running in a device's tabs (Claude Code, Codex): the
+same tools as a local agent in that window, but bounded to that Mac: a
+caller on device D reaches only sessions, windows and projects whose
+`ProjectLocation` is `.remote(deviceID: D)` (after a security review of the
+first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSetup.swift`,
+`Sources/CherryControl/CherryControlAuth.swift`, the device listeners of
+`CherryControlServer`, `Sources/CherryMCPStdio/main.swift`):
+
+- **Transport: a reverse forward of a device listener.** The control
+  server listens on one more socket per device
+  (`CherryControlServer.addDeviceListener`: `mcp-<16 hex of the device
+  id>.sock` next to the control socket, 0600 in its 0700 directory), and
+  `RemoteMCPForwards` runs `ssh -o ControlPath=<first master> -O forward -R
+  <there>:<here> -- <dest>` on the device's first SSH master. There is
+  `<DARWIN_USER_TEMP_DIR>/cherry-mcp-<16 hex of SHA-256("<installation
+  id>|<device id>")>/control.sock`: in the account's per-user temporary
+  directory (`getconf DARWIN_USER_TEMP_DIR`, `/var/folders/…/T/`, which
+  only that account can enter; never the shared `/tmp`), one directory per
+  installation of Cherry and device, so two Macs sharing a device never
+  meet. The check (Add Mac…, Update Session Host…) records that directory
+  (`RemoteDevice.userTemporaryDirectory`), and so does every forward (its
+  script reports it); a tab gets Cherry MCP only once it is known, and only
+  while the socket path is at most 103 bytes (`RemoteMCPPaths`). The
+  directory the device reports goes into the `-R` spec (OpenSSH splits it
+  at `:` and expands `${…}` in it), so it is allow-listed wherever it is
+  read or stored (the check's output, each forward's report, `devices.json`
+  as it is decoded, `RemoteMCPPaths.remoteDirectory`): absolute, only
+  `[A-Za-z0-9/_.+-]`, no `.` or `..` component, at most 128 bytes
+  (`RemoteMCPPaths.temporaryDirectoryProblem`). Any other value is dropped
+  with a logged reason, and that device gets no Cherry MCP until a check
+  reports a usable one. Before
+  each forward a `sh -s` script over the master makes that directory (mode
+  0700), refuses it unless it is a real directory this account owns
+  (`[ -O ]`, not a link), and removes a socket an earlier master left: sshd
+  binds the socket itself and, with `StreamLocalBindUnlink no` (its
+  default), would refuse to replace it. sshd creates the socket with its
+  `StreamLocalBindMask` (0177 by default: 0600). The forward is made
+  whenever the device's control connects (`RemoteDeviceStore`'s connection
+  watch, and once for the devices already connected when the app's server
+  starts, `ensureMCPForwardsOfConnectedDevices`), so a master that came back
+  (a reconnect, a wake) gets it again; asking again while the same master is
+  up does nothing. It holds a lease on the master only while it is made: the
+  forward lives as long as the master, which the device's control keeps.
+  When the master exits (`masterDidStopNotification`) its state is dropped;
+  removing the device cancels it (`-O cancel -R`), removes the socket and
+  directory there and stops the listener. A stop wins over a forward being
+  made: each stop moves the device's generation on, and the making checks
+  it after every await (a forward it made after the stop is cancelled at
+  once and its listener removed). The device's sshd must allow
+  remote forwards of Unix sockets: `AllowStreamLocalForwarding` yes or
+  remote, and (checked against a real sshd) `AllowTcpForwarding` yes or
+  remote too, since sshd denies a `streamlocal-forward` request under
+  `AllowTcpForwarding local`; both are yes by default. A server that
+  refuses (those, `DisableForwarding`, a `restrict`ed key: "remote port
+  forwarding failed", "administratively prohibited") is reported as such:
+  "The SSH server on Studio refused to forward Cherry's control socket (its
+  sshd_config must allow remote forwards: AllowStreamLocalForwarding and
+  AllowTcpForwarding yes, the defaults): …", in the Set Up sheet and the
+  log.
+- **Identity: per-tab capability tokens.** `RemoteLaunchSpec` gives every
+  device tab `CHERRY_CONTROL_SOCKET` (the path there), `CHERRY_MCP_TOKEN`,
+  `CHERRY_MCP_HELPER` (the install's CherryMCP, when the install has the
+  resources) and `CHERRY_CONTROL_MACHINE` (This Mac's name), next to
+  `CHERRY_PROCESS_ID`; This Mac's values of these are never sent
+  (`localOnlyKeys`). The token is 64 hex digits: HMAC-SHA256 of
+  `cherry-mcp-v2`, the device id, the tab id and the tab's launch
+  generation under a random 256-bit key in `Application
+  Support/<identity>/mcp-token-key` (0600, made with `O_EXCL`; one others
+  can read is not used) — `RemoteMCPTokens`. The generation is a random
+  128-bit nonce made each time the tab's Create is built (a start, a
+  restart), kept in `mcp-generations.json` next to the key (0600, written
+  atomically, entries older than 90 days dropped), so a token that leaked
+  stops working when the tab's program restarts, while a tab restored after
+  Cherry relaunched keeps its program's token. CherryMCP
+  sends the token and tab id with every request, on the same line
+  (`CherryControlEnvelope`, `{"cherryAuth":{token,processID},"request":…}`:
+  each control connection carries one request, so this is the handshake).
+  The server accepts a request on a device listener only with a token that
+  is valid (compared in constant time) for an open tab of a window of that
+  device's project; any other, a missing one, another device's, or one of
+  a closed tab is refused with `unauthorized`. A device listener never
+  looks at its peer's pid (it is This Mac's ssh). This Mac's socket keeps
+  identifying its callers by process, as before.
+- **Request limits.** A device listener takes a request line of at most 8
+  MiB, refused (`request_too_large`) as soon as it is longer and before any
+  decoding; the whole line must arrive within 15 s (`request_timeout`, one
+  deadline, not per read); and it serves at most 16 connections at once,
+  the next refused at once (`too_many_connections`)
+  (`CherryControlServer.RequestLimits.device`). This Mac's socket takes
+  lines of at most 64 MiB, with its per-read timeouts as before. Accepted
+  sockets (and `CherryControlClient`'s) never raise SIGPIPE: a caller that
+  goes away mid-answer cannot stop the app.
+- **Scope boundary.** The first cut scoped a remote caller "as a local
+  agent in that window", which a review found let it out: a `..` in a
+  project root resolved (through `URL(fileURLWithPath:)` against the app's
+  directory) to a This Mac project; a scoped request nested in a scoped one
+  skipped the mapping; process ids and links resolved in every window;
+  `device:` keys of other devices were used as given; listings showed
+  every project. Now a remote caller's request runs with a task-local
+  device (`CherryControlServer.remoteDevice`, set for the whole handling,
+  so requests interleaving on the main actor never share it), and:
+  - its project roots are matched by location only
+    (`remoteProjectLocation`, `remoteWorkspace`): a path on its Mac or a
+    `device:` key of its Mac, refused with `invalid_project_root` when it
+    has a `.` or `..` component (in the raw key too) or is not absolute, and
+    with `outside_caller_mac` when it is another device's key; the window
+    is the device window with that path, or the one whose path contains it;
+    never through `standardizedProjectRoot`;
+  - Open Project (`activate_worktree`) opens only a known key of its Mac,
+    matched exactly;
+  - the one choke point, `requireOnRemoteDevice`, at the top of
+    `handleUnscoped` (which every tool runs through after all mapping),
+    refuses any workspace that is not a project of its Mac, and refuses a
+    nested scoped request and a nested Open Project;
+  - sessions found by id (`findSessionWithWorkspace`: every process and
+    terminal tool, ports, restart, close, input) search only its Mac's
+    windows, so another window's id is `terminal_not_found`; links resolve
+    only to its Mac's projects (`found: false` otherwise, no output);
+  - `list_projects` lists only its Mac's projects; the other listings
+    (processes, terminals, agents' counts, services, notes, todos, status)
+    are of its window, which the choke point checks;
+  - (second review) a session must itself be on its Mac, not only its
+    window: Persistent Sessions could attach a This Mac session, or a saved
+    SSH host's, into a device window. `CherryControlServer.isSession(_:in:onDevice:)`
+    is true only for a tab of a window of that device whose program runs on
+    the window's own hosting (`persistentHosting` is the window's
+    `backendPolicy.localSessions`, a device's) or that is attached to a
+    session of that hosting's host (`hostedAttachment.host`). Every lookup
+    by id (`findSessionWithWorkspace`) and by name, every listing, count,
+    selected id and child-agent count, `services_list`, `get_process_ports`,
+    `wait_for_bound_port` (with or without a process), `stop_all_commands`,
+    parent-agent resolution, closing an agent with its sub-agents and the
+    caller's own token (`remoteCaller`) go through it; any other tab is
+    `terminal_not_found`/`process_not_found` or simply absent. In a device
+    window the Persistent Sessions sheet offers only that device (no Host
+    picker, no Add Host) and attaches nothing else;
+  - This Mac's port scan (lsof) never runs for it: its tabs' ports come
+    only from its Mac (`RemotePortScanner`), `include_unattributed` (every
+    listener of This Mac) is refused with `unattributed_not_available`, and
+    an HTTP probe (`wait_for_bound_port` with `probe_http`) of another
+    Mac's port goes only through that port's forward
+    (`CherryControlServer.probeURL`: none when the forward failed, whose
+    `url` would otherwise be This Mac's `localhost`), for a port its own
+    tab reports;
+  - not bounded (informational): `list_agents` reports the configured
+    agents' command lines (`AgentSettings` is global), as it does for a
+    local caller; nothing of This Mac's sessions is in it.
+  Unscoped requests go to the tab's window. Input guards
+  (`agent_awaiting_permission`), the caller-parent rules of `spawn_agent`
+  and everything else run the same code as for a local caller.
+- **CherryMCP on the device.** The installer copies CherryMCP with the
+  Ghostty resources (`RemoteHostHelpers.mcpHelper`: next to the app's
+  helpers, else next to the running executable), as `<build>/CherryMCP`,
+  immutable per build. It is part of the resources digest
+  (`resources_hash` hashes it with the trees), so a build without it is
+  copied again, and `xattr -c` clears it. `Scripts/build-mcp-helper` builds
+  it universal (one SwiftPM build per triple, joined with `lipo`);
+  `install-local-app` and `package-dmg` check its architectures. It needs
+  the macOS the package declares on that Mac too; Set Up says when it does
+  not run there. CherryMCP gained `--version` and `--call TOOL [JSON]` (one
+  call, for checks and tests).
+- **Agent configuration there: "Set Up Cherry MCP on <Mac>…"** (the
+  device's menu, and Settings › Sessions › Other Macs), never done
+  silently. The sheet shows the exact commands and first runs only a check
+  (`command -v claude`, `command -v codex` on the login PATH, CherryMCP
+  `--version`; no agent CLI runs, no configuration is read). **Set Up**
+  writes a stable launcher, `~/Library/Application
+  Support/cherry-host/mcp/cherry-mcp` (it runs `$CHERRY_MCP_HELPER`, else
+  the newest installed CherryMCP, else that Mac's own Cherry.app's), and
+  registers it: `claude mcp remove --scope user cherry; claude mcp add
+  --scope user --transport stdio cherry -- <launcher>` and `codex mcp
+  remove cherry; codex mcp add cherry -- <launcher>`, then adds `env_vars =
+  [the Cherry variables]` to the `[mcp_servers.cherry]` table Codex just
+  wrote (Codex passes only listed variables to MCP servers; its CLI has no
+  flag for it), replacing one Codex wrote there (a multi-line array
+  included). The config is replaced atomically: the new text is written to
+  a temporary file next to it (its target when it is a link, which stays a
+  link) with its mode, then renamed over it. The launcher's fallback is the
+  newest installed build by build id (the leading 14-digit time stamp, as
+  `HostBuildOrder`), not the name that sorts last. Running it again gives the same result. **Remove** runs
+  `claude mcp remove --scope user cherry` and `codex mcp remove cherry`
+  (the launcher stays: another Cherry may use it). The server's name is
+  the identity's URL scheme (`cherry`).
+- **Offline.** When the forwarded socket does not answer (Cherry quit, the
+  Mac slept, the master is being made again) or closes without an answer,
+  CherryMCP's tools fail with `cherry_unreachable`: "Cherry on <This Mac>
+  is not reachable (…). Its connection to this Mac comes back when Cherry
+  there reconnects." (`CherryControlClient` with credentials). The next
+  connection of the device's control makes the forward again.
+- **Tests.** `RemoteDeviceMCPTests`, whose harness registers real windows
+  (a device window, another device's, and a This Mac window with a live
+  `/bin/cat` command) in `ProjectWindowRegistry.shared`, where the server
+  looks: tokens, their key and generation files; a token that changes when
+  the tab's program restarts (the old one refused); the device listener
+  refusing no token, a wrong one, another tab's, another device's, a This
+  Mac tab's and a closed tab's; `..` in a project root (four forms)
+  refused, with no spawn in and no input to the This Mac window (whose
+  command a local caller shows live); a nested scoped JSON line refused;
+  a This Mac tab's and another device's tab's ids `terminal_not_found`
+  for status, output, input, send_input, restart, stop, close, ports and
+  terminal output, and a link to it not found; another device's key and
+  This Mac's root refused, its own path, key and a folder inside resolving;
+  list_projects, list_processes, list_terminals and status of its Mac only;
+  the envelope; the unreachable message; the launch environment in the
+  per-user temporary directory and what never travels; the device store's
+  launch (none until that directory is known); the forward's prepare and
+  cleanup scripts (with the real `getconf`) and arguments, refusals told
+  apart; Set Up's script against stand-in `claude` and `codex` in a private
+  HOME: check changes nothing, install twice gives one registration and one
+  `env_vars`, Codex's multi-line `env_vars` replaced, its config (a link)
+  replaced atomically with the link and mode kept, the launcher running
+  `CHERRY_MCP_HELPER` or the newest build by build id, remove; the menu
+  item). The boundary tests (a–e and the Codex one) were run against the
+  first cut's logic and fail there: three terminals spawned in the This Mac
+  window, its command got the input, and the rest reached it) and `RemoteDeviceRealHostMCPTests`: through `Scripts/fake-remote-mac`
+  (whose stand-in master now bridges `-O forward -R THERE:HERE` with a
+  link, fails like sshd when THERE exists, and refuses with
+  `DIR/remote-forward-fails`): a stale socket removed, the forward made
+  once, an agent's shell in a real device tab with the forwarded socket and
+  its token, the real CherryMCP listing its window's processes and
+  project, with only Codex's variables plus `env_vars`, a wrong token
+  refused, `spawn_process` with a `..` project root and
+  `send_process_input`/`get_process_status` with the id of a This Mac tab
+  (its window registered) refused through the real CherryMCP, the forward made again after its master went, a refusing
+  server reported, and "Cherry on Laptop is not reachable" once it ended;
+  and `RemoteDeviceRealHostForwardsCherryMCPOverSSH`, which
+  `Scripts/test-remote-mac-loopback` runs against its real sshd (now with
+  `AllowStreamLocalForwarding yes`, `StreamLocalBindUnlink no`, and
+  `AllowTcpForwarding yes` with `PermitListen none` in place of
+  `AllowTcpForwarding local`, which denied the Unix socket forward): a real
+  `ssh -O forward -R` of a Unix socket on an app-style master, the real
+  CherryMCP with a test token calling `list_processes` through it, refused
+  without a token or with another tab's, and the socket gone after `-O
+  cancel` and the cleanup.
+
+Deviations from the plan (the task's design, and phase 3's "forward the
+app's control socket with `ssh -R` to a per-session socket"):
+
+- The forward reaches a listener of its own per device, not the app's
+  control socket: that listener requires a token and never uses peer pids,
+  and names the device (a token of another device is refused), while the
+  control socket keeps This Mac's pid-based identity unchanged.
+- One socket per device and installation, not per session: tabs are told
+  apart by their tokens.
+- The socket there is in the per-user temporary directory
+  (`DARWIN_USER_TEMP_DIR`), not `~/Library/Application
+  Support/cherry-host/run/<installation id>/`: that path is longer than a
+  Unix socket path may be (103 bytes) for most home folders. The name is a
+  hash, so the path is known before a connection once the directory is
+  recorded; the directory's owner and mode are checked before every
+  forward.
+- Tokens are derived (HMAC under a stored key, with a per-launch nonce)
+  rather than random per tab: a restored tab keeps the token in its
+  program's environment across Cherry relaunches, and revocation is "the
+  tab is not open" or "its program restarted".
+- A remote caller is not scoped "as a local agent in that window": process
+  ids, links, listings and project roots are bounded to its Mac (see
+  *Scope boundary*).
+- `cherry-host mcp-relay` over a dedicated channel was not needed: `-O
+  forward -R` of a Unix socket through the master works against a real
+  sshd (the loopback test) with the master's `ClearAllForwardings=yes`.
+- Codex needs `env_vars`: CherryMCP cannot read the variables from its
+  agent's environment instead (macOS does not show another process's
+  environment through `KERN_PROCARGS2`), so Set Up adds them to Codex's
+  table.
+- The agent registration is a stable launcher, not the build's CherryMCP
+  path, which an update's garbage collection would remove later.
 
 ## Phase 1: devices and remote project windows (the plan)
 

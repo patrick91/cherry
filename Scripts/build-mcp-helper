@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Build CherryMCP, the MCP helper, universal (arm64 and x86_64): Cherry
+# installs it on the user's other Macs next to cherry and cherry-host, for
+# agents in their tabs (docs/specs/remote-devices.md, phase 4b). Each
+# architecture is its own SwiftPM build (--triple), joined with lipo.
+#
+#   Scripts/build-mcp-helper [debug|release]
+#
+# Prints the universal executable's path (.build/universal/<configuration>/
+# CherryMCP). CHERRY_HOST_ARCHS=native builds this Mac's architecture only,
+# as Scripts/build-host does, and says so. CherryMCP needs the macOS the
+# package declares (Package.swift) on that Mac too.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+configuration=${1:-release}
+case "$configuration" in debug|release) ;; *) echo "Usage: Scripts/build-mcp-helper [debug|release]" >&2; exit 1;; esac
+cd "$root"
+output="$root/.build/universal/$configuration"
+mkdir -p "$output"
+
+case "${CHERRY_HOST_ARCHS:-universal}" in
+  # This Mac's own architecture last: SwiftPM may put every triple's
+  # products in one directory, which then holds this Mac's again.
+  universal) archs="$( [ "$(uname -m)" = arm64 ] && echo "x86_64 arm64" || echo "arm64 x86_64")" ;;
+  native)
+    archs=$(uname -m)
+    echo "note: building CherryMCP for $archs only (CHERRY_HOST_ARCHS=native); agents on a Mac of the other architecture cannot use Cherry MCP" >&2
+    ;;
+  *) echo "CHERRY_HOST_ARCHS must be universal or native, not '${CHERRY_HOST_ARCHS}'" >&2; exit 1 ;;
+esac
+
+# The deployment target the package declares, for each triple.
+minimum=$(sed -n 's/.*\.macOS(\.v\([0-9][0-9]*\)).*/\1/p' Package.swift | head -n 1)
+[ -n "$minimum" ] || { echo "could not read the macOS version from Package.swift" >&2; exit 1; }
+
+inputs=()
+for arch in $archs; do
+  triple="$arch-apple-macosx$minimum.0"
+  swift build -c "$configuration" --product CherryMCP --triple "$triple" >&2
+  bin=$(swift build -c "$configuration" --product CherryMCP --triple "$triple" --show-bin-path)
+  # Copied at once: the next triple's build may write the same path.
+  cp "$bin/CherryMCP" "$output/CherryMCP.$arch"
+  inputs+=("$output/CherryMCP.$arch")
+done
+staged="$output/CherryMCP.partial.$$"
+lipo -create -output "$staged" "${inputs[@]}"
+mv -f "$staged" "$output/CherryMCP"
+for arch in $archs; do rm -f "$output/CherryMCP.$arch"; done
+echo "$output/CherryMCP"

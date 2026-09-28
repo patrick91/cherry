@@ -39,6 +39,73 @@ is running inside a Cherry agent. If there is no bound caller, new agents are
 created at the top level unless `parent_agent_id` explicitly points somewhere
 else.
 
+## Agents On Another Mac
+
+An agent running in a tab of a project on another Mac (a device, see
+[docs/specs/remote-devices.md](specs/remote-devices.md), phase 4b) uses the
+same tools as a local agent in that window, bounded to that Mac:
+
+- Cherry forwards its control socket to that Mac over the device's SSH
+  connection (`ssh -O forward -R`), and the tab's environment names it:
+  `CHERRY_CONTROL_SOCKET=<its per-user temporary directory>/cherry-mcp-<hash>/control.sock`
+  there (`getconf DARWIN_USER_TEMP_DIR`, never the shared `/tmp`). That
+  Mac's sshd must allow remote forwards (`AllowStreamLocalForwarding` and
+  `AllowTcpForwarding` yes, the defaults); Set Up Cherry MCP says when it
+  refused.
+- Each tab gets its own capability token, `CHERRY_MCP_TOKEN` (256 bits),
+  next to `CHERRY_PROCESS_ID`. CherryMCP sends both with every request;
+  the forwarded socket refuses a request without a valid token
+  (`unauthorized`). A token is valid only while its tab is open in a window
+  of that Mac's project (closing the tab revokes it) and until the tab's
+  program restarts (each launch gets a new one); it keeps working after
+  Cherry relaunches and restores the tab. This Mac's own callers are
+  still identified by their process.
+- Unscoped requests go to the tab's window. A `project_root` is an
+  absolute path on that Mac (`CHERRY_PROJECT_ROOT` is the path there) or a
+  `device:` key of that Mac; one with `.` or `..` components is refused
+  (`invalid_project_root`), another Mac's key too (`outside_caller_mac`).
+  Everything such an agent reaches is on that Mac: `process_id`s of other
+  windows (This Mac's, another Mac's) are `terminal_not_found`, links to
+  them are not found, `list_projects` lists that Mac's projects, and a
+  scoped request inside another is refused. A tab of its window that runs
+  somewhere else (a This Mac or SSH host session attached there) is not
+  listed and not found either. Ports come only from that Mac:
+  `include_unattributed` is refused (`unattributed_not_available`), and
+  `probe_http` probes only through the port's forward. Requests are at
+  most 8 MiB, must arrive within 15 s, and at most 16 run at once
+  (`request_too_large`, `request_timeout`, `too_many_connections`).
+- `CHERRY_MCP_HELPER` is the CherryMCP of the Cherry build that started the
+  tab, installed on that Mac with `cherry` and `cherry-host`.
+- When Cherry cannot be reached from there (it quit, the Mac slept, the SSH
+  connection is being made again), tools fail with `cherry_unreachable`:
+  "Cherry on <this Mac> is not reachable". The forward is made again when
+  Cherry reconnects to that Mac.
+
+Claude Code and Codex on that Mac read their MCP servers from their own
+configuration there. **Set Up Cherry MCP on <Mac>…** (the device's menu in
+the project picker, or Settings › Sessions › Other Macs) shows these
+commands and runs them there only when you confirm; running it again gives
+the same result, and **Remove** takes the registrations away:
+
+```bash
+# the launcher: runs $CHERRY_MCP_HELPER (else the newest installed CherryMCP,
+# else that Mac's own Cherry.app's)
+~/Library/Application Support/cherry-host/mcp/cherry-mcp
+claude mcp add --scope user --transport stdio cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
+codex mcp add cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
+```
+
+Codex passes an MCP server only a few variables of its own environment, so
+Set Up also adds `env_vars = ["CHERRY_MCP_TOKEN", "CHERRY_CONTROL_SOCKET",
+"CHERRY_PROCESS_ID", "CHERRY_AGENT_ID", "CHERRY_PROJECT_ROOT",
+"CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE"]` to `[mcp_servers.cherry]`
+in `~/.codex/config.toml` (or `$CODEX_HOME`) there. Cherry never changes
+those configurations otherwise.
+
+`CherryMCP --call TOOL [JSON]` runs one tool call and prints its result (exit
+1 on an error), and `CherryMCP --version` says what it is; both are for
+checks without an MCP client.
+
 ## Worktree Tools
 
 - `list_projects` includes discovered worktrees, their branch/HEAD state, and

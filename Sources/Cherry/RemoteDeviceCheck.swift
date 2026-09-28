@@ -289,6 +289,8 @@ struct RemoteDeviceProbeResult: Equatable, Sendable {
     var hostName: String?
     var localHostName: String?
     var homeDirectory: String?
+    /// `getconf DARWIN_USER_TEMP_DIR` there (phase 4b).
+    var userTemporaryDirectory: String?
     var shell: String?
     /// The cherry-host it ran (the given path, or the one it found).
     var hostPath: String?
@@ -342,6 +344,7 @@ enum RemoteDeviceProbe {
             "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null)\"",
             "printf 'home=%s\\n' \"$HOME\"",
             "printf 'shell=%s\\n' \"$SHELL\"",
+            "printf 'usertmp=%s\\n' \"$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)\"",
         ]
         // This Cherry's installs (phase 2): each build's directory with its
         // files' hashes, and any Cherry.app with what its cherry-host is.
@@ -437,6 +440,7 @@ enum RemoteDeviceProbe {
             case "localhost": result.localHostName = value.nilIfEmpty
             case "hostname": result.hostName = value.nilIfEmpty
             case "home": result.homeDirectory = value.nilIfEmpty
+            case "usertmp": result.userTemporaryDirectory = RemoteMCPPaths.validTemporaryDirectory(value, source: "the check")
             case "shell": result.shell = value.nilIfEmpty
             case "hostpath": result.hostPath = value.nilIfEmpty
             case "version": result.hostVersion = try? decoder.decode(RemoteHostVersionReport.self, from: Data(value.utf8))

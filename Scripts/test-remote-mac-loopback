@@ -34,11 +34,23 @@
 # test RemoteDeviceRealHostShardsSSHMastersAboveTheChannelCap checks against
 # it that the app opens a second SSH master (a shard) once the first is full,
 # where a fourth session on the first is refused. Its sshd allows local
-# forwards to its own loopback only (AllowTcpForwarding local, PermitOpen),
+# forwards to its own loopback only (PermitOpen) and no remote TCP listener
+# (PermitListen none),
 # and the Swift test RemoteDeviceRealHostForwardsAPortThroughTheSSHMaster
 # forwards a port through an app-style master (ClearAllForwardings=yes) with
 # `ssh -O forward`, fetches a page served on the "remote" side through it,
 # and checks that `-O cancel` and the master's end take the forward away.
+# Its sshd allows Unix socket forwarding (AllowStreamLocalForwarding yes,
+# the default, with StreamLocalBindUnlink no, the default; sshd also refuses
+# a remote Unix socket forward unless AllowTcpForwarding allows remote
+# forwards, so it is yes, with PermitListen none: no remote TCP listener),
+# and the Swift
+# test RemoteDeviceRealHostForwardsCherryMCPOverSSH reverse-forwards a test
+# control server's device listener with `ssh -O forward -R <socket there>:
+# <socket here>` on an app-style master, then runs the real CherryMCP with a
+# tab's test token against the forwarded socket (list_processes), checks
+# that a missing or wrong token is refused, and that `-O cancel` and the
+# cleanup take the socket away ("Cherry on Laptop is not reachable").
 # Exits 2 when sshd cannot run here (then use Scripts/fake-remote-mac, which
 # the Swift tests use).
 set -euo pipefail
@@ -127,8 +139,11 @@ UsePAM no
 StrictModes no
 PermitTTY no
 AllowAgentForwarding no
-AllowTcpForwarding local
+AllowTcpForwarding yes
 PermitOpen localhost:* 127.0.0.1:* [::1]:*
+PermitListen none
+AllowStreamLocalForwarding yes
+StreamLocalBindUnlink no
 X11Forwarding no
 PermitUserEnvironment no
 MaxSessions 3
@@ -275,6 +290,18 @@ if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
 fi
 grep -q "Test $forward_test() passed" "$dir/swift-forward.log" || { cat "$dir/swift-forward.log" >&2; fail "$forward_test did not run"; }
 pass "a page fetched through ssh -O forward on a master with ClearAllForwardings=yes, then cancelled"
+
+# Cherry MCP through a reverse forward of a Unix socket (the app's
+# RemoteMCPForwards and the real CherryMCP, run by their Swift test).
+mcp_test=RemoteDeviceRealHostForwardsCherryMCPOverSSH
+if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
+  CHERRY_TEST_LOOPBACK_SSH="$dir/bin/ssh" CHERRY_TEST_LOOPBACK_DESTINATION=loopback \
+  swift test --skip-build --no-parallel --filter "$mcp_test" >"$dir/swift-mcp.log" 2>&1); then
+  cat "$dir/swift-mcp.log" >&2
+  fail "Cherry MCP over a reverse forward ($mcp_test)"
+fi
+grep -q "Test $mcp_test() passed" "$dir/swift-mcp.log" || { cat "$dir/swift-mcp.log" >&2; fail "$mcp_test did not run"; }
+pass "CherryMCP called list_processes through ssh -O forward -R of a Unix socket, refused without a valid token"
 
 # The daemon it started is this script's private one.
 pgrep -f "serve --socket $socket" >/dev/null || fail "a private daemon served $socket"

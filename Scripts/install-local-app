@@ -128,13 +128,15 @@ if [[ "$BUNDLE_HOST" == 1 ]]; then
 else
   echo "Skipping the Persistent Sessions helpers (CHERRY_SKIP_HOST=1)"
 fi
+# CherryMCP universal: Cherry also installs it on the user's other Macs, for
+# agents in their tabs (docs/specs/remote-devices.md, phase 4b). Built before
+# the app, since each triple's build may share SwiftPM's products directory.
+MCP_HELPER_PATH="$("$ROOT/Scripts/build-mcp-helper" "$CONFIGURATION" | tail -n 1)"
 # shellcheck disable=SC2086 # EXTRA_BUILD_ARGS is split on purpose (see above).
 swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS
-swift build -c "$CONFIGURATION" --product CherryMCP
 
 BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
 BINARY_PATH="$BIN_DIR/Cherry"
-MCP_HELPER_PATH="$BIN_DIR/CherryMCP"
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"
@@ -148,7 +150,7 @@ if [[ "$BUNDLE_HOST" == 1 ]]; then
   # Cherry copies these to the user's other Macs, of either kind
   # (docs/specs/remote-devices.md): they must be universal. A build for this
   # Mac only (CHERRY_HOST_ARCHS=native) is installed with a warning.
-  if ! "$ROOT/Scripts/check-helper-archs" "$APP_PATH/Contents/MacOS/cherry" "$APP_PATH/Contents/MacOS/cherry-host"; then
+  if ! "$ROOT/Scripts/check-helper-archs" "$APP_PATH/Contents/MacOS/cherry" "$APP_PATH/Contents/MacOS/cherry-host" "$APP_PATH/Contents/MacOS/CherryMCP"; then
     if [[ "${CHERRY_HOST_ARCHS:-universal}" == native ]]; then
       echo "warning: CHERRY_HOST_ARCHS=native: this copy cannot install its session host on a Mac of the other architecture" >&2
     else

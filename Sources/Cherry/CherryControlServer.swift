@@ -150,21 +150,132 @@ final class CherryControlServer: @unchecked Sendable {
             listenFileDescriptor = -1
         }
         try? FileManager.default.removeItem(at: socketURL)
+        for deviceID in listenerLock.withLock({ Array(deviceListeners.keys) }) {
+            removeDeviceListener(deviceID: deviceID)
+        }
     }
 
-    private func prepareSocketDirectory() throws {
+    // MARK: Listeners for other Macs (docs/specs/remote-devices.md, phase 4b)
+
+    /// Where a caller comes from: This Mac's socket (identified by its
+    /// process), or the listener a device's forward reaches (identified by
+    /// its tab's token, required).
+    enum CallerOrigin: Equatable, Sendable {
+        case thisMac
+        case device(UUID)
+    }
+
+    /// Checks the tokens of callers on other Macs (the app's).
+    var mcpTokens: RemoteMCPTokens = .shared
+
+    private struct DeviceListener {
+        var url: URL
+        var source: DispatchSourceRead
+    }
+
+    private let listenerLock = NSLock()
+    private var deviceListeners: [UUID: DeviceListener] = [:]
+    /// Connections each device's listener serves now (`RequestLimits.maxConnections`).
+    private var deviceConnections: [UUID: Int] = [:]
+
+    /// What one connection may send and how many may be served at once.
+    struct RequestLimits: Sendable {
+        /// The longest request line; a longer one is refused
+        /// (`request_too_large`) before it is decoded.
+        var maxBytes: Int
+        /// The whole request must arrive within this long
+        /// (`request_timeout`), however slowly its bytes come; nil: only
+        /// each read's timeout.
+        var deadline: TimeInterval?
+        /// Connections served at once; the next is refused at once
+        /// (`too_many_connections`). Nil: no limit.
+        var maxConnections: Int?
+
+        /// A device's listener: whatever reaches it came from another Mac.
+        static let device = RequestLimits(maxBytes: 8 << 20, deadline: 15, maxConnections: 16)
+        /// This Mac's socket (0600, this account's processes): a generous
+        /// cap only (pasted input and notes can be large).
+        static let thisMac = RequestLimits(maxBytes: 64 << 20, deadline: nil, maxConnections: nil)
+    }
+
+    nonisolated static func limits(for origin: CallerOrigin) -> RequestLimits {
+        origin == .thisMac ? .thisMac : .device
+    }
+
+    /// Takes one of the device's connection slots; false when all are in use.
+    private nonisolated func acquireConnectionSlot(for origin: CallerOrigin) -> Bool {
+        guard case .device(let deviceID) = origin, let maximum = Self.limits(for: origin).maxConnections else { return true }
+        return listenerLock.withLock {
+            let current = deviceConnections[deviceID, default: 0]
+            guard current < maximum else { return false }
+            deviceConnections[deviceID] = current + 1
+            return true
+        }
+    }
+
+    private nonisolated func releaseConnectionSlot(for origin: CallerOrigin) {
+        guard case .device(let deviceID) = origin, Self.limits(for: origin).maxConnections != nil else { return }
+        listenerLock.withLock {
+            let remaining = deviceConnections[deviceID, default: 1] - 1
+            deviceConnections[deviceID] = remaining > 0 ? remaining : nil
+        }
+    }
+
+    /// The local socket a device's reverse forward reaches: next to the
+    /// control socket, in its private directory.
+    func deviceListenerURL(deviceID: UUID) -> URL {
+        socketURL.deletingLastPathComponent()
+            .appendingPathComponent("mcp-\(RemoteMCPPaths.shortName(deviceID: deviceID)).sock", isDirectory: false)
+    }
+
+    /// Listens for callers of `deviceID` (its CherryMCPs, through the
+    /// forward): every request must carry a valid token of an open tab of
+    /// that device. Returns the socket (the one there already, if any).
+    @discardableResult
+    func addDeviceListener(deviceID: UUID) throws -> URL {
+        if let existing = listenerLock.withLock({ deviceListeners[deviceID] }) { return existing.url }
+        try prepareSocketDirectory(removingSocket: false)
+        let url = deviceListenerURL(deviceID: deviceID)
+        try? FileManager.default.removeItem(at: url)
+        let fd = try Self.bindListeningSocket(path: url.path)
+        let source = makeAcceptSource(fileDescriptor: fd, origin: .device(deviceID))
+        listenerLock.withLock { deviceListeners[deviceID] = DeviceListener(url: url, source: source) }
+        source.resume()
+        return url
+    }
+
+    /// Stops listening for `deviceID`'s callers and removes its socket.
+    func removeDeviceListener(deviceID: UUID) {
+        guard let listener = listenerLock.withLock({ deviceListeners.removeValue(forKey: deviceID) }) else { return }
+        listener.source.cancel()
+        try? FileManager.default.removeItem(at: listener.url)
+    }
+
+    private func prepareSocketDirectory(removingSocket: Bool = true) throws {
         let directoryURL = socketURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         chmod(directoryURL.path, S_IRWXU)
-        try? FileManager.default.removeItem(at: socketURL)
+        if removingSocket { try? FileManager.default.removeItem(at: socketURL) }
     }
 
     private func bindAndListen() throws {
+        let fd = try Self.bindListeningSocket(path: socketURL.path)
+        listenFileDescriptor = fd
+        let source = makeAcceptSource(fileDescriptor: fd, origin: .thisMac, closesOnCancel: false)
+        source.setCancelHandler {
+            close(fd)
+        }
+        acceptSource = source
+        source.resume()
+    }
+
+    /// A listening Unix socket at `path` (mode 0600, non-blocking).
+    private nonisolated static func bindListeningSocket(path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        Self.setCloseOnExec(fileDescriptor: fd)
+        setCloseOnExec(fileDescriptor: fd)
 
         let currentFlags = fcntl(fd, F_GETFL)
         if currentFlags >= 0 {
@@ -173,7 +284,6 @@ final class CherryControlServer: @unchecked Sendable {
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
-        let path = socketURL.path
         let maximumPathLength = MemoryLayout.size(ofValue: address.sun_path)
         guard path.utf8.count < maximumPathLength else {
             close(fd)
@@ -205,30 +315,48 @@ final class CherryControlServer: @unchecked Sendable {
             close(fd)
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-
-        listenFileDescriptor = fd
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in
-            self?.acceptAvailableConnections()
-        }
-        source.setCancelHandler {
-            close(fd)
-        }
-        acceptSource = source
-        source.resume()
+        return fd
     }
 
-    private nonisolated func acceptAvailableConnections() {
+    private func makeAcceptSource(fileDescriptor fd: Int32, origin: CallerOrigin, closesOnCancel: Bool = true) -> DispatchSourceRead {
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            self?.acceptAvailableConnections(on: fd, origin: origin)
+        }
+        if closesOnCancel {
+            source.setCancelHandler {
+                close(fd)
+            }
+        }
+        return source
+    }
+
+    private nonisolated func acceptAvailableConnections(on listenFileDescriptor: Int32, origin: CallerOrigin) {
         while true {
             let clientFD = accept(listenFileDescriptor, nil, nil)
             if clientFD >= 0 {
                 Self.setCloseOnExec(fileDescriptor: clientFD)
                 Self.configureBlocking(fileDescriptor: clientFD)
+                // A client that went away (a device's ssh, whose other end
+                // closed) makes a write fail with EPIPE, never SIGPIPE.
+                var noSigpipe: Int32 = 1
+                _ = setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
                 // A silent client must not pin a pool thread forever (enough of
                 // them starves EVERY later connection), and a client that stops
                 // reading must not block response writes indefinitely.
                 Self.configureSocketTimeouts(fileDescriptor: clientFD, seconds: 10)
-                handleConnection(fileDescriptor: clientFD)
+                guard acquireConnectionSlot(for: origin) else {
+                    // Every slot of this device's listener is in use.
+                    DispatchQueue.global(qos: .utility).async {
+                        Self.writeResponse(.init(error: .init(
+                            code: "too_many_connections",
+                            message: "Cherry is already serving as many requests from this Mac as it will at once. Try again shortly."
+                        )), to: clientFD)
+                        close(clientFD)
+                    }
+                    continue
+                }
+                handleConnection(fileDescriptor: clientFD, origin: origin)
                 continue
             }
 
@@ -242,7 +370,13 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
-    private nonisolated func handleConnection(fileDescriptor clientFD: Int32) {
+    private nonisolated func handleConnection(fileDescriptor clientFD: Int32, origin: CallerOrigin) {
+        // The connection's slot is given back once it is closed, whichever
+        // way it ends.
+        let finish: @Sendable () -> Void = { [weak self] in
+            close(clientFD)
+            self?.releaseConnectionSlot(for: origin)
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else {
                 close(clientFD)
@@ -251,22 +385,24 @@ final class CherryControlServer: @unchecked Sendable {
 
             // Peer PID of the connecting process (e.g. an agent's MCP server), used
             // to route unscoped requests to the caller's own workspace when the
-            // agent CLI stripped CHERRY_PROJECT_ROOT from the MCP env.
-            let peerPID = Self.peerProcessID(fileDescriptor: clientFD)
+            // agent CLI stripped CHERRY_PROJECT_ROOT from the MCP env. Never
+            // for a device's listener: its peer is This Mac's ssh, and its
+            // callers are another Mac's processes.
+            let peerPID = origin == .thisMac ? Self.peerProcessID(fileDescriptor: clientFD) : nil
 
             let requestData: Data
             do {
-                requestData = try Self.readRequest(fileDescriptor: clientFD)
+                requestData = try Self.readRequest(fileDescriptor: clientFD, limits: Self.limits(for: origin))
             } catch {
                 Self.writeResponse(.init(error: Self.controlError(from: error)), to: clientFD)
-                close(clientFD)
+                finish()
                 return
             }
 
             Task { @MainActor [weak self] in
                 let response: CherryControlResponse
                 if let self {
-                    response = await self.handleRequestData(requestData, peerPID: peerPID)
+                    response = await self.handleRequestData(requestData, peerPID: peerPID, origin: origin)
                 } else {
                     response = .init(error: .init(code: "server_unavailable", message: "Cherry control server is unavailable."))
                 }
@@ -276,16 +412,31 @@ final class CherryControlServer: @unchecked Sendable {
                 // buffer.
                 DispatchQueue.global(qos: .userInitiated).async {
                     Self.writeResponse(response, to: clientFD)
-                    close(clientFD)
+                    finish()
                 }
             }
         }
     }
 
     @MainActor
-    private func handleRequestData(_ data: Data, peerPID: Int32?) async -> CherryControlResponse {
+    func handleRequestData(_ data: Data, peerPID: Int32?, origin: CallerOrigin = .thisMac) async -> CherryControlResponse {
         do {
-            let request = try JSONDecoder().decode(CherryControlRequest.self, from: data)
+            let (credentials, request) = try CherryControlEnvelope.decode(data)
+            if let credentials {
+                let caller = try remoteCaller(credentials, origin: origin)
+                // Everything this request reaches is checked against the
+                // caller's device (`requireOnRemoteDevice`, the one choke
+                // point), however it was mapped.
+                return try await Self.$remoteDevice.withValue(caller.deviceID) {
+                    try await handle(request, remoteCaller: caller)
+                }
+            }
+            guard origin == .thisMac else {
+                throw CherryControlError(
+                    code: "unauthorized",
+                    message: "This request came from another Mac without a Cherry MCP token. Run CherryMCP in a Cherry tab of that Mac."
+                )
+            }
             return try await handle(request, peerPID: peerPID)
         } catch let error as CherryControlError {
             return .init(error: error)
@@ -314,6 +465,208 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         return try await handleUnscoped(request, workspace: workspace, isProjectScoped: false)
+    }
+
+    /// A caller on another Mac, as its token identifies it: its tab, that
+    /// tab's window, and the device.
+    struct RemoteCaller {
+        var deviceID: UUID
+        var session: TerminalSession
+        var workspace: TerminalWorkspace
+    }
+
+    /// The open tab of a device `credentials` name, when its token is that
+    /// tab's. Through a device's listener the device is the listener's; on
+    /// This Mac's socket (never used by CherryMCP there) it is the tab's.
+    @MainActor
+    private func remoteCaller(_ credentials: CherryControlCredentials, origin: CallerOrigin) throws -> RemoteCaller {
+        let refused = CherryControlError(
+            code: "unauthorized",
+            message: "Cherry refused this Cherry MCP token: it does not belong to an open tab of this Mac's Cherry (the tab was closed, or it was started by another copy of Cherry)."
+        )
+        guard let tabID = UUID(uuidString: credentials.processID) else { throw refused }
+        let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
+            + [workspace, workspaceProvider()].compactMap { $0 }
+        for candidate in workspaces {
+            guard let session = candidate.sessions.first(where: { $0.id == tabID }),
+                  let key = candidate.projectRoot,
+                  let deviceID = ProjectLocation(key: key).deviceID
+            else { continue }
+            if case .device(let listenerDevice) = origin, listenerDevice != deviceID { throw refused }
+            // Only a tab whose program runs on that device carries its
+            // token (never one attached from This Mac or another host).
+            guard Self.isSession(session, in: candidate, onDevice: deviceID) else { throw refused }
+            guard mcpTokens.isValid(credentials.token, tabID: tabID, deviceID: deviceID) else { throw refused }
+            return RemoteCaller(deviceID: deviceID, session: session, workspace: candidate)
+        }
+        throw refused
+    }
+
+    /// The device of the caller on another Mac whose request is being
+    /// handled, nil for This Mac's callers. A task local: requests
+    /// interleave on the main actor, and each sees only its own.
+    @TaskLocal static var remoteDevice: UUID?
+
+    static func refusedOutsideDevice(_ what: String) -> CherryControlError {
+        CherryControlError(
+            code: "outside_caller_mac",
+            message: "A caller on another Mac can only reach its own Mac's projects and processes: \(what) is not one of them."
+        )
+    }
+
+    /// The one choke point for a caller on another Mac (`remoteDevice`):
+    /// a workspace it reaches must be a project on that Mac
+    /// (`ProjectLocation.remote(deviceID:)`). Every request goes through
+    /// `handleUnscoped`, which checks its workspace here after all mapping;
+    /// sessions found by id, links and listings check theirs too.
+    @MainActor
+    private func requireOnRemoteDevice(_ workspace: TerminalWorkspace) throws {
+        guard let device = Self.remoteDevice else { return }
+        guard Self.isOnDevice(workspace.projectRoot, device) else {
+            throw Self.refusedOutsideDevice("that window")
+        }
+    }
+
+    /// Whether `key` is a project on `device`.
+    nonisolated static func isOnDevice(_ key: String?, _ device: UUID) -> Bool {
+        guard let key else { return false }
+        return ProjectLocation(key: key).deviceID == device
+    }
+
+    /// Whether `session`, a tab of `workspace`, runs on `device`: the
+    /// window is a project of that device, and the tab's program runs on
+    /// the window's own hosting (the device's, `SessionBackendPolicy.remote`)
+    /// or is a session of that hosting's host attached from Persistent
+    /// Sessions. A This Mac session or another SSH host's attached into
+    /// the device's window is not on the device, nor is any native tab.
+    @MainActor
+    static func isSession(_ session: TerminalSession, in workspace: TerminalWorkspace, onDevice device: UUID) -> Bool {
+        guard isOnDevice(workspace.projectRoot, device),
+              let hosting = workspace.backendPolicy.localSessions,
+              !hosting.profile.isThisMac, !hosting.profile.allowsNativeFallback
+        else { return false }
+        if let attachment = session.hostedAttachment {
+            return attachment.host == hosting.profile.host
+        }
+        return session.persistentHosting === hosting
+    }
+
+    /// Whether the caller may see and act on `session` of `workspace`:
+    /// always for This Mac's callers; for a caller on another Mac, only a
+    /// session on that Mac (`isSession(_:in:onDevice:)`).
+    @MainActor
+    private func callerReaches(_ session: TerminalSession, in workspace: TerminalWorkspace) -> Bool {
+        guard let device = Self.remoteDevice else { return true }
+        return Self.isSession(session, in: workspace, onDevice: device)
+    }
+
+    /// The tabs of `workspace` the caller may see (`callerReaches`): every
+    /// listing, name lookup, count and scan goes through this.
+    @MainActor
+    private func callerSessions(_ workspace: TerminalWorkspace) -> [TerminalSession] {
+        guard Self.remoteDevice != nil else { return workspace.sessions }
+        return workspace.sessions.filter { callerReaches($0, in: workspace) }
+    }
+
+    /// The selected tab, when the caller may see it.
+    @MainActor
+    private func callerSelectedSession(_ workspace: TerminalWorkspace) -> TerminalSession? {
+        workspace.selectedSession.flatMap { callerReaches($0, in: workspace) ? $0 : nil }
+    }
+
+    /// `childAgentCount` of the tabs the caller may see.
+    @MainActor
+    private func callerChildAgentCount(of session: TerminalSession, in workspace: TerminalWorkspace) -> Int {
+        guard Self.remoteDevice != nil else { return workspace.childAgentCount(of: session) }
+        return workspace.childAgentSessions(of: session).filter { callerReaches($0, in: workspace) }.count
+    }
+
+    /// A request of a caller on another Mac: scoped as a local agent in the
+    /// same window would be, but only ever on that Mac. Its unscoped
+    /// requests go to its tab's window; a project root it names is a path
+    /// on its Mac, or a `device:` key of that Mac, matched by location
+    /// (never resolved as a path here).
+    @MainActor
+    private func handle(_ request: CherryControlRequest, remoteCaller caller: RemoteCaller) async throws -> CherryControlResponse {
+        switch request {
+        case .scoped(let scopedRequest):
+            let workspace = try remoteWorkspace(projectRoot: scopedRequest.projectRoot, deviceID: caller.deviceID)
+            return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
+        case .openProject(let open):
+            return .init(result: .openProject(try openRemoteProject(open, caller: caller)))
+        default:
+            return try await handleUnscoped(request, workspace: caller.workspace, isProjectScoped: true)
+        }
+    }
+
+    /// The key a caller on `deviceID` names: a path there (absolute, no `.`
+    /// or `..`), or a `device:` key of that same device.
+    nonisolated static func remoteProjectLocation(_ root: String, deviceID: UUID) throws -> ProjectLocation {
+        let trimmed = root.trimmingCharacters(in: .whitespacesAndNewlines)
+        let location: ProjectLocation
+        if trimmed.hasPrefix(ProjectLocation.remoteKeyPrefix) {
+            location = ProjectLocation(key: trimmed)
+            guard case .remote(let keyDevice, _) = location else {
+                throw CherryControlError(code: "project_unavailable", message: "Not a project key: \(root).")
+            }
+            guard keyDevice == deviceID else { throw refusedOutsideDevice("\(root)") }
+            // The raw key's path, before normalisation keeps `..`.
+            let rawPath = String(trimmed.drop { $0 != "/" })
+            guard !ProjectLocation.hasDotComponents(rawPath) else {
+                throw CherryControlError(code: "invalid_project_root", message: "A project root may not contain . or .. components.")
+            }
+        } else {
+            guard trimmed.hasPrefix("/") else {
+                throw CherryControlError(code: "invalid_project_root", message: "A project root must be an absolute path on this Mac: \(root).")
+            }
+            location = .remote(deviceID: deviceID, path: trimmed)
+        }
+        guard !ProjectLocation.hasDotComponents(location.path), !ProjectLocation.hasDotComponents(trimmed) else {
+            throw CherryControlError(code: "invalid_project_root", message: "A project root may not contain . or .. components.")
+        }
+        return location
+    }
+
+    /// The open window of the device's project at `projectRoot` (or the
+    /// project containing it, a worktree's window first), matched by
+    /// location: the same device and the path, never through
+    /// `standardizedProjectRoot`.
+    @MainActor
+    private func remoteWorkspace(projectRoot: String, deviceID: UUID) throws -> TerminalWorkspace {
+        let location = try Self.remoteProjectLocation(projectRoot, deviceID: deviceID)
+        let path = location.path
+        let workspaces = (openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
+            + [workspace, workspaceProvider()].compactMap { $0 })
+            .filter { Self.isOnDevice($0.projectRoot, deviceID) }
+        if let exact = workspaces.first(where: { $0.projectRoot.map { ProjectLocation(key: $0).path } == path }) {
+            return exact
+        }
+        let containing = workspaces
+            .compactMap { candidate -> (TerminalWorkspace, String)? in
+                guard let root = candidate.projectRoot.map({ ProjectLocation(key: $0).path }),
+                      path.hasPrefix(root == "/" ? "/" : root + "/")
+                else { return nil }
+                return (candidate, root)
+            }
+            .max { $0.1.count < $1.1.count }
+        guard let containing else {
+            throw CherryControlError(code: "project_unavailable", message: "Cherry project is not open for scoped request: \(projectRoot).")
+        }
+        return containing.0
+    }
+
+    /// Open Project for a caller on another Mac: only a project of its Mac
+    /// that Cherry knows, matched by its key exactly.
+    @MainActor
+    private func openRemoteProject(_ request: OpenProjectRequest, caller: RemoteCaller) throws -> OpenProjectResult {
+        let key = try Self.remoteProjectLocation(request.projectRoot, deviceID: caller.deviceID).key
+        let known = agentSettings.projects.map(\.root) + openProjectRootsProvider() + [caller.workspace.projectRoot].compactMap { $0 }
+        guard known.contains(key) else {
+            throw CherryControlError(code: "project_not_found", message: "Cherry project is not configured: \(request.projectRoot).")
+        }
+        let alreadyOpen = openProjectRootsProvider().contains(key)
+        openProjectProvider(key)
+        return OpenProjectResult(projectRoot: key, alreadyOpen: alreadyOpen)
     }
 
     /// The workspace whose session process tree contains the connecting peer (the
@@ -385,6 +738,17 @@ final class CherryControlServer: @unchecked Sendable {
         if !isProjectScoped {
             try rejectAmbiguousUnscopedProjectMutation(request)
         }
+        if Self.remoteDevice != nil {
+            try requireOnRemoteDevice(workspace)
+            // A scoped request inside a scoped one would name a project
+            // without the caller's mapping.
+            if case .scoped = request {
+                throw CherryControlError(code: "invalid_request", message: "A scoped request may not contain another one.")
+            }
+            if case .openProject = request {
+                throw CherryControlError(code: "invalid_request", message: "Open a project with an unscoped request.")
+            }
+        }
 
         switch request {
         case .scoped(let scopedRequest):
@@ -439,7 +803,7 @@ final class CherryControlServer: @unchecked Sendable {
             )))
         case .servicesList(let request):
             let kind = try processKind(from: request.kind)
-            let sessions = workspace.sessions.filter { session in
+            let sessions = callerSessions(workspace).filter { session in
                 guard let kind else { return true }
                 return session.kind == kind
             }
@@ -533,7 +897,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .startAllCommands(try listProcesses(workspace: workspace, kind: nil)))
         case .stopAllCommands(let request):
-            workspace.commandSessions.forEach { $0.stopManagedCommand() }
+            workspace.commandSessions.filter { callerReaches($0, in: workspace) }.forEach { $0.stopManagedCommand() }
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
             }
@@ -612,7 +976,7 @@ final class CherryControlServer: @unchecked Sendable {
                 agentName: session.agentName,
                 summary: nil,
                 parentAgentID: session.parentAgentID?.uuidString,
-                childAgentCount: workspace.childAgentCount(of: session),
+                childAgentCount: callerChildAgentCount(of: session, in: workspace),
                 projectRoot: projectRoot,
                 sentBytes: sentBytes,
                 output: output
@@ -855,8 +1219,12 @@ final class CherryControlServer: @unchecked Sendable {
         fallbackWorkspace workspace: TerminalWorkspace
     ) throws -> ResolveDeepLinkResult {
         let deepLink = try CherryDeepLink.parse(request.link)
-        let projectRoot = projectRoot(forProjectKey: deepLink.projectKey, fallbackWorkspace: workspace)
+        var projectRoot = projectRoot(forProjectKey: deepLink.projectKey, fallbackWorkspace: workspace)
         let normalizedLink = deepLink.absoluteString
+        // A caller on another Mac resolves only its Mac's links.
+        if let device = Self.remoteDevice, !Self.isOnDevice(projectRoot, device) {
+            projectRoot = nil
+        }
 
         guard let projectRoot else {
             return ResolveDeepLinkResult(
@@ -911,7 +1279,8 @@ final class CherryControlServer: @unchecked Sendable {
             // key → workspace mapping misses.
             let linked = workspaceForProjectRoot(projectRoot, fallbackWorkspace: workspace)
                 .flatMap { linkedWorkspace in
-                    linkedWorkspace.session(id: terminalID.uuidString).map { ($0, linkedWorkspace) }
+                    linkedWorkspace.session(id: terminalID.uuidString)
+                        .flatMap { callerReaches($0, in: linkedWorkspace) ? ($0, linkedWorkspace) : nil }
                 }
             guard let (session, sessionWorkspace) = linked
                 ?? (try? findSessionWithWorkspace(workspace: workspace, terminalID: terminalID.uuidString))
@@ -1000,7 +1369,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func listTerminals(workspace: TerminalWorkspace) -> ListTerminalsResult {
         ListTerminalsResult(
-            terminals: workspace.sessions.map { session in
+            terminals: callerSessions(workspace).map { session in
                 TerminalInfo(
                     id: session.id.uuidString,
                     title: session.title,
@@ -1013,10 +1382,10 @@ final class CherryControlServer: @unchecked Sendable {
                     agentName: session.agentName,
                     summary: nil,
                     parentAgentID: session.parentAgentID?.uuidString,
-                    childAgentCount: workspace.childAgentCount(of: session)
+                    childAgentCount: callerChildAgentCount(of: session, in: workspace)
                 )
             },
-            selectedTerminalID: workspace.selectedSessionID?.uuidString
+            selectedTerminalID: callerSelectedSession(workspace)?.id.uuidString
         )
     }
 
@@ -1026,7 +1395,7 @@ final class CherryControlServer: @unchecked Sendable {
             activeProjectRoot: workspace.projectRoot,
             agents: agentSettings.resolvedAgents.map { agent in
                 let normalizedName = agent.definition.normalizedName
-                let activeSessionCount = workspace.agentSessions.filter {
+                let activeSessionCount = workspace.agentSessions.filter { callerReaches($0, in: workspace) }.filter {
                     $0.agentName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
                 }.count
 
@@ -1049,6 +1418,13 @@ final class CherryControlServer: @unchecked Sendable {
         let activeRoot = workspace.projectRoot
         let activeRepositoryRoot = agentSettings.repositoryRoot(for: activeRoot)
         var roots = agentSettings.projects.map(\.root)
+        if let device = Self.remoteDevice {
+            // A caller on another Mac: its Mac's projects only (configured
+            // or open).
+            roots = (roots + openProjectRootsProvider()).filter { Self.isOnDevice($0, device) }
+            var seen = Set<String>()
+            roots = roots.filter { seen.insert($0).inserted }
+        }
         if let activeRepositoryRoot, !roots.contains(activeRepositoryRoot) {
             roots.insert(activeRepositoryRoot, at: 0)
         }
@@ -1098,6 +1474,7 @@ final class CherryControlServer: @unchecked Sendable {
         _ request: OpenProjectRequest,
         fallbackWorkspace workspace: TerminalWorkspace
     ) throws -> OpenProjectResult {
+        if Self.remoteDevice != nil { throw Self.refusedOutsideDevice("that project") }
         let requestedRoot = standardizedProjectRoot(request.projectRoot)
         let candidateRoots = agentSettings.projects.map(\.root)
             + openProjectRootsProvider()
@@ -1119,7 +1496,7 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func projectStatus(workspace: TerminalWorkspace) -> ProjectStatusResult {
-        let selectedSession = workspace.selectedSession
+        let selectedSession = callerSelectedSession(workspace)
         let noteStore = try? activeNoteStore(for: workspace)
         let todoStore = try? activeTodoStore(for: workspace)
         let features = projectFeatureAvailability(for: workspace.projectRoot)
@@ -1141,12 +1518,12 @@ final class CherryControlServer: @unchecked Sendable {
         return PerformanceStatusResult(
             activeProjectRoot: workspace.projectRoot,
             processCounts: processCounts(workspace: workspace),
-            selectedProcessID: workspace.selectedSessionID?.uuidString,
+            selectedProcessID: callerSelectedSession(workspace)?.id.uuidString,
             ghosttyLiveBridgeCount: GhosttySessionBridge.liveBridgeCount,
             ghosttyInstalledOutputObserverCount: GhosttySessionBridge.installedOutputObserverCount,
-            rawOutputObserverCount: workspace.sessions.reduce(0) { $0 + $1.rawOutputObserverCount },
-            rawOutputRetainedBytes: workspace.sessions.reduce(0) { $0 + $1.rawOutputRetainedByteCount },
-            rawOutputRetainedChunkCount: workspace.sessions.reduce(0) { $0 + $1.rawOutputRetainedChunkCount },
+            rawOutputObserverCount: callerSessions(workspace).reduce(0) { $0 + $1.rawOutputObserverCount },
+            rawOutputRetainedBytes: callerSessions(workspace).reduce(0) { $0 + $1.rawOutputRetainedByteCount },
+            rawOutputRetainedChunkCount: callerSessions(workspace).reduce(0) { $0 + $1.rawOutputRetainedChunkCount },
             terminalPerfEnabled: TerminalPerformanceMonitor.isEnabled,
             terminalPerfCounters: TerminalPerformanceCounters(
                 ptyChunks: counters.ptyChunks,
@@ -1171,25 +1548,34 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func processCounts(workspace: TerminalWorkspace) -> ProcessCounts {
-        ProcessCounts(
-            total: workspace.sessions.count,
-            terminals: workspace.terminalSessions.count,
-            agents: workspace.agentSessions.count,
-            commands: workspace.commandSessions.count
+        guard Self.remoteDevice != nil else {
+            return ProcessCounts(
+                total: workspace.sessions.count,
+                terminals: workspace.terminalSessions.count,
+                agents: workspace.agentSessions.count,
+                commands: workspace.commandSessions.count
+            )
+        }
+        let reachable = callerSessions(workspace)
+        return ProcessCounts(
+            total: reachable.count,
+            terminals: workspace.terminalSessions.filter { callerReaches($0, in: workspace) }.count,
+            agents: workspace.agentSessions.filter { callerReaches($0, in: workspace) }.count,
+            commands: workspace.commandSessions.filter { callerReaches($0, in: workspace) }.count
         )
     }
 
     @MainActor
     private func listProcesses(workspace: TerminalWorkspace, kind requestedKind: String?) throws -> ListProcessesResult {
         let kind = try processKind(from: requestedKind)
-        let sessions = workspace.sessions.filter { session in
+        let sessions = callerSessions(workspace).filter { session in
             guard let kind else { return true }
             return session.kind == kind
         }
         return ListProcessesResult(
             activeProjectRoot: workspace.projectRoot,
             processes: sessions.map { processInfo(for: $0, workspace: workspace) },
-            selectedProcessID: workspace.selectedSessionID?.uuidString
+            selectedProcessID: callerSelectedSession(workspace)?.id.uuidString
         )
     }
 
@@ -1220,7 +1606,7 @@ final class CherryControlServer: @unchecked Sendable {
             agentName: session.agentName,
             commandName: session.commandName,
             parentAgentID: session.parentAgentID?.uuidString,
-            childAgentCount: workspace.childAgentCount(of: session),
+            childAgentCount: callerChildAgentCount(of: session, in: workspace),
             agentActivityState: reportedAgentActivityState(of: session),
             usesAlternateScreen: session.usesAlternateScreen,
             lastContentChangeAt: session.lastContentChangeAt,
@@ -1275,7 +1661,7 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         let normalizedName = AgentToolDefinition.normalizedName(requestedName)
-        let matches = workspace.sessions.filter { session in
+        let matches = callerSessions(workspace).filter { session in
             self.processName(for: session).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
                 || session.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
         }
@@ -1484,10 +1870,14 @@ final class CherryControlServer: @unchecked Sendable {
                 agentName: session.agentName
             )
         }
+        // A caller on another Mac never runs This Mac's scan (lsof): not
+        // of every listener (`include_unattributed`), nor of its tabs.
+        let remoteCaller = Self.remoteDevice != nil
+        if remoteCaller, includeUnattributed { throw Self.unattributedNotAvailable }
         // Tabs of other Macs: their Mac says which ports their programs
         // listen on, and the ports are forwarded here (never a local pid).
         let onOtherMacs = sessions.filter { $0.persistentHosting?.profile.isThisMac == false }
-        let local = sessions.filter { $0.persistentHosting?.profile.isThisMac != false }
+        let local = remoteCaller ? [] : sessions.filter { $0.persistentHosting?.profile.isThisMac != false }
         let remote: [RemoteInspectableProcess] = onOtherMacs.compactMap { session in
             guard let hosting = session.persistentHosting, let pid = session.remoteProgramProcessID else { return nil }
             return RemoteInspectableProcess(
@@ -1516,15 +1906,21 @@ final class CherryControlServer: @unchecked Sendable {
         return records
     }
 
+    static let unattributedNotAvailable = CherryControlError(
+        code: "unattributed_not_available",
+        message: "include_unattributed lists every listening port of the Mac Cherry runs on, which a caller on another Mac cannot see. Leave it off: the ports of this Mac's own processes are listed without it."
+    )
+
     @MainActor
     private func waitForBoundPort(_ request: WaitForBoundPortRequest, workspace: TerminalWorkspace) async throws -> ServiceRecord {
         let deadline = Date().addingTimeInterval(TimeInterval(min(max(request.timeoutMilliseconds ?? 10_000, 1), 60_000)) / 1_000)
         let includeUnattributed = request.includeUnattributed ?? false
+        if Self.remoteDevice != nil, includeUnattributed { throw Self.unattributedNotAvailable }
         let sessions: [TerminalSession]
         if request.processID != nil || request.processName != nil {
             sessions = [try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)]
         } else {
-            sessions = workspace.sessions
+            sessions = callerSessions(workspace)
         }
 
         var lastCandidates: [ServiceRecord] = []
@@ -1695,13 +2091,20 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
-    private func httpReadiness(for service: ServiceRecord, path requestedPath: String?) async -> ServiceReadiness {
+    /// Where an HTTP probe of `service` goes: its URL here. A service of
+    /// another Mac is probed only through its forward (`forwardedFrom`):
+    /// without one its `url` is the address there, which here would be
+    /// This Mac's own localhost.
+    static func probeURL(for service: ServiceRecord, path requestedPath: String?) -> URL? {
+        if service.machine != nil, service.forwardedFrom == nil { return nil }
         let path = requestedPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "/"
-        guard var components = URLComponents(string: service.url) else {
-            return .httpFailed
-        }
+        guard var components = URLComponents(string: service.url) else { return nil }
         components.path = path.hasPrefix("/") ? path : "/\(path)"
-        guard let url = components.url else {
+        return components.url
+    }
+
+    private func httpReadiness(for service: ServiceRecord, path requestedPath: String?) async -> ServiceReadiness {
+        guard let url = Self.probeURL(for: service, path: requestedPath) else {
             return .httpFailed
         }
 
@@ -1750,6 +2153,10 @@ final class CherryControlServer: @unchecked Sendable {
         agentClosePolicy: AgentClosePolicy?
     ) throws {
         let descendants = workspace.descendantAgentSessions(of: session)
+        // A caller on another Mac closes or re-parents only its Mac's tabs.
+        guard descendants.allSatisfy({ callerReaches($0, in: workspace) }) else {
+            throw Self.refusedOutsideDevice("one of that agent's sub-agents")
+        }
         guard !descendants.isEmpty else {
             guard workspace.sessions.count > 1 else {
                 throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
@@ -1808,7 +2215,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard let parentID = UUID(uuidString: rawValue) else {
             throw CherryControlError(code: "invalid_parent_agent_id", message: "parent_agent_id must be a Cherry agent UUID.")
         }
-        guard let parent = workspace.sessions.first(where: { $0.id == parentID }) else {
+        guard let parent = callerSessions(workspace).first(where: { $0.id == parentID }) else {
             throw CherryControlError(code: "parent_agent_not_found", message: "No Cherry agent exists with parent_agent_id \(rawValue).")
         }
         guard parent.kind == .agent else {
@@ -1822,18 +2229,18 @@ final class CherryControlServer: @unchecked Sendable {
     private func selectedAgentParentID(workspace: TerminalWorkspace) -> UUID? {
         if let chromeState = chromeState(for: workspace),
            chromeState.isShowingTerminalContent,
-           let selectedSession = workspace.selectedSession,
+           let selectedSession = callerSelectedSession(workspace),
            selectedSession.kind == .agent {
             return selectedSession.id
         }
 
         if chromeState(for: workspace) == nil,
-           let selectedSession = workspace.selectedSession,
+           let selectedSession = callerSelectedSession(workspace),
            selectedSession.kind == .agent {
             return selectedSession.id
         }
 
-        return workspace.rootAgentSessions.last?.id
+        return workspace.rootAgentSessions.last { callerReaches($0, in: workspace) }?.id
     }
 
     @MainActor
@@ -1851,7 +2258,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func restartAllCommands(workspace: TerminalWorkspace) async throws {
         let sessions = try await startAllCommands(workspace: workspace)
-        for session in sessions {
+        for session in sessions where callerReaches(session, in: workspace) {
             session.restart()
         }
     }
@@ -2011,12 +2418,19 @@ final class CherryControlServer: @unchecked Sendable {
         workspace: TerminalWorkspace,
         terminalID: String
     ) throws -> (session: TerminalSession, workspace: TerminalWorkspace) {
-        if let session = workspace.session(id: terminalID) {
+        // A caller on another Mac finds only its Mac's sessions.
+        // Only sessions running on its Mac (`isSession(_:in:onDevice:)`):
+        // never a This Mac or other host's session attached into its
+        // Mac's window.
+        let device = Self.remoteDevice
+        if let session = workspace.session(id: terminalID),
+           device.map({ Self.isSession(session, in: workspace, onDevice: $0) }) ?? true {
             return (session, workspace)
         }
         for (_, openWorkspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot()
-        where openWorkspace !== workspace {
-            if let session = openWorkspace.session(id: terminalID) {
+        where openWorkspace !== workspace && (device.map { Self.isOnDevice(openWorkspace.projectRoot, $0) } ?? true) {
+            if let session = openWorkspace.session(id: terminalID),
+               device.map({ Self.isSession(session, in: openWorkspace, onDevice: $0) }) ?? true {
                 return (session, openWorkspace)
             }
         }
@@ -2236,7 +2650,7 @@ final class CherryControlServer: @unchecked Sendable {
             agentName: session.agentName,
             summary: nil,
             parentAgentID: session.parentAgentID?.uuidString,
-            childAgentCount: workspace.childAgentCount(of: session)
+            childAgentCount: callerChildAgentCount(of: session, in: workspace)
         )
     }
 
@@ -2846,17 +3260,39 @@ final class CherryControlServer: @unchecked Sendable {
             : text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
     }
 
-    private nonisolated static func readRequest(fileDescriptor fd: Int32) throws -> Data {
+    /// One request line, without its newline: at most `limits.maxBytes`
+    /// (refused before any decoding, `request_too_large`), all of it within
+    /// `limits.deadline` when there is one (`request_timeout`).
+    nonisolated static func readRequest(fileDescriptor fd: Int32, limits: RequestLimits = .thisMac) throws -> Data {
         var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        let deadline = limits.deadline.map { Date().addingTimeInterval($0) }
+        let tooLarge = CherryControlError(
+            code: "request_too_large",
+            message: "The request is larger than Cherry accepts (\(limits.maxBytes) bytes)."
+        )
         while true {
+            if let deadline {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw requestTimedOut }
+                var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&poller, 1, Int32(min(remaining * 1_000, 60_000).rounded(.up)))
+                if ready == 0 { continue }
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
             let count = read(fd, &buffer, buffer.count)
             if count > 0 {
-                data.append(contentsOf: buffer.prefix(count))
-                if data.last == 0x0A {
-                    data.removeLast()
+                // Only the new bytes are searched for the newline.
+                if let newline = buffer[..<count].firstIndex(of: 0x0A) {
+                    guard data.count + newline <= limits.maxBytes else { throw tooLarge }
+                    data.append(contentsOf: buffer[..<newline])
                     return data
                 }
+                guard data.count + count <= limits.maxBytes else { throw tooLarge }
+                data.append(contentsOf: buffer[..<count])
             } else if count == 0 {
                 return data
             } else if errno == EINTR {
@@ -2866,6 +3302,11 @@ final class CherryControlServer: @unchecked Sendable {
             }
         }
     }
+
+    private nonisolated static let requestTimedOut = CherryControlError(
+        code: "request_timeout",
+        message: "The request did not arrive in time."
+    )
 
     private nonisolated static func configureBlocking(fileDescriptor fd: Int32) {
         let flags = fcntl(fd, F_GETFL)

@@ -122,8 +122,13 @@ struct RemoteHostHelpers: Equatable, Sendable {
     /// has none (then nothing is installed with them).
     var resources: GhosttyResourceStaging.Source? = nil
     /// Their digest (`RemoteHostResources.digest`), as the other Mac's
-    /// scripts compute it (`resources_hash`).
+    /// scripts compute it (`resources_hash`), CherryMCP included when there
+    /// is one.
     var resourcesHash: String? = nil
+    /// CherryMCP (docs/specs/remote-devices.md, phase 4b), installed with
+    /// the resources as `<build>/CherryMCP` for agents in tabs there; nil
+    /// when this Cherry has none next to its helpers or its own executable.
+    var mcpHelper: URL? = nil
 
     var build: String { version.build ?? "unknown" }
 
@@ -145,8 +150,10 @@ struct RemoteHostHelpers: Equatable, Sendable {
     /// default) installed next to them.
     static func load(
         directory: URL,
-        resources: GhosttyResourceStaging.Source? = GhosttyResourceStaging.bundledSource()
+        resources: GhosttyResourceStaging.Source? = GhosttyResourceStaging.bundledSource(),
+        mcpHelper: URL?? = nil
     ) throws -> RemoteHostHelpers {
+        let mcpHelper = mcpHelper ?? defaultMCPHelper(near: directory)
         let files = names.map { directory.appendingPathComponent($0) }
         for file in files where !FileManager.default.isExecutableFile(atPath: file.path) {
             throw HostedSessionError.message("This Cherry has no \(file.lastPathComponent) to install (looked in \(directory.path)).")
@@ -169,8 +176,18 @@ struct RemoteHostHelpers: Equatable, Sendable {
             architectures: architectures ?? [],
             hashes: try files.map(sha256),
             resources: installable,
-            resourcesHash: installable.flatMap { try? RemoteHostResources.digest(of: $0) }
+            resourcesHash: installable.flatMap { try? RemoteHostResources.digest(of: $0, mcpHelper: mcpHelper) },
+            mcpHelper: installable == nil ? nil : mcpHelper
         )
+    }
+
+    /// The CherryMCP installed with the helpers: next to them (the app's
+    /// Contents/MacOS), else next to the running executable (a SwiftPM
+    /// build's products).
+    static func defaultMCPHelper(near directory: URL) -> URL? {
+        let candidates = [directory, Bundle.main.executableURL?.deletingLastPathComponent()].compactMap { $0 }
+        return candidates.map { $0.appendingPathComponent(RemoteMCPPaths.helperName) }
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
     static func sha256(_ url: URL) throws -> String {
@@ -300,11 +317,12 @@ enum RemoteHostResources {
     /// The digest the other Mac's `resources_hash` computes: the SHA-256 of
     /// `shasum -a 256` lines ("<hex>  <path>") of every regular file under
     /// `Ghostty/` and `terminfo/`, by path in byte order.
-    static func digest(of source: GhosttyResourceStaging.Source) throws -> String {
+    static func digest(of source: GhosttyResourceStaging.Source, mcpHelper: URL? = nil) throws -> String {
         var files: [(path: String, url: URL)] = []
         for (name, root) in zip(treeNames, [source.resourcesDirectory, source.terminfoDirectory]) {
             try collectFiles(in: root, relativePath: name, into: &files)
         }
+        if let mcpHelper { files.append((RemoteMCPPaths.helperName, mcpHelper)) }
         files.sort { Array($0.path.utf8).lexicographicallyPrecedes(Array($1.path.utf8)) }
         var listing = ""
         for file in files {
@@ -326,12 +344,12 @@ enum RemoteHostResources {
         }
     }
 
-    /// `resources_hash D`: the digest of D's trees, or `-` when either is
-    /// missing.
+    /// `resources_hash D`: the digest of D's trees and its CherryMCP (when
+    /// it has one), or `-` when either tree is missing.
     static let hashFunction: [String] = [
         "resources_hash() {",
         "  if [ -d \"$1/Ghostty/shell-integration\" ] && [ -d \"$1/terminfo\" ]; then",
-        "    (cd \"$1\" && /usr/bin/find Ghostty terminfo -type f -print 2>/dev/null | LC_ALL=C /usr/bin/sort | while IFS= read -r f; do \(RemoteHostInstaller.Tool.shasum) -a 256 \"$f\"; done) | \(RemoteHostInstaller.Tool.shasum) -a 256 | \(RemoteHostInstaller.Tool.awk) '{ print $1 }'",
+        "    (cd \"$1\" && { /usr/bin/find Ghostty terminfo -type f -print 2>/dev/null; if [ -f CherryMCP ]; then echo CherryMCP; fi; } | LC_ALL=C /usr/bin/sort | while IFS= read -r f; do \(RemoteHostInstaller.Tool.shasum) -a 256 \"$f\"; done) | \(RemoteHostInstaller.Tool.shasum) -a 256 | \(RemoteHostInstaller.Tool.awk) '{ print $1 }'",
         "  else",
         "    echo -",
         "  fi",
@@ -926,6 +944,7 @@ struct RemoteHostInstaller: Sendable {
             "if [ -f \"$src/cherry\" ] && [ -x \"$src/cherry\" ] && [ -f \"$src/cherry-host\" ] && [ -x \"$src/cherry-host\" ]; then",
             "  \(Tool.xattr) -c \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null",
             "  for tree in Ghostty terminfo; do [ -d \"$src/$tree\" ] && \(Tool.xattr) -cr \"$src/$tree\" 2>/dev/null; done",
+            "  [ -f \"$src/CherryMCP\" ] && \(Tool.xattr) -c \"$src/CherryMCP\" 2>/dev/null",
             "  printf 'resources_hash=%s\\n' \"$(resources_hash \"$src\")\"",
             "  printf 'xattrs=%s\\n' \"$(\(Tool.xattr) \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null | tr '\\n' ' ')\"",
             "  if signature=$(\(Tool.codesign) --verify --strict \"$src/cherry-host\" 2>&1) && signature=$(\(Tool.codesign) --verify --strict \"$src/cherry\" 2>&1); then",
@@ -1402,6 +1421,9 @@ struct RemoteHostInstaller: Sendable {
                 "-C", resources.resourcesDirectory.deletingLastPathComponent().path, RemoteHostResources.treeNames[0],
                 "-C", resources.terminfoDirectory.deletingLastPathComponent().path, RemoteHostResources.treeNames[1],
             ]
+            if let mcpHelper = helpers.mcpHelper {
+                arguments += ["-C", mcpHelper.deletingLastPathComponent().path, mcpHelper.lastPathComponent]
+            }
         }
         return arguments
     }

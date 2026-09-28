@@ -204,7 +204,8 @@ final class AddDeviceModel: ObservableObject {
                 installedBuild: installed?.build,
                 installedArch: installed?.architecture,
                 shell: probe.shell,
-                installedResources: installed?.resourcesInstalled ?? false
+                installedResources: installed?.resourcesInstalled ?? false,
+                userTemporaryDirectory: probe.userTemporaryDirectory
             )
         } catch {
             self.error = error.localizedDescription
@@ -484,6 +485,7 @@ final class UpdateDeviceHostModel: ObservableObject {
                 store.update(deviceID) { device in
                     device.shell = probe.shell ?? device.shell
                     device.homeDirectory = probe.homeDirectory ?? device.homeDirectory
+                    device.userTemporaryDirectory = probe.userTemporaryDirectory ?? device.userTemporaryDirectory
                 }
             }
             self.outcome = outcome

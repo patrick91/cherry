@@ -55,6 +55,13 @@ public enum ProjectLocation: Hashable, Sendable {
 
     public var isRemote: Bool { deviceID != nil }
 
+    /// Whether `path` has a `.` or `..` component. A remote key's path keeps
+    /// them (the other machine resolves them), so anything that compares or
+    /// resolves a path a caller on another Mac sent refuses them instead.
+    public static func hasDotComponents(_ path: String) -> Bool {
+        path.split(separator: "/", omittingEmptySubsequences: true).contains { $0 == "." || $0 == ".." }
+    }
+
     /// `device:<uuid>:<absolute path>`, nil for anything else.
     private static func remote(fromKey key: String) -> ProjectLocation? {
         guard key.hasPrefix(remoteKeyPrefix) else { return nil }

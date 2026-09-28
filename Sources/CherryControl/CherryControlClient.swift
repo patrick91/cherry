@@ -4,20 +4,67 @@ import Foundation
 public struct CherryControlClient: Sendable {
     public let socketURL: URL
     public let timeout: TimeInterval
+    /// A tab of another Mac's token and id, sent with every request
+    /// (`CherryControlEnvelope`); nil for This Mac's callers, which the app
+    /// identifies by their process.
+    public let credentials: CherryControlCredentials?
+    /// The Mac Cherry runs on, when this caller reaches it through a
+    /// forward (for "Cherry on <Mac> is not reachable").
+    public let controlMachine: String?
 
-    public init(socketURL: URL = CherryControl.socketURL, timeout: TimeInterval = 10) {
+    public init(
+        socketURL: URL = CherryControl.socketURL,
+        timeout: TimeInterval = 10,
+        credentials: CherryControlCredentials? = CherryControlCredentials.fromEnvironment(),
+        controlMachine: String? = ProcessInfo.processInfo.environment[CherryControl.controlMachineEnvironmentKey]
+    ) {
         self.socketURL = socketURL
         self.timeout = max(timeout, 0.1)
+        self.credentials = credentials
+        self.controlMachine = controlMachine?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmptyString
+    }
+
+    /// "Cherry on <Mac> is not reachable": the forward of its control
+    /// socket to this Mac is down (Cherry quit, the Mac slept or went
+    /// offline, the SSH connection is being made again).
+    private func unreachable(_ detail: String) -> CherryControlError {
+        let machine = controlMachine ?? "the other Mac"
+        return CherryControlError(
+            code: "cherry_unreachable",
+            message: "Cherry on \(machine) is not reachable (\(detail)). Its connection to this Mac comes back when Cherry there reconnects."
+        )
     }
 
     public func send(_ request: CherryControlRequest) throws -> CherryControlResponse {
+        do {
+            return try sendOnce(request)
+        } catch let error as CherryControlError where credentials != nil {
+            switch error.code {
+            case "cherry_unavailable": throw unreachable("its control socket \(socketURL.path) did not answer")
+            case "empty_response", "read_failed", "write_failed": throw unreachable("the connection closed without an answer")
+            default: throw error
+            }
+        }
+    }
+
+    private func sendOnce(_ request: CherryControlRequest) throws -> CherryControlResponse {
         let encoder = JSONEncoder()
-        let payload = try encoder.encode(request) + Data([0x0A])
+        let body: Data = if let credentials {
+            try encoder.encode(CherryControlEnvelope(cherryAuth: credentials, request: request))
+        } else {
+            try encoder.encode(request)
+        }
+        let payload = body + Data([0x0A])
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw CherryControlError(code: "socket_failed", message: "Failed to create local socket.")
         }
         setCloseOnExec(fileDescriptor: fd)
+        // A server that refused the request before reading it (and closed)
+        // makes the write fail with EPIPE, never SIGPIPE; its answer is
+        // still read.
+        var noSigpipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
         defer {
             close(fd)
         }
@@ -112,6 +159,9 @@ public struct CherryControlClient: Sendable {
                     offset += written
                 } else if written < 0, errno == EINTR {
                     continue
+                } else if written < 0, errno == EPIPE {
+                    // The server answered and closed early: read its answer.
+                    return
                 } else if written < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT {
                     throw CherryControlError(code: "request_timed_out", message: "Timed out writing Cherry control request.")
                 } else {
@@ -126,6 +176,10 @@ public struct CherryControlClient: Sendable {
         guard flags >= 0 else { return }
         _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
     }
+}
+
+private extension String {
+    var nilIfEmptyString: String? { isEmpty ? nil : self }
 }
 
 private func + (lhs: Data, rhs: Data) -> Data {

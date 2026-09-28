@@ -920,6 +920,9 @@ struct CherryApp: App {
                     })
                     server.start()
                     controlServer = server
+                    // Devices' forwards reach its listeners (phase 4b).
+                    RemoteMCPForwards.appServer = server
+                    RemoteDeviceStore.shared.ensureMCPForwardsOfConnectedDevices()
                 }
         }
         .defaultSize(width: 1_340, height: 840)

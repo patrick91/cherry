@@ -47,6 +47,10 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// The install there (`remoteHostPath`) has this Cherry's Ghostty
     /// resources (terminfo, shell integration) next to cherry-host.
     var installedResources: Bool
+    /// Its account's per-user temporary directory (`getconf
+    /// DARWIN_USER_TEMP_DIR`), from the check or the first Cherry MCP
+    /// forward: where the forwarded control socket goes (phase 4b).
+    var userTemporaryDirectory: String? = nil
 
     init(
         id: UUID = UUID(),
@@ -99,6 +103,10 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         installedArch = try container.decodeIfPresent(String.self, forKey: .installedArch)
         shell = try container.decodeIfPresent(String.self, forKey: .shell)
         installedResources = try container.decodeIfPresent(Bool.self, forKey: .installedResources) ?? false
+        // Checked again when read back: it goes into `ssh -R` specs.
+        userTemporaryDirectory = RemoteMCPPaths.validTemporaryDirectory(
+            try container.decodeIfPresent(String.self, forKey: .userTemporaryDirectory), source: "devices.json"
+        )
     }
 
     /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
@@ -259,7 +267,8 @@ final class RemoteDeviceStore: ObservableObject {
         installedBuild: String? = nil,
         installedArch: String? = nil,
         shell: String? = nil,
-        installedResources: Bool = false
+        installedResources: Bool = false,
+        userTemporaryDirectory: String? = nil
     ) throws -> RemoteDevice {
         guard canWrite() else { throw HostedSessionError.message(Self.readOnlyReason) }
         let host = try HostedSessionHost.ssh(sshDestination)
@@ -273,7 +282,7 @@ final class RemoteDeviceStore: ObservableObject {
             )
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let device = RemoteDevice(
+        var device = RemoteDevice(
             name: trimmed.isEmpty ? destination : trimmed,
             sshDestination: destination,
             remoteHostPath: remoteHostPath?.nilIfEmpty,
@@ -288,6 +297,7 @@ final class RemoteDeviceStore: ObservableObject {
             shell: shell?.nilIfEmpty,
             installedResources: installedResources
         )
+        device.userTemporaryDirectory = RemoteMCPPaths.validTemporaryDirectory(userTemporaryDirectory, source: "the check")
         if device.createdHostEntry { try hostStore.add(destination) }
         devices.append(device)
         save()
@@ -321,6 +331,9 @@ final class RemoteDeviceStore: ObservableObject {
         if device.createdHostEntry, let host = device.host { hostStore.remove(host) }
         connectionWatches.removeValue(forKey: id)
         lastMarked.removeValue(forKey: id)
+        if let forwards = RemoteMCPForwards.existing {
+            Task { await forwards.stop(deviceID: id) }
+        }
         if let hosting = hostings.removeValue(forKey: id), !hosting.isInUse {
             // One still in use stays registered: its windows and ends keep
             // it, and adding the Mac again takes it back.
@@ -386,7 +399,7 @@ final class RemoteDeviceStore: ObservableObject {
         }
         let hosting = makeHosting(
             .remote(host: host, displayName: device.name, machineNames: Set(device.machineNames)) { [weak self] in
-                self?.device(id: id)?.launchDevice
+                self?.launchDevice(id: id)
             },
             installation
         )
@@ -396,6 +409,63 @@ final class RemoteDeviceStore: ObservableObject {
         registry.register(hosting)
         watchConnections(of: id, control: hosting.control)
         return hosting
+    }
+
+    /// What a launch of the device's tabs needs (`RemoteLaunchSpec.Device`),
+    /// with Cherry MCP's forwarded socket and tokens (phase 4b).
+    func launchDevice(id: UUID) -> RemoteLaunchSpec.Device? {
+        guard let device = device(id: id) else { return nil }
+        var launch = device.launchDevice
+        // The socket goes in the account's per-user temporary directory
+        // there: known from the check or the first forward; until then its
+        // tabs have no Cherry MCP (never a path in the shared /tmp).
+        if let installation = installationID(),
+           let socket = RemoteMCPPaths.remoteSocket(
+               temporaryDirectory: device.userTemporaryDirectory, installationID: installation, deviceID: id
+           ) {
+            launch.mcp = RemoteMCPLaunch(
+                deviceID: id,
+                socketPath: socket,
+                helperPath: device.installedResources
+                    ? RemoteMCPPaths.helperPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
+                    : nil,
+                controlMachine: RemoteMCPLaunch.thisMacName,
+                tokens: .shared
+            )
+        }
+        return launch
+    }
+
+    /// The forward of Cherry's control socket to the device, made on each
+    /// connection of its control (phase 4b): a master that came back gets
+    /// it again. Tests turn it off.
+    var forwardsMCP = true
+
+    /// Makes the forwards of the devices connected now (once the app's
+    /// control server started, which may be after they connected).
+    func ensureMCPForwardsOfConnectedDevices() {
+        for (id, hosting) in hostings where hosting.control.state == .connected {
+            ensureMCPForward(of: id)
+        }
+    }
+
+    private func ensureMCPForward(of id: UUID) {
+        // Only once the app's control server runs (never in tests that did
+        // not set one up): nothing else is made or run before.
+        guard forwardsMCP, RemoteMCPForwards.existing != nil || RemoteMCPForwards.appServer != nil,
+              let device = device(id: id), let installation = installationID()
+        else { return }
+        let target = RemoteMCPForwards.Target(
+            deviceID: id, destination: device.sshDestination, machine: device.name, installationID: installation
+        )
+        let forwards = RemoteMCPForwards.shared
+        forwards.temporaryDirectoryFound = { [weak self] deviceID, directory in
+            guard let self, self.device(id: deviceID)?.userTemporaryDirectory != directory, self.canWrite(),
+                  RemoteMCPPaths.validTemporaryDirectory(directory, source: "the forward") != nil
+            else { return }
+            self.update(deviceID) { $0.userTemporaryDirectory = directory }
+        }
+        Task { await forwards.ensure(target) }
     }
 
     /// On each connection of the device's control: marks the build
@@ -408,7 +478,10 @@ final class RemoteDeviceStore: ObservableObject {
             .removeDuplicates()
             .filter { $0 == .connected }
             .sink { [weak self] _ in
-                MainActor.assumeIsolated { self?.markUsedBuild(of: id) }
+                MainActor.assumeIsolated {
+                    self?.markUsedBuild(of: id)
+                    self?.ensureMCPForward(of: id)
+                }
             }
     }
 

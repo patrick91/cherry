@@ -293,14 +293,26 @@ struct HostedSessionsSheet: View {
     @State private var workingDirectory = ""
     @State private var selectedSessionID: String?
     @State private var terminationCandidate: HostedSessionInfo?
+    /// A device window's own Mac (docs/specs/remote-devices.md): the only
+    /// host its sheet offers, so no session of This Mac or of another host
+    /// is ever attached into it (Cherry MCP there reaches only that Mac's).
+    private let deviceHost: HostedSessionHost?
 
     /// Opens on the host the picker asked for (Persistent Sessions on
-    /// <Mac>…, Other sessions), else a device window's own Mac, else This Mac.
+    /// <Mac>…, Other sessions), else a device window's own Mac, else This
+    /// Mac. A device window only ever shows its own Mac.
     init(workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState) {
         self.workspace = workspace
         self.chromeState = chromeState
-        let deviceHost = workspace.backendPolicy.localSessions.flatMap { $0.profile.isThisMac ? nil : $0.profile.host }
-        _selectedHost = State(initialValue: chromeState.hostedSessionsInitialHost ?? deviceHost ?? .local)
+        let deviceHost = Self.deviceHost(of: workspace)
+        self.deviceHost = deviceHost
+        _selectedHost = State(initialValue: deviceHost ?? chromeState.hostedSessionsInitialHost ?? .local)
+    }
+
+    /// The host a device window's sheet is limited to: its hosting's.
+    @MainActor
+    static func deviceHost(of workspace: TerminalWorkspace) -> HostedSessionHost? {
+        workspace.backendPolicy.localSessions.flatMap { $0.profile.isThisMac ? nil : $0.profile.host }
     }
 
     private var selectedSession: HostedSessionInfo? {
@@ -338,11 +350,15 @@ struct HostedSessionsSheet: View {
             }
 
             HStack {
-                Picker("Host", selection: $selectedHost) {
-                    Text("This Mac").tag(HostedSessionHost.local)
-                    ForEach(hosts.hosts) { host in Text(host.displayName).tag(host) }
+                if let deviceHost {
+                    LabeledContent("Host", value: workspace.backendPolicy.localSessions?.profile.displayName ?? deviceHost.displayName)
+                } else {
+                    Picker("Host", selection: $selectedHost) {
+                        Text("This Mac").tag(HostedSessionHost.local)
+                        ForEach(hosts.hosts) { host in Text(host.displayName).tag(host) }
+                    }
                 }
-                if selectedHost.sshDestination != nil {
+                if deviceHost == nil, selectedHost.sshDestination != nil {
                     Button("Forget Host", systemImage: "minus.circle") {
                         hosts.remove(selectedHost)
                         selectedHost = .local
@@ -360,14 +376,16 @@ struct HostedSessionsSheet: View {
             }
             .disabled(controller.isBusy)
 
-            HStack {
-                TextField("SSH alias or user@hostname", text: $newHost)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(saveHost)
-                Button("Add Host", action: saveHost)
-                    .disabled(newHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            if deviceHost == nil {
+                HStack {
+                    TextField("SSH alias or user@hostname", text: $newHost)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(saveHost)
+                    Button("Add Host", action: saveHost)
+                        .disabled(newHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .disabled(controller.isBusy)
             }
-            .disabled(controller.isBusy)
 
             List(selection: $selectedSessionID) {
                 ForEach(controller.sessions) { session in
@@ -548,6 +566,8 @@ struct HostedSessionsSheet: View {
     /// client shows, becomes a regular tab of this window (closing it follows
     /// Settings › Sessions); others attach, and closing them only disconnects.
     private func attach(_ attachment: HostedSessionAttachment, takeover: Bool = false, info: HostedSessionInfo? = nil) {
+        // A device window takes only its own Mac's sessions.
+        guard deviceHost == nil || attachment.host == deviceHost else { return }
         workspace.attachHostedSession(attachment, takeover: takeover, info: info)
         chromeState.selectTerminal()
         dismiss()

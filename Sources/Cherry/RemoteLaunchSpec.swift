@@ -22,7 +22,10 @@ import Foundation
 ///   `GHOSTTY_RESOURCES_DIR` when it has the resources, else
 ///   `xterm-256color`), `COLORTERM`, the tab's identity (`CHERRY_PROCESS_ID`,
 ///   `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` as the path there,
-///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the shell
+///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), Cherry MCP's
+///   (`CHERRY_CONTROL_SOCKET` as the socket forwarded there,
+///   `CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CONTROL_MACHINE`;
+///   phase 4b), the shell
 ///   integration's variables (paths on the device), the command's own
 ///   variables (cherry.toml), and the locale (`LANG`, `LC_*`). The host adds
 ///   its own (`CHERRY_SESSION_ID`, `PWD`, `SSH_AUTH_SOCK`, and HOME, USER,
@@ -61,11 +64,15 @@ enum RemoteLaunchSpec {
         var shell: String?
         var homeDirectory: String?
         var resources: Resources?
+        /// Cherry MCP for its agents (phase 4b): the forwarded control
+        /// socket there, the tab's token, the install's CherryMCP.
+        var mcp: RemoteMCPLaunch?
 
-        init(shell: String? = nil, homeDirectory: String? = nil, resources: Resources? = nil) {
+        init(shell: String? = nil, homeDirectory: String? = nil, resources: Resources? = nil, mcp: RemoteMCPLaunch? = nil) {
             self.shell = shell
             self.homeDirectory = homeDirectory
             self.resources = resources
+            self.mcp = mcp
         }
     }
 
@@ -73,6 +80,9 @@ enum RemoteLaunchSpec {
     /// sent to another Mac, whatever the tab's environment says.
     static let localOnlyKeys: Set<String> = CherryTabEnvironment.keys.union([
         CherryControl.socketEnvironmentKey,
+        CherryControl.mcpTokenEnvironmentKey,
+        CherryControl.mcpHelperEnvironmentKey,
+        CherryControl.controlMachineEnvironmentKey,
         "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK", "PWD", "OLDPWD",
         "TERM", "TERMINFO", "TERMINFO_DIRS", "ZDOTDIR", "XDG_DATA_DIRS", "MANPATH",
         "TERM_PROGRAM_VERSION", "__CF_USER_TEXT_ENCODING", "ENV", "HISTFILE"
@@ -104,6 +114,11 @@ enum RemoteLaunchSpec {
         }
         if let agentID = configuration.agentID?.nilIfEmpty {
             environment[CherryControl.agentIDEnvironmentKey] = agentID
+        }
+        if let mcp = device.mcp, let processID = configuration.processID?.nilIfEmpty {
+            // The forwarded control socket there (never This Mac's path)
+            // and the tab's own token.
+            environment.merge(mcp.environment(processID: processID)) { _, mcp in mcp }
         }
         let shell = device.shell?.nilIfEmpty ?? remoteShell.nilIfEmpty ?? defaultRemoteShell
         var argv: [String] = if let line = configuration.startupCommand?.nilIfEmpty {

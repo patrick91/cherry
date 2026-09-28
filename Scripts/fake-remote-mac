@@ -32,7 +32,14 @@
 #                 master succeed and append "forward|cancel PATH SPEC" to
 #                 DIR/forwards (nothing listens: the loopback test makes a
 #                 real forward); with DIR/forward-fails a forward fails as
-#                 ssh does when its local port is taken.
+#                 ssh does when its local port is taken. `-O forward -R
+#                 THERE:HERE` (a Unix socket forwarded to this Mac, Cherry
+#                 MCP) links THERE to HERE, which bridges them since the fake
+#                 Mac's files are this Mac's; like sshd it fails when THERE
+#                 exists (StreamLocalBindUnlink no), and always with
+#                 DIR/remote-forward-fails (a server that refuses, as with
+#                 AllowStreamLocalForwarding no). `-O cancel -R` removes the
+#                 link. Both are logged to DIR/forwards too.
 # and in DIR/hosts/NAME:
 #   offline   ssh: connect to host NAME port 22: Connection timed out (255)
 #   hostkey   Host key verification failed. (255)
@@ -193,6 +200,7 @@ master=no
 control=
 path=
 spec=
+rspec=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; destination=${1-}; [ $# -gt 0 ] && shift; break ;;
@@ -208,6 +216,7 @@ while [ $# -gt 0 ]; do
       case "${1-}" in ControlPath=*) path=${1#ControlPath=} ;; esac ;;
     -oControlPath=*) path=${1#-oControlPath=} ;;
     -L) shift; spec=${1-} ;;
+    -R) shift; rspec=${1-} ;;
     -[BbcDEeFIiJlmpQRSWw]) shift ;;
     -*) ;;
     *) destination=$1; shift; break ;;
@@ -224,6 +233,23 @@ if [ -n "$control" ]; then
     forward|cancel)
       if [ -z "$path" ] || [ ! -f "$path.pid" ]; then
         echo "Control socket connect($path): No such file or directory" >&2; exit 255
+      fi
+      if [ -n "$rspec" ]; then
+        there=${rspec%%:*}
+        here=${rspec#*:}
+        if [ "$control" = forward ]; then
+          if [ -f "$dir/remote-forward-fails" ]; then
+            echo "mux_client_forward: forwarding request failed: remote port forwarding failed for listen path $there" >&2; exit 255
+          fi
+          if [ -e "$there" ] || [ -L "$there" ]; then
+            echo "mux_client_forward: forwarding request failed: remote port forwarding failed for listen path $there" >&2; exit 255
+          fi
+          /bin/ln -s "$here" "$there" || exit 255
+        else
+          [ -L "$there" ] && /bin/rm -f "$there"
+        fi
+        printf '%s %s -R %s\n' "$control" "$path" "$rspec" >> "$dir/forwards"
+        exit 0
       fi
       if [ "$control" = forward ] && [ -f "$dir/forward-fails" ]; then
         echo "mux_client_forward: forwarding request failed: Port forwarding failed" >&2; exit 255

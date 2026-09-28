@@ -461,7 +461,9 @@ adopts the other's sessions (the other's are attached, never owned).
 
 Add Mac… (and a device's Update Session Host…) installs the Mac app's own
 `cherry` and `cherry-host` on that Mac, in
-`~/Library/Application Support/cherry-host/bin/<build>/`, and passes
+`~/Library/Application Support/cherry-host/bin/<build>/` (with Ghostty's
+terminfo and shell integration, and the app's `CherryMCP` for agents in its
+tabs, checked by the same `resources_hash` digest), and passes
 `--remote-host-path ~/Library/Application Support/cherry-host/bin/<build>/cherry-host`
 from then on. Each build has its own directory, which is never changed once
 in place: a running signed executable whose pages change is killed by
@@ -684,6 +686,19 @@ it runs as a one-shot command over the master rather than as a request on
 the control connection, so the protocol (and a daemon another app shares)
 is unchanged, and an older cherry-host without it makes the app say to
 update it.
+
+Cherry MCP for agents in a device's tabs (docs/specs/remote-devices.md,
+phase 4b) uses neither the host nor its protocol: the app reverse-forwards
+a listener of its own control server to that Mac over the device's SSH
+master (`ssh -O forward -R <DARWIN_USER_TEMP_DIR>/cherry-mcp-<hash>/control.sock:<here>`; the
+directory is 0700 and this account's, and the socket a dead master left is
+removed first, since sshd's StreamLocalBindUnlink is off by default), and
+the tabs' Create carries `CHERRY_CONTROL_SOCKET` (that path),
+`CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER` and `CHERRY_CONTROL_MACHINE` in
+its environment like any other variable. The holder does nothing with them.
+The server's sshd must allow remote forwards of Unix sockets:
+`AllowStreamLocalForwarding` and `AllowTcpForwarding` yes or remote (sshd
+denies one under `AllowTcpForwarding local`); both are yes by default.
 
 `--socket /absolute/private/path/host.sock` selects a separate host (its own
 daemon and state directory); with `--host`, that path is on the remote machine.

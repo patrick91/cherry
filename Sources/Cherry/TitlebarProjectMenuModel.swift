@@ -69,6 +69,9 @@ struct TitlebarProjectMenuModel: Equatable {
         case trustDeviceIdentity(UUID)
         /// Update Session Host…: install this Cherry's there.
         case updateDeviceHost(UUID)
+        /// Set Up Cherry MCP on <Mac>…: registers Cherry MCP with the
+        /// agents there, when the user confirms (phase 4b).
+        case setUpDeviceMCP(UUID)
         case renameDevice(UUID)
         case removeDevice(UUID)
         case addMac
@@ -201,6 +204,7 @@ struct TitlebarProjectMenuModel: Equatable {
             children.append(.item(Item(title: entry.hostUpdateTitle, isEnabled: canModify, action: .updateDeviceHost(id))))
         }
         children.append(.item(Item(title: "Persistent Sessions on \(device.name)…", action: .openDeviceSessions(id))))
+        children.append(.item(Item(title: "Set Up Cherry MCP on \(device.name)…", isEnabled: canOpen, action: .setUpDeviceMCP(id))))
         children.append(.separator)
         children.append(.item(Item(title: "Rename…", isEnabled: canModify, action: .renameDevice(id))))
         children.append(.item(Item(title: "Remove…", isEnabled: canModify, action: .removeDevice(id))))

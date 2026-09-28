@@ -695,3 +695,60 @@ private extension ProcessInfo {
         throw error
     }
 }
+
+// MARK: - CherryMCP in the install (phase 4b)
+
+@Test(.enabled(if: installRealHostEnabled))
+@MainActor func RemoteDeviceRealHostInstallCopiesCherryMCPWithTheHelpers() async throws {
+    let repository = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let mcp = repository.appendingPathComponent(".build/debug/CherryMCP")
+    try #require(FileManager.default.isExecutableFile(atPath: mcp.path), "Build CherryMCP first: swift build --build-tests")
+    let mac = try FakeRemoteMac(name: "mcpinstall", host: "none", startsDaemon: false)
+    let directory = try temporaryDirectory("mcpinstall")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    do {
+        let helpers = try RemoteHostHelpers.load(directory: mac.binaries, mcpHelper: .some(mcp))
+        #expect(helpers.mcpHelper == mcp)
+        // CherryMCP is part of the resources' digest.
+        let without = try RemoteHostHelpers.load(directory: mac.binaries, mcpHelper: .some(nil))
+        #expect(without.mcpHelper == nil)
+        #expect(helpers.resourcesHash != nil && helpers.resourcesHash != without.resourcesHash)
+        #expect(RemoteHostInstaller.archiveArguments(helpers).suffix(3) == ["-C", mcp.deletingLastPathComponent().path, "CherryMCP"])
+        #expect(!RemoteHostInstaller.archiveArguments(without).contains("CherryMCP"))
+
+        let store = deviceStore(for: mac, directory: directory)
+        let model = AddDeviceModel(
+            store: store, aliases: [], shell: { mac.shell }, helpers: { .success(helpers) }, openInTerminal: { _ in }
+        )
+        model.destination = "mcpinstall"
+        await model.check()
+        let device = try #require(await model.addInstallingIfNeeded(), "\(model.error ?? "")")
+        let installed = mac.installRoot.appendingPathComponent(helpers.directoryName, isDirectory: true)
+        #expect(entries(installed) == ["CherryMCP", "Ghostty", "cherry", "cherry-host", "terminfo"])
+        #expect(try RemoteHostHelpers.sha256(installed.appendingPathComponent("CherryMCP")) == RemoteHostHelpers.sha256(mcp))
+        #expect(device.installedResources)
+        // It runs there.
+        #expect(try runTool(installed.appendingPathComponent("CherryMCP").path, ["--version"]) == 0)
+        // The device's tabs name it.
+        #expect(store.launchDevice(id: device.id)?.mcp?.helperPath == installed.appendingPathComponent("CherryMCP").path)
+        // Checked again: the shell's digest counts CherryMCP too, so nothing
+        // is copied again.
+        let update = UpdateDeviceHostModel(
+            deviceID: device.id, store: store, shell: { mac.shell }, helpers: { .success(helpers) },
+            masters: noMasters, reconnect: { _ in }
+        )
+        await update.check()
+        #expect(update.installation?.plan?.copyNeeded == false)
+        // Helpers whose digest differs (here: without CherryMCP) copy again.
+        let olderCheck = UpdateDeviceHostModel(
+            deviceID: device.id, store: store, shell: { mac.shell }, helpers: { .success(without) },
+            masters: noMasters, reconnect: { _ in }
+        )
+        await olderCheck.check()
+        #expect(olderCheck.installation?.plan?.copyNeeded == true)
+    } catch {
+        Issue.record(error)
+    }
+    await mac.tearDown()
+}

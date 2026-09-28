@@ -190,6 +190,7 @@ struct RemoteDevicesSettingsSection: View {
                                 Button(row.updateTitle) { RemoteDeviceUpdatePresenter.present(deviceID: row.id) }
                                     .disabled(!model.canModify)
                             }
+                            Button("Set Up Cherry MCP…") { RemoteMCPSetupPresenter.present(deviceID: row.id) }
                             Button("Remove…") { RemoteDeviceAlerts.confirmRemove(row.id, store: .shared) }
                                 .disabled(!model.canModify)
                         }

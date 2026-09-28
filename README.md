@@ -219,12 +219,21 @@ Studio"). Cherry's MCP tools (`get_process_ports`, `services_list`,
 naming the Mac (`machine`, `remoteURL`); they forward nothing, except
 `wait_for_bound_port` with `probe_http`, which forwards the port it probes
 (`url` is then the forwarded one). Forwards end when their tab or window
-closes. Its
+closes. Agents in its tabs (Claude Code, Codex) can use Cherry's MCP tools
+too, scoped to their window and never reaching beyond that Mac's projects
+and tabs: Cherry forwards its control socket to that Mac over the SSH
+connection and gives each tab a token of its own, renewed whenever its
+program restarts. **Set Up Cherry MCP on Studio…** (in its menu and in
+Settings › Sessions › Other Macs) shows the commands that register Cherry
+MCP with Claude Code and Codex there and runs them only when you confirm;
+**Remove** takes them away again. While Cherry cannot be reached from there
+(it quit, or the connection is being made again) the tools say "Cherry on
+<this Mac> is not reachable". Its
 sessions no tab shows are listed under its name in Background Sessions
 (while Cherry is connected to it, or while the menu is open; looking at a
 Mac, there or in the project picker, never starts its session host), and
 **Settings › Sessions › Other Macs** shows how each Mac stands, with
-**Reconnect**, **Update Session Host…** and **Remove…**. A tab that cannot
+**Reconnect**, **Update Session Host…**, **Set Up Cherry MCP…** and **Remove…**. A tab that cannot
 start there says so ("Couldn't start on Studio: …", with **Retry**), never
 running a shell on this Mac instead. **Not open here** in the sidebar lists
 that project's sessions on the Mac that no tab shows: **Reopen** for this
@@ -390,7 +399,9 @@ claude mcp add --transport stdio --scope user cherry -- "$HOME/Applications/Cher
 Run the Cherry app first. The helper forwards MCP tool calls to Cherry's
 instance-scoped Unix control socket under `/tmp/cherry-$UID/`. The MCP server
 exposes process-first tools for terminals, agents, configured project commands,
-output reads, idle waiting, service readiness, notes, and todos. See
+output reads, idle waiting, service readiness, notes, and todos. Agents on
+your other Macs reach it through **Set Up Cherry MCP on <Mac>…** (see
+Devices above). See
 [docs/mcp.md](docs/mcp.md) for the tool guide and recommended agent workflows.
 
 ## Rendering Debug

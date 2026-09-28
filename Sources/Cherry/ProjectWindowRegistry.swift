@@ -1196,6 +1196,12 @@ final class ProjectWindowChromeState: ObservableObject {
     /// Test seam for `isCursorActuallyOverLeadingSidebar(width:)`.
     var cursorOverSidebarProbeForTesting: ((CGFloat) -> Bool)?
 
+    /// Test seam for when a docked sidebar animation's state ends: given
+    /// the end, runs it when the animation is over. By default it runs
+    /// `dockedSidebarAnimationStateDuration` later; tests run it when they
+    /// choose, so overlapping animations do not race the clock.
+    var dockedAnimationEndSchedulerForTesting: ((@escaping @MainActor () -> Void) -> Void)?
+
     /// Tests give toasts a clock and announcer of their own, which the
     /// closed tabs share.
     init(toasts: ProjectWindowToasts = ProjectWindowToasts()) {
@@ -1393,18 +1399,28 @@ final class ProjectWindowChromeState: ObservableObject {
         withAnimation(.snappy(duration: 0.18)) {
             body()
         }
-        Task { @MainActor [weak self] in
+        let end: @MainActor () -> Void = { [weak self] in
+            self?.endDockedAnimation()
+        }
+        if let schedule = dockedAnimationEndSchedulerForTesting {
+            schedule(end)
+            return
+        }
+        Task { @MainActor in
             do {
                 try await Task.sleep(for: Self.dockedSidebarAnimationStateDuration)
             } catch {
                 return
             }
-            guard let self else { return }
-            self.dockedSidebarAnimationDepth = max(0, self.dockedSidebarAnimationDepth - 1)
-            self.isSidebarAnimating = self.dockedSidebarAnimationDepth > 0
-            if self.dockedSidebarAnimationDepth == 0 {
-                self.pendingPostAnimationDelta = 0
-            }
+            end()
+        }
+    }
+
+    private func endDockedAnimation() {
+        dockedSidebarAnimationDepth = max(0, dockedSidebarAnimationDepth - 1)
+        isSidebarAnimating = dockedSidebarAnimationDepth > 0
+        if dockedSidebarAnimationDepth == 0 {
+            pendingPostAnimationDelta = 0
         }
     }
 }

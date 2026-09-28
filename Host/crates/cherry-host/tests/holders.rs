@@ -153,9 +153,11 @@ fn a_crashed_holder_ends_only_its_own_session() {
 #[test]
 fn a_crashed_holders_exit_event_says_the_holder_was_lost() {
     let host = Host::new();
+    // Subscribed before either session starts: a fast shell (dash on Linux)
+    // can exit before `create` returns, and events are not replayed.
+    let mut events = subscribe(&host);
     let doomed = host.create(shell("exec sleep 60"));
     let finished = host.create(shell("exit 3"));
-    let mut events = subscribe(&host);
     host.wait(&finished.id, |s| s.state == SessionState::Exited);
     unsafe {
         libc::kill(holder_of(&host.sandbox, &doomed.id), libc::SIGKILL);

@@ -230,6 +230,13 @@ private func makeHostedContentViewWindow(
     try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
     let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     let chromeState = ProjectWindowChromeState()
+    // The window is placed clear of the real pointer, and tests drive hover
+    // themselves. Without a probe the real check hit-tests the pointer
+    // against `NSApp.keyWindow` (this window is not registered), which is
+    // whatever window an earlier test left key: a stray `true` there turns a
+    // Cmd+S into the floating swap or keeps a revealed sidebar up. Tests
+    // that need the cursor over the sidebar set their own probe.
+    chromeState.cursorOverSidebarProbeForTesting = { _ in false }
     let noteStore = ProjectNoteStore(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
@@ -246,6 +253,11 @@ private func makeHostedContentViewWindow(
         defer: false
     )
     window.isReleasedWhenClosed = false
+    // Tests send every mouse event to the views themselves. The window is
+    // on screen, so without this the real pointer (someone using the Mac
+    // during a run) enters and leaves the hover tracking areas too, and
+    // reveals or keeps up the floating sidebar at random.
+    window.ignoresMouseEvents = true
 
     let rootView = ContentViewTestHost(
         workspace: workspace,
@@ -740,21 +752,41 @@ private struct MCPWhoamiPayload: Decodable {
 @MainActor
 @Test func sidebarAnimationStateSurvivesOverlappingDockedToggles() async throws {
     let chromeState = ProjectWindowChromeState()
+    // Each animation ends when the test says so, not on a timer: under load
+    // a sleeping test can wake after the second animation's end too.
+    var pendingEnds: [@MainActor () -> Void] = []
+    chromeState.dockedAnimationEndSchedulerForTesting = { pendingEnds.append($0) }
 
     chromeState.toggleSidebar()
     #expect(chromeState.isSidebarAnimating)
-    try await Task.sleep(for: .milliseconds(80))
+    #expect(pendingEnds.count == 1)
 
     chromeState.toggleSidebar()
     #expect(chromeState.isSidebarAnimating)
+    #expect(pendingEnds.count == 2)
+    let secondDelta = chromeState.pendingPostAnimationDelta
+    #expect(secondDelta == -(chromeState.dockedSidebarWidth - 5))
 
     // The first animation has completed, but the second one is still inside
     // its animation window. A single Boolean completion used to flip this
     // false here, making ContentView treat fast Cmd+S changes as non-animated.
-    try await Task.sleep(for: .milliseconds(130))
+    pendingEnds.removeFirst()()
     #expect(chromeState.isSidebarAnimating)
+    #expect(chromeState.pendingPostAnimationDelta == secondDelta)
 
-    try await Task.sleep(for: .milliseconds(180))
+    pendingEnds.removeFirst()()
+    #expect(!chromeState.isSidebarAnimating)
+    #expect(chromeState.pendingPostAnimationDelta == 0)
+
+    // On the real clock, overlapping animations still end.
+    chromeState.dockedAnimationEndSchedulerForTesting = nil
+    chromeState.toggleSidebar()
+    chromeState.toggleSidebar()
+    #expect(chromeState.isSidebarAnimating)
+    let deadline = ContinuousClock.now + .seconds(5)
+    while chromeState.isSidebarAnimating, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
     #expect(!chromeState.isSidebarAnimating)
     #expect(chromeState.pendingPostAnimationDelta == 0)
 }

@@ -818,6 +818,11 @@ impl Screen {
         });
     }
 
+    /// Apply messages until `done` holds; `what` names it in a timeout.
+    pub fn wait_for(&mut self, socket: &mut UnixStream, what: &str, done: impl Fn(&Self) -> bool) {
+        self.receive_until(socket, what, done)
+    }
+
     pub fn wait_exit(&mut self, socket: &mut UnixStream) -> (u32, Option<i32>) {
         self.receive_until(socket, "the exit", |screen| screen.exit.is_some());
         self.exit.unwrap()

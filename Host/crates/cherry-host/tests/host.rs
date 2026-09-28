@@ -1242,18 +1242,33 @@ fn neovim_survives_reattach_at_a_new_size() {
     // Neovim negotiates the kitty keyboard protocol with the host, so a bare
     // ESC byte is not Escape; stay in normal mode.
     input(&mut socket, b":call setline(1, 'hello from nvim')\r");
-    screen.wait_text(&mut socket, "hello from nvim");
+    // In the buffer, not just on the command line being typed.
+    screen.wait_for(&mut socket, "the line in the buffer", |screen| {
+        screen.text().starts_with("hello from nvim")
+    });
     drop(socket);
     host.wait(&session.id, |s| !s.attached);
     let (mut socket, info, offset, snapshot) = host.attach(&session.id, 110, 35);
     assert_eq!((info.cols, info.rows), (110, 35));
     let mut screen = Screen::new(110, 35, offset, &snapshot);
     assert!(
-        screen.text().contains("hello from nvim"),
+        screen.text().starts_with("hello from nvim"),
         "{}",
         screen.text()
     );
-    // Neovim redraws for the new size.
+    // Neovim redraws for the new size: its buffer line, a `~` on each of the
+    // other 32 rows above the status and command lines. Only then type: the
+    // resize reaches it as SIGWINCH, and input already waiting on its
+    // terminal can be read first (it would echo the old width, and no redraw
+    // would ever show SIZE_110).
+    screen.wait_for(&mut socket, "the redraw at 110x35", |screen| {
+        screen
+            .text()
+            .lines()
+            .filter(|line| line.starts_with('~'))
+            .count()
+            == 32
+    });
     input(&mut socket, b":echo 'SIZE_'.&columns\r");
     screen.wait_text(&mut socket, "SIZE_110");
     input(&mut socket, b":qa!\r");

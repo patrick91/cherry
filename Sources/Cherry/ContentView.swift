@@ -871,7 +871,8 @@ private final class SidebarRevealHoverTrackingView: NSView {
     }
 
     func refreshHoverStateFromWindow() {
-        guard let window else { return }
+        // A window that ignores mouse events is never under the pointer.
+        guard let window, !window.ignoresMouseEvents else { return }
         let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         setHovering(bounds.contains(location))
     }

@@ -1798,10 +1798,16 @@ fn a_slow_terminal_holds_back_neither_the_program_nor_a_faster_window() {
     ]);
     let id = created["id"].as_str().unwrap();
     let mut fast = Attached::new(&host, id, 80, 24);
-    let mut slow = Attached::new(&host, id, 80, 24);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rate = 50 * 1024;
     let fast_reader = read_terminal(fast.master.try_clone().unwrap(), None, stop.clone());
+    // The fast window's pace alone, on this machine (a debug build takes
+    // about 800 KB/s here, a loaded CI runner far less).
+    thread::sleep(Duration::from_secs(1));
+    let alone_from = Instant::now();
+    thread::sleep(Duration::from_secs(2));
+    let alone_to = Instant::now();
+    let mut slow = Attached::new(&host, id, 80, 24);
     let slow_reader = read_terminal(slow.master.try_clone().unwrap(), Some(rate), stop.clone());
     // The slow window's buffers fill first.
     thread::sleep(Duration::from_secs(3));
@@ -1816,9 +1822,16 @@ fn a_slow_terminal_holds_back_neither_the_program_nor_a_faster_window() {
             .filter(|(at, _)| (from..=to).contains(at))
             .collect()
     };
-    let fast_arrivals = window(&fast_reader.join().unwrap());
+    let all_fast_arrivals = fast_reader.join().unwrap();
+    let fast_arrivals = window(&all_fast_arrivals);
     let slow_arrivals = window(&slow_reader.join().unwrap());
     let bytes = |arrivals: &[(Instant, usize)]| arrivals.iter().map(|(_, n)| n).sum::<usize>();
+    let alone_rate = all_fast_arrivals
+        .iter()
+        .filter(|(at, _)| (alone_from..=alone_to).contains(at))
+        .map(|(_, n)| n)
+        .sum::<usize>() as f64
+        / (alone_to - alone_from).as_secs_f64();
     let seconds = (to - from).as_secs_f64();
     let (fast_rate, slow_rate) = (
         bytes(&fast_arrivals) as f64 / seconds,
@@ -1826,11 +1839,11 @@ fn a_slow_terminal_holds_back_neither_the_program_nor_a_faster_window() {
     );
     // The slow terminal takes output all along, at its pace.
     assert!(slow_rate > 0.8 * rate as f64, "slow {slow_rate:.0} B/s");
-    // The program, and so the other window, goes far faster (a debug
-    // build's pipeline takes about 800 KB/s).
+    // The program, and so the other window, keeps going at its own pace:
+    // at least half what it took alone, and well past the slow one's.
     assert!(
-        fast_rate > 5.0 * slow_rate,
-        "fast {fast_rate:.0} B/s, slow {slow_rate:.0} B/s"
+        fast_rate > 0.5 * alone_rate && fast_rate > 2.0 * slow_rate,
+        "fast {fast_rate:.0} B/s (alone {alone_rate:.0} B/s), slow {slow_rate:.0} B/s"
     );
     // Evenly: no long pause.
     let mut last = from;

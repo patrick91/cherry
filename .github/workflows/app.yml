@@ -100,3 +100,13 @@ jobs:
       - name: Real host through native Ghostty
         timeout-minutes: 20
         run: Scripts/test-session-suites --skip-build real-host
+      # Each group's full log (Scripts/test-session-suites writes them under
+      # $RUNNER_TEMP/cherry-session-tests.*), for a failed run.
+      - name: Upload the session test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-test-logs
+          path: ${{ runner.temp }}/cherry-session-tests.*/*.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -231,6 +231,21 @@ fn an_attachment_is_served_at_interactive_priority_while_it_lasts() {
     // Nothing attached: every thread at the default priority.
     wait_raised(holder, |raised| raised == 0);
     wait_raised(daemon, |raised| raised == 0);
+    // A QoS clamp on whatever started the tests (`taskpolicy -c utility`,
+    // a CI runner's launchd job) caps every descendant below the default
+    // priority, and no thread of theirs can be raised: the threads of a
+    // detached holder then run below 31, where they otherwise run at it.
+    let clamped = thread_priorities(holder)
+        .into_iter()
+        .max()
+        .is_some_and(|priority| priority < 31);
+    if clamped {
+        eprintln!(
+            "QoS is clamped below the default priority here \
+             ({:?}): only checking that nothing runs above it",
+            thread_priorities(holder)
+        );
+    }
     let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut screen = Screen::new(80, 24, offset, &snapshot);
     input(&mut socket, b"hello\n");
@@ -238,8 +253,10 @@ fn an_attachment_is_served_at_interactive_priority_while_it_lasts() {
     // The holder's thread and its terminal's, and the daemon's session
     // worker and connection reader (its writer too, once it has something
     // to write).
-    wait_raised(holder, |raised| raised == 2);
-    wait_raised(daemon, |raised| raised >= 2);
+    if !clamped {
+        wait_raised(holder, |raised| raised == 2);
+        wait_raised(daemon, |raised| raised >= 2);
+    }
     send(&mut socket, &ClientMessage::Detach);
     loop {
         if matches!(receive(&mut socket), ServerMessage::Ok) {

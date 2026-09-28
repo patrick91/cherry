@@ -550,7 +550,18 @@ private extension ProcessInfo {
         let build = mac.installRoot.appendingPathComponent(helpers.directoryName, isDirectory: true)
         try FileManager.default.createDirectory(at: build, withIntermediateDirectories: true)
         try Data("#!/bin/sh\necho another build\n".utf8).write(to: build.appendingPathComponent("cherry"))
-        try Data("#!/bin/sh\nsleep 600\n".utf8).write(to: build.appendingPathComponent("cherry-host"))
+        // Runs until stopped (with its sleep), but a check that asks it what
+        // it is (`version`, `status`) is answered at once, as a real one
+        // would, instead of waiting for the check's timeout.
+        try Data("""
+        #!/bin/sh
+        [ $# -gt 0 ] && exit 1
+        trap 'kill $child 2>/dev/null; exit 0' TERM
+        sleep 600 &
+        child=$!
+        wait $child
+
+        """.utf8).write(to: build.appendingPathComponent("cherry-host"))
         for name in RemoteHostHelpers.names {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: build.appendingPathComponent(name).path)
         }
@@ -600,7 +611,12 @@ private extension ProcessInfo {
         let probe = await RemoteDeviceProbe.run(destination: "race", remoteHostPath: nil, shell: mac.shell)
         let plan = try #require(RemoteHostInstall.decide(probe: probe, helpers: .success(helpers), machine: "race").plan)
         #expect(plan.copyNeeded)
-        let installer = RemoteHostInstaller(shell: mac.shell, helpers: helpers)
+        var racer = RemoteHostInstaller(shell: mac.shell, helpers: helpers)
+        // Each copy takes seconds: a stalled one fails the test in two
+        // minutes, saying what it waited for, not after the 15 an install
+        // over a slow link may take.
+        racer.copyTimeout = 120
+        let installer = racer
         async let first = installer.install(plan, on: "race", machine: "race")
         async let second = installer.install(plan, on: "race", machine: "race")
         async let third = installer.install(plan, on: "race", machine: "race")

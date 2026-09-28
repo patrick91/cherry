@@ -74,12 +74,39 @@ struct RemoteDeviceShell: Sendable {
     }
 
     /// Runs `script` on `destination`. Never on the main actor's time: the
-    /// process is waited for on a detached task.
+    /// process is waited for on a thread of its own.
     func run(_ script: String, on destination: String) async -> Output {
         let shell = self
-        return await Task.detached(priority: .userInitiated) {
+        return await Self.onOwnThread {
             shell.runSynchronously(script, on: destination).text
-        }.value
+        }
+    }
+
+    /// Runs `body`, which blocks (waits for a process, reads its pipes), on
+    /// a thread of its own. Neither Swift's cooperative pool (as wide as the
+    /// Mac has cores, 3 on a CI runner) nor GCD's global queues (at most 5
+    /// threads a core) may be held for as long as a copy can take: blocked
+    /// there, their threads run nothing else, and blocks queued behind them
+    /// (another install's pipe reads) wait until their timeout.
+    static func onOwnThread<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            let thread = Thread { continuation.resume(returning: body()) }
+            thread.qualityOfService = .userInitiated
+            thread.start()
+        }
+    }
+
+    /// Reads `handle` to its end on a thread of its own, into `box`, then
+    /// leaves `group` (see `onOwnThread`).
+    static func readToEnd(_ handle: FileHandle, into box: PipeOutputBox, group: DispatchGroup) {
+        group.enter()
+        let thread = Thread {
+            box.data = handle.readDataToEndOfFile()
+            box.finished = true
+            group.leave()
+        }
+        thread.qualityOfService = .userInitiated
+        thread.start()
     }
 
     /// What a script printed, as bytes (git's NUL-separated lists).
@@ -153,18 +180,10 @@ struct RemoteDeviceShell: Sendable {
             return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(error.localizedDescription)")
         }
         let group = DispatchGroup()
-        let outData = OutputBox()
-        let errData = OutputBox()
-        group.enter()
-        DispatchQueue.global().async {
-            outData.data = stdout.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        group.enter()
-        DispatchQueue.global().async {
-            errData.data = stderr.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
+        let outData = PipeOutputBox()
+        let errData = PipeOutputBox()
+        readToEnd(stdout.fileHandleForReading, into: outData, group: group)
+        readToEnd(stderr.fileHandleForReading, into: errData, group: group)
         stdin.fileHandleForWriting.write(Data(input.utf8))
         try? stdin.fileHandleForWriting.close()
         var timedOut = false
@@ -187,9 +206,21 @@ struct RemoteDeviceShell: Sendable {
 }
 
 /// One reader's output: written by its reader before the group is left,
-/// read after the wait.
-private final class OutputBox: @unchecked Sendable {
-    var data = Data()
+/// read after the wait (`finished` also for a wait that timed out).
+final class PipeOutputBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedData = Data()
+    private var storedFinished = false
+
+    var data: Data {
+        get { lock.withLock { storedData } }
+        set { lock.withLock { storedData = newValue } }
+    }
+
+    var finished: Bool {
+        get { lock.withLock { storedFinished } }
+        set { lock.withLock { storedFinished = newValue } }
+    }
 }
 
 /// How ssh failed, as Add Mac… explains it.

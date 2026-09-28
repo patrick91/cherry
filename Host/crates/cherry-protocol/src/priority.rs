@@ -236,6 +236,17 @@ mod tests {
         if let (Some(prepared), Some(raised), Some(other), Some(lowered)) =
             (prepared.1, raised.1, other.1, lowered.1)
         {
+            // A QoS clamp on whatever started the tests (`taskpolicy -c
+            // utility`, a CI runner's launchd job) caps this process below
+            // the default priority, where no class can raise a thread.
+            if prepared < 31 {
+                eprintln!("QoS is clamped here: the default class runs at {prepared}");
+                for (what, priority) in [("raised", raised), ("other", other), ("lowered", lowered)]
+                {
+                    assert!(priority <= prepared, "{what}: {priority}");
+                }
+                return;
+            }
             // Without the application role, macOS would keep it at 31.
             assert!(raised > 40, "raised to {raised}");
             for (what, priority) in [

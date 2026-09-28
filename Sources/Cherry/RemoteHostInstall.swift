@@ -1374,7 +1374,10 @@ struct RemoteHostInstaller: Sendable {
     }
 
     private static func failure(_ what: String, _ output: RemoteDeviceShell.Output) -> String {
-        if output.timedOut { return "\(what): it did not finish in time." }
+        if output.timedOut {
+            let detail = output.standardError.components(separatedBy: .newlines).last { $0.hasPrefix("the copy stalled") }
+            return "\(what): it did not finish in time" + (detail.map { " (\($0))." } ?? ".")
+        }
         if output.status == 255 {
             return "\(what): \(RemoteDeviceSSHFailure.classify(output.standardError).message)"
         }
@@ -1400,9 +1403,10 @@ struct RemoteHostInstaller: Sendable {
         let environment = shell.environment
         let tarArguments = Self.archiveArguments(helpers)
         let timeout = copyTimeout
-        let output = await Task.detached(priority: .userInitiated) {
-            Self.runPipeline(ssh: ssh, arguments: arguments, environment: environment, tarArguments: tarArguments, timeout: timeout)
-        }.value
+        let sshArguments = arguments
+        let output = await RemoteDeviceShell.onOwnThread {
+            Self.runPipeline(ssh: ssh, arguments: sshArguments, environment: environment, tarArguments: tarArguments, timeout: timeout)
+        }
         if shell.controlPath != nil, output.status == 255, RemoteDeviceShell.isRefusedByMaster(output.standardError) {
             // The master has no session to spare: directly, as the CLI does.
             var direct = self
@@ -1471,19 +1475,22 @@ struct RemoteHostInstaller: Sendable {
         try? archive.fileHandleForReading.close()
         try? archive.fileHandleForWriting.close()
         let group = DispatchGroup()
-        let out = InstallOutputBox()
-        let err = InstallOutputBox()
-        let tarErr = InstallOutputBox()
+        let out = PipeOutputBox()
+        let err = PipeOutputBox()
+        let tarErr = PipeOutputBox()
         for (pipe, box) in [(stdout, out), (stderr, err), (tarErrors, tarErr)] {
-            group.enter()
-            DispatchQueue.global().async {
-                box.data = pipe.fileHandleForReading.readDataToEndOfFile()
-                group.leave()
-            }
+            RemoteDeviceShell.readToEnd(pipe.fileHandleForReading, into: box, group: group)
         }
         var timedOut = false
+        var stalled = ""
         if group.wait(timeout: .now() + timeout) == .timedOut {
             timedOut = true
+            // What was still under way, for the message and the log.
+            stalled = "the copy stalled after \(Int(timeout)) s: tar \(tar.isRunning ? "still running" : "exited \(tar.terminationStatus)"), "
+                + "ssh \(process.isRunning ? "still running" : "exited \(process.terminationStatus)"), "
+                + "output \(out.finished ? "read" : "open"), errors \(err.finished ? "read" : "open"), "
+                + "tar errors \(tarErr.finished ? "read" : "open")"
+            SessionLog.error("remote install: \(stalled)")
             tar.terminate()
             process.terminate()
             if group.wait(timeout: .now() + 2) == .timedOut {
@@ -1498,6 +1505,7 @@ struct RemoteHostInstaller: Sendable {
         if tar.terminationStatus != 0 {
             errors += "\ntar: " + String(decoding: tarErr.data, as: UTF8.self)
         }
+        if !stalled.isEmpty { errors += "\n" + stalled }
         return .init(
             status: timedOut ? 255 : (tar.terminationStatus != 0 && process.terminationStatus == 0 ? 1 : process.terminationStatus),
             standardOutput: String(decoding: out.data, as: UTF8.self),
@@ -1507,6 +1515,3 @@ struct RemoteHostInstaller: Sendable {
     }
 }
 
-private final class InstallOutputBox: @unchecked Sendable {
-    var data = Data()
-}

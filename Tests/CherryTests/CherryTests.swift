@@ -1826,6 +1826,30 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(services.allSatisfy { $0.processID == "process-1" })
 }
 
+@Test func macOSServiceDetectorTakesLsofsNothingFoundExitAsNoListeners() throws {
+    // lsof exits 1 with no output when this user has no listening socket
+    // (a fresh CI runner): that is an empty list, not a failure.
+    #expect(try MacOSServiceDetector.runTool(
+        path: "/bin/sh", arguments: ["-c", "exit 1"], acceptedStatuses: [0, 1]
+    ) == "")
+    #expect(try MacOSServiceDetector.runTool(
+        path: "/bin/sh", arguments: ["-c", "printf 'p1\\n'; exit 1"], acceptedStatuses: [0, 1]
+    ) == "p1\n")
+    #expect(MacOSServiceDetector.parseLsofOutput("").isEmpty)
+    // Other statuses, and a tool the watchdog killed, still fail.
+    #expect(throws: CherryControlError.self) {
+        try MacOSServiceDetector.runTool(path: "/bin/sh", arguments: ["-c", "exit 2"], acceptedStatuses: [0, 1])
+    }
+    #expect(throws: CherryControlError.self) {
+        try MacOSServiceDetector.runTool(path: "/bin/sh", arguments: ["-c", "exit 1"])
+    }
+    #expect(throws: CherryControlError.self) {
+        try MacOSServiceDetector.runTool(
+            path: "/bin/sh", arguments: ["-c", "exec sleep 5"], timeout: 0.2, acceptedStatuses: [0, 1, 15]
+        )
+    }
+}
+
 @Test func macOSServiceDetectorFindsLocalListeningSocket() async throws {
     let fd = socket(AF_INET, SOCK_STREAM, 0)
     try #require(fd >= 0)

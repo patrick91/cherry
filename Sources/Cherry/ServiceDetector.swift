@@ -202,10 +202,26 @@ struct MacOSServiceDetector: ServiceDetecting {
     }
 
     private static func currentLsofOutput() throws -> String {
-        try runTool(path: "/usr/sbin/lsof", arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcfnPT"])
+        // lsof exits 1 when it lists nothing (no listening socket this user
+        // can see, as on a fresh CI runner) or could not read some process
+        // (one that exited meanwhile); what it printed is still the answer,
+        // as `cherry-host ports` takes it.
+        try runTool(
+            path: "/usr/sbin/lsof",
+            arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcfnPT"],
+            acceptedStatuses: [0, 1]
+        )
     }
 
-    private static func runTool(path: String, arguments: [String], timeout: TimeInterval = 4.0) throws -> String {
+    /// Runs `path` and returns its standard output, when it exits (not killed
+    /// by a signal, as the watchdog does after `timeout`) with one of
+    /// `acceptedStatuses`.
+    static func runTool(
+        path: String,
+        arguments: [String],
+        timeout: TimeInterval = 4.0,
+        acceptedStatuses: Set<Int32> = [0]
+    ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -240,7 +256,7 @@ struct MacOSServiceDetector: ServiceDetecting {
             NSLog("[cherry] service-detect %@ took %.2fs", path, elapsed)
         }
 
-        if process.terminationStatus == 0 {
+        if process.terminationReason == .exit, acceptedStatuses.contains(process.terminationStatus) {
             return String(decoding: output, as: UTF8.self)
         }
 

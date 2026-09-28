@@ -659,7 +659,12 @@ private enum MachOFixture {
 // MARK: - The device
 
 @Test func remoteDeviceInstallMenuOffersUpdateSessionHostForAnOlderInstall() {
-    let device = RemoteDevice(name: "Studio", sshDestination: "studio", installedBuild: "20260101000000.old", installedArch: "arm64")
+    // Installed with Ghostty's resources (phase 3); one without them is
+    // offered the update at any build (RemoteDeviceParityTests).
+    let device = RemoteDevice(
+        name: "Studio", sshDestination: "studio", installedBuild: "20260101000000.old", installedArch: "arm64",
+        installedResources: true
+    )
     func menu(_ entry: TitlebarProjectMenuModel.Device) -> String {
         TitlebarProjectMenuModel(worktrees: nil, projects: [], devices: [entry], currentProjectKey: nil).snapshot
     }

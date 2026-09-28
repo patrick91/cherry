@@ -345,10 +345,13 @@ final class ProjectWindowRegistry {
             opener(root)
             repository = await waitForRepository(projectRoot: root)
         }
-        if repository == nil {
+        // A device's session shows only in a window of its project there,
+        // never in one of This Mac's (docs/specs/remote-devices.md).
+        let isDevice = !localSessions.profile.isThisMac
+        if repository == nil, !isDevice {
             repository = activeProjectRoot.flatMap { self.repository(for: $0) } ?? allRepositories.first
         }
-        if repository == nil, let opener = projectWindowOpener {
+        if repository == nil, !isDevice, let opener = projectWindowOpener {
             opener(nil)
             let deadline = ContinuousClock.now + .seconds(10)
             while allRepositories.isEmpty, ContinuousClock.now < deadline {

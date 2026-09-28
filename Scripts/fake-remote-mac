@@ -16,11 +16,19 @@
 #   host.sock    its session host's socket (CHERRY_HOST_SOCKET there)
 #
 # The shim takes ssh's options, refuses master connections (-M, -O: masters
-# are off, as FakeSSH in HostControlSSHMasterTests), and runs the remote
-# command with /bin/sh -c under `env -i` with that Mac's HOME, PATH, SHELL
-# and CHERRY_HOST_SOCKET, so its cherry-host gateway serves the private
-# daemon. Standard input and output pass through (the gateway's frames, a
-# check's script). Behaviour switches, files in DIR/hosts/NAME:
+# are off, as FakeSSH in HostControlSSHMasterTests) unless DIR/masters
+# exists, and runs the remote command with /bin/sh -c under `env -i` with
+# that Mac's HOME, PATH, SHELL and CHERRY_HOST_SOCKET, so its cherry-host
+# gateway serves the private daemon. Standard input and output pass through
+# (the gateway's frames, a check's script, scp's protocol). Behaviour
+# switches, files in DIR:
+#   masters       `-M` runs a stand-in master (its ControlPath is a plain
+#                 file while it runs; `-O check` and `-O exit` work), and a
+#                 command given `-o ControlPath=P` of a running master is one
+#                 of its sessions: at most the number in DIR/max-sessions
+#                 (default 10) run at once, as sshd's MaxSessions, and one
+#                 more fails with "Session open refused by peer" (255).
+# and in DIR/hosts/NAME:
 #   offline   ssh: connect to host NAME port 22: Connection timed out (255)
 #   hostkey   Host key verification failed. (255)
 #   denied    NAME: Permission denied (publickey). (255)
@@ -138,16 +146,39 @@ EOF
     cat >> "$dir/bin/ssh" <<'EOF'
 printf '%s\n' "$*" >> "$dir/calls"
 destination=
+master=no
+control=
+path=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; destination=${1-}; [ $# -gt 0 ] && shift; break ;;
-    -M|-O*) echo "fake-remote-mac: SSH master connections are off" >&2; exit 255 ;;
-    -[BbcDEeFIiJLlmopQRSWw]) shift ;;
+    -M|-O*)
+      if [ ! -f "$dir/masters" ]; then echo "fake-remote-mac: SSH master connections are off" >&2; exit 255; fi
+      case "$1" in
+        -M) master=yes ;;
+        -O) shift; control=${1-} ;;
+        -O*) control=${1#-O} ;;
+      esac ;;
+    -o)
+      shift
+      case "${1-}" in ControlPath=*) path=${1#ControlPath=} ;; esac ;;
+    -oControlPath=*) path=${1#-oControlPath=} ;;
+    -[BbcDEeFIiJLlmpQRSWw]) shift ;;
     -*) ;;
     *) destination=$1; shift; break ;;
   esac
   shift
 done
+# ssh doubles % in a ControlPath.
+path=$(printf '%s' "$path" | /usr/bin/sed 's/%%/%/g')
+if [ -n "$control" ]; then
+  case "$control" in
+    check) [ -n "$path" ] && [ -e "$path" ] && exit 0
+           echo "Control socket connect($path): No such file or directory" >&2; exit 255 ;;
+    exit) [ -f "$path.pid" ] && kill -TERM "$(/bin/cat "$path.pid")"; echo "Exit request sent." >&2; exit 0 ;;
+    *) exit 255 ;;
+  esac
+fi
 name=${destination#*@}
 host="$dir/hosts/$name"
 if [ -z "$name" ] || [ ! -d "$host" ]; then
@@ -169,9 +200,45 @@ if [ -f "$host/denied" ]; then
   echo "$name: Permission denied (publickey)." >&2
   exit 255
 fi
+if [ "$master" = yes ]; then
+  if [ -z "$path" ]; then echo "fake-remote-mac: a master needs a ControlPath" >&2; exit 255; fi
+  printf '%s' "$$" > "$path.pid"
+  trap '/bin/rm -f "$path" "$path.pid"; /bin/rm -rf "$path.ch"; exit 0' TERM INT HUP
+  : > "$path"
+  /bin/mkdir -p "$path.ch"
+  while :; do /bin/sleep 0.1; done
+fi
 if [ $# -eq 0 ]; then
   echo "fake-remote-mac: no remote command (interactive logins are not faked)" >&2
   exit 255
+fi
+if [ -n "$path" ] && [ -f "$path.pid" ] && [ -d "$path.ch" ]; then
+  # A session of a running master: MaxSessions.
+  max=10
+  [ -f "$dir/max-sessions" ] && max=$(/bin/cat "$dir/max-sessions")
+  count=0
+  for f in "$path.ch"/*; do
+    [ -f "$f" ] || continue
+    if kill -0 "${f##*/}" 2>/dev/null; then count=$((count + 1)); else /bin/rm -f "$f"; fi
+  done
+  if [ "$count" -ge "$max" ]; then
+    echo "mux_client_request_session: session request failed: Session open refused by peer" >&2
+    exit 255
+  fi
+  : > "$path.ch/$$"
+  printf '%s\n' "$path" >> "$dir/sessions"
+  /usr/bin/env -i \
+    HOME="$host/home" \
+    USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
+    PATH="$host/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    SHELL=/bin/sh \
+    LANG="${LANG:-en_US.UTF-8}" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    CHERRY_HOST_SOCKET="$host/host.sock" \
+    /bin/sh -c "$*"
+  status=$?
+  /bin/rm -f "$path.ch/$$"
+  exit $status
 fi
 exec /usr/bin/env -i \
   HOME="$host/home" \
@@ -187,6 +254,11 @@ EOF
     echo "$dir/bin"
     ;;
   stop)
+    # Stand-in masters (DIR/masters) of this DIR, by the pid each wrote.
+    for pidfile in "$dir"/*.pid "$dir"/*/*.pid; do
+      [ -f "$pidfile" ] || continue
+      kill -TERM "$(cat "$pidfile")" 2>/dev/null || true
+    done
     [ -d "$dir/hosts" ] || exit 0
     for host in "$dir"/hosts/*; do
       [ -d "$host" ] || continue

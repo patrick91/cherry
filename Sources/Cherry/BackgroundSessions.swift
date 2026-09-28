@@ -41,6 +41,8 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     /// Clients attached to it (a terminal outside Cherry).
     let clients: Int
     let createdAt: Date?
+    /// The device it runs on (its name); nil for This Mac.
+    var machine: String? = nil
 
     var isRunning: Bool { exitStatus == nil }
 
@@ -198,12 +200,21 @@ final class BackgroundSessionsSummary: ObservableObject {
 /// last list, the open tabs, the windows' saved tabs) and on the host's
 /// added, removed, exited and resync events, and publishes only when the
 /// list changed.
+/// A device whose own sessions Background Sessions lists (phase 3): its
+/// hosting (`RemoteDeviceStore`), with the name its section shows.
+struct BackgroundDeviceHosting {
+    let id: UUID
+    let name: String
+    let hosting: PersistentHostSessions
+}
+
 @MainActor
 final class BackgroundSessionsModel: ObservableObject {
     static let shared = BackgroundSessionsModel(
         localSessions: .shared,
         registry: .shared,
-        removeStaleResources: { GhosttyResourceStager.shared.removeStaleCopies(inUse: $0) }
+        removeStaleResources: { GhosttyResourceStager.shared.removeStaleCopies(inUse: $0) },
+        deviceHostings: { RemoteDeviceStore.shared.backgroundHostings() }
     )
 
     /// Shows the End All confirmation, on the window it was asked from
@@ -218,6 +229,24 @@ final class BackgroundSessionsModel: ObservableObject {
     @Published private(set) var sessions: [BackgroundSession] = []
     let summary = BackgroundSessionsSummary()
     let localSessions: PersistentLocalSessions
+    /// The device these sessions are on (a section of This Mac's model);
+    /// nil for This Mac's own model.
+    private(set) var device: (id: UUID, name: String)?
+    /// Each device's own model, in the devices' order: the panel's sections
+    /// (docs/specs/remote-devices.md, phase 3). Only This Mac's model has
+    /// them.
+    @Published private(set) var devices: [BackgroundSessionsModel] = []
+    /// The devices whose sessions are listed (This Mac's model; nil for a
+    /// device's).
+    private let deviceHostings: (@MainActor () -> [BackgroundDeviceHosting])?
+    private var deviceSubscriptions: [UUID: AnyCancellable] = [:]
+    private weak var parent: BackgroundSessionsModel?
+    /// A device's model shows what a look that starts nothing found
+    /// (`peeks`) while the menu bar panel is open and its control is not
+    /// connected.
+    private(set) var isPanelOpen = false
+    /// Looks at devices without starting or replacing their daemons.
+    private let peeks: RemoteDevicePeeks
     private let registry: ProjectWindowRegistry
     private let attachedTabs: OpenHostedTabs
     private let prefersPersistentLocalSessions: @MainActor () -> Bool
@@ -290,8 +319,14 @@ final class BackgroundSessionsModel: ObservableObject {
         endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
         now: @escaping @MainActor () -> Date = { Date() },
         isAppActive: @escaping @MainActor () -> Bool = { NSApp?.isActive ?? false },
-        removeStaleResources: (@MainActor (Set<String>) -> Void)? = nil
+        removeStaleResources: (@MainActor (Set<String>) -> Void)? = nil,
+        deviceHostings: (@MainActor () -> [BackgroundDeviceHosting])? = nil,
+        device: (id: UUID, name: String)? = nil,
+        peeks: RemoteDevicePeeks = .shared
     ) {
+        self.peeks = peeks
+        self.device = device
+        self.deviceHostings = deviceHostings
         self.isAppActive = isAppActive
         self.removeStaleResources = removeStaleResources
         self.localSessions = localSessions
@@ -305,10 +340,35 @@ final class BackgroundSessionsModel: ObservableObject {
         self.now = now
     }
 
+    /// Whether these are a device's sessions (a section of This Mac's).
+    var isDevice: Bool { device != nil }
+
+    /// The device model whose host is `hostID`.
+    private func device(ofHostID hostID: String) -> BackgroundSessionsModel? {
+        devices.first { ($0.localSessions.control.hostID ?? $0.knownHostID) == hostID }
+    }
+
+    /// Every background session listed, This Mac's then each device's.
+    var allSessions: [BackgroundSession] {
+        sessions + devices.flatMap(\.sessions)
+    }
+
+    /// The model (This Mac's or a device's) that lists `id`.
+    func model(listing id: String) -> BackgroundSessionsModel? {
+        if sessions.contains(where: { $0.id == id }) { return self }
+        return devices.first { $0.sessions.contains { $0.id == id } }
+    }
+
     /// Starts following the host (the app: once launched, after the local
     /// host's warm-up, so the instance lock is known). Nothing connects.
+    /// This Mac's model refreshes the devices' too.
     func start() {
         guard timer == nil else { return }
+        if isDevice {
+            startFollowingHost()
+            refresh()
+            return
+        }
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] timer in
             guard let self else {
                 timer.invalidate()
@@ -318,6 +378,12 @@ final class BackgroundSessionsModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        startFollowingHost()
+        refresh()
+    }
+
+    /// The host's signals and list events.
+    private func startFollowingHost() {
         // Bells and notifications of sessions no tab follows.
         localSessions.backgroundSignalHandler = { [weak self] info, signal in
             self?.backgroundSessionDidSignal(info, signal) ?? false
@@ -334,19 +400,75 @@ final class BackgroundSessionsModel: ObservableObject {
                 }
             }
         }
-        refresh()
+        if isDevice {
+            // A device's list follows its connection (it lists only while
+            // connected): refreshed as that changes.
+            connectionSubscription = localSessions.control.$state
+                .removeDuplicates()
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated { self?.scheduleRefresh() }
+                }
+        }
     }
+
+    private var connectionSubscription: AnyCancellable?
 
     /// Stops following the host and lets the connection go (tests).
     func stop() {
         timer?.invalidate()
         timer = nil
         eventSubscription = nil
+        connectionSubscription = nil
         localSessions.backgroundSignalHandler = nil
         sessions = []
         summary.update([])
         lease?.release()
         lease = nil
+        for device in devices { device.stop() }
+        devices = []
+        deviceSubscriptions.removeAll()
+    }
+
+    /// Follows the devices `deviceHostings` names now: a model for each
+    /// new one (started), none for one removed (stopped).
+    private func syncDevices() {
+        guard let deviceHostings else { return }
+        let current = deviceHostings()
+        var models: [BackgroundSessionsModel] = []
+        for entry in current {
+            if let existing = devices.first(where: { $0.device?.id == entry.id && $0.localSessions === entry.hosting }) {
+                if existing.device?.name != entry.name { existing.device = (entry.id, entry.name) }
+                models.append(existing)
+                continue
+            }
+            let model = BackgroundSessionsModel(
+                localSessions: entry.hosting,
+                registry: registry,
+                attachedTabs: attachedTabs,
+                prefersPersistentLocalSessions: { false },
+                closesTabsOnCleanExit: closesTabsOnCleanExit,
+                presentAlert: presentAlert,
+                postNotification: postNotification,
+                endedSessionGrace: endedSessionGrace,
+                now: now,
+                isAppActive: isAppActive,
+                device: (entry.id, entry.name),
+                peeks: peeks
+            )
+            model.parent = self
+            model.start()
+            deviceSubscriptions[entry.id] = model.objectWillChange.sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            models.append(model)
+        }
+        for removed in devices where !models.contains(where: { $0 === removed }) {
+            removed.stop()
+            if let id = removed.device?.id, !models.contains(where: { $0.device?.id == id }) {
+                deviceSubscriptions.removeValue(forKey: id)
+            }
+        }
+        if models.map(ObjectIdentifier.init) != devices.map(ObjectIdentifier.init) { devices = models }
     }
 
     private func scheduleRefresh() {
@@ -367,16 +489,50 @@ final class BackgroundSessionsModel: ObservableObject {
     func refresh() {
         let control = localSessions.control
         if let hostID = control.hostID { knownHostID = hostID }
-        var listed = knownHostID.map { backgroundSessions(in: control.sessions, hostID: $0) } ?? []
+        var listed: [BackgroundSession]
+        // Whether `listed` is what the host has now (unread marks of
+        // sessions it no longer has go only then).
+        var isLive = true
+        if isDevice, control.state != .connected {
+            // A device is listed while its control is connected, or while
+            // the panel is open from a look that started nothing there.
+            if isPanelOpen, let peeked = peeks.list(for: localSessions.profile.host) {
+                knownHostID = peeked.hostID
+                listed = backgroundSessions(in: peeked.sessions, hostID: peeked.hostID)
+            } else {
+                listed = []
+                isLive = false
+            }
+        } else {
+            listed = knownHostID.map { backgroundSessions(in: control.sessions, hostID: $0) } ?? []
+        }
         listed = removeCleanlyEndedTerminals(listed)
         listed = removeExpiredEndedSessions(listed)
         removeStaleResourcesOnce()
         if listed != sessions { sessions = listed }
         loadSavedUnreadMarks()
-        let unread = unreadSessionIDs.filter { id in listed.contains { $0.id == id } }
-        if unread != unreadSessionIDs { unreadSessionIDs = unread }
-        summary.update(listed)
+        // Kept while a device is not listed (a disconnect), so they are
+        // there again when it is.
+        if isLive {
+            let unread = unreadSessionIDs.filter { id in listed.contains { $0.id == id } }
+            if unread != unreadSessionIDs { unreadSessionIDs = unread }
+        }
+        if !isDevice {
+            syncDevices()
+            for device in devices { device.refresh() }
+        }
+        updateSummary()
         updateLease()
+    }
+
+    /// The counts the app shows: This Mac's and every device's.
+    private func updateSummary() {
+        if let parent {
+            summary.update(sessions)
+            parent.summary.update(parent.allSessions)
+        } else {
+            summary.update(allSessions)
+        }
     }
 
     /// Once per run, from a live list that expects no more holders (a host
@@ -485,7 +641,7 @@ final class BackgroundSessionsModel: ObservableObject {
         guard recentNotifications.count < Self.notificationLimit else { return true }
         recentNotifications.append(now)
         lastNotification[info.id] = now
-        postNotification(BackgroundSessionNotificationContent(session: item, signal: signal))
+        postNotification(BackgroundSessionNotificationContent(session: item, signal: signal, machine: device?.name))
         return true
     }
 
@@ -521,6 +677,7 @@ final class BackgroundSessionsModel: ObservableObject {
         else { return [] }
         let attachedTabs = attachedTabs
         let endsRequested = endsRequested
+        let machine = device?.name
         return BackgroundSessions.classify(
             sessions,
             hostID: hostID,
@@ -533,11 +690,19 @@ final class BackgroundSessionsModel: ObservableObject {
             },
             awaitingRestore: registry.sessionRecordsAwaitingRestore()
         )
+        .map { session in
+            var session = session
+            session.machine = machine
+            return session
+        }
     }
 
     /// How the Persistent Sessions sheet marks a session of This Mac: this
     /// app's own ones only.
     func ownershipLabel(for info: HostedSessionInfo, hostID: String) -> String? {
+        if let device = device(ofHostID: hostID) {
+            return device.ownershipLabel(for: info, hostID: hostID)
+        }
         guard info.owner == localSessions.owner else { return nil }
         if isEnding(info, hostID: hostID) { return "Ending" }
         if localSessions.isShownByOpenTab(info, hostID: hostID, attachedTabs: attachedTabs) { return "In a tab" }
@@ -551,7 +716,10 @@ final class BackgroundSessionsModel: ObservableObject {
     /// it: a tab attached to it would not own it, and would lose it to the
     /// end, or keep it running unowned once ⌘Z brought its own tab back.
     func isEnding(_ info: HostedSessionInfo, hostID: String) -> Bool {
-        info.owner == localSessions.owner
+        if let device = device(ofHostID: hostID) {
+            return device.isEnding(info, hostID: hostID)
+        }
+        return info.owner == localSessions.owner
             && (endsRequested.contains(info.id) || localSessions.isEnding(info.id)
                 || localSessions.isScheduledToEnd(info, hostID: hostID))
     }
@@ -564,6 +732,7 @@ final class BackgroundSessionsModel: ObservableObject {
     /// sessions, and an unused one closes by itself.
     func panelDidAppear() {
         refresh()
+        for device in devices { device.devicePanelDidAppear() }
         let control = localSessions.control
         guard control.state != .connected, mayConnect else { return }
         Task { @MainActor [weak self] in
@@ -572,17 +741,55 @@ final class BackgroundSessionsModel: ObservableObject {
         }
     }
 
+    /// The panel opened: a device whose control is not connected is looked
+    /// at once with `peeks` (never starting or replacing its daemon;
+    /// throttled, and never after a refused login until a wake, a network
+    /// change or Reconnect); what it found shows while the panel is open.
+    /// Nothing connects its control.
+    private func devicePanelDidAppear() {
+        isPanelOpen = true
+        let control = localSessions.control
+        guard isDevice, control.state != .connected, control.state != .connecting,
+              localSessions.instanceUnavailableReason == nil,
+              TitlebarProjectMenuController.refreshesOnOpen(control.state)
+        else { return }
+        let peeks = peeks
+        Task { @MainActor [weak self] in
+            await peeks.refresh(control)
+            self?.refresh()
+            self?.parent?.refresh()
+        }
+    }
+
+    /// The panel closed: devices not connected are no longer shown.
+    func panelDidDisappear() {
+        for device in devices { device.isPanelOpen = false }
+        refresh()
+    }
+
+    /// The host's sessions as this list shows them: over the connection,
+    /// or (a device's, while the panel is open) from a look.
+    private var currentSessions: [HostedSessionInfo] {
+        let control = localSessions.control
+        if isDevice, control.state != .connected, isPanelOpen,
+           let peeked = peeks.list(for: localSessions.profile.host) {
+            return peeked.sessions
+        }
+        return control.sessions
+    }
+
     /// Whether the list may connect to the local host (which starts one
     /// when none runs): only in the copy that owns this Mac's sessions, and
     /// only once this run reached the host, when local tabs run in it, or
-    /// while it lists sessions.
+    /// while it lists sessions. A device's list never connects by itself.
     private var mayConnect: Bool {
-        localSessions.instanceUnavailableReason == nil
+        !isDevice && localSessions.instanceUnavailableReason == nil
             && (localSessions.connectionGeneration > 0 || prefersPersistentLocalSessions() || !sessions.isEmpty)
     }
 
     private func updateLease() {
-        let needed = !sessions.isEmpty
+        // A device's list never keeps its connection up.
+        let needed = !sessions.isEmpty && !isDevice
         if needed, lease == nil {
             lease = localSessions.control.retain()
         } else if !needed, let lease {
@@ -596,7 +803,7 @@ final class BackgroundSessionsModel: ObservableObject {
     /// Shows the session in a tab (`ProjectWindowRegistry.showBackgroundSession`).
     @discardableResult
     func open(_ item: BackgroundSession) -> Task<Void, Never>? {
-        guard let info = localSessions.control.sessions.first(where: { $0.id == item.id }) else { return nil }
+        guard let info = currentSessions.first(where: { $0.id == item.id }) else { return nil }
         let registry = registry
         let localSessions = localSessions
         let attachedTabs = attachedTabs
@@ -610,6 +817,19 @@ final class BackgroundSessionsModel: ObservableObject {
     /// as Open does, listing the host first when the connection does not
     /// know it (the notification may predate this run). Nothing for a
     /// session that is gone or not this app's.
+    /// A notification of the session `sessionID` of host `hostID` was
+    /// clicked: This Mac's or a device's model shows it.
+    @discardableResult
+    func open(sessionID: String, hostID: String?) -> Task<Void, Never> {
+        if let hostID, let device = device(ofHostID: hostID) {
+            return device.open(sessionID: sessionID)
+        }
+        if let device = devices.first(where: { $0.sessions.contains { $0.id == sessionID } }) {
+            return device.open(sessionID: sessionID)
+        }
+        return open(sessionID: sessionID)
+    }
+
     @discardableResult
     func open(sessionID: String) -> Task<Void, Never> {
         let registry = registry
@@ -639,7 +859,7 @@ final class BackgroundSessionsModel: ObservableObject {
     /// system.
     func clearEnded() {
         refresh()
-        endAll(sessions.filter { !$0.isRunning }.map(\.id))
+        endAll(allSessions.filter { !$0.isRunning }.map(\.id))
     }
 
     /// Ends the session when it is still in the background: Kill, wait for
@@ -651,7 +871,7 @@ final class BackgroundSessionsModel: ObservableObject {
     func end(sessionID: String) -> Task<Void, Never>? {
         let control = localSessions.control
         guard let hostID = control.hostID ?? knownHostID,
-              let info = control.sessions.first(where: { $0.id == sessionID }),
+              let info = currentSessions.first(where: { $0.id == sessionID }),
               !backgroundSessions(in: [info], hostID: hostID).isEmpty
         else { return nil }
         let timeout = localSessions.configuration.endRetryWindow
@@ -675,9 +895,10 @@ final class BackgroundSessionsModel: ObservableObject {
         }
     }
 
-    /// Ends those of `ids` that are still in the background.
+    /// Ends those of `ids` that are still in the background, on This Mac
+    /// or a device.
     func endAll(_ ids: [String]) {
-        for id in ids { end(sessionID: id) }
+        for id in ids { (model(listing: id) ?? self).end(sessionID: id) }
     }
 
     /// Cherry › End Background Sessions…, Settings › Sessions and the
@@ -689,7 +910,8 @@ final class BackgroundSessionsModel: ObservableObject {
     /// notice's End…).
     func confirmEndAll(from window: NSWindow? = nil, limitedTo ids: [String]? = nil) {
         refresh()
-        let listed = ids.map { ids in sessions.filter { ids.contains($0.id) } } ?? sessions
+        let all = allSessions
+        let listed = ids.map { ids in all.filter { ids.contains($0.id) } } ?? all
         guard !listed.isEmpty else { return }
         let alert = Self.makeEndAllAlert(
             running: listed.filter(\.isRunning).count,

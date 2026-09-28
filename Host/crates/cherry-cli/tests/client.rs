@@ -2720,6 +2720,12 @@ fn ssh_uses_one_quoted_gateway_command_and_never_becomes_a_control_master() {
     // Only commands that need a session may start the remote host.
     for (arguments, batch, gateway) in [
         (&["list", "--json"][..], batch, "gateway"),
+        // A list that only looks (Cherry listing another Mac).
+        (
+            &["list", "--json", "--no-start"],
+            batch,
+            "gateway --no-start",
+        ),
         (&["new", "--cwd=/work"], batch, "gateway"),
         (&["attach", "S"], "", "gateway"),
         (&["control"], control, "gateway"),
@@ -2853,7 +2859,12 @@ fn a_remote_gateway_that_found_no_host_is_reported_once_by_name() {
             &directory.path().join("ssh"),
             &format!("printf '%s\\n' \"$@\" > \"$CHERRY_TEST_SSH_LOG\"\n{body}"),
         );
-        for arguments in [&["kill", "S"][..], &["remove", "S"], &["shutdown"]] {
+        for arguments in [
+            &["kill", "S"][..],
+            &["remove", "S"],
+            &["shutdown"],
+            &["list", "--json", "--no-start"],
+        ] {
             let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
                 .args(["--host", "devbox"])
                 .args(arguments)
@@ -3184,7 +3195,12 @@ fn kill_remove_and_shutdown_never_start_a_host_but_list_does() {
             .stdin(Stdio::null());
         command
     };
-    for arguments in [&["kill", "S"][..], &["remove", "S"], &["shutdown"]] {
+    for arguments in [
+        &["kill", "S"][..],
+        &["remove", "S"],
+        &["shutdown"],
+        &["list", "--json", "--no-start"],
+    ] {
         let output = cherry().args(arguments).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         let error = String::from_utf8_lossy(&output.stderr);

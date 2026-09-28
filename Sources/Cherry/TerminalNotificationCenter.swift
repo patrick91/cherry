@@ -136,7 +136,11 @@ final class TerminalNotificationCenter {
     /// (`BackgroundSessionsModel.open(sessionID:)`), a tab's focuses the tab.
     func handleResponse(userInfo: [AnyHashable: Any], backgroundSessions: BackgroundSessionsModel) {
         if let sessionID = (userInfo[BackgroundSessionNotificationContent.sessionIDKey] as? String)?.nilIfEmpty {
-            backgroundSessions.open(sessionID: sessionID)
+            // This Mac's or a device's (its host identity says which).
+            backgroundSessions.open(
+                sessionID: sessionID,
+                hostID: (userInfo[BackgroundSessionNotificationContent.hostIDKey] as? String)?.nilIfEmpty
+            )
             return
         }
         handleResponse(userInfo: userInfo)
@@ -174,18 +178,24 @@ final class TerminalNotificationCenter {
 struct BackgroundSessionNotificationContent: Equatable {
     /// The host session id, in `userInfo` under `sessionIDKey`.
     static let sessionIDKey = "backgroundSessionID"
+    /// Its host's identity (This Mac's or a device's), under `hostIDKey`.
+    static let hostIDKey = "backgroundSessionHostID"
 
     let sessionID: String
+    let hostID: String
     /// The session, as Background Sessions names it.
     let title: String
     /// Its project, and that it runs in the background.
     let subtitle: String
     let body: String
 
-    init(session: BackgroundSession, signal: PersistentHostSignal) {
+    /// `machine`: the device the session is on, nil for This Mac.
+    init(session: BackgroundSession, signal: PersistentHostSignal, machine: String? = nil) {
         sessionID = session.id
+        hostID = session.hostID
         title = session.title
-        subtitle = "\(session.projectName) · in the background"
+        subtitle = machine.map { "\(session.projectName) on \($0) · in the background" }
+            ?? "\(session.projectName) · in the background"
         switch signal {
         case .notification(let title, let body):
             let body = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -201,6 +211,6 @@ struct BackgroundSessionNotificationContent: Equatable {
     }
 
     var userInfo: [String: String] {
-        [Self.sessionIDKey: sessionID]
+        [Self.sessionIDKey: sessionID, Self.hostIDKey: hostID]
     }
 }

@@ -58,20 +58,36 @@ final class HostSSHMasterManager: @unchecked Sendable {
         /// the control helper and one-off commands (list, kill) need one
         /// each.
         ///
-        /// Over the cap: `controlPath(forLaunch:)` returns nil and registers
-        /// nothing, so that adapter runs its own ssh (its own connection
-        /// and login, which may prompt in its tab, as without a master) for
-        /// as long as it runs, reconnects included: `cherry attach`
-        /// reconnects with the arguments it was launched with. Launches
-        /// are counted, not tabs: every launch of a tab's adapter (a
-        /// relaunch after its reconnect window, a Reconnect) is registered
-        /// afresh, so one that starts while a slot is free shares the
-        /// master again. Nothing moves a running adapter onto the master
-        /// when a slot frees. `cherry` also connects directly when a
+        /// Over the cap, a launch shares another master of the same
+        /// destination (a shard: `dest#2`, `dest#3`, …, each its own SSH
+        /// connection, docs/specs/remote-devices.md phase 3). A shard is
+        /// started before it is needed: once the masters that are up or
+        /// starting have `spareChannels` free slots or fewer, the next one
+        /// starts, so the launch that fills the last slot finds the next
+        /// master up. A launch that finds no master with room (the next one
+        /// is still starting, could not log in, or `maxMasters` run) returns
+        /// nil and runs its own ssh (its own connection and login, which may
+        /// prompt in its tab) for as long as it runs, reconnects included:
+        /// `cherry attach` reconnects with the arguments it was launched
+        /// with. Launches are counted, not tabs: every launch of a tab's
+        /// adapter (a relaunch after its reconnect window, a Reconnect) is
+        /// registered afresh, on the first master with room. Nothing moves a
+        /// running adapter onto a master when a slot frees. A shard with no
+        /// launches stops (after `idleStopDelay`) once the others have
+        /// spare room without it. `cherry` also connects directly when a
         /// master refuses a session anyway (a server with a lower
         /// `MaxSessions`).
         var maxChannelsPerMaster = Configuration.defaultMaxChannelsPerMaster
         static let defaultMaxChannelsPerMaster = 8
+        /// Free slots below which the next shard starts.
+        var spareChannels = 1
+        /// Masters per destination at most (the first and its shards).
+        var maxMasters = 8
+        /// A shard that failed to start (it could not connect or log in):
+        /// no shard of that destination is started again for this long, or
+        /// until its first master comes up again, so one refused login is
+        /// not repeated by every next shard.
+        var shardRetryDelay: TimeInterval = 60
     }
 
     enum Phase: Equatable, Sendable {
@@ -84,6 +100,8 @@ final class HostSSHMasterManager: @unchecked Sendable {
 
     struct Status: Equatable, Sendable {
         var phase: Phase
+        /// 1 for the destination's first master, 2 and up for its shards.
+        var shard: Int = 1
         var controlPath: String?
         /// Why the last master exited, from its standard error.
         var lastError: String?
@@ -97,7 +115,13 @@ final class HostSSHMasterManager: @unchecked Sendable {
     /// Guarded by the manager's lock.
     private final class Master: @unchecked Sendable {
         let destination: String
+        /// 1 for the first; its key in `masters` is the destination, a
+        /// shard's `destination#shard`.
+        let shard: Int
         let controlPath: String
+        /// A shard started ahead of the launches that will use it
+        /// (`spareChannels`): needed until the others have room again.
+        var reserved = false
         var environment: [String: String] = [:]
         var leases: Set<UUID> = []
         var launches: Set<String> = []
@@ -115,17 +139,27 @@ final class HostSSHMasterManager: @unchecked Sendable {
         var idleStop: DispatchWorkItem?
         var restart: DispatchWorkItem?
 
-        init(destination: String, controlPath: String) {
+        init(destination: String, shard: Int = 1, controlPath: String) {
             self.destination = destination
+            self.shard = shard
             self.controlPath = controlPath
         }
 
-        var isNeeded: Bool { !leases.isEmpty || !launches.isEmpty }
+        var key: String { HostSSHMasterManager.key(destination: destination, shard: shard) }
+        var isNeeded: Bool { !leases.isEmpty || !launches.isEmpty || reserved }
+    }
+
+    /// A master's key: the destination for the first, `destination#N` for
+    /// a shard (also what its control path is named after).
+    static func key(destination: String, shard: Int) -> String {
+        shard == 1 ? destination : "\(destination)#\(shard)"
     }
 
     let configuration: Configuration
     private let lock = NSLock()
     private var masters: [String: Master] = [:]
+    /// Until when no shard of a destination starts (`shardRetryDelay`).
+    private var shardBackoff: [String: Date] = [:]
     private var resolvedDirectory: URL??
     /// Set by `stopAll`: no master starts again.
     private var isShutDown = false
@@ -176,17 +210,98 @@ final class HostSSHMasterManager: @unchecked Sendable {
     /// launch still runs; it is checked under the manager's lock, so a launch
     /// that ended (and whose `endLaunch` already ran) is never kept again.
     func controlPath(forLaunch launch: String, destination: String, isLive: () -> Bool = { true }) -> String? {
-        lock.withLock {
-            guard let master = masters[destination], master.phase == .up, isLive() else { return nil }
-            // Full: this launch connects on its own.
-            guard master.launches.contains(launch) || master.launches.count < configuration.maxChannelsPerMaster else {
-                return nil
+        let (path, starts): (String?, [(Master, Int)]) = lock.withLock {
+            let shards = shardsLocked(of: destination)
+            guard let first = shards.first, first.shard == 1, first.phase == .up, isLive() else { return (nil, []) }
+            if let registered = shards.first(where: { $0.launches.contains(launch) }) {
+                if registered.phase == .up { return (registered.controlPath, []) }
+                // Its master went: it takes a slot where there is one now.
+                registered.launches.remove(launch)
             }
-            master.launches.insert(launch)
-            master.idleStop?.cancel()
-            master.idleStop = nil
-            return master.controlPath
+            // The first master with room; none: this launch connects on its own.
+            let chosen = shards.first { $0.phase == .up && $0.launches.count < configuration.maxChannelsPerMaster }
+            if let chosen {
+                chosen.launches.insert(launch)
+                chosen.reserved = false
+                chosen.idleStop?.cancel()
+                chosen.idleStop = nil
+            }
+            return (chosen?.controlPath, balanceShardsLocked(of: destination))
         }
+        for (master, generation) in starts { self.launch(master, generation: generation) }
+        return path
+    }
+
+    /// The statuses of the destination's masters, the first one first.
+    func shardStatuses(of destination: String) -> [Status] {
+        lock.withLock {
+            shardsLocked(of: destination).map { master in
+                Status(
+                    phase: master.phase, shard: master.shard, controlPath: master.controlPath,
+                    lastError: master.lastError, leases: master.leases.count,
+                    launches: master.launches.count, failures: master.failures
+                )
+            }
+        }
+    }
+
+    /// The destination's masters, the first one first.
+    private func shardsLocked(of destination: String) -> [Master] {
+        masters.values.filter { $0.destination == destination }.sorted { $0.shard < $1.shard }
+    }
+
+    /// Keeps a spare master for the destination's next launches: starts the
+    /// next shard once the masters that are up or starting have
+    /// `spareChannels` free slots or fewer, and lets a reserved shard with
+    /// no launches go once the others have room without it (or the first
+    /// master is not up). Returns the masters to launch.
+    private func balanceShardsLocked(of destination: String) -> [(Master, Int)] {
+        guard !isShutDown else { return [] }
+        let cap = configuration.maxChannelsPerMaster
+        let shards = shardsLocked(of: destination)
+        guard let first = shards.first, first.shard == 1 else { return [] }
+        let firstIsUp = first.phase == .up
+        func freeSlots(excluding excluded: Master?) -> Int {
+            shards.filter { $0 !== excluded && ($0.phase == .up || $0.phase == .starting) && ($0.shard == 1 || $0.isNeeded) }
+                .reduce(0) { $0 + max(0, cap - $1.launches.count) }
+        }
+        // Spares no longer needed.
+        for shard in shards.reversed() where shard.shard > 1 && shard.launches.isEmpty && shard.reserved {
+            if !firstIsUp || freeSlots(excluding: shard) > configuration.spareChannels {
+                shard.reserved = false
+                scheduleIdleStopLocked(shard)
+            }
+        }
+        guard firstIsUp, freeSlots(excluding: nil) <= configuration.spareChannels else { return [] }
+        // After a shard failed to start: none until the backoff passes (or
+        // the first master came up again); adapters use their own ssh.
+        if let until = shardBackoff[destination], Date() < until { return [] }
+        // A shard that is up or starting and no longer needed (its idle
+        // stop pending) is kept instead of a new one.
+        if let idle = shards.first(where: { $0.shard > 1 && ($0.phase == .up || $0.phase == .starting) && !$0.isNeeded }) {
+            idle.reserved = true
+            idle.idleStop?.cancel()
+            idle.idleStop = nil
+            return []
+        }
+        // A stopped shard is started again before a new one is added.
+        let next: Master
+        if let stopped = shards.first(where: { $0.shard > 1 && $0.phase == .stopped && !$0.isNeeded }) {
+            next = stopped
+        } else {
+            let number = (shards.last?.shard ?? 1) + 1
+            guard number <= configuration.maxMasters,
+                  let directory = directoryLocked(),
+                  let path = Self.controlPath(in: directory, destination: Self.key(destination: destination, shard: number))
+            else { return [] }
+            next = Master(destination: destination, shard: number, controlPath: path)
+            masters[next.key] = next
+        }
+        next.environment = first.environment
+        next.reserved = true
+        next.idleStop?.cancel()
+        next.idleStop = nil
+        return beginStartLocked(next).map { [$0] } ?? []
     }
 
     /// Starts the destination's master again when it failed to start and is
@@ -203,11 +318,15 @@ final class HostSSHMasterManager: @unchecked Sendable {
 
     /// The launch no longer needs a master.
     func endLaunch(_ launch: String) {
-        lock.withLock {
+        let starts: [(Master, Int)] = lock.withLock {
+            var destinations = Set<String>()
             for master in masters.values where master.launches.remove(launch) != nil {
                 scheduleIdleStopLocked(master)
+                destinations.insert(master.destination)
             }
+            return destinations.flatMap { balanceShardsLocked(of: $0) }
         }
+        for (master, generation) in starts { self.launch(master, generation: generation) }
     }
 
     /// The control path once the master is up; nil when it fails, is not
@@ -275,6 +394,13 @@ final class HostSSHMasterManager: @unchecked Sendable {
             guard let master = masters[destination], master.leases.remove(lease) != nil else { return }
             scheduleIdleStopLocked(master)
         }
+    }
+
+    /// The first master of a destination came up or went: its shards
+    /// follow (`balanceShardsLocked`).
+    private func balanceShards(of destination: String) {
+        let starts = lock.withLock { balanceShardsLocked(of: destination) }
+        for (master, generation) in starts { launch(master, generation: generation) }
     }
 
     private func masterLocked(for destination: String) -> Master? {
@@ -391,7 +517,12 @@ final class HostSSHMasterManager: @unchecked Sendable {
                 if !master.isNeeded { scheduleIdleStopLocked(master) }
                 return true
             }
-            if delivered { scheduleHealthCheck(master, generation: generation) }
+            if delivered {
+                scheduleHealthCheck(master, generation: generation)
+                // The first master is up (again): shards may be tried again.
+                if master.shard == 1 { lock.withLock { shardBackoff[destination] = nil } }
+                balanceShards(of: destination)
+            }
             return
         }
         // A master that takes longer than the start timeout (a slow network)
@@ -449,6 +580,12 @@ final class HostSSHMasterManager: @unchecked Sendable {
             master.upSince = nil
             resumeWaitersLocked(master, with: nil)
             master.phase = .stopped
+            if master.shard > 1, previous == .starting {
+                // A shard that never came up: no more shards for a while,
+                // and this one is not kept for launches.
+                shardBackoff[master.destination] = Date().addingTimeInterval(configuration.shardRetryDelay)
+                master.reserved = false
+            }
             guard master.isNeeded else { return nil }
             if previous == .stopping { return beginStartLocked(master) }
             // Never up: it could not connect or log in, and trying on a timer
@@ -465,6 +602,7 @@ final class HostSSHMasterManager: @unchecked Sendable {
             return nil
         }
         if let restart { launch(restart.0, generation: restart.1) }
+        if master.shard == 1 { balanceShards(of: master.destination) }
     }
 
     private func restartIfNeeded(_ master: Master, after generation: Int) {

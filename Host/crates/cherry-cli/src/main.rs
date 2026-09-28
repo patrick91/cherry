@@ -99,6 +99,11 @@ enum Action {
     List {
         #[arg(long)]
         json: bool,
+        /// Never start a host, nor replace one speaking an older protocol:
+        /// when none of this version runs, say so and fail (for a client
+        /// that only looks, such as Cherry listing another Mac).
+        #[arg(long)]
+        no_start: bool,
     },
     /// Create a persistent session and print its JSON descriptor.
     New {
@@ -202,7 +207,12 @@ impl Action {
     fn starts_host(&self) -> bool {
         matches!(
             self,
-            Action::List { .. } | Action::New { .. } | Action::Attach { .. } | Action::Control
+            Action::List {
+                no_start: false,
+                ..
+            } | Action::New { .. }
+                | Action::Attach { .. }
+                | Action::Control
         )
     }
 }
@@ -447,7 +457,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             transport::start_local_host_from(&executable, &socket, None, false)?;
             Ok(0)
         }
-        Action::List { json } => {
+        Action::List { json, .. } => {
             transport.send(&ClientMessage::List)?;
             match transport.receive(RPC_TIMEOUT)? {
                 ServerMessage::Sessions {

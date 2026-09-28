@@ -499,7 +499,7 @@ struct MenuBarAgentsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if model.groups.isEmpty && background.sessions.isEmpty {
+            if model.groups.isEmpty && background.allSessions.isEmpty {
                 Text("No active agents")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
@@ -513,7 +513,7 @@ struct MenuBarAgentsPanel: View {
                         if !model.groups.isEmpty {
                             agentList
                         }
-                        if !background.sessions.isEmpty {
+                        if !background.allSessions.isEmpty {
                             backgroundSection
                         }
                     }
@@ -529,6 +529,7 @@ struct MenuBarAgentsPanel: View {
         }
         .frame(width: 300)
         .onAppear { background.panelDidAppear() }
+        .onDisappear { background.panelDidDisappear() }
     }
 
     private var agentList: some View {
@@ -561,7 +562,7 @@ struct MenuBarAgentsPanel: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
-                if background.sessions.contains(where: { !$0.isRunning }) {
+                if background.allSessions.contains(where: { !$0.isRunning }) {
                     Button("Clear Ended") { background.clearEnded() }
                         .buttonStyle(.plain)
                         .font(.system(size: 11))
@@ -581,17 +582,42 @@ struct MenuBarAgentsPanel: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 4)
-            ForEach(background.sessions) { item in
-                MenuBarBackgroundSessionRow(
-                    item: item,
-                    isUnread: background.unreadSessionIDs.contains(item.id),
-                    open: { background.open(item) },
-                    end: { background.end(item) }
-                )
+            // This Mac's, then each device's under its name (phase 3).
+            let devices = background.devices.filter { !$0.sessions.isEmpty }
+            if !devices.isEmpty, !background.sessions.isEmpty {
+                deviceHeader("This Mac")
+            }
+            rows(of: background)
+            ForEach(devices, id: \.localSessions.profile.host) { device in
+                deviceHeader(device.device?.name ?? device.localSessions.profile.displayName)
+                rows(of: device)
             }
         }
         .padding(.top, 2)
         .padding(.bottom, 6)
+    }
+
+    private func deviceHeader(_ name: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: name == "This Mac" ? "laptopcomputer" : "desktopcomputer")
+            Text(name)
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.tertiary)
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 2)
+    }
+
+    private func rows(of list: BackgroundSessionsModel) -> some View {
+        ForEach(list.sessions) { item in
+            MenuBarBackgroundSessionRow(
+                item: item,
+                isUnread: list.unreadSessionIDs.contains(item.id),
+                open: { list.open(item) },
+                end: { list.end(item) }
+            )
+        }
     }
 
     private var footer: some View {

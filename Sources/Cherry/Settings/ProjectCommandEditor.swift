@@ -1,3 +1,4 @@
+import CherryControl
 import AppKit
 import SwiftUI
 
@@ -69,7 +70,8 @@ struct ProjectCommandEditor: View {
         _draft = State(initialValue: ProjectCommandDraft(
             command: command,
             projectRoot: projectRoot,
-            storage: storage
+            // A device project's commands are saved on this Mac only.
+            storage: ProjectLocation.isRemoteKey(projectRoot) ? .local : storage
         ))
         self.projectRoot = projectRoot
         self.canDelete = canDelete
@@ -125,8 +127,11 @@ struct ProjectCommandEditor: View {
                     HStack(spacing: 10) {
                         TextField("e.g., ., web, packages/api", text: $draft.workingDirectory)
 
-                        Button("Browse") {
-                            chooseWorkingDirectory()
+                        // Not for a folder on another Mac.
+                        if !ProjectLocation.isRemoteKey(projectRoot) {
+                            Button("Browse") {
+                                chooseWorkingDirectory()
+                            }
                         }
                     }
 
@@ -153,14 +158,23 @@ struct ProjectCommandEditor: View {
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                ProjectCommandStorageOption(
-                    title: "Save to cherry.toml",
-                    subtitle: CherryProjectFile.exists(projectRoot: projectRoot)
-                        ? "Share this command through the project config"
-                        : "No cherry.toml found — Cherry will create one",
-                    isSelected: draft.storage == .projectFile
-                ) {
-                    draft.storage = .projectFile
+                if ProjectLocation.isRemoteKey(projectRoot) {
+                    // A device's cherry.toml is read there, never written
+                    // from here (docs/specs/remote-devices.md, phase 3).
+                    Text(CherryProjectFile.remoteReadOnlyNote)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ProjectCommandStorageOption(
+                        title: "Save to cherry.toml",
+                        subtitle: CherryProjectFile.exists(projectRoot: projectRoot)
+                            ? "Share this command through the project config"
+                            : "No cherry.toml found — Cherry will create one",
+                        isSelected: draft.storage == .projectFile
+                    ) {
+                        draft.storage = .projectFile
+                    }
                 }
 
                 ProjectCommandStorageOption(

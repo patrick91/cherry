@@ -76,19 +76,58 @@ struct RemoteDeviceShell: Sendable {
     /// Runs `script` on `destination`. Never on the main actor's time: the
     /// process is waited for on a detached task.
     func run(_ script: String, on destination: String) async -> Output {
+        let shell = self
+        return await Task.detached(priority: .userInitiated) {
+            shell.runSynchronously(script, on: destination).text
+        }.value
+    }
+
+    /// What a script printed, as bytes (git's NUL-separated lists).
+    struct DataOutput: Sendable {
+        var status: Int32
+        var standardOutput: Data
+        var standardError: String
+        var timedOut = false
+
+        var text: Output {
+            Output(
+                status: status,
+                standardOutput: String(decoding: standardOutput, as: UTF8.self),
+                standardError: standardError,
+                timedOut: timedOut
+            )
+        }
+    }
+
+    /// Runs `script` on `destination` and waits for it (blocking: call it
+    /// off the main actor).
+    func runSynchronously(_ script: String, on destination: String) -> DataOutput {
         let host: HostedSessionHost
         do {
             host = try HostedSessionHost.ssh(destination)
         } catch {
-            return Output(status: 255, standardOutput: "", standardError: error.localizedDescription)
+            return DataOutput(status: 255, standardOutput: Data(), standardError: error.localizedDescription)
         }
-        let arguments = arguments(destination: host.sshDestination ?? destination)
-        let executable = sshExecutable
-        let environment = environment
-        let timeout = timeout
-        return await Task.detached(priority: .userInitiated) {
-            Self.runProcess(executable: executable, arguments: arguments, environment: environment, input: script, timeout: timeout)
-        }.value
+        let output = Self.runProcess(
+            executable: sshExecutable,
+            arguments: arguments(destination: host.sshDestination ?? destination),
+            environment: environment,
+            input: script,
+            timeout: timeout
+        )
+        if controlPath != nil, output.status == 255, Self.isRefusedByMaster(output.standardError) {
+            // The master has no session to spare (a server with a lower
+            // MaxSessions): directly, as the CLI does.
+            var direct = self
+            direct.controlPath = nil
+            return direct.runSynchronously(script, on: destination)
+        }
+        return output
+    }
+
+    /// ssh's words when the master connection refused a session.
+    static func isRefusedByMaster(_ standardError: String) -> Bool {
+        standardError.contains("Session open refused by peer")
     }
 
     private static func runProcess(
@@ -97,7 +136,7 @@ struct RemoteDeviceShell: Sendable {
         environment: [String: String],
         input: String,
         timeout: TimeInterval
-    ) -> Output {
+    ) -> DataOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -111,7 +150,7 @@ struct RemoteDeviceShell: Sendable {
         do {
             try process.run()
         } catch {
-            return Output(status: 255, standardOutput: "", standardError: "Could not run ssh: \(error.localizedDescription)")
+            return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(error.localizedDescription)")
         }
         let group = DispatchGroup()
         let outData = OutputBox()
@@ -138,9 +177,9 @@ struct RemoteDeviceShell: Sendable {
             }
         }
         process.waitUntilExit()
-        return Output(
+        return DataOutput(
             status: timedOut ? 255 : process.terminationStatus,
-            standardOutput: String(decoding: outData.data, as: UTF8.self),
+            standardOutput: outData.data,
             standardError: String(decoding: errData.data, as: UTF8.self),
             timedOut: timedOut
         )
@@ -306,6 +345,7 @@ enum RemoteDeviceProbe {
         ]
         // This Cherry's installs (phase 2): each build's directory with its
         // files' hashes, and any Cherry.app with what its cherry-host is.
+        lines += RemoteHostResources.hashFunction
         lines += [
             "root=\"$HOME\"/" + singleQuoted(RemoteHostInstall.rootRelativePath),
             "newest=",
@@ -321,6 +361,8 @@ enum RemoteDeviceProbe {
             "    hashes=\"$hashes ${h:--}\"",
             "  done",
             "  printf 'installed=%s%s\\n' \"${d##*/}\" \"$hashes\"",
+            // Ghostty's terminfo and shell integration there (phase 3).
+            "  printf 'resources=%s %s\\n' \"${d##*/}\" \"$(resources_hash \"$d\")\"",
             "  [ -x \"$d/cherry-host\" ] || continue",
             "  [ -n \"$newest\" ] && [ \"$newest\" -nt \"$d\" ] || newest=$d",
             "done",
@@ -403,6 +445,11 @@ enum RemoteDeviceProbe {
                 let parts = value.split(separator: " ").map(String.init)
                 if let name = parts.first {
                     result.installedBuilds.append(RemoteInstalledBuild(name: name, hashes: Array(parts.dropFirst())))
+                }
+            case "resources":
+                let parts = value.split(separator: " ").map(String.init)
+                if parts.count == 2, let index = result.installedBuilds.lastIndex(where: { $0.name == parts[0] }) {
+                    result.installedBuilds[index].resourcesHash = parts[1]
                 }
             case "app":
                 let parts = value.split(separator: "\t", maxSplits: 1).map(String.init)

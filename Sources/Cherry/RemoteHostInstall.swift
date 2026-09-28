@@ -116,6 +116,14 @@ struct RemoteHostHelpers: Equatable, Sendable {
     var architectures: Set<String>
     /// SHA-256 (hex) of `cherry`, then `cherry-host`.
     var hashes: [String]
+    /// Ghostty's resources this Cherry bundles (the xterm-ghostty terminfo
+    /// and shell integration), installed next to the helpers as `Ghostty/`
+    /// and `terminfo/` (docs/specs/remote-devices.md, phase 3); nil when it
+    /// has none (then nothing is installed with them).
+    var resources: GhosttyResourceStaging.Source? = nil
+    /// Their digest (`RemoteHostResources.digest`), as the other Mac's
+    /// scripts compute it (`resources_hash`).
+    var resourcesHash: String? = nil
 
     var build: String { version.build ?? "unknown" }
 
@@ -132,8 +140,13 @@ struct RemoteHostHelpers: Equatable, Sendable {
         return name.isEmpty ? "unknown" : String(name.prefix(96))
     }
 
-    /// Reads the helpers in `directory` (runs `cherry-host version --json`).
-    static func load(directory: URL) throws -> RemoteHostHelpers {
+    /// Reads the helpers in `directory` (runs `cherry-host version --json`),
+    /// with the Ghostty resources (`resources`: the app's bundled ones by
+    /// default) installed next to them.
+    static func load(
+        directory: URL,
+        resources: GhosttyResourceStaging.Source? = GhosttyResourceStaging.bundledSource()
+    ) throws -> RemoteHostHelpers {
         let files = names.map { directory.appendingPathComponent($0) }
         for file in files where !FileManager.default.isExecutableFile(atPath: file.path) {
             throw HostedSessionError.message("This Cherry has no \(file.lastPathComponent) to install (looked in \(directory.path)).")
@@ -149,11 +162,14 @@ struct RemoteHostHelpers: Equatable, Sendable {
             }
             architectures = architectures.map { $0.intersection(found) } ?? found
         }
+        let installable = resources.flatMap(RemoteHostResources.installable)
         return RemoteHostHelpers(
             directory: directory,
             version: version,
             architectures: architectures ?? [],
-            hashes: try files.map(sha256)
+            hashes: try files.map(sha256),
+            resources: installable,
+            resourcesHash: installable.flatMap { try? RemoteHostResources.digest(of: $0) }
         )
     }
 
@@ -256,6 +272,73 @@ private final class AppHelpersCache: @unchecked Sendable {
     }
 }
 
+// MARK: - Ghostty's resources
+
+/// Ghostty's terminfo (`xterm-ghostty`) and shell integration, installed
+/// next to cherry-host on another Mac (`<build>/Ghostty`, `<build>/terminfo`)
+/// so its tabs get Cherry's terminal type and OSC 7, titles and prompt marks
+/// (docs/specs/remote-devices.md, phase 3). Like the helpers, one copy per
+/// build, never changed once in place, checked by digest.
+enum RemoteHostResources {
+    /// The names the two trees have there (and in the archive).
+    static let treeNames = [GhosttyResourceStaging.resourcesName, GhosttyResourceStaging.terminfoName]
+
+    /// `source` when both of its directories are there and named as they
+    /// are installed (`Ghostty`, `terminfo`).
+    static func installable(_ source: GhosttyResourceStaging.Source) -> GhosttyResourceStaging.Source? {
+        let resources = source.resourcesDirectory.resolvingSymlinksInPath()
+        let terminfo = source.terminfoDirectory.resolvingSymlinksInPath()
+        guard resources.lastPathComponent == treeNames[0], terminfo.lastPathComponent == treeNames[1] else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resources.appendingPathComponent("shell-integration").path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              FileManager.default.fileExists(atPath: terminfo.path, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return nil }
+        return GhosttyResourceStaging.Source(resourcesDirectory: resources, terminfoDirectory: terminfo)
+    }
+
+    /// The digest the other Mac's `resources_hash` computes: the SHA-256 of
+    /// `shasum -a 256` lines ("<hex>  <path>") of every regular file under
+    /// `Ghostty/` and `terminfo/`, by path in byte order.
+    static func digest(of source: GhosttyResourceStaging.Source) throws -> String {
+        var files: [(path: String, url: URL)] = []
+        for (name, root) in zip(treeNames, [source.resourcesDirectory, source.terminfoDirectory]) {
+            try collectFiles(in: root, relativePath: name, into: &files)
+        }
+        files.sort { Array($0.path.utf8).lexicographicallyPrecedes(Array($1.path.utf8)) }
+        var listing = ""
+        for file in files {
+            listing += "\(try RemoteHostHelpers.sha256(file.url))  \(file.path)\n"
+        }
+        return SHA256.hash(data: Data(listing.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func collectFiles(in directory: URL, relativePath: String, into files: inout [(path: String, url: URL)]) throws {
+        for name in try FileManager.default.contentsOfDirectory(atPath: directory.path) {
+            let url = directory.appendingPathComponent(name)
+            var status = stat()
+            guard lstat(url.path, &status) == 0 else { continue }
+            switch status.st_mode & S_IFMT {
+            case S_IFDIR: try collectFiles(in: url, relativePath: "\(relativePath)/\(name)", into: &files)
+            case S_IFREG: files.append(("\(relativePath)/\(name)", url))
+            default: break
+            }
+        }
+    }
+
+    /// `resources_hash D`: the digest of D's trees, or `-` when either is
+    /// missing.
+    static let hashFunction: [String] = [
+        "resources_hash() {",
+        "  if [ -d \"$1/Ghostty/shell-integration\" ] && [ -d \"$1/terminfo\" ]; then",
+        "    (cd \"$1\" && /usr/bin/find Ghostty terminfo -type f -print 2>/dev/null | LC_ALL=C /usr/bin/sort | while IFS= read -r f; do \(RemoteHostInstaller.Tool.shasum) -a 256 \"$f\"; done) | \(RemoteHostInstaller.Tool.shasum) -a 256 | \(RemoteHostInstaller.Tool.awk) '{ print $1 }'",
+        "  else",
+        "    echo -",
+        "  fi",
+        "}",
+    ]
+}
+
 // MARK: - What the other Mac has
 
 /// A build directory of ours on the other Mac, as the check found it.
@@ -263,6 +346,14 @@ struct RemoteInstalledBuild: Equatable, Sendable {
     var name: String
     /// SHA-256 of its `cherry` and `cherry-host`, in that order.
     var hashes: [String]
+    /// The digest of its Ghostty resources (`RemoteHostResources`), `-`
+    /// when it has none; nil when the check did not say (an older Cherry's).
+    var resourcesHash: String? = nil
+
+    /// It has `helpers` (and their resources, when they have any).
+    func matches(_ helpers: RemoteHostHelpers) -> Bool {
+        hashes == helpers.hashes && (helpers.resourcesHash == nil || resourcesHash == helpers.resourcesHash)
+    }
 }
 
 /// A Cherry.app on the other Mac (/Applications, ~/Applications).
@@ -488,7 +579,7 @@ enum RemoteHostInstall {
         var copyNeeded = true
         let alternate = RemoteHostInstaller.alternateName(directoryName, hashes: helpers.hashes)
         for candidate in [directoryName, alternate]
-        where probe.installedBuilds.contains(where: { $0.name == candidate && $0.hashes == helpers.hashes }) {
+        where probe.installedBuilds.contains(where: { $0.name == candidate && $0.matches(helpers) }) {
             directoryName = candidate
             copyNeeded = false
             break
@@ -736,6 +827,8 @@ struct RemoteHostInstaller: Sendable {
         var kept: [String: Set<RemoteHostInstall.BuildUse>] = [:]
         /// Found once the build ran there (`RemoteHostInstall.recheck`).
         var warnings: [String] = []
+        /// Ghostty's resources are there with it (`RemoteHostResources`).
+        var resourcesInstalled = false
     }
 
     var shell: RemoteDeviceShell
@@ -801,16 +894,19 @@ struct RemoteHostInstaller: Sendable {
     }
 
     /// `verify_dir D`: both executables are there, their hashes are
-    /// `$expected`, both signatures verify and cherry-host runs; else
-    /// `$why` says what is wrong.
-    private static func verifyFunction(expectedHashes: [String]) -> [String] {
-        [
+    /// `$expected`, the Ghostty resources' digest is `$expected_resources`
+    /// (when set), both signatures verify and cherry-host runs; else `$why`
+    /// says what is wrong.
+    private static func verifyFunction(expectedHashes: [String], expectedResources: String? = nil) -> [String] {
+        RemoteHostResources.hashFunction + [
             "expected='\(expectedHashes.joined(separator: " ")) '",
+            "expected_resources=\(expectedResources.map(RemoteDeviceProbe.singleQuoted) ?? "")",
             "verify_dir() {",
             "  why=",
             "  if [ ! -f \"$1/cherry\" ] || [ ! -x \"$1/cherry\" ] || [ ! -f \"$1/cherry-host\" ] || [ ! -x \"$1/cherry-host\" ]; then why=incomplete; return 1; fi",
             "  found=$(\(Tool.shasum) -a 256 \"$1/cherry\" \"$1/cherry-host\" 2>/dev/null | \(Tool.awk) '{ printf \"%s \", $1 }')",
             "  if [ \"$found\" != \"$expected\" ]; then why=hashes; return 1; fi",
+            "  if [ -n \"$expected_resources\" ] && [ \"$(resources_hash \"$1\")\" != \"$expected_resources\" ]; then why=resources; return 1; fi",
             "  if \(Tool.codesign) --verify --strict \"$1/cherry-host\" >/dev/null 2>&1 && \(Tool.codesign) --verify --strict \"$1/cherry\" >/dev/null 2>&1; then :; else why=codesign; return 1; fi",
             "  if \"$1/cherry-host\" version --json >/dev/null 2>&1; then return 0; fi",
             "  why=version",
@@ -824,10 +920,13 @@ struct RemoteHostInstaller: Sendable {
     /// `cherry-host version --json` and hashes both files.
     static func verifyScript(directoryName: String, sourceName: String) -> String {
         var lines = prelude(directoryName: directoryName)
+        lines += RemoteHostResources.hashFunction
         lines += [
             "src=\"$root\"/" + RemoteDeviceProbe.singleQuoted(sourceName),
             "if [ -f \"$src/cherry\" ] && [ -x \"$src/cherry\" ] && [ -f \"$src/cherry-host\" ] && [ -x \"$src/cherry-host\" ]; then",
             "  \(Tool.xattr) -c \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null",
+            "  for tree in Ghostty terminfo; do [ -d \"$src/$tree\" ] && \(Tool.xattr) -cr \"$src/$tree\" 2>/dev/null; done",
+            "  printf 'resources_hash=%s\\n' \"$(resources_hash \"$src\")\"",
             "  printf 'xattrs=%s\\n' \"$(\(Tool.xattr) \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null | tr '\\n' ' ')\"",
             "  if signature=$(\(Tool.codesign) --verify --strict \"$src/cherry-host\" 2>&1) && signature=$(\(Tool.codesign) --verify --strict \"$src/cherry\" 2>&1); then",
             "    echo codesign=ok",
@@ -876,10 +975,11 @@ struct RemoteHostInstaller: Sendable {
         directoryName: String,
         sourceName: String?,
         expectedHashes: [String],
+        expectedResources: String? = nil,
         installationID: UUID? = nil
     ) -> String {
         var lines = prelude(directoryName: directoryName)
-        lines += verifyFunction(expectedHashes: expectedHashes)
+        lines += verifyFunction(expectedHashes: expectedHashes, expectedResources: expectedResources)
         lines += [
             "processes=$(\(Tool.ps) -axww -o command= 2>/dev/null)",
             "in_use() { case \"$processes\" in *\"$1/\"*) return 0 ;; esac; return 1; }",
@@ -1035,10 +1135,13 @@ struct RemoteHostInstaller: Sendable {
         var missing = false
         /// Extended attributes still on the files after `xattr -c`.
         var remainingAttributes: String?
+        /// The copy's Ghostty resources digest (`-`: none).
+        var resourcesHash: String?
 
         init(fields: [(key: String, value: String)]) {
             for (key, value) in fields {
                 switch key {
+                case "resources_hash": resourcesHash = value.trimmingCharacters(in: .whitespaces).nilIfEmpty
                 case "codesign": codesignOK = value == "ok"
                 case "codesign_error": codesignError = value.trimmingCharacters(in: .whitespaces).nilIfEmpty
                 case "verify_status": status = Int32(value)
@@ -1069,6 +1172,9 @@ struct RemoteHostInstaller: Sendable {
             }
             if hashes != helpers.hashes {
                 return "The copy on \(machine) differs from this Cherry's helpers (their SHA-256 do not match)."
+            }
+            if let expected = helpers.resourcesHash, resourcesHash != expected {
+                return "The copy of Ghostty's terminfo and shell integration on \(machine) differs from this Cherry's."
             }
             return nil
         }
@@ -1167,7 +1273,8 @@ struct RemoteHostInstaller: Sendable {
         let finishOutput = await shell.run(
             Self.finishScript(
                 directoryName: directory, sourceName: sourceName,
-                expectedHashes: helpers.hashes, installationID: installationID
+                expectedHashes: helpers.hashes, expectedResources: helpers.resourcesHash,
+                installationID: installationID
             ),
             on: destination
         )
@@ -1242,7 +1349,8 @@ struct RemoteHostInstaller: Sendable {
             placement: report.final ?? "moved",
             brokenKept: report.brokenInUse,
             kept: kept,
-            warnings: warnings
+            warnings: warnings,
+            resourcesInstalled: helpers.resourcesHash != nil
         )
     }
 
@@ -1271,23 +1379,43 @@ struct RemoteHostInstaller: Sendable {
         arguments.append(command)
         let ssh = shell.sshExecutable
         let environment = shell.environment
-        let directory = helpers.directory
+        let tarArguments = Self.archiveArguments(helpers)
         let timeout = copyTimeout
-        return await Task.detached(priority: .userInitiated) {
-            Self.runPipeline(ssh: ssh, arguments: arguments, environment: environment, directory: directory, timeout: timeout)
+        let output = await Task.detached(priority: .userInitiated) {
+            Self.runPipeline(ssh: ssh, arguments: arguments, environment: environment, tarArguments: tarArguments, timeout: timeout)
         }.value
+        if shell.controlPath != nil, output.status == 255, RemoteDeviceShell.isRefusedByMaster(output.standardError) {
+            // The master has no session to spare: directly, as the CLI does.
+            var direct = self
+            direct.shell.controlPath = nil
+            return await direct.copy(to: partialName, on: destination)
+        }
+        return output
+    }
+
+    /// What `tar -cf -` archives: the helpers, then Ghostty's two trees
+    /// when there are any, each from its own directory.
+    static func archiveArguments(_ helpers: RemoteHostHelpers) -> [String] {
+        var arguments = ["-cf", "-", "-C", helpers.directory.path] + RemoteHostHelpers.names
+        if let resources = helpers.resources, helpers.resourcesHash != nil {
+            arguments += [
+                "-C", resources.resourcesDirectory.deletingLastPathComponent().path, RemoteHostResources.treeNames[0],
+                "-C", resources.terminfoDirectory.deletingLastPathComponent().path, RemoteHostResources.treeNames[1],
+            ]
+        }
+        return arguments
     }
 
     private static func runPipeline(
         ssh: String,
         arguments: [String],
         environment: [String: String],
-        directory: URL,
+        tarArguments: [String],
         timeout: TimeInterval
     ) -> RemoteDeviceShell.Output {
         let tar = Process()
         tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tar.arguments = ["-cf", "-", "-C", directory.path] + RemoteHostHelpers.names
+        tar.arguments = tarArguments
         // Extended attributes travel with the files (macOS tar merges them
         // back on extraction); the check there clears them (`xattr -c`).
         tar.environment = ["PATH": "/usr/bin:/bin"]

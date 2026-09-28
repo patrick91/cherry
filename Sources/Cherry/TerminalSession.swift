@@ -1319,7 +1319,8 @@ final class TerminalWorkspace: ObservableObject {
                 hostSessionID: session.persistentSession?.sessionID,
                 title: SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode).title,
                 place: place,
-                isBusy: session.hasRunningProcess()
+                isBusy: session.hasRunningProcess(),
+                machine: session.remoteMachineName
             )
         }
         return SessionTeardownSummary(
@@ -4225,6 +4226,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentHosting != nil
     }
 
+    /// The home folder `~` stands for in this tab's paths: the device's
+    /// for a tab of another Mac (from its check; "" when not known, so no
+    /// path is shortened with This Mac's), else This Mac's.
+    var pathHomeDirectory: String {
+        guard let hosting = persistentHosting, !hosting.profile.isThisMac else { return NSHomeDirectory() }
+        return hosting.profile.homeDirectory ?? ""
+    }
+
     /// The device this tab's program runs on (docs/specs/remote-devices.md),
     /// by its name; nil for This Mac's tabs.
     var remoteMachineName: String? {
@@ -6406,10 +6415,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// program ran ssh) is ignored, as Ghostty ignores such an OSC 7.
     private func applyHostReportedTitleAndDirectory(of info: HostedSessionInfo, resynchronizing: Bool) {
         let passesThrough = !resynchronizing && adapterPassesSignalsThrough
+        // A device's tab takes its directory from the host even while the
+        // adapter passes signals through: the surface ignores an OSC 7 of
+        // another machine (`ingestNativeWorkingDirectory`).
+        let directoryPassesThrough = passesThrough && reportsLocalWorkingDirectory
         var didChange = false
         if resynchronizing || info.pwd != lastHostReportedDirectory {
             lastHostReportedDirectory = info.pwd
-            if !passesThrough, let path = hostReportedWorkingDirectory(of: info) {
+            if !directoryPassesThrough, let path = hostReportedWorkingDirectory(of: info) {
                 if workingDirectory != path {
                     workingDirectory = path
                     didChange = true

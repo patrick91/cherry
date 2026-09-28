@@ -1,10 +1,13 @@
 # Devices: projects on your other Macs
 
 Status: phase 0 (groundwork), phase 1 (devices and remote project
-windows) and phase 2 (Add Mac… installs the session host) implemented on
-`codex/persistent-sessions`; phases 3 and 4 are the plan. Phases 1 and 2 as
-built, and where they differ from the plan below, are in *Phase 1 as built*
-and *Phase 2 as built*. Builds on
+windows), phase 2 (Add Mac… installs the session host) and phase 3 (parity:
+worktrees, cherry.toml, shell integration, editors, background sessions,
+dropped files, master shards) implemented on `codex/persistent-sessions`;
+the rest of phase 3's plan (MCP for remote agents, previews, ports and
+services) and phase 4 are the plan. Phases 1–3 as built, and where they
+differ from the plan below, are in *Phase 1 as built*, *Phase 2 as built*
+and *Phase 3 as built*. Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
 [remote-session-host.md](remote-session-host.md) (SSH transport, gateway,
@@ -104,9 +107,10 @@ choosing a project folder, remote previews without SSH port forwarding.
    (`MaxSessions`). One master connection per destination
    (`HostSSHMasterManager`) carries at most
    `Configuration.maxChannelsPerMaster` (8) adapter launches; further
-   adapters use their own ssh. The CLI connects again without the
-   ControlPath when a master refuses a session ("Session open refused by
-   peer").
+   adapters share another master of the destination (a shard, phase 3),
+   and use their own ssh only when no master has room. The CLI connects
+   again without the ControlPath when a master refuses a session ("Session
+   open refused by peer").
 
 ## Phase 0: groundwork (done)
 
@@ -338,11 +342,9 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
 Deviations from the plan below: Add Mac… (connect and check) is in phase
 1; projects come from the device's session tags and added folders, not
 `AgentSettings.projects`, and "Open Folder on <Mac>…" is Open Home Folder
-plus Add Project on <Mac>… (no `ListDir`); sidebar path labels do not use
-the device's home yet; Settings › Sessions does not list each device's
-status; the quit question counts device sessions with This Mac's but does
-not say "on 2 Macs"; file paste and drop into a device tab still insert
-This Mac's paths (phase 3).
+plus Add Project on <Mac>… (no `ListDir`). The phase 1 leftovers (sidebar
+labels with the device's home, each device in Settings › Sessions, the
+quit question naming Macs, dropped files) were done in phase 3.
 
 ## Phase 2 as built
 
@@ -529,6 +531,192 @@ Deviations from the plan below:
   Update Session Host… is not offered for them by the menu (it is for
   another protocol); a handover from our own install of such a build to
   another is done, since it only happens when the user asked.
+
+## Phase 3 as built
+
+What exists (`Sources/Cherry/RemoteProjects.swift`, `RemoteFileDrop.swift`,
+`RemoteDeviceSettings.swift`, `RemoteLaunchSpec.swift`, the device sections
+of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
+`Host/crates/cherry-host/src/project_info.rs`):
+
+- **`cherry-host project-info --json PATH…`** (Rust, shipped with the
+  install): for each path (at most 64) whether it exists and is a folder,
+  its git top level, common directory and `git worktree list --porcelain
+  -z` (cut at 1 MiB, at a record, `worktrees_truncated`), and its
+  `cherry.toml` (at most 256 KiB, UTF-8; larger or not UTF-8: its size and
+  an `error`, no text). It runs only the git `CHERRY_GIT` names (unset or
+  empty: no git at all, `git_error: "git not found"`, never one from PATH,
+  which on a Mac without the command line tools would pop their install
+  prompt), reads only, and never starts or talks to a daemon. The app runs it as a one-shot `sh -s`
+  script over the device's ssh (`RemoteProjectAccess`: the master's
+  `ControlPath` while it is up, else its own BatchMode ssh), which finds a
+  git that will not ask to install the command line tools (`command -v
+  git`, Homebrew's, `/usr/bin/git` only when `xcode-select -p` answers) and
+  runs the device's cherry-host (`remoteHostPath`, else `PATH`), with
+  `CHERRY_GIT` unset when it found none. The answer
+  is versioned (`version: 1`); an older cherry-host without the subcommand,
+  or another version, is `RemoteProjectError.unsupported` ("update it").
+  The app re-checks the cap (a text over 256 KiB is not used) and reads at
+  most 4 MiB.
+- **Remote git worktrees.** `GitWorktreeService` takes a runner
+  (`GitWorktreeService(runner:isLocal:)`); a device window's is
+  `RemoteProjectAccess.gitRunner`, which runs `exec "$git" '<arg>'…` in a
+  `sh -s` script there (so any login shell runs it; an ssh failure is a
+  `GitWorktreeCommandError` with the ssh message). `RepositoryWorkspace`
+  (given `remoteProject`, the app passes `RemoteProjectAccess.app(device)`
+  for a known device) names worktrees by key (`device:<id>:<path>`) and
+  converts to the device's paths for git (`gitPath`); its refresh is one
+  `project-info` for the project, then one for the other worktrees'
+  cherry.toml; discovery, dirty status, New Worktree… (under the device's
+  `~/.cherry/worktrees`, `managedWorktreeDestination`; git makes the
+  folders), branch references, fetch, rename, remove, remove all and prune
+  run there. Hidden and last active worktrees are kept by key.
+  `GitWorktree.displayPath` shows the path, never the key.
+- **cherry.toml on devices.** `RemoteProjectFiles` keeps each device
+  project's text by key (from `project-info`), and `CherryProjectFile`
+  parses it (commands, features, appearance) as it parses a local file.
+  Writes throw `RemoteProjectFileError` ("read-only in Cherry: edit it on
+  that Mac, or save the command on this Mac only"); the command editor
+  shows that note instead of "Save to cherry.toml" and saves locally
+  (overrides keyed by the project key, as `commandsByProject` keys any
+  project). The sidebar lists the device's commands; auto-start waits for
+  the first `project-info` answer (`whenRemoteProjectLoaded`), then runs as
+  for This Mac; restart on exit is unchanged. A device that cannot be
+  reached when its window opens is read again once its control connects
+  (`refreshRemoteProjectOnConnection`), and auto-start keeps waiting until
+  then. New Worktree… asks a device whose home is not recorded for it
+  (`printf "$HOME"`, then recorded) and refuses when it cannot say.
+- **Shell integration there.** The installer copies Ghostty's terminfo and
+  shell integration (this Cherry's bundled resources, `RemoteHostResources`)
+  next to the helpers as `<build>/terminfo` and `<build>/Ghostty`, in the
+  same tar stream, checked like them by a digest (`resources_hash`: the
+  SHA-256 of the `shasum -a 256` lines of every file, by path) that the
+  probe reports per build (`resources=`), `verify_dir` requires and the
+  decision matches (a build without them is copied again; the menu and
+  Settings offer Update Session Host… for an install without them).
+  `RemoteDevice` records `shell` (the check's `$SHELL`, refreshed by Update
+  Session Host…) and `installedResources`; the hosting's profile reads them
+  at each launch (`PersistentHostProfile.device`). `RemoteLaunchSpec` then
+  sets `TERM=xterm-ghostty`, `TERMINFO`, `GHOSTTY_RESOURCES_DIR` and
+  `GHOSTTY_SHELL_FEATURES` for every tab, and a terminal runs its login
+  shell as `/bin/bash --noprofile --norc -c 'exec -l <shell…>'` with
+  `HostedLaunchSpec.ghosttyShellIntegration` (zsh `ZDOTDIR`, bash
+  `--posix`/`ENV`, fish `XDG_DATA_DIRS`) with the device's paths. Without
+  the resources it is phase 1's launch (`xterm-256color`, argv `[]`). With
+  the resources but no known login shell, a terminal's argv stays `[]` (the
+  host runs the account's shell, without Ghostty's integration) while
+  `TERM=xterm-ghostty`, `TERMINFO` and `GHOSTTY_RESOURCES_DIR` are still
+  set; commands and agents get those variables either way. A device tab now takes its directory from the host's reports
+  even while its adapter passes signals through (the surface ignores an
+  OSC 7 of another machine), so OSC 7 moves the tab's directory, and a new
+  tab starts in the selected tab's.
+- **SSH master shards.** `HostSSHMasterManager` keeps up to `maxMasters`
+  (8) masters per destination: the first (`dest`, the control's lease) and
+  shards (`dest#2`…, control paths named after that key). Once the masters
+  up or starting have `spareChannels` (1) free slots or fewer, the next
+  shard starts (reserved); a launch takes the first master with room; a
+  reserved shard with no launches stops once the others have room without
+  it or the first master is down; a shard that is up or starting but no
+  longer needed (its idle stop pending) is kept as the spare instead of
+  starting another. A shard that fails to start (it could not connect or
+  log in) is not kept, and no shard of that destination starts for
+  `shardRetryDelay` (60 s) or until its first master comes up again, so a
+  refused login is not repeated by every next shard; adapters then use
+  their own ssh as before. `shardStatuses(of:)` reports them. The device's
+  one-shot shells (`RemoteDeviceShell`, the install's copy) and scp of
+  dropped files connect directly when the master refuses a session
+  ("Session open refused by peer"), as the CLI does.
+- **Open in an editor.** `RemoteEditorLink`: VS Code (and Insiders) and
+  Cursor open `vscode://vscode-remote/ssh-remote+<dest><path>` (their own
+  scheme) with the app; Zed opens its documented hotlink
+  `zed://ssh/[user@]host/<path>` with the app, whose path Zed
+  percent-decodes (so a folder with spaces opens as named; the CLI's
+  `zed ssh://host/<path>` form is not used because its decoding is not
+  documented). Other editors are not offered for a device's project
+  (`ExternalEditorLauncher.editors`); the opener is injected.
+- **Background Sessions per device.** This Mac's `BackgroundSessionsModel`
+  keeps a model per registered device hosting
+  (`RemoteDeviceStore.backgroundHostings`), shown as sections under the
+  device's name in the menu bar panel; Open (only in a window of that
+  device's project), End, Clear Ended, End All, notifications (naming the
+  Mac; `userInfo` carries the host identity) and unread marks work as
+  This Mac's; unread marks survive a disconnect. A device's model lists
+  while its control is connected; it holds no lease and never connects by
+  itself. **Listing a device never starts or replaces its daemon** unless
+  the user acts on that Mac (opens one of its projects, Reconnect, Add Mac…,
+  Update Session Host…): the panel, the project picker's refresh on open
+  and the launch notice look at a device that is not connected with
+  `cherry list --json --no-start` (`HostControl.listWithoutStarting`,
+  `RemoteDevicePeeks`; the CLI's `list --no-start` runs `cherry-host
+  gateway --no-start`), which leaves its control alone; a device where no
+  daemon runs shows nothing ("Its session host is not running" in the
+  picker), one that answers shows its sessions while the panel is open
+  ("Reachable · N sessions"). Looks are throttled per device: after a
+  failure at most once a minute, after a refused login, another identity or
+  protocol not until a wake, a network change or Reconnect/Retry. The
+  launch notice uses the connection of a device connected now, else such a
+  look (within 10 s), for the devices this run reached; it names their
+  projects "app on Studio", reopens each session on its own hosting, and
+  keeps the told ids of a host that did not answer.
+- **Phase 1 leftovers.** Sidebar and context bar paths use the device's
+  home for `~` (`TerminalSession.pathHomeDirectory`; not known: nothing is
+  shortened, never with This Mac's). Settings › Sessions › Other Macs lists
+  each device (`RemoteDeviceSettingsRow`: connected, connecting, not
+  connected, offline, needs attention, "Update available") with Reconnect
+  (or Trust New Identity…), Update Session Host… and Remove…. The quit
+  question says "Keep 5 sessions running (3 on this Mac, 2 on Studio)?"
+  ("… running on Studio?" when all are there); End Sessions ends device
+  sessions with the offline recording of phase 1. Files pasted (⌘V) or
+  dropped on a device tab (`AppTerminalView.dropHandler`) are not inserted
+  as This Mac's paths: Cherry asks ("Copy 2 files to Studio?"), makes a
+  folder there (`mktemp -d "$TMPDIR/cherry-drop.XXXXXX"`), copies them with
+  `scp -O -r -B -S <ssh>` (the master's ControlPath when up) and inserts
+  the paths they have there (text is pasted as before).
+- **Tests.** `RemoteDeviceParityTests` (project-info parsing and caps, the
+  scripts' quoting through sh, cherry.toml from the device and never
+  written, no git without `CHERRY_GIT`, the launch spec per shell, device
+  records, the resources digest
+  against the shell function and the probe, editor links, `~` labels,
+  Settings rows, the quit question, End Sessions ending device sessions,
+  Background Sessions listing only connected devices without connecting
+  (looks through fake peeks, their throttle, unread marks kept across a
+  disconnect), the picker looking without connecting, the launch notice,
+  dropped files and scp's options) and `HostControlSSHMasterTests` (shards,
+  a shard that cannot log in stopping further shards for its backoff, an
+  idle shard kept as the spare) and `RemoteDeviceRealHostParityTests`
+  through `Scripts/fake-remote-mac` (worktrees created, dirty and removed on
+  the device through the runner; cherry.toml commands auto-started and
+  restarted there, local overrides, the 256 KiB cap, an old cherry-host;
+  the terminfo and zsh integration installed, `TERM=xterm-ghostty` with a
+  working `infocmp`, OSC 7 reaching the tab, the next tab's directory;
+  files copied with scp through the shim; shards against the fake's
+  stand-in masters with `max-sessions` 3; a shell and scp connecting
+  directly when the master refuses every session; a look at a device
+  without a daemon starting none, and listing one that runs; a window
+  opened while its device is offline reading its project and starting its
+  commands once it connects; New Worktree… asking the device for its
+  home). The fake Mac's shim gained
+  stand-in masters (`DIR/masters`) and a MaxSessions stand-in
+  (`DIR/max-sessions`). `Scripts/test-remote-mac-loopback`'s sshd has
+  `MaxSessions 3` and runs the shard test over real SSH (a fourth session
+  on the first master is refused, the third adapter runs on the second).
+
+Deviations from the plan below:
+
+- Host services are not additive protocol requests over the control
+  connection: `project-info` and git run as one-shot ssh commands over the
+  master (the control protocol is unchanged). Process metadata, ports,
+  service discovery, MCP for remote agents (`ssh -R`) and previews are not
+  built.
+- Zed opens through its `zed://ssh/` hotlink rather than its CLI (see
+  above).
+- Dropped files go to a new temporary folder on the device, never the
+  project folder (a copy there could overwrite files); scp uses its legacy
+  protocol (`-O`), which any sshd serves.
+- Background Sessions per device, their notifications and unread marks, and
+  the launch notice naming devices (phase 4 in the plan) are done here.
+- Settings › Sessions shows each device's connection state, not a
+  per-device `PersistentSessionsStatus`.
 
 ## Phase 1: devices and remote project windows (the plan)
 

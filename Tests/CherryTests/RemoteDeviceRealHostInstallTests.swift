@@ -82,6 +82,11 @@ private func placeCopy(of helpers: RemoteHostHelpers, at build: URL) throws {
     for name in RemoteHostHelpers.names {
         try FileManager.default.copyItem(at: helpers.directory.appendingPathComponent(name), to: build.appendingPathComponent(name))
     }
+    // With Ghostty's resources, as the install places them.
+    if let resources = helpers.resources {
+        try FileManager.default.copyItem(at: resources.resourcesDirectory, to: build.appendingPathComponent("Ghostty"))
+        try FileManager.default.copyItem(at: resources.terminfoDirectory, to: build.appendingPathComponent("terminfo"))
+    }
 }
 
 /// No masters: every command logs in (through the shim).
@@ -116,7 +121,8 @@ private let noMasters = HostSSHMasterManager(configuration: .init(directory: { n
         #expect(device.installedBuild == helpers.build)
         // The fake Mac is this one: the copy runs as its architecture.
         #expect(device.installedArch == ProcessInfo.processInfo.machineHardwareName)
-        #expect(entries(installed) == ["cherry", "cherry-host"])
+        // With Ghostty's terminfo and shell integration (phase 3).
+        #expect(entries(installed) == ["Ghostty", "cherry", "cherry-host", "terminfo"])
         // Only the build's directory: no partial copy is left.
         #expect(entries(mac.installRoot) == [helpers.directoryName])
         // Marked as installed, and as used by this installation.
@@ -474,7 +480,7 @@ private let noMasters = HostSSHMasterManager(configuration: .init(directory: { n
 
         // Checked again: the same files are there, so nothing is copied.
         let second = await RemoteDeviceProbe.run(destination: destination, remoteHostPath: nil, shell: shell)
-        #expect(second.installedBuilds == [RemoteInstalledBuild(name: outcome.directoryName, hashes: helpers.hashes)])
+        #expect(second.installedBuilds == [RemoteInstalledBuild(name: outcome.directoryName, hashes: helpers.hashes, resourcesHash: helpers.resourcesHash)])
         let again = try #require(RemoteHostInstall.decide(probe: second, helpers: .success(helpers), machine: destination).plan)
         #expect(!again.copyNeeded)
         let skipped = try await installer.install(again, on: destination, machine: destination)
@@ -512,7 +518,7 @@ private extension ProcessInfo {
         try FileManager.default.copyItem(at: mac.binaries.appendingPathComponent("cherry"), to: build.appendingPathComponent("cherry"))
 
         let probe = await RemoteDeviceProbe.run(destination: "damaged", remoteHostPath: nil, shell: mac.shell)
-        #expect(probe.installedBuilds == [RemoteInstalledBuild(name: helpers.directoryName, hashes: [helpers.hashes[0], "-"])])
+        #expect(probe.installedBuilds == [RemoteInstalledBuild(name: helpers.directoryName, hashes: [helpers.hashes[0], "-"], resourcesHash: "-")])
         let plan = try #require(RemoteHostInstall.decide(probe: probe, helpers: .success(helpers), machine: "damaged").plan)
         #expect(plan.copyNeeded && plan.directoryName == helpers.directoryName)
         let outcome = try await RemoteHostInstaller(shell: mac.shell, helpers: helpers, installationID: mac.installationID)
@@ -603,7 +609,7 @@ private extension ProcessInfo {
         #expect(outcomes.filter { $0.placement == "moved" }.count == 1)
         #expect(outcomes.filter { $0.placement == "existing" }.count == 2)
         let build = mac.installRoot.appendingPathComponent(helpers.directoryName, isDirectory: true)
-        #expect(entries(build) == ["cherry", "cherry-host"])
+        #expect(entries(build) == ["Ghostty", "cherry", "cherry-host", "terminfo"])
         #expect(entries(mac.installRoot) == [helpers.directoryName])
 
         // An older installer's copy nested inside the build: removed, and
@@ -616,7 +622,7 @@ private extension ProcessInfo {
         let outcome = try await installer.install(reuse, on: "race", machine: "race")
         #expect(outcome.placement == "existing")
         #expect(!FileManager.default.fileExists(atPath: nested.path))
-        #expect(entries(build) == ["cherry", "cherry-host"])
+        #expect(entries(build) == ["Ghostty", "cherry", "cherry-host", "terminfo"])
         await mac.tearDown()
     } catch {
         await mac.tearDown()

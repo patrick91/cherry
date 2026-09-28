@@ -30,6 +30,10 @@
 # private home, runs xattr -c, codesign --verify --strict and cherry-host
 # version --json there, checks the hashes, skips a second copy of the same
 # files; then `cherry --host` runs the installed cherry-host's gateway.
+# Its sshd allows 3 sessions per connection (MaxSessions 3), and the Swift
+# test RemoteDeviceRealHostShardsSSHMastersAboveTheChannelCap checks against
+# it that the app opens a second SSH master (a shard) once the first is full,
+# where a fourth session on the first is refused.
 # Exits 2 when sshd cannot run here (then use Scripts/fake-remote-mac, which
 # the Swift tests use).
 set -euo pipefail
@@ -121,6 +125,7 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 X11Forwarding no
 PermitUserEnvironment no
+MaxSessions 3
 ForceCommand $dir/force-command
 EOF
 
@@ -236,6 +241,22 @@ if [ "$install" = 1 ]; then
     || fail "the gateway ran the installed cherry-host"
   pass "the installed cherry-host's gateway serves cherry --host"
 fi
+
+# SSH master shards against MaxSessions 3 (the app's manager, run by its
+# Swift test against this sshd).
+if [ "$build" = 1 ] && [ "$install" = 0 ]; then
+  (cd "$root" && PATH="$original_path" swift build --build-tests >"$dir/swift-build.log" 2>&1) \
+    || { cat "$dir/swift-build.log" >&2; fail "swift build --build-tests"; }
+fi
+shard_test=RemoteDeviceRealHostShardsSSHMastersAboveTheChannelCap
+if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
+  CHERRY_TEST_LOOPBACK_SSH="$dir/bin/ssh" CHERRY_TEST_LOOPBACK_DESTINATION=loopback \
+  swift test --skip-build --no-parallel --filter "$shard_test" >"$dir/swift-shard.log" 2>&1); then
+  cat "$dir/swift-shard.log" >&2
+  fail "SSH master shards over SSH ($shard_test)"
+fi
+grep -q "Test $shard_test() passed" "$dir/swift-shard.log" || { cat "$dir/swift-shard.log" >&2; fail "$shard_test did not run"; }
+pass "a second SSH master above MaxSessions 3 (the first refused a fourth session)"
 
 # The daemon it started is this script's private one.
 pgrep -f "serve --socket $socket" >/dev/null || fail "a private daemon served $socket"

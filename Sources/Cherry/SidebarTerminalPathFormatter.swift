@@ -44,9 +44,12 @@ enum SidebarTerminalPathFormatter {
         }
     }
 
+    /// `path` with its home folder as `~`. An empty `homeDirectory` (a
+    /// device whose home is not known) shortens nothing.
     static func displayPath(_ path: String, homeDirectory: String = NSHomeDirectory()) -> String {
         let normalizedPath = normalizedAbsolutePath(path, homeDirectory: homeDirectory)
         let normalizedHome = normalizedAbsolutePath(homeDirectory, homeDirectory: homeDirectory)
+        guard !normalizedHome.isEmpty, normalizedHome != "/" else { return normalizedPath }
         if normalizedPath == normalizedHome {
             return "~"
         }
@@ -133,7 +136,7 @@ enum SidebarTerminalPathFormatter {
     private static func relativeComponents(for path: String, homeDirectory: String) -> [String] {
         let normalizedPath = normalizedAbsolutePath(path, homeDirectory: homeDirectory)
         let normalizedHome = normalizedAbsolutePath(homeDirectory, homeDirectory: homeDirectory)
-        guard normalizedPath.hasPrefix(normalizedHome + "/") else { return [] }
+        guard !normalizedHome.isEmpty, normalizedHome != "/", normalizedPath.hasPrefix(normalizedHome + "/") else { return [] }
         return normalizedPath
             .dropFirst(normalizedHome.count + 1)
             .split(separator: "/", omittingEmptySubsequences: true)
@@ -145,11 +148,11 @@ enum SidebarTerminalPathFormatter {
         guard !trimmed.isEmpty else { return "" }
 
         let expanded: String
-        if trimmed == "~" {
+        if trimmed == "~", !homeDirectory.isEmpty {
             expanded = homeDirectory
-        } else if trimmed.hasPrefix("~/") {
+        } else if trimmed.hasPrefix("~/"), !homeDirectory.isEmpty {
             expanded = homeDirectory + "/" + trimmed.dropFirst(2)
-        } else if trimmed.hasPrefix("~") {
+        } else if trimmed.hasPrefix("~"), homeDirectory == NSHomeDirectory() {
             expanded = NSString(string: trimmed).expandingTildeInPath
         } else {
             expanded = trimmed

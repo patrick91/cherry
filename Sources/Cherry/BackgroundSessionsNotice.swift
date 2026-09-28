@@ -61,6 +61,8 @@ final class BackgroundSessionsNotice {
     private let restoreWait: Duration
     private let retryDelay: TimeInterval
     private let retries: Int
+    /// Looks at devices without starting their daemons.
+    private let peeks: RemoteDevicePeeks
 
     /// - Parameters:
     ///   - isEnabled: Settings › Sessions' "Tell me about background
@@ -80,8 +82,10 @@ final class BackgroundSessionsNotice {
         settleDelay: Duration = .seconds(2),
         restoreWait: Duration = .seconds(20),
         retryDelay: TimeInterval = 0.5,
-        retries: Int = 20
+        retries: Int = 20,
+        peeks: RemoteDevicePeeks = .shared
     ) {
+        self.peeks = peeks
         self.model = model
         self.registry = registry
         self.isEnabled = isEnabled
@@ -136,20 +140,75 @@ final class BackgroundSessionsNotice {
         for repository in registry.allRepositories {
             await repository.waitUntilSessionsRestored(before: deadline)
         }
+        guard isEnabled() else { return nil }
+        var background: [BackgroundSession] = []
+        var listedIDs = Set<String>()
+        var everyHostAnswered = true
+        hostingBySession = [:]
         let localSessions = model.localSessions
-        guard isEnabled(),
-              localSessions.instanceUnavailableReason == nil,
-              localSessions.connectionGeneration > 0,
-              let list = try? await localSessions.completeList(),
-              !list.awaitsHolders
-        else { return nil }
-        let listedIDs = Set(list.sessions.map(\.id))
+        if localSessions.instanceUnavailableReason == nil, localSessions.connectionGeneration > 0,
+           let list = try? await localSessions.completeList(), !list.awaitsHolders {
+            listedIDs.formUnion(list.sessions.map(\.id))
+            let found = model.backgroundSessions(in: list.sessions, hostID: list.hostID)
+            for session in found { hostingBySession[session.id] = localSessions }
+            background += found
+        } else {
+            everyHostAnswered = false
+        }
+        // Each device this run reached that answers now (phase 3): over its
+        // connection when connected, else by a look that never starts or
+        // replaces its daemon (`RemoteDevicePeeks`).
+        model.refresh()
+        for device in model.devices {
+            let hosting = device.localSessions
+            guard hosting.instanceUnavailableReason == nil, hosting.connectionGeneration > 0,
+                  let list = await deviceList(hosting), !list.awaitsHolders
+            else {
+                everyHostAnswered = false
+                continue
+            }
+            listedIDs.formUnion(list.sessions.map(\.id))
+            let found = device.backgroundSessions(in: list.sessions, hostID: list.hostID)
+            for session in found { hostingBySession[session.id] = hosting }
+            background += found
+        }
         let told = toldIDs()
-        let stillListed = told.filter(listedIDs.contains)
+        // Told ids of a host that did not answer stay told.
+        let stillListed = everyHostAnswered ? told.filter(listedIDs.contains) : told
         if stillListed != told { defaults.set(stillListed, forKey: Self.toldIDsKey) }
-        let untold = model.backgroundSessions(in: list.sessions, hostID: list.hostID)
-            .filter { $0.isAtWork && !stillListed.contains($0.id) }
+        let untold = background.filter { $0.isAtWork && !stillListed.contains($0.id) }
         return untold.isEmpty ? nil : Self.content(for: untold)
+    }
+
+    /// Which hosting each session the notice named runs on (This Mac's or
+    /// a device's), for Reopen.
+    private var hostingBySession: [String: PersistentHostSessions] = [:]
+    /// How long a device may take to answer the notice's list.
+    private let deviceListTimeout: Duration = .seconds(10)
+
+    /// A device's sessions: what its connection knows when connected, else
+    /// a look that starts nothing (nil: none runs, or no answer in time).
+    private func deviceList(_ hosting: PersistentHostSessions) async -> HostedSessionList? {
+        let control = hosting.control
+        if control.state == .connected, let hostID = control.hostID {
+            return HostedSessionList(hostID: hostID, sessions: control.sessions, pendingHolders: control.expectsHolders ? 1 : 0)
+        }
+        let peeks = peeks
+        let peek = await Self.within(deviceListTimeout) { await peeks.refresh(control) }
+        if case .listed(let list)?? = peek { return list }
+        return nil
+    }
+
+    /// `work`'s answer, or nil when it takes longer than `timeout`.
+    private static func within<T: Sendable>(_ timeout: Duration, _ work: @escaping @MainActor () async -> T) async -> T? {
+        let once = ResumeOnceBox<T>()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            Task { @MainActor in once.resume(continuation, with: await work()) }
+            Task { @MainActor in
+                try? await Task.sleep(for: timeout)
+                once.resume(continuation, with: nil)
+            }
+        }
     }
 
     private func checked(_ content: Content?) {
@@ -225,7 +284,7 @@ final class BackgroundSessionsNotice {
         return Task { @MainActor in
             for id in ids {
                 await SessionCloseCoordinator.reopen(
-                    .backgroundSession(id: id), hosting: model.localSessions, into: nil,
+                    .backgroundSession(id: id), hosting: self.hostingBySession[id] ?? model.localSessions, into: nil,
                     chromeState: nil, registry: registry
                 )
             }
@@ -255,8 +314,10 @@ final class BackgroundSessionsNotice {
     static func content(for sessions: [BackgroundSession]) -> Content {
         let single = sessions.count == 1
         var projects: [String] = []
-        for session in sessions where session.projectRoot != nil && !projects.contains(session.projectName) {
-            projects.append(session.projectName)
+        for session in sessions where session.projectRoot != nil {
+            // A device's project names its Mac.
+            let name = session.machine.map { "\(session.projectName) on \($0)" } ?? session.projectName
+            if !projects.contains(name) { projects.append(name) }
         }
         let named: String? = switch projects.count {
         case 0: nil
@@ -275,5 +336,17 @@ final class BackgroundSessionsNotice {
             message: from + (named.map { " (\($0))" } ?? "") + ". " + whereTo,
             sessionIDs: sessions.map(\.id)
         )
+    }
+}
+
+/// Resumes a continuation once, whichever answer comes first.
+@MainActor
+private final class ResumeOnceBox<T: Sendable> {
+    private var resumed = false
+
+    func resume(_ continuation: CheckedContinuation<T?, Never>, with value: T?) {
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume(returning: value)
     }
 }

@@ -1320,17 +1320,28 @@ enum CherryProjectFile {
         URL(fileURLWithPath: projectRoot, isDirectory: true).appendingPathComponent(fileName)
     }
 
+    @MainActor
     static func exists(projectRoot: String) -> Bool {
-        guard !ProjectLocation.isRemoteKey(projectRoot) else { return false }
+        guard !ProjectLocation.isRemoteKey(projectRoot) else {
+            return RemoteProjectFiles.shared.text(for: projectRoot) != nil
+        }
         return FileManager.default.fileExists(atPath: fileURL(projectRoot: projectRoot).path)
     }
 
     /// A project on another Mac (a `ProjectLocation` key) has its
-    /// cherry.toml there: this Mac neither reads nor writes one for it
-    /// (docs/specs/remote-devices.md, phase 3).
+    /// cherry.toml there: Cherry reads it through that Mac's
+    /// `cherry-host project-info` (`RemoteProjectFiles`) and never writes it
+    /// (docs/specs/remote-devices.md, phase 3). Its commands can be
+    /// overridden or added on this Mac only.
     struct RemoteProjectFileError: LocalizedError {
-        var errorDescription: String? { "cherry.toml of a project on another Mac cannot be changed from here yet." }
+        var errorDescription: String? {
+            "cherry.toml of a project on another Mac is read-only in Cherry: edit it on that Mac, or save the command on this Mac only."
+        }
     }
+
+    /// The note the command editor shows for a device's project instead of
+    /// offering to save to its cherry.toml.
+    static let remoteReadOnlyNote = "This project's cherry.toml is on the other Mac and read-only here: edit it there. Commands you save here are kept on this Mac only."
 
     private static func requireLocal(_ projectRoot: String) throws {
         if ProjectLocation.isRemoteKey(projectRoot) { throw RemoteProjectFileError() }
@@ -1356,9 +1367,21 @@ enum CherryProjectFile {
         parseCache[projectRoot] = nil
     }
 
+    /// A device project's cherry.toml changed (`RemoteProjectFiles`).
+    @MainActor
+    static func invalidateRemote(projectRoot: String) {
+        parseCache[projectRoot] = nil
+    }
+
     @MainActor
     private static func parsed(projectRoot: String) -> ParsedFile {
-        guard !ProjectLocation.isRemoteKey(projectRoot) else { return ParsedFile() }
+        if ProjectLocation.isRemoteKey(projectRoot) {
+            let key = ProjectLocation(key: projectRoot).key
+            if let cached = parseCache[key] { return cached }
+            let parsed = RemoteProjectFiles.shared.text(for: key).map { parse(contents: $0) } ?? ParsedFile()
+            parseCache[key] = parsed
+            return parsed
+        }
         let url = fileURL(projectRoot: projectRoot)
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         let modificationDate = attributes?[.modificationDate] as? Date
@@ -1370,25 +1393,34 @@ enum CherryProjectFile {
             return cached
         }
 
-        var parsed = ParsedFile(modificationDate: modificationDate, fileSize: fileSize)
+        var parsed = ParsedFile()
         if let contents = try? String(contentsOf: url, encoding: .utf8) {
-            let commandSource = managedSection(in: contents) ?? contents
-            parsed.commands = (try? ProjectCommandConfiguration.validated(parseCommands(from: commandSource))) ?? []
-            if let featureSource = tableSection(named: "features", in: contents) {
-                let fields = parseKeyValues(from: featureSource)
-                parsed.features = ProjectFeatureSettings(
-                    notesEnabled: boolValue(fields["notes"]) ?? false,
-                    todosEnabled: boolValue(fields["todos"]) ?? false
-                )
-            }
-            if let appearanceSource = tableSection(named: "appearance", in: contents) {
-                let fields = parseKeyValues(from: appearanceSource)
-                parsed.appearance = ProjectAppearanceSettings(
-                    color: fields["color"].flatMap(ProjectIdentityColor.init(rawValue:))
-                )
-            }
+            parsed = parse(contents: contents)
         }
+        parsed.modificationDate = modificationDate
+        parsed.fileSize = fileSize
         parseCache[projectRoot] = parsed
+        return parsed
+    }
+
+    /// A cherry.toml's commands, features and appearance.
+    private static func parse(contents: String) -> ParsedFile {
+        var parsed = ParsedFile()
+        let commandSource = managedSection(in: contents) ?? contents
+        parsed.commands = (try? ProjectCommandConfiguration.validated(parseCommands(from: commandSource))) ?? []
+        if let featureSource = tableSection(named: "features", in: contents) {
+            let fields = parseKeyValues(from: featureSource)
+            parsed.features = ProjectFeatureSettings(
+                notesEnabled: boolValue(fields["notes"]) ?? false,
+                todosEnabled: boolValue(fields["todos"]) ?? false
+            )
+        }
+        if let appearanceSource = tableSection(named: "appearance", in: contents) {
+            let fields = parseKeyValues(from: appearanceSource)
+            parsed.appearance = ProjectAppearanceSettings(
+                color: fields["color"].flatMap(ProjectIdentityColor.init(rawValue:))
+            )
+        }
         return parsed
     }
 

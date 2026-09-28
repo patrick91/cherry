@@ -157,11 +157,17 @@
             draggingEntered(sender)
         }
 
+        /// Handles a drop before the default (inserting paths): returns true
+        /// when it took it. Cherry sets it for a tab whose program runs on
+        /// another Mac, where This Mac's paths mean nothing.
+        public var dropHandler: ((NSPasteboard) -> Bool)?
+
         /// Dropped files insert their (escaped) paths; dropped image bytes are
         /// written to a temp file and the path inserted — so terminal agents can
         /// attach them. Mirrors ghostty's apprt drag handling.
         override public func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
             let pasteboard = sender.draggingPasteboard
+            if let dropHandler, dropHandler(pasteboard) { return true }
             let text: String
             if let urls = pasteboard.readObjects(
                 forClasses: [NSURL.self],

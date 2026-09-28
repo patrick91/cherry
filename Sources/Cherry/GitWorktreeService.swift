@@ -1,3 +1,4 @@
+import CherryControl
 import CryptoKit
 import Foundation
 
@@ -29,6 +30,12 @@ struct GitWorktree: Identifiable, Codable, Equatable, Hashable, Sendable {
 
     var isLocked: Bool {
         lockReason != nil
+    }
+
+    /// Its folder as a path (a device worktree's root is a key,
+    /// `ProjectLocation`): what the UI shows.
+    var displayPath: String {
+        ProjectLocation.launchPath(forKey: root)
     }
 
     var isPrunable: Bool {
@@ -85,50 +92,78 @@ struct GitWorktreeCommandError: LocalizedError, Equatable, Sendable {
     }
 }
 
+/// What one `git` run printed.
+struct GitCommandResult: Sendable {
+    let standardOutput: Data
+    let standardError: Data
+    let exitCode: Int32
+}
+
+/// Runs git for the worktree operations. The default runs `git` here; a
+/// device's project window runs it on that Mac over its SSH master
+/// (`RemoteProjectAccess.gitRunner`, docs/specs/remote-devices.md), where
+/// the paths it is given are that Mac's.
 struct GitWorktreeService: Sendable {
+    /// Runs `git <arguments>` (blocking; called off the main actor) and
+    /// returns what it printed, whatever its exit status.
+    typealias Runner = @Sendable (_ arguments: [String]) throws -> GitCommandResult
+
+    private let runner: Runner
+    /// Whether the worktree paths are This Mac's: a new worktree's parent
+    /// folder is made here first. On another Mac git makes it.
+    private let isLocal: Bool
+
+    init() {
+        runner = { try GitWorktreeService.runLocalGit($0) }
+        isLocal = true
+    }
+
+    /// Runs git with `runner` instead, on another machine (`isLocal` false)
+    /// or through a test's stand-in.
+    init(runner: @escaping Runner, isLocal: Bool = false) {
+        self.runner = runner
+        self.isLocal = isLocal
+    }
+
     func discover(projectRoot: String) async throws -> GitRepositorySnapshot {
-        try await Self.perform {
-            let records = try Self.runGit(
+        let service = self
+        return try await Self.perform {
+            let records = try service.runGit(
                 ["-C", projectRoot, "worktree", "list", "--porcelain", "-z"]
             )
-            let parsed = Self.parseWorktreeList(records.standardOutput)
-            guard let first = parsed.first else {
-                throw GitWorktreeCommandError(
-                    arguments: ["worktree", "list", "--porcelain", "-z"],
-                    exitCode: 1,
-                    standardError: "Git did not report any worktrees."
-                )
-            }
-
-            let commonDirectoryResult = try Self.runGit([
+            let commonDirectoryResult = try service.runGit([
                 "-C", projectRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"
             ])
-            let commonDirectory = Self.decoded(commonDirectoryResult.standardOutput)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let primaryRoot = first.root
-            let worktrees = parsed.enumerated().map { index, worktree in
-                GitWorktree(
-                    root: worktree.root,
-                    head: worktree.head,
-                    branch: worktree.branch,
-                    isMain: index == 0,
-                    isBare: worktree.isBare,
-                    isDetached: worktree.isDetached,
-                    lockReason: worktree.lockReason,
-                    pruneReason: worktree.pruneReason
-                )
-            }
-            return GitRepositorySnapshot(
-                primaryRoot: primaryRoot,
-                commonDirectory: commonDirectory,
-                worktrees: worktrees
+            return try Self.snapshot(
+                worktreeList: records.standardOutput,
+                commonDirectory: Self.decoded(commonDirectoryResult.standardOutput)
             )
         }
     }
 
+    /// A repository snapshot from `git worktree list --porcelain -z` and
+    /// `git rev-parse --git-common-dir` output (here, or as a device's
+    /// `cherry-host project-info` reported them).
+    static func snapshot(worktreeList: Data, commonDirectory: String) throws -> GitRepositorySnapshot {
+        let parsed = parseWorktreeList(worktreeList)
+        guard let first = parsed.first else {
+            throw GitWorktreeCommandError(
+                arguments: ["worktree", "list", "--porcelain", "-z"],
+                exitCode: 1,
+                standardError: "Git did not report any worktrees."
+            )
+        }
+        return GitRepositorySnapshot(
+            primaryRoot: first.root,
+            commonDirectory: commonDirectory.trimmingCharacters(in: .whitespacesAndNewlines),
+            worktrees: parsed
+        )
+    }
+
     func branchReferences(repositoryRoot: String) async throws -> [GitBranchReference] {
-        try await Self.perform {
-            let result = try Self.runGit([
+        let service = self
+        return try await Self.perform {
+            let result = try service.runGit([
                 "-C", repositoryRoot,
                 "for-each-ref",
                 "--format=%(refname)%00%(objectname)%00%(upstream:short)",
@@ -139,26 +174,29 @@ struct GitWorktreeService: Sendable {
     }
 
     func validateBranchName(_ branchName: String, repositoryRoot: String) async throws {
+        let service = self
         _ = try await Self.perform {
-            try Self.runGit([
+            try service.runGit([
                 "-C", repositoryRoot, "check-ref-format", "--branch", branchName
             ])
         }
     }
 
     func isDirty(worktreeRoot: String) async throws -> Bool {
-        try await Self.perform {
-            try Self.dirtyStatus(worktreeRoot: worktreeRoot)
+        let service = self
+        return try await Self.perform {
+            try service.dirtyStatus(worktreeRoot: worktreeRoot)
         }
     }
 
     func dirtyStatuses(worktreeRoots: [String]) async -> [String: Bool] {
+        let service = self
         do {
             return try await Self.perform {
                 var statuses: [String: Bool] = [:]
                 for root in worktreeRoots {
                     do {
-                        statuses[root] = try Self.dirtyStatus(worktreeRoot: root)
+                        statuses[root] = try service.dirtyStatus(worktreeRoot: root)
                     } catch {
                         // A worktree can disappear between discovery and this check.
                     }
@@ -171,15 +209,18 @@ struct GitWorktreeService: Sendable {
     }
 
     func create(_ creation: GitWorktreeCreation, repositoryRoot: String) async throws {
+        let service = self
         try await Self.perform {
             let destination = URL(
                 fileURLWithPath: creation.destination,
                 isDirectory: true
             ).standardizedFileURL.path
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: destination, isDirectory: true).deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
+            if service.isLocal {
+                try FileManager.default.createDirectory(
+                    at: URL(fileURLWithPath: destination, isDirectory: true).deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+            }
             let arguments: [String]
             switch creation {
             case .newBranch(let name, let startPoint, _):
@@ -197,13 +238,14 @@ struct GitWorktreeService: Sendable {
                     localName, destination, remoteName
                 ]
             }
-            _ = try Self.runGit(arguments)
+            _ = try service.runGit(arguments)
         }
     }
 
     func renameBranch(worktreeRoot: String, newName: String) async throws {
+        let service = self
         try await Self.perform {
-            _ = try Self.runGit([
+            _ = try service.runGit([
                 "-C", worktreeRoot, "branch", "-m", newName
             ])
         }
@@ -214,6 +256,7 @@ struct GitWorktreeService: Sendable {
         repositoryRoot: String,
         force: Bool = false
     ) async throws {
+        let service = self
         try await Self.perform {
             var arguments = ["-C", repositoryRoot, "worktree", "remove"]
             if force {
@@ -222,19 +265,21 @@ struct GitWorktreeService: Sendable {
                 arguments.append(contentsOf: ["--force", "--force"])
             }
             arguments.append(worktreeRoot)
-            _ = try Self.runGit(arguments)
+            _ = try service.runGit(arguments)
         }
     }
 
     func prune(repositoryRoot: String) async throws {
+        let service = self
         try await Self.perform {
-            _ = try Self.runGit(["-C", repositoryRoot, "worktree", "prune"])
+            _ = try service.runGit(["-C", repositoryRoot, "worktree", "prune"])
         }
     }
 
     func fetch(repositoryRoot: String) async throws {
+        let service = self
         try await Self.perform {
-            _ = try Self.runGit(["-C", repositoryRoot, "fetch", "--prune"])
+            _ = try service.runGit(["-C", repositoryRoot, "fetch", "--prune"])
         }
     }
 
@@ -244,18 +289,37 @@ struct GitWorktreeService: Sendable {
         branchName: String,
         fileManager: FileManager = .default
     ) -> String {
+        managedWorktreeRoot(
+            repositoryName: repositoryName,
+            repositoryIdentity: repositoryIdentity,
+            branchName: branchName,
+            homeDirectory: fileManager.homeDirectoryForCurrentUser.path,
+            isTaken: { fileManager.fileExists(atPath: $0) }
+        )
+    }
+
+    /// `~/.cherry/worktrees/<repository>-<id>/<branch>` under
+    /// `homeDirectory` (This Mac's, or a device's), with a number added
+    /// while `isTaken` says the path is used.
+    static func managedWorktreeRoot(
+        repositoryName: String,
+        repositoryIdentity: String,
+        branchName: String,
+        homeDirectory: String,
+        isTaken: (String) -> Bool
+    ) -> String {
         let repositorySlug = slug(repositoryName, fallback: "repository")
         let branchSlug = slug(branchName.replacingOccurrences(of: "/", with: "-"), fallback: "worktree")
         let digest = SHA256.hash(data: Data(repositoryIdentity.utf8))
         let identity = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
-        let parent = fileManager.homeDirectoryForCurrentUser
+        let parent = URL(fileURLWithPath: homeDirectory, isDirectory: true)
             .appendingPathComponent(".cherry", isDirectory: true)
             .appendingPathComponent("worktrees", isDirectory: true)
             .appendingPathComponent("\(repositorySlug)-\(identity)", isDirectory: true)
 
         var candidate = parent.appendingPathComponent(branchSlug, isDirectory: true)
         var suffix = 2
-        while fileManager.fileExists(atPath: candidate.path) {
+        while isTaken(candidate.path) {
             candidate = parent.appendingPathComponent("\(branchSlug)-\(suffix)", isDirectory: true)
             suffix += 1
         }
@@ -373,12 +437,6 @@ struct GitWorktreeService: Sendable {
         var pruneReason: String?
     }
 
-    private struct GitResult {
-        let standardOutput: Data
-        let standardError: Data
-        let exitCode: Int32
-    }
-
     private final class PipeCapture: @unchecked Sendable {
         private let lock = NSLock()
         private var captured = Data()
@@ -403,7 +461,21 @@ struct GitWorktreeService: Sendable {
         try await Task.detached(priority: .userInitiated, operation: operation).value
     }
 
-    private static func runGit(_ arguments: [String]) throws -> GitResult {
+    /// Runs git through the runner; a non-zero exit throws what it said.
+    private func runGit(_ arguments: [String]) throws -> GitCommandResult {
+        let result = try runner(arguments)
+        guard result.exitCode == 0 else {
+            throw GitWorktreeCommandError(
+                arguments: arguments,
+                exitCode: result.exitCode,
+                standardError: Self.decoded(result.standardError)
+            )
+        }
+        return result
+    }
+
+    /// `git <arguments>` on This Mac.
+    static func runLocalGit(_ arguments: [String]) throws -> GitCommandResult {
         let process = Process()
         let output = Pipe()
         let error = Pipe()
@@ -437,29 +509,21 @@ struct GitWorktreeService: Sendable {
         }
         process.waitUntilExit()
         readGroup.wait()
-        let result = GitResult(
+        return GitCommandResult(
             standardOutput: outputCapture.data,
             standardError: errorCapture.data,
             exitCode: process.terminationStatus
         )
-        guard result.exitCode == 0 else {
-            throw GitWorktreeCommandError(
-                arguments: arguments,
-                exitCode: result.exitCode,
-                standardError: decoded(result.standardError)
-            )
-        }
-        return result
     }
 
-    private static func dirtyStatus(worktreeRoot: String) throws -> Bool {
+    private func dirtyStatus(worktreeRoot: String) throws -> Bool {
         let result = try runGit([
             "-C", worktreeRoot, "status", "--porcelain=v1", "--untracked-files=normal"
         ])
         return !result.standardOutput.isEmpty
     }
 
-    private static func decoded(_ data: Data) -> String {
+    static func decoded(_ data: Data) -> String {
         String(decoding: data, as: UTF8.self)
     }
 

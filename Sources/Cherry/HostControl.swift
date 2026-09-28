@@ -1496,3 +1496,106 @@ final class HostControlRegistry {
         for control in controls.values { control.disconnect() }
     }
 }
+
+// MARK: - Listing without starting anything
+
+/// What a look at a host's sessions found, without a control connection and
+/// without ever starting or replacing its daemon (`HostControl.listWithoutStarting`).
+enum HostSessionPeek: Equatable, Sendable {
+    case listed(HostedSessionList)
+    /// No daemon of this protocol runs there: nothing to show.
+    case notRunning
+    case failed(HostedSessionError)
+}
+
+extension HostControl {
+    /// How many leases hold the connection now (tests).
+    var activeLeaseCount: Int { leaseCount }
+
+    /// The host's sessions from one `cherry list --json --no-start` (through
+    /// the SSH master while it is up; a master that refuses the session is
+    /// bypassed by the CLI itself): it never starts a daemon on the host,
+    /// nor replaces one of an older protocol, and it leaves this control
+    /// (its state, sessions and connection) as it is. For a device the user
+    /// only looks at (Background Sessions, the project picker, the launch
+    /// notice), docs/specs/remote-devices.md.
+    func listWithoutStarting(timeout: TimeInterval = 20) async -> HostSessionPeek {
+        if let unavailableReason { return .failed(.unavailable(unavailableReason)) }
+        let client: HostedSessionClient
+        do {
+            client = try clientProvider()
+        } catch {
+            return .failed((error as? HostedSessionError) ?? .message(error.localizedDescription))
+        }
+        let capture = await client.resolvedLoginEnvironment()
+        let environment = HostedSessionLoginEnvironment.helperEnvironment(
+            base: ProcessInfo.processInfo.environment, login: capture?.environment
+        )
+        let controlPath = host.sshDestination.flatMap { masters.controlPathIfUp(for: $0) }
+        let trusted = hostStore.trustedHostID(for: host)
+        let arguments = host.arguments(sshControlPath: controlPath)
+            + Self.expectedHostIDArguments(trusted)
+            + ["list", "--json", "--no-start"]
+        let executable = client.executableURL
+        let output = await Task.detached(priority: .userInitiated) {
+            Self.runCapturing(executable: executable, arguments: arguments, environment: environment, timeout: timeout)
+        }.value
+        return Self.peek(status: output.status, standardOutput: output.output, standardError: output.errors, trusted: trusted)
+    }
+
+    /// Runs a helper to its end (or `timeout`, then terminates it) and
+    /// returns what it printed.
+    nonisolated static func runCapturing(
+        executable: URL, arguments: [String], environment: [String: String], timeout: TimeInterval
+    ) -> (status: Int32, output: String, errors: String) {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        let out = Pipe()
+        let err = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = out
+        process.standardError = err
+        do {
+            try process.run()
+        } catch {
+            return (127, "", "Could not run \(executable.lastPathComponent): \(error.localizedDescription)")
+        }
+        final class Box: @unchecked Sendable { var data = Data() }
+        let outBox = Box()
+        let errBox = Box()
+        let group = DispatchGroup()
+        for (pipe, box) in [(out, outBox), (err, errBox)] {
+            group.enter()
+            DispatchQueue.global().async {
+                box.data = pipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+        }
+        if group.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = group.wait(timeout: .now() + 2)
+        }
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: outBox.data, as: UTF8.self), String(decoding: errBox.data, as: UTF8.self))
+    }
+
+    /// Reads what `cherry list --json --no-start` printed.
+    nonisolated static func peek(status: Int32, standardOutput: String, standardError: String, trusted: String?) -> HostSessionPeek {
+        if status == 0, let list = try? JSONDecoder().decode(HostedSessionList.self, from: Data(standardOutput.utf8)) {
+            if let trusted, UUID(uuidString: trusted) != nil, list.hostID != trusted {
+                return .failed(.identityMismatch("\(list.hostID) answered, not the trusted \(trusted)."))
+            }
+            return .listed(list)
+        }
+        let errors = standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        if errors.contains("no cherry-host is running") { return .notRunning }
+        // All it said (ssh's refusal comes before the CLI's own line).
+        let lines = errors.components(separatedBy: .newlines)
+            .map { $0.hasPrefix("cherry: ") ? String($0.dropFirst(8)) : $0 }
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let message = lines.isEmpty ? "cherry list exited \(status)" : String(lines.joined(separator: " ").prefix(2_000))
+        return .failed(.unavailable(message))
+    }
+}

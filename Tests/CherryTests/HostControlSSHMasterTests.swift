@@ -46,7 +46,8 @@ private struct FakeSSH {
           printf '%s' "${SSH_AUTH_SOCK-}" > "$dir/master-agent"
           if [ -f "$dir/master-fails" ]; then cat "$dir/master-fails" >&2; exit 255; fi
           printf '%s' "$$" > "$dir/master-pid"
-          trap 'rm -f "$path"; exit 0' TERM INT HUP
+          printf '%s' "$$" > "$path.pid"
+          trap 'rm -f "$path" "$path.pid"; exit 0' TERM INT HUP
           : > "$path"
           while :; do /bin/sleep 0.05; done
         fi
@@ -56,7 +57,8 @@ private struct FakeSSH {
             printf 'Control socket connect(%s): No such file or directory\\n' "$path" >&2
             exit 255 ;;
           exit)
-            [ -f "$dir/master-pid" ] && kill -TERM "$(cat "$dir/master-pid")"
+            if [ -f "$path.pid" ]; then kill -TERM "$(cat "$path.pid")"
+            elif [ -f "$dir/master-pid" ]; then kill -TERM "$(cat "$dir/master-pid")"; fi
             printf 'Exit request sent.\\n' >&2
             exit 0 ;;
         esac
@@ -103,8 +105,17 @@ private struct FakeSSH {
     var masterCalls: [String] { calls.filter { $0.hasPrefix("-M ") } }
     var masterPID: pid_t? { read("master-pid").flatMap { pid_t($0) } }
 
+    /// Each running master's pid, by its control path.
+    var masterPIDs: [pid_t] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: sockets.path)) ?? [])
+            .filter { $0.hasSuffix(".pid") }
+            .compactMap { try? String(contentsOf: sockets.appendingPathComponent($0), encoding: .utf8) }
+            .compactMap { pid_t($0) }
+    }
+
     func cleanUp() {
         if let pid = masterPID { kill(pid, SIGKILL) }
+        for pid in masterPIDs { kill(pid, SIGKILL) }
         try? FileManager.default.removeItem(at: directory)
     }
 }
@@ -427,39 +438,178 @@ private func eventually(
     #expect(manager.status(of: "devbox")?.leases == 0)
 }
 
-@Test func HostSSHMasterSharesAtMostMaxChannelsPerMasterAdapterLaunches() async throws {
+@Test func HostSSHMasterSharesAtMostMaxChannelsPerMasterAdapterLaunchesAndShardsTheRest() async throws {
     // sshd's MaxSessions is 10 by default: the control helper and one-off
-    // commands need room beside the adapters.
+    // commands need room beside the adapters. Over the cap, launches share
+    // a second master (a shard), started before it is needed.
     let ssh = try FakeSSH()
     defer { ssh.cleanUp() }
     let manager = ssh.manager()
     #expect(manager.configuration.maxChannelsPerMaster == 8)
-    let lease = manager.acquire("devbox", environment: [:])
+    #expect(manager.configuration.spareChannels == 1)
+    let lease = manager.acquire("devbox", environment: ["SSH_AUTH_SOCK": "/login/agent.sock"])
     let path = try #require(await manager.waitUntilUp("devbox"))
-    for index in 1...8 {
+    for index in 1...6 {
         #expect(manager.controlPath(forLaunch: "/tmp/launch-\(index)", destination: "devbox") == path)
     }
-    // Full: the next adapter uses its own ssh, and holds nothing.
-    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == nil)
+    // Room for two more: no second master yet.
+    #expect(manager.shardStatuses(of: "devbox").count == 1)
+    // The seventh leaves one slot: the next master starts now.
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-7", destination: "devbox") == path)
+    let shards = manager.shardStatuses(of: "devbox")
+    #expect(shards.map(\.shard) == [1, 2])
+    let secondPath = try #require(shards.last?.controlPath)
+    #expect(secondPath != path)
+    #expect(secondPath == HostSSHMasterManager.controlPath(in: ssh.sockets, destination: "devbox#2"))
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last?.phase == .up })
+    // It is its own connection to the same destination, with the same agent.
+    #expect(ssh.masterCalls.last == HostSSHMasterManager.masterArguments(destination: "devbox", controlPath: secondPath).joined(separator: " "))
+    #expect(ssh.masterCalls.count == 2)
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-8", destination: "devbox") == path)
     #expect(manager.status(of: "devbox")?.launches == 8)
+    // Full: the ninth shares the second master instead of its own ssh.
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == secondPath)
+    #expect(manager.shardStatuses(of: "devbox").map(\.launches) == [8, 1])
     // A launch that has its channel keeps it.
     #expect(manager.controlPath(forLaunch: "/tmp/launch-3", destination: "devbox") == path)
-    // Room again once one ends.
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == secondPath)
+    // A slot of the first master frees: the next launch takes it.
     manager.endLaunch("/tmp/launch-1")
-    #expect(manager.controlPath(forLaunch: "/tmp/launch-9", destination: "devbox") == path)
-    #expect(manager.status(of: "devbox")?.launches == 8)
-    for index in 2...9 { manager.endLaunch("/tmp/launch-\(index)") }
+    #expect(manager.controlPath(forLaunch: "/tmp/launch-10", destination: "devbox") == path)
+    #expect(manager.shardStatuses(of: "devbox").map(\.launches) == [8, 1])
+    // The second master stops once nothing uses it and the first has room.
+    for index in [2, 3, 4, 9] { manager.endLaunch("/tmp/launch-\(index)") }
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last?.phase == .stopped })
+    #expect(manager.status(of: "devbox")?.phase == .up)
+    for index in [5, 6, 7, 8, 10] { manager.endLaunch("/tmp/launch-\(index)") }
     lease.release()
     #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
+    #expect(await eventually { ssh.masterPIDs.isEmpty })
 }
 
-@Test func HostSSHMasterAnAdapterOverTheCapSharesTheMasterWhenItRelaunchesIntoAFreeSlot() async throws {
-    // Each launch of a tab's adapter registers afresh (a new status file
-    // directory): the relaunch after its reconnect window gives up, or a
-    // Reconnect, takes a slot that freed meanwhile.
+@Test func HostSSHMasterShardsAtMostMaxMastersAndAnAdapterOverThemRunsItsOwnSSH() async throws {
     let ssh = try FakeSSH()
     defer { ssh.cleanUp() }
-    let manager = ssh.manager()
+    let sockets = ssh.sockets
+    let executable = ssh.executable.path
+    let manager = HostSSHMasterManager(configuration: .init(
+        directory: { sockets },
+        sshExecutable: { _ in executable },
+        startTimeout: 5, healthCheckInterval: 3_600, idleStopDelay: 0.2, restartDelay: (0.05, 0.2),
+        pollInterval: 0.02, commandTimeout: 2, stableUptime: 60,
+        maxChannelsPerMaster: 2, spareChannels: 1, maxMasters: 2
+    ))
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    #expect(manager.controlPath(forLaunch: "/tmp/a", destination: "devbox") == path)
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last.map { $0.shard == 2 && $0.phase == .up } == true })
+    let second = try #require(manager.shardStatuses(of: "devbox").last?.controlPath)
+    #expect(manager.controlPath(forLaunch: "/tmp/b", destination: "devbox") == path)
+    #expect(manager.controlPath(forLaunch: "/tmp/c", destination: "devbox") == second)
+    #expect(manager.controlPath(forLaunch: "/tmp/d", destination: "devbox") == second)
+    // Every master full, and no third allowed: its own ssh, holding nothing.
+    #expect(manager.controlPath(forLaunch: "/tmp/e", destination: "devbox") == nil)
+    #expect(manager.shardStatuses(of: "devbox").count == 2)
+    #expect(manager.shardStatuses(of: "devbox").map(\.launches) == [2, 2])
+    for name in ["/tmp/a", "/tmp/b", "/tmp/c", "/tmp/d"] { manager.endLaunch(name) }
+    lease.release()
+    #expect(await eventually { manager.shardStatuses(of: "devbox").allSatisfy { $0.phase == .stopped } })
+    #expect(await eventually { ssh.masterPIDs.isEmpty })
+}
+
+private func shardManager(
+    _ ssh: FakeSSH, cap: Int = 2, idleStopDelay: TimeInterval = 0.2, shardRetryDelay: TimeInterval = 60
+) -> HostSSHMasterManager {
+    let sockets = ssh.sockets
+    let executable = ssh.executable.path
+    return HostSSHMasterManager(configuration: .init(
+        directory: { sockets },
+        sshExecutable: { _ in executable },
+        startTimeout: 5, healthCheckInterval: 3_600, idleStopDelay: idleStopDelay, restartDelay: (0.05, 0.2),
+        pollInterval: 0.02, commandTimeout: 2, stableUptime: 60,
+        maxChannelsPerMaster: cap, spareChannels: 1, maxMasters: 8, shardRetryDelay: shardRetryDelay
+    ))
+}
+
+@Test func HostSSHMasterAShardThatCannotLogInStopsFurtherShardsUntilItsBackoffPasses() async throws {
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let manager = shardManager(ssh, shardRetryDelay: 1.5)
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    // Logins fail from now on: the shard the first launch starts fails.
+    try ssh.write("master-fails", "devbox: Permission denied (publickey).\n")
+    #expect(manager.controlPath(forLaunch: "/tmp/a", destination: "devbox") == path)
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last.map { $0.shard == 2 && $0.phase == .stopped } == true })
+    let failedLogins = ssh.masterCalls.count
+    #expect(failedLogins == 2)
+    // Its reservation is gone, and while the backoff runs no shard is tried
+    // again, however many launches come: they run their own ssh.
+    #expect(manager.controlPath(forLaunch: "/tmp/b", destination: "devbox") == path)
+    for name in ["/tmp/c", "/tmp/d", "/tmp/e"] {
+        #expect(manager.controlPath(forLaunch: name, destination: "devbox") == nil)
+    }
+    manager.endLaunch("/tmp/b")
+    #expect(manager.controlPath(forLaunch: "/tmp/b2", destination: "devbox") == path)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(ssh.masterCalls.count == failedLogins)
+    #expect(manager.shardStatuses(of: "devbox").count == 2)
+    #expect(manager.shardStatuses(of: "devbox").last?.phase == .stopped)
+    // Once it passed (and logins work again), the next launch's balance
+    // starts it again.
+    ssh.remove("master-fails")
+    try await Task.sleep(for: .milliseconds(1_300))
+    #expect(manager.controlPath(forLaunch: "/tmp/f", destination: "devbox") == nil)
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last?.phase == .up })
+    #expect(ssh.masterCalls.count == failedLogins + 1)
+    for name in ["/tmp/a", "/tmp/b2"] { manager.endLaunch(name) }
+    lease.release()
+    manager.stopAll()
+}
+
+@Test func HostSSHMasterKeepsAnIdleShardWhenTheFirstIsFullInsteadOfStartingAnother() async throws {
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let manager = shardManager(ssh, idleStopDelay: 3)
+    let lease = manager.acquire("devbox", environment: [:])
+    let path = try #require(await manager.waitUntilUp("devbox"))
+    // The first launch leaves one slot: the second master starts as spare.
+    #expect(manager.controlPath(forLaunch: "/tmp/a", destination: "devbox") == path)
+    #expect(await eventually { manager.shardStatuses(of: "devbox").last.map { $0.shard == 2 && $0.phase == .up } == true })
+    let second = try #require(manager.shardStatuses(of: "devbox").last?.controlPath)
+    // It ends: the first has room again, so the spare is let go (its idle
+    // stop is pending, it still runs).
+    manager.endLaunch("/tmp/a")
+    // The first fills up again before it stopped: the spare is kept (its
+    // stop cancelled), not a third master started.
+    #expect(manager.controlPath(forLaunch: "/tmp/b", destination: "devbox") == path)
+    #expect(manager.controlPath(forLaunch: "/tmp/c", destination: "devbox") == path)
+    #expect(manager.shardStatuses(of: "devbox").count == 2)
+    #expect(ssh.masterCalls.count == 2)
+    #expect(manager.controlPath(forLaunch: "/tmp/d", destination: "devbox") == second)
+    try await Task.sleep(for: .milliseconds(300))
+    // (The second is in use now, so a third starts as the spare.)
+    #expect(Array(manager.shardStatuses(of: "devbox").map(\.phase).prefix(2)) == [.up, .up])
+    for name in ["/tmp/b", "/tmp/c", "/tmp/d"] { manager.endLaunch(name) }
+    lease.release()
+    manager.stopAll()
+}
+
+@Test func HostSSHMasterAnAdapterOverTheCapSharesTheNextMasterWhenItRelaunches() async throws {
+    // Each launch of a tab's adapter registers afresh (a new status file
+    // directory): the relaunch after its reconnect window gives up, or a
+    // Reconnect, takes a slot on the first master with room.
+    let ssh = try FakeSSH()
+    defer { ssh.cleanUp() }
+    let sockets = ssh.sockets
+    let executable = ssh.executable.path
+    let manager = HostSSHMasterManager(configuration: .init(
+        directory: { sockets },
+        sshExecutable: { _ in executable },
+        startTimeout: 5, healthCheckInterval: 3_600, idleStopDelay: 0.2, restartDelay: (0.05, 0.2),
+        pollInterval: 0.02, commandTimeout: 2, stableUptime: 60,
+        maxChannelsPerMaster: 8, spareChannels: 1, maxMasters: 1
+    ))
     let lease = manager.acquire("devbox", environment: [:])
     let path = try #require(await manager.waitUntilUp("devbox"))
     let attachment = HostedSessionAttachment(
@@ -473,7 +623,8 @@ private func eventually(
         return attachment.arguments(statusFile: HostedAttachmentStatusFile.statusFileURL(in: directory), masters: manager)
     }
     for _ in 1...8 { #expect(try launch().contains(path)) }
-    // The ninth runs its own ssh, and holds no slot.
+    // One master only (maxMasters 1): the ninth runs its own ssh, and
+    // holds no slot.
     let over = try launch()
     #expect(!over.contains("--ssh-control-path"))
     #expect(manager.status(of: "devbox")?.launches == 8)

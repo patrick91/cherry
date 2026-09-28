@@ -161,6 +161,7 @@ final class HostedReconnects: ObservableObject {
     /// control connections waiting to reconnect (a restore that waits for
     /// its host) try at once.
     func systemDidWake() {
+        RemoteDevicePeeks.shared.systemChanged()
         retryNow()
         for control in controls() { control.reconnectNow() }
     }
@@ -168,6 +169,7 @@ final class HostedReconnects: ObservableObject {
     /// A network path became available (NWPathMonitor reported satisfied
     /// after it was not).
     func networkBecameAvailable() {
+        RemoteDevicePeeks.shared.systemChanged()
         retryNow()
         for control in controls() { control.reconnectNow() }
     }

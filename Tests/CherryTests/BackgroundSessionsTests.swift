@@ -1811,7 +1811,11 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(first.title == "Claude")
     #expect(first.subtitle == "\(BackgroundSessionPresentation.projectName(projectRoot: project)) · in the background")
     #expect(first.body == "Claude: Waiting for your input")
-    #expect(first.userInfo == [BackgroundSessionNotificationContent.sessionIDKey: "s-agent"])
+    // With its host's identity: This Mac's or a device's (phase 3).
+    #expect(first.userInfo == [
+        BackgroundSessionNotificationContent.sessionIDKey: "s-agent",
+        BackgroundSessionNotificationContent.hostIDKey: "host-a",
+    ])
     #expect(model.unreadSessionIDs == ["s-agent"])
     #expect(store.unreadSessions(hostID: "host-a") == ["s-agent"])
 

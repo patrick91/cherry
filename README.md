@@ -181,8 +181,24 @@ knew when it opened and updates as each Mac answers.
 A project on another Mac opens in its own window ("app — Studio", with a
 computer glyph; each tab's row names the Mac): its terminal and agent tabs
 run there, in its `cherry-host`, and close, detach, **Cmd-Z**, the quit
-question and relaunches work as for this Mac's tabs. Its project commands,
-worktrees and **Open in** an editor are not available yet. A tab that cannot
+question ("Keep 5 sessions running (3 on this Mac, 2 on Studio)?", whose End
+Sessions ends them there too) and relaunches work as for this Mac's tabs.
+Its terminals get Cherry's terminal type (`xterm-ghostty`) and Ghostty's
+zsh, bash or fish integration there, installed next to its `cherry-host`,
+so the directory, title and prompt marks follow the shell there, paths in
+the sidebar show that Mac's home as `~`, and a new tab starts in the
+selected tab's directory. Its git worktrees (the Worktrees section, **New
+Worktree…**, **Manage Worktrees…**) run git on that Mac, its `cherry.toml`
+commands are read there (read-only: a command you edit is saved on this Mac
+only), auto-start and restart on exit as usual, and **Open in** offers the
+editors that reach it over SSH (VS Code and Cursor through Remote - SSH,
+Zed). Pasting or dropping files into its tab asks first and copies them to
+a temporary folder on that Mac, then inserts the paths they have there. Its
+sessions no tab shows are listed under its name in Background Sessions
+(while Cherry is connected to it, or while the menu is open; looking at a
+Mac, there or in the project picker, never starts its session host), and
+**Settings › Sessions › Other Macs** shows how each Mac stands, with
+**Reconnect**, **Update Session Host…** and **Remove…**. A tab that cannot
 start there says so ("Couldn't start on Studio: …", with **Retry**), never
 running a shell on this Mac instead. **Not open here** in the sidebar lists
 that project's sessions on the Mac that no tab shows: **Reopen** for this

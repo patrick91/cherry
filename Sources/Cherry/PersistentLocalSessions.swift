@@ -125,6 +125,10 @@ struct PersistentHostProfile: Sendable {
     /// longer knows (`RemoteDeviceStore.unavailableHosting`): its window
     /// holds no connection and restores nothing until the device is known.
     var isKnownDevice = true
+    /// What a device's launches and labels need of it now: its login shell,
+    /// home folder and Ghostty resources (`RemoteDeviceStore`); nil for This
+    /// Mac.
+    var device: @MainActor @Sendable () -> RemoteLaunchSpec.Device? = { nil }
 
     /// This Mac's own host.
     static let thisMac = PersistentHostProfile(
@@ -136,14 +140,27 @@ struct PersistentHostProfile: Sendable {
     )
 
     /// Another Mac's host, reached over SSH at `host`.
-    static func remote(host: HostedSessionHost, displayName: String, machineNames: Set<String> = []) -> PersistentHostProfile {
+    static func remote(
+        host: HostedSessionHost,
+        displayName: String,
+        machineNames: Set<String> = [],
+        device: @escaping @MainActor @Sendable () -> RemoteLaunchSpec.Device? = { nil }
+    ) -> PersistentHostProfile {
         PersistentHostProfile(
             host: host,
             displayName: displayName,
             allowsNativeFallback: false,
             isThisMac: false,
-            machineNames: { machineNames }
+            machineNames: { machineNames },
+            device: device
         )
+    }
+
+    /// The home folder `~` stands for in the paths its tabs report: This
+    /// Mac's, or the device's (from its check); nil when not known.
+    @MainActor
+    var homeDirectory: String? {
+        isThisMac ? NSHomeDirectory() : device()?.homeDirectory?.nilIfEmpty
     }
 
     /// "the local session host", "the session host on Studio".
@@ -316,7 +333,7 @@ final class PersistentHostSessions {
             owner: remoteOwner(installationID: installationID),
             control: control ?? { HostControlRegistry.shared.control(for: host) },
             installationUnavailableReason: installationUnavailableReason,
-            launchSpec: RemoteLaunchSpec.builder(remoteShell: remoteShell),
+            launchSpec: RemoteLaunchSpec.builder(remoteShell: remoteShell) { profile.device() ?? RemoteLaunchSpec.Device() },
             status: status,
             instanceLock: instanceLock,
             terminalColors: terminalColors,

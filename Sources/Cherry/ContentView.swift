@@ -3438,10 +3438,10 @@ private struct CommandPaletteOverlay: View {
             query: query,
             agents: project.launchableAgents,
             projects: settings.projects,
-            installedEditors: editorDiscovery.installedEditors,
+            // A device's project: the editors that open folders over SSH.
+            installedEditors: ExternalEditorLauncher.editors(editorDiscovery.installedEditors, forProjectRoot: project.validProjectRoot),
             defaultEditorID: terminalSettings.defaultEditorID,
-            // Open in an editor is This Mac's (a device's project is phase 3).
-            hasOpenProject: project.validProjectRoot.map { !ProjectLocation.isRemoteKey($0) } ?? false,
+            hasOpenProject: project.validProjectRoot != nil,
             supportsWorktrees: repository.supportsWorktrees,
             usageScores: usageScores
         )
@@ -3508,7 +3508,10 @@ private struct CommandPaletteOverlay: View {
 
     private var filteredEditors: [InstalledEditor] {
         ranked(
-            editorDiscovery.installedEditors,
+            ExternalEditorLauncher.editors(
+                editorDiscovery.installedEditors,
+                forProjectRoot: settings.resolvedProject(for: selectedProjectRoot).validProjectRoot
+            ),
             id: { "editor:\($0.id)" },
             fields: { [$0.displayName] }
         )
@@ -5005,6 +5008,8 @@ private struct SidebarTabsPage: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var agentSettings = AgentSettings.shared
+    /// A device project's cherry.toml, once read there.
+    @ObservedObject private var remoteProjectFiles = RemoteProjectFiles.shared
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
@@ -5020,10 +5025,10 @@ private struct SidebarTabsPage: View {
         let visibleAgentItems = agentTree.visibleItems(
             collapsedIDs: chromeState.collapsedAgentGroupIDs
         )
-        // A device's project has no commands here in phase 1: its
-        // cherry.toml is on that Mac (docs/specs/remote-devices.md).
+        // A device's project reads its cherry.toml there (phase 3,
+        // `RemoteProjectFiles`); it changes as that file is read again.
         let isRemote = projectRoot.map(ProjectLocation.isRemoteKey) ?? false
-        let commands = isRemote ? [] : agentSettings.launchableProjectCommands(for: projectRoot)
+        let commands = agentSettings.launchableProjectCommands(for: projectRoot)
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
@@ -5068,20 +5073,18 @@ private struct SidebarTabsPage: View {
                         .id("not-open-\(projectRoot ?? "")")
                 }
 
-                if !isRemote {
-                    SidebarCommandSection(
-                        settings: agentSettings,
-                        workspace: workspace,
-                        chromeState: chromeState,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
-                        palette: palette,
-                        commands: commands,
-                        shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
-                        showShortcutHints: chromeState.isCommandKeyPressed
-                    )
-                    .id("commands-\(projectRoot ?? "")")
-                }
+                SidebarCommandSection(
+                    settings: agentSettings,
+                    workspace: workspace,
+                    chromeState: chromeState,
+                    projectRoot: projectRoot,
+                    presentation: presentation,
+                    palette: palette,
+                    commands: commands,
+                    shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
+                    showShortcutHints: chromeState.isCommandKeyPressed
+                )
+                .id("commands-\(projectRoot ?? "")")
 
                 if features.todosEnabled {
                     SidebarTodosSection(
@@ -6829,12 +6832,15 @@ private struct TitlebarProjectPicker: View {
             }
             let control = HostControlRegistry.shared.control(for: host)
             if control.state == .connected { store.noteSeen(device.id) }
+            // Not connected: what a look that starts nothing found.
+            let peek = control.state == .connected ? nil : RemoteDevicePeeks.shared.result(for: host)
+            let peeked = control.state == .connected ? nil : RemoteDevicePeeks.shared.list(for: host)
             return .init(
                 device: device,
                 state: RemoteDeviceConnectionState(
-                    control: control.state, sessionCount: control.sessions.count, lastSeen: device.lastSeen
+                    control: control.state, sessionCount: control.sessions.count, lastSeen: device.lastSeen, peek: peek
                 ),
-                sessions: control.sessions,
+                sessions: peeked?.sessions ?? control.sessions,
                 bundledBuild: RemoteHostHelpers.cachedAppBuild
             )
         }
@@ -6880,6 +6886,7 @@ private struct TitlebarProjectPicker: View {
             store.hideProject(path: path, on: deviceID)
         case .reconnectDevice(let deviceID):
             guard let host = store.device(id: deviceID)?.host else { return }
+            RemoteDevicePeeks.shared.retry(host)
             let control = HostControlRegistry.shared.control(for: host)
             if case .waitingToReconnect = control.state {
                 control.reconnectNow()
@@ -10035,17 +10042,21 @@ enum SidebarSessionLabel {
             return .init(title: session.title, detail: session.sidebarDetail.nilIfEmpty)
         }
 
+        // A device's tab shortens its paths with that Mac's home.
+        let home = session.pathHomeDirectory
         let trimmedTitle = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedTitle == SidebarTerminalPathFormatter.displayPath(session.workingDirectory) {
+        if trimmedTitle == SidebarTerminalPathFormatter.displayPath(session.workingDirectory, homeDirectory: home) {
             return SidebarTerminalPathFormatter.label(
                 for: session.workingDirectory,
-                mode: pathDisplayMode
+                mode: pathDisplayMode,
+                homeDirectory: home
             )
         }
 
         if let programLabel = SidebarTerminalProgramFormatter.label(
             for: session.title,
             workingDirectory: session.workingDirectory,
+            homeDirectory: home,
             resolvedCommandLine: session.resolvedCommandLine
         ) {
             return programLabel
@@ -10053,11 +10064,13 @@ enum SidebarSessionLabel {
 
         if SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
             title: session.title,
-            workingDirectory: session.workingDirectory
+            workingDirectory: session.workingDirectory,
+            homeDirectory: home
         ) {
             return SidebarTerminalPathFormatter.label(
                 for: session.workingDirectory,
-                mode: pathDisplayMode
+                mode: pathDisplayMode,
+                homeDirectory: home
             )
         }
 
@@ -12310,6 +12323,8 @@ struct TerminalContextBarContent: Equatable {
     let titleSource: TerminalSession.TitleSource
     let subtitle: String
     let workingDirectory: String
+    /// What `~` stands for in its path (a device's home for its tabs).
+    let homeDirectory: String
 
     @MainActor
     init(session: TerminalSession) {
@@ -12319,10 +12334,11 @@ struct TerminalContextBarContent: Equatable {
         titleSource = session.titleSource
         subtitle = session.subtitle
         workingDirectory = session.workingDirectory
+        homeDirectory = session.pathHomeDirectory
     }
 
     var displayPath: String {
-        SidebarTerminalPathFormatter.displayPath(workingDirectory)
+        SidebarTerminalPathFormatter.displayPath(workingDirectory, homeDirectory: homeDirectory)
     }
 
     var sessionLabel: String {
@@ -12338,7 +12354,8 @@ struct TerminalContextBarContent: Equatable {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if title.isEmpty || SidebarTerminalPathFormatter.shouldUseWorkingDirectoryLabel(
             title: title,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            homeDirectory: homeDirectory
         ) {
             return subtitle.replacingOccurrences(of: " login shell", with: "")
         }

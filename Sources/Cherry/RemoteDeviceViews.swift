@@ -202,7 +202,9 @@ final class AddDeviceModel: ObservableObject {
                 homeDirectory: probe.homeDirectory,
                 hostID: probe.hostStatus?.host_id,
                 installedBuild: installed?.build,
-                installedArch: installed?.architecture
+                installedArch: installed?.architecture,
+                shell: probe.shell,
+                installedResources: installed?.resourcesInstalled ?? false
             )
         } catch {
             self.error = error.localizedDescription
@@ -476,6 +478,14 @@ final class UpdateDeviceHostModel: ObservableObject {
                 progress: { [weak self] stage in self?.installStage = stage }
             )
             store.recordInstall(outcome, on: deviceID)
+            // What the check found now: its shell and home (a terminal's
+            // shell integration and `~` labels use them).
+            if let probe {
+                store.update(deviceID) { device in
+                    device.shell = probe.shell ?? device.shell
+                    device.homeDirectory = probe.homeDirectory ?? device.homeDirectory
+                }
+            }
             self.outcome = outcome
             if let updated = store.device(id: deviceID) { reconnect(updated) }
         } catch {
@@ -827,6 +837,9 @@ enum RemoteDeviceAvailability: Equatable {
         let control = hosting.control
         switch action {
         case .reconnectNow, .retryLogin:
+            // Retry: looks at it (Background Sessions, the picker) may run
+            // again too.
+            RemoteDevicePeeks.shared.retry(hosting.profile.host)
             if case .waitingToReconnect = control.state {
                 control.reconnectNow()
             } else {

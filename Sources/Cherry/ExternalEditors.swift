@@ -103,28 +103,111 @@ final class ExternalEditorDiscovery: ObservableObject {
     }
 }
 
-@MainActor
-struct ExternalEditorLauncher {
-    private let openHandler: (URL, URL) -> Void
+/// How an editor opens a folder on another Mac over SSH
+/// (docs/specs/remote-devices.md, phase 3): VS Code and Cursor through their
+/// Remote - SSH URL, Zed through its `zed://ssh/` hotlink. Other editors
+/// cannot, and are not offered for a device's project.
+enum RemoteEditorLink: Equatable {
+    /// Opened with the editor's app.
+    case url(URL)
 
-    init(openHandler: @escaping (URL, URL) -> Void = { folderURL, appURL in
-        NSWorkspace.shared.open(
-            [folderURL],
-            withApplicationAt: appURL,
-            configuration: NSWorkspace.OpenConfiguration()
-        ) { _, error in
-            if let error {
-                NSLog("[cherry] open-in-editor failed: %@", error.localizedDescription)
-            }
+    /// The URL scheme of a VS Code-family editor that opens
+    /// `<scheme>://vscode-remote/ssh-remote+<destination><path>`.
+    static func vscodeScheme(bundleIdentifier: String) -> String? {
+        switch bundleIdentifier {
+        case "com.microsoft.VSCode": "vscode"
+        case "com.microsoft.VSCodeInsiders": "vscode-insiders"
+        case "com.todesktop.230313mzl4w4u92": "cursor"
+        default: nil
         }
-    }) {
-        self.openHandler = openHandler
     }
 
-    /// A project on another Mac (a `ProjectLocation` key) is not opened:
-    /// its folder is not on this Mac (docs/specs/remote-devices.md, phase 3).
+    /// Whether `editor` can open a folder on another Mac.
+    static func supports(_ editor: InstalledEditor) -> Bool {
+        editor.id == "zed" || vscodeScheme(bundleIdentifier: editor.bundleIdentifier) != nil
+    }
+
+    /// The link that opens `path` (absolute, on the device) on the SSH
+    /// `destination` in `editor`; nil when it cannot.
+    static func make(editor: InstalledEditor, destination: String, path: String) -> RemoteEditorLink? {
+        guard path.hasPrefix("/"), !destination.isEmpty else { return nil }
+        let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        let encodedDestination = destination.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed.union(["@"])) ?? destination
+        if let scheme = vscodeScheme(bundleIdentifier: editor.bundleIdentifier) {
+            return URL(string: "\(scheme)://vscode-remote/ssh-remote+\(encodedDestination)\(encodedPath)").map { .url($0) }
+        }
+        if editor.id == "zed" {
+            // Zed's documented hotlink, `zed://ssh/[user@]host/<path>`,
+            // whose path Zed percent-decodes (a folder with spaces opens
+            // as named). Not its CLI's `ssh://host/<path>`, whose decoding
+            // Zed does not document; the host is left unencoded (Zed reads
+            // `user@host:port` there).
+            return URL(string: "zed://ssh/\(destination)\(encodedPath)").map { .url($0) }
+        }
+        return nil
+    }
+}
+
+@MainActor
+struct ExternalEditorLauncher {
+    typealias RemoteOpener = @MainActor (RemoteEditorLink, InstalledEditor) -> Void
+
+    private let openHandler: (URL, URL) -> Void
+    private let remoteOpener: RemoteOpener
+    /// The SSH destination of the device a project key names.
+    private let destination: @MainActor (String) -> String?
+
+    init(
+        openHandler: @escaping (URL, URL) -> Void = { folderURL, appURL in
+            NSWorkspace.shared.open(
+                [folderURL],
+                withApplicationAt: appURL,
+                configuration: NSWorkspace.OpenConfiguration()
+            ) { _, error in
+                if let error {
+                    NSLog("[cherry] open-in-editor failed: %@", error.localizedDescription)
+                }
+            }
+        },
+        remoteOpener: @escaping RemoteOpener = ExternalEditorLauncher.openRemote,
+        destination: @escaping @MainActor (String) -> String? = { key in
+            RemoteDeviceStore.shared.device(forProjectKey: key)?.sshDestination
+        }
+    ) {
+        self.openHandler = openHandler
+        self.remoteOpener = remoteOpener
+        self.destination = destination
+    }
+
+    /// Opens the project in `editor`. A project on another Mac (a
+    /// `ProjectLocation` key) opens through the editor's remote support
+    /// when it has one (`RemoteEditorLink`), else nothing happens.
     func open(projectRoot: String, with editor: InstalledEditor) {
-        guard !ProjectLocation.isRemoteKey(projectRoot) else { return }
-        openHandler(URL(fileURLWithPath: projectRoot, isDirectory: true), editor.appURL)
+        guard ProjectLocation.isRemoteKey(projectRoot) else {
+            openHandler(URL(fileURLWithPath: projectRoot, isDirectory: true), editor.appURL)
+            return
+        }
+        guard let destination = destination(projectRoot),
+              let link = RemoteEditorLink.make(
+                editor: editor, destination: destination, path: ProjectLocation.launchPath(forKey: projectRoot)
+              )
+        else { return }
+        remoteOpener(link, editor)
+    }
+
+    /// The editors a project's Open in… offers: every installed one for
+    /// This Mac's, those with remote support for a device's.
+    static func editors(_ installed: [InstalledEditor], forProjectRoot projectRoot: String?) -> [InstalledEditor] {
+        guard let projectRoot, ProjectLocation.isRemoteKey(projectRoot) else { return installed }
+        return installed.filter(RemoteEditorLink.supports)
+    }
+
+    static let openRemote: RemoteOpener = { link, editor in
+        switch link {
+        case .url(let url):
+            NSWorkspace.shared.open([url], withApplicationAt: editor.appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                if let error { NSLog("[cherry] open-in-editor failed: %@", error.localizedDescription) }
+            }
+        }
     }
 }

@@ -1022,6 +1022,8 @@ struct SessionTeardownSummary: Equatable {
         /// Its program is busy (`TerminalSession.hasRunningProcess`): a
         /// command, an agent, or a shell running a job.
         let isBusy: Bool
+        /// The device it runs on (its name); nil for This Mac.
+        var machine: String? = nil
     }
 
     /// Local persistent tabs whose program runs (their Create may still be
@@ -1159,9 +1161,31 @@ struct SessionTeardownQuestion {
 
     var messageText: String {
         let count = summary.runningSessions.count
-        return count == 1
-            ? "Keep 1 session running in the background?"
-            : "Keep \(count) sessions running in the background?"
+        let sessions = count == 1 ? "1 session" : "\(count) sessions"
+        let machines = Self.machineCounts(summary.runningSessions)
+        // Sessions on other Macs name them (docs/specs/remote-devices.md).
+        if machines.contains(where: { $0.name != nil }) {
+            if machines.count == 1, let name = machines[0].name {
+                return "Keep \(sessions) running on \(name)?"
+            }
+            let parts = machines.map { "\($0.count) on \($0.name ?? "this Mac")" }
+            return "Keep \(sessions) running (\(parts.joined(separator: ", ")))?"
+        }
+        return "Keep \(sessions) running in the background?"
+    }
+
+    /// How many of `sessions` run on each Mac: This Mac's (nil) first,
+    /// then each device's in the order they come.
+    static func machineCounts(_ sessions: [SessionTeardownSummary.Session]) -> [(name: String?, count: Int)] {
+        var counts: [(name: String?, count: Int)] = []
+        for session in sessions {
+            if let index = counts.firstIndex(where: { $0.name == session.machine }) {
+                counts[index].count += 1
+            } else {
+                counts.append((session.machine, 1))
+            }
+        }
+        return counts.filter { $0.name == nil } + counts.filter { $0.name != nil }
     }
 
     var informativeText: String {

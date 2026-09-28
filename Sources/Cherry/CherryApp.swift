@@ -1278,8 +1278,10 @@ private struct ProjectWorkspaceView: View {
         // A project on another Mac runs its tabs on that Mac's host
         // (docs/specs/remote-devices.md); a device Cherry no longer knows
         // gets a hosting whose tabs fail, saying so, never local ones.
+        let device = ProjectLocation.isRemoteKey(projectRoot)
+            ? RemoteDeviceStore.shared.device(forProjectKey: projectRoot) : nil
         let hosting: PersistentHostSessions = if ProjectLocation.isRemoteKey(projectRoot) {
-            RemoteDeviceStore.shared.device(forProjectKey: projectRoot).flatMap { RemoteDeviceStore.shared.hosting(for: $0.id) }
+            device.flatMap { RemoteDeviceStore.shared.hosting(for: $0.id) }
                 ?? RemoteDeviceStore.unavailableHosting(
                     for: projectRoot,
                     reason: "This Mac is not among your devices any more (or this copy of Cherry cannot run its tabs). Add it again from the project menu."
@@ -1294,7 +1296,9 @@ private struct ProjectWorkspaceView: View {
             // An unknown device's saved tabs stay saved as they are.
             sessionRestorer: hosting.profile.isKnownDevice
                 ? WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting)
-                : RemoteDeviceStore.keepingRestorer
+                : RemoteDeviceStore.keepingRestorer,
+            // A device's git worktrees and cherry.toml, read there (phase 3).
+            remoteProject: hosting.profile.isKnownDevice ? device.map { RemoteProjectAccess.app($0) } : nil
         ))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(
             projectRoot: projectRoot,

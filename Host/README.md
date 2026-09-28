@@ -495,6 +495,19 @@ daemon again (the check may have found no cherry-host to ask): a newer
 protocol, or one before 4, is refused and the device is not changed; another
 daemon it did not know of is reported.
 
+With the helpers go Ghostty's terminfo (`xterm-ghostty`) and shell
+integration, as `<build>/terminfo` and `<build>/Ghostty` (the tar stream
+carries both trees; `xattr -cr` clears them). They are checked by digest
+like the helpers' SHA-256 (`resources_hash`: the SHA-256 of the `shasum -a
+256` lines of every file in both trees, sorted by path), the check reports
+each build's digest, a build without them (installed by an older Cherry)
+does not match, and `verify_dir` requires it. A device's terminal tabs set
+`TERM=xterm-ghostty`, `TERMINFO` and `GHOSTTY_RESOURCES_DIR` to them, and run
+its login shell as `/bin/bash --noprofile --norc -c 'exec -l <shell>'` with
+Ghostty's zsh (`ZDOTDIR`), bash (`--posix` and `ENV`) or fish
+(`XDG_DATA_DIRS`) integration, so the host sees the shell's OSC 7, titles
+and prompt marks as it does This Mac's.
+
 Every Cherry installation that uses a build marks it: the install, each
 check and each connection of a device's control (at most every 6 hours)
 touch `<build>/.used-by/<installation id>`. Afterwards a build is removed
@@ -538,8 +551,14 @@ before the gateway's preamble arrived, the client connects again once,
 directly, without the ControlPath. The Mac app shares one master among at
 most 8 attach adapters per destination
 (`HostSSHMasterManager.Configuration.maxChannelsPerMaster`), leaving room
-for its control connection and one-off commands; further adapters run their
-own ssh.
+for its control connection and one-off commands; further adapters share a
+second master to the same destination (a shard, `dest#2`, then `dest#3`, up
+to 8), which starts once the masters up have one free slot left, so it is up
+before it is needed and stops when nothing uses it and the others have room.
+A shard that cannot log in is not tried again for a minute (or until the
+first master comes up again). Only an adapter that finds no master with room
+(the next one still starting, or backing off) runs its own ssh; the app's
+one-shot commands and scp connect directly when a master refuses a session.
 
 When the client expects a particular host identity (`--expected-host-id`, or
 the host an attachment reconnects to), the remote command is
@@ -625,6 +644,27 @@ always print JSON with `--json` and exit 0 whatever they report, so a client
 can parse every outcome; without `--json`, `status` prints one line. Cherry's
 Add Mac check runs them on the other machine
 ([remote-devices.md](../docs/specs/remote-devices.md)).
+
+`cherry list --json --no-start` lists without ever starting a host or
+replacing one of an older protocol (through `cherry-host gateway --no-start`
+with `--host`): when none of this version runs it says "no cherry-host is
+running" and exits 1. Cherry uses it to look at another Mac's sessions
+(Background Sessions, the project picker) without starting anything there.
+
+`cherry-host project-info --json PATH…` describes project folders on this
+machine for a Cherry on another Mac, in one round trip over its SSH master:
+`{"version":1,"projects":[{"path":"…","exists":true,"is_directory":true,
+"git":{"top_level":"…","common_dir":"…","worktrees":"<git worktree list
+--porcelain -z>"},"cherry_toml":{"size":123,"text":"…"}}]}`. `git` is null
+(with `git_error`) outside a repository; `cherry_toml` is null when the
+folder has none, and has no `text` (but an `error`) when it is larger than
+256 KiB or not UTF-8. It runs only the `git` that `CHERRY_GIT` names
+(Cherry's script picks one that will not ask to install the command line
+tools); without it no git runs (`git_error` is `git not found`), never one
+from `PATH`. Git runs only for `rev-parse` and `worktree list`; it reads
+at most 64 paths, never starts or talks to a daemon and changes nothing. It
+ships with the cherry-host Cherry installs, so its answer's format follows
+the app; an older cherry-host without it makes the app say to update it.
 
 `--socket /absolute/private/path/host.sock` selects a separate host (its own
 daemon and state directory); with `--host`, that path is on the remote machine.
@@ -1714,14 +1754,25 @@ travelled with the copy, repair a damaged build, fall back to
 `<build>-<hash>` when a damaged one is in use, race three installs of one
 build, leave a daemon that changed before the handover, report a daemon the
 check could not see, mark builds as used and collect unused ones.
+With a file named `masters` in its directory, the shim also runs stand-in
+SSH masters (`-M`, `-O check`, `-O exit`), and a command given the
+`ControlPath` of one is one of its sessions, at most the number in
+`max-sessions` (default 10) at once, as sshd's `MaxSessions`: one more fails
+with "Session open refused by peer". The device tests of phase 3 run git
+worktrees, `cherry-host project-info`, cherry.toml commands (auto-start,
+restart on exit), the installed terminfo and zsh integration (OSC 7 reaching
+the tab), `scp -O` of dropped files and SSH master shards through it.
 `Scripts/test-remote-mac-loopback` checks the same over real SSH to this Mac
-without admin rights: a private `sshd` on 127.0.0.1 run as you, with its own
-keys and a forced command that sets a private `HOME` and socket, and an ssh
-that only ever reads its private config (never `~/.ssh`); it also runs the
-app's installer against that sshd (the Swift test
-`RemoteDeviceRealHostInstallRunsTheRealCopyOverSSH`, so it builds the Swift
-tests first unless `--skip-build`; `--no-install` leaves it out), then
-`cherry --host` through the installed cherry-host. `Scripts/test-session-suites`
+without admin rights: a private `sshd` on 127.0.0.1 run as you (with
+`MaxSessions 3`), with its own keys and a forced command that sets a private
+`HOME` and socket, and an ssh that only ever reads its private config (never
+`~/.ssh`); it also runs the app's installer against that sshd (the Swift
+test `RemoteDeviceRealHostInstallRunsTheRealCopyOverSSH`, so it builds the
+Swift tests first unless `--skip-build`; `--no-install` leaves it out), then
+`cherry --host` through the installed cherry-host, then
+`RemoteDeviceRealHostShardsSSHMastersAboveTheChannelCap`: the app's master
+manager opens a second master once the first has its sessions, where sshd
+refuses a fourth session on the first. `Scripts/test-session-suites`
 without `--skip-build` builds the Swift tests first, and for `real-host` the
 Rust helpers too.
 

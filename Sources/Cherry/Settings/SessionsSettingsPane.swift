@@ -7,6 +7,8 @@ struct SessionsSettingsPane: View {
     @ObservedObject var backgroundSessions: BackgroundSessionsSummary
     @ObservedObject var hostDiagnostics: SessionHostDiagnostics
     let endBackgroundSessions: () -> Void
+    /// The user's other Macs (docs/specs/remote-devices.md).
+    @StateObject private var remoteDevices: RemoteDeviceSettingsModel
     @State private var confirmsHostRestart = false
 
     init(
@@ -16,8 +18,10 @@ struct SessionsSettingsPane: View {
         hostDiagnostics: SessionHostDiagnostics = .shared,
         // On the Settings window, where it was asked (the window it was
         // clicked in is key).
-        endBackgroundSessions: @escaping () -> Void = { BackgroundSessionsModel.shared.confirmEndAll(from: NSApp.keyWindow) }
+        endBackgroundSessions: @escaping () -> Void = { BackgroundSessionsModel.shared.confirmEndAll(from: NSApp.keyWindow) },
+        remoteDevices: RemoteDeviceSettingsModel? = nil
     ) {
+        _remoteDevices = StateObject(wrappedValue: remoteDevices ?? RemoteDeviceSettingsModel())
         self.settings = settings
         self.status = status
         self.backgroundSessions = backgroundSessions
@@ -147,6 +151,8 @@ struct SessionsSettingsPane: View {
                 Text("The host that runs your persistent sessions stops and starts again. Your programs keep running, and their tabs reconnect in a moment.")
             }
 
+            RemoteDevicesSettingsSection(model: remoteDevices)
+
             Text("Sessions on SSH hosts always keep running when you close a tab, close a window or quit. Manage them from File › Persistent Sessions.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -156,6 +162,9 @@ struct SessionsSettingsPane: View {
         .onAppear {
             // Checks the installation (disk image, helper) now; cheap.
             PersistentLocalSessions.shared.refreshStatus()
+            // Which build this Cherry installs, for "Update available".
+            RemoteHostHelpers.preloadApp()
+            remoteDevices.update()
         }
         .task {
             // `cherry status` never starts a host.

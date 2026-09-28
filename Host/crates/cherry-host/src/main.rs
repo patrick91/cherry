@@ -7,6 +7,7 @@ mod link;
 mod outbox;
 mod paths;
 mod processes;
+mod project_info;
 mod report;
 mod screen;
 mod session;
@@ -60,6 +61,17 @@ enum Action {
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Describe project folders on this machine for a Cherry on another
+    /// Mac: whether each exists, its git top level, common directory and
+    /// worktrees, and its cherry.toml (at most 256 KiB). Reads only; never
+    /// starts or talks to a host.
+    ProjectInfo {
+        #[arg(long)]
+        json: bool,
+        /// The folders, absolute (or relative to the current directory).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
     },
     /// Hold one session for the daemon (started by the daemon, with its
     /// link on descriptor 3).
@@ -120,6 +132,28 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report::status_line(&report));
+            }
+            Ok(())
+        }
+        Action::ProjectInfo { json, paths } => {
+            let report = project_info::report(&paths);
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                for project in &report.projects {
+                    let what = match (&project.git, project.is_directory, project.exists) {
+                        (Some(git), _, _) => format!("git repository at {}", git.top_level),
+                        (None, true, _) => "a folder".to_owned(),
+                        (None, false, true) => "not a folder".to_owned(),
+                        (None, false, false) => "missing".to_owned(),
+                    };
+                    let toml = match &project.cherry_toml {
+                        Some(toml) if toml.text.is_some() => ", cherry.toml",
+                        Some(_) => ", cherry.toml (not sent)",
+                        None => "",
+                    };
+                    println!("{}: {what}{toml}", project.path);
+                }
             }
             Ok(())
         }

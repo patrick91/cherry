@@ -214,7 +214,7 @@ private struct WorktreeSpaceMarker: View {
     }
 
     private var helpText: String {
-        var lines = [worktree.displayName, worktree.root]
+        var lines = [worktree.displayName, worktree.displayPath]
         if repository.dirtyByRoot[worktree.root] == true {
             lines.append("Modified or untracked files")
         }
@@ -531,23 +531,19 @@ struct NewWorktreeSheet: View {
         guard canCreate else { return }
         isCreating = true
         errorMessage = nil
-        let destination = GitWorktreeService.managedWorktreeRoot(
-            repositoryName: repository.repositoryName,
-            repositoryIdentity: repository.commonDirectory ?? repository.repositoryRoot,
-            branchName: requestedBranchName.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
+        let destinationBranch = requestedBranchName.trimmingCharacters(in: .whitespacesAndNewlines)
 
         Task {
             defer { isCreating = false }
             do {
+                // On the Mac the project is on (a device's home for its
+                // projects, asked there when not known).
+                let destination = try await repository.managedWorktreeDestination(branchName: destinationBranch)
                 let creation: GitWorktreeCreation
                 switch mode {
                 case .newBranch:
                     let name = branchName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    try await GitWorktreeService().validateBranchName(
-                        name,
-                        repositoryRoot: repository.repositoryRoot
-                    )
+                    try await repository.validateBranchName(name)
                     creation = .newBranch(
                         name: name,
                         startPoint: startPoint,
@@ -560,10 +556,7 @@ struct NewWorktreeSheet: View {
                     )
                 case .remoteBranch:
                     let localName = remoteLocalName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    try await GitWorktreeService().validateBranchName(
-                        localName,
-                        repositoryRoot: repository.repositoryRoot
-                    )
+                    try await repository.validateBranchName(localName)
                     creation = .remoteBranch(
                         remoteName: selectedRemoteBranch,
                         localName: localName,
@@ -601,7 +594,7 @@ struct RenameWorktreeSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Rename Worktree")
                     .font(.title2.weight(.semibold))
-                Text("Rename its checked-out branch. The checkout folder will stay at \(worktree.root).")
+                Text("Rename its checked-out branch. The checkout folder will stay at \(worktree.displayPath).")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -852,7 +845,7 @@ struct WorktreeManagerSheet: View {
 
     private func removalMessage(for worktree: GitWorktree) -> String {
         if worktree.isPrunable {
-            return "The checkout at \(worktree.root) is already missing. Cherry will prune its stale Git entry."
+            return "The checkout at \(worktree.displayPath) is already missing. Cherry will prune its stale Git entry."
         }
 
         var details: [String] = []
@@ -871,7 +864,7 @@ struct WorktreeManagerSheet: View {
         let consequences = details.isEmpty
             ? "remove the checkout"
             : details.joined(separator: ", ") + ", and remove the checkout"
-        return "Cherry will \(consequences) at \(worktree.root). Its branch will be kept."
+        return "Cherry will \(consequences) at \(worktree.displayPath). Its branch will be kept."
     }
 
     private var removeAllButtonTitle: String {
@@ -994,12 +987,12 @@ private struct WorktreeManagerRow: View {
                             .background(status.color.opacity(0.12), in: Capsule())
                     }
                 }
-                Text(worktree.root)
+                Text(worktree.displayPath)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help(worktree.root)
+                    .help(worktree.displayPath)
             }
 
             Spacer(minLength: 18)

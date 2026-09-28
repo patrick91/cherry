@@ -33,11 +33,15 @@ struct TitlebarProjectMenuModel: Equatable {
         var bundledBuild: String? = nil
 
         /// Update Session Host… is offered: the install there is an older
-        /// build than this Cherry's, or its host speaks another protocol.
+        /// build than this Cherry's, or one without Ghostty's terminfo and
+        /// shell integration (installed before phase 3), or its host speaks
+        /// another protocol.
         var offersHostUpdate: Bool {
             switch state {
             case .incompatible, .hostMissing: return true
-            default: return device.hostIsOlder(thanBundled: bundledBuild)
+            default:
+                return device.hostIsOlder(thanBundled: bundledBuild)
+                    || (bundledBuild != nil && device.installedBuild != nil && !device.installedResources)
             }
         }
 
@@ -271,12 +275,17 @@ final class TitlebarProjectMenuController: NSObject, NSMenuDelegate {
     private var subscriptions: [AnyCancellable] = []
     private(set) var menu = NSMenu()
 
+    /// Looks at devices that are not connected, starting nothing there.
+    private let peeks: RemoteDevicePeeks
+
     init(
         makeModel: @escaping @MainActor () -> TitlebarProjectMenuModel,
         controls: @escaping @MainActor () -> [HostControl],
+        peeks: RemoteDevicePeeks = .shared,
         perform: @escaping @MainActor (TitlebarProjectMenuModel.Action) -> Void
     ) {
         self.makeModel = makeModel
+        self.peeks = peeks
         self.controls = controls
         self.perform = perform
         super.init()
@@ -380,8 +389,10 @@ final class TitlebarProjectMenuController: NSObject, NSMenuDelegate {
     /// asking again).
     nonisolated static func refreshesOnOpen(_ state: HostControl.ConnectionState) -> Bool {
         switch state {
-        case .idle, .connecting, .connected:
+        case .idle, .connected:
             return true
+        case .connecting:
+            return false
         case .waitingToReconnect(let error), .failed(let error):
             return !error.isAuthenticationFailure && !error.isIdentityMismatch && !error.isVersionMismatch
         }
@@ -399,10 +410,16 @@ final class TitlebarProjectMenuController: NSObject, NSMenuDelegate {
         subscriptions.removeAll()
     }
 
-    /// Lists every device's host now (without a lease) and follows its
-    /// connection and sessions while the menu is open.
+    /// Lists every device's host now and follows its connection and
+    /// sessions while the menu is open: a connected one over its
+    /// connection, any other with a look that never starts or replaces its
+    /// daemon (`RemoteDevicePeeks`, throttled; never after a refused
+    /// login until a wake, a network change or Reconnect).
     func startRefreshing() {
         subscriptions.removeAll()
+        subscriptions.append(peeks.$entries.dropFirst().debounce(for: .milliseconds(50), scheduler: DispatchQueue.main).sink { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDevices() }
+        })
         for control in controls() {
             let changes = control.$state.map { _ in () }
                 .merge(with: control.$sessions.map { _ in () })
@@ -411,8 +428,11 @@ final class TitlebarProjectMenuController: NSObject, NSMenuDelegate {
             subscriptions.append(changes.sink { [weak self] in
                 MainActor.assumeIsolated { self?.refreshDevices() }
             })
-            if Self.refreshesOnOpen(control.state) {
+            if control.state == .connected {
                 Task { _ = try? await control.list() }
+            } else if Self.refreshesOnOpen(control.state) {
+                let peeks = peeks
+                Task { await peeks.refresh(control) }
             }
         }
     }

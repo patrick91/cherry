@@ -144,12 +144,13 @@ final class RepositoryWorkspace: ObservableObject {
         stateStore: WorkspaceStateStore? = nil,
         sessionRestorer: @escaping WorkspaceSessionRestorer = WorkspaceSessionRestorers.none,
         autoStartCommands: @escaping @MainActor (String) -> [ProjectCommandDefinition] = { root in
-            // A device's project has no commands in phase 1: its cherry.toml
-            // is on the other Mac (docs/specs/remote-devices.md).
-            guard !ProjectLocation.isRemoteKey(root) else { return [] }
-            return AgentSettings.shared.launchableProjectCommands(for: root).filter(\.autoStart)
+            // A device's project reads its cherry.toml through that Mac's
+            // `project-info` (`RemoteProjectFiles`, docs/specs/remote-devices.md).
+            AgentSettings.shared.launchableProjectCommands(for: root).filter(\.autoStart)
         },
-        restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared
+        restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared,
+        remoteProject: RemoteProjectAccess? = nil,
+        remoteProjectFiles: RemoteProjectFiles? = nil
     ) {
         let runStartedAt = Self.appRunStartedAt
         // A project on another Mac (docs/specs/remote-devices.md) keeps its
@@ -172,6 +173,9 @@ final class RepositoryWorkspace: ObservableObject {
         repositoryRoot = root
         initialWorktreeRoot = initialRoot
         self.service = service
+        self.remoteProject = location.isRemote ? remoteProject : nil
+        self.remoteProjectFiles = remoteProjectFiles ?? (location.isRemote && remoteProject != nil ? .shared : nil)
+        remoteProjectLoaded = !(location.isRemote && remoteProject != nil)
         self.backendPolicy = backendPolicy
         self.stateStore = stateStore
         self.sessionRestorer = sessionRestorer
@@ -244,9 +248,9 @@ final class RepositoryWorkspace: ObservableObject {
         initialResolvedPaths[initialRoot] = initialRoot
         resolvedPathsByInput = initialResolvedPaths
         loadedWorktreeRoots = [initialRoot]
-        hiddenWorktreeRoots = location.isRemote ? [] : Set(
-            AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath)
-        )
+        hiddenWorktreeRoots = location.isRemote
+            ? (remoteProject == nil ? [] : AgentSettings.shared.hiddenWorktreeRoots(for: root))
+            : Set(AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath))
         worktrees = [GitWorktree(
             root: initialRoot,
             head: "",
@@ -320,8 +324,41 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     /// A project on another Mac (docs/specs/remote-devices.md): its tabs run
-    /// there, and it has no git, worktrees or project commands here.
+    /// there; its git worktrees and cherry.toml are read there
+    /// (`remoteProject`), never on this Mac's disk.
     let isRemote: Bool
+
+    /// How a device's window reaches that Mac for git and `project-info`
+    /// (phase 3); nil for This Mac's projects, and for a device window
+    /// without it (an unknown device: no git, worktrees or commands).
+    let remoteProject: RemoteProjectAccess?
+    /// Where a device project's cherry.toml goes once read.
+    private let remoteProjectFiles: RemoteProjectFiles?
+    /// Whether the device project's `project-info` answered (or failed)
+    /// once: its auto-start commands wait for it. True for This Mac's.
+    @Published private(set) var remoteProjectLoaded: Bool
+    /// What stands in the way of the device project's git worktrees or
+    /// cherry.toml (an older session host there, a cherry.toml too large).
+    @Published private(set) var remoteProjectNote: String?
+    private var remoteProjectWaiters: [@MainActor () -> Void] = []
+
+    /// The git that runs this repository's worktree commands: This Mac's,
+    /// or the device's over its SSH master.
+    private func gitService() async -> GitWorktreeService {
+        if let remoteProject { return await remoteProject.gitService() }
+        return service
+    }
+
+    /// A worktree's path where git runs (a device key's path there).
+    private func gitPath(_ root: String) -> String {
+        isRemote ? ProjectLocation.launchPath(forKey: root) : root
+    }
+
+    /// A path git reported, as this window names worktrees (a key on a
+    /// device).
+    private func worktreeKey(_ path: String) -> String {
+        remoteProject?.key(forPath: path) ?? path
+    }
 
     /// The device's hosting when this is another Mac's project.
     /// Nil for a device Cherry no longer knows (its stand-in hosting holds
@@ -361,41 +398,155 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func refresh() async {
-        guard TerminalSettings.shared.worktreeSpacesEnabled, !isRemote else { return }
+        if isRemote {
+            await refreshRemoteProject()
+            return
+        }
+        guard TerminalSettings.shared.worktreeSpacesEnabled else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
         do {
             let snapshot = try await service.discover(projectRoot: repositoryRoot)
-            commonDirectory = snapshot.commonDirectory
-            worktrees = snapshot.worktrees
-            for worktree in snapshot.worktrees {
-                resolvedPathsByInput[worktree.root] = worktree.root
-            }
-            discoveryError = nil
-            hiddenWorktreeRoots.formIntersection(Set(snapshot.worktrees.map(\.root)))
-            persistHiddenWorktrees()
-            AgentSettings.shared.registerWorktreeRoots(
-                snapshot.worktrees.map(\.root),
-                repositoryRoot: repositoryRoot
-            )
-            if !snapshot.worktrees.contains(where: { $0.root == activeWorktreeRoot }) {
-                let fallback = snapshot.worktrees.first?.root ?? repositoryRoot
-                activate(worktreeRoot: fallback, chromeState: nil)
-            }
-            restorePendingWorktrees(droppingUndiscovered: true)
-            // Worktrees discovered now may have sessions no saved tab names.
-            scanForOrphanedSessions()
-            AgentSettings.shared.markWorktreeOpened(
-                activeWorktreeRoot,
-                repositoryRoot: repositoryRoot
-            )
-            ProjectWindowRegistry.shared.repositoryDidRefresh(self)
-            await refreshDirtyStatus()
+            await apply(snapshot)
         } catch {
             discoveryError = error.localizedDescription
             commonDirectory = nil
         }
+    }
+
+    /// The worktrees git reported (their roots as this window names them).
+    private func apply(_ snapshot: GitRepositorySnapshot) async {
+        commonDirectory = snapshot.commonDirectory
+        worktrees = snapshot.worktrees
+        for worktree in snapshot.worktrees {
+            resolvedPathsByInput[worktree.root] = worktree.root
+        }
+        discoveryError = nil
+        hiddenWorktreeRoots.formIntersection(Set(snapshot.worktrees.map(\.root)))
+        persistHiddenWorktrees()
+        AgentSettings.shared.registerWorktreeRoots(
+            snapshot.worktrees.map(\.root),
+            repositoryRoot: repositoryRoot
+        )
+        if !snapshot.worktrees.contains(where: { $0.root == activeWorktreeRoot }) {
+            let fallback = snapshot.worktrees.first?.root ?? repositoryRoot
+            activate(worktreeRoot: fallback, chromeState: nil)
+        }
+        restorePendingWorktrees(droppingUndiscovered: true)
+        // Worktrees discovered now may have sessions no saved tab names.
+        scanForOrphanedSessions()
+        AgentSettings.shared.markWorktreeOpened(
+            activeWorktreeRoot,
+            repositoryRoot: repositoryRoot
+        )
+        ProjectWindowRegistry.shared.repositoryDidRefresh(self)
+        await refreshDirtyStatus()
+    }
+
+    /// A device's project (docs/specs/remote-devices.md, phase 3): one
+    /// `cherry-host project-info` there says whether the folder exists, its
+    /// git worktrees and its cherry.toml; the other worktrees' cherry.toml
+    /// come in a second call. Worktrees are listed only with worktree
+    /// spaces on, as for This Mac's projects. Auto-start commands wait for
+    /// the first answer (`whenRemoteProjectLoaded`).
+    private func refreshRemoteProject() async {
+        guard let access = remoteProject, !isTearingDown else {
+            finishRemoteProjectLoad()
+            return
+        }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        let rootPath = access.path(forKey: repositoryRoot)
+        do {
+            let report: RemoteProjectInfoReport
+            do {
+                report = try await access.projectInfo(paths: [rootPath])
+            } catch RemoteProjectError.unreachable(let reason) {
+                // Offline now: read it once the device's control connects,
+                // and keep auto-start waiting for that answer.
+                remoteProjectNote = "\(access.deviceName) could not be reached (\(reason)); its commands and worktrees show once it is."
+                refreshRemoteProjectOnConnection()
+                return
+            }
+            // It answered: auto-start may run (with what it said, or none).
+            defer { finishRemoteProjectLoad() }
+            guard let info = report.project(at: rootPath) else {
+                throw RemoteProjectError.invalid("\(access.deviceName) did not describe \(rootPath).")
+            }
+            remoteProjectFiles?.record(info, for: repositoryRoot)
+            var notes: [String] = []
+            if !info.isDirectory {
+                notes.append("\(rootPath) is not a folder on \(access.deviceName).")
+            }
+            if let problem = info.cherryTomlProblem { notes.append("\(problem) on \(access.deviceName); its commands are not read.") }
+            guard TerminalSettings.shared.worktreeSpacesEnabled, let git = info.git, !isTearingDown else {
+                remoteProjectNote = notes.isEmpty ? nil : notes.joined(separator: " ")
+                commonDirectory = nil
+                return
+            }
+            let snapshot = try git.snapshot()
+            let others = snapshot.worktrees.map(\.root).filter { $0 != rootPath }
+            if !others.isEmpty, let more = try? await access.projectInfo(paths: others) {
+                for other in more.projects { remoteProjectFiles?.record(other, for: access.key(forPath: other.path)) }
+            }
+            if git.truncated { notes.append("\(access.deviceName) has more worktrees than Cherry lists.") }
+            remoteProjectNote = notes.isEmpty ? nil : notes.joined(separator: " ")
+            guard !isTearingDown else { return }
+            await apply(GitRepositorySnapshot(
+                primaryRoot: worktreeKey(snapshot.primaryRoot),
+                commonDirectory: snapshot.commonDirectory,
+                worktrees: snapshot.worktrees.map { worktree in
+                    GitWorktree(
+                        root: worktreeKey(worktree.root), head: worktree.head, branch: worktree.branch,
+                        isMain: worktree.isMain, isBare: worktree.isBare, isDetached: worktree.isDetached,
+                        lockReason: worktree.lockReason, pruneReason: worktree.pruneReason
+                    )
+                }
+            ))
+        } catch {
+            discoveryError = error.localizedDescription
+            remoteProjectNote = error.localizedDescription
+            commonDirectory = nil
+        }
+    }
+
+    private var remoteProjectRetry: AnyCancellable?
+
+    /// Refreshes the device's project once its control connects (a window
+    /// that opened while it was offline).
+    private func refreshRemoteProjectOnConnection() {
+        guard remoteProjectRetry == nil, let hosting = deviceHosting else { return }
+        remoteProjectRetry = hosting.control.$state
+            .dropFirst()
+            .filter { $0 == .connected }
+            .first()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.remoteProjectRetry = nil
+                    guard let self, !self.isTearingDown else { return }
+                    Task { await self.refresh() }
+                }
+            }
+    }
+
+    private func finishRemoteProjectLoad() {
+        guard !remoteProjectLoaded else { return }
+        remoteProjectLoaded = true
+        let waiters = remoteProjectWaiters
+        remoteProjectWaiters.removeAll()
+        waiters.forEach { $0() }
+    }
+
+    /// Runs `action` once a device project's `project-info` answered (at
+    /// once for This Mac's).
+    private func whenRemoteProjectLoaded(perform action: @escaping @MainActor () -> Void) {
+        guard !remoteProjectLoaded else {
+            action()
+            return
+        }
+        remoteProjectWaiters.append(action)
     }
 
     func refreshDirtyStatus() async {
@@ -403,7 +554,11 @@ final class RepositoryWorkspace: ObservableObject {
         let roots = worktrees.filter { !$0.isBare && !$0.isPrunable }.map(\.root)
         // Keep the probes in one background task. A task group here can crash in
         // Swift's TaskGroup::offer when several Git processes complete together.
-        dirtyByRoot = await service.dirtyStatuses(worktreeRoots: roots)
+        let service = await gitService()
+        let statuses = await service.dirtyStatuses(worktreeRoots: roots.map(gitPath))
+        dirtyByRoot = Dictionary(uniqueKeysWithValues: roots.compactMap { root in
+            statuses[gitPath(root)].map { (root, $0) }
+        })
     }
 
     func disableWorktreeSpaces(chromeState: ProjectWindowChromeState?) {
@@ -484,19 +639,62 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func branchReferences() async throws -> [GitBranchReference] {
-        try await service.branchReferences(repositoryRoot: repositoryRoot)
+        try await gitService().branchReferences(repositoryRoot: gitPath(repositoryRoot))
     }
 
     func fetch() async throws {
-        try await service.fetch(repositoryRoot: repositoryRoot)
+        try await gitService().fetch(repositoryRoot: gitPath(repositoryRoot))
         await refresh()
+    }
+
+    /// Checks a new branch name with git (the device's for its projects).
+    func validateBranchName(_ name: String) async throws {
+        try await gitService().validateBranchName(name, repositoryRoot: gitPath(repositoryRoot))
+    }
+
+    /// Where New Worktree… puts a worktree for `branchName`:
+    /// `~/.cherry/worktrees/<repository>-<id>/<branch>` in the home of the
+    /// Mac it is on (a key for a device's project).
+    ///
+    /// A device whose home is not recorded is asked for it first (and it is
+    /// recorded); one that cannot say is refused, never guessed.
+    func managedWorktreeDestination(branchName: String) async throws -> String {
+        guard isRemote else {
+            return GitWorktreeService.managedWorktreeRoot(
+                repositoryName: repositoryName,
+                repositoryIdentity: commonDirectory ?? repositoryRoot,
+                branchName: branchName
+            )
+        }
+        guard let remoteProject else {
+            throw GitWorktreeCommandError(arguments: ["worktree", "add"], exitCode: 1, standardError: "This Mac is not among your devices.")
+        }
+        let rootPath = gitPath(repositoryRoot)
+        let home = try await remoteProject.resolveHomeDirectory()
+        let taken = Set(worktrees.map { gitPath($0.root) })
+        let path = GitWorktreeService.managedWorktreeRoot(
+            repositoryName: repositoryName,
+            repositoryIdentity: commonDirectory ?? rootPath,
+            branchName: branchName,
+            homeDirectory: home,
+            isTaken: { taken.contains($0) }
+        )
+        return worktreeKey(path)
     }
 
     func create(
         _ creation: GitWorktreeCreation,
         chromeState: ProjectWindowChromeState?
     ) async throws {
-        try await service.create(creation, repositoryRoot: repositoryRoot)
+        let onGit: GitWorktreeCreation = switch creation {
+        case .newBranch(let name, let startPoint, let destination):
+            .newBranch(name: name, startPoint: startPoint, destination: gitPath(destination))
+        case .localBranch(let name, let destination):
+            .localBranch(name: name, destination: gitPath(destination))
+        case .remoteBranch(let remoteName, let localName, let destination):
+            .remoteBranch(remoteName: remoteName, localName: localName, destination: gitPath(destination))
+        }
+        try await gitService().create(onGit, repositoryRoot: gitPath(repositoryRoot))
         await refresh()
         _ = activate(worktreeRoot: creation.destination, chromeState: chromeState)
     }
@@ -520,8 +718,9 @@ final class RepositoryWorkspace: ObservableObject {
         }
         let newName = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard newName != currentName else { return }
-        try await service.validateBranchName(newName, repositoryRoot: repositoryRoot)
-        try await service.renameBranch(worktreeRoot: worktree.root, newName: newName)
+        let service = await gitService()
+        try await service.validateBranchName(newName, repositoryRoot: gitPath(repositoryRoot))
+        try await service.renameBranch(worktreeRoot: gitPath(worktree.root), newName: newName)
         await refresh()
     }
 
@@ -537,7 +736,7 @@ final class RepositoryWorkspace: ObservableObject {
             + savedRecordsNotOpen(root: worktree.root).filter(\.mayOwnLocalSession).count
         let isDirty: Bool
         do {
-            isDirty = try await service.isDirty(worktreeRoot: worktree.root)
+            isDirty = try await gitService().isDirty(worktreeRoot: gitPath(worktree.root))
         } catch {
             isDirty = true
         }
@@ -595,12 +794,13 @@ final class RepositoryWorkspace: ObservableObject {
         let wasActive = isCurrent
         let fallback = visibleWorktrees.first { $0.root != worktree.root }
             ?? worktrees.first { $0.root != worktree.root }
-        let gitRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
+        let gitRoot = gitPath(worktrees.first(where: \.isMain)?.root ?? repositoryRoot)
+        let service = await gitService()
         if worktree.isPrunable {
             try await service.prune(repositoryRoot: gitRoot)
         } else {
             try await service.remove(
-                worktreeRoot: worktree.root,
+                worktreeRoot: gitPath(worktree.root),
                 repositoryRoot: gitRoot,
                 force: force
             )
@@ -617,17 +817,19 @@ final class RepositoryWorkspace: ObservableObject {
     ) async throws {
         let targets = worktrees.filter { !$0.isMain }
         guard !targets.isEmpty else { return }
-        let gitRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
+        let mainRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
+        let gitRoot = gitPath(mainRoot)
+        let service = await gitService()
 
         if targets.contains(where: { $0.root == activeWorktreeRoot }) {
-            _ = activate(worktreeRoot: gitRoot, chromeState: chromeState)
+            _ = activate(worktreeRoot: mainRoot, chromeState: chromeState)
         }
 
         var failures: [String] = []
         for worktree in targets where !worktree.isPrunable {
             do {
                 try await service.remove(
-                    worktreeRoot: worktree.root,
+                    worktreeRoot: gitPath(worktree.root),
                     repositoryRoot: gitRoot,
                     force: true
                 )
@@ -658,7 +860,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func prune() async throws {
-        try await service.prune(repositoryRoot: repositoryRoot)
+        try await gitService().prune(repositoryRoot: gitPath(repositoryRoot))
         await refresh()
     }
 
@@ -698,6 +900,8 @@ final class RepositoryWorkspace: ObservableObject {
             restoreTasks.values.forEach { $0.cancel() }
             restoreWaiters.removeAll()
             restoreRetries.removeAll()
+            remoteProjectRetry = nil
+            remoteProjectWaiters.removeAll()
             autoStartsWaitingForRetry.removeAll()
             orphanScanTask?.cancel()
             orphanScanTask = nil
@@ -803,8 +1007,11 @@ final class RepositoryWorkspace: ObservableObject {
         let root = initialWorktreeRoot
         guard autoStartedRoots.insert(root).inserted else { return }
         whenRestored(root: root) { [weak self] in
-            guard let self, let workspace = self.workspaces[root] else { return }
-            self.startAutoStartCommands(in: workspace, root: workspace.projectRoot ?? root, worktreeRoot: root)
+            // A device's commands are known once its cherry.toml was read.
+            self?.whenRemoteProjectLoaded { [weak self] in
+                guard let self, let workspace = self.workspaces[root] else { return }
+                self.startAutoStartCommands(in: workspace, root: workspace.projectRoot ?? root, worktreeRoot: root)
+            }
         }
     }
 
@@ -827,8 +1034,10 @@ final class RepositoryWorkspace: ObservableObject {
             }
             self.pendingAutoStartTask = nil
             self.whenRestored(root: root) { [weak self, weak workspace] in
-                guard let self, let workspace, self.workspaces[root] === workspace else { return }
-                self.startAutoStartCommands(in: workspace, root: root)
+                self?.whenRemoteProjectLoaded { [weak self, weak workspace] in
+                    guard let self, let workspace, self.workspaces[root] === workspace else { return }
+                    self.startAutoStartCommands(in: workspace, root: root)
+                }
             }
         }
     }

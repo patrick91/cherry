@@ -449,6 +449,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         Self.liveBridgeCount += 1
         terminalView.delegate = self
+        // Files dropped on a tab of another Mac are copied there first
+        // (`RemoteFileDropCoordinator`), never inserted as This Mac's paths.
+        terminalView.dropHandler = { [weak self] pasteboard in
+            MainActor.assumeIsolated { self?.handleRemoteFiles(pasteboard, isPaste: false) ?? false }
+        }
         terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
             self?.handlePostRender()
@@ -2393,6 +2398,26 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 }
 
+extension GhosttySessionBridge {
+    /// Files pasted or dropped on a tab whose program runs on another Mac
+    /// (docs/specs/remote-devices.md, phase 3): asked about, copied there
+    /// and their paths there inserted. False when it is not such a tab or
+    /// it carries no files (the default paste or drop then runs).
+    func handleRemoteFiles(_ pasteboard: NSPasteboard, isPaste: Bool) -> Bool {
+        guard let session = proxy.session else { return false }
+        return RemoteFileDropCoordinator.handle(
+            pasteboard, for: session, isPaste: isPaste, window: terminalView.window
+        ) { [weak self, weak session] text in
+            guard let self, let session else { return }
+            if session.keyboardInputGoesThroughHost || !self.isNativePTYBacked {
+                session.send(data: Data(text.utf8))
+            } else {
+                self.terminalView.sendText(text)
+            }
+        }
+    }
+}
+
 @MainActor
 final class GhosttyTerminalContainerView: NSView {
     private static let snapshotFadeDuration: CFTimeInterval = 0.18
@@ -3177,6 +3202,10 @@ final class GhosttyTerminalContainerView: NSView {
                   window?.firstResponder === activeBridge?.terminalView
             else {
                 return false
+            }
+            // Files pasted into a tab of another Mac are copied there.
+            if isPasteShortcut(event), activeBridge?.handleRemoteFiles(pasteboard, isPaste: true) == true {
+                return true
             }
             return sendKeyThroughHostWhileAdapterIsAway(event)
         }

@@ -300,6 +300,13 @@ final class FakeRemoteMac {
         return try JSONDecoder().decode(Created.self, from: data).id
     }
 
+    /// As `startSession`, but starting the daemon there as that Mac's own
+    /// Cherry would (a test whose fake Mac has none yet).
+    func startSessionStartingDaemon(_ command: [String]) throws -> String {
+        if daemon == nil { try startDaemon() }
+        return try startSession(command)
+    }
+
     var calls: [String] {
         ((try? String(contentsOf: root.appendingPathComponent("calls"), encoding: .utf8)) ?? "")
             .split(separator: "\n").map(String.init)

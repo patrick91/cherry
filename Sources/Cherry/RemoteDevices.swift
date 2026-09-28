@@ -41,6 +41,12 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     var installedBuild: String?
     /// The architecture that install runs as there (`arm64`, `x86_64`).
     var installedArch: String?
+    /// Its login shell (`$SHELL`), as the check found it: a terminal there
+    /// runs it with Ghostty's shell integration.
+    var shell: String?
+    /// The install there (`remoteHostPath`) has this Cherry's Ghostty
+    /// resources (terminfo, shell integration) next to cherry-host.
+    var installedResources: Bool
 
     init(
         id: UUID = UUID(),
@@ -55,7 +61,9 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         hostID: String? = nil,
         createdHostEntry: Bool = false,
         installedBuild: String? = nil,
-        installedArch: String? = nil
+        installedArch: String? = nil,
+        shell: String? = nil,
+        installedResources: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -70,6 +78,8 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         self.createdHostEntry = createdHostEntry
         self.installedBuild = installedBuild
         self.installedArch = installedArch
+        self.shell = shell
+        self.installedResources = installedResources
     }
 
     init(from decoder: Decoder) throws {
@@ -87,6 +97,19 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         createdHostEntry = try container.decodeIfPresent(Bool.self, forKey: .createdHostEntry) ?? false
         installedBuild = try container.decodeIfPresent(String.self, forKey: .installedBuild)
         installedArch = try container.decodeIfPresent(String.self, forKey: .installedArch)
+        shell = try container.decodeIfPresent(String.self, forKey: .shell)
+        installedResources = try container.decodeIfPresent(Bool.self, forKey: .installedResources) ?? false
+    }
+
+    /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
+    var launchDevice: RemoteLaunchSpec.Device {
+        RemoteLaunchSpec.Device(
+            shell: shell,
+            homeDirectory: homeDirectory,
+            resources: installedResources
+                ? RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
+                : nil
+        )
     }
 
     /// Update Session Host… is offered: the cherry-host this Cherry
@@ -234,7 +257,9 @@ final class RemoteDeviceStore: ObservableObject {
         homeDirectory: String? = nil,
         hostID: String? = nil,
         installedBuild: String? = nil,
-        installedArch: String? = nil
+        installedArch: String? = nil,
+        shell: String? = nil,
+        installedResources: Bool = false
     ) throws -> RemoteDevice {
         guard canWrite() else { throw HostedSessionError.message(Self.readOnlyReason) }
         let host = try HostedSessionHost.ssh(sshDestination)
@@ -259,7 +284,9 @@ final class RemoteDeviceStore: ObservableObject {
             hostID: hostID?.nilIfEmpty,
             createdHostEntry: !hostStore.hosts.contains(host),
             installedBuild: installedBuild?.nilIfEmpty,
-            installedArch: installedArch?.nilIfEmpty
+            installedArch: installedArch?.nilIfEmpty,
+            shell: shell?.nilIfEmpty,
+            installedResources: installedResources
         )
         if device.createdHostEntry { try hostStore.add(destination) }
         devices.append(device)
@@ -274,6 +301,7 @@ final class RemoteDeviceStore: ObservableObject {
             device.remoteHostPath = outcome.remoteHostPath
             device.installedBuild = outcome.build
             device.installedArch = outcome.architecture ?? device.installedArch
+            device.installedResources = outcome.resourcesInstalled
         }
     }
 
@@ -357,7 +385,9 @@ final class RemoteDeviceStore: ObservableObject {
             return live
         }
         let hosting = makeHosting(
-            .remote(host: host, displayName: device.name, machineNames: Set(device.machineNames)),
+            .remote(host: host, displayName: device.name, machineNames: Set(device.machineNames)) { [weak self] in
+                self?.device(id: id)?.launchDevice
+            },
             installation
         )
         hosting.endedSessionsStore = endedSessionsStore
@@ -406,6 +436,15 @@ final class RemoteDeviceStore: ObservableObject {
         )
         if RemoteHostInstaller.fields(output)?.contains(where: { $0.key == "marked" }) != true {
             SessionLog.error("could not mark \(directoryName) on \(device.name) as used: \(output.standardError)")
+        }
+    }
+
+    /// The hostings of the devices this store knows that were made
+    /// (registered at launch): Background Sessions lists each one's own
+    /// sessions, as it lists This Mac's (phase 3).
+    func backgroundHostings() -> [BackgroundDeviceHosting] {
+        devices.compactMap { device in
+            hostings[device.id].map { BackgroundDeviceHosting(id: device.id, name: device.name, hosting: $0) }
         }
     }
 
@@ -606,6 +645,11 @@ enum RemoteDeviceConnectionState: Equatable {
     case unknown(lastSeen: Date?)
     case connecting
     case connected(sessionCount: Int)
+    /// Not connected, but a look that starts nothing found its session
+    /// host running with these sessions (`RemoteDevicePeeks`).
+    case reachable(sessionCount: Int)
+    /// A look found no session host running there (none was started).
+    case notRunning
     /// Unreachable now (it keeps being tried while a window leases it).
     case offline(reason: String)
     /// Another host identity answered: Trust New Identity.
@@ -617,7 +661,23 @@ enum RemoteDeviceConnectionState: Equatable {
     /// The cherry-host its path names is not there (removed): Reinstall.
     case hostMissing(reason: String)
 
-    init(control state: HostControl.ConnectionState, sessionCount: Int, lastSeen: Date?) {
+    /// `peek`: what the last look that starts nothing found, used while the
+    /// control is not connected (idle, or failed with something a look
+    /// could see past).
+    init(control state: HostControl.ConnectionState, sessionCount: Int, lastSeen: Date?, peek: HostSessionPeek? = nil) {
+        switch (state, peek) {
+        case (.idle, .listed(let list)?):
+            self = .reachable(sessionCount: list.sessions.count)
+            return
+        case (.idle, .notRunning?):
+            self = .notRunning
+            return
+        case (.idle, .failed(let error)?):
+            self = Self.failure(error)
+            return
+        default:
+            break
+        }
         switch state {
         case .idle:
             self = .unknown(lastSeen: lastSeen)
@@ -645,10 +705,10 @@ enum RemoteDeviceConnectionState: Equatable {
 
     var dot: Dot {
         switch self {
-        case .connected: .green
+        case .connected, .reachable: .green
         case .connecting: .yellow
         case .identityChanged, .loginRefused, .incompatible, .hostMissing: .red
-        case .offline, .unknown: .gray
+        case .offline, .unknown, .notRunning: .gray
         }
     }
 
@@ -662,6 +722,10 @@ enum RemoteDeviceConnectionState: Equatable {
             return "Connecting…"
         case .connected(let count):
             return count == 1 ? "Connected · 1 session" : "Connected · \(count) sessions"
+        case .reachable(let count):
+            return count == 1 ? "Reachable · 1 session" : "Reachable · \(count) sessions"
+        case .notRunning:
+            return "Its session host is not running"
         case .offline:
             return "Offline"
         case .identityChanged:
@@ -681,6 +745,8 @@ enum RemoteDeviceConnectionState: Equatable {
         case .unknown(let lastSeen): lastSeen == nil ? "Not checked yet" : "Not connected"
         case .connecting: "Connecting…"
         case .connected: "Connected"
+        case .reachable: "Reachable (not connected)"
+        case .notRunning: "Its session host is not running (opening a project there starts it)"
         case .offline(let reason): "Offline: \(reason)"
         case .identityChanged(let reason): "Identity changed: \(reason)"
         case .loginRefused(let reason): "SSH login refused: \(reason)"
@@ -693,7 +759,7 @@ enum RemoteDeviceConnectionState: Equatable {
     var offersReconnect: Bool {
         switch self {
         case .connected, .connecting, .identityChanged: false
-        case .unknown, .offline, .loginRefused, .incompatible, .hostMissing: true
+        case .unknown, .offline, .loginRefused, .incompatible, .hostMissing, .reachable, .notRunning: true
         }
     }
 

@@ -455,6 +455,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.dropHandler = { [weak self] pasteboard in
             MainActor.assumeIsolated { self?.handleRemoteFiles(pasteboard, isPaste: false) ?? false }
         }
+        // Edit › Paste: images, files and host-routed input are Cherry's,
+        // as ⌘V (the window's key monitor) is.
+        terminalView.pasteHandler = { [weak self] in
+            MainActor.assumeIsolated { self?.handleMenuPaste(TerminalClipboard.pasteboard()) ?? false }
+        }
         terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
             self?.handlePostRender()
@@ -2424,8 +2429,9 @@ extension GhosttySessionBridge {
 
     /// ⌘V: files and images into a tab of another Mac
     /// (`handleRemoteFiles`); an image alone into a tab of This Mac, as its
-    /// saved file's path (`LocalImagePaste`). False for anything else
-    /// (text, files on This Mac): the surface pastes it.
+    /// saved file's path, and files copied with no text as their paths
+    /// (`LocalImagePaste`). False for anything else (text, Finder's files,
+    /// which carry their names as text): the surface pastes it.
     func handlePaste(_ pasteboard: NSPasteboard) -> Bool {
         guard let session = proxy.session else { return false }
         if let hosting = session.persistentHosting, !hosting.profile.isThisMac {
@@ -2436,20 +2442,39 @@ extension GhosttySessionBridge {
         }
     }
 
-    /// An image the surface pastes by itself (Edit › Paste, a context
-    /// menu, an OSC 52 read) or has dropped on it: in a tab of This Mac, its
-    /// saved file's quoted path (`LocalImagePaste`, as ⌘V); in a tab of
-    /// another Mac nothing now, and the copy's path there once it is copied
-    /// (`handleRemoteFiles`).
+    /// Edit › Paste (`AppTerminalView.paste(_:)`), as ⌘V: what Cherry
+    /// pastes itself (`handlePaste`), and, while the surface's process
+    /// takes no keys (a host-managed surface, or a persistent tab whose
+    /// attach adapter is away), the pasteboard's text through the host,
+    /// bracketed as it reports the program's mode. False leaves the rest
+    /// to the surface's own paste.
+    func handleMenuPaste(_ pasteboard: NSPasteboard) -> Bool {
+        guard let session = proxy.session, session.acceptsInput else { return false }
+        if handlePaste(pasteboard) { return true }
+        guard session.keyboardInputGoesThroughHost || !isNativePTYBacked else { return false }
+        if let data = TerminalPasteboardContent.pasteData(from: pasteboard, bracketing: session.bracketsPaste) {
+            if isNativePTYBacked {
+                session.noteNativeHostInput(event: nil)
+            } else {
+                scrollToBottomForHostInput()
+            }
+            session.send(data: data)
+        }
+        return true
+    }
+
+    /// A pasteboard with no text the surface pastes by itself (Edit ›
+    /// Paste, a context menu, an OSC 52 read) or an image dropped on it:
+    /// in a tab of This Mac, an image's saved file's quoted path or the
+    /// files' paths (`LocalImagePaste`, as ⌘V); in a tab of another Mac
+    /// nothing now (an empty text), and the copy's path there once it is
+    /// copied (`handleRemoteFiles`).
     func terminalText(forImageOn pasteboard: NSPasteboard) -> String? {
         guard let session = proxy.session else { return nil }
         if let hosting = session.persistentHosting, !hosting.profile.isThisMac {
-            _ = handleRemoteFiles(pasteboard, isPaste: true)
-            return nil
+            return handleRemoteFiles(pasteboard, isPaste: true) ? "" : nil
         }
-        var text: String?
-        LocalImagePaste.handle(pasteboard) { text = $0 }
-        return text
+        return LocalImagePaste.text(for: pasteboard)
     }
 
     /// Ctrl+V with an image in an agent tab of another Mac
@@ -2496,9 +2521,15 @@ final class GhosttyTerminalContainerView: NSView {
     private var isLiveScrolling = false
     private var lastSentScrollRow: Int?
     private var allowsAutoFocus = true
-    /// Where ⌘V takes what Cherry types itself (the host-managed surface, or
-    /// a persistent tab whose attach adapter is away). Tests use their own.
-    var pasteboard: NSPasteboard = .general
+    /// Where ⌘V takes what Cherry pastes itself (images, files, and text
+    /// for the host-managed surface or a persistent tab whose attach
+    /// adapter is away): the surfaces' clipboard (`TerminalClipboard`),
+    /// unless set. Tests use their own.
+    var pasteboard: NSPasteboard {
+        get { pasteboardOverride ?? TerminalClipboard.pasteboard() }
+        set { pasteboardOverride = newValue }
+    }
+    private var pasteboardOverride: NSPasteboard?
     private var isActivePane = true
     private var activatePane: (() -> Void)?
     private var pendingTerminalFocus = false
@@ -3264,7 +3295,7 @@ final class GhosttyTerminalContainerView: NSView {
         // whose attach adapter is away): then the host types them.
         if activeBridge?.isNativePTYBacked == true {
             guard event.window === window,
-                  window?.firstResponder === activeBridge?.terminalView
+                  Self.terminalHasKeyboard(window?.firstResponder, terminalView: activeBridge?.terminalView)
             else {
                 return false
             }
@@ -3303,7 +3334,7 @@ final class GhosttyTerminalContainerView: NSView {
         guard event.window === window,
               let activeSession,
               activeSession.acceptsInput,
-              window?.firstResponder === activeBridge?.terminalView
+              Self.terminalHasKeyboard(window?.firstResponder, terminalView: activeBridge?.terminalView)
         else {
             return false
         }
@@ -3381,6 +3412,13 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         return false
+    }
+
+    /// Whether the window's keys go to the tab's terminal: its view, or a
+    /// view inside it, is the first responder.
+    static func terminalHasKeyboard(_ firstResponder: NSResponder?, terminalView: NSView?) -> Bool {
+        guard let terminalView, let view = firstResponder as? NSView else { return false }
+        return view === terminalView || view.isDescendant(of: terminalView)
     }
 
     /// A key typed into a persistent tab's EXEC surface while its attach

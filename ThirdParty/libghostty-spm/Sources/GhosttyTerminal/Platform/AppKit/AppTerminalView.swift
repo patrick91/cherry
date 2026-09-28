@@ -162,6 +162,18 @@
         /// another Mac, where This Mac's paths mean nothing.
         public var dropHandler: ((NSPasteboard) -> Bool)?
 
+        /// Handles Edit › Paste (`paste(_:)`) before Ghostty's own paste:
+        /// returns true when it took it. Cherry sets it for what it pastes
+        /// itself (images, files, a tab whose input goes elsewhere).
+        public var pasteHandler: (() -> Bool)?
+
+        /// Edit › Paste, and any `paste:` sent down the responder chain:
+        /// `pasteHandler`, else Ghostty's `paste_from_clipboard`, as ⌘V.
+        @IBAction public func paste(_: Any?) {
+            if let pasteHandler, pasteHandler() { return }
+            _ = performBindingAction("paste_from_clipboard")
+        }
+
         /// Dropped files insert their (escaped) paths; dropped image bytes are
         /// written to a temp file and the path inserted — so terminal agents can
         /// attach them. Mirrors ghostty's apprt drag handling.

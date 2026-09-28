@@ -132,21 +132,36 @@ enum PastedImageStore {
     }
 }
 
-/// ⌘V of an image into a tab of This Mac: the image is saved
-/// (`PastedImageStore`) and its path pasted with `insert`, which pastes it
-/// as the tab pastes text (bracketed while the program asks for it). False
-/// when the pasteboard is not an image alone (text or files paste as
-/// before) or the image could not be saved.
+/// ⌘V (or Edit › Paste) of an image into a tab of This Mac: the image is
+/// saved (`PastedImageStore`) and its path pasted with `insert`, which
+/// pastes it as the tab pastes text (bracketed while the program asks for
+/// it). Files copied with no text (a screenshot tool's copy, which puts the
+/// image's file and its data there; with no text a terminal would paste
+/// nothing) paste their paths. False when the pasteboard has text (it
+/// pastes as before: Finder's copied files paste their names), has none of
+/// these, or the image could not be saved.
 @MainActor
 enum LocalImagePaste {
     static var directory: () -> URL = { PastedImageStore.defaultDirectory }
 
     @discardableResult
     static func handle(_ pasteboard: NSPasteboard, insert: (String) -> Void) -> Bool {
-        guard let png = PastedContent(pasteboard: pasteboard).image,
-              let file = try? PastedImageStore.save(png, in: directory())
-        else { return false }
-        insert(PastedImage.quoted(file.path))
+        guard let text = text(for: pasteboard) else { return false }
+        insert(text)
         return true
+    }
+
+    /// What `handle` pastes; nil when it pastes nothing.
+    static func text(for pasteboard: NSPasteboard) -> String? {
+        switch PastedContent(pasteboard: pasteboard) {
+        case .image(let png):
+            guard let file = try? PastedImageStore.save(png, in: directory()) else { return nil }
+            return PastedImage.quoted(file.path)
+        case .files(let urls):
+            guard pasteboard.string(forType: .string)?.isEmpty != false else { return nil }
+            return urls.map { PastedImage.quoted($0.path) }.joined(separator: " ")
+        case .text, .nothing:
+            return nil
+        }
     }
 }

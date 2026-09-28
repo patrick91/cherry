@@ -12,6 +12,32 @@ import GhosttyKit
     import AppKit
 #endif
 
+#if canImport(AppKit) && !canImport(UIKit)
+    /// The pasteboard the surfaces paste from and copy to
+    /// (`NSPasteboard.general`). Tests use one of their own.
+    public enum TerminalClipboard {
+        public nonisolated(unsafe) static var pasteboard: () -> NSPasteboard = { .general }
+
+        /// What a paste into `bridge`'s surface types: the pasteboard's
+        /// text; with none, the delegate's text for it (an image's saved
+        /// path, files' paths, or nothing when it copies them elsewhere),
+        /// else the paths of its files (a copied file with no text would
+        /// paste nothing). Nil when there is nothing to paste.
+        @MainActor
+        static func pasteText(for bridge: TerminalCallbackBridge) -> String? {
+            let pasteboard = pasteboard()
+            if let string = pasteboard.string(forType: .string) { return string }
+            if let text = bridge.pastedImageText(from: pasteboard) { return text }
+            let files = (pasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL]) ?? []
+            guard !files.isEmpty else { return nil }
+            return files.map { TerminalPasteboardImage.escapedForInput($0.path) }.joined(separator: " ")
+        }
+    }
+#endif
+
 enum TerminalCallbacks {
     static func wakeup(userdata: UnsafeMutableRawPointer?) {
         guard let userdata else { return }
@@ -92,7 +118,7 @@ enum TerminalCallbacks {
         #if canImport(UIKit)
             UIPasteboard.general.string = string
         #elseif canImport(AppKit)
-            let pasteboard = NSPasteboard.general
+            let pasteboard = TerminalClipboard.pasteboard()
             pasteboard.clearContents()
             pasteboard.setString(string, forType: .string)
         #endif
@@ -111,22 +137,43 @@ enum TerminalCallbacks {
         guard let surface = bridge.rawSurface else { return false }
 
         #if canImport(UIKit)
-            let string = UIPasteboard.general.string
-        #elseif canImport(AppKit)
-            var string = NSPasteboard.general.string(forType: .string)
-            // No text but an image on the clipboard (a screenshot pasted
-            // from the menu, or read by OSC 52): the delegate saves it and
-            // says what to paste for it (its file's path).
-            if string == nil, Thread.isMainThread {
-                string = MainActor.assumeIsolated { bridge.pastedImageText(from: .general) }
+            guard let string = UIPasteboard.general.string else { return false }
+            string.withCString { cString in
+                ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, false)
             }
+            return true
+        #elseif canImport(AppKit)
+            // What to paste may be the delegate's (an image's saved path,
+            // a file copied to another Mac), which runs on the main thread.
+            // A request made there (a key binding, Edit › Paste) is
+            // answered now; one made elsewhere is answered on the main
+            // thread next, which Ghostty allows (its request state lives
+            // until it is completed).
+            if Thread.isMainThread {
+                guard let text = MainActor.assumeIsolated({ TerminalClipboard.pasteText(for: bridge) }) else {
+                    return false
+                }
+                text.withCString { cString in
+                    ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, false)
+                }
+                return true
+            }
+            let requestState = UInt(bitPattern: opaquePtr)
+            terminalRunOnMain {
+                guard bridge.rawSurface == surface,
+                      let opaquePtr = UnsafeMutableRawPointer(bitPattern: requestState)
+                else {
+                    return
+                }
+                // Completed even when there is nothing to paste, so the
+                // request is not left open.
+                let text = TerminalClipboard.pasteText(for: bridge) ?? ""
+                text.withCString { cString in
+                    ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, false)
+                }
+            }
+            return true
         #endif
-
-        guard let string else { return false }
-        string.withCString { cString in
-            ghostty_surface_complete_clipboard_request(surface, cString, opaquePtr, false)
-        }
-        return true
     }
 
     static func confirmReadClipboard(

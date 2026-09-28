@@ -137,10 +137,13 @@ public protocol TerminalSurfaceLinkHoverDelegate: TerminalSurfaceViewDelegate {
 #if canImport(AppKit) && !canImport(UIKit)
     import AppKit
 
-    /// An image on a pasteboard the surface pastes or has dropped on it
-    /// (no text, no file URLs): terminals take text, so the delegate saves
-    /// it and returns what to type for it (its file's quoted path), or nil
-    /// to paste nothing.
+    /// A pasteboard with no text the surface pastes (an image, or copied
+    /// files), or an image dropped on it: terminals take text, so the
+    /// delegate saves an image and returns what to type for it (its file's
+    /// quoted path), or for the files (their paths). Nil leaves the paste
+    /// as it is (the files' paths, else nothing); an empty text pastes
+    /// nothing (the delegate took it, e.g. to copy it to another machine
+    /// first).
     @MainActor
     public protocol TerminalSurfacePastedImageDelegate: TerminalSurfaceViewDelegate {
         func terminalText(forImageOn pasteboard: NSPasteboard) -> String?

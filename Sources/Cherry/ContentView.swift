@@ -6834,9 +6834,13 @@ private struct TitlebarProjectPicker: View {
                 state: RemoteDeviceConnectionState(
                     control: control.state, sessionCount: control.sessions.count, lastSeen: device.lastSeen
                 ),
-                sessions: control.sessions
+                sessions: control.sessions,
+                bundledBuild: RemoteHostHelpers.cachedAppBuild
             )
         }
+        // Read once in the background: the next menu offers Update Session
+        // Host… for a device whose install is older.
+        if !store.devices.isEmpty { RemoteHostHelpers.preloadApp() }
         return TitlebarProjectMenuModel(
             worktrees: worktrees,
             projects: projects,
@@ -6884,6 +6888,8 @@ private struct TitlebarProjectPicker: View {
             }
         case .trustDeviceIdentity(let deviceID):
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
+        case .updateDeviceHost(let deviceID):
+            RemoteDeviceUpdatePresenter.present(deviceID: deviceID, store: store)
         case .renameDevice(let deviceID):
             RemoteDeviceAlerts.rename(deviceID, store: store)
         case .removeDevice(let deviceID):

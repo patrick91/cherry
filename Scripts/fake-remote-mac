@@ -24,6 +24,21 @@
 #   offline   ssh: connect to host NAME port 22: Connection timed out (255)
 #   hostkey   Host key verification failed. (255)
 #   denied    NAME: Permission denied (publickey). (255)
+#   arch      its contents (e.g. x86_64) are the architecture `uname -m`
+#             and `uname -sm` report there (a stand-in `uname`)
+#
+# What cherry-host a fake Mac has (CHERRY_FAKE_REMOTE_HOST at setup):
+#   link      (the default) cherry and cherry-host on its PATH, linked to the
+#             debug builds
+#   none      none (CHERRY_FAKE_REMOTE_NO_HOST=1 is the same)
+#   newer     on its PATH, a stand-in cherry-host of protocol 99 whose
+#             status reports a running daemon of protocol 99 (a newer
+#             Cherry there); its gateway refuses
+#   old-build none on its PATH; copies of the debug builds installed as
+#             this Cherry installs them, in home/Library/Application
+#             Support/cherry-host/bin/20200101000000.old (a test starts
+#             the daemon from there with CHERRY_HOST_TEST_BUILD set to
+#             that build)
 # A NAME that is a symlink to another fake Mac's directory is that Mac (an
 # alias). An unknown NAME: Could not resolve hostname (255). Every call is logged
 # to DIR/calls.
@@ -57,11 +72,49 @@ case "$command" in
       host="$dir/hosts/$name"
       mkdir -p "$host/home" "$host/bin"
       chmod 700 "$host" "$host/home" "$host/bin"
-      if [ "${CHERRY_FAKE_REMOTE_NO_HOST:-}" != 1 ]; then
-        for tool in cherry cherry-host; do
-          if [ -x "$binaries/$tool" ]; then ln -sf "$binaries/$tool" "$host/bin/$tool"; fi
-        done
-      fi
+      kind=${CHERRY_FAKE_REMOTE_HOST:-link}
+      [ "${CHERRY_FAKE_REMOTE_NO_HOST:-}" = 1 ] && kind=none
+      case "$kind" in
+        link)
+          for tool in cherry cherry-host; do
+            if [ -x "$binaries/$tool" ]; then ln -sf "$binaries/$tool" "$host/bin/$tool"; fi
+          done
+          ;;
+        none) ;;
+        newer)
+          cat > "$host/bin/cherry-host" <<'EOF'
+#!/bin/sh
+case "${1-}" in
+  version) echo '{"protocol":99,"build":"29990101000000.future","version":"9.0.0","os":"macos","arch":"aarch64","min_macos":"11.0"}' ;;
+  status) echo '{"running":true,"state":"ready","protocol":99,"build":"29990101000000.future","host_id":"fake-newer-host"}' ;;
+  *) echo "cherry-host: this stand-in speaks protocol 99 only" >&2; exit 1 ;;
+esac
+EOF
+          chmod 700 "$host/bin/cherry-host"
+          ;;
+        old-build)
+          old="$host/home/Library/Application Support/cherry-host/bin/20200101000000.old"
+          mkdir -p "$old"
+          for tool in cherry cherry-host; do cp "$binaries/$tool" "$old/$tool"; done
+          ;;
+        *) echo "fake-remote-mac: CHERRY_FAKE_REMOTE_HOST must be link, none, newer or old-build" >&2; exit 2 ;;
+      esac
+      quoted_host=$(printf "%s" "$host" | sed "s/'/'\\\\''/g")
+      cat > "$host/bin/uname" <<EOF
+#!/bin/sh
+host='$quoted_host'
+EOF
+      cat >> "$host/bin/uname" <<'EOF'
+if [ -f "$host/arch" ]; then
+  arch=$(cat "$host/arch")
+  case "$*" in
+    -sm) echo "Darwin $arch"; exit 0 ;;
+    -m) echo "$arch"; exit 0 ;;
+  esac
+fi
+exec /usr/bin/uname "$@"
+EOF
+      chmod 700 "$host/bin/uname"
       cat > "$host/bin/scutil" <<EOF
 #!/bin/sh
 case "\$*" in

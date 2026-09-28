@@ -29,8 +29,17 @@ Debian/Ubuntu, install `build-essential git curl xz-utils`. The VT build script
 downloads checksum-pinned Zig 0.16.0 and builds a pinned Ghostty revision as a
 ReleaseSafe library. See [the VT dependency notes](vendor/ghostty-vt/README.md)
 for revision, stamp, and toolchain overrides. `Scripts/build-host-vt` accepts a
-Rust target triple for the library; the complete host build and packaging
-scripts build native binaries.
+Rust target triple for the library. On Linux the complete host build and
+packaging scripts build native binaries. On macOS `Scripts/build-host` builds
+universal ones: each of `aarch64-apple-darwin` and `x86_64-apple-darwin`
+with its own VT library, joined with `lipo` and signed (ad hoc, or
+`CHERRY_CODESIGN_IDENTITY`), because the Mac app installs them on the user's
+other Macs of either kind. A missing Rust target stops the build with the
+command that installs it (`rustup target add x86_64-apple-darwin`);
+`CHERRY_HOST_ARCHS=native` builds for this Mac only, and says so.
+`Scripts/check-helper-archs FILE…` checks that `lipo -archs` lists arm64
+and x86_64; `Scripts/install-local-app` (unless `CHERRY_HOST_ARCHS=native`)
+and `Scripts/package-dmg` run it on the helpers they bundle.
 
 `Scripts/build-host`, `Scripts/package-host`, and `Scripts/install-local-app`
 use Cargo's output directory: `CARGO_TARGET_DIR`, else `CARGO_BUILD_TARGET_DIR`,
@@ -42,7 +51,8 @@ rebuilds the VT library when it is missing or its stamps do not match (unless
 config `build.target` would put them somewhere else.
 
 `Scripts/package-host` creates
-`dist/host/cherry-host-<rust-target>.tar.gz`, containing both executables,
+`dist/host/cherry-host-<rust-target>.tar.gz` (`universal-apple-darwin` for
+universal macOS executables), containing both executables,
 documentation, service templates, and dependency notices. Install the matching
 archive on each host:
 
@@ -142,7 +152,12 @@ holders, and the new one adopts them. Use it when an update of the same
 protocol version replaced or removed the running daemon's executable, which
 then starts new sessions from whatever build is installed, or none. (`list`,
 `new`, `attach` and `control` do it themselves when the daemon reports an
-older build than theirs; see [Updates](#updates).)
+older build than theirs; see [Updates](#updates).) `restart --if-pid PID
+--if-executable PATH --if-build BUILD` (any of them) restarts only the daemon
+they describe: it asks the daemon's status on the connection that then asks
+it to restart, and when another daemon runs (or it cannot say) it leaves it
+running and exits with status 4. The Mac app's Update Session Host… uses it,
+so a daemon that changed after it looked is never restarted.
 
 `cherry status` describes the daemon and never starts one:
 
@@ -435,13 +450,86 @@ check runs `ssh -T -o ControlMaster=no -o RemoteCommand=none
 input (so any login shell runs it), which prints the Mac's system,
 `cherry-host version --json` and `cherry-host status --json` (from
 `--remote-host-path`, the remote `PATH`, `~/Library/Application
-Support/Cherry/bin` or `/Applications/Cherry.app/Contents/MacOS`; never
-starting or replacing a daemon), and whether a protected folder and the
+Support/Cherry/bin`, the newest install in `~/Library/Application
+Support/cherry-host/bin`, or the `Contents/MacOS` of `/Applications/Cherry.app`
+or `~/Applications/Cherry.app`; never starting or replacing a daemon), and whether a protected folder and the
 login keychain can be read over SSH. Add Project on a Mac checks the folder
 the same way (`test -d`, `pwd -P`). A device's tabs are sessions of the
 daemon on that Mac's default socket, which that Mac's own Cherry shares:
 they are created with the owner `<app>@<installation id>`, so neither app
 adopts the other's sessions (the other's are attached, never owned).
+
+Add Mac… (and a device's Update Session Host…) installs the Mac app's own
+`cherry` and `cherry-host` on that Mac, in
+`~/Library/Application Support/cherry-host/bin/<build>/`, and passes
+`--remote-host-path ~/Library/Application Support/cherry-host/bin/<build>/cherry-host`
+from then on. Each build has its own directory, which is never changed once
+in place: a running signed executable whose pages change is killed by
+macOS, and daemons and holders of older builds keep running from theirs.
+The check also lists those directories with the SHA-256 of their files, and
+the `cherry-host version --json` of any `/Applications/Cherry.app` or
+`~/Applications/Cherry.app`. The copy is `tar -cf - cherry cherry-host`
+piped into `ssh … '/bin/sh -c …'`, whose one-line script (quoted so that
+sh, bash, zsh, fish, csh and tcsh all hand it to sh unchanged) makes
+`<build>.partial-<uuid>` with `umask 077` and extracts the archive there
+(extended attributes travel with it); it goes through the device's SSH
+master when that is up. Then, over `sh -s`: `xattr -c` on both files,
+`codesign --verify --strict` of both, `cherry-host version --json` from the
+copy (exit 137: macOS refused its signature) and `shasum -a 256` of both,
+which must match what was sent; a failed copy is removed. The checked copy
+is then renamed to `<build>` with rename(2) (`perl -e rename`), which fails
+when the target exists, so concurrent installs of one build never nest.
+When `<build>` is there, it is used only when both executables are, their
+hashes match, both signatures verify and cherry-host runs; a damaged one
+that no process runs from is moved aside and replaced, one in use is left
+and the copy goes to `<build>-<hash>`. A partial copy nested inside a build
+by an older installer is removed. When the check found `<build>` (or
+`<build>-<hash>`) with the same hashes nothing is copied, but it is checked
+the same way (and copied after all if it fails). The check lists every build
+directory, incomplete ones too (a missing file's hash is `-`), so they get
+repaired. The scripts run the system tools by absolute path (`/usr/bin/stat`,
+`/usr/bin/tar`, `/usr/bin/shasum`, `/usr/bin/xattr`, `/usr/bin/codesign`,
+`/bin/ps`, `/usr/bin/perl`), so a PATH with GNU coreutils first changes
+nothing. Once in place, the new build's `cherry-host status --json` asks the
+daemon again (the check may have found no cherry-host to ask): a newer
+protocol, or one before 4, is refused and the device is not changed; another
+daemon it did not know of is reported.
+
+Every Cherry installation that uses a build marks it: the install, each
+check and each connection of a device's control (at most every 6 hours)
+touch `<build>/.used-by/<installation id>`. Afterwards a build is removed
+only when it is not the current one, not one of the two most recently
+installed others, no running process (from `ps`, read once before anything
+searches it) or the daemon (`cherry status --json`: its executable, its
+build, its running sessions' holder builds) uses it, no marker is younger
+than 30 days, and it was installed (`<build>/.installed`, else the
+directory's time) more than 7 days ago; so another Mac whose device record
+points at a build keeps it. Partial copies and directories moved aside go
+after an hour unless in use. A device whose recorded cherry-host is gone
+anyway says so ("Its session host is missing") and offers **Reinstall
+Session Host…**.
+
+Which daemon runs on that Mac's default socket (`cherry-host status
+--json`) decides what the installer does:
+
+| Daemon there | What happens |
+|---|---|
+| none | install; the first tab's gateway starts it |
+| this protocol | install; the gateway relays to that daemon |
+| an older protocol (4 or later) | warn (Cherry there is older: update it too), install; the gateway's `Replace` moves the daemon to this build and its sessions carry on |
+| a newer protocol | refused: update Cherry on this Mac |
+| older than protocol 4 | refused, with how to stop it (see [Updates](#updates)) |
+
+A daemon of the same protocol is handed over to the new build only when it
+runs from one of this installer's own directories (under
+`~/Library/Application Support/cherry-host/bin/`, or the older manual place
+`~/Library/Application Support/Cherry/bin/`; never the other Mac's
+Cherry.app's), its build is not newer than the new one, and the user asked
+for the install or update; the new build's `cherry restart` then moves it,
+and the sessions' holders keep running and register with the new daemon.
+The gateway itself never hands a remote daemon over to another build of
+its protocol (see [Updates](#updates)), so a device's own Cherry and this one
+never take turns replacing each other's daemon.
 
 An SSH server allows a limited number of sessions on one connection
 (`MaxSessions`, 10 by default). When ssh reports that the master connection
@@ -1053,7 +1141,9 @@ builds whose last handover came back with the older build still answering
 build, of a development build, one of another installation, or one that does
 not report its build is left running, so two copies of Cherry never take
 turns replacing the daemon; `cherry restart` moves it to this build. The
-gateway does not do this for a remote host: run `cherry restart` there.
+gateway does not do this for a remote host: run `cherry restart` there. (The
+Mac app's Update Session Host… does it for a device whose daemon runs an
+older install of its own; see [Remote hosts](#remote-hosts).)
 
 Running sessions keep the holders, and so the code, of the build that created
 them until they are removed; new sessions run the new build (`cherry status`
@@ -1601,7 +1691,7 @@ added to the groups in `Scripts/test-session-suites`. Swift Testing's
 selects every test in the files named after it. `real-host` sets
 `CHERRY_TEST_HOST_INTEGRATION=1` and runs every test whose ID contains
 `RealHost` (`HostedSessionRealHost`, `PersistentLocalRealHost`,
-`AgentInputRealHost`, `RemoteDeviceRealHost`, …) against the helpers in
+`AgentInputRealHost`, `RemoteDeviceRealHost`, `RemoteDeviceRealHostInstall`, …) against the helpers in
 `Host/target/debug` (or `CARGO_TARGET_DIR`), each with its own daemon on a
 private socket and a private `HOME`; a skipped test fails the run.
 `RemoteDeviceRealHost*` reach their daemon as a device through
@@ -1609,12 +1699,31 @@ private socket and a private `HOME`; a skipped test fails the run.
 on the helpers' `PATH`) that refuses master connections, never runs the real
 ssh, and runs the remote command with `/bin/sh -c` under `env -i` with that
 Mac's private `HOME`, `PATH` and `CHERRY_HOST_SOCKET`; files named `offline`,
-`hostkey` and `denied` in its directory make it fail as ssh would.
+`hostkey` and `denied` in its directory make it fail as ssh would, and
+`arch` (its contents) is the architecture its `uname` reports. At setup,
+`CHERRY_FAKE_REMOTE_HOST` says which cherry-host it has: `link` (the debug
+builds on its `PATH`), `none`, `newer` (a stand-in of protocol 99 whose
+daemon runs) or `old-build` (an install of build `20200101000000.old` in its
+home, as the Mac app installs one); `none` with a daemon runs it from the
+debug build (one no check can ask). The install tests put the debug helpers
+there with the app's installer, run the gateway from them, update an older
+build whose sessions keep running, refuse a newer host, a missing
+architecture and a copy without a valid signature (the real
+`/usr/bin/codesign` fails on it), clear a quarantine attribute that
+travelled with the copy, repair a damaged build, fall back to
+`<build>-<hash>` when a damaged one is in use, race three installs of one
+build, leave a daemon that changed before the handover, report a daemon the
+check could not see, mark builds as used and collect unused ones.
 `Scripts/test-remote-mac-loopback` checks the same over real SSH to this Mac
 without admin rights: a private `sshd` on 127.0.0.1 run as you, with its own
 keys and a forced command that sets a private `HOME` and socket, and an ssh
-that only ever reads its private config (never `~/.ssh`). Without `--skip-build` it builds
-the Swift tests first, and for `real-host` the Rust helpers too.
+that only ever reads its private config (never `~/.ssh`); it also runs the
+app's installer against that sshd (the Swift test
+`RemoteDeviceRealHostInstallRunsTheRealCopyOverSSH`, so it builds the Swift
+tests first unless `--skip-build`; `--no-install` leaves it out), then
+`cherry --host` through the installed cherry-host. `Scripts/test-session-suites`
+without `--skip-build` builds the Swift tests first, and for `real-host` the
+Rust helpers too.
 
 The 20 ignored `real_host` tests run the `cherry` that `cargo test` builds
 and the `cherry-host` beside it (hence `cargo build --bins` first; set

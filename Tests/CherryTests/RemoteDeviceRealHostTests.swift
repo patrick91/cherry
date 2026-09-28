@@ -19,7 +19,7 @@ import Testing
 private let realHostEnabled = ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"
 
 @MainActor
-private final class FakeRemoteMac {
+final class FakeRemoteMac {
     let name: String
     let root: URL
     /// The shim's directory: the only PATH entry of every local `cherry`.
@@ -37,10 +37,21 @@ private final class FakeRemoteMac {
     let projectPath: String
     private let suite: String
     private let daemonEnvironment: [String: String]
+    /// The cherry-host its daemon runs as (its PATH's, or an install).
+    private let daemonExecutable: URL
     private var daemon: RealHostTestDaemon?
     private var controls: [HostControl] = []
 
-    init(name: String = "studio") throws {
+    /// Where this Cherry installs its session host there.
+    var installRoot: URL {
+        home.appendingPathComponent(RemoteHostInstall.rootRelativePath, isDirectory: true)
+    }
+
+    /// `host`: what cherry-host it has (`CHERRY_FAKE_REMOTE_HOST`: link,
+    /// none, newer, old-build). `startsDaemon`: a daemon runs there from the
+    /// start (from its PATH's cherry-host, or for old-build from that
+    /// install, reporting that build).
+    init(name: String = "studio", host kind: String = "link", startsDaemon: Bool = true) throws {
         self.name = name
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -69,7 +80,7 @@ private final class FakeRemoteMac {
         try Self.run(
             repository.appendingPathComponent("Scripts/fake-remote-mac").path,
             ["setup", root.path, name],
-            environment: ["CHERRY_FAKE_REMOTE_BIN": binaries.path]
+            environment: ["CHERRY_FAKE_REMOTE_BIN": binaries.path, "CHERRY_FAKE_REMOTE_HOST": kind]
         )
         bin = root.appendingPathComponent("bin", isDirectory: true)
         hostDirectory = root.appendingPathComponent("hosts/\(name)", isDirectory: true)
@@ -90,7 +101,7 @@ private final class FakeRemoteMac {
         suite = "CherryTests.RemoteDevice.\(UUID().uuidString)"
         hostStore = HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: suite)))
         // The fake Mac's daemon, as its own login would start it.
-        daemonEnvironment = [
+        var environment = [
             "HOME": home.path,
             "CHERRY_HOST_SOCKET": socket.path,
             "PATH": hostDirectory.appendingPathComponent("bin").path + ":/usr/bin:/bin:/usr/sbin:/sbin",
@@ -98,12 +109,25 @@ private final class FakeRemoteMac {
             "LANG": "en_US.UTF-8",
             "TMPDIR": NSTemporaryDirectory(),
         ]
-        try startDaemon()
+        if kind == "old-build" {
+            daemonExecutable = home.appendingPathComponent("\(RemoteHostInstall.rootRelativePath)/\(Self.oldBuild)/cherry-host")
+            environment["CHERRY_HOST_TEST_BUILD"] = Self.oldBuild
+        } else if kind == "none" {
+            // A daemon no check can ask (no cherry-host where it looks).
+            daemonExecutable = binaries.appendingPathComponent("cherry-host")
+        } else {
+            daemonExecutable = hostDirectory.appendingPathComponent("bin/cherry-host")
+        }
+        daemonEnvironment = environment
+        if startsDaemon { try startDaemon() }
     }
+
+    /// The build of the install `old-build` puts there.
+    static let oldBuild = "20200101000000.old"
 
     private func startDaemon() throws {
         daemon = try RealHostTestDaemon(
-            executable: hostDirectory.appendingPathComponent("bin/cherry-host"),
+            executable: daemonExecutable,
             environment: daemonEnvironment,
             socket: socket
         )
@@ -219,13 +243,61 @@ private final class FakeRemoteMac {
 
     /// Another fake Mac beside this one without a cherry-host.
     func addBareMac(_ name: String) throws {
+        try addMac(name, host: "none")
+    }
+
+    /// Another fake Mac beside this one (no daemon runs there).
+    func addMac(_ name: String, host kind: String) throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         try Self.run(
             repository.appendingPathComponent("Scripts/fake-remote-mac").path,
             ["setup", root.path, name],
-            environment: ["CHERRY_FAKE_REMOTE_NO_HOST": "1"]
+            environment: ["CHERRY_FAKE_REMOTE_BIN": binaries.path, "CHERRY_FAKE_REMOTE_HOST": kind]
         )
+    }
+
+    /// Turns a switch of another fake Mac beside this one on.
+    func set(_ behaviour: String, _ contents: String, on name: String) throws {
+        try contents.write(
+            to: root.appendingPathComponent("hosts/\(name)/\(behaviour)"), atomically: true, encoding: .utf8
+        )
+    }
+
+    /// `cherry status --json` for its daemon, as a process there would ask
+    /// (never through ssh, never starting one).
+    func cliStatus() throws -> RemoteCLIStatusReport {
+        let process = Process()
+        process.executableURL = binaries.appendingPathComponent("cherry")
+        process.arguments = ["status", "--json"]
+        process.environment = daemonEnvironment.filter { $0.key != "CHERRY_HOST_TEST_BUILD" }
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return try JSONDecoder().decode(RemoteCLIStatusReport.self, from: data)
+    }
+
+    /// Starts `command` as a session there, as the other Mac's own Cherry
+    /// would (owner "Cherry", locally, never starting or replacing a
+    /// daemon); returns its id.
+    func startSession(_ command: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = binaries.appendingPathComponent("cherry")
+        process.arguments = ["new", "--cwd", home.path, "--owner", "Cherry", "--name", "work", "--"] + command
+        var environment = daemonEnvironment.filter { $0.key != "CHERRY_HOST_TEST_BUILD" }
+        environment["CHERRY_HOST_PATH"] = root.appendingPathComponent("no-auto-start").path
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        struct Created: Decodable { var id: String }
+        return try JSONDecoder().decode(Created.self, from: data).id
     }
 
     var calls: [String] {
@@ -405,15 +477,30 @@ private func remoteRepository(
         await again.check()
         #expect(again.error?.contains("already") == true)
 
-        // A Mac without cherry-host: said so, with what to do meanwhile.
+        // A Mac without cherry-host: said so; this Cherry installs its own
+        // (Install & Add, phase 2)…
         try mac.addBareMac("bare")
-        let bare = AddDeviceModel(store: store, aliases: [], shell: { mac.shell })
+        let helpers = try RemoteHostHelpers.load(directory: mac.binaries)
+        let bare = AddDeviceModel(store: store, aliases: [], shell: { mac.shell }, helpers: { .success(helpers) })
         bare.destination = "bare"
         await bare.check()
         let hostItem = try #require(bare.checklist?.items.first { $0.id == "host" })
-        #expect(hostItem.status == .warning)
+        #expect(hostItem.status == .ok)
         #expect(hostItem.detail?.contains("No cherry-host was found") == true)
+        #expect(bare.checklist?.items.first { $0.id == "install" }?.title == "Install")
+        #expect(bare.primaryTitle == "Install & Add")
         #expect(bare.checklist?.canAdd == true)
+        // …and without helpers of its own, says what to do meanwhile.
+        let noHelpers = AddDeviceModel(
+            store: store, aliases: [], shell: { mac.shell }, helpers: { .failure(.message("no helpers here")) }
+        )
+        noHelpers.destination = "bare"
+        await noHelpers.check()
+        let manual = try #require(noHelpers.checklist?.items.first { $0.id == "host" })
+        #expect(manual.status == .warning)
+        #expect(manual.detail?.contains("by hand") == true)
+        #expect(noHelpers.checklist?.items.first { $0.id == "install" }?.detail == "no helpers here")
+        #expect(noHelpers.primaryTitle == "Add" && noHelpers.checklist?.canAdd == true)
         #expect(mac.calls.allSatisfy { !$0.contains("-M") && !$0.contains("-O ") })
     } catch {
         await mac.tearDown()

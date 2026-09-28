@@ -25,7 +25,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -81,7 +81,20 @@ enum Action {
     /// in their holders, and the new daemon (this cherry's cherry-host)
     /// adopts them. For a daemon whose executable an update replaced or
     /// removed.
-    Restart,
+    Restart {
+        /// Only when the running daemon has this pid; otherwise it is left
+        /// running and the command fails (exit 4). With the other --if-*
+        /// options, a client checks and restarts on one connection, so it
+        /// never restarts a daemon that changed since it looked.
+        #[arg(long, value_name = "PID")]
+        if_pid: Option<u32>,
+        /// Only when the running daemon's executable is this file.
+        #[arg(long, value_name = "PATH")]
+        if_executable: Option<PathBuf>,
+        /// Only when the running daemon reports this build.
+        #[arg(long, value_name = "BUILD")]
+        if_build: Option<String>,
+    },
     /// List sessions on the selected host.
     List {
         #[arg(long)]
@@ -176,7 +189,7 @@ impl Action {
             Action::Attach { .. } => Kind::Attach,
             Action::Control => Kind::Control,
             Action::Shutdown
-            | Action::Restart
+            | Action::Restart { .. }
             | Action::New { .. }
             | Action::Kill { .. }
             | Action::Remove { .. } => Kind::Mutation,
@@ -319,10 +332,10 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
 
     // Where to start the next host once this one made way.
     let restart_socket = match cli.command {
-        Action::Restart if cli.host.is_some() => {
+        Action::Restart { .. } if cli.host.is_some() => {
             bail!("restart is local only");
         }
-        Action::Restart => {
+        Action::Restart { .. } => {
             // Found and checked before the running host is asked to stop:
             // one that cannot be started would leave no host at all.
             let executable = transport::runnable_host_executable()
@@ -398,7 +411,35 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             transport.send(&ClientMessage::Shutdown)?;
             expect_ok(transport, "shutdown acknowledgement")
         }
-        Action::Restart => {
+        Action::Restart {
+            if_pid,
+            if_executable,
+            if_build,
+        } => {
+            if if_pid.is_some() || if_executable.is_some() || if_build.is_some() {
+                let condition = RestartCondition {
+                    pid: if_pid,
+                    executable: if_executable,
+                    build: if_build,
+                };
+                transport.send(&ClientMessage::Status)?;
+                let status = match transport.receive(RPC_TIMEOUT)? {
+                    ServerMessage::Status { status } => Some(status),
+                    ServerMessage::Error { code, .. }
+                        if code == cherry_protocol::error_code::UNSUPPORTED_OPERATION =>
+                    {
+                        None
+                    }
+                    message => {
+                        unexpected("status", message)?;
+                        unreachable!()
+                    }
+                };
+                if let Err(why) = condition.check(status.as_ref()) {
+                    eprintln!("cherry: not restarting the host, which keeps running: {why}");
+                    return Ok(RESTART_CONDITION_UNMET);
+                }
+            }
             transport.send(&ClientMessage::Restart)?;
             expect_ok(transport, "restart acknowledgement")?;
             *slot = None;
@@ -833,6 +874,59 @@ pub(crate) fn print(text: &str) -> Result<()> {
         .context("could not write to standard output")
 }
 
+/// `restart --if-*` found a daemon other than the one it was told about.
+const RESTART_CONDITION_UNMET: u32 = 4;
+
+/// What `restart --if-pid/--if-executable/--if-build` requires of the
+/// running daemon, checked on the connection that then asks it to restart.
+#[derive(Debug, Default)]
+struct RestartCondition {
+    pid: Option<u32>,
+    executable: Option<PathBuf>,
+    build: Option<String>,
+}
+
+impl RestartCondition {
+    /// Why the daemon (`status`: its `Status`, or None when it does not
+    /// answer one) is not the expected one.
+    fn check(
+        &self,
+        status: Option<&cherry_protocol::HostStatus>,
+    ) -> std::result::Result<(), String> {
+        let Some(status) = status else {
+            return Err("it does not report its pid, executable or build".into());
+        };
+        if let Some(pid) = self.pid {
+            if status.pid != pid {
+                return Err(format!("its pid is {}, not {pid}", status.pid));
+            }
+        }
+        if let Some(expected) = &self.executable {
+            let running = status.executable.as_deref().map(Path::new);
+            let same = running.is_some_and(|running| {
+                running == expected
+                    || matches!(
+                        (running.canonicalize(), expected.canonicalize()),
+                        (Ok(a), Ok(b)) if a == b
+                    )
+            });
+            if !same {
+                return Err(format!(
+                    "its executable is {}, not {}",
+                    running.map_or("unknown".into(), |path| path.display().to_string()),
+                    expected.display()
+                ));
+            }
+        }
+        if let Some(build) = &self.build {
+            if &status.build != build {
+                return Err(format!("its build is {}, not {build}", status.build));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn expect_ok(transport: &mut Transport, expected: &str) -> Result<u32> {
     match transport.receive(RPC_TIMEOUT)? {
         ServerMessage::Ok => Ok(0),
@@ -1019,6 +1113,101 @@ pub(crate) fn validate_host(value: &str) -> std::result::Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_status(pid: u32, executable: Option<&str>, build: &str) -> cherry_protocol::HostStatus {
+        cherry_protocol::HostStatus {
+            host_id: "h".into(),
+            version: cherry_protocol::PROTOCOL_VERSION,
+            build: build.into(),
+            pid,
+            started_at: 1,
+            uptime_ms: 2,
+            socket: "/tmp/x/host.sock".into(),
+            state_dir: "/state".into(),
+            log_path: None,
+            executable: executable.map(Into::into),
+            executable_changed: false,
+            sessions: 0,
+            running_sessions: 0,
+            max_sessions: 128,
+            connections: 1,
+            max_connections: 1024,
+            holders_registered: 0,
+            holders_expected: 0,
+            lost_sessions: 0,
+            fd_limit: None,
+        }
+    }
+
+    #[test]
+    fn a_conditional_restart_needs_the_daemon_it_names() {
+        let running = host_status(42, Some("/opt/a/cherry-host"), "20260101000000.old");
+        let all = RestartCondition {
+            pid: Some(42),
+            executable: Some("/opt/a/cherry-host".into()),
+            build: Some("20260101000000.old".into()),
+        };
+        assert_eq!(all.check(Some(&running)), Ok(()));
+        assert_eq!(RestartCondition::default().check(Some(&running)), Ok(()));
+        let pid = RestartCondition {
+            pid: Some(43),
+            ..Default::default()
+        };
+        assert_eq!(
+            pid.check(Some(&running)),
+            Err("its pid is 42, not 43".into())
+        );
+        let executable = RestartCondition {
+            executable: Some("/opt/b/cherry-host".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            executable.check(Some(&running)),
+            Err("its executable is /opt/a/cherry-host, not /opt/b/cherry-host".into())
+        );
+        let unknown = host_status(42, None, "b");
+        assert!(executable
+            .check(Some(&unknown))
+            .unwrap_err()
+            .contains("unknown"));
+        let build = RestartCondition {
+            build: Some("new".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build.check(Some(&running)),
+            Err("its build is 20260101000000.old, not new".into())
+        );
+        // A host that does not answer Status is never restarted on a condition.
+        assert!(all.check(None).is_err());
+    }
+
+    #[test]
+    fn restart_takes_its_conditions() {
+        let cli = Cli::try_parse_from([
+            "cherry",
+            "restart",
+            "--if-pid",
+            "7",
+            "--if-executable",
+            "/x/cherry-host",
+            "--if-build",
+            "b",
+        ])
+        .unwrap();
+        match cli.command {
+            Action::Restart {
+                if_pid,
+                if_executable,
+                if_build,
+            } => {
+                assert_eq!(if_pid, Some(7));
+                assert_eq!(if_executable, Some(PathBuf::from("/x/cherry-host")));
+                assert_eq!(if_build.as_deref(), Some("b"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn list_says_when_a_session_host_crashed() {

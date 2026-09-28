@@ -14,10 +14,10 @@ mkdir -p "$root/.build" "$root/dist"
 stage=$(mktemp -d "$root/.build/dmg.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 
-# The disk image always contains the session helpers, whatever the caller's
-# CHERRY_SKIP_HOST says.
+# The disk image always contains the session helpers, universal (arm64 and
+# x86_64), whatever the caller's CHERRY_SKIP_HOST or CHERRY_HOST_ARCHS says.
 CHERRY_CONFIGURATION=release CHERRY_APP_NAME="$app_name" CHERRY_INSTALL_DIR="$stage" \
-  CHERRY_SKIP_HOST=0 CHERRY_BUNDLE_ID="$bundle_id" CHERRY_URL_SCHEME="$url_scheme" \
+  CHERRY_SKIP_HOST=0 CHERRY_HOST_ARCHS=universal CHERRY_BUNDLE_ID="$bundle_id" CHERRY_URL_SCHEME="$url_scheme" \
   CHERRY_APPLICATION_SUPPORT_NAME="$support_name" CHERRY_ICON_PATH="$icon" \
   "$root/Scripts/install-local-app"
 ln -s /Applications "$stage/Applications"
@@ -54,11 +54,13 @@ Both cherry and cherry-host are included inside:
   $app_name.app/Contents/MacOS/
 Local persistent sessions work without a separate command-line installation.
 
-For a remote Mac, install this app there and put its cherry-host executable
-on that machine's SSH command PATH. First verify ordinary SSH access and:
-  ssh your-host 'command -v cherry-host'
-Then add that SSH alias in Persistent Sessions on your laptop.
-The portable host can also be built for Linux from the source repository.
+For another Mac, choose Add Mac… in the project picker: once key-based SSH
+login works, it checks that Mac and installs this app's cherry and
+cherry-host there (in ~/Library/Application Support/cherry-host/bin; both
+are universal, for Apple silicon and Intel Macs alike). For any other SSH
+host, put cherry-host on that machine's SSH command PATH and add its SSH
+alias in Persistent Sessions. The portable host can also be built for Linux
+from the source repository.
 
 Sessions survive quitting or a crash of $app_name, SSH disconnection, and a
 crash or restart of the host daemon: each session's own holder process keeps
@@ -66,7 +68,8 @@ it running. They end when that machine reboots.
 
 Updating the app does not end sessions. A host daemon that speaks an older
 protocol is replaced when the new version connects, and its sessions carry
-on. On a remote host, also put the new cherry-host on its SSH command PATH.
+on. On another Mac, choose Update Session Host… in its menu of the project
+picker; on another SSH host, put the new cherry-host on its SSH command PATH.
 A daemon that speaks a newer protocol than this app is reported, never
 replaced.
 
@@ -74,6 +77,8 @@ This is a locally signed test build; it is not notarized for distribution.
 EOF
 
 codesign --verify --deep --strict "$stage/$app_name.app"
+# The helpers Cherry installs on the user's other Macs cover both kinds.
+"$root/Scripts/check-helper-archs" "$stage/$app_name.app/Contents/MacOS/cherry" "$stage/$app_name.app/Contents/MacOS/cherry-host"
 "$root/Scripts/test-packaged-app" "$stage/$app_name.app"
 hdiutil create -volname "$app_name" -srcfolder "$stage" -format UDZO -ov "$output"
 hdiutil verify "$output"

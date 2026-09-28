@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build a native archive. Run this on each supported release architecture.
+# Build an archive of the helpers: universal on macOS (Scripts/build-host),
+# native elsewhere. On Linux, run it on each supported architecture.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # Same resolution as Scripts/build-host, which receives the absolute path.
@@ -8,6 +9,14 @@ case "$target_dir" in /*) ;; *) target_dir="$PWD/$target_dir" ;; esac
 export CARGO_TARGET_DIR="$target_dir"
 "$root/Scripts/build-host" release
 target=$(rustc -vV | sed -n 's/^host: //p')
+# Scripts/build-host builds universal executables on macOS.
+case "$target" in
+  *-apple-darwin)
+    if "$root/Scripts/check-helper-archs" "$target_dir/release/cherry" "$target_dir/release/cherry-host" 2>/dev/null; then
+      target=universal-apple-darwin
+    fi
+    ;;
+esac
 output="$root/dist/host"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT

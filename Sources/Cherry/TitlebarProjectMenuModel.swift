@@ -28,6 +28,24 @@ struct TitlebarProjectMenuModel: Equatable {
         var state: RemoteDeviceConnectionState
         /// Its host's sessions as last listed (every owner's).
         var sessions: [HostedSessionInfo]
+        /// The build of the cherry-host this Cherry bundles (nil until
+        /// read): an older install there offers Update Session Host….
+        var bundledBuild: String? = nil
+
+        /// Update Session Host… is offered: the install there is an older
+        /// build than this Cherry's, or its host speaks another protocol.
+        var offersHostUpdate: Bool {
+            switch state {
+            case .incompatible, .hostMissing: return true
+            default: return device.hostIsOlder(thanBundled: bundledBuild)
+            }
+        }
+
+        /// "Reinstall Session Host…" when the one it names is gone.
+        var hostUpdateTitle: String {
+            if case .hostMissing = state { return "Reinstall Session Host…" }
+            return "Update Session Host…"
+        }
     }
 
     enum Action: Equatable {
@@ -45,6 +63,8 @@ struct TitlebarProjectMenuModel: Equatable {
         case hideDeviceProject(deviceID: UUID, path: String)
         case reconnectDevice(UUID)
         case trustDeviceIdentity(UUID)
+        /// Update Session Host…: install this Cherry's there.
+        case updateDeviceHost(UUID)
         case renameDevice(UUID)
         case removeDevice(UUID)
         case addMac
@@ -172,6 +192,9 @@ struct TitlebarProjectMenuModel: Equatable {
         }
         if entry.state.offersTrustNewIdentity {
             children.append(.item(Item(title: "Trust New Identity…", isEnabled: canModify, action: .trustDeviceIdentity(id))))
+        }
+        if entry.offersHostUpdate {
+            children.append(.item(Item(title: entry.hostUpdateTitle, isEnabled: canModify, action: .updateDeviceHost(id))))
         }
         children.append(.item(Item(title: "Persistent Sessions on \(device.name)…", action: .openDeviceSessions(id))))
         children.append(.separator)

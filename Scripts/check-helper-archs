@@ -1,0 +1,32 @@
+#!/bin/sh
+# Checks that each executable is universal: `lipo -archs` lists arm64 and
+# x86_64. Cherry copies its cherry and cherry-host to the user's other Macs,
+# of either kind (docs/specs/remote-devices.md), so a packaged app must carry
+# both. Scripts/build-host, install-local-app and package-dmg run it.
+#
+#   Scripts/check-helper-archs FILE...
+#
+# Exits 1 naming each file that lacks one, 2 on a usage error.
+set -eu
+[ $# -ge 1 ] || { echo "Usage: Scripts/check-helper-archs FILE..." >&2; exit 2; }
+command -v lipo >/dev/null 2>&1 || { echo "check-helper-archs needs lipo (xcode-select --install)" >&2; exit 2; }
+status=0
+for file in "$@"; do
+  if ! archs=$(lipo -archs "$file" 2>/dev/null); then
+    echo "error: $file is not a Mach-O executable lipo can read" >&2
+    status=1
+    continue
+  fi
+  missing=
+  for required in arm64 x86_64; do
+    case " $archs " in
+      *" $required "*) ;;
+      *) missing="$missing $required" ;;
+    esac
+  done
+  if [ -n "$missing" ]; then
+    echo "error: $file is built for $archs only; it lacks$missing. Build the helpers with Scripts/build-host (universal by default; rustup target add aarch64-apple-darwin x86_64-apple-darwin)." >&2
+    status=1
+  fi
+done
+exit "$status"

@@ -36,6 +36,11 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// already): Remove forgets that host (and its trusted identity) only
     /// then, never a host the user had saved.
     var createdHostEntry: Bool
+    /// The build of the cherry-host this Cherry installed there (its
+    /// `remoteHostPath` is then that build's), for Update Session Host….
+    var installedBuild: String?
+    /// The architecture that install runs as there (`arm64`, `x86_64`).
+    var installedArch: String?
 
     init(
         id: UUID = UUID(),
@@ -48,7 +53,9 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         hiddenProjects: [String] = [],
         lastSeen: Date? = nil,
         hostID: String? = nil,
-        createdHostEntry: Bool = false
+        createdHostEntry: Bool = false,
+        installedBuild: String? = nil,
+        installedArch: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -61,6 +68,8 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         self.lastSeen = lastSeen
         self.hostID = hostID
         self.createdHostEntry = createdHostEntry
+        self.installedBuild = installedBuild
+        self.installedArch = installedArch
     }
 
     init(from decoder: Decoder) throws {
@@ -76,6 +85,14 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         lastSeen = try container.decodeIfPresent(Date.self, forKey: .lastSeen)
         hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
         createdHostEntry = try container.decodeIfPresent(Bool.self, forKey: .createdHostEntry) ?? false
+        installedBuild = try container.decodeIfPresent(String.self, forKey: .installedBuild)
+        installedArch = try container.decodeIfPresent(String.self, forKey: .installedArch)
+    }
+
+    /// Update Session Host… is offered: the cherry-host this Cherry
+    /// installed there is an older build than the one it bundles now.
+    func hostIsOlder(thanBundled bundled: String?) -> Bool {
+        HostBuildOrder.isNewer(bundled, than: installedBuild)
     }
 
     /// Its host, when the destination is valid.
@@ -137,6 +154,14 @@ final class RemoteDeviceStore: ObservableObject {
     private let remoteHostPaths: HostedRemoteHostPaths
     private let makeHosting: HostingFactory
     private var hostings: [UUID: PersistentHostSessions] = [:]
+    /// Marks a device's build directory as used by this installation
+    /// (`RemoteHostInstaller.markScript`): on each connection of its
+    /// control, at most once per `markInterval`. Tests replace it.
+    typealias BuildMarker = @MainActor (_ device: RemoteDevice, _ directoryName: String, _ installationID: UUID) async -> Void
+    private let markBuild: BuildMarker
+    static let markInterval: TimeInterval = 6 * 3_600
+    private var lastMarked: [UUID: (directory: String, at: Date)] = [:]
+    private var connectionWatches: [UUID: AnyCancellable] = [:]
     /// The app's saved-state store: each hosting records the sessions it
     /// ends on purpose, and those its host reports lost, there, and
     /// finishes the ends it could not do while its device was offline.
@@ -151,7 +176,8 @@ final class RemoteDeviceStore: ObservableObject {
         remoteHostPaths: HostedRemoteHostPaths,
         makeHosting: @escaping HostingFactory = { profile, installationID in
             PersistentHostSessions.remote(profile: profile, installationID: installationID)
-        }
+        },
+        markBuild: @escaping BuildMarker = RemoteDeviceStore.markBuildOverSSH
     ) {
         self.fileURL = fileURL
         self.canWrite = canWrite
@@ -160,6 +186,7 @@ final class RemoteDeviceStore: ObservableObject {
         self.registry = registry
         self.remoteHostPaths = remoteHostPaths
         self.makeHosting = makeHosting
+        self.markBuild = markBuild
         devices = Self.load(from: fileURL)
         updateRemoteHostPaths()
     }
@@ -185,6 +212,9 @@ final class RemoteDeviceStore: ObservableObject {
 
     // MARK: Changes
 
+    /// This installation's id (the remote owner), when this copy has one.
+    var currentInstallationID: UUID? { installationID() }
+
     /// Whether this copy may change the devices (it holds the instance
     /// lock): the picker's and sheets' changing items are off otherwise.
     var canModify: Bool { canWrite() }
@@ -202,7 +232,9 @@ final class RemoteDeviceStore: ObservableObject {
         remoteHostPath: String? = nil,
         machineNames: [String] = [],
         homeDirectory: String? = nil,
-        hostID: String? = nil
+        hostID: String? = nil,
+        installedBuild: String? = nil,
+        installedArch: String? = nil
     ) throws -> RemoteDevice {
         guard canWrite() else { throw HostedSessionError.message(Self.readOnlyReason) }
         let host = try HostedSessionHost.ssh(sshDestination)
@@ -225,12 +257,24 @@ final class RemoteDeviceStore: ObservableObject {
             // Saved to the second.
             lastSeen: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
             hostID: hostID?.nilIfEmpty,
-            createdHostEntry: !hostStore.hosts.contains(host)
+            createdHostEntry: !hostStore.hosts.contains(host),
+            installedBuild: installedBuild?.nilIfEmpty,
+            installedArch: installedArch?.nilIfEmpty
         )
         if device.createdHostEntry { try hostStore.add(destination) }
         devices.append(device)
         save()
         return device
+    }
+
+    /// Update Session Host… installed `outcome` there: the device's tabs
+    /// use that cherry-host from their next connection on.
+    func recordInstall(_ outcome: RemoteHostInstaller.Outcome, on id: UUID) {
+        update(id) { device in
+            device.remoteHostPath = outcome.remoteHostPath
+            device.installedBuild = outcome.build
+            device.installedArch = outcome.architecture ?? device.installedArch
+        }
     }
 
     func rename(_ id: UUID, to name: String) {
@@ -247,6 +291,8 @@ final class RemoteDeviceStore: ObservableObject {
         devices.removeAll { $0.id == id }
         // Only a saved host (and trusted identity) Add Mac… made.
         if device.createdHostEntry, let host = device.host { hostStore.remove(host) }
+        connectionWatches.removeValue(forKey: id)
+        lastMarked.removeValue(forKey: id)
         if let hosting = hostings.removeValue(forKey: id), !hosting.isInUse {
             // One still in use stays registered: its windows and ends keep
             // it, and adding the Mac again takes it back.
@@ -318,7 +364,49 @@ final class RemoteDeviceStore: ObservableObject {
         hosting.resumeRecordedEndsOnConnection()
         hostings[id] = hosting
         registry.register(hosting)
+        watchConnections(of: id, control: hosting.control)
         return hosting
+    }
+
+    /// On each connection of the device's control: marks the build
+    /// directory its `remoteHostPath` names as used by this installation,
+    /// so another Mac's install of Cherry never collects it
+    /// (`RemoteHostInstall.garbage`).
+    private func watchConnections(of id: UUID, control: HostControl) {
+        guard connectionWatches[id] == nil else { return }
+        connectionWatches[id] = control.$state
+            .removeDuplicates()
+            .filter { $0 == .connected }
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.markUsedBuild(of: id) }
+            }
+    }
+
+    /// Marks the build directory the device uses now, unless it was marked
+    /// within `markInterval`.
+    func markUsedBuild(of id: UUID, now: Date = Date()) {
+        guard let device = device(id: id),
+              let directory = RemoteHostInstall.directoryName(ofRemoteHostPath: device.remoteHostPath),
+              let installation = installationID()
+        else { return }
+        if let last = lastMarked[id], last.directory == directory, now.timeIntervalSince(last.at) < Self.markInterval { return }
+        lastMarked[id] = (directory, now)
+        let markBuild = markBuild
+        Task { await markBuild(device, directory, installation) }
+    }
+
+    /// Runs `RemoteHostInstaller.markScript` over the device's ssh (its
+    /// master when up).
+    static func markBuildOverSSH(_ device: RemoteDevice, directoryName: String, installationID: UUID) async {
+        var shell = await RemoteDeviceShell.app()
+        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let output = await shell.run(
+            RemoteHostInstaller.markScript(directoryName: directoryName, installationID: installationID),
+            on: device.sshDestination
+        )
+        if RemoteHostInstaller.fields(output)?.contains(where: { $0.key == "marked" }) != true {
+            SessionLog.error("could not mark \(directoryName) on \(device.name) as used: \(output.standardError)")
+        }
     }
 
     /// Registers every device's hosting (at launch, once the store has the
@@ -526,6 +614,8 @@ enum RemoteDeviceConnectionState: Equatable {
     case loginRefused(reason: String)
     /// Its cherry-host speaks another protocol.
     case incompatible(reason: String)
+    /// The cherry-host its path names is not there (removed): Reinstall.
+    case hostMissing(reason: String)
 
     init(control state: HostControl.ConnectionState, sessionCount: Int, lastSeen: Date?) {
         switch state {
@@ -545,6 +635,7 @@ enum RemoteDeviceConnectionState: Equatable {
         if error.isIdentityMismatch { return .identityChanged(reason: reason) }
         if error.isVersionMismatch { return .incompatible(reason: reason) }
         if error.isAuthenticationFailure { return .loginRefused(reason: reason) }
+        if error.isRemoteHostMissing { return .hostMissing(reason: reason) }
         return .offline(reason: reason)
     }
 
@@ -556,7 +647,7 @@ enum RemoteDeviceConnectionState: Equatable {
         switch self {
         case .connected: .green
         case .connecting: .yellow
-        case .identityChanged, .loginRefused, .incompatible: .red
+        case .identityChanged, .loginRefused, .incompatible, .hostMissing: .red
         case .offline, .unknown: .gray
         }
     }
@@ -579,6 +670,8 @@ enum RemoteDeviceConnectionState: Equatable {
             return "SSH login refused"
         case .incompatible:
             return "Needs the same Cherry version"
+        case .hostMissing:
+            return "Its session host is missing"
         }
     }
 
@@ -592,6 +685,7 @@ enum RemoteDeviceConnectionState: Equatable {
         case .identityChanged(let reason): "Identity changed: \(reason)"
         case .loginRefused(let reason): "SSH login refused: \(reason)"
         case .incompatible(let reason): reason
+        case .hostMissing(let reason): "Its session host is missing: \(reason)"
         }
     }
 
@@ -599,7 +693,7 @@ enum RemoteDeviceConnectionState: Equatable {
     var offersReconnect: Bool {
         switch self {
         case .connected, .connecting, .identityChanged: false
-        case .unknown, .offline, .loginRefused, .incompatible: true
+        case .unknown, .offline, .loginRefused, .incompatible, .hostMissing: true
         }
     }
 

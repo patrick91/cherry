@@ -7,43 +7,62 @@ import SwiftUI
 
 // MARK: - Add Mac…
 
-/// Add Mac…'s state: the SSH host typed, the check's checklist, the name.
-/// Phase 1 connects and checks only; nothing is installed.
+/// Add Mac…'s state: the SSH host typed, the check's checklist, what
+/// installing this Cherry's session host there would do, the name, and the
+/// install's progress. With a cherry-host path typed, nothing is installed:
+/// that one is used, as checked.
 @MainActor
 final class AddDeviceModel: ObservableObject {
     @Published var destination = "" {
-        didSet { if destination != oldValue { checklist = nil } }
+        didSet { if destination != oldValue { invalidate() } }
     }
     /// Where cherry-host is on the other Mac, when not on its PATH. A
-    /// change asks for a new check before Add.
+    /// change asks for a new check before Add; with one given, Add uses it
+    /// and installs nothing.
     @Published var remoteHostPath = "" {
-        didSet { if remoteHostPath != oldValue { checklist = nil } }
+        didSet { if remoteHostPath != oldValue { invalidate() } }
     }
     @Published var name = ""
     @Published private(set) var isChecking = false
     @Published private(set) var checklist: RemoteDeviceChecklist?
     @Published private(set) var probe: RemoteDeviceProbeResult?
+    /// What Install & Add would do; nil with a cherry-host path typed.
+    @Published private(set) var installation: RemoteHostInstallDecision?
+    /// The install running now, and what it does.
+    @Published private(set) var installStage: RemoteHostInstaller.Stage?
     @Published var error: String?
+    /// What the install found once its build ran there (a session host the
+    /// check could not see), shown once the Mac is added.
+    @Published private(set) var installWarnings: [String] = []
 
     /// Host aliases from ~/.ssh/config (non-wildcard).
     let aliases: [String]
     private let store: RemoteDeviceStore
     private let shell: @MainActor () async -> RemoteDeviceShell
+    private let helpers: @MainActor () async -> Result<RemoteHostHelpers, HostedSessionError>
     /// Runs `ssh <host>` in a local terminal tab (a host key to accept).
     let openInTerminal: @MainActor (String) -> Void
     private var checkedDestination: String?
     private var checkedHostPath: String?
+    private var loadedHelpers: RemoteHostHelpers?
 
     init(
         store: RemoteDeviceStore = .shared,
         aliases: [String] = SSHConfigHosts.userAliases(),
         shell: @escaping @MainActor () async -> RemoteDeviceShell = { await RemoteDeviceShell.app() },
+        helpers: @escaping @MainActor () async -> Result<RemoteHostHelpers, HostedSessionError> = { await RemoteHostHelpers.app() },
         openInTerminal: @escaping @MainActor (String) -> Void = AddDeviceModel.openLocalTerminal
     ) {
         self.store = store
         self.aliases = aliases
         self.shell = shell
+        self.helpers = helpers
         self.openInTerminal = openInTerminal
+    }
+
+    private func invalidate() {
+        checklist = nil
+        installation = nil
     }
 
     var suggestions: [String] {
@@ -60,11 +79,18 @@ final class AddDeviceModel: ObservableObject {
         remoteHostPath.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    var isInstalling: Bool { installStage != nil }
+
     /// Only what was checked, as it was checked, by the copy that keeps
     /// the devices.
     var canAdd: Bool {
         checklist?.canAdd == true && checkedDestination == trimmedDestination && checkedHostPath == trimmedHostPath
-            && !isChecking && store.canModify && !isAliasOfAddedMac
+            && !isChecking && !isInstalling && store.canModify && !isAliasOfAddedMac
+    }
+
+    /// The primary button: Install & Add, Update & Add, or Add.
+    var primaryTitle: String {
+        installation?.plan?.addTitle ?? "Add"
     }
 
     /// The check found the daemon of a Mac already added (another alias).
@@ -72,10 +98,11 @@ final class AddDeviceModel: ObservableObject {
         probe?.hostStatus?.host_id.map { store.device(withHostID: $0) != nil } ?? false
     }
 
-    /// Reaches the host (BatchMode) and checks it.
+    /// Reaches the host (BatchMode) and checks it, and decides what Install
+    /// & Add would do there.
     func check() async {
         let destination = trimmedDestination
-        guard !destination.isEmpty else { return }
+        guard !destination.isEmpty, !isInstalling else { return }
         do {
             _ = try HostedSessionHost.ssh(destination)
         } catch {
@@ -94,8 +121,20 @@ final class AddDeviceModel: ObservableObject {
             destination: destination, remoteHostPath: hostPath.nilIfEmpty, shell: await shell()
         )
         guard trimmedDestination == destination, trimmedHostPath == hostPath else { return }
+        var decision: RemoteHostInstallDecision?
+        if hostPath.isEmpty, result.sshFailure == nil, result.isMac {
+            let helpers = await helpers()
+            if case .success(let loaded) = helpers { loadedHelpers = loaded }
+            decision = RemoteHostInstall.decide(
+                probe: result,
+                helpers: helpers,
+                machine: result.computerName ?? destination
+            )
+        }
+        guard trimmedDestination == destination, trimmedHostPath == hostPath else { return }
         probe = result
-        let checklist = RemoteDeviceChecklist(result: result, destination: destination)
+        installation = decision
+        let checklist = RemoteDeviceChecklist(result: result, destination: destination, installation: decision)
         self.checklist = checklist
         checkedDestination = destination
         checkedHostPath = hostPath
@@ -110,18 +149,60 @@ final class AddDeviceModel: ObservableObject {
         }
     }
 
+    /// Installs this Cherry's session host there when the check said so
+    /// (Install & Add, Update & Add), then adds the Mac with it; nil (with
+    /// `error`) when either could not be done.
+    func addInstallingIfNeeded() async -> RemoteDevice? {
+        guard canAdd, let probe else { return nil }
+        let destination = trimmedDestination
+        guard let plan = installation?.plan, let helpers = loadedHelpers else { return add() }
+        error = nil
+        installStage = .copying
+        let installer = RemoteHostInstaller(
+            shell: await shellForInstall(destination: destination), helpers: helpers,
+            installationID: store.currentInstallationID
+        )
+        let outcome: RemoteHostInstaller.Outcome
+        do {
+            outcome = try await installer.install(
+                plan, on: destination, machine: probe.computerName ?? destination,
+                progress: { [weak self] stage in self?.installStage = stage }
+            )
+            installStage = nil
+        } catch {
+            installStage = nil
+            self.error = error.localizedDescription
+            return nil
+        }
+        guard trimmedDestination == destination else { return nil }
+        installWarnings = outcome.warnings
+        return add(installed: outcome)
+    }
+
+    /// The check's shell, through the destination's SSH master when one is
+    /// up.
+    private func shellForInstall(destination: String) async -> RemoteDeviceShell {
+        var shell = await shell()
+        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: destination)
+        return shell
+    }
+
     /// Adds the checked Mac; nil (with `error`) when it could not be.
+    /// `installed`: what Install & Add put there.
     @discardableResult
-    func add() -> RemoteDevice? {
+    func add(installed: RemoteHostInstaller.Outcome? = nil) -> RemoteDevice? {
         guard canAdd, let probe else { return nil }
         do {
             return try store.add(
                 name: name.trimmingCharacters(in: .whitespaces).nilIfEmpty ?? checklist?.suggestedName ?? trimmedDestination,
                 sshDestination: trimmedDestination,
-                remoteHostPath: trimmedHostPath.nilIfEmpty ?? Self.remoteHostPath(found: probe.hostPath, home: probe.homeDirectory),
+                remoteHostPath: installed?.remoteHostPath ?? trimmedHostPath.nilIfEmpty
+                    ?? Self.remoteHostPath(found: probe.hostPath, home: probe.homeDirectory),
                 machineNames: probe.machineNames,
                 homeDirectory: probe.homeDirectory,
-                hostID: probe.hostStatus?.host_id
+                hostID: probe.hostStatus?.host_id,
+                installedBuild: installed?.build,
+                installedArch: installed?.architecture
             )
         } catch {
             self.error = error.localizedDescription
@@ -133,8 +214,12 @@ final class AddDeviceModel: ObservableObject {
     /// known install place (not on PATH), as `~/…` under its home.
     nonisolated static func remoteHostPath(found: String?, home: String?) -> String? {
         guard let found = found?.nilIfEmpty else { return nil }
-        let known = ["/Library/Application Support/Cherry/bin/cherry-host", "/Applications/Cherry.app/Contents/MacOS/cherry-host"]
-        guard known.contains(where: { found.hasSuffix($0) }) else { return nil }
+        let known = [
+            "/Library/Application Support/Cherry/bin/cherry-host",
+            "/Applications/Cherry.app/Contents/MacOS/cherry-host",
+        ]
+        let isOurInstall = found.contains("/\(RemoteHostInstall.rootRelativePath)/") && found.hasSuffix("/cherry-host")
+        guard isOurInstall || known.contains(where: { found.hasSuffix($0) }) else { return nil }
         if let home = home?.nilIfEmpty, found.hasPrefix(home + "/") {
             return "~/" + found.dropFirst(home.count + 1)
         }
@@ -174,7 +259,7 @@ struct AddDeviceSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Add Mac").font(.title2.weight(.semibold))
-                Text("Cherry reaches your other Mac over SSH, with key-based login (no passwords) and Remote Login turned on there. Projects you open on it run their tabs there.")
+                Text("Cherry reaches your other Mac over SSH, with key-based login (no passwords) and Remote Login turned on there, and installs its session host there (in ~/Library/Application Support/cherry-host). Projects you open on it run their tabs there.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -184,8 +269,9 @@ struct AddDeviceSheet: View {
                     TextField("SSH host (an alias from ~/.ssh/config, or user@host)", text: $model.destination)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { Task { await model.check() } }
+                        .disabled(model.isInstalling)
                     Button("Check") { Task { await model.check() } }
-                        .disabled(model.trimmedDestination.isEmpty || model.isChecking)
+                        .disabled(model.trimmedDestination.isEmpty || model.isChecking || model.isInstalling)
                     if model.isChecking { ProgressView().controlSize(.small) }
                 }
                 if !model.suggestions.isEmpty, model.checklist == nil {
@@ -199,9 +285,10 @@ struct AddDeviceSheet: View {
                         }
                     }
                 }
-                TextField("cherry-host on that Mac (optional; ~/… or an absolute path)", text: $model.remoteHostPath)
+                TextField("cherry-host on that Mac (optional: use it instead of installing this Cherry's)", text: $model.remoteHostPath)
                     .textFieldStyle(.roundedBorder)
                     .font(.callout)
+                    .disabled(model.isInstalling)
             }
 
             if let error = model.error {
@@ -242,17 +329,34 @@ struct AddDeviceSheet: View {
                     Text("Name")
                     TextField("Name", text: $model.name)
                         .textFieldStyle(.roundedBorder)
+                        .disabled(model.isInstalling)
                 }
             }
 
             HStack {
+                if let stage = model.installStage {
+                    ProgressView().controlSize(.small)
+                    Text(stage.text)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Add") {
-                    if let device = model.add() {
-                        dismiss()
-                        didAdd(device)
+                    .disabled(model.isInstalling)
+                Button(model.primaryTitle) {
+                    Task {
+                        if let device = await model.addInstallingIfNeeded() {
+                            let warnings = model.installWarnings
+                            dismiss()
+                            didAdd(device)
+                            if !warnings.isEmpty {
+                                let alert = NSAlert()
+                                alert.messageText = "Added \(device.name)"
+                                alert.informativeText = warnings.joined(separator: "\n\n")
+                                alert.runModal()
+                            }
+                        }
                     }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -277,6 +381,248 @@ struct AddDeviceSheet: View {
         case .warning: .orange
         case .failure: .red
         }
+    }
+}
+
+// MARK: - Update Session Host…
+
+/// A device's Update Session Host…: checks the Mac as Add Mac… does, says
+/// what installing this Cherry's session host there would do, and does it,
+/// then points the device at it (its tabs use it from their next
+/// connection; a daemon of an older protocol is replaced by the first one).
+@MainActor
+final class UpdateDeviceHostModel: ObservableObject {
+    let deviceID: UUID
+    @Published private(set) var isChecking = false
+    @Published private(set) var probe: RemoteDeviceProbeResult?
+    @Published private(set) var installation: RemoteHostInstallDecision?
+    @Published private(set) var installStage: RemoteHostInstaller.Stage?
+    @Published private(set) var outcome: RemoteHostInstaller.Outcome?
+    @Published var error: String?
+
+    private let store: RemoteDeviceStore
+    private let shell: @MainActor () async -> RemoteDeviceShell
+    private let helpers: @MainActor () async -> Result<RemoteHostHelpers, HostedSessionError>
+    private let masters: HostSSHMasterManager
+    /// Connects the device's control again once its host changed.
+    private let reconnect: @MainActor (RemoteDevice) -> Void
+    private var loadedHelpers: RemoteHostHelpers?
+
+    init(
+        deviceID: UUID,
+        store: RemoteDeviceStore = .shared,
+        shell: @escaping @MainActor () async -> RemoteDeviceShell = { await RemoteDeviceShell.app() },
+        helpers: @escaping @MainActor () async -> Result<RemoteHostHelpers, HostedSessionError> = { await RemoteHostHelpers.app() },
+        masters: HostSSHMasterManager = .shared,
+        reconnect: @escaping @MainActor (RemoteDevice) -> Void = UpdateDeviceHostModel.reconnectControl
+    ) {
+        self.deviceID = deviceID
+        self.store = store
+        self.shell = shell
+        self.helpers = helpers
+        self.masters = masters
+        self.reconnect = reconnect
+    }
+
+    var device: RemoteDevice? { store.device(id: deviceID) }
+    var isInstalling: Bool { installStage != nil }
+
+    var canInstall: Bool {
+        installation?.plan != nil && !isChecking && !isInstalling && outcome == nil && store.canModify
+    }
+
+    var primaryTitle: String {
+        installation?.plan?.updateTitle ?? "Update"
+    }
+
+    /// Checks the Mac with its own cherry-host path left out, so the check
+    /// sees every install and the daemon, not only the one it uses now.
+    func check() async {
+        guard let device, !isInstalling else { return }
+        error = nil
+        outcome = nil
+        isChecking = true
+        defer { isChecking = false }
+        var shell = await shell()
+        shell.controlPath = masters.controlPathIfUp(for: device.sshDestination)
+        // The build it uses now is marked as used (the check counts as a use).
+        let marker = RemoteHostInstall.directoryName(ofRemoteHostPath: device.remoteHostPath)
+            .flatMap { directory in store.currentInstallationID.map { (directoryName: directory, installationID: $0) } }
+        let result = await RemoteDeviceProbe.run(
+            destination: device.sshDestination, remoteHostPath: nil, marker: marker, shell: shell
+        )
+        let helpers = await helpers()
+        if case .success(let loaded) = helpers { loadedHelpers = loaded }
+        probe = result
+        let decision = RemoteHostInstall.decide(probe: result, helpers: helpers, machine: device.name)
+        installation = decision
+        if case .blocked(let reason, _) = decision { error = reason }
+        if !store.canModify { error = RemoteDeviceStore.readOnlyReason }
+    }
+
+    /// Installs it and points the device at it.
+    func install() async {
+        guard canInstall, let device, let plan = installation?.plan, let helpers = loadedHelpers else { return }
+        error = nil
+        installStage = .copying
+        defer { installStage = nil }
+        var shell = await shell()
+        shell.controlPath = masters.controlPathIfUp(for: device.sshDestination)
+        do {
+            let outcome = try await RemoteHostInstaller(
+                shell: shell, helpers: helpers, installationID: store.currentInstallationID
+            ).install(
+                plan, on: device.sshDestination, machine: device.name,
+                progress: { [weak self] stage in self?.installStage = stage }
+            )
+            store.recordInstall(outcome, on: deviceID)
+            self.outcome = outcome
+            if let updated = store.device(id: deviceID) { reconnect(updated) }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// What the plan will do, for the sheet.
+    var summary: [String] {
+        guard let device else { return [] }
+        switch installation {
+        case .install(let plan)?:
+            var lines: [String] = []
+            let place = "~/\(RemoteHostInstall.rootRelativePath)/\(plan.directoryName)"
+            lines.append(plan.copyNeeded
+                ? "Copies this Cherry's cherry and cherry-host to \(place) on \(device.name) and uses them from the next connection."
+                : "This Cherry's cherry and cherry-host are already at \(place) on \(device.name); the device uses them from the next connection.")
+            switch plan.daemon {
+            case .absent: lines.append("No session host runs there now; the first tab starts one.")
+            case .sameProtocol(_, let newer):
+                lines.append(newer
+                    ? "Its session host is a newer build and keeps running; this one relays to it."
+                    : "Its session host keeps its sessions. When it runs an older install of this Cherry's, it moves to this build (`cherry restart`), and its sessions carry on.")
+            case .olderProtocol(let version):
+                lines.append("Its session host speaks protocol \(version): the next connection replaces it, and its sessions carry on.")
+            case .unknown(let reason):
+                lines.append("Its session host did not answer (\(reason)).")
+            }
+            return lines + plan.warnings
+        case .blocked(let reason, _)?:
+            return [reason]
+        case nil:
+            return []
+        }
+    }
+
+    /// Connects the device's control connection again when it is not
+    /// connected (another protocol answered, or it gave up).
+    static func reconnectControl(_ device: RemoteDevice) {
+        guard let host = device.host else { return }
+        let control = HostControlRegistry.shared.control(for: host)
+        switch control.state {
+        case .connected, .connecting:
+            return
+        case .waitingToReconnect:
+            control.reconnectNow()
+        case .idle, .failed:
+            Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
+        }
+    }
+}
+
+struct UpdateDeviceHostSheet: View {
+    @StateObject var model: UpdateDeviceHostModel
+    let close: () -> Void
+
+    var body: some View {
+        let name = model.device?.name ?? "Mac"
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Update Session Host on \(name)").font(.title2.weight(.semibold))
+            if model.isChecking {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Checking \(name)…").foregroundStyle(.secondary)
+                }
+            } else if let outcome = model.outcome {
+                Label(
+                    outcome.handedOver
+                        ? "Installed build \(outcome.build); its session host moved to it, and its sessions carry on."
+                        : "\(name) now uses build \(outcome.build)\(outcome.copied ? "" : " (already there)").",
+                    systemImage: "checkmark.circle.fill"
+                )
+                .foregroundStyle(.green)
+                .fixedSize(horizontal: false, vertical: true)
+                ForEach(Array(outcome.warnings.enumerated()), id: \.offset) { _, warning in
+                    Text(warning).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(model.summary.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if let error = model.error, model.outcome == nil {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if let stage = model.installStage {
+                    ProgressView().controlSize(.small)
+                    Text(stage.text).font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.outcome != nil {
+                    Button("Done") { close() }.keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel") { close() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(model.isInstalling)
+                    Button(model.primaryTitle) { Task { await model.install() } }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!model.canInstall)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .task { await model.check() }
+    }
+}
+
+/// Shows Update Session Host… for a device as a sheet on the key window
+/// (the device menu, and the Update… of a tab's or window's bar).
+@MainActor
+enum RemoteDeviceUpdatePresenter {
+    static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
+        guard store.device(id: deviceID) != nil else { return }
+        let panel = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+            styleMask: [.titled], backing: .buffered, defer: true
+        )
+        weak let weakPanel = panel
+        let close = {
+            guard let panel = weakPanel else { return }
+            if let parent = panel.sheetParent { parent.endSheet(panel) } else { panel.close() }
+        }
+        panel.contentViewController = NSHostingController(
+            rootView: UpdateDeviceHostSheet(model: UpdateDeviceHostModel(deviceID: deviceID, store: store), close: close)
+        )
+        if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
+            parent.beginSheet(panel)
+        } else {
+            panel.center()
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// The device a hosting runs on.
+    static func deviceID(for host: HostedSessionHost, store: RemoteDeviceStore = .shared) -> UUID? {
+        store.devices.first { $0.host == host }?.id
     }
 }
 
@@ -402,12 +748,14 @@ enum RemoteDeviceAvailability: Equatable {
     case identityChanged(String)
     /// Its cherry-host speaks another protocol: nothing retries.
     case incompatible(String)
+    /// The cherry-host its path names is not there: Reinstall.
+    case hostMissing(String)
     /// This app cannot reach it at all (no helper, a device no longer
     /// known), or it failed with nothing retrying: Check Again.
     case unavailable(String)
 
     enum Action: Equatable {
-        case reconnectNow, retryLogin, trustNewIdentity, update, checkAgain
+        case reconnectNow, retryLogin, trustNewIdentity, update, reinstall, checkAgain
     }
 
     static func of(_ state: HostControl.ConnectionState, installationProblem: String?) -> Self {
@@ -418,9 +766,11 @@ enum RemoteDeviceAvailability: Equatable {
         case .idle, .connecting:
             return .reconnecting
         case .waitingToReconnect(let error):
+            if error.isRemoteHostMissing { return .hostMissing(error.errorDescription ?? "") }
             return error.isAuthenticationFailure ? .loginRefused(error.errorDescription ?? "") : .reconnecting
         case .failed(let error):
             let reason = error.errorDescription ?? ""
+            if error.isRemoteHostMissing { return .hostMissing(reason) }
             if error.isIdentityMismatch { return .identityChanged(reason) }
             if error.isVersionMismatch { return .incompatible(reason) }
             if error.isAuthenticationFailure { return .loginRefused(reason) }
@@ -435,6 +785,7 @@ enum RemoteDeviceAvailability: Equatable {
         case .loginRefused: "\(machine) refused the SSH login"
         case .identityChanged: "Another identity answers for \(machine)"
         case .incompatible: "\(machine)'s session host speaks another protocol"
+        case .hostMissing: "\(machine)'s session host is missing"
         case .unavailable(let reason): reason.isEmpty ? "\(machine) cannot be reached" : reason
         }
     }
@@ -442,7 +793,7 @@ enum RemoteDeviceAvailability: Equatable {
     var detail: String? {
         switch self {
         case .online, .reconnecting: nil
-        case .loginRefused(let reason), .identityChanged(let reason), .incompatible(let reason): reason
+        case .loginRefused(let reason), .identityChanged(let reason), .incompatible(let reason), .hostMissing(let reason): reason
         case .unavailable: nil
         }
     }
@@ -454,6 +805,7 @@ enum RemoteDeviceAvailability: Equatable {
         case .loginRefused: .retryLogin
         case .identityChanged: .trustNewIdentity
         case .incompatible: .update
+        case .hostMissing: .reinstall
         case .unavailable: .checkAgain
         }
     }
@@ -464,6 +816,7 @@ enum RemoteDeviceAvailability: Equatable {
         case .retryLogin: "Retry"
         case .trustNewIdentity: "Trust New Identity…"
         case .update: "Update…"
+        case .reinstall: "Reinstall…"
         case .checkAgain: "Check Again"
         case nil: nil
         }
@@ -481,12 +834,18 @@ enum RemoteDeviceAvailability: Equatable {
             }
         case .trustNewIdentity:
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: hosting.profile.host, name: hosting.profile.displayName)
-        case .update:
-            let alert = NSAlert()
-            alert.messageText = "Use the same Cherry on both Macs"
-            alert.informativeText = "The session host on \(hosting.profile.displayName) speaks another protocol than this Cherry. Update the older Cherry, or "
-                + RemoteDeviceChecklist.manualInstallInstructions(destination: hosting.profile.host.sshDestination ?? "")
-            alert.runModal()
+        case .update, .reinstall:
+            // Update Session Host…: it checks which side is older and
+            // installs this Cherry's there, or says to update this Cherry.
+            if let deviceID = RemoteDeviceUpdatePresenter.deviceID(for: hosting.profile.host) {
+                RemoteDeviceUpdatePresenter.present(deviceID: deviceID)
+            } else {
+                let alert = NSAlert()
+                alert.messageText = "Use the same Cherry on both Macs"
+                alert.informativeText = "The session host on \(hosting.profile.displayName) speaks another protocol than this Cherry. "
+                    + RemoteDeviceChecklist.manualInstallInstructions(destination: hosting.profile.host.sshDestination ?? "")
+                alert.runModal()
+            }
         case .checkAgain:
             hosting.refreshStatus()
             if hosting.installationProblem() == nil {

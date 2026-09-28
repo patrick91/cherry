@@ -2,6 +2,16 @@
 # Build the native cherry and cherry-host executables. CHERRY_BUILD_ID, when
 # set, is the build they report (Host/crates/cherry-protocol/build.rs);
 # otherwise the checked-out commit's time and revision.
+#
+# On macOS they are universal (arm64 and x86_64), because Cherry copies them
+# to the user's other Macs, of either kind (docs/specs/remote-devices.md):
+# each architecture is built with its own Rust target and libghostty-vt,
+# joined with lipo, and signed (ad hoc, or CHERRY_CODESIGN_IDENTITY).
+# CHERRY_HOST_ARCHS=native builds for this Mac's architecture only, and says
+# so; such helpers cannot be installed on a Mac of the other kind, and
+# Scripts/package-dmg refuses them. A missing toolchain for an architecture
+# stops the build with what to install; it never falls back to one.
+# Elsewhere (Linux) they are built for the machine's own target, as before.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 configuration=${1:-release}
@@ -10,16 +20,61 @@ if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; the
   echo "Scripts/build-host needs Rust (cargo and rustc); install it from https://rustup.rs" >&2
   exit 1
 fi
-target=$(rustc -vV | sed -n 's/^host: //p')
+host_target=$(rustc -vV | sed -n 's/^host: //p')
 
 # Cargo's own precedence for the output directory. Passing it explicitly keeps
 # a build.target-dir from a Cargo config file from moving the executables away
 # from where callers (install-local-app, package-host) copy them.
 target_dir=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/Host/target}}
 case "$target_dir" in /*) ;; *) target_dir="$PWD/$target_dir" ;; esac
-# The helpers are always native. A build target would move them into
-# <target dir>/<triple>/, and the VT library is only built for the host.
+# The targets are chosen here. A build target from the environment would move
+# the executables of a plain build into <target dir>/<triple>/.
 unset CARGO_BUILD_TARGET
+
+case "$host_target" in
+  *-apple-darwin)
+    universal=1
+    case "${CHERRY_HOST_ARCHS:-universal}" in
+      universal) targets="aarch64-apple-darwin x86_64-apple-darwin" ;;
+      native)
+        targets=$host_target
+        echo "note: building the helpers for $host_target only (CHERRY_HOST_ARCHS=native); Cherry cannot install them on a Mac of the other architecture" >&2
+        ;;
+      *) echo "CHERRY_HOST_ARCHS must be universal or native, not '${CHERRY_HOST_ARCHS}'" >&2; exit 1 ;;
+    esac
+    ;;
+  *)
+    universal=0
+    targets=$host_target
+    ;;
+esac
+
+# Every toolchain first, so a missing one stops before a long build.
+if [ "$universal" = 1 ]; then
+  for tool in lipo codesign; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "Scripts/build-host needs $tool (the Xcode Command Line Tools: xcode-select --install)" >&2
+      exit 1
+    fi
+  done
+  for target in $targets; do
+    libdir=$(rustc --print target-libdir --target "$target" 2>/dev/null || true)
+    if [ -z "$libdir" ] || ! ls "$libdir"/libstd-*.rlib >/dev/null 2>&1; then
+      {
+        echo "The Rust standard library for $target is not installed, so the helpers cannot be built for it."
+        echo "Install it with:"
+        echo "  rustup target add $target"
+        echo "or build for this Mac's architecture only (such helpers cannot be installed on a Mac of the other kind):"
+        echo "  CHERRY_HOST_ARCHS=native Scripts/build-host $configuration"
+      } >&2
+      exit 1
+    fi
+  done
+  if [ -n "${CHERRY_GHOSTTY_VT_DIR:-}" ] && [ "$targets" != "$host_target" ]; then
+    echo "CHERRY_GHOSTTY_VT_DIR names one architecture's libghostty-vt; use it with CHERRY_HOST_ARCHS=native" >&2
+    exit 1
+  fi
+fi
 
 # Rebuild the VT library when it is missing or was built from another revision
 # or optimize level; cherry-vt's build script refuses a mismatched archive.
@@ -30,28 +85,74 @@ if [ -z "${CHERRY_GHOSTTY_VT_DIR:-}" ]; then
     echo "Could not read the pinned revision and optimize level from Scripts/build-host-vt" >&2
     exit 1
   fi
-  prefix="$root/Host/vendor/ghostty-vt/$target"
-  if [ ! -f "$prefix/lib/libghostty-vt.a" ] \
-    || [ "$(cat "$prefix/SOURCE_REVISION" 2>/dev/null)" != "$revision" ] \
-    || [ "$(cat "$prefix/OPTIMIZE" 2>/dev/null)" != "$optimize" ]; then
-    "$root/Scripts/build-host-vt" "$target"
-  fi
+  for target in $targets; do
+    prefix="$root/Host/vendor/ghostty-vt/$target"
+    if [ ! -f "$prefix/lib/libghostty-vt.a" ] \
+      || [ "$(cat "$prefix/SOURCE_REVISION" 2>/dev/null)" != "$revision" ] \
+      || [ "$(cat "$prefix/OPTIMIZE" 2>/dev/null)" != "$optimize" ]; then
+      "$root/Scripts/build-host-vt" "$target"
+    fi
+  done
 fi
 
-# Cargo links fresh copies of the executables into <target dir>/<cfg>/ on
-# every build, even when nothing changed. Removing them first means the check
-# below only passes for executables this build produced; a build.target in a
+cargo_build() {
+  if [ "$configuration" = release ]; then
+    cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --release --bins "$@"
+  else
+    cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --bins "$@"
+  fi
+}
+
+# Cargo links fresh copies of the executables into their output directory on
+# every build, even when nothing changed. Removing them first means the checks
+# below only pass for executables this build produced; a build.target in a
 # Cargo config file would otherwise leave stale ones there for callers to copy.
 rm -f "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"
-if [ "$configuration" = release ]; then
-  cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --release --bins
-else
-  cargo build --manifest-path "$root/Host/Cargo.toml" --target-dir "$target_dir" --locked --bins
+
+if [ "$universal" = 0 ]; then
+  cargo_build
+  for binary in cherry cherry-host; do
+    if [ ! -x "$target_dir/$configuration/$binary" ]; then
+      echo "Cargo did not produce $target_dir/$configuration/$binary; remove any build.target setting from your Cargo config" >&2
+      exit 1
+    fi
+  done
+  printf 'Built %s and %s\n' "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"
+  exit 0
 fi
+
+for target in $targets; do
+  rm -f "$target_dir/$target/$configuration/cherry" "$target_dir/$target/$configuration/cherry-host"
+  cargo_build --target "$target"
+  for binary in cherry cherry-host; do
+    if [ ! -x "$target_dir/$target/$configuration/$binary" ]; then
+      echo "Cargo did not produce $target_dir/$target/$configuration/$binary" >&2
+      exit 1
+    fi
+  done
+done
+
+# Join the architectures and sign the result, then move it into place: a
+# rename never changes the pages of a copy that runs now (a daemon or holder
+# started from here), which macOS would kill for an invalid signature.
+mkdir -p "$target_dir/$configuration"
+identity=${CHERRY_CODESIGN_IDENTITY:--}
 for binary in cherry cherry-host; do
-  if [ ! -x "$target_dir/$configuration/$binary" ]; then
-    echo "Cargo did not produce $target_dir/$configuration/$binary; remove any build.target setting from your Cargo config" >&2
+  output="$target_dir/$configuration/$binary"
+  staged="$output.universal-$$"
+  inputs=()
+  for target in $targets; do inputs+=("$target_dir/$target/$configuration/$binary"); done
+  lipo -create -output "$staged" "${inputs[@]}"
+  # Quiet unless it fails ("replacing existing signature" is the linker's).
+  if ! signed=$(codesign --force --sign "$identity" "$staged" 2>&1); then
+    printf '%s\n' "$signed" >&2
+    rm -f "$staged"
     exit 1
   fi
+  mv -f "$staged" "$output"
 done
-printf 'Built %s and %s\n' "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"
+if [ "${CHERRY_HOST_ARCHS:-universal}" = universal ]; then
+  "$root/Scripts/check-helper-archs" "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host"
+fi
+printf 'Built %s and %s (%s)\n' "$target_dir/$configuration/cherry" "$target_dir/$configuration/cherry-host" \
+  "$(lipo -archs "$target_dir/$configuration/cherry-host")"

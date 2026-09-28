@@ -140,9 +140,32 @@ not trust yet offers **Open in Terminal**, which runs `ssh <host>` in a tab
 on this Mac; a refused login says how to set up keys), the Mac's name,
 macOS version and architecture, whether its `cherry-host` speaks this
 Cherry's protocol, and whether programs started over SSH there lack Full
-Disk Access or a keychain. Cherry does not install anything there yet: when
-`cherry-host` is missing or of another protocol, the check says how to copy
-this Cherry's helpers there (an installer is coming). Name it and **Add**.
+Disk Access or a keychain. It then says what it will do about the session
+host there, and the button says it too: **Install & Add** copies this
+Cherry's `cherry` and `cherry-host` (universal, so for Apple silicon and
+Intel Macs alike) to `~/Library/Application Support/cherry-host/bin/<build>/`
+on that Mac, checks the copy there (its signature, that it runs, its
+SHA-256) and uses it; **Update & Add** does the same over an older install;
+**Add** when the same files are already there, or when you gave the path of
+a `cherry-host` to use instead. Nothing needs `sudo` or a `PATH` change.
+
+If that Mac runs its own Cherry, both share its session host. When it runs a
+session host of this protocol, Cherry installs its own and relays to it;
+when an older one (Cherry there is older), Cherry says so, installs its own,
+and the first connection replaces that host while its sessions carry on
+(update Cherry there too). A session host newer than this Cherry is never
+replaced: update Cherry on this Mac. A very old one (before protocol 4)
+cannot make way, and the check says how to stop it. Later, **Update Session
+Host…** in that Mac's submenu (offered when this Cherry bundles a newer
+build, or its host speaks another protocol; the **Update…** of an offline
+tab's bar opens it too) installs this Cherry's current build the same way;
+when the session host there runs an older install of Cherry's own, it moves
+to the new build and its sessions carry on. Cherry keeps the current build
+and the two before it there, and any build something runs from, that was
+installed this week, or that a Cherry (on any of your Macs) used in the last
+30 days; it removes the rest. A damaged install is repaired. If the session
+host a Mac uses is gone anyway, its menu says so and offers **Reinstall
+Session Host…**.
 
 Each Mac's submenu, with a status dot and a subtitle, lists its projects:
 the folders its sessions belong to (this Cherry's, that Mac's own Cherry's,
@@ -235,8 +258,13 @@ command-line tools. The first build also needs network access:
 `Scripts/build-host-vt` downloads a checksum-pinned Zig 0.16.0 and fetches a
 pinned Ghostty revision, and Cargo fetches crates. Later builds reuse them.
 The helpers are built into `CARGO_TARGET_DIR` (or `CARGO_BUILD_TARGET_DIR`)
-when set, otherwise `Host/target`. To install without the helpers, and without
-Rust:
+when set, otherwise `Host/target`. They are universal (arm64 and x86_64),
+since Cherry installs them on your other Macs, so Rust needs both macOS
+targets (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`; the
+build says so when one is missing). `CHERRY_HOST_ARCHS=native` builds them
+for this Mac only; the installer then warns that this copy cannot install
+its session host on a Mac of the other kind, and `Scripts/package-dmg`
+refuses such helpers. To install without the helpers, and without Rust:
 
 ```bash
 CHERRY_SKIP_HOST=1 Scripts/install-local-app

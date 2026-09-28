@@ -1571,10 +1571,47 @@ fn restart_replaces_the_daemon_and_keeps_its_running_sessions() {
     assert!(stderr.contains("refusing to restart"), "{stderr}");
     assert!(host.child.try_wait().unwrap().is_none());
     assert_eq!(daemons(&host), [host.child.id() as i32]);
-    // The new daemon is this build's, with the test's private state.
+    // A conditional restart that names another daemon leaves this one
+    // running (exit 4), on the connection that checked it.
+    let status = host.json(&["status", "--json"]);
+    let pid = status["host"]["pid"].as_u64().unwrap().to_string();
+    let executable = status["host"]["executable"].as_str().unwrap().to_owned();
+    let build = status["host"]["build"].as_str().unwrap().to_owned();
+    for (option, value) in [
+        ("--if-pid", "1"),
+        ("--if-executable", "/nonexistent/cherry-host"),
+        ("--if-build", "20000101000000.other"),
+    ] {
+        let unmet = host
+            .command()
+            .args(["restart", option, value])
+            .env("CHERRY_HOST_PATH", host_binary())
+            .env("HOME", &host.home)
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert_eq!(unmet.status.code(), Some(4), "{option}");
+        assert!(
+            String::from_utf8_lossy(&unmet.stderr).contains("keeps running"),
+            "{}",
+            String::from_utf8_lossy(&unmet.stderr)
+        );
+        assert!(host.child.try_wait().unwrap().is_none());
+        assert_eq!(daemons(&host), [host.child.id() as i32]);
+    }
+    // The new daemon is this build's, with the test's private state; the
+    // conditions name the daemon that runs.
     let output = host
         .command()
-        .arg("restart")
+        .args([
+            "restart",
+            "--if-pid",
+            &pid,
+            "--if-executable",
+            &executable,
+            "--if-build",
+            &build,
+        ])
         .env("CHERRY_HOST_PATH", host_binary())
         .env("HOME", &host.home)
         .env_remove("XDG_STATE_HOME")

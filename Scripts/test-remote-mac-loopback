@@ -3,10 +3,11 @@
 # Mac, without admin rights: a private sshd on 127.0.0.1, run as you, with its
 # own host key, authorized key and config under a temporary directory.
 #
-#   Scripts/test-remote-mac-loopback
+#   Scripts/test-remote-mac-loopback [--skip-build] [--no-install]
 #
 # It needs /usr/sbin/sshd (it runs as you; no Remote Login setting changes)
-# and the debug helpers (Scripts/build-host debug, or CARGO_TARGET_DIR).
+# and the debug helpers (Scripts/build-host debug, or CARGO_TARGET_DIR), and
+# for the install check the Swift tests (built first unless --skip-build).
 #
 # Nothing of yours is used or changed:
 # - ssh always runs with `-F` and a private config (its own key, known_hosts
@@ -21,10 +22,28 @@
 #
 # It checks what the app does over SSH for a device: a BatchMode login, the
 # Add Mac check (`cherry-host version --json` and `status --json` through
-# `sh -s`), and sessions created, listed and ended through `cherry --host`,
-# with and without --remote-host-path. Exits 2 when sshd cannot run here
-# (then use Scripts/fake-remote-mac, which the Swift tests use).
+# `sh -s`), sessions created, listed and ended through `cherry --host`, with
+# and without --remote-host-path, and (unless --no-install) Install & Add's
+# copy: the app's installer (the Swift test
+# RemoteDeviceRealHostInstallRunsTheRealCopyOverSSH, pointed at this sshd)
+# sends this Cherry's cherry and cherry-host as a tar stream into the
+# private home, runs xattr -c, codesign --verify --strict and cherry-host
+# version --json there, checks the hashes, skips a second copy of the same
+# files; then `cherry --host` runs the installed cherry-host's gateway.
+# Exits 2 when sshd cannot run here (then use Scripts/fake-remote-mac, which
+# the Swift tests use).
 set -euo pipefail
+
+build=1
+install=1
+for argument in "$@"; do
+  case "$argument" in
+    --skip-build) build=0 ;;
+    --no-install) install=0 ;;
+    *) echo "Usage: Scripts/test-remote-mac-loopback [--skip-build] [--no-install]" >&2; exit 2 ;;
+  esac
+done
+original_path=$PATH
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 binaries=${CHERRY_FAKE_REMOTE_BIN:-${CARGO_TARGET_DIR:-$root/Host/target}/debug}
@@ -63,7 +82,8 @@ ssh-keygen -q -t ed25519 -N '' -f "$dir/client_key" -C cherry-loopback-client
 cp "$dir/client_key.pub" "$dir/authorized_keys"
 chmod 600 "$dir/authorized_keys"
 
-# Every command sshd runs goes through this, with the private environment.
+# Every command sshd runs goes through this, with the private environment;
+# each is logged to $dir/commands.
 cat > "$dir/force-command" <<EOF
 #!/bin/sh
 HOME='$dir/remote/home'
@@ -71,6 +91,7 @@ CHERRY_HOST_SOCKET='$socket'
 PATH='$dir/remote/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 SHELL=/bin/sh
 export HOME CHERRY_HOST_SOCKET PATH SHELL
+printf '%s\n' "\$SSH_ORIGINAL_COMMAND" >> '$dir/commands'
 case "\$SSH_ORIGINAL_COMMAND" in
   *gateway*)
     case "\$SSH_ORIGINAL_COMMAND" in
@@ -185,6 +206,36 @@ for _ in $(seq 1 50); do
 done
 cli remove "$id" >/dev/null 2>&1 || true
 pass "the session ended"
+
+if [ "$install" = 1 ]; then
+  # Install & Add over this sshd: the app's installer, run by its Swift test.
+  if [ "$build" = 1 ]; then
+    (cd "$root" && PATH="$original_path" swift build --build-tests >"$dir/swift-build.log" 2>&1) \
+      || { cat "$dir/swift-build.log" >&2; fail "swift build --build-tests"; }
+  fi
+  test_name=RemoteDeviceRealHostInstallRunsTheRealCopyOverSSH
+  if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
+    CHERRY_TEST_LOOPBACK_SSH="$dir/bin/ssh" CHERRY_TEST_LOOPBACK_HOME="$dir/remote/home" \
+    CHERRY_TEST_LOOPBACK_DESTINATION=loopback \
+    swift test --skip-build --no-parallel --filter "$test_name" >"$dir/swift-test.log" 2>&1); then
+    cat "$dir/swift-test.log" >&2
+    fail "the installer over SSH ($test_name)"
+  fi
+  grep -q "Test $test_name() passed" "$dir/swift-test.log" || { cat "$dir/swift-test.log" >&2; fail "$test_name did not run"; }
+  grep -q "tar -xf - -C" "$dir/commands" || fail "the copy went over this sshd as a tar stream"
+  installed=$(cd "$dir/remote/home/Library/Application Support/cherry-host/bin" && ls)
+  [ "$(printf '%s\n' "$installed" | wc -l | tr -d ' ')" = 1 ] || fail "one build directory installed: $installed"
+  codesign --verify --strict "$dir/remote/home/Library/Application Support/cherry-host/bin/$installed/cherry-host" \
+    || fail "the installed cherry-host is signed"
+  pass "Install & Add copied, checked and placed $installed over SSH (and skipped copying it again)"
+
+  "$binaries/cherry" --host loopback --socket "$socket" \
+    --remote-host-path "~/Library/Application Support/cherry-host/bin/$installed/cherry-host" list >/dev/null \
+    || fail "cherry --host through the installed cherry-host"
+  grep -F -q "'Library/Application Support/cherry-host/bin/$installed/cherry-host' gateway" "$dir/commands" \
+    || fail "the gateway ran the installed cherry-host"
+  pass "the installed cherry-host's gateway serves cherry --host"
+fi
 
 # The daemon it started is this script's private one.
 pgrep -f "serve --socket $socket" >/dev/null || fail "a private daemon served $socket"

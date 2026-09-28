@@ -2,13 +2,13 @@ import CherryControl
 import Darwin
 import Foundation
 
-// Add Mac… (docs/specs/remote-devices.md, phase 1: connect and check only).
-// One `ssh -T -o BatchMode=yes <host> sh -s` runs a POSIX script on the other
-// Mac (whatever its login shell), which reports the system, the session
-// host it finds (`cherry-host version --json` and `status --json`, never
-// starting or replacing anything) and the permissions tabs there will have.
-// Nothing is installed: a missing or mismatched cherry-host is reported with
-// manual instructions until phase 2's installer.
+// Add Mac… (docs/specs/remote-devices.md). One `ssh -T -o BatchMode=yes
+// <host> sh -s` runs a POSIX script on the other Mac (whatever its login
+// shell), which reports the system, the session host it finds (`cherry-host
+// version --json` and `status --json`, never starting or replacing
+// anything), this Cherry's installs there and any Cherry.app, and the
+// permissions tabs there will have. Installing this Cherry's session host
+// there is RemoteHostInstall.swift's (phase 2).
 
 /// Runs a script on another Mac through the user's ssh, without a terminal:
 /// BatchMode (no prompts), no forwarding, a connect timeout. The script goes
@@ -22,6 +22,10 @@ struct RemoteDeviceShell: Sendable {
     var environment: [String: String]
     var connectTimeout: Int = 10
     var timeout: TimeInterval = 30
+    /// The device's SSH master's control path while it is up
+    /// (`HostSSHMasterManager.controlPathIfUp`): an install's commands go
+    /// through it instead of logging in again.
+    var controlPath: String?
 
     struct Output: Equatable, Sendable {
         var status: Int32
@@ -55,6 +59,9 @@ struct RemoteDeviceShell: Sendable {
         [
             "-T",
             "-o", "ControlMaster=no",
+        ]
+        + (controlPath.map { ["-o", HostSSHMasterManager.controlPathOption($0)] } ?? [])
+        + [
             "-o", "RemoteCommand=none",
             "-o", "ClearAllForwardings=yes",
             "-o", "PermitLocalCommand=no",
@@ -252,6 +259,11 @@ struct RemoteDeviceProbeResult: Equatable, Sendable {
     var fullDiskAccess: Bool?
     /// Whether the login keychain could be read in an SSH session.
     var keychainUnlocked: Bool?
+    /// Build directories of ours (~/Library/Application Support/
+    /// cherry-host/bin/<build>), with their files' hashes.
+    var installedBuilds: [RemoteInstalledBuild] = []
+    /// Cherry.app copies there (/Applications, ~/Applications).
+    var cherryApps: [RemoteCherryApp] = []
 
     var architecture: String? {
         uname?.split(separator: " ").last.map(String.init)
@@ -279,7 +291,9 @@ enum RemoteDeviceProbe {
 
     /// The POSIX script run on the other Mac. `remoteHostPath`: the
     /// cherry-host to check (else PATH, then the known install places).
-    static func script(remoteHostPath: String?) -> String {
+    /// `marker`: a build directory of ours this installation uses, marked
+    /// as used now (`.used-by/<installation id>`).
+    static func script(remoteHostPath: String?, marker: (directoryName: String, installationID: UUID)? = nil) -> String {
         var lines = [
             "printf '%s\\n' '\(beginMarker)'",
             "printf 'uname=%s\\n' \"$(uname -sm 2>/dev/null)\"",
@@ -290,14 +304,44 @@ enum RemoteDeviceProbe {
             "printf 'home=%s\\n' \"$HOME\"",
             "printf 'shell=%s\\n' \"$SHELL\"",
         ]
+        // This Cherry's installs (phase 2): each build's directory with its
+        // files' hashes, and any Cherry.app with what its cherry-host is.
+        lines += [
+            "root=\"$HOME\"/" + singleQuoted(RemoteHostInstall.rootRelativePath),
+            "newest=",
+            // Every build directory, incomplete ones too (a missing file
+            // is `-`), so the install repairs them.
+            "for d in \"$root\"/*; do",
+            "  [ -d \"$d\" ] || continue",
+            "  case \"$d\" in *.partial-*|*.broken-*) continue ;; esac",
+            "  hashes=",
+            "  for f in cherry cherry-host; do",
+            "    h=",
+            "    [ -f \"$d/$f\" ] && h=$(\(RemoteHostInstaller.Tool.shasum) -a 256 \"$d/$f\" 2>/dev/null | \(RemoteHostInstaller.Tool.awk) '{ print $1 }')",
+            "    hashes=\"$hashes ${h:--}\"",
+            "  done",
+            "  printf 'installed=%s%s\\n' \"${d##*/}\" \"$hashes\"",
+            "  [ -x \"$d/cherry-host\" ] || continue",
+            "  [ -n \"$newest\" ] && [ \"$newest\" -nt \"$d\" ] || newest=$d",
+            "done",
+            "for app in /Applications/Cherry.app \"$HOME/Applications/Cherry.app\"; do",
+            "  if [ -x \"$app/Contents/MacOS/cherry-host\" ]; then",
+            "    printf 'app=%s\\t%s\\n' \"$app\" \"$(\"$app/Contents/MacOS/cherry-host\" version --json 2>/dev/null | tr -d '\\n')\"",
+            "  fi",
+            "done",
+        ]
+        if let marker {
+            lines.append("used=\"$root\"/" + singleQuoted(marker.directoryName))
+            lines += RemoteHostInstaller.markerLines(directoryVariable: "used", installationID: marker.installationID)
+        }
         if let remoteHostPath = remoteHostPath?.nilIfEmpty {
             lines.append("host=\(shellWord(remoteHostPath))")
         } else {
             lines += [
                 "host=$(command -v cherry-host 2>/dev/null)",
-                "for candidate in \"$HOME/Library/Application Support/Cherry/bin/cherry-host\" /Applications/Cherry.app/Contents/MacOS/cherry-host; do",
+                "for candidate in \"$HOME/Library/Application Support/Cherry/bin/cherry-host\" \"${newest:+$newest/cherry-host}\" /Applications/Cherry.app/Contents/MacOS/cherry-host \"$HOME/Applications/Cherry.app/Contents/MacOS/cherry-host\"; do",
                 "  [ -n \"$host\" ] && break",
-                "  [ -x \"$candidate\" ] && host=$candidate",
+                "  [ -n \"$candidate\" ] && [ -x \"$candidate\" ] && host=$candidate",
                 "done",
             ]
         }
@@ -307,7 +351,7 @@ enum RemoteDeviceProbe {
             "  printf 'version=%s\\n' \"$(\"$host\" version --json 2>/dev/null | tr -d '\\n')\"",
             "  printf 'status=%s\\n' \"$(\"$host\" status --json 2>/dev/null | tr -d '\\n')\"",
             "fi",
-            "if ls \"$HOME/Library/Safari\" >/dev/null 2>&1; then echo fda=yes; else echo fda=no; fi",
+            "if /bin/ls \"$HOME/Library/Safari\" >/dev/null 2>&1; then echo fda=yes; else echo fda=no; fi",
             "if security show-keychain-info >/dev/null 2>&1; then echo keychain=unlocked; else echo keychain=locked; fi",
             "printf '%s\\n' '\(endMarker)'",
         ]
@@ -355,6 +399,18 @@ enum RemoteDeviceProbe {
             case "hostpath": result.hostPath = value.nilIfEmpty
             case "version": result.hostVersion = try? decoder.decode(RemoteHostVersionReport.self, from: Data(value.utf8))
             case "status": result.hostStatus = try? decoder.decode(RemoteHostStatusReport.self, from: Data(value.utf8))
+            case "installed":
+                let parts = value.split(separator: " ").map(String.init)
+                if let name = parts.first {
+                    result.installedBuilds.append(RemoteInstalledBuild(name: name, hashes: Array(parts.dropFirst())))
+                }
+            case "app":
+                let parts = value.split(separator: "\t", maxSplits: 1).map(String.init)
+                if let path = parts.first {
+                    let version = parts.count > 1
+                        ? try? decoder.decode(RemoteHostVersionReport.self, from: Data(parts[1].utf8)) : nil
+                    result.cherryApps.append(RemoteCherryApp(path: path, version: version))
+                }
             case "fda": result.fullDiskAccess = value == "yes"
             case "keychain": result.keychainUnlocked = value == "unlocked"
             default: break
@@ -363,8 +419,13 @@ enum RemoteDeviceProbe {
         return result
     }
 
-    static func run(destination: String, remoteHostPath: String?, shell: RemoteDeviceShell) async -> RemoteDeviceProbeResult {
-        parse(await shell.run(script(remoteHostPath: remoteHostPath), on: destination))
+    static func run(
+        destination: String,
+        remoteHostPath: String?,
+        marker: (directoryName: String, installationID: UUID)? = nil,
+        shell: RemoteDeviceShell
+    ) async -> RemoteDeviceProbeResult {
+        parse(await shell.run(script(remoteHostPath: remoteHostPath, marker: marker), on: destination))
     }
 
     /// Checks a folder on the device for Add Project on <Mac>…: its
@@ -425,26 +486,35 @@ struct RemoteDeviceChecklist: Equatable {
     }
 
     let items: [Item]
-    /// Whether Add is offered: SSH works and it is a Mac. A missing or
-    /// mismatched cherry-host is reported, not refused: tabs there fail,
-    /// saying why, until it is installed (phase 2 installs it).
+    /// Whether Add is offered: SSH works, it is a Mac, and, when this
+    /// Cherry can install its session host there (`installation`), the
+    /// install is not refused, or the cherry-host already there can be used.
     let canAdd: Bool
     /// The name field's default (its ComputerName).
     let suggestedName: String?
     /// Whether the device's cherry-host speaks this Cherry's protocol.
     let hostIsCompatible: Bool
 
-    /// Manual installation until phase 2's installer.
+    /// How to put a session host there by hand, when this Cherry cannot
+    /// install one (it has no helpers of its own).
     static func manualInstallInstructions(destination: String) -> String {
         """
-        Cherry's installer for other Macs is coming. Until then, copy this Cherry's helpers there:
+        Install the same version of Cherry on that Mac, or copy this Cherry's helpers there by hand:
           ssh \(destination) 'mkdir -p "$HOME/Library/Application Support/Cherry/bin"'
           scp /Applications/Cherry.app/Contents/MacOS/cherry /Applications/Cherry.app/Contents/MacOS/cherry-host \(destination):'Library/Application Support/Cherry/bin/'
-        or install the same version of Cherry on that Mac, then check again.
+        then check again.
         """
     }
 
-    init(result: RemoteDeviceProbeResult, destination: String, localProtocol: UInt32 = HostProtocol.version) {
+    /// `installation`: what installing this Cherry's session host there
+    /// would do (`RemoteHostInstall.decide`); nil when no install is
+    /// offered (a cherry-host path was given), as in phase 1.
+    init(
+        result: RemoteDeviceProbeResult,
+        destination: String,
+        localProtocol: UInt32 = HostProtocol.version,
+        installation: RemoteHostInstallDecision? = nil
+    ) {
         var items: [Item] = []
         if let failure = result.sshFailure {
             items.append(Item(
@@ -468,7 +538,9 @@ struct RemoteDeviceChecklist: Equatable {
                 detail: "\(result.uname ?? "This machine") is not a Mac. Other systems are not supported in the picker yet; use Persistent Sessions for its sessions."
             ))
         }
+        // What is there now.
         var compatible = false
+        let installs = installation?.plan != nil
         if let version = result.hostVersion {
             let path = result.hostPath.map { " (\($0))" } ?? ""
             if version.protocol == localProtocol {
@@ -480,6 +552,12 @@ struct RemoteDeviceChecklist: Equatable {
                     id: "host", status: .ok, title: "Session host",
                     detail: "cherry-host \(version.version ?? version.build ?? "") speaks protocol \(version.protocol), as this Cherry does\(path)\(running)."
                 ))
+            } else if installs {
+                // The installer puts this Cherry's own next to it.
+                items.append(Item(
+                    id: "host", status: .ok, title: "Session host",
+                    detail: "The cherry-host there\(path) speaks protocol \(version.protocol); this Cherry speaks \(localProtocol) and uses its own."
+                ))
             } else {
                 items.append(Item(
                     id: "host", status: .failure, title: "Session host",
@@ -487,7 +565,7 @@ struct RemoteDeviceChecklist: Equatable {
                         + Self.manualInstallInstructions(destination: destination)
                 ))
             }
-            if let status = result.hostStatus, status.running, let running = status.protocol, running != localProtocol {
+            if installation == nil, let status = result.hostStatus, status.running, let running = status.protocol, running != localProtocol {
                 compatible = false
                 items.append(Item(
                     id: "daemon", status: .failure, title: "Running host",
@@ -495,11 +573,44 @@ struct RemoteDeviceChecklist: Equatable {
                 ))
             }
         } else {
+            let found = "No cherry-host was found\(result.hostPath.map { " at \($0)" } ?? " on its PATH")."
             items.append(Item(
-                id: "host", status: .warning, title: "Session host",
-                detail: "No cherry-host was found\(result.hostPath.map { " at \($0)" } ?? " on its PATH"). "
-                    + Self.manualInstallInstructions(destination: destination)
+                id: "host", status: installs ? .ok : .warning, title: "Session host",
+                detail: installs ? found : found + " " + Self.manualInstallInstructions(destination: destination)
             ))
+        }
+        if let status = result.hostStatus, status.running, let running = status.protocol, running != localProtocol {
+            compatible = false
+        }
+        // What Install & Add does, or why it cannot.
+        var blocked = false
+        switch installation {
+        case .install(let plan)?:
+            let what = plan.copyNeeded
+                ? "\(plan.addTitle.replacingOccurrences(of: " & Add", with: "")) copies this Cherry's cherry and cherry-host to ~/\(RemoteHostInstall.rootRelativePath)/\(plan.directoryName) there"
+                : "This Cherry's cherry and cherry-host are already there (~/\(RemoteHostInstall.rootRelativePath)/\(plan.directoryName))"
+            let daemon: String
+            switch plan.daemon {
+            case .absent: daemon = "; the first tab starts its session host."
+            case .sameProtocol: daemon = "; it relays to the session host that runs there, whose sessions carry on."
+            case .olderProtocol: daemon = "; the first connection replaces the older session host there, whose sessions carry on."
+            case .unknown: daemon = "."
+            }
+            items.append(Item(
+                id: "install", status: plan.warnings.isEmpty ? .ok : .warning,
+                title: plan.copyNeeded ? (plan.isUpdate ? "Update" : "Install") : "Installed",
+                detail: ([what + daemon] + plan.warnings).joined(separator: " ")
+            ))
+        case .blocked(let reason, let allowsPlainAdd)?:
+            blocked = !allowsPlainAdd
+            items.append(Item(
+                id: "install", status: blocked ? .failure : .warning, title: "Session host",
+                detail: allowsPlainAdd && compatible
+                    ? reason + " The cherry-host already there is used instead."
+                    : reason
+            ))
+        case nil:
+            break
         }
         if result.fullDiskAccess == false {
             items.append(Item(
@@ -514,7 +625,7 @@ struct RemoteDeviceChecklist: Equatable {
             ))
         }
         self.items = items
-        canAdd = result.isMac
+        canAdd = result.isMac && !blocked
         suggestedName = result.computerName ?? result.localHostName ?? result.hostName
         hostIsCompatible = compatible
     }

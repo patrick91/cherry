@@ -145,6 +145,16 @@ if [[ "$BUNDLE_HOST" == 1 ]]; then
   if ! cmp -s "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"; then
     fail "Packaged GUI executable was overwritten; GUI and helper filenames must be distinct."
   fi
+  # Cherry copies these to the user's other Macs, of either kind
+  # (docs/specs/remote-devices.md): they must be universal. A build for this
+  # Mac only (CHERRY_HOST_ARCHS=native) is installed with a warning.
+  if ! "$ROOT/Scripts/check-helper-archs" "$APP_PATH/Contents/MacOS/cherry" "$APP_PATH/Contents/MacOS/cherry-host"; then
+    if [[ "${CHERRY_HOST_ARCHS:-universal}" == native ]]; then
+      echo "warning: CHERRY_HOST_ARCHS=native: this copy cannot install its session host on a Mac of the other architecture" >&2
+    else
+      fail "The Persistent Sessions helpers are not universal (arm64 and x86_64); see the error above."
+    fi
+  fi
   mkdir -p "$APP_PATH/Contents/Resources/HostLicenses"
   cp "$ROOT/Host/vendor/ghostty-vt/LICENSE" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-LICENSE"
   cp "$ROOT/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-THIRD_PARTY_NOTICES.txt"

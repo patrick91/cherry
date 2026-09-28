@@ -287,7 +287,7 @@ private func session(
     #expect(checklist.canAdd && !checklist.hostIsCompatible)
     let missing = checklist.items.first { $0.id == "host" }
     #expect(missing?.status == .warning)
-    #expect(missing?.detail?.contains("installer for other Macs is coming") == true)
+    #expect(missing?.detail?.contains("copy this Cherry's helpers there by hand") == true)
     #expect(missing?.detail?.contains("ssh mini") == true)
 
     // Another protocol.

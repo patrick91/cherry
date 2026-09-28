@@ -56,6 +56,7 @@ final class HostedRemoteHostPaths: @unchecked Sendable {
 
     private let lock = NSLock()
     private var resolver: Resolver
+    private var overrides: [String: String] = [:]
 
     init(resolver: @escaping Resolver = { _ in nil }) {
         self.resolver = resolver
@@ -65,10 +66,17 @@ final class HostedRemoteHostPaths: @unchecked Sendable {
         lock.withLock { self.resolver = resolver }
     }
 
+    /// A path for one destination that wins over the resolver (nil
+    /// removes it): tests of a fake Mac use it, so they never replace the
+    /// device store's resolver for everyone else.
+    func setOverride(_ path: String?, for sshDestination: String) {
+        lock.withLock { overrides[sshDestination] = path }
+    }
+
     /// The destination's cherry-host path, or nil for the one on its PATH.
     func path(for sshDestination: String) -> String? {
-        let resolver = lock.withLock { self.resolver }
-        return resolver(sshDestination)?.nilIfEmpty
+        let (override, resolver) = lock.withLock { (overrides[sshDestination], self.resolver) }
+        return (override ?? resolver(sshDestination))?.nilIfEmpty
     }
 }
 
@@ -1000,6 +1008,16 @@ enum HostedSessionError: LocalizedError, Equatable {
             "Permission denied", "Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED",
             "Too many authentication failures", "No more authentication methods",
         ].contains { text.contains($0) }
+    }
+
+    /// The remote cherry-host the gateway command names is not there (its
+    /// shell said "No such file or directory" or "command not found", and
+    /// the connection closed before the gateway started): a device whose
+    /// install was removed. Reinstalling it (Update Session Host…) fixes it.
+    var isRemoteHostMissing: Bool {
+        let text = errorDescription ?? ""
+        guard text.contains("cherry-host") else { return false }
+        return ["No such file or directory", "command not found", "cherry-host: not found"].contains { text.contains($0) }
     }
 
     /// The host speaks a protocol this app's helper can neither use nor

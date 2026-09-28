@@ -25,6 +25,11 @@ runs:
         fi
         rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
         rustup default 1.94.0
+        # Scripts/build-host builds universal (arm64 and x86_64) helpers on
+        # macOS: Cherry installs them on the user's other Macs of either kind.
+        if [ "$(uname -s)" = Darwin ]; then
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        fi
 
     # The revision and Zig version are pinned in Scripts/build-host-vt, so its
     # digest identifies the library. The Zig archive is keyed on its version.
@@ -32,7 +37,21 @@ runs:
       id: pins
       shell: bash
       run: |
-        echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+        triple=$(rustc -vV | sed -n 's/^host: //p')
+        echo "triple=$triple" >> "$GITHUB_OUTPUT"
+        # The VT libraries Scripts/build-host links: both Mac architectures
+        # on macOS, the machine's own elsewhere.
+        case "$triple" in
+          *-apple-darwin) targets="aarch64-apple-darwin x86_64-apple-darwin" ;;
+          *) targets=$triple ;;
+        esac
+        echo "targets=$targets" >> "$GITHUB_OUTPUT"
+        echo "targets_key=$(printf '%s' "$targets" | tr ' ' '+')" >> "$GITHUB_OUTPUT"
+        {
+          echo "vt_paths<<EOF"
+          for target in $targets; do echo "Host/vendor/ghostty-vt/$target"; done
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
         echo "zig=$(sed -n 's/^zig_version=//p' Scripts/build-host-vt)" >> "$GITHUB_OUTPUT"
         if command -v sha256sum >/dev/null 2>&1; then
           digest=$(sha256sum Scripts/build-host-vt | cut -d ' ' -f 1)
@@ -45,8 +64,8 @@ runs:
       id: vt
       uses: actions/cache/restore@v4
       with:
-        path: Host/vendor/ghostty-vt/${{ steps.pins.outputs.triple }}
-        key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.script }}
+        path: ${{ steps.pins.outputs.vt_paths }}
+        key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.script }}-${{ steps.pins.outputs.targets_key }}
 
     - name: Restore Zig download
       id: zig
@@ -59,7 +78,10 @@ runs:
     - name: Build pinned Ghostty VT library
       if: steps.vt.outputs.cache-hit != 'true'
       shell: bash
-      run: Scripts/build-host-vt
+      run: |
+        for target in ${{ steps.pins.outputs.targets }}; do
+          Scripts/build-host-vt "$target"
+        done
 
     # Save right away rather than in a post step, which only runs when the
     # whole job succeeds; a failing test must not force the next run to
@@ -75,5 +97,5 @@ runs:
       if: steps.vt.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
-        path: Host/vendor/ghostty-vt/${{ steps.pins.outputs.triple }}
+        path: ${{ steps.pins.outputs.vt_paths }}
         key: ${{ steps.vt.outputs.cache-primary-key }}

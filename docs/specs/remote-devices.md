@@ -1,9 +1,10 @@
 # Devices: projects on your other Macs
 
-Status: phase 0 (groundwork) and phase 1 (devices and remote project
-windows, with Add Mac… connecting and checking only) implemented on
-`codex/persistent-sessions`; phases 2 to 4 are the plan. Phase 1 as built,
-and where it differs from the plan below, is in *Phase 1 as built*. Builds on
+Status: phase 0 (groundwork), phase 1 (devices and remote project
+windows) and phase 2 (Add Mac… installs the session host) implemented on
+`codex/persistent-sessions`; phases 3 and 4 are the plan. Phases 1 and 2 as
+built, and where they differ from the plan below, are in *Phase 1 as built*
+and *Phase 2 as built*. Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
 [remote-session-host.md](remote-session-host.md) (SSH transport, gateway,
@@ -20,8 +21,8 @@ window looks and behaves like a local one: tabs survive Cherry quitting on
 either Mac, come back on relaunch, and a tab that cannot start says so
 instead of running anything locally.
 
-**Add Mac…** (phase 2) checks the other Mac over SSH and installs the
-`cherry` and `cherry-host` that match this Cherry there.
+**Add Mac…** checks the other Mac over SSH and installs the `cherry` and
+`cherry-host` that match this Cherry there (phase 2).
 
 Cherry may run on the other Mac too. Both apps then share that Mac's daemon
 (the default socket, `/tmp/cherry-host-$UID/host.sock`), so nothing here may
@@ -203,7 +204,8 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   `name`, `sshDestination`, `remoteHostPath?`, `machineNames`,
   `homeDirectory?`, `addedProjects`, `hiddenProjects`, `lastSeen`, `hostID`
   (its host's identity from `status --json`) and `createdHostEntry`
-  (`installedHostPath` and `lastProbe` wait for phase 2). Each destination
+  (phase 2 adds `installedBuild` and `installedArch`; there is no
+  `installedHostPath`, `remoteHostPath` is it, nor a stored `lastProbe`). Each destination
   is also a saved host of `HostedSessionHostStore`, whose trusted
   identities pin it; Remove ends nothing, and forgets that saved host and
   its pin only when Add Mac… created it (never a host the user had saved).
@@ -341,6 +343,192 @@ the device's home yet; Settings › Sessions does not list each device's
 status; the quit question counts device sessions with This Mac's but does
 not say "on 2 Macs"; file paste and drop into a device tab still insert
 This Mac's paths (phase 3).
+
+## Phase 2 as built
+
+What exists (`Sources/Cherry/RemoteHostInstall.swift`, the Add Mac and
+Update Session Host sheets in `RemoteDeviceViews.swift`, the probe in
+`RemoteDeviceCheck.swift`, the scripts):
+
+- **Universal helpers.** `Scripts/build-host` on macOS builds
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` (each with its own
+  libghostty-vt, `Scripts/build-host-vt <triple>`), joins them with `lipo`
+  and signs the result (ad hoc, or `CHERRY_CODESIGN_IDENTITY`), then moves
+  it into place (a rename, never a write into a file that may run). A
+  missing Rust target stops it with `rustup target add …`;
+  `CHERRY_HOST_ARCHS=native` builds this Mac's architecture only and says so.
+  `Scripts/check-helper-archs` checks `lipo -archs` lists arm64 and x86_64;
+  `install-local-app` runs it (a native build is installed with a warning)
+  and `package-dmg` requires it. `Scripts/package-host` names a universal
+  archive `cherry-host-universal-apple-darwin.tar.gz`. CI's host toolchain
+  installs both targets and caches both VT libraries.
+- **This Cherry's helpers** (`RemoteHostHelpers`): the `cherry` and
+  `cherry-host` it runs (`HostedSessionClient.installed()`'s directory),
+  their `version --json`, the architectures both carry (read from the
+  Mach-O headers, `MachOArchitectures`; no Xcode tools needed) and their
+  SHA-256; read once off the main actor and again when the files change.
+- **The probe** (the Add Mac check's script) also reports each build
+  directory of ours (`installed=<name> <sha cherry> <sha cherry-host>`) and
+  each `/Applications/Cherry.app` and `~/Applications/Cherry.app` with its
+  `cherry-host version --json` (`app=`); the cherry-host it checks is looked
+  for in `--remote-host-path`, `PATH`, `~/Library/Application
+  Support/Cherry/bin`, the newest install of ours, then the two apps.
+- **The decision** (`RemoteHostInstall.decide`, pure): from the probe, the
+  helpers (or why there are none) and the daemon's `status --json`:
+
+  | Daemon there | Decision |
+  |---|---|
+  | absent | install; the first tab's gateway starts ours |
+  | same protocol | install ours; it relays to that daemon (a newer build of it is said to keep running) |
+  | older protocol (≥ 4) | warn "Cherry on <Mac> is older; connecting updates its session host; its sessions carry on; update Cherry there too" (or, with no older Cherry.app there, that the host is replaced), then install; the gateway's `Replace` does the rest |
+  | newer protocol | blocked: "… Update Cherry on this Mac, then check again." |
+  | older than 4 | blocked, with the README's shutdown instructions |
+  | unresponsive, or its socket could not be checked | install, with a warning |
+
+  Also blocked: no helpers here, helpers of another protocol, an
+  architecture they lack ("built for arm64 only, and Mini is an Intel Mac
+  (x86_64)"; an arm64e Mac runs arm64), a macOS older than the slice's
+  `min_macos`. Those four still allow a plain **Add** (`allowsPlainAdd`),
+  as in phase 1: with the cherry-host already there when it speaks this
+  protocol, otherwise its tabs say what is missing. A Cherry.app there
+  of an older protocol is warned about (it cannot use the newer host while
+  it runs), one of a newer protocol too (it will replace our host). The
+  plan names the directory (`<build>`; `<build>-<first 12 of the hashes>`
+  when `<build>` holds other files), whether a copy is needed (not when
+  `<build>` has the same hashes), and whether it is an update (another
+  build of ours, an older host or daemon there): **Install & Add**, **Update
+  & Add** or **Add**; **Install**, **Update** or **Use It** in Update
+  Session Host….
+- **The install** (`RemoteHostInstaller`), over the check's BatchMode ssh
+  with `-o ControlPath=<master>` when the device's master is up
+  (`HostSSHMasterManager.controlPathIfUp`):
+  1. copy: `/usr/bin/tar -cf - -C <helpers> cherry cherry-host` (extended
+     attributes travel) piped into `ssh … -- HOST "/bin/sh -c '<line>'"`,
+     the line being `umask 077 && mkdir -p "$HOME"/'…/<build>.partial-<uuid>'
+     && /usr/bin/tar -xf - -C … && echo CHERRY-INSTALL-COPIED`: one line, no `!`,
+     no backslash inside the quotes, so sh, bash, zsh, fish, csh and tcsh
+     hand it to sh unchanged (tested);
+  2. verify (`sh -s`): `xattr -c`, `codesign --verify --strict` of both,
+     `cherry-host version --json` (exit 137 or 9: "macOS on <Mac> refused to
+     run cherry-host … its code signature is not valid there"), `shasum -a
+     256` of both; protocol, build and hashes must be this Cherry's. A
+     failure removes the partial directory and says why;
+  3. finish (`sh -s`, `RemoteHostInstaller.finishScript`): rename the
+     partial directory to `<build>` with rename(2) (`/usr/bin/perl -e
+     rename`, which fails when the target exists: concurrent installs of
+     one build never nest); when `<build>` is there, `verify_dir` it (both
+     executables, the expected hashes, both signatures, cherry-host runs):
+     good, drop the partial; damaged and no process runs from it, move it
+     aside and replace it; damaged and in use, leave it and place the copy
+     at `<build>-<first 12 of the hashes>` (checked the same way). Partial
+     copies an older installer nested inside a build are removed. Without a
+     copy (the check saw the same hashes), the directory must pass
+     `verify_dir`, or the install copies after all. The placed build gets
+     `.installed` and this installation's `.used-by/<id>` marker. Then the
+     report: `cherry status --json` and `cherry-host status --json` of the
+     new build (neither starts a daemon), each directory with its install
+     time and newest marker, and the processes running from the install
+     root (`/bin/ps`, read into a variable first so no `grep` matches
+     itself);
+  4. recheck (`RemoteHostInstall.recheck`): the daemon as the new build
+     sees it; a newer protocol or one before 4 is refused (the device is
+     not changed), a daemon the check could not see is reported;
+  5. handover, only when `RemoteHostInstall.shouldHandOver`: the daemon
+     speaks this protocol, runs from one of our directories other than the
+     new one (or the pre-phase-2 manual place, `~/Library/Application
+     Support/Cherry/bin`), of another build that is not newer than ours:
+     `<build>/cherry restart --if-pid P --if-executable E --if-build B`
+     with what the report said (a new CLI option: checked on the connection
+     that asks the restart; another daemon is left running, exit 4). Its
+     sessions' holders keep running and register with the new daemon;
+  6. collect (`RemoteHostInstall.garbage`): a build goes only when it is not
+     the current one nor one of the two most recently installed others, no
+     process runs from it, the daemon's executable is not there, neither the
+     daemon's nor a running session's holder build names it
+     (`directoriesInUse` says which of these keeps it), no `.used-by` marker
+     is younger than 30 days, and it was installed more than 7 days ago;
+     partial and moved-aside directories go after an hour unless in use;
+     the removal re-reads the process list and keeps what runs.
+
+  Every script runs the system tools by absolute path (`/usr/bin/stat`,
+  `/usr/bin/tar`, `/usr/bin/shasum`, `/usr/bin/xattr`, `/usr/bin/codesign`,
+  `/bin/ps`, `/usr/bin/perl`, `/usr/bin/touch`), so GNU coreutils first on
+  PATH or a stand-in changes nothing.
+- **Markers**: each connection of a device's control (at most every 6 hours
+  per device, `RemoteDeviceStore.markUsedBuild`) and each Update Session
+  Host… check touch `.used-by/<installation id>` in the build directory the
+  device's `remoteHostPath` names, so another Mac's install never collects a
+  build this one points at. A device whose cherry-host is gone anyway
+  (`HostedSessionError.isRemoteHostMissing`: "No such file or directory" or
+  "command not found" before the gateway started) is shown as "Its session
+  host is missing" (`RemoteDeviceConnectionState.hostMissing`), with
+  **Reinstall Session Host…** in its menu and **Reinstall…** on its bars.
+- **Recording**: Add stores `remoteHostPath =
+  ~/Library/Application Support/cherry-host/bin/<build>/cherry-host`,
+  `installedBuild` and `installedArch` (the copy's `version --json` arch,
+  as `arm64`/`x86_64`); Update Session Host… does the same
+  (`RemoteDeviceStore.recordInstall`) and connects the device's control
+  again unless it is connected (tabs and the control use the new path from
+  their next connection; an older-protocol daemon is replaced by the first).
+- **UI**: the Add Mac sheet's checklist gains an **Install**/**Update**/
+  **Installed** row (or why not), its primary button is **Install & Add**,
+  **Update & Add** or **Add** with the stage underway ("Copying cherry and
+  cherry-host…", "Checking the copy there…", …) and errors in place; a
+  typed cherry-host path skips the installer (phase 1 behaviour). The
+  device submenu has **Update Session Host…** when the install there is an
+  older build than this Cherry bundles (ordered builds only) or its host
+  speaks another protocol; the **Update…** of a tab's or waiting window's
+  bar (another protocol) opens the same sheet
+  (`RemoteDeviceUpdatePresenter`).
+- **Tests**: `RemoteDeviceInstallTests` (the decision table, the checklist,
+  probe parsing, build order, Mach-O architectures,
+  `Scripts/check-helper-archs` on thin and fat fixtures, the copy command
+  through sh, bash, zsh, csh, tcsh and fish where installed, the scripts'
+  reports, garbage collection, the handover rule, the menu, recording) and
+  `RemoteDeviceRealHostInstallTests` through `Scripts/fake-remote-mac`
+  (new switch: `arch`; `CHERRY_FAKE_REMOTE_HOST=link|none|newer|old-build`):
+  Install & Add into a fake home, then the gateway run from the install;
+  skipping an identical install; markers from the install, the check and a
+  connection; a missing cherry-host shown as missing; an update from an
+  older build of ours with live sessions, handed over with their holders
+  running and registered again, while builds are collected by the rules
+  above (young, recently marked, newest two and in use kept); a newer host,
+  a missing architecture (plain Add) and an unsigned copy refused, leaving
+  nothing behind; a damaged build repaired, a damaged one in use left for
+  `<build>-<hash>`; three concurrent installs of one build (one placed, two
+  reuse it, nothing nested) and an old nested partial removed; a handover
+  naming another pid, executable or build refused; a daemon the check could
+  not see reported after the install; a quarantine attribute that travelled
+  with the copy cleared. Rust: `restart --if-*` unit tests and the ignored
+  `restart_replaces_the_daemon_and_keeps_its_running_sessions`. `Scripts/test-remote-mac-loopback` runs the installer's
+  test against its real sshd (tar, xattr, codesign), then `cherry --host`
+  through the installed cherry-host.
+
+Deviations from the plan below:
+
+- The layout is `~/Library/Application Support/cherry-host/bin/<build>/`
+  (immutable, one per build), not `Application Support/Cherry/bin/`, which is
+  also the other Mac's own Cherry's data folder; the copy is a tar stream
+  into a partial directory and a rename, not `cat > ….tmp && mv`.
+- A device whose own Cherry.app runs a daemon of this protocol gets our
+  install too (it relays to that daemon) rather than using that app's
+  cherry-host: the device's path then never moves when that app updates.
+- An older-protocol daemon is not refused: the gateway replaces it (its
+  sessions carry on), with a warning to update Cherry there. A newer one,
+  or one older than protocol 4, is refused.
+- `min_macos` is checked per slice (an arm64 slice needs 11.0 at least);
+  `xattr -c` runs although the files are not downloaded (it also clears
+  provenance attributes).
+- The first `cherry control` still pins the host identity as before;
+  nothing is reinstalled by itself when this Cherry updates: the device menu
+  offers Update Session Host…, and a protocol mismatch's Update… opens it.
+- GC keeps more than "current plus two": builds installed within 7 days
+  and builds any installation marked within 30 days stay too, so another
+  Mac pointing at one keeps it.
+- Builds without a time stamp (development builds) are never "older", so
+  Update Session Host… is not offered for them by the menu (it is for
+  another protocol); a handover from our own install of such a build to
+  another is done, since it only happens when the user asked.
 
 ## Phase 1: devices and remote project windows (the plan)
 

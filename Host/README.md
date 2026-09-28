@@ -248,7 +248,11 @@ Attaching to a session from inside that same session is refused.
   one Ctrl-] to the session (Vim tag jumps, a nested `cherry attach`). The key
   is also recognized in kitty keyboard and modifyOtherKeys encodings, with Caps
   Lock or Num Lock on, and is ignored inside a bracketed paste. End of input
-  (piped stdin) also detaches, after everything read before it.
+  (piped stdin) also detaches, after everything read before it. A lone Escape
+  is held for 25 ms to tell it from an encoded detach key; a termination
+  signal (SIGTERM, SIGHUP) sends what is held to the session before the
+  client leaves (waiting up to 250 ms for the transport to take it), so an
+  Escape typed just before it still leaves Neovim's insert mode.
   `--detach-key none` disables in-band detaching and forwards every byte; the
   Mac app uses it. Detaching resets the local terminal's modes and leaves any
   alternate screen. Modes whose default comes from the terminal's own

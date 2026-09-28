@@ -712,6 +712,67 @@ fn attach_disconnect_reconnect_preserves_process_and_terminal_screen() {
 
 #[test]
 #[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn an_escape_typed_just_before_a_termination_signal_reaches_the_session() {
+    // The attachment holds a lone Escape for a moment (it could begin an
+    // encoded detach key). A SIGTERM then must still deliver it: dropped,
+    // it would leave Neovim in insert mode and type the next command.
+    let host = Host::start();
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'READY\\n'; while IFS= read -r line; do printf 'HEX:%s:END\\n' \"$(printf '%s' \"$line\" | od -An -tx1 | tr -d ' \\n')\"; done",
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let pid = &created["pid"];
+    let mut first = Attached::new(&host, id, 80, 24);
+    first.expect(b"READY");
+    first.master.write_all(b"x\n").unwrap();
+    first.expect(b"HEX:78:END");
+    first.master.write_all(b"\x1b").unwrap();
+    // Once the attachment has read it, and well within the 25 ms it holds
+    // it. (Linux moves what the master writes to the terminal's input a
+    // moment later, so its unread count can still be 0 right after the
+    // write.) Should the signal come later on a busy machine, the Escape
+    // has left anyway and the test passes without testing anything.
+    thread::sleep(Duration::from_millis(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut unread: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(first._slave.as_raw_fd(), libc::FIONREAD, &mut unread) },
+            0
+        );
+        if unread == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attachment never read the Escape"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        unsafe { libc::kill(first.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    assert_eq!(first.wait().code(), Some(128 + libc::SIGTERM));
+    host.wait_for_detached_running(id, pid);
+    let mut second = Attached::new(&host, id, 80, 24);
+    second.master.write_all(b"y\n").unwrap();
+    // The Escape, then y; without it the line would be 79 alone.
+    second.expect(b"HEX:1b79:END");
+    second.master.write_all(&[0x1d]).unwrap();
+    assert!(second.wait().success());
+    let killed = host.command().args(["kill", id]).output().unwrap();
+    assert!(killed.status.success());
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
 fn piped_input_reaches_the_session_before_detaching() {
     let host = Host::start();
     let directory = tempfile::tempdir().unwrap();

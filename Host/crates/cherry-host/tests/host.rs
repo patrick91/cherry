@@ -243,8 +243,28 @@ fn rapid_resizes_are_coalesced_into_one_snapshot_while_other_windows_watch() {
     let mut other_screen = Screen::new(120, 45, offset, &snapshot);
     let (mut socket, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut screen = Screen::new(100, 30, offset, &snapshot);
-    // Like a window drag: one step every 10 ms.
+    // Like a window drag: one step every 10 ms. The host applies a size
+    // once it has been stable for its settle time (75 ms): a step that
+    // comes that much later (a stalled test thread on a busy machine, as
+    // macOS CI runners can be) ends one drag and starts another, which is
+    // allowed its replacements. Each gap is measured, with 25 ms of slack
+    // for the way from this socket to the session.
+    const SETTLE: Duration = Duration::from_millis(75);
+    const SLACK: Duration = Duration::from_millis(25);
+    let mut sent_at: Option<Instant> = None;
+    let mut paused = 0usize;
     for step in 0..20u16 {
+        let now = Instant::now();
+        if let Some(gap) = sent_at.map(|at| now - at) {
+            // After one settle time the grid follows the step before; after
+            // two, the next step also changes it at once.
+            if gap + SLACK >= SETTLE * 2 {
+                paused += 2;
+            } else if gap + SLACK >= SETTLE {
+                paused += 1;
+            }
+        }
+        sent_at = Some(now);
         send(
             &mut socket,
             &ClientMessage::Resize {
@@ -260,7 +280,8 @@ fn rapid_resizes_are_coalesced_into_one_snapshot_while_other_windows_watch() {
     other_screen.wait_size(&mut other, 99, 39);
     // Nothing else follows once the size has settled: the first step may
     // change the grid at once, the rest once the size settled. (The other
-    // window also got one when this one attached.)
+    // window also got one when this one attached.) Without a pause in the
+    // drag that is 3 at most.
     for (socket, screen) in [(&mut socket, &mut screen), (&mut other, &mut other_screen)] {
         socket
             .set_read_timeout(Some(Duration::from_millis(400)))
@@ -269,9 +290,10 @@ fn rapid_resizes_are_coalesced_into_one_snapshot_while_other_windows_watch() {
             screen.apply(&message);
         }
         assert!(
-            screen.attached.len() <= 3,
-            "{} snapshots for one drag",
-            screen.attached.len()
+            screen.attached.len() <= 3 + paused,
+            "{} snapshots for one drag ({paused} allowed for steps that came a settle time late): {:?}",
+            screen.attached.len(),
+            screen.attached
         );
     }
     assert_eq!((screen.cols, screen.rows), (99, 39));

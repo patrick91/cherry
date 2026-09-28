@@ -110,6 +110,9 @@ const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 const RENDER_SCROLLBACK_BYTES: usize = 1024 * 1024;
 /// A keyboard detach waits this long at most for the host's confirmation.
 const KEY_DETACH_WAIT: Duration = Duration::from_secs(2);
+/// After a termination signal, how long the keys already read may take to
+/// leave for the host (see `Attachment::interrupted`).
+const TERMINATION_INPUT_WAIT: Duration = Duration::from_millis(250);
 /// On leaving, how long the terminal may take to answer the query written
 /// after the reset (see `read_reports`). The answer ends the wait, so only a
 /// terminal that never answers pays it in full; one behind a slow link or a
@@ -556,7 +559,7 @@ impl Attachment<'_> {
     ) -> Result<Outcome> {
         let id = self.id;
         loop {
-            interrupted()?;
+            self.interrupted(transport, connection)?;
             let now = Instant::now();
             if connection.detach.is_none() {
                 connection.overflow.release(transport)?;
@@ -774,7 +777,7 @@ impl Attachment<'_> {
                 deadline.saturating_duration_since(now)
             };
             poll(&mut fds, wait)?;
-            interrupted()?;
+            self.interrupted(transport, connection)?;
             if fds[3].revents != 0 {
                 self.output.clear_wake();
             }
@@ -969,6 +972,32 @@ impl Attachment<'_> {
         }
         let mut fds = [pollfd(libc::STDIN_FILENO, libc::POLLIN)];
         poll(&mut fds, Duration::ZERO).is_ok() && fds[0].revents != 0
+    }
+
+    /// `sys::interrupted`, for an attached connection. A termination signal
+    /// ends the attachment at once, but the keys the terminal already sent
+    /// are the user's and go to the session first, as at the end of input:
+    /// those the detach key's parser still holds (a lone Escape waits
+    /// `ESCAPE_WAIT` to be told from an encoded detach key, so a signal
+    /// right after Escape would drop it and leave a program such as Neovim
+    /// in insert mode), with `TERMINATION_INPUT_WAIT` at most for the
+    /// transport to take them.
+    fn interrupted(
+        &mut self,
+        transport: &mut Transport,
+        connection: &mut Connection,
+    ) -> Result<()> {
+        if sys::termination_signal().is_some() && connection.detach.is_none() {
+            let rest = self.input.finish();
+            if !rest.is_empty()
+                && self
+                    .forward_input(transport, &mut connection.overflow, &rest)
+                    .is_ok()
+            {
+                let _ = flush_for(transport, TERMINATION_INPUT_WAIT);
+            }
+        }
+        interrupted()
     }
 
     /// Read terminal input that is ready (the caller knows it is, or it is
@@ -2168,6 +2197,24 @@ pub fn check_output_offset(expected: &mut u64, received: u64, len: usize) -> Res
         .checked_add(len as u64)
         .context("session output offset overflow")?;
     Ok(())
+}
+
+/// Write what the transport has queued, for `wait` at most; whether all of
+/// it left.
+fn flush_for(transport: &mut Transport, wait: Duration) -> Result<bool> {
+    let deadline = Instant::now() + wait;
+    loop {
+        transport.write_ready()?;
+        let now = Instant::now();
+        if transport.pending() == 0 {
+            return Ok(true);
+        }
+        if now >= deadline {
+            return Ok(false);
+        }
+        let mut fds = [pollfd(transport.write_fd(), libc::POLLOUT)];
+        poll(&mut fds, deadline - now)?;
+    }
 }
 
 /// The window size as the terminal reports it, unclamped, and the size of a

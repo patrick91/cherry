@@ -339,7 +339,7 @@ final class ProjectWindowRegistry {
         restoreWait: Duration = .seconds(10)
     ) async {
         let worktree = OrphanedSessionCriteria.projectRoot(of: info)
-        var repository = worktree.flatMap { repository(for: $0) }
+        var repository = worktree.flatMap { self.repository(for: $0) }
         if repository == nil, let worktree,
            let root = AgentSettings.shared.repositoryRoot(for: worktree), let opener = projectWindowOpener {
             opener(root)

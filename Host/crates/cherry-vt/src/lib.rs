@@ -4,9 +4,11 @@ use anyhow::{bail, ensure, Result};
 use std::{ffi::c_void, io::Write, marker::PhantomData, ptr::NonNull};
 
 mod events;
+mod graphics;
 pub use events::{
     parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
 };
+pub use graphics::{decode_rgba, GraphicsReplay, MAX_DECODED_BYTES, MAX_IMAGE_SIDE};
 
 type Handle = *mut c_void;
 type Sink = extern "C" fn(*mut c_void, *const u8, usize);
@@ -114,6 +116,14 @@ unsafe extern "C" {
     fn cherry_vt_debug_row(term: Handle, y: u32, sink: Sink, userdata: *mut c_void) -> i32;
     fn cherry_vt_row_flags(term: Handle, y: u32, wrap: *mut bool, continuation: *mut bool) -> i32;
     fn cherry_vt_lines_ending(term: Handle, first: u64, last: u64, count: *mut u64) -> i32;
+    fn cherry_vt_set_image_limit(term: Handle, bytes: u64) -> i32;
+    fn cherry_vt_placements(
+        term: Handle,
+        out: *mut graphics::RawPlacement,
+        cap: usize,
+        count: *mut usize,
+    ) -> i32;
+    fn cherry_vt_image(term: Handle, id: u32, out: *mut graphics::RawImage) -> i32;
     fn ghostty_terminal_free(term: Handle);
     fn ghostty_terminal_vt_write(term: Handle, bytes: *const u8, len: usize);
     fn ghostty_terminal_resize(
@@ -130,6 +140,29 @@ unsafe extern "C" {
         len: *mut usize,
     ) -> i32;
     fn ghostty_free(allocator: *const c_void, bytes: *mut c_void, len: usize);
+}
+
+/// A new terminal's cell size in pixels (see `Terminal::resize_cells`).
+pub const DEFAULT_CELL: (u32, u32) = (8, 16);
+/// The largest cell side, in pixels, `Terminal::resize_cells` takes.
+pub const MAX_CELL_SIDE: u32 = 4096;
+/// The kitty graphics `snapshot` and `snapshot_limited` re-send at most, in
+/// bytes (see `Terminal::graphics_replay`).
+pub const SNAPSHOT_GRAPHICS_BYTES: usize = 6 * 1024 * 1024;
+/// The kitty images each screen of a session's terminal keeps, in bytes
+/// (`Terminal::set_image_storage_limit`).
+pub const IMAGE_STORAGE_BYTES: u64 = 32 * 1024 * 1024;
+/// `graphics_replay` keeps the compressed images it sent for the next
+/// snapshot, in at most this many bytes.
+pub const GRAPHICS_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// A numbered image whose ID is above this is not re-sent (see
+/// `Terminal::graphics_replay`).
+const MAX_FILLERS: usize = 256;
+/// What one stand-in costs a snapshot, at most.
+const FILLER_BYTES: usize = 72;
+
+fn valid_cell(width: u32, height: u32) -> bool {
+    (1..=MAX_CELL_SIDE).contains(&width) && (1..=MAX_CELL_SIDE).contains(&height)
 }
 
 // Upstream formatter extras, see cherry_vt_extras in shim.c.
@@ -301,11 +334,17 @@ pub struct Terminal {
     handle: NonNull<c_void>,
     cols: u16,
     rows: u16,
+    /// The cell size in pixels, which size reports and images use.
+    cell_width: u32,
+    cell_height: u32,
     // C retains this address as every callback's userdata, so it is a heap
     // allocation of its own, freed after the terminal (see Drop).
     callbacks: NonNull<Callbacks>,
     /// `clear_history` waits for the output to finish a UTF-8 character.
     history_clear_pending: bool,
+    /// The images `graphics_replay` compressed, for the next one.
+    graphics_cache: std::cell::RefCell<graphics::Cache>,
+    compressions: std::cell::Cell<usize>,
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 unsafe impl Send for Terminal {}
@@ -361,6 +400,9 @@ pub struct Inspection {
     /// Tab stops, margins, keyboard mode, pen and character sets as VT.
     pub state: String,
     pub kitty_flags: u8,
+    /// The active screen's kitty image placements with their images'
+    /// pixels (as RGBA, summed), sorted.
+    pub graphics: Vec<String>,
 }
 
 impl Terminal {
@@ -368,6 +410,7 @@ impl Terminal {
     /// notifications and progress reports as events (`take_events`).
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self> {
         ensure!(cols > 0 && rows > 0, "terminal dimensions must be positive");
+        graphics::install_png_decoder();
         let callbacks = NonNull::from(Box::leak(Box::new(Callbacks {
             event,
             light: false,
@@ -396,8 +439,12 @@ impl Terminal {
             handle: NonNull::new(handle).expect("successful terminal creation"),
             cols,
             rows,
+            cell_width: DEFAULT_CELL.0,
+            cell_height: DEFAULT_CELL.1,
             callbacks,
             history_clear_pending: false,
+            graphics_cache: Default::default(),
+            compressions: Default::default(),
             _not_sync: PhantomData,
         })
     }
@@ -481,15 +528,228 @@ impl Terminal {
         unsafe { borrowed(ptr, len) }
     }
 
+    /// Resize to `cols` by `rows` cells, keeping the cell size. Returns the
+    /// replies the resize caused (an in-band size report, mode 2048).
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<Vec<u8>> {
+        self.resize_cells(cols, rows, self.cell_width, self.cell_height)
+    }
+
+    /// Resize to `cols` by `rows` cells of `cell_width` by `cell_height`
+    /// pixels, which size reports (CSI 14t, 16t, 18t, mode 2048) and kitty
+    /// images then use. A new terminal's cells are 8×16. A change of the
+    /// cell size alone changes no cell but reports the new size (mode
+    /// 2048) and ends synchronized output, as any resize does.
+    pub fn resize_cells(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Result<Vec<u8>> {
         ensure!(cols > 0 && rows > 0, "terminal dimensions must be positive");
+        ensure!(
+            valid_cell(cell_width, cell_height),
+            "cell size {cell_width}x{cell_height} is out of range"
+        );
         check(
-            unsafe { ghostty_terminal_resize(self.handle.as_ptr(), cols, rows, 8, 16) },
+            unsafe {
+                ghostty_terminal_resize(self.handle.as_ptr(), cols, rows, cell_width, cell_height)
+            },
             "resize",
         )?;
         self.cols = cols;
         self.rows = rows;
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
         Ok(std::mem::take(&mut self.callbacks().replies))
+    }
+
+    /// Test support: how many images `graphics_replay` compressed (those
+    /// it took from its cache are not counted).
+    #[doc(hidden)]
+    pub fn graphics_compressions(&self) -> usize {
+        self.compressions.get()
+    }
+
+    /// The cell size in pixels (`resize_cells`).
+    pub fn cell_size(&self) -> (u32, u32) {
+        (self.cell_width, self.cell_height)
+    }
+
+    /// How many bytes of kitty images each screen may keep; 0 (a new
+    /// terminal's) turns kitty graphics off and deletes every image.
+    pub fn set_image_storage_limit(&mut self, bytes: u64) -> Result<()> {
+        check(
+            unsafe { cherry_vt_set_image_limit(self.handle.as_ptr(), bytes) },
+            "image storage limit",
+        )
+    }
+
+    /// Kitty graphics commands that give a fresh renderer, which has just
+    /// replayed this terminal's active screen, its images and placements:
+    /// each image with a placement shown once (`a=t`, RGBA, zlib, in
+    /// chunks of 4096 base64 bytes), then each virtual placement (unicode
+    /// placeholders, `U=1`), and each direct placement all of whose rows
+    /// are on screen, at its cell, which the cursor is moved to (and left
+    /// at: `C=1`). Every command carries `q=2`. Images come newest first,
+    /// and one whose commands do not fit in what is left of `budget` bytes
+    /// is left out with its placements (`GraphicsReplay::dropped`). Not
+    /// carried: placements in the history or off screen, the primary
+    /// screen's images under the alternate screen, images without a
+    /// placement, and animation frames other than the current one.
+    pub fn graphics_replay(&self, budget: usize) -> Result<GraphicsReplay> {
+        let handle = self.handle.as_ptr();
+        let mut placements = vec![graphics::RawPlacement::default(); 16];
+        loop {
+            let mut count = 0;
+            check(
+                unsafe {
+                    cherry_vt_placements(
+                        handle,
+                        placements.as_mut_ptr(),
+                        placements.len(),
+                        &mut count,
+                    )
+                },
+                "placements",
+            )?;
+            if count <= placements.len() {
+                placements.truncate(count);
+                break;
+            }
+            placements = vec![graphics::RawPlacement::default(); count];
+        }
+        let mut replay = GraphicsReplay::default();
+        let mut cache = self.graphics_cache.borrow_mut();
+        let candidates = graphics::candidates(&placements, self.rows);
+        // Forget the images no longer shown.
+        cache.retain(|key| candidates.iter().any(|c| (c.id, c.generation) == *key));
+        struct Kept {
+            id: u32,
+            number: u32,
+            transmit: Vec<u8>,
+            places: Vec<u8>,
+        }
+        let mut kept: Vec<Kept> = Vec::new();
+        let mut used = 0;
+        // The smallest image that did not fit: no larger one is compressed
+        // after it (one already compressed is still tried).
+        let mut overflowed: Option<usize> = None;
+        for candidate in candidates {
+            let mut raw = graphics::RawImage {
+                width: 0,
+                height: 0,
+                format: 0,
+                data: std::ptr::null(),
+                len: 0,
+                number: 0,
+            };
+            if unsafe { cherry_vt_image(handle, candidate.id, &mut raw) } != 0 {
+                continue;
+            }
+            let pixels = raw.width as usize * raw.height as usize * 4;
+            let places: Vec<u8> = candidate
+                .placements
+                .iter()
+                .flat_map(graphics::place)
+                .collect();
+            // A numbered image gets its ID on the receiver from stand-ins
+            // under every lower ID that is free (see below), at most
+            // `MAX_FILLERS`, each paid for here.
+            let fillers = if raw.number == 0 {
+                0
+            } else if candidate.id as usize > MAX_FILLERS {
+                replay.dropped += 1;
+                replay.dropped_bytes += pixels;
+                replay.unnamed += 1;
+                continue;
+            } else {
+                (candidate.id as usize - 1) * FILLER_BYTES
+            };
+            let room = budget.saturating_sub(used);
+            let fixed = places.len() + fillers + 64;
+            let key = (candidate.id, candidate.generation);
+            let cached = cache.get(&key);
+            let too_big = cached.map_or_else(
+                || {
+                    graphics::encoded_at_least(pixels) + fixed > room
+                        || overflowed.is_some_and(|smallest| pixels >= smallest)
+                },
+                |payload| payload.len() + fixed > room,
+            );
+            if too_big {
+                replay.dropped += 1;
+                replay.dropped_bytes += pixels;
+                continue;
+            }
+            let payload = match cached {
+                Some(payload) => payload.clone(),
+                None => {
+                    // Borrowed until the terminal changes, which `&self`
+                    // excludes.
+                    let data = unsafe { borrowed(raw.data, raw.len) };
+                    let Some(rgba) = graphics::to_rgba(raw.width, raw.height, raw.format, data)
+                    else {
+                        continue;
+                    };
+                    self.compressions.set(self.compressions.get() + 1);
+                    let payload = std::rc::Rc::new(graphics::encode_pixels(&rgba));
+                    cache.insert(key, payload.clone());
+                    payload
+                }
+            };
+            let name = if raw.number == 0 {
+                graphics::Name::Id(candidate.id)
+            } else {
+                graphics::Name::Number(raw.number)
+            };
+            let transmit = graphics::transmit(name, raw.width, raw.height, &payload);
+            if transmit.len() + fixed - 64 > room {
+                overflowed = Some(overflowed.map_or(pixels, |smallest| smallest.min(pixels)));
+                replay.dropped += 1;
+                replay.dropped_bytes += pixels;
+                continue;
+            }
+            used += transmit.len() + fixed - 64;
+            replay.images += 1;
+            replay.placements += candidate.placements.len();
+            kept.push(Kept {
+                id: candidate.id,
+                number: raw.number,
+                transmit,
+                places,
+            });
+        }
+        // Images named by ID first. Then the numbered ones, lowest ID
+        // first: the receiver gives an image sent with only a number
+        // (`I=`) the lowest free ID, which is the one it has here once
+        // every lower free ID holds a stand-in (removed afterwards).
+        let mut taken: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for image in kept.iter().filter(|image| image.number == 0) {
+            replay.bytes.extend_from_slice(&image.transmit);
+            taken.insert(image.id);
+        }
+        let mut numbered: Vec<&Kept> = kept.iter().filter(|image| image.number != 0).collect();
+        numbered.sort_by_key(|image| image.id);
+        let mut fillers = Vec::new();
+        for image in numbered {
+            for id in 1..image.id {
+                if taken.insert(id) {
+                    replay.bytes.extend(graphics::filler(id));
+                    fillers.push(id);
+                }
+            }
+            replay.bytes.extend_from_slice(&image.transmit);
+            taken.insert(image.id);
+        }
+        for id in fillers {
+            replay.bytes.extend(graphics::remove_filler(id));
+        }
+        for image in &kept {
+            replay.bytes.extend_from_slice(&image.places);
+        }
+        cache.shrink_to(GRAPHICS_CACHE_BYTES);
+        Ok(replay)
     }
 
     /// The terminfo entry name the program runs under (its TERM), reported
@@ -681,10 +941,7 @@ impl Terminal {
     /// cursor, the kitty keyboard stack and unfinished UTF-8/control
     /// continuations. See the README for what is not carried.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        self.encode(Replay::Snapshot {
-            skip: 0,
-            layout: None,
-        })
+        Ok(self.snapshot_with(None, SNAPSHOT_GRAPHICS_BYTES, &[])?.0)
     }
 
     /// VT bytes that bring a terminal of the same dimensions which already
@@ -702,7 +959,7 @@ impl Terminal {
     /// one synchronized update (2026), which it leaves as the session has
     /// it.
     pub fn refresh(&self) -> Result<Vec<u8>> {
-        self.encode(Replay::Refresh)
+        self.encode(Replay::Refresh, &[])
     }
 
     /// `snapshot()` limited to `max_bytes`: the oldest history is dropped,
@@ -711,15 +968,46 @@ impl Terminal {
     /// the kept history starts with the start of a line; when that line
     /// continues into the active screen, all history is dropped. The active
     /// screen, and the primary screen under an alternate screen, are never
-    /// dropped; if they alone exceed the limit this fails.
+    /// dropped; if they alone exceed the limit this fails. The kitty
+    /// graphics it re-sends (see `snapshot_with`) come on top of the limit.
     pub fn snapshot_limited(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        Ok(self
+            .snapshot_with(Some(max_bytes), SNAPSHOT_GRAPHICS_BYTES, &[])?
+            .0)
+    }
+
+    /// `snapshot()`, or `snapshot_limited(max)` when a limit is given, with
+    /// at most `graphics_budget` bytes of kitty graphics: the images and
+    /// placements of the active screen (`graphics_replay`), after its
+    /// content and before the cursor, modes and the rest of its state, so
+    /// neither the cursor nor the saved cursor moves. `unfinished`, the
+    /// chunks of a kitty graphics transmission the output began and has
+    /// not ended (as renderers got them), follows the graphics, so the
+    /// chunks still to come complete it; it counts against the budget.
+    /// Also returns what the graphics carried and left out (without their
+    /// bytes).
+    pub fn snapshot_with(
+        &self,
+        max_bytes: Option<usize>,
+        graphics_budget: usize,
+        unfinished: &[u8],
+    ) -> Result<(Vec<u8>, GraphicsReplay)> {
+        let mut graphics =
+            self.graphics_replay(graphics_budget.saturating_sub(unfinished.len()))?;
+        let mut extra = std::mem::take(&mut graphics.bytes);
+        extra.extend_from_slice(unfinished);
+        let snapshot = |skip: u64, layout: Option<&mut Layout>| {
+            self.encode(Replay::Snapshot { skip, layout }, &extra)
+        };
+        let Some(max_bytes) = max_bytes else {
+            return Ok((snapshot(0, None)?, graphics));
+        };
         let mut layout = Layout::default();
-        let full = self.encode(Replay::Snapshot {
-            skip: 0,
-            layout: Some(&mut layout),
-        })?;
-        if full.len() <= max_bytes {
-            return Ok(full);
+        let full = snapshot(0, Some(&mut layout))?;
+        // The graphics come on top of the limit.
+        let text = |bytes: &[u8]| bytes.len() - extra.len();
+        if text(&full) <= max_bytes {
+            return Ok((full, graphics));
         }
         // offsets[i] is where history row i starts; offsets[history] is the
         // first active row.
@@ -729,7 +1017,7 @@ impl Terminal {
         } = layout;
         let rows = usize::from(self.rows);
         let history = offsets.len().saturating_sub(rows + 1);
-        let excess = full.len() - max_bytes;
+        let excess = text(&full) - max_bytes;
         // The first history row at or after `skip` that starts a line.
         let line_start = |skip: usize| {
             (skip.min(history)..history)
@@ -742,17 +1030,14 @@ impl Terminal {
         let mut step = 1;
         loop {
             let dropped = line_start(skip);
-            let candidate = self.encode(Replay::Snapshot {
-                skip: dropped as u64,
-                layout: None,
-            })?;
-            if candidate.len() <= max_bytes {
-                return Ok(candidate);
+            let candidate = snapshot(dropped as u64, None)?;
+            if text(&candidate) <= max_bytes {
+                return Ok((candidate, graphics));
             }
             ensure!(
                 dropped < history,
                 "the active screen needs a {}-byte snapshot; the limit is {max_bytes} bytes",
-                candidate.len()
+                text(&candidate)
             );
             skip = dropped + step;
             step *= 2;
@@ -881,7 +1166,9 @@ impl Terminal {
         ] {
             extra.extend(extras(handle, kind)?);
         }
+        let graphics = self.describe_graphics()?;
         Ok(Inspection {
+            graphics,
             alternate: state.alternate,
             history: rows,
             active,
@@ -893,7 +1180,69 @@ impl Terminal {
         })
     }
 
-    fn encode(&self, replay: Replay<'_>) -> Result<Vec<u8>> {
+    /// `graphics`: kitty graphics commands that follow the active screen's
+    /// content in a snapshot (never in a refresh).
+    /// Test support: each placement of the active screen, with its image.
+    fn describe_graphics(&self) -> Result<Vec<String>> {
+        let handle = self.handle.as_ptr();
+        let mut placements = vec![graphics::RawPlacement::default(); 256];
+        let mut count = 0;
+        check(
+            unsafe { cherry_vt_placements(handle, placements.as_mut_ptr(), 256, &mut count) },
+            "placements",
+        )?;
+        placements.truncate(count.min(256));
+        let mut out = Vec::new();
+        for p in placements {
+            let mut raw = graphics::RawImage {
+                width: 0,
+                height: 0,
+                format: 0,
+                data: std::ptr::null(),
+                len: 0,
+                number: 0,
+            };
+            let mut number = String::new();
+            let image = if unsafe { cherry_vt_image(handle, p.image_id, &mut raw) } == 0 {
+                if raw.number != 0 {
+                    number = format!("#{} ", raw.number);
+                }
+                let data = unsafe { borrowed(raw.data, raw.len) };
+                let rgba =
+                    graphics::to_rgba(raw.width, raw.height, raw.format, data).unwrap_or_default();
+                let sum = rgba.iter().enumerate().fold(0u64, |sum, (i, &b)| {
+                    sum.wrapping_mul(31).wrapping_add(b as u64 ^ i as u64)
+                });
+                format!("{}x{} {sum:x}", raw.width, raw.height)
+            } else {
+                "pending".into()
+            };
+            let at = if p.is_virtual {
+                "virtual".to_string()
+            } else {
+                format!("at {},{}", p.viewport_col, p.viewport_row)
+            };
+            // Not the placement ID, which a snapshot does not carry (see
+            // `graphics::place`).
+            out.push(format!(
+                "image {} {number}[{image}] {at} c={} r={} src={},{},{},{} off={},{} z={}",
+                p.image_id,
+                p.columns,
+                p.rows,
+                p.source_x,
+                p.source_y,
+                p.source_width,
+                p.source_height,
+                p.x_offset,
+                p.y_offset,
+                p.z
+            ));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn encode(&self, replay: Replay<'_>, graphics: &[u8]) -> Result<Vec<u8>> {
         let handle = self.handle.as_ptr();
         let continuation = allocated(|ptr, len| unsafe {
             ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
@@ -953,6 +1302,7 @@ impl Terminal {
                 Rows::from(refresh, skip, layout),
                 false,
                 &after_content,
+                &[],
                 &primary_stack,
                 &mut out,
             )?;
@@ -975,6 +1325,7 @@ impl Terminal {
                 Rows::from(refresh, 0, None),
                 true,
                 &saved,
+                graphics,
                 &stack,
                 &mut out,
             )?;
@@ -998,6 +1349,7 @@ impl Terminal {
                 Rows::from(refresh, skip, layout),
                 true,
                 &after_content,
+                graphics,
                 &stack,
                 &mut out,
             )?;
@@ -1063,12 +1415,15 @@ struct ScreenState {
 /// replayed under default modes. Content is always replayed under defaults;
 /// the pending-wrap glyph is reprinted before character sets are restored
 /// and before autowrap may be disabled. `kitty` is the screen's keyboard
-/// stack from `kitty_stack`.
+/// stack from `kitty_stack`. `graphics` (kitty graphics commands, which
+/// move the cursor) follow `after_content`, while origin mode is off and the
+/// margins are full.
 fn encode_screen(
     term: Handle,
     rows: Rows<'_>,
     last: bool,
     after_content: &[u8],
+    graphics: &[u8],
     kitty: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<ScreenState> {
@@ -1128,6 +1483,7 @@ fn encode_screen(
         }
     }
     out.extend_from_slice(after_content);
+    out.extend_from_slice(graphics);
     let mut margins = Vec::new();
     let (mut origin, mut wraparound, mut synchronized) = (false, true, false);
     let mut right = state.cols;

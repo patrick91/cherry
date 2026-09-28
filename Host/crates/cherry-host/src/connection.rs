@@ -714,6 +714,8 @@ impl Connection {
                 takeover,
                 answers_queries,
                 client_id,
+                cell_width,
+                cell_height,
             } => {
                 if self.attached.is_some() {
                     bail!("connection already attached");
@@ -737,6 +739,8 @@ impl Connection {
                     takeover,
                     answers_queries,
                     client_id,
+                    // A cell size out of range is no cell size.
+                    cell: cherry_protocol::valid_cell_size(cell_width, cell_height),
                     outbox: self.outbox.clone(),
                     abort: self.stream.try_clone()?,
                     cancelled: self.cancelled.clone(),
@@ -783,7 +787,12 @@ impl Connection {
                 }
                 return Ok((None, Flow::Continue));
             }
-            ClientMessage::Resize { cols, rows } => {
+            ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+            } => {
                 self.attached
                     .as_ref()
                     .context("attach before resize")?
@@ -791,6 +800,7 @@ impl Connection {
                         lease: self.lease,
                         cols,
                         rows,
+                        cell: cherry_protocol::valid_cell_size(cell_width, cell_height),
                     })?;
                 return Ok((None, Flow::Continue));
             }

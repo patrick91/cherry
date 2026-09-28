@@ -127,6 +127,13 @@ impl Host {
         command
     }
 
+    /// `cherry attach <id>`.
+    fn command_attach(&self, id: &str) -> Command {
+        let mut command = self.command();
+        command.args(["attach", id]);
+        command
+    }
+
     fn json(&self, args: &[&str]) -> serde_json::Value {
         let output = self.command().args(args).output().unwrap();
         assert!(
@@ -312,13 +319,19 @@ impl Attached {
         Self::with_command(command, cols, rows)
     }
 
-    fn with_command(mut command: Command, cols: u16, rows: u16) -> Self {
+    fn with_command(command: Command, cols: u16, rows: u16) -> Self {
+        Self::with_window(command, cols, rows, (0, 0))
+    }
+
+    /// Attached through a terminal of `cols` by `rows` cells and `pixels`
+    /// (width, height; 0 when it does not say).
+    fn with_window(mut command: Command, cols: u16, rows: u16, pixels: (u16, u16)) -> Self {
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: pixels.0,
+            ws_ypixel: pixels.1,
         };
         assert_eq!(
             unsafe {
@@ -2108,4 +2121,83 @@ fn a_client_never_replaces_a_newer_unordered_or_foreign_daemon() {
     );
     assert_eq!(serving_daemons(&host.socket), [host.child.id() as i32]);
     assert_eq!(host.json(&["status", "--json"])["build"], OLD_BUILD);
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn kitty_images_come_back_when_attaching_again_and_programs_see_pixels() {
+    let host = Host::start();
+    // Image 7 (one RGB pixel) placed at the cursor; image 9 (two pixels)
+    // placed virtually, shown by two placeholder cells (U+10EEEE, row and
+    // column diacritics, the image ID as the foreground colour). Then, for
+    // each line, the PTY's size as the program sees it.
+    let script = format!(
+        r#"printf '\033_Ga=T,f=24,s=1,v=1,i=7,q=2;AQID\033\\\r\n'
+printf '\033_Ga=T,U=1,f=24,s=2,v=1,i=9,c=2,r=1,q=2;AQIDBAUG\033\\'
+printf '\033[38;5;9m\364\216\273\256\314\205\314\205\364\216\273\256\314\205\314\215\033[m\r\n'
+printf 'READY\n'
+while IFS= read -r line; do
+  perl -e 'ioctl(STDIN, {}, my $w = "\0" x 8) or die "TIOCGWINSZ: $!"; printf("PIXELS:%d:%d:%d:%d\n", unpack("S4", $w))'
+done"#,
+        libc::TIOCGWINSZ
+    );
+    let created = host.json(&[
+        "new", "--cwd", "/tmp", "--name", "Kitty", "--", "/bin/sh", "-c", &script,
+    ]);
+    let id = created["id"].as_str().unwrap();
+    // A window of 10x21-pixel cells.
+    let mut first = Attached::with_window(host.command_attach(id), 80, 24, (800, 504));
+    first.expect(b"READY");
+    first.master.write_all(b"size\n").unwrap();
+    first.expect(b"PIXELS:24:80:800:504");
+    first.master.write_all(&[0x1d]).unwrap();
+    assert!(first.wait().success());
+    host.wait_for_detached_running(id, &created["pid"]);
+
+    let mut second = Attached::with_window(host.command_attach(id), 80, 24, (800, 504));
+    second.expect(b"READY");
+    // The images come after the snapshot's reset, quietly.
+    second.expect(b"U=1,i=9");
+    let received = String::from_utf8_lossy(&second.received).into_owned();
+    let after = &received[received.rfind("\x1bc").expect("the snapshot's reset")..];
+    let commands: Vec<&str> = after
+        .split("\x1b_G")
+        .skip(1)
+        .map(|command| command.split([';', '\x1b']).next().unwrap())
+        .collect();
+    let has = |keys: &[&str]| {
+        commands
+            .iter()
+            .any(|control| keys.iter().all(|key| control.split(',').any(|k| k == *key)))
+    };
+    assert!(has(&["a=t", "i=7", "q=2"]), "{commands:?}");
+    assert!(has(&["a=p", "i=7", "q=2"]), "{commands:?}");
+    assert!(has(&["a=t", "i=9", "q=2"]), "{commands:?}");
+    assert!(has(&["a=p", "U=1", "i=9", "q=2"]), "{commands:?}");
+    assert!(
+        commands
+            .iter()
+            .all(|control| control.split(',').any(|key| key == "q=2")),
+        "{commands:?}"
+    );
+    // The program still sees the window's pixels.
+    let reports = |attached: &Attached| {
+        String::from_utf8_lossy(&attached.received)
+            .matches("PIXELS:24:80:800:504")
+            .count()
+    };
+    let before = reports(&second);
+    second.master.write_all(b"size\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reports(&second) == before {
+        assert!(Instant::now() < deadline, "no second report");
+        second.expect(b"PIXELS");
+        thread::sleep(Duration::from_millis(20));
+        let mut bytes = [0u8; 4096];
+        if let Ok(n) = second.master.read(&mut bytes) {
+            second.received.extend_from_slice(&bytes[..n]);
+        }
+    }
+    second.master.write_all(&[0x1d]).unwrap();
+    assert!(second.wait().success());
 }

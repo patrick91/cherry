@@ -2072,7 +2072,8 @@ fn real_pty_forwards_resize_and_control_c_and_restores_mode_on_sigterm() {
             read_client(&mut stream),
             Some(ClientMessage::Resize {
                 cols: 101,
-                rows: 41
+                rows: 41,
+                ..
             })
         ));
         resized_tx.send(()).unwrap();
@@ -2129,7 +2130,8 @@ fn a_resize_that_sets_the_shared_grid_switches_straight_to_the_new_snapshot() {
             read_client(&mut stream),
             Some(ClientMessage::Resize {
                 cols: 101,
-                rows: 41
+                rows: 41,
+                ..
             })
         ));
         // A moment later, as over a network.
@@ -2204,7 +2206,8 @@ fn a_repeated_resize_signal_keeps_waiting_for_the_grid() {
             read_client(&mut stream),
             Some(ClientMessage::Resize {
                 cols: 101,
-                rows: 41
+                rows: 41,
+                ..
             })
         ));
         resized_tx.send(()).unwrap();
@@ -7254,7 +7257,7 @@ fn the_first_resize_goes_at_once_and_those_right_after_it_as_one() {
         let mut sizes = Vec::new();
         loop {
             match read_client(&mut stream) {
-                Some(ClientMessage::Resize { cols, rows }) => {
+                Some(ClientMessage::Resize { cols, rows, .. }) => {
                     sizes.push(((cols, rows), Instant::now()));
                     resized_tx.send((cols, rows)).unwrap();
                     if (cols, rows) == (110, 45) {
@@ -7330,7 +7333,8 @@ fn a_resized_grid_keeps_what_the_window_shows_while_the_program_repaints() {
             read_client(&mut stream),
             Some(ClientMessage::Resize {
                 cols: 101,
-                rows: 41
+                rows: 41,
+                ..
             })
         ));
         for frame in [
@@ -7564,7 +7568,10 @@ fn without_a_copy_the_client_asks_the_host_for_one_to_paint_a_viewport() {
                 other => asked.push(format!("{other:?}")),
             }
         }
-        assert_eq!(asked, ["Some(Resize { cols: 101, rows: 41 })"]);
+        assert_eq!(
+            asked,
+            ["Some(Resize { cols: 101, rows: 41, cell_width: None, cell_height: None })"]
+        );
         for frame in [
             ServerMessage::Attached {
                 reason: AttachReason::Resize,

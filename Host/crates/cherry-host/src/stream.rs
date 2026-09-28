@@ -27,6 +27,75 @@ pub struct DisplayStream {
     escaped: bool,
     utf8_left: usize,
     discarding: bool,
+    transfer: Transfer,
+}
+
+/// A chunked kitty graphics transmission (`m=1`) that has begun and not
+/// ended, as renderers get it (`q=2`): a snapshot taken meanwhile carries
+/// it, so the chunks that follow complete it on the renderer as on the
+/// host. At most `cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES`; a longer
+/// one is dropped, and so are its later chunks.
+#[derive(Default)]
+struct Transfer {
+    chunks: Vec<u8>,
+    /// Its chunks go on, but it was dropped.
+    dropped: bool,
+}
+
+impl Transfer {
+    fn observe(&mut self, token: &[u8]) {
+        if token == b"\x1bc" {
+            // A reset abandons it.
+            *self = Self::default();
+            return;
+        }
+        let Some(body) = token
+            .strip_prefix(b"\x1b_G")
+            .and_then(|rest| rest.strip_suffix(b"\x1b\\"))
+        else {
+            return;
+        };
+        let control = body.split(|&b| b == b';').next().unwrap_or_default();
+        let keys: Vec<&[u8]> = control
+            .split(|&b| b == b',')
+            .filter(|k| !k.is_empty())
+            .collect();
+        if keys.contains(&&b"a=q"[..]) {
+            return;
+        }
+        let more = keys.contains(&&b"m=1"[..]);
+        let continues = keys
+            .iter()
+            .all(|key| key.starts_with(b"m=") || key.starts_with(b"q="));
+        if continues {
+            if self.chunks.is_empty() && !self.dropped {
+                return;
+            }
+        } else {
+            *self = Self::default();
+            if !more {
+                return;
+            }
+        }
+        if !more {
+            *self = Self::default();
+            return;
+        }
+        if self.dropped {
+            return;
+        }
+        let Route::Split { display, .. } = route_graphics(token) else {
+            return;
+        };
+        if self.chunks.len() + display.len() > cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES {
+            *self = Self {
+                chunks: Vec::new(),
+                dropped: true,
+            };
+            return;
+        }
+        self.chunks.extend(display);
+    }
 }
 #[derive(Default, PartialEq, Eq)]
 enum Mode {
@@ -154,6 +223,12 @@ const ENQ: u8 = 0x05;
 const ESC: u8 = 0x1b;
 
 impl DisplayStream {
+    /// The chunks of a kitty graphics transmission that has begun and not
+    /// ended, as renderers got them (see `Transfer`); empty when none.
+    pub fn unfinished_transfer(&self) -> &[u8] {
+        &self.transfer.chunks
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Batch {
         let mut batch = Batch {
             terminal: Vec::with_capacity(bytes.len()),
@@ -361,6 +436,7 @@ impl DisplayStream {
     fn finish(&mut self, batch: &mut Batch) {
         if !self.discarding {
             batch.token(&self.pending);
+            self.transfer.observe(&self.pending);
         }
         self.pending.clear();
         self.reset();
@@ -919,8 +995,13 @@ mod tests {
             .collect()
     }
 
+    /// What a session's terminal, which keeps kitty images, answers.
     fn host_replies(bytes: &[u8]) -> Vec<u8> {
-        cherry_vt::Terminal::new(80, 24, 4096).unwrap().feed(bytes)
+        let mut terminal = cherry_vt::Terminal::new(80, 24, 4096).unwrap();
+        terminal
+            .set_image_storage_limit(crate::holder::IMAGE_STORAGE_BYTES)
+            .unwrap();
+        terminal.feed(bytes)
     }
 
     /// Every query has exactly one responder: either the host answers it
@@ -1516,6 +1597,52 @@ mod tests {
             // Byte after byte too.
             assert_eq!(split(bytes).answered, answered, "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn an_unfinished_chunked_transmission_is_kept_until_it_ends() {
+        let mut stream = DisplayStream::default();
+        stream.feed(b"\x1b_Ga=T,f=100,i=3,m=1;AAAA\x1b\\text");
+        assert_eq!(
+            stream.unfinished_transfer(),
+            b"\x1b_Ga=T,f=100,i=3,m=1,q=2;AAAA\x1b\\"
+        );
+        // A probe or another command in between leaves it alone.
+        stream.feed(b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\\x1b[H");
+        stream.feed(b"\x1b_Gm=1;BBBB\x1b");
+        stream.feed(b"\\");
+        assert_eq!(
+            stream.unfinished_transfer(),
+            b"\x1b_Ga=T,f=100,i=3,m=1,q=2;AAAA\x1b\\\x1b_Gm=1,q=2;BBBB\x1b\\"
+        );
+        // Its last chunk ends it.
+        stream.feed(b"\x1b_Gm=0;CCCC\x1b\\");
+        assert!(stream.unfinished_transfer().is_empty());
+        // Continuation chunks without a beginning are not kept.
+        stream.feed(b"\x1b_Gm=1;DDDD\x1b\\");
+        assert!(stream.unfinished_transfer().is_empty());
+        // A new transmission replaces one, and a reset abandons it.
+        stream.feed(b"\x1b_Ga=t,i=4,m=1;AAAA\x1b\\\x1b_Ga=t,i=5,m=1;BBBB\x1b\\");
+        assert_eq!(
+            stream.unfinished_transfer(),
+            b"\x1b_Ga=t,i=5,m=1,q=2;BBBB\x1b\\"
+        );
+        stream.feed(b"\x1bc");
+        assert!(stream.unfinished_transfer().is_empty());
+        // One too large for a snapshot is dropped, with the rest of it.
+        let chunk = [&b"\x1b_Gm=1;"[..], &[b'A'; 4096], b"\x1b\\"].concat();
+        stream.feed(b"\x1b_Ga=t,i=6,m=1;AAAA\x1b\\");
+        for _ in 0..(cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES / 4096 + 1) {
+            stream.feed(&chunk);
+        }
+        assert!(stream.unfinished_transfer().is_empty());
+        stream.feed(&chunk);
+        assert!(stream.unfinished_transfer().is_empty());
+        stream.feed(b"\x1b_Gm=0;AAAA\x1b\\\x1b_Ga=t,i=7,m=1;AAAA\x1b\\");
+        assert_eq!(
+            stream.unfinished_transfer(),
+            b"\x1b_Ga=t,i=7,m=1,q=2;AAAA\x1b\\"
+        );
     }
 
     #[test]

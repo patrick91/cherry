@@ -1996,3 +1996,444 @@ fn clearing_history_keeps_the_screen_and_an_unfinished_sequence() {
     assert_eq!(terminal.cursor().unwrap().x, plain.cursor().unwrap().x);
     assert!(!terminal.screen_text().unwrap().contains('\u{fffd}'));
 }
+
+// ---------------------------------------------------------------------------
+// Kitty graphics.
+
+const IMAGE_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// A terminal that keeps kitty images, as the holder's does.
+fn graphics_term(cols: u16, rows: u16) -> Terminal {
+    let mut terminal = term(cols, rows);
+    terminal.set_image_storage_limit(IMAGE_LIMIT).unwrap();
+    terminal
+}
+
+fn png_bytes(width: u32, height: u32, color: png::ColorType, pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+fn apc(control: &str, payload: &[u8]) -> Vec<u8> {
+    [
+        format!("\x1b_G{control};").as_bytes(),
+        &graphics::base64(payload),
+        b"\x1b\\",
+    ]
+    .concat()
+}
+
+/// Pseudo-random bytes, which do not compress.
+fn noise(len: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+/// A unicode placeholder cell for row `row` and column `col` of an image
+/// whose ID is the foreground colour (set by the caller).
+fn placeholder(row: usize, col: usize) -> String {
+    const DIACRITICS: [char; 4] = ['\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}'];
+    format!("\u{10EEEE}{}{}", DIACRITICS[row], DIACRITICS[col])
+}
+
+#[test]
+fn png_images_are_stored_and_probes_answer_ok() {
+    let mut terminal = graphics_term(40, 10);
+    let pixels = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 9, 9, 128];
+    let png = png_bytes(2, 2, png::ColorType::Rgba, &pixels);
+    let reply = terminal.feed(&apc("a=T,f=100,i=5", &png));
+    assert_eq!(reply, b"\x1b_Gi=5;OK\x1b\\");
+    let reply = terminal.feed(&apc("a=q,f=100,i=31", &png));
+    assert_eq!(reply, b"\x1b_Gi=31;OK\x1b\\");
+    let graphics = terminal.inspect().unwrap().graphics;
+    assert_eq!(graphics.len(), 1, "{graphics:?}");
+    assert!(
+        graphics[0].starts_with("image 5 [2x2 ") && graphics[0].contains("at 0,0"),
+        "{graphics:?}"
+    );
+    // Grey, grey with alpha and palette images become RGBA too.
+    let gray = png_bytes(3, 1, png::ColorType::Grayscale, &[0, 128, 255]);
+    assert_eq!(
+        decode_rgba(&gray).unwrap().2,
+        [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]
+    );
+    let gray_alpha = png_bytes(1, 1, png::ColorType::GrayscaleAlpha, &[7, 9]);
+    assert_eq!(decode_rgba(&gray_alpha).unwrap(), (1, 1, vec![7, 7, 7, 9]));
+    let rgb = png_bytes(1, 1, png::ColorType::Rgb, &[1, 2, 3]);
+    assert_eq!(decode_rgba(&rgb).unwrap(), (1, 1, vec![1, 2, 3, 255]));
+}
+
+#[test]
+fn a_malformed_or_oversized_png_fails_without_a_panic() {
+    let mut terminal = graphics_term(40, 10);
+    for payload in [
+        b"not a png at all".to_vec(),
+        // A valid signature and a truncated header.
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00".to_vec(),
+        // A valid PNG cut short in its data.
+        png_bytes(4, 4, png::ColorType::Rgba, &noise(64, 3))[..60].to_vec(),
+        // Wider than any image may be.
+        png_bytes(
+            MAX_IMAGE_SIDE + 1,
+            1,
+            png::ColorType::Grayscale,
+            &vec![0; MAX_IMAGE_SIDE as usize + 1],
+        ),
+    ] {
+        assert!(decode_rgba(&payload).is_err());
+        let reply = terminal.feed(&apc("a=q,f=100,i=31", &payload));
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("\x1b_Gi=31;"), "{reply:?}");
+        assert!(!reply.contains(";OK"), "{reply:?}");
+    }
+    // The terminal still works.
+    let png = png_bytes(1, 1, png::ColorType::Rgb, &[1, 2, 3]);
+    assert_eq!(
+        terminal.feed(&apc("a=q,f=100,i=1", &png)),
+        b"\x1b_Gi=1;OK\x1b\\"
+    );
+    // Too many pixels, though each side is allowed.
+    let side = 5000;
+    let wide = png_bytes(
+        side,
+        side,
+        png::ColorType::Grayscale,
+        &vec![0; (side * side) as usize],
+    );
+    assert!(decode_rgba(&wide).is_err());
+}
+
+#[test]
+fn size_reports_give_the_cell_size_the_terminal_was_resized_with() {
+    let mut terminal = term(80, 24);
+    assert_eq!(terminal.cell_size(), DEFAULT_CELL);
+    assert_eq!(terminal.feed(b"\x1b[16t"), b"\x1b[6;16;8t");
+    terminal.resize_cells(100, 30, 10, 21).unwrap();
+    assert_eq!(terminal.feed(b"\x1b[16t"), b"\x1b[6;21;10t");
+    assert_eq!(terminal.feed(b"\x1b[14t"), b"\x1b[4;630;1000t");
+    assert_eq!(terminal.feed(b"\x1b[18t"), b"\x1b[8;30;100t");
+    // A plain resize keeps the cells.
+    terminal.resize(90, 20).unwrap();
+    assert_eq!(terminal.feed(b"\x1b[14t"), b"\x1b[4;420;900t");
+    // The cells alone can change, and an in-band report says so.
+    terminal.feed(b"\x1b[?2048h");
+    let reply = terminal.resize_cells(90, 20, 12, 24).unwrap();
+    assert_eq!(reply, b"\x1b[48;20;90;480;1080t");
+    assert_eq!(terminal.feed(b"\x1b[16t"), b"\x1b[6;24;12t");
+    assert!(terminal.resize_cells(90, 20, 0, 24).is_err());
+    assert!(terminal
+        .resize_cells(90, 20, 12, MAX_CELL_SIDE + 1)
+        .is_err());
+}
+
+/// A screen with a direct placement of image 7 (an RGB PNG would do as
+/// well; this is raw RGB), a virtual placement of image 9 with its
+/// placeholder cells, text around them, and the cursor and saved cursor
+/// away from the images.
+fn screen_with_images() -> Terminal {
+    let mut terminal = graphics_term(40, 10);
+    terminal.resize_cells(40, 10, 10, 20).unwrap();
+    terminal.feed(b"top line\r\n");
+    terminal.feed(&apc("a=T,f=24,s=1,v=1,i=7,q=2", &[200, 100, 50]));
+    terminal.feed(b"\r\n");
+    let png = png_bytes(2, 2, png::ColorType::Rgba, &noise(16, 9));
+    terminal.feed(&apc("a=T,f=100,U=1,i=9,c=2,r=2,q=2", &png));
+    terminal.feed(
+        format!(
+            "\x1b[38;5;9m{}{}\r\n{}{}\x1b[m\r\n",
+            placeholder(0, 0),
+            placeholder(0, 1),
+            placeholder(1, 0),
+            placeholder(1, 1)
+        )
+        .as_bytes(),
+    );
+    // A second placement of 7, with a placement ID, source rectangle and
+    // offsets, further down.
+    terminal.feed(b"\x1b[6;5H");
+    terminal.feed(&apc("a=p,i=7,p=3,X=2,Y=3,c=2,r=1,z=-1,C=1,q=2", &[]));
+    terminal.feed(b"\x1b[3;7H\x1b7\x1b[8;12Hafter");
+    terminal
+}
+
+#[test]
+fn a_snapshot_brings_back_images_and_placements() {
+    let original = screen_with_images();
+    let graphics = original.inspect().unwrap().graphics;
+    assert_eq!(graphics.len(), 3, "{graphics:?}");
+    assert!(
+        graphics
+            .iter()
+            .any(|g| g.starts_with("image 9 ") && g.contains("virtual")),
+        "{graphics:?}"
+    );
+    let snapshot = original.snapshot().unwrap();
+    let mut copy = graphics_term(40, 10);
+    copy.resize_cells(40, 10, 10, 20).unwrap();
+    assert!(copy.feed(&snapshot).is_empty(), "q=2: nothing answers");
+    assert_same(&original, &copy);
+    // The saved cursor is where it was, too.
+    let mut original = original;
+    original.feed(b"\x1b8");
+    copy.feed(b"\x1b8");
+    assert_eq!(original.cursor().unwrap(), copy.cursor().unwrap());
+    assert_eq!(copy.cursor().unwrap().y, 2);
+    // A terminal that keeps no images still takes the snapshot.
+    let mut plain = term(40, 10);
+    plain.feed(&snapshot);
+    assert_eq!(
+        plain.inspect().unwrap().active,
+        copy.inspect().unwrap().active
+    );
+}
+
+#[test]
+fn a_snapshot_resends_images_after_the_reset_and_the_content() {
+    let original = screen_with_images();
+    let snapshot = original.snapshot().unwrap();
+    let at = |needle: &[u8]| {
+        snapshot
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("{:?} missing", String::from_utf8_lossy(needle)))
+    };
+    let reset = at(b"\x1bc");
+    let transmit = at(b"\x1b_Ga=t,i=7,s=1,v=1,f=32,o=z,q=2,");
+    assert!(reset < transmit);
+    assert!(at("after".as_bytes()) < transmit);
+    // Placement IDs are not carried (Ghostty's own cannot be told from the
+    // program's).
+    assert!(
+        at(b"\x1b_Ga=t,i=9,s=2,v=2,f=32,o=z,q=2,") < at(b"\x1b_Ga=p,U=1,i=9,c=2,r=2,q=2\x1b\\")
+    );
+    assert!(contains(&snapshot, b"\x1b[2;1H\x1b_Ga=p,i=7,C=1,q=2\x1b\\"));
+    assert!(contains(
+        &snapshot,
+        b"\x1b[6;5H\x1b_Ga=p,i=7,X=2,Y=3,c=2,r=1,z=-1,C=1,q=2\x1b\\"
+    ));
+    assert!(!contains(&snapshot, b",p="));
+    // Every graphics command is quiet.
+    let text = String::from_utf8_lossy(&snapshot);
+    for command in text.split("\x1b_G").skip(1) {
+        let control = command.split([';', '\x1b']).next().unwrap();
+        assert!(control.split(',').any(|key| key == "q=2"), "{control}");
+    }
+    // The cursor goes back after the graphics.
+    let cursor = text.rfind("\x1b[8;17H").expect("the cursor");
+    assert!(cursor > text.rfind("\x1b_G").unwrap());
+    // A refresh re-sends none.
+    assert!(!contains(&original.refresh().unwrap(), b"\x1b_G"));
+}
+
+#[test]
+fn the_graphics_budget_drops_the_oldest_images() {
+    let mut terminal = graphics_term(40, 20);
+    for (row, id) in [1u32, 2, 3].into_iter().enumerate() {
+        terminal.feed(format!("\x1b[{};1H", row * 3 + 1).as_bytes());
+        terminal.feed(&apc(
+            &format!("a=T,f=32,s=32,v=32,i={id},C=1,q=2"),
+            &noise(32 * 32 * 4, id),
+        ));
+    }
+    let full = terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!((full.images, full.placements, full.dropped), (3, 3, 0));
+    // Room for two of the three.
+    let budget = full.bytes.len() * 2 / 3 + 200;
+    let replay = terminal.graphics_replay(budget).unwrap();
+    assert_eq!(
+        (replay.images, replay.placements, replay.dropped),
+        (2, 2, 1)
+    );
+    assert_eq!(replay.dropped_bytes, 32 * 32 * 4);
+    assert!(replay.bytes.len() <= budget);
+    assert!(!contains(&replay.bytes, b"i=1,"));
+    assert!(contains(&replay.bytes, b"a=t,i=2,") && contains(&replay.bytes, b"a=t,i=3,"));
+    // The newest first.
+    let at = |needle: &[u8]| replay.bytes.windows(needle.len()).position(|w| w == needle);
+    assert!(at(b"a=t,i=3,") < at(b"a=t,i=2,"));
+    // Nothing fits.
+    let none = terminal.graphics_replay(10).unwrap();
+    assert_eq!((none.images, none.dropped), (0, 3));
+    assert!(none.bytes.is_empty());
+    // The snapshot's own limit leaves the graphics out of its count.
+    let (limited, graphics) = terminal.snapshot_with(Some(4096), budget, &[]).unwrap();
+    assert_eq!((graphics.images, graphics.dropped), (2, 1));
+    assert!(graphics.bytes.is_empty());
+    assert!(limited.len() > 2 * 32 * 32 * 4);
+    assert!(contains(&limited, b"a=t,i=3,") && contains(&limited, b"a=t,i=2,"));
+}
+
+#[test]
+fn images_off_screen_or_in_history_are_not_resent() {
+    let mut terminal = graphics_term(20, 5);
+    terminal.feed(&apc("a=T,f=24,s=1,v=1,i=4,q=2", &[1, 2, 3]));
+    terminal.feed(&numbered(10));
+    let replay = terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!((replay.images, replay.placements), (0, 0));
+    assert!(replay.bytes.is_empty());
+}
+
+/// A terminal of `source`'s size and cells that keeps images, with
+/// `source`'s snapshot replayed.
+fn graphics_copy(source: &Terminal) -> Terminal {
+    let mut copy = graphics_term(source.cols, source.rows);
+    let (width, height) = source.cell_size();
+    copy.resize_cells(source.cols, source.rows, width, height)
+        .unwrap();
+    assert!(copy.feed(&source.snapshot().unwrap()).is_empty());
+    copy
+}
+
+#[test]
+fn a_placement_named_later_lands_alike_on_the_host_and_the_renderer() {
+    let mut original = graphics_term(40, 10);
+    original.feed(&apc("a=t,f=24,s=1,v=1,i=7,q=2", &[1, 2, 3]));
+    // Three placements without an ID: Ghostty numbers them itself.
+    for row in [1, 3, 5] {
+        original.feed(format!("\x1b[{row};1H").as_bytes());
+        original.feed(&apc("a=p,i=7,C=1,q=2", &[]));
+    }
+    let mut copy = graphics_copy(&original);
+    assert_eq!(copy.inspect().unwrap().graphics.len(), 3);
+    // The program names one now: a fourth on both.
+    for terminal in [&mut original, &mut copy] {
+        terminal.feed(b"\x1b[8;1H");
+        terminal.feed(&apc("a=p,i=7,p=1,C=1,q=2", &[]));
+    }
+    assert_eq!(original.inspect().unwrap().graphics.len(), 4);
+    assert_eq!(copy.inspect().unwrap().graphics.len(), 4);
+    assert_eq!(original.inspect().unwrap(), copy.inspect().unwrap());
+}
+
+#[test]
+fn numbered_images_keep_their_number_and_id() {
+    let mut original = graphics_term(40, 10);
+    // I=5 gets ID 1 and I=6 ID 2; then 1 is deleted, leaving a gap, and
+    // image 4 is named by its ID.
+    original.feed(&apc("a=t,f=24,s=1,v=1,I=5,q=2", &[1, 2, 3]));
+    original.feed(&apc("a=t,f=24,s=1,v=1,I=6,q=2", &[4, 5, 6]));
+    original.feed(&apc("a=d,d=I,i=1,q=2", &[]));
+    original.feed(&apc("a=t,f=24,s=1,v=1,i=4,q=2", &[7, 8, 9]));
+    for (row, image) in [(1, "I=6"), (3, "i=4")] {
+        original.feed(format!("\x1b[{row};1H").as_bytes());
+        original.feed(&apc(&format!("a=p,{image},C=1,q=2"), &[]));
+    }
+    let graphics = original.inspect().unwrap().graphics;
+    assert!(
+        graphics.iter().any(|g| g.starts_with("image 2 #6 ")),
+        "{graphics:?}"
+    );
+    let mut copy = graphics_copy(&original);
+    assert_eq!(original.inspect().unwrap(), copy.inspect().unwrap());
+    // Placed by its number again: both find it.
+    for terminal in [&mut original, &mut copy] {
+        terminal.feed(b"\x1b[6;1H");
+        terminal.feed(&apc("a=p,I=6,C=1,q=2", &[]));
+        terminal.feed(b"\x1b[8;1H");
+        terminal.feed(&apc("a=p,i=2,C=1,q=2", &[]));
+    }
+    assert_eq!(original.inspect().unwrap().graphics.len(), 4);
+    assert_eq!(original.inspect().unwrap(), copy.inspect().unwrap());
+}
+
+#[test]
+fn replayed_images_are_compressed_once_and_not_past_the_budget() {
+    let mut terminal = graphics_term(40, 20);
+    for (row, id) in [1u32, 2, 3].into_iter().enumerate() {
+        terminal.feed(format!("\x1b[{};1H", row * 3 + 1).as_bytes());
+        terminal.feed(&apc(
+            &format!("a=T,f=32,s=64,v=64,i={id},C=1,q=2"),
+            &noise(64 * 64 * 4, id),
+        ));
+    }
+    let first = terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!(terminal.graphics_compressions(), 3);
+    let again = terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!(again, first);
+    assert_eq!(terminal.graphics_compressions(), 3, "cached");
+    // A new image under an old ID is compressed again.
+    terminal.feed(b"\x1b[1;1H");
+    terminal.feed(&apc(
+        "a=T,f=32,s=64,v=64,i=3,C=1,q=2",
+        &noise(64 * 64 * 4, 99),
+    ));
+    terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!(terminal.graphics_compressions(), 4);
+
+    // A budget no image can fit in compresses nothing, and one that the
+    // first image overflows compresses no more of the same size.
+    let mut fresh = graphics_term(40, 20);
+    for (row, id) in [1u32, 2, 3].into_iter().enumerate() {
+        fresh.feed(format!("\x1b[{};1H", row * 3 + 1).as_bytes());
+        fresh.feed(&apc(
+            &format!("a=T,f=32,s=64,v=64,i={id},C=1,q=2"),
+            &noise(64 * 64 * 4, id),
+        ));
+    }
+    let none = fresh.graphics_replay(10).unwrap();
+    assert_eq!((none.images, none.dropped), (0, 3));
+    assert_eq!(fresh.graphics_compressions(), 0);
+    let overflow = fresh.graphics_replay(5000).unwrap();
+    assert_eq!((overflow.images, overflow.dropped), (0, 3));
+    assert_eq!(fresh.graphics_compressions(), 1);
+}
+
+#[test]
+fn pngs_larger_than_the_image_storage_are_refused() {
+    let side = 3000;
+    let big = png_bytes(
+        side,
+        side,
+        png::ColorType::Grayscale,
+        &vec![0; (side * side) as usize],
+    );
+    assert!((side * side * 4) as u64 > IMAGE_STORAGE_BYTES);
+    assert!(decode_rgba(&big).is_err());
+}
+
+#[test]
+fn a_numbered_image_whose_id_is_too_high_to_give_again_is_left_out() {
+    let mut terminal = graphics_term(40, 10);
+    // Numbers 1 to 300 take IDs 1 to 300; all but the last are deleted.
+    for number in 1..=300 {
+        terminal.feed(&apc(
+            &format!("a=t,f=24,s=1,v=1,I={number},q=2"),
+            &[1, 2, 3],
+        ));
+    }
+    for id in 1..300 {
+        terminal.feed(&apc(&format!("a=d,d=I,i={id},q=2"), &[]));
+    }
+    terminal.feed(&apc("a=p,I=300,C=1,q=2", &[]));
+    let replay = terminal.graphics_replay(usize::MAX).unwrap();
+    assert_eq!((replay.images, replay.dropped, replay.unnamed), (0, 1, 1));
+    assert!(replay.bytes.is_empty());
+}
+
+#[test]
+fn rgba_pngs_decode_to_their_pixels() {
+    let pixels = noise(3 * 2 * 4, 5);
+    let png = png_bytes(3, 2, png::ColorType::Rgba, &pixels);
+    assert_eq!(decode_rgba(&png).unwrap(), (3, 2, pixels.clone()));
+    let mut terminal = graphics_term(40, 10);
+    terminal.feed(&apc("a=T,f=100,i=2,q=2", &png));
+    let mut direct = graphics_term(40, 10);
+    direct.feed(&apc("a=T,f=32,s=3,v=2,i=2,q=2", &pixels));
+    assert_eq!(
+        terminal.inspect().unwrap().graphics,
+        direct.inspect().unwrap().graphics
+    );
+}

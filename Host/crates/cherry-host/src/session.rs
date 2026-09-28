@@ -116,6 +116,9 @@ pub enum Command {
         /// Names the client: an attachment with the same ID is dropped
         /// (see `Worker::drop_stale`).
         client_id: Option<String>,
+        /// The client's cell size in pixels, when it gave one (see
+        /// `Worker::cell_source`).
+        cell: Option<(u32, u32)>,
         outbox: Arc<Outbox>,
         abort: UnixStream,
         cancelled: Arc<AtomicBool>,
@@ -153,6 +156,8 @@ pub enum Command {
         lease: u64,
         cols: u16,
         rows: u16,
+        /// The window's new cell size in pixels; None keeps the one it had.
+        cell: Option<(u32, u32)>,
     },
     /// The attachment asks for a replacement of the grid
     /// (`ClientMessage::Refresh`).
@@ -261,6 +266,8 @@ struct Attachment {
     answers_queries: bool,
     /// See `Command::Attach`.
     client_id: Option<String>,
+    /// Its cell size in pixels, when it gave one.
+    cell: Option<(u32, u32)>,
 }
 
 impl Attachment {
@@ -736,6 +743,7 @@ impl Session {
             grid_due: None,
             grid_changed: None,
             typist: None,
+            cell_sent: None,
             next_req: 1,
             requests: BTreeMap::new(),
             waiting: VecDeque::new(),
@@ -914,6 +922,10 @@ struct Snapshot {
     size: (u16, u16),
 }
 
+/// A client's window: its cell size, columns and rows (see
+/// `Worker::cell_source`).
+type CellCandidate = (Option<(u32, u32)>, u16, u16);
+
 /// An attach waiting for its snapshot.
 struct PendingAttach {
     lease: u64,
@@ -922,6 +934,7 @@ struct PendingAttach {
     takeover: bool,
     answers_queries: bool,
     client_id: Option<String>,
+    cell: Option<(u32, u32)>,
     outbox: Arc<Outbox>,
     abort: UnixStream,
     cancelled: Arc<AtomicBool>,
@@ -943,6 +956,7 @@ impl PendingAttach {
             takeover: self.takeover,
             answers_queries: self.answers_queries,
             client_id: self.client_id,
+            cell: self.cell,
             outbox: self.outbox,
             abort: self.abort,
             cancelled: self.cancelled,
@@ -1024,6 +1038,8 @@ struct Worker {
     /// Of the attachments whose terminal answers queries, the one that most
     /// recently sent input: it answers them (see `send_query`).
     typist: Option<u64>,
+    /// The cell size the holder was last given (link version 8).
+    cell_sent: Option<(u32, u32)>,
     next_req: u64,
     requests: BTreeMap<u64, Request>,
     /// Attaches waiting for the one in progress: one at a time, so each
@@ -1120,6 +1136,8 @@ impl Worker {
 
     fn update_attached_flag(&mut self) {
         self.attend();
+        // The client that gives the cell size may have come or gone.
+        self.sync_cell(None);
         {
             let mut info = self.info();
             let clients = u32::try_from(self.attached.len()).unwrap_or(u32::MAX);
@@ -1201,14 +1219,15 @@ impl Worker {
         if self.size() == (cols, rows) || !self.running() {
             return;
         }
-        self.resize(cols, rows);
+        self.resize(cols, rows, None);
         self.send_resized(|_| true, true);
     }
 
     /// Resize the terminal. The holder applies it before any request that
     /// follows, so the snapshots asked for next have the new size.
-    fn resize(&mut self, cols: u16, rows: u16) {
-        if !self.tell(link::encode(kind::RESIZE, &link::Size { cols, rows }, &[])) {
+    fn resize(&mut self, cols: u16, rows: u16, attaching: Option<CellCandidate>) {
+        let cell = self.cell_source((cols, rows), attaching);
+        if !self.send_size(cols, rows, cell) {
             return;
         }
         self.grid_changed = Some(Instant::now());
@@ -1218,6 +1237,75 @@ impl Worker {
             info.rows = rows;
         }
         self.changed();
+    }
+
+    /// Tell the holder the grid and `cell` (from link version 8; an older
+    /// holder gets the grid alone). Whether it was sent.
+    fn send_size(&mut self, cols: u16, rows: u16, cell: Option<(u32, u32)>) -> bool {
+        let version = self.link.as_ref().map_or(0, |link| link.version);
+        let size = link::Size::for_holder(cols, rows, cell, version);
+        if !self.tell(link::encode(kind::RESIZE, &size, &[])) {
+            return false;
+        }
+        if let Some(cell) = size.cell() {
+            self.cell_sent = Some(cell);
+        }
+        true
+    }
+
+    /// The cell size the session's terminal reports for a grid of `size`:
+    /// that of the window that sets the grid, of those that gave one (its
+    /// columns and rows are the grid's, or else one of them is), so the
+    /// PTY's pixels match the window the program is sized for; the one the
+    /// holder has among equals, or else the first attached. `attaching`: a
+    /// window not attached yet, which counts as the last. Which client
+    /// types, or answers queries, changes nothing: a new cell size makes
+    /// the program repaint.
+    fn cell_source(
+        &self,
+        size: (u16, u16),
+        attaching: Option<CellCandidate>,
+    ) -> Option<(u32, u32)> {
+        let windows: Vec<CellCandidate> = self
+            .attached
+            .iter()
+            .filter(|a| !a.cancelled.load(Ordering::SeqCst) && !a.outbox.is_dead())
+            .map(|a| (a.cell, a.cols, a.rows))
+            .chain(attaching)
+            .filter(|(cell, _, _)| cell.is_some())
+            .collect();
+        let rank = |&(_, cols, rows): &CellCandidate| match (
+            (cols, rows) == size,
+            cols == size.0 || rows == size.1,
+        ) {
+            (true, _) => 0,
+            (false, true) => 1,
+            (false, false) => 2,
+        };
+        let best = windows.iter().map(rank).min()?;
+        let leaders: Vec<&CellCandidate> = windows.iter().filter(|w| rank(w) == best).collect();
+        leaders
+            .iter()
+            .find(|(cell, _, _)| *cell == self.cell_sent)
+            .or(leaders.first())
+            .and_then(|(cell, _, _)| *cell)
+    }
+
+    /// Give the holder the cell size of `cell_source` when it is not the one
+    /// it has, keeping the grid.
+    fn sync_cell(&mut self, attaching: Option<CellCandidate>) {
+        if !self.running() {
+            return;
+        }
+        let Some(cell) = self.cell_source(self.size(), attaching) else {
+            return;
+        };
+        let version = self.link.as_ref().map_or(0, |link| link.version);
+        if Some(cell) == self.cell_sent || version < link::CELL_SIZE_VERSION {
+            return;
+        }
+        let (cols, rows) = self.size();
+        self.send_size(cols, rows, Some(cell));
     }
 
     /// Send the attachments `due` selects an `Attached{Resize}` for the
@@ -1569,6 +1657,7 @@ impl Worker {
                 takeover,
                 answers_queries,
                 client_id,
+                cell,
                 outbox,
                 abort,
                 cancelled,
@@ -1580,6 +1669,7 @@ impl Worker {
                 takeover,
                 answers_queries,
                 client_id,
+                cell,
                 outbox,
                 abort,
                 cancelled,
@@ -1659,7 +1749,12 @@ impl Worker {
                 }
                 let _ = ack.send(applied);
             }
-            Command::Resize { lease, cols, rows } => {
+            Command::Resize {
+                lease,
+                cols,
+                rows,
+                cell,
+            } => {
                 if !valid_size(cols, rows) {
                     self.send_to(
                         lease,
@@ -1678,13 +1773,21 @@ impl Worker {
                 let changed = (attachment.cols, attachment.rows) != (cols, rows);
                 attachment.cols = cols;
                 attachment.rows = rows;
+                if cell.is_some() {
+                    attachment.cell = cell;
+                }
                 if self.leads_grid(cols, rows) {
                     // The grid follows this window at once (see
-                    // `leads_grid`); it gets its replacement with the others.
+                    // `leads_grid`), with its cell size; it gets its
+                    // replacement with the others.
                     self.grid_due = None;
                     self.change_size(cols, rows);
+                    self.sync_cell(None);
                     return;
                 }
+                // A new cell size goes to the holder at once, before the grid
+                // settles.
+                self.sync_cell(None);
                 self.schedule_grid();
                 let size = self.size();
                 let target = self.grid_due.map_or(size, |(_, target)| target);
@@ -1977,8 +2080,9 @@ impl Worker {
         };
         let resized = dimensions != self.size();
         pending.resized = resized;
+        let attaching = Some((pending.cell, pending.cols, pending.rows));
         if resized {
-            self.resize(dimensions.0, dimensions.1);
+            self.resize(dimensions.0, dimensions.1, attaching);
             if !pending.takeover {
                 // The other windows get replacements for the new size;
                 // those that need a full snapshot get this one's. The
@@ -1987,6 +2091,9 @@ impl Worker {
                 pending.full_others = full;
                 self.request_screens(screens, true);
             }
+        } else {
+            // Its snapshot already sees the cell size it brings.
+            self.sync_cell(attaching);
         }
         self.request_snapshot("limited", Request::Attach(pending));
     }
@@ -2049,6 +2156,7 @@ impl Worker {
             takeover,
             answers_queries,
             client_id,
+            cell,
             outbox,
             abort,
             cancelled,
@@ -2151,6 +2259,7 @@ impl Worker {
             resync_after: None,
             answers_queries,
             client_id,
+            cell,
         });
         self.update_attached_flag();
         self.schedule_grid();

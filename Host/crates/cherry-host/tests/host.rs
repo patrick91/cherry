@@ -148,7 +148,15 @@ fn takeover_moves_live_session_without_restarting_or_accepting_stale_input() {
     drop(first);
     assert!(host.wait(&session.id, |s| s.attached).attached);
 
-    send(&mut second, &ClientMessage::Resize { cols: 90, rows: 28 });
+    send(
+        &mut second,
+        &ClientMessage::Resize {
+            cols: 90,
+            rows: 28,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     screen.wait_size(&mut second, 90, 28);
     input(&mut second, b"NEW_CONTROLLER\n");
     screen.wait_text(&mut second, "INPUT:NEW_CONTROLLER");
@@ -195,6 +203,8 @@ fn shared_attachments_both_type_and_resize_to_smallest_client_until_detach() {
         &ClientMessage::Resize {
             cols: 120,
             rows: 40,
+            cell_width: None,
+            cell_height: None,
         },
     );
     screen1.wait_size(&mut first, 100, 30);
@@ -240,6 +250,8 @@ fn rapid_resizes_are_coalesced_into_one_snapshot_while_other_windows_watch() {
             &ClientMessage::Resize {
                 cols: 80 + step,
                 rows: 20 + step,
+                cell_width: None,
+                cell_height: None,
             },
         );
         thread::sleep(Duration::from_millis(10));
@@ -275,10 +287,26 @@ fn a_lone_windows_drag_changes_the_grid_at_every_step() {
     let session = host.create(shell("exec sleep 60"));
     let (mut socket, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut screen = Screen::new(100, 30, offset, &snapshot);
-    send(&mut socket, &ClientMessage::Resize { cols: 90, rows: 25 });
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 90,
+            rows: 25,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     screen.wait_size(&mut socket, 90, 25);
     let started = Instant::now();
-    send(&mut socket, &ClientMessage::Resize { cols: 91, rows: 26 });
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 91,
+            rows: 26,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     screen.wait_size(&mut socket, 91, 26);
     // Not held back for the size to settle, even on a busy machine.
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -1437,6 +1465,8 @@ fn replies_echo_request_ids_and_several_requests_can_be_in_flight() {
                 takeover: false,
                 answers_queries: false,
                 client_id: None,
+                cell_width: None,
+                cell_height: None,
             },
         ),
     )
@@ -1557,6 +1587,8 @@ fn protocol_4_control_requests_are_answered_on_one_connection() {
                 takeover: false,
                 answers_queries: false,
                 client_id: None,
+                cell_width: None,
+                cell_height: None,
             },
             error_code::UNKNOWN_SESSION,
         ),
@@ -2000,7 +2032,15 @@ fn another_clients_stuck_paste_does_not_stall_this_client() {
     let mut screen = Screen::new(80, 24, offset, &snapshot);
     // Its resizes and heartbeats are still read and answered.
     let started = Instant::now();
-    send(&mut other, &ClientMessage::Resize { cols: 80, rows: 20 });
+    send(
+        &mut other,
+        &ClientMessage::Resize {
+            cols: 80,
+            rows: 20,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     ping_until(&mut other, &mut screen, "the resize", |screen| {
         (screen.cols, screen.rows) == (80, 20)
     });

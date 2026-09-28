@@ -84,6 +84,15 @@
 //!   `Launch` gains `colors`, the colours and appearance its terminal
 //!   reports to the program; a holder that does not know it reports its
 //!   defaults.
+//! - Version 8 adds the cell size, as fields: `cell_width` and
+//!   `cell_height` in `Resize` (`Size`), the pixels of one cell of the
+//!   client window the session's size queries follow (see
+//!   `session::Worker::sync_cell`). The holder gives its terminal (size
+//!   reports, kitty images) and the PTY (`TIOCGWINSZ` pixels) that cell
+//!   size, and a `Resize` that changes only the cell size resizes both
+//!   without changing the grid. Its full and limited snapshots re-send the
+//!   kitty images on screen (see `cherry_vt::Terminal::graphics_replay`).
+//!   An older holder is never sent the fields (its PTY keeps 0×0 pixels).
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -97,7 +106,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 7;
+pub const LINK_VERSION: u16 = 8;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
@@ -109,10 +118,17 @@ pub const PACE_VERSION: u16 = 6;
 /// The oldest link version whose holders report bracketed paste and take
 /// `ClearHistory`.
 pub const CLEAR_HISTORY_VERSION: u16 = 7;
+/// The oldest link version whose holders take a cell size in `Size`.
+pub const CELL_SIZE_VERSION: u16 = 8;
 /// The oldest link version this daemon adopts holders of.
 pub const MIN_LINK_VERSION: u16 = 1;
-/// Frames are at most this long (an 8 MiB snapshot, and room to spare).
+/// Frames are at most this long (an 8 MiB snapshot with its images, and
+/// room to spare).
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
+const _: () = assert!(
+    cherry_protocol::MAX_SNAPSHOT_BYTES + cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES + 64 * 1024
+        < MAX_FRAME
+);
 /// Bytes before the meta: kind, version and the meta length.
 const HEADER: usize = 1 + 2 + 4;
 /// The room a read into `Reader`'s buffer has, at least.
@@ -637,10 +653,36 @@ pub struct Req {
     pub req: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+/// Daemon to holder (`RESIZE`): the grid, and from version 8 the cell size
+/// in pixels, which a holder keeps until another one comes (see
+/// `Size::for_holder`).
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Size {
     pub cols: u16,
     pub rows: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_height: Option<u32>,
+}
+
+impl Size {
+    /// A resize for a holder of link `version`: the cell size only from
+    /// version 8 (`CELL_SIZE_VERSION`).
+    pub fn for_holder(cols: u16, rows: u16, cell: Option<(u32, u32)>, version: u16) -> Self {
+        let cell = cell.filter(|_| version >= CELL_SIZE_VERSION);
+        Self {
+            cols,
+            rows,
+            cell_width: cell.map(|(width, _)| width),
+            cell_height: cell.map(|(_, height)| height),
+        }
+    }
+
+    /// The cell size, when it came whole.
+    pub fn cell(&self) -> Option<(u32, u32)> {
+        cherry_protocol::valid_cell_size(self.cell_width, self.cell_height)
+    }
 }
 
 /// A snapshot request: `full`, `limited` (to `max` bytes, the oldest
@@ -848,7 +890,16 @@ mod tests {
         let frames = [
             encode(kind::QUERY, &Empty {}, b"\x1b[?6n"),
             bare(kind::KILL),
-            encode(kind::RESIZE, &Size { cols: 90, rows: 30 }, &[]),
+            encode(
+                kind::RESIZE,
+                &Size {
+                    cols: 90,
+                    rows: 30,
+                    cell_width: None,
+                    cell_height: None,
+                },
+                &[],
+            ),
         ]
         .concat();
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1022,6 +1073,31 @@ mod tests {
             with.colors.map(|colors| (colors.background, colors.dark)),
             Some((cherry_protocol::Rgb([255, 255, 255]), false))
         );
+    }
+
+    #[test]
+    fn only_a_holder_of_version_8_is_sent_a_cell_size() {
+        const { assert!(LINK_VERSION >= CELL_SIZE_VERSION) };
+        let json = |size: &Size| serde_json::to_string(size).unwrap();
+        for version in 1..CELL_SIZE_VERSION {
+            let size = Size::for_holder(80, 24, Some((9, 18)), version);
+            assert_eq!(json(&size), r#"{"cols":80,"rows":24}"#, "{version}");
+        }
+        let size = Size::for_holder(80, 24, Some((9, 18)), CELL_SIZE_VERSION);
+        assert_eq!(
+            json(&size),
+            r#"{"cols":80,"rows":24,"cell_width":9,"cell_height":18}"#
+        );
+        assert_eq!(size.cell(), Some((9, 18)));
+        let frame = encode(kind::RESIZE, &size, &[]);
+        assert_eq!(decode(&frame[4..]).unwrap().meta::<Size>().unwrap(), size);
+        // Without a cell size, and from an older daemon.
+        assert_eq!(
+            json(&Size::for_holder(80, 24, None, LINK_VERSION)),
+            r#"{"cols":80,"rows":24}"#
+        );
+        let old: Size = serde_json::from_str(r#"{"cols":80,"rows":24}"#).unwrap();
+        assert_eq!(old.cell(), None);
     }
 
     #[test]

@@ -415,7 +415,8 @@ offset, pending events}`, `Output{offset, bytes}`, `Query{bytes}`,
 `InputAck{lease, bytes}`, `DetachDone{req}`, `Info{changed fields}`,
 `Event{bell|notification|progress}`, `Exited{exit_code, signal}`.
 Daemon → holder: `Input{lease, bytes}`, `DiscardLease{lease}`, `Detach{req,
-lease}`, `Resize{cols, rows}`, `Snapshot{req, kind: full|limited(max)|refresh}`,
+lease}`, `Resize{cols, rows, cell_width?, cell_height?}` (the cell size from
+link version 8), `Snapshot{req, kind: full|limited(max)|refresh}`,
 `Screen{req, scrollback}`, `Kill`, `Remove`.
 
 Because the holder serializes output and snapshot replies on one stream, a
@@ -548,7 +549,7 @@ differs from the design above.
 
 - The daemon (`cherry-host serve`) and one holder per session
   (`cherry-host hold --socket …`, link on fd 3, never the daemon's child) are
-  implemented as designed. The holder link is at `LINK_VERSION` 7, and a
+  implemented as designed. The holder link is at `LINK_VERSION` 8, and a
   daemon speaks every version from 1. Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
@@ -559,7 +560,11 @@ differs from the design above.
   additive; version 4 adds only `application_cursor_keys` (in `Info` and
   the hello's session), and version 7 adds `bracketed_paste` there (left
   out by older holders, which the daemon then reports as unknown), the
-  daemon-to-holder `ClearHistory`, and `Launch.colors`. On Linux a daemon starts holders from its own image
+  daemon-to-holder `ClearHistory`, and `Launch.colors`; version 8 adds the
+  cell size to `Resize` (`cell_width`, `cell_height`), which the holder
+  gives its terminal (size reports, kitty images) and the PTY's pixels, and
+  its full and limited snapshots re-send the kitty images on screen (see
+  "Kitty graphics" in `Host/README.md`, with the known gaps). On Linux a daemon starts holders from its own image
   (`/proc/self/exe`); on macOS from its executable's path, which after an
   app update is the new build, so `Launch` fields are additive too.
 - A crashed holder reports its session exited with code 1, and says why:

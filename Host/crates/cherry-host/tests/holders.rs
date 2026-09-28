@@ -1689,7 +1689,15 @@ fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens
         // The small window shrinks the grid; the holder is asked where the
         // new size took effect, which it may answer without the screens
         // (the program on the alternate screen repaints).
-        send(&mut small, &ClientMessage::Resize { cols: 70, rows: 20 });
+        send(
+            &mut small,
+            &ClientMessage::Resize {
+                cols: 70,
+                rows: 20,
+                cell_width: None,
+                cell_height: None,
+            },
+        );
         let resize = holder.expect(link::RESIZE);
         assert_eq!(
             (resize.meta["cols"].as_u64(), resize.meta["rows"].as_u64()),

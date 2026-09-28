@@ -7,6 +7,8 @@
 #include <ghostty/vt/snapshot.h>
 #include <ghostty/vt/allocator.h>
 #include <ghostty/vt/style.h>
+#include <ghostty/vt/kitty_graphics.h>
+#include <ghostty/vt/sys.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -16,11 +18,18 @@
 // Receives encoded bytes. Rust appends them to a Vec.
 typedef void (*CherrySink)(void *userdata, const uint8_t *bytes, size_t len);
 
+// Size reports (CSI 14t, 16t, 18t) give the cell size the terminal was last
+// resized with (`cherry_vt_new` starts it at 8x16).
 static bool terminal_size(GhosttyTerminal term, void *userdata, GhosttySizeReportSize *out) {
     (void)userdata;
-    out->cell_width = 8; out->cell_height = 16;
-    return !ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLS, &out->columns)
-        && !ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ROWS, &out->rows);
+    uint32_t width = 0, height = 0;
+    if (ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLS, &out->columns)
+        || ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ROWS, &out->rows)
+        || ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_WIDTH_PX, &width)
+        || ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_HEIGHT_PX, &height)) return false;
+    out->cell_width = out->columns && width ? width / out->columns : 8;
+    out->cell_height = out->rows && height ? height / out->rows : 16;
+    return true;
 }
 
 // The head of Rust's `Callbacks`, which is every callback's userdata.
@@ -151,6 +160,12 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
     // replays the rows into.
     GhosttyTerminalModeConfig graphemes = { .mode = ghostty_mode_new(2027, false), .value = true };
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
+    // Kitty graphics stay off until `cherry_vt_set_image_limit` turns them
+    // on: only the holder's terminal keeps images.
+    uint64_t no_images = 0;
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &no_images);
+    // A nominal cell size until the first resize that gives one.
+    if (!rc) rc = ghostty_terminal_resize(*out, cols, rows, 8, 16);
     if (rc) { ghostty_terminal_free(*out); *out = NULL; }
     return rc;
 }
@@ -1015,4 +1030,121 @@ int cherry_vt_lines_ending(GhosttyTerminal term, uint64_t first, uint64_t last, 
     }
     *count = lines;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Kitty graphics.
+
+int cherry_vt_install_png(GhosttySysDecodePngFn decode) {
+    return ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)decode);
+}
+
+// The kitty image storage limit of every screen, in bytes; 0 turns kitty
+// graphics off (and deletes every image).
+int cherry_vt_set_image_limit(GhosttyTerminal term, uint64_t bytes) {
+    return ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &bytes);
+}
+
+// Mirrored by `RawPlacement` in lib.rs.
+typedef struct {
+    uint32_t image_id, placement_id;
+    uint32_t x_offset, y_offset;
+    uint32_t source_x, source_y, source_width, source_height;
+    uint32_t columns, rows;
+    int32_t z;
+    int32_t viewport_col, viewport_row;
+    uint32_t grid_cols, grid_rows;
+    uint64_t generation;      // the image's
+    bool is_virtual, visible; // visible: at least partly in the viewport
+    bool has_pixels;          // the image's data is complete
+} CherryPlacement;
+
+// The active screen's placements, at most `cap` of them into `out`, and how
+// many there are in `*count` (which may exceed `cap`). Placements whose
+// image is gone are skipped.
+int cherry_vt_placements(GhosttyTerminal term, CherryPlacement *out, size_t cap, size_t *count) {
+    *count = 0;
+    GhosttyKittyGraphics graphics = NULL;
+    int rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics);
+    if (rc == GHOSTTY_NO_VALUE) return 0;
+    if (rc) return rc;
+    GhosttyKittyGraphicsPlacementIterator it = NULL;
+    rc = ghostty_kitty_graphics_placement_iterator_new(NULL, &it);
+    if (rc) return rc;
+    rc = ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR, &it);
+    size_t n = 0;
+    while (!rc && ghostty_kitty_graphics_placement_next(it)) {
+        CherryPlacement p;
+        memset(&p, 0, sizeof(p));
+        GhosttyKittyGraphicsPlacementData keys[] = {
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_X_OFFSET, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_X, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_Y,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_WIDTH, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_HEIGHT,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_COLUMNS, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_ROWS,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z,
+        };
+        void *values[] = {
+            &p.image_id, &p.placement_id, &p.is_virtual, &p.x_offset, &p.y_offset,
+            &p.source_x, &p.source_y, &p.source_width, &p.source_height,
+            &p.columns, &p.rows, &p.z,
+        };
+        rc = ghostty_kitty_graphics_placement_get_multi(it, sizeof(keys) / sizeof(keys[0]), keys, values, NULL);
+        if (rc) break;
+        GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, p.image_id);
+        if (!image) continue;
+        const uint8_t *pixels = NULL;
+        p.has_pixels = !ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &pixels)
+            && pixels != NULL;
+        rc = ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &p.generation);
+        if (rc) break;
+        GhosttyKittyGraphicsPlacementRenderInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        rc = ghostty_kitty_graphics_placement_render_info(it, image, term, &info);
+        if (rc) break;
+        p.viewport_col = info.viewport_col;
+        p.viewport_row = info.viewport_row;
+        p.grid_cols = info.grid_cols;
+        p.grid_rows = info.grid_rows;
+        p.visible = info.viewport_visible;
+        if (n < cap) out[n] = p;
+        n++;
+    }
+    ghostty_kitty_graphics_placement_iterator_free(it);
+    *count = n;
+    return rc;
+}
+
+// Mirrored by `RawImage` in lib.rs. `data` is borrowed until the terminal
+// next changes.
+typedef struct {
+    uint32_t width, height;
+    int32_t format;  // GhosttyKittyImageFormat
+    const uint8_t *data;
+    size_t len;
+    uint32_t number; // its image number (I=), 0 for none
+} CherryImage;
+
+// Image `id` of the active screen, with its decoded pixels. GHOSTTY_NO_VALUE
+// when there is no such image or its data is still pending.
+int cherry_vt_image(GhosttyTerminal term, uint32_t id, CherryImage *out) {
+    memset(out, 0, sizeof(*out));
+    GhosttyKittyGraphics graphics = NULL;
+    int rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics);
+    if (rc) return rc;
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, id);
+    if (!image) return GHOSTTY_NO_VALUE;
+    GhosttyKittyImageFormat format = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+    GhosttyKittyGraphicsImageData keys[] = {
+        GHOSTTY_KITTY_IMAGE_DATA_WIDTH, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, GHOSTTY_KITTY_IMAGE_DATA_FORMAT,
+        GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN,
+        GHOSTTY_KITTY_IMAGE_DATA_NUMBER,
+    };
+    void *values[] = { &out->width, &out->height, &format, &out->data, &out->len, &out->number };
+    rc = ghostty_kitty_graphics_image_get_multi(image, sizeof(keys) / sizeof(keys[0]), keys, values, NULL);
+    out->format = (int32_t)format;
+    if (!rc && !out->data) rc = GHOSTTY_NO_VALUE;
+    return rc;
 }

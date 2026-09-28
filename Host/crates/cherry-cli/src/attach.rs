@@ -203,12 +203,13 @@ pub fn attach(
     // this thread starts meanwhile (ssh, a host) starts at the default.
     priority::prepare_process();
     let id = target.id;
-    let physical = physical_size();
+    let (physical, cell) = physical_size();
     let sent_size = protocol_size(physical);
     let first = request_attach(
         slot.as_mut().expect("connected"),
         id,
         sent_size,
+        cell,
         target.takeover,
         target.client_id,
         RPC_TIMEOUT,
@@ -236,7 +237,7 @@ pub fn attach(
         terminal_paste: PasteMarkers::default(),
         paste_tail: None,
     }
-    .run(slot, reconnect, first, sent_size);
+    .run(slot, reconnect, first, sent_size, cell);
     // Before the reset changes the copy's modes.
     output.reporting = renderer.reporting();
     output.reset = renderer.detach_reset();
@@ -283,12 +284,13 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Attach at `size` and wait for the snapshot, as long as something arrives
-/// every `idle`.
+/// Attach at `size`, with cells of `cell` pixels when the window knows them,
+/// and wait for the snapshot, as long as something arrives every `idle`.
 fn request_attach(
     transport: &mut Transport,
     id: &str,
     size: (u16, u16),
+    cell: Option<(u32, u32)>,
     takeover: bool,
     client_id: Option<&str>,
     idle: Duration,
@@ -303,6 +305,8 @@ fn request_attach(
         answers_queries: unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1
             && same_terminal(libc::STDIN_FILENO, libc::STDOUT_FILENO),
         client_id: client_id.map(str::to_owned),
+        cell_width: cell.map(|(width, _)| width),
+        cell_height: cell.map(|(_, height)| height),
     })?;
     // The host expects heartbeats from its acknowledgement on, which can be
     // long before a large snapshot has arrived.
@@ -391,6 +395,8 @@ struct Connection {
     offset: u64,
     /// The grid size last requested.
     sent_size: (u16, u16),
+    /// The cell size last sent, in pixels.
+    sent_cell: Option<(u32, u32)>,
     overflow: Overflow,
     resize_at: Option<Instant>,
     /// When the last Resize was sent: the next waits for `RESIZE_COALESCE`
@@ -412,6 +418,8 @@ struct Reattached {
     snapshot: Snapshot,
     /// The grid size requested.
     size: (u16, u16),
+    /// The cell size sent with it.
+    cell: Option<(u32, u32)>,
     /// The window's size then.
     physical: (u16, u16),
 }
@@ -440,15 +448,16 @@ impl Attachment<'_> {
         reconnect: &mut Reconnect,
         first: Snapshot,
         sent_size: (u16, u16),
+        sent_cell: Option<(u32, u32)>,
     ) -> Result<Outcome> {
-        let (mut snapshot, mut sent_size) = (first, sent_size);
+        let (mut snapshot, mut sent_size, mut sent_cell) = (first, sent_size, sent_cell);
         // A paste the lost connection left open in the session, still to be
         // ended.
         let mut open_paste = false;
         loop {
             let transport = slot.as_mut().expect("connected");
             let mut connection = None;
-            let result = match self.start(transport, snapshot, sent_size) {
+            let result = match self.start(transport, snapshot, sent_size, sent_cell) {
                 Err(error) => Err(error),
                 Ok(started) => {
                     let connection = connection.insert(started);
@@ -491,6 +500,7 @@ impl Attachment<'_> {
                     *slot = Some(reattached.transport);
                     snapshot = reattached.snapshot;
                     sent_size = reattached.size;
+                    sent_cell = reattached.cell;
                     self.renderer.physical = reattached.physical;
                 }
                 Reconnected::Ended(outcome) => return Ok(outcome),
@@ -506,6 +516,7 @@ impl Attachment<'_> {
         transport: &mut Transport,
         snapshot: Snapshot,
         sent_size: (u16, u16),
+        sent_cell: Option<(u32, u32)>,
     ) -> Result<Connection> {
         transport.silence_stderr();
         self.connected_at = Instant::now();
@@ -519,6 +530,7 @@ impl Attachment<'_> {
         Ok(Connection {
             offset: snapshot.offset,
             sent_size,
+            sent_cell,
             overflow: Overflow::default(),
             resize_at: None,
             resize_sent: None,
@@ -578,20 +590,28 @@ impl Attachment<'_> {
             }
             if connection.resize_at.is_some_and(|at| now >= at) {
                 connection.resize_at = None;
-                let physical = physical_size();
+                let (physical, cell) = physical_size();
                 let size = protocol_size(physical);
+                // A cell size the host has not been sent; a window that no
+                // longer reports one keeps the last.
+                let new_cell = cell.filter(|&cell| Some(cell) != connection.sent_cell);
                 // The host reads nothing after Detach; the window is repainted
                 // from the local copy instead.
                 if size != connection.sent_size && connection.detach.is_none() {
-                    transport.queue(&ClientMessage::Resize {
-                        cols: size.0,
-                        rows: size.1,
-                    })?;
+                    transport.queue(&resize_message(size, cell))?;
                     // The host may change the grid at once.
                     transport.write_ready()?;
                     connection.sent_size = size;
+                    connection.sent_cell = cell.or(connection.sent_cell);
                     connection.resize_sent = Some(now);
                     connection.awaiting_grid = Some((physical, now + timing().grid_wait));
+                } else if new_cell.is_some() && connection.detach.is_none() {
+                    // Only the cells changed (the font size, a display of
+                    // another scale): the grid stays, and so does the window.
+                    transport.queue(&resize_message(connection.sent_size, new_cell))?;
+                    transport.write_ready()?;
+                    connection.sent_cell = new_cell;
+                    connection.resize_sent = Some(now);
                 } else if let Some((awaited, _)) = connection.awaiting_grid.as_mut() {
                     // The grid change requested before is still on its way (a
                     // terminal can signal one resize several times): the window
@@ -1263,18 +1283,19 @@ fn attempt(
     transport.set_deadline(deadline);
     // Resizes until now are in the size sent with the Attach.
     let _ = sys::take_resize();
-    let physical = physical_size();
+    let (physical, cell) = physical_size();
     let size = protocol_size(physical);
     // Never a takeover: the others who lost their connection with this one
     // attach again too. The client ID replaces this client's own attachment
     // of the lost connection, should the host not have noticed the loss.
-    match request_attach(transport, id, size, false, client_id, limit) {
+    match request_attach(transport, id, size, cell, false, client_id, limit) {
         Ok(snapshot) => {
             transport.clear_deadline();
             Ok(Box::new(Reattached {
                 transport: slot.take().expect("connected"),
                 snapshot,
                 size,
+                cell,
                 physical,
             }))
         }
@@ -1605,6 +1626,10 @@ pub struct Renderer {
     /// Viewport mode: since when a frame waits for the session's
     /// synchronized update to end (see `SYNC_HOLD`).
     held_since: Option<Instant>,
+    /// The copy holds the kitty images the window had: it was made from a
+    /// full snapshot (which re-sends them) and followed the output since.
+    /// One made from the screens alone did not get them.
+    copy_has_images: bool,
 }
 
 /// In viewport mode a frame is not painted while the copy is inside the
@@ -1662,6 +1687,7 @@ impl Renderer {
             passthrough: Passthrough::default(),
             queried: false,
             held_since: None,
+            copy_has_images: false,
         }
     }
 
@@ -1702,6 +1728,16 @@ impl Renderer {
     fn want_copy(&mut self) {
         if !self.refresh_asked {
             self.refresh_wanted = true;
+        }
+    }
+
+    /// Back on the stream from a copy that lacks the window's kitty images
+    /// (see `copy_has_images`): the host is asked for a replacement, which
+    /// is a full snapshot with them when the host too took the window for a
+    /// viewport.
+    fn images_from_host(&mut self) {
+        if !self.copy_has_images {
+            self.want_copy();
         }
     }
 
@@ -1794,7 +1830,11 @@ impl Renderer {
         }
         let mut terminal =
             cherry_vt::Terminal::new(canonical.0, canonical.1, RENDER_SCROLLBACK_BYTES)?;
+        // Kitty images, which a full snapshot of the copy gives the window
+        // again when it goes back to the stream.
+        terminal.set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)?;
         let _ = terminal.feed(snapshot);
+        self.copy_has_images = snapshot.starts_with(b"\x18\x1bc");
         self.terminal = Some(terminal);
         self.tracker = None;
         if self.direct() {
@@ -1923,6 +1963,7 @@ impl Renderer {
             self.held_since = None;
             if self.sent_modes.take().is_some() {
                 let snapshot = self.terminal().snapshot()?;
+                self.images_from_host();
                 self.lighten(&snapshot)?;
                 return Ok(snapshot);
             }
@@ -1952,6 +1993,7 @@ impl Renderer {
             // Back to the direct stream: a full snapshot resets the window.
             self.sent_modes = None;
             let snapshot = self.terminal().snapshot()?;
+            self.images_from_host();
             self.lighten(&snapshot)?;
             Ok(snapshot)
         } else {
@@ -2128,18 +2170,45 @@ pub fn check_output_offset(expected: &mut u64, received: u64, len: usize) -> Res
     Ok(())
 }
 
-/// The window size as the terminal reports it, unclamped.
-fn physical_size() -> (u16, u16) {
+/// The window size as the terminal reports it, unclamped, and the size of a
+/// cell in pixels when the terminal reports its pixels (`ws_xpixel`,
+/// `ws_ypixel`; many leave them 0).
+fn physical_size() -> ((u16, u16), Option<(u32, u32)>) {
     for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
         let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
         if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0
             && size.ws_col > 0
             && size.ws_row > 0
         {
-            return (size.ws_col, size.ws_row);
+            return (
+                (size.ws_col, size.ws_row),
+                cell_size(size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel),
+            );
         }
     }
-    (DEFAULT_COLS, DEFAULT_ROWS)
+    ((DEFAULT_COLS, DEFAULT_ROWS), None)
+}
+
+/// A cell of a window of `cols` by `rows` cells and `width` by `height`
+/// pixels, when those are known and give a cell the host takes.
+fn cell_size(cols: u16, rows: u16, width: u16, height: u16) -> Option<(u32, u32)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    cherry_protocol::valid_cell_size(
+        Some(u32::from(width) / u32::from(cols)),
+        Some(u32::from(height) / u32::from(rows)),
+    )
+}
+
+/// A `Resize` to `size`, with the cell size when there is one.
+fn resize_message(size: (u16, u16), cell: Option<(u32, u32)>) -> ClientMessage {
+    ClientMessage::Resize {
+        cols: size.0,
+        rows: size.1,
+        cell_width: cell.map(|(width, _)| width),
+        cell_height: cell.map(|(_, height)| height),
+    }
 }
 
 /// The size requested from the host, within the protocol's limits.
@@ -2777,6 +2846,36 @@ mod tests {
         assert!(!renderer.reporting().reports);
         live(&mut renderer, b"\x1b[?1004h");
         assert!(!renderer.reporting().reports, "not painted yet");
+    }
+
+    #[test]
+    fn going_back_to_the_stream_keeps_the_windows_kitty_images() {
+        let mut source = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+        source
+            .set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)
+            .unwrap();
+        source.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=7,q=2;AQID\x1b\\TEXT");
+        // A copy made from a full snapshot has the images.
+        let mut renderer = Renderer::new((100, 40));
+        renderer.refreshes = true;
+        renderer
+            .replace((80, 24), &source.snapshot().unwrap())
+            .unwrap();
+        live(&mut renderer, b"\x1b_Ga=T,f=24,s=1,v=1,i=8,q=2;AQID\x1b\\");
+        let direct = renderer.resize_physical((80, 24)).unwrap();
+        assert!(contains(&direct, b"TEXT"));
+        assert!(contains(&direct, b"\x1b_Ga=t,i=7,"));
+        assert!(contains(&direct, b"\x1b_Ga=t,i=8,"));
+        assert!(!renderer.take_refresh());
+        // One made from the screens alone does not: the host is asked for
+        // a full snapshot.
+        let mut renderer = Renderer::new((100, 40));
+        renderer.refreshes = true;
+        renderer
+            .replace((80, 24), &source.refresh().unwrap())
+            .unwrap();
+        renderer.resize_physical((80, 24)).unwrap();
+        assert!(renderer.take_refresh());
     }
 
     #[test]

@@ -34,8 +34,8 @@ use crate::{
     watch::DirWatch,
 };
 use anyhow::{bail, Context, Result};
-use cherry_protocol::{priority, valid_size, MAX_SNAPSHOT_BYTES};
-use cherry_vt::{ProgressState, Terminal, VtEvent};
+use cherry_protocol::{priority, valid_size, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_GRAPHICS_BYTES};
+use cherry_vt::{GraphicsReplay, ProgressState, Terminal, VtEvent};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
     collections::VecDeque,
@@ -234,14 +234,23 @@ fn panic_report(session: Option<&str>, at: SystemTime, panic: &str) -> String {
     )
 }
 
-fn size(cols: u16, rows: u16) -> PtySize {
+/// The PTY's size: its pixels are the grid's in cells of `cell` pixels, or
+/// 0×0 while no client has given a cell size.
+fn size(cols: u16, rows: u16, cell: Option<(u32, u32)>) -> PtySize {
+    let (width, height) = cell.unwrap_or((0, 0));
+    let pixels = |cells: u16, side: u32| u16::try_from(u32::from(cells) * side).unwrap_or(u16::MAX);
     PtySize {
         cols,
         rows,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: pixels(cols, width),
+        pixel_height: pixels(rows, height),
     }
 }
+
+/// The kitty images each screen of a session's terminal keeps, in bytes.
+pub const IMAGE_STORAGE_BYTES: u64 = cherry_vt::IMAGE_STORAGE_BYTES;
+/// How often at most a holder logs that a snapshot left images out.
+const DROPPED_IMAGES_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What the terminal reports of its colours, from a `Launch`'s.
 fn terminal_colors(colors: cherry_protocol::TerminalColors) -> cherry_vt::Colors {
@@ -279,7 +288,7 @@ fn spawn(
     cols: u16,
     rows: u16,
 ) -> Result<(Box<dyn MasterPty + Send>, libc::pid_t)> {
-    let pair = native_pty_system().openpty(size(cols, rows))?;
+    let pair = native_pty_system().openpty(size(cols, rows, None))?;
     let fd = pair
         .master
         .as_raw_fd()
@@ -613,12 +622,17 @@ fn unwritten_events(frames: Vec<Vec<u8>>) -> Vec<link::Event> {
 /// bytes (oldest history dropped), or its screens without history; and the
 /// kind of snapshot that is (see `link::SnapshotRequest`). `resized`: the
 /// last resize took effect where the output ends now.
+///
+/// Full and limited snapshots re-send the kitty images on screen, in at
+/// most `MAX_SNAPSHOT_GRAPHICS_BYTES` on top of the limit (see
+/// `cherry_vt::Terminal::snapshot_with`); what they left out is returned.
 fn snapshot(
     terminal: &mut Terminal,
     mut kind: String,
     max: Option<usize>,
     resized: bool,
-) -> Result<(String, Vec<u8>)> {
+    unfinished: &[u8],
+) -> Result<(String, Vec<u8>, Option<GraphicsReplay>)> {
     if kind == "resized" {
         // A full-screen program repaints when its terminal is resized:
         // only where the new size took effect is needed, and the reply
@@ -627,13 +641,19 @@ fn snapshot(
         // size would have taken the program's repaint for the new one
         // (or whatever else came meanwhile) at the wrong size.
         if resized && terminal.cursor()?.alternate {
-            return Ok(("size".into(), Vec::new()));
+            return Ok(("size".into(), Vec::new(), None));
         }
         kind = "refresh".into();
     }
+    let mut graphics = None;
     let raw = match kind.as_str() {
-        "full" => terminal.snapshot()?,
-        "limited" => terminal.snapshot_limited(max.unwrap_or(MAX_SNAPSHOT_BYTES))?,
+        "full" | "limited" => {
+            let max = (kind == "limited").then(|| max.unwrap_or(MAX_SNAPSHOT_BYTES));
+            let (raw, replay) =
+                terminal.snapshot_with(max, MAX_SNAPSHOT_GRAPHICS_BYTES, unfinished)?;
+            graphics = Some(replay);
+            raw
+        }
         "refresh" => {
             let raw = terminal.refresh()?;
             if raw.len() > MAX_SNAPSHOT_BYTES {
@@ -646,11 +666,12 @@ fn snapshot(
         }
         other => bail!("unknown snapshot kind {other:?}"),
     };
+    // The kitty graphics it re-sends keep their `q=2` through the stream.
     let display = DisplayStream::default().feed(&raw).display;
     if display.len() > link::MAX_FRAME - 64 * 1024 {
         bail!("the snapshot exceeds the link's frame limit");
     }
-    Ok((kind, display))
+    Ok((kind, display, graphics))
 }
 
 fn progress_name(state: ProgressState) -> &'static str {
@@ -681,6 +702,11 @@ struct Holder {
     /// snapshot request is answered `size` only while nothing followed it
     /// (see `snapshot`).
     resized_at: Option<u64>,
+    /// The cell size in pixels the daemon last gave (link version 8), which
+    /// the terminal and the PTY have; None until one comes.
+    cell: Option<(u32, u32)>,
+    /// When a snapshot last logged images it left out.
+    images_logged: Option<Instant>,
     pending_input: PendingInput,
     eof: bool,
     termination: Option<Termination>,
@@ -760,6 +786,8 @@ impl Holder {
             bail!("no command to launch");
         }
         let mut terminal = Terminal::new(cols, rows, screen::SCROLLBACK_BYTES)?;
+        // Kitty images, which snapshots re-send (see `snapshot`).
+        terminal.set_image_storage_limit(IMAGE_STORAGE_BYTES)?;
         // What the program is told of its terminal's colours: the app's.
         if let Some(colors) = colors {
             terminal.set_colors(terminal_colors(colors))?;
@@ -819,6 +847,8 @@ impl Holder {
             display: DisplayStream::default(),
             offset: 0,
             resized_at: None,
+            cell: None,
+            images_logged: None,
             pending_input: PendingInput::default(),
             eof: false,
             termination: None,
@@ -1326,19 +1356,23 @@ impl Holder {
         }
     }
 
-    /// Resize the terminal; whether its size changed.
-    fn resize(&mut self, cols: u16, rows: u16) -> bool {
-        if !self.state.running
-            || !valid_size(cols, rows)
-            || (self.state.cols, self.state.rows) == (cols, rows)
-        {
+    /// Resize the terminal to `cols` by `rows`, and to cells of `cell`
+    /// pixels when one is given (otherwise they stay as they are); whether
+    /// the grid changed. A new cell size alone resizes the terminal and the
+    /// PTY too (whose pixels change, which signals the program), but not
+    /// the grid.
+    fn resize(&mut self, cols: u16, rows: u16, cell: Option<(u32, u32)>) -> bool {
+        let cell = cell.or(self.cell);
+        let grid = (self.state.cols, self.state.rows) != (cols, rows);
+        if !self.state.running || !valid_size(cols, rows) || (!grid && cell == self.cell) {
             return false;
         }
         // Where the output read so far ends, as the program's own terminal
         // is resized after it.
-        let resized = self
-            .terminal
-            .call(move |terminal| terminal.resize(cols, rows));
+        let resized = self.terminal.call(move |terminal| match cell {
+            Some((width, height)) => terminal.resize_cells(cols, rows, width, height),
+            None => terminal.resize(cols, rows),
+        });
         // The replies to that output go first.
         self.collect_terminal();
         let replies = match resized {
@@ -1352,7 +1386,7 @@ impl Holder {
             }
         };
         if let Some(master) = &self.master {
-            if let Err(error) = master.resize(size(cols, rows)) {
+            if let Err(error) = master.resize(size(cols, rows, cell)) {
                 log(format_args!(
                     "session {}: resizing the terminal failed: {error:#}",
                     self.id
@@ -1360,11 +1394,12 @@ impl Holder {
             }
         }
         self.queue_replies(&replies);
+        self.cell = cell;
         self.state.cols = cols;
         self.state.rows = rows;
         self.info.cols = Some(cols);
         self.info.rows = Some(rows);
-        true
+        grid
     }
 
     /// The terminal as a renderer stream, exactly as the output up to
@@ -1374,12 +1409,31 @@ impl Holder {
         let kind = request.kind.clone();
         let max = request.max;
         let resized = self.resized_at == Some(self.offset);
+        // A kitty image whose chunks are still coming (see
+        // `DisplayStream::unfinished_transfer`).
+        let unfinished = self.display.unfinished_transfer().to_vec();
         let snapshot = self
             .terminal
-            .call(move |terminal| snapshot(terminal, kind, max, resized));
+            .call(move |terminal| snapshot(terminal, kind, max, resized, &unfinished));
         self.collect_terminal();
         self.send_info();
-        snapshot
+        let (kind, bytes, graphics) = snapshot?;
+        let due = self
+            .images_logged
+            .is_none_or(|at| at.elapsed() >= DROPPED_IMAGES_LOG_INTERVAL);
+        if let Some(graphics) = graphics.filter(|graphics| graphics.dropped > 0 && due) {
+            self.images_logged = Some(Instant::now());
+            log(format_args!(
+                "session {}: the snapshot re-sends {} of {} images on screen, leaving out {} bytes of pixels: {} did not fit in {MAX_SNAPSHOT_GRAPHICS_BYTES} bytes, {} are numbered images whose ID it cannot give again (logged at most once a minute)",
+                self.id,
+                graphics.images,
+                graphics.images + graphics.dropped,
+                graphics.dropped_bytes,
+                graphics.dropped - graphics.unnamed,
+                graphics.unnamed
+            ));
+        }
+        Ok((kind, bytes))
     }
 
     /// The screen as text (see `screen::read`), exactly as the output up to
@@ -1475,8 +1529,13 @@ impl Holder {
             }
             kind::RESIZE => {
                 if let Ok(size) = frame.meta::<link::Size>() {
-                    let resized = self.resize(size.cols, size.rows);
-                    self.resized_at = resized.then_some(self.offset);
+                    let cell = self.cell;
+                    let resized = self.resize(size.cols, size.rows, size.cell());
+                    // A new cell size alone leaves where the grid last
+                    // changed as it was.
+                    if resized || self.cell == cell {
+                        self.resized_at = resized.then_some(self.offset);
+                    }
                 }
             }
             kind::SNAPSHOT => {

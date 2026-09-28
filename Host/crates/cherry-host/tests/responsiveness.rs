@@ -27,6 +27,8 @@ fn attach_as(
             takeover: false,
             answers_queries: true,
             client_id: client.map(str::to_owned),
+            cell_width: None,
+            cell_height: None,
         },
     );
     match receive(&mut socket) {
@@ -145,6 +147,8 @@ fn a_client_that_attaches_again_replaces_its_stale_attachment() {
             takeover: false,
             answers_queries: true,
             client_id: Some("x".repeat(MAX_CLIENT_ID_BYTES + 1)),
+            cell_width: None,
+            cell_height: None,
         },
     );
     match receive(&mut socket) {
@@ -275,7 +279,15 @@ fn a_lone_window_resizes_the_grid_at_once_and_a_full_screen_program_repaints_it(
     // grid for each, with no replacement snapshot, since the program
     // repaints its screen itself.
     for (cols, rows) in [(90, 30), (91, 31)] {
-        send(&mut socket, &ClientMessage::Resize { cols, rows });
+        send(
+            &mut socket,
+            &ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width: None,
+                cell_height: None,
+            },
+        );
     }
     screen.wait_size(&mut socket, 91, 31);
     assert_eq!(screen.resized, [(90, 30), (91, 31)]);
@@ -291,7 +303,15 @@ fn a_lone_window_resizes_the_grid_at_once_and_a_full_screen_program_repaints_it(
     let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut screen = Screen::new(80, 24, offset, &snapshot);
     screen.wait_text(&mut socket, "SHELL$");
-    send(&mut socket, &ClientMessage::Resize { cols: 70, rows: 20 });
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 70,
+            rows: 20,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     screen.wait_size(&mut socket, 70, 20);
     assert_eq!(screen.attached, [AttachReason::Resize]);
     assert_eq!(screen.resized, []);
@@ -312,7 +332,15 @@ fn a_window_that_waits_for_other_windows_still_gets_its_new_grid() {
     let (mut large, info, offset, snapshot) = host.attach(&session.id, 100, 40);
     assert_eq!((info.cols, info.rows), (60, 20));
     let mut large_screen = Screen::new(60, 20, offset, &snapshot);
-    send(&mut small, &ClientMessage::Resize { cols: 70, rows: 24 });
+    send(
+        &mut small,
+        &ClientMessage::Resize {
+            cols: 70,
+            rows: 24,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     small_screen.wait_size(&mut small, 70, 24);
     large_screen.wait_size(&mut large, 70, 24);
     // Neither needed its history back: both follow with the program's own
@@ -435,12 +463,22 @@ fn a_window_that_follows_a_new_grid_gets_it_before_the_programs_repaint() {
             &ClientMessage::Resize {
                 cols: 120,
                 rows: 40,
+                cell_width: None,
+                cell_height: None,
             },
         );
         wait_for_the_repaint(&host, &id, &mut b, &mut b_screen, (100, 30));
         wait_for_the_repaint(&host, &id, &mut a, &mut a_screen, (100, 30));
         if round < 2 {
-            send(&mut b, &ClientMessage::Resize { cols: 80, rows: 24 });
+            send(
+                &mut b,
+                &ClientMessage::Resize {
+                    cols: 80,
+                    rows: 24,
+                    cell_width: None,
+                    cell_height: None,
+                },
+            );
             wait_for_the_repaint(&host, &id, &mut b, &mut b_screen, (80, 24));
             wait_for_the_repaint(&host, &id, &mut a, &mut a_screen, (80, 24));
         }

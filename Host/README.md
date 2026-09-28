@@ -1516,6 +1516,73 @@ character sets, the kitty keyboard stack, the primary screen beneath an
 alternate screen (1049, 1047, or 47), and the saved cursors (DECSC, 1048) of
 the active screen and of that primary screen.
 
+### Kitty graphics
+
+A session's terminal keeps kitty graphics images (32 MiB per screen, PNG
+payloads decoded with the `png` crate into 8-bit RGBA, straight into
+Ghostty's buffer when the PNG is RGBA already; images over 10000 pixels a
+side or 32 MiB decoded, which the storage could not keep, are refused
+before decoding, and a malformed PNG fails its command), so it answers
+`a=q` probes and acknowledges transmissions itself; renderers get every
+other graphics command with `q=2`. A full or limited snapshot (an attach, a
+resync, a window that comes back to the grid) begins with a reset, which
+deletes the renderer's images, so it re-sends those on screen after the
+content of the active screen and before its cursor, modes and the rest of
+its state (neither the cursor nor the saved cursor moves):
+
+- each image that has a virtual placement (unicode placeholders) or a
+  direct placement all of whose rows are on screen, once, as `a=t` with
+  RGBA pixels (`f=32`), zlib-compressed (`o=z`) in chunks of 4096 base64
+  bytes. An image the program named by ID is sent with `i=`. One it named
+  by number (`I=`) is sent with its number alone, after the others and in
+  order of ID, with stand-in images under every lower free ID, deleted
+  afterwards: the renderer gives it the lowest free ID, which is then its
+  ID on the host, so `i=` and `I=` both keep finding it. A numbered image
+  whose ID is above 256 is not re-sent.
+- then each virtual placement (`a=p,U=1`) and each such direct placement,
+  at its cell with `C=1`, with its source rectangle, offsets, columns, rows
+  and z-index, but not its placement ID: libghostty-vt does not say
+  whether the program gave it or Ghostty numbered the placement itself,
+  and a number of Ghostty's sent as an ID would stand for the program's
+  own `p=`. So until the next snapshot a command that names a placement
+  by `p=` (`a=p` to move it, `a=d,d=p`) does not reach a re-sent placement
+  on the renderer, only on the host.
+- then the chunks so far of a transmission the program began (`m=1`) and
+  has not ended, as renderers got them, so the chunks still to come
+  complete it on the renderer. The holder's display stream keeps them, as
+  much as the graphics budget allows; a longer one is not carried.
+
+Every command carries `q=2`. The graphics take at most 6 MiB
+(`MAX_SNAPSHOT_GRAPHICS_BYTES`) on top of the 8 MiB of text, newest image
+first; an image that does not fit is left out with its placements, and no
+image at least as large is compressed after one that did not fit, nor one
+that could not fit however well it compressed. The holder keeps the
+compressed images it sent (16 MiB, by image ID and generation), so a resync
+or another attach does not compress them again, and logs the images a
+snapshot left out at most once a minute. A screens-only replacement (a
+resize, `Refresh`) keeps the renderer's history and images and re-sends
+none.
+
+`cherry attach`'s own copy of the screen (the one a window of another size
+is painted from) keeps images too, so a window that goes back to the
+stream gets them from the copy's full snapshot; a copy made from the
+screens alone lacks those sent before it, so the client then asks the host
+for a replacement (`Refresh`), which carries them when the host too took
+the window for a viewport.
+
+The PTY's pixels and size replies follow the window that sets the grid
+(its columns and rows are the grid's), of those that give a cell size, not
+the client that types or answers queries: a new cell size makes the
+program repaint, so it changes only with the grid's window.
+
+Known gaps: a window rendering a viewport gets no kitty graphics at all (the
+viewport drops APC); only direct transmission is kept (`t=f`, `t=t` and
+`t=s` media are off); placements in the history or partly off screen, the
+primary screen's images under the alternate screen, images without a
+placement, placement IDs (above) and animation frames other than the
+current one are not re-sent; sixel and iTerm2 images are not supported
+(nor by Ghostty).
+
 When an attachment's size matches the shared grid, it uses the ordinary
 terminal stream and its own scrollback. A larger attachment is repainted from a
 bounded view of the shared active screen, so its native terminal scrollback is
@@ -1558,12 +1625,20 @@ mode reports, XTVERSION, DECRQSS, the kitty keyboard, graphics, and clipboard
 and colour queries for the palette, foreground, background, and cursor (OSC 4,
 10–12, 21). It also keeps the report modes it answers itself, in-band resize
 (2048) and 2033, away from renderers: neither live output, snapshots, nor
-viewport mode enables them there. Size replies use nominal 8×16 pixel
-cells. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
+viewport mode enables them there. Size replies use the cell size of the
+window that sets the grid, of those that report one (see
+[kitty graphics](#kitty-graphics)): `Attach` and `Resize` carry `cell_width` and
+`cell_height` (pixels, 1 to 1024, both or neither), which `cherry attach`
+derives from its terminal's `TIOCGWINSZ` pixels and sends again when only
+they change (a new font size, a display of another scale). The holder also
+gives the program's PTY those pixels (`cols × cell_width` by `rows ×
+cell_height`), which image programs size images by; until a client gave a
+cell size, and for a holder older than link version 8, size replies use
+nominal 8×16 cells and the PTY reports 0×0 pixels. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
 (`CSI ?996n`) use the colours and appearance `Create` named (`colors`; the
 Mac app passes its terminal theme for the appearance it shows), or light
 grey on black and dark without them. Kitty graphics reach renderers
-with `q=2`, so only the host replies. Other queries (status reports such as
+with `q=2`, so only the host replies (see [kitty graphics](#kitty-graphics)). Other queries (status reports such as
 `CSI ?6n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/19–21 t` and size
 reports with extra parameters, ANSI mode requests, DECREQTPARM, DECRQPSR,
 DECRQTSR, DECRQUPSS, DECRQCRA, XTREPORTSGR, XTQMODKEYS, XTSMGRAPHICS, OSC 52
@@ -1710,7 +1785,10 @@ order but carrying no offset. The client writes them to its terminal as they
 are, and the terminal's replies return as ordinary `Input`. `Attach` has a
 required `answers_queries` flag: true only when the client writes queries to
 a terminal whose replies it reads as input. The host sends no queries to a
-client that sets it false. Errors carry a code: `version_mismatch`,
+client that sets it false. `Attach` and `Resize` may carry the window's cell
+size in pixels (`cell_width`, `cell_height`; additive, so protocol 7 is
+unchanged and an older host ignores them); a `Resize` may change only
+them. Errors carry a code: `version_mismatch`,
 `request_failed`, `taken_over`, `replaced` (protocol 5: a newer attachment
 of the same `client_id` replaced this one), `resize_failed`, `snapshot_failed`,
 `unsupported_operation`, `unknown_session` (no session has that ID),

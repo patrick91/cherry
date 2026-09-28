@@ -16,7 +16,7 @@ frontend can generate duplicate replies. Snapshots and `modes()` never carry
 those two modes. The host also takes the queries it leaves unanswered out of
 that stream and sends each to one attached client to answer (see the
 [host guide](../../README.md#bounds-and-terminal-fidelity)).
-Size queries use the session's rows/columns and nominal 8×16 pixel cells.
+Size queries use the session's rows/columns and its cell size (`resize_cells`; 8×16 until a client reports one).
 Color queries (OSC 10, 11 and 12) and the color-scheme query (`CSI ?996n`)
 report the colors `set_colors` gave (the host passes those its `Create`
 named), by default light gray on black and dark; a reset keeps them.

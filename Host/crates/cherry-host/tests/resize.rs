@@ -97,7 +97,15 @@ impl Window {
         cols: u16,
         rows: u16,
     ) -> Vec<(u16, u16)> {
-        send(socket, &ClientMessage::Resize { cols, rows });
+        send(
+            socket,
+            &ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width: None,
+                cell_height: None,
+            },
+        );
         self.terminal.resize(cols, rows).unwrap();
         let history = self.terminal.inspect().unwrap().history;
         let mut between = Vec::new();
@@ -254,6 +262,8 @@ fn resizes_send_screens_without_history_and_full_snapshots_where_needed() {
         &ClientMessage::Resize {
             cols: 120,
             rows: 40,
+            cell_width: None,
+            cell_height: None,
         },
     );
     let (session_info, offset, snapshot) = first_window.until_attached(&mut first);
@@ -285,6 +295,8 @@ fn resizes_send_screens_without_history_and_full_snapshots_where_needed() {
         &ClientMessage::Resize {
             cols: 100,
             rows: 30,
+            cell_width: None,
+            cell_height: None,
         },
     );
     let (session_info, _, snapshot) = second_window.until_attached(&mut second);
@@ -326,7 +338,15 @@ fn a_lone_clients_own_resizes_send_only_the_screens() {
     }
     // A size the window leaves again before the grid follows: the window
     // is repainted at the grid's size, still without history.
-    send(&mut socket, &ClientMessage::Resize { cols: 70, rows: 20 });
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 70,
+            rows: 20,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     window.terminal.resize(70, 20).unwrap();
     for (cols, rows) in window.resize_directly(&mut socket, 80, 26) {
         // Only on a machine too busy to read both within the settle time.
@@ -421,7 +441,15 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
     // Replacements for sizes the grid moved on from are superseded while
     // queued (unless the socket took them), and the output stays.
     for (cols, rows) in [(70, 20), (60, 18), (50, 16)] {
-        send(&mut fast, &ClientMessage::Resize { cols, rows });
+        send(
+            &mut fast,
+            &ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width: None,
+                cell_height: None,
+            },
+        );
         fast_screen.wait_size(&mut fast, cols, rows);
     }
 
@@ -576,11 +604,21 @@ fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             takeover: false,
             answers_queries: true,
             client_id: None,
+            cell_width: None,
+            cell_height: None,
         },
     );
     thread::sleep(Duration::from_millis(300));
     // ...before the other window makes the grid smaller.
-    send(&mut first, &ClientMessage::Resize { cols: 90, rows: 25 });
+    send(
+        &mut first,
+        &ClientMessage::Resize {
+            cols: 90,
+            rows: 25,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
     holder.resume();
     // The snapshot shows the grid it was taken at; the new grid follows.
@@ -632,7 +670,15 @@ fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     drain(&mut lagging_screen, &mut lagging);
     thread::sleep(Duration::from_millis(300));
     // ...and the grid changes before the holder answers.
-    send(&mut active, &ClientMessage::Resize { cols: 90, rows: 25 });
+    send(
+        &mut active,
+        &ClientMessage::Resize {
+            cols: 90,
+            rows: 25,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
     host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
     holder.resume();
     lagging_screen.wait_size(&mut lagging, 90, 25);
@@ -685,4 +731,181 @@ fn a_refresh_is_answered_with_the_screens_of_the_grid() {
         receive(&mut control),
         ServerMessage::Error { code, .. } if code == error_code::REQUEST_FAILED
     ));
+}
+
+/// A program that, for each `q` it reads, asks its terminal for the cell
+/// size (CSI 16t) and prints the reply, then the PTY's size as
+/// `TIOCGWINSZ` gives it: rows, columns and pixels.
+fn size_reporter() -> Vec<String> {
+    let script = format!(
+        r#"$| = 1;
+system("stty", "-icanon", "-echo", "min", "1", "time", "0");
+print "READY\n";
+while (sysread(STDIN, my $key, 1)) {{
+    next unless $key eq "q";
+    print "\e[16t";
+    my $reply = "";
+    while (sysread(STDIN, my $byte, 1)) {{ $reply .= $byte; last if $byte eq "t"; }}
+    $reply =~ s/\e/ESC/g;
+    ioctl(STDIN, {}, my $size = "\0" x 8) or die "TIOCGWINSZ: $!";
+    my ($rows, $cols, $width, $height) = unpack("S4", $size);
+    print "CELL:$reply PTY:$rows:$cols:$width:$height\n";
+}}"#,
+        libc::TIOCGWINSZ
+    );
+    vec!["perl".into(), "-e".into(), script]
+}
+
+#[test]
+fn a_cell_size_reaches_size_reports_and_the_pty() {
+    let host = Host::new();
+    let session = host.create(size_reporter());
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut socket, "READY");
+    // No client gave a cell size yet: nominal 8x16 cells, and no pixels.
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "CELL:ESC[6;16;8t PTY:24:80:0:0");
+    // The cells alone change: the grid stays.
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 80,
+            rows: 24,
+            cell_width: Some(10),
+            cell_height: Some(21),
+        },
+    );
+    thread::sleep(Duration::from_millis(200));
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "CELL:ESC[6;21;10t PTY:24:80:800:504");
+    // The grid and the cells change together.
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 100,
+            rows: 30,
+            cell_width: Some(9),
+            cell_height: Some(18),
+        },
+    );
+    screen.wait_size(&mut socket, 100, 30);
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "CELL:ESC[6;18;9t PTY:30:100:900:540");
+    // A resize without a cell size keeps the last one; one out of range is
+    // none.
+    for (cols, width) in [(90, None), (90, Some(0))] {
+        send(
+            &mut socket,
+            &ClientMessage::Resize {
+                cols,
+                rows: 30,
+                cell_width: width,
+                cell_height: Some(18),
+            },
+        );
+    }
+    screen.wait_size(&mut socket, 90, 30);
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "CELL:ESC[6;18;9t PTY:30:90:810:540");
+    // Another, larger window attaches with cells of its own. The grid
+    // stays the first window's, and so do the cells, whichever types.
+    let report = "CELL:ESC[6;18;9t PTY:30:90:810:540";
+    let reports = |screen: &Screen, report: &str| screen.text().matches(report).count();
+    let mut second = host.connect();
+    send(
+        &mut second,
+        &ClientMessage::Attach {
+            id: session.id.clone(),
+            cols: 120,
+            rows: 40,
+            takeover: false,
+            answers_queries: true,
+            client_id: None,
+            cell_width: Some(12),
+            cell_height: Some(25),
+        },
+    );
+    assert!(matches!(
+        receive(&mut second),
+        ServerMessage::Attached { .. }
+    ));
+    input(&mut second, b"q");
+    screen.wait_for(&mut socket, "a report after the second typed", |screen| {
+        reports(screen, report) == 2
+    });
+    input(&mut socket, b"q");
+    screen.wait_for(&mut socket, "a report after the first typed", |screen| {
+        reports(screen, report) == 3
+    });
+    // The second window shrinks below the first: it sets the grid now,
+    // with its cells.
+    send(
+        &mut second,
+        &ClientMessage::Resize {
+            cols: 70,
+            rows: 20,
+            cell_width: Some(12),
+            cell_height: Some(25),
+        },
+    );
+    screen.wait_size(&mut socket, 70, 20);
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "CELL:ESC[6;25;12t PTY:20:70:840:500");
+    // Once it detaches, the grid and the cells are the first window's again.
+    send(&mut second, &ClientMessage::Detach);
+    screen.wait_size(&mut socket, 90, 30);
+    input(&mut socket, b"q");
+    screen.wait_for(&mut socket, "a report after the detach", |screen| {
+        reports(screen, report) == 4
+    });
+    host.kill(&session.id);
+}
+
+/// A renderer that keeps kitty images, as the app's terminal does.
+fn image_renderer(cols: u16, rows: u16, snapshot: &[u8]) -> Terminal {
+    let mut terminal = Terminal::new(cols, rows, 1024 * 1024).unwrap();
+    terminal
+        .set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)
+        .unwrap();
+    terminal.feed(snapshot);
+    terminal
+}
+
+#[test]
+fn an_image_whose_transmission_a_snapshot_cuts_in_two_arrives_whole() {
+    let host = Host::new();
+    // The first chunk of image 5 (two RGB pixels, placed at the cursor),
+    // then, once a line comes, the last.
+    let session = host.create(shell(
+        "stty -echo; printf '\\033_Ga=T,f=24,s=2,v=1,i=5,m=1;AQID\\033\\\\'; printf 'READY\\n'; \
+         read line; printf '\\033_Gm=0;BAUG\\033\\\\'; printf 'DONE\\n'; read line",
+    ));
+    // Wait for the first chunk before attaching.
+    let (mut first, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut first, "READY");
+    send(&mut first, &ClientMessage::Detach);
+    drop(first);
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut renderer = image_renderer(80, 24, &snapshot);
+    let mut at = offset;
+    input(&mut socket, b"\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !renderer.screen_text().unwrap().contains("DONE") {
+        assert!(Instant::now() < deadline, "no DONE");
+        match receive(&mut socket) {
+            ServerMessage::Output { offset, data } => {
+                assert_eq!(offset, at);
+                at += data.len() as u64;
+                assert!(renderer.feed(&data).is_empty(), "q=2");
+            }
+            ServerMessage::Pong => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let graphics = renderer.inspect().unwrap().graphics;
+    assert_eq!(graphics.len(), 1, "{graphics:?}");
+    assert!(graphics[0].starts_with("image 5 [2x1 "), "{graphics:?}");
+    host.kill(&session.id);
 }

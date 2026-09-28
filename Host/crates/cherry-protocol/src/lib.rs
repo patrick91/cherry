@@ -187,6 +187,13 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 /// Keep snapshots well below the frame limit so an attach can never exceed
 /// it, header and all.
 pub const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+/// A snapshot re-sends the kitty images on screen in at most this many
+/// bytes, on top of `MAX_SNAPSHOT_BYTES`.
+pub const MAX_SNAPSHOT_GRAPHICS_BYTES: usize = 6 * 1024 * 1024;
+const _: () =
+    assert!(MAX_SNAPSHOT_BYTES + MAX_SNAPSHOT_GRAPHICS_BYTES + 64 * 1024 < MAX_FRAME_BYTES);
+/// A cell is at most this many pixels wide or tall (`valid_cell_size`).
+pub const MAX_CELL_PIXELS: u32 = 1024;
 /// `ScreenText::text` is at most this long: the oldest lines are dropped to
 /// fit. Plain text doubles at most in JSON, so the frame always fits.
 pub const MAX_SCREEN_TEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -515,6 +522,15 @@ pub enum ClientMessage {
         /// this one in turn).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
+        /// The size of one cell of the client's terminal in pixels, when it
+        /// knows one (`valid_cell_size`); sent only then. The session's
+        /// terminal reports it to the program (size queries, the PTY's
+        /// pixel size), which kitty graphics programs size images by. A
+        /// host older than the fields ignores them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_height: Option<u32>,
     },
     /// Terminal input for the attached session, at most `MAX_INPUT_BYTES`.
     /// A binary frame only (`binary_kind::INPUT`).
@@ -522,9 +538,16 @@ pub enum ClientMessage {
     Input {
         data: Vec<u8>,
     },
+    /// The client's window changed: its size in cells, and the size of a
+    /// cell in pixels as in `Attach` (a client sends one when only that
+    /// changed, too).
     Resize {
         cols: u16,
         rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_height: Option<u32>,
     },
     /// Ask for a replacement snapshot of the grid (`Attached{Resize}`),
     /// queued behind the attachment's output like any replacement; the host
@@ -923,6 +946,18 @@ pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), String> {
 
 pub fn valid_size(cols: u16, rows: u16) -> bool {
     (2..=500).contains(&cols) && (1..=200).contains(&rows)
+}
+
+/// A cell size in pixels a host takes (`Attach`, `Resize`): both given,
+/// each from 1 to `MAX_CELL_PIXELS`. Anything else is no cell size.
+pub fn valid_cell_size(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+    let range = 1..=MAX_CELL_PIXELS;
+    match (width, height) {
+        (Some(width), Some(height)) if range.contains(&width) && range.contains(&height) => {
+            Some((width, height))
+        }
+        _ => None,
+    }
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -2180,9 +2215,74 @@ mod tests {
             takeover: false,
             answers_queries: true,
             client_id: None,
+            cell_width: None,
+            cell_height: None,
         })
         .contains("client_id"));
     }
+    #[test]
+    fn cell_sizes_are_optional_and_sent_only_when_known() {
+        let attach = |cell_width, cell_height| ClientMessage::Attach {
+            id: "a".into(),
+            cols: 80,
+            rows: 24,
+            takeover: false,
+            answers_queries: true,
+            client_id: None,
+            cell_width,
+            cell_height,
+        };
+        let without = json(&attach(None, None));
+        assert!(!without.contains("cell_"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&without).unwrap(),
+            attach(None, None)
+        );
+        let with = json(&attach(Some(9), Some(19)));
+        assert!(
+            with.contains(r#""cell_width":9,"cell_height":19"#),
+            "{with}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&with).unwrap(),
+            attach(Some(9), Some(19))
+        );
+        // A resize from an older client, and one with a cell size.
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(r#"{"op":"resize","cols":90,"rows":30}"#)
+                .unwrap(),
+            ClientMessage::Resize {
+                cols: 90,
+                rows: 30,
+                cell_width: None,
+                cell_height: None,
+            }
+        );
+        let resize = ClientMessage::Resize {
+            cols: 90,
+            rows: 30,
+            cell_width: Some(10),
+            cell_height: Some(21),
+        };
+        assert_eq!(
+            json(&resize),
+            r#"{"op":"resize","cols":90,"rows":30,"cell_width":10,"cell_height":21}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json(&resize)).unwrap(),
+            resize
+        );
+        assert_eq!(valid_cell_size(Some(10), Some(21)), Some((10, 21)));
+        for (width, height) in [
+            (None, Some(21)),
+            (Some(10), None),
+            (Some(0), Some(21)),
+            (Some(10), Some(MAX_CELL_PIXELS + 1)),
+        ] {
+            assert_eq!(valid_cell_size(width, height), None);
+        }
+    }
+
     fn json<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap()
     }
@@ -2491,6 +2591,8 @@ mod tests {
                 takeover: true,
                 answers_queries: false,
                 client_id: None,
+                cell_width: None,
+                cell_height: None,
             },
             ClientMessage::Attach {
                 id: "s".into(),
@@ -2499,6 +2601,8 @@ mod tests {
                 takeover: false,
                 answers_queries: true,
                 client_id: Some("6d1f0c2e-3b4a-4c5d-8e9f-0a1b2c3d4e5f".into()),
+                cell_width: Some(16),
+                cell_height: Some(34),
             },
             ClientMessage::Input {
                 data: bytes.clone(),
@@ -2506,6 +2610,14 @@ mod tests {
             ClientMessage::Resize {
                 cols: u16::MAX,
                 rows: 1,
+                cell_width: None,
+                cell_height: None,
+            },
+            ClientMessage::Resize {
+                cols: 80,
+                rows: 24,
+                cell_width: Some(9),
+                cell_height: Some(18),
             },
             ClientMessage::Refresh,
             ClientMessage::Detach,

@@ -17,11 +17,14 @@
 #
 # real-host: sets CHERRY_TEST_HOST_INTEGRATION=1 and runs every test whose ID
 # contains RealHost (HostedSessionRealHost*, PersistentLocalRealHost*,
-# AgentInputRealHost* and any other) against the Rust helpers in
-# Host/target/debug (or CARGO_TARGET_DIR). Each of those tests starts its own
-# daemon on a private socket with a private HOME. Every selected test must run
+# AgentInputRealHost*, RemoteDeviceRealHost* and any other) against the Rust
+# helpers in Host/target/debug (or CARGO_TARGET_DIR). Each of those tests
+# starts its own daemon on a private socket with a private HOME;
+# RemoteDeviceRealHost* reaches its daemon through a fake remote Mac
+# (Scripts/fake-remote-mac: an ssh shim that never runs the real ssh). Every selected test must run
 # and pass: a skipped one fails the run, and so does a run in which
-# HostedSessionRealHost* or PersistentLocalRealHost* passes nothing.
+# HostedSessionRealHost*, PersistentLocalRealHost* or RemoteDeviceRealHost*
+# passes nothing.
 #
 # Without --skip-build, the Swift tests are built first, and for real-host
 # the Rust helpers too (Scripts/build-host debug). CI builds them in earlier
@@ -112,6 +115,7 @@ groups=(
   SessionCloseFlow      # SessionCloseFlow{,Detach,Quit,Toast,Undo}Tests
   BackgroundSession     # BackgroundSessionsTests
   '[Aa]ppIdentity'      # AppIdentityTests
+  RemoteDevice          # RemoteDevice{,RealHost}Tests
 )
 
 # What marks a test file as a session suite: the hosted and persistent session
@@ -184,7 +188,7 @@ case "$mode" in
     if [ "$skipped" -ne 0 ]; then
       failures+=("RealHost: $skipped selected test(s) skipped instead of running")
     fi
-    for name in HostedSessionRealHost PersistentLocalRealHost; do
+    for name in HostedSessionRealHost PersistentLocalRealHost RemoteDeviceRealHost; do
       passed=$(count "$log" "${name}[^ ]*" 'passed after')
       if [ "$passed" -eq 0 ]; then
         failures+=("$name: no test passed; the filter no longer selects its tests")

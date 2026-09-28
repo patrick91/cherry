@@ -880,6 +880,9 @@ final class AgentSettings: ObservableObject {
 
     func markProjectOpened(_ projectRoot: String?) {
         guard let root = Self.validDirectory(projectRoot ?? "") else { return }
+        // A new window opens This Mac's last project, never another Mac's
+        // (docs/specs/remote-devices.md).
+        guard !ProjectLocation.isRemoteKey(root) else { return }
         guard lastOpenedProjectRoot != root else { return }
         lastOpenedProjectRoot = root
         saveLastOpenedProjectRoot()

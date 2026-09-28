@@ -61,6 +61,12 @@ final class ProjectWindowRegistry {
     private(set) var windowFrameStore: ProjectWindowFrameStore?
     private var windowFrameSavers: [String: ProjectWindowFrameSaver] = [:]
 
+    /// Whether a saved window of another Mac's project (a `ProjectLocation`
+    /// key) can open: its device is still known (`RemoteDeviceStore`).
+    /// None by default; the app points it at its device store at launch
+    /// (tests inject their own, never the real devices.json).
+    var remoteProjectIsKnown: @MainActor (String) -> Bool = { _ in false }
+
     /// The app uses `shared`; tests make their own.
     init() {}
 
@@ -74,7 +80,7 @@ final class ProjectWindowRegistry {
     /// saves the list again), then saves window changes to `store`.
     func configureWorkspacePersistence(store: WorkspaceStateStore) {
         guard workspaceStateStore == nil else { return }
-        projectWindowRootsToReopenAtLaunch = store.projectWindowRootsToReopen()
+        projectWindowRootsToReopenAtLaunch = store.projectWindowRootsToReopen(remoteProjectIsKnown: remoteProjectIsKnown)
         workspaceStateStore = store
     }
 
@@ -524,6 +530,23 @@ final class ProjectWindowRegistry {
         return nil
     }
 
+    /// The workspace of the frontmost window of a project on This Mac: the
+    /// key window's when it is one, else the one active most recently.
+    func frontmostLocalWorkspace() -> TerminalWorkspace? {
+        pruneStaleWindows()
+        if let key = projectRoot(for: NSApp.keyWindow), !ProjectLocation.isRemoteKey(key),
+           let workspace = repositories[key]?.repository?.activeWorkspace ?? workspaces[key]?.workspace {
+            return workspace
+        }
+        for root in activationOrder.reversed() + windows.keys.sorted() where !ProjectLocation.isRemoteKey(root) {
+            guard windows[root]?.window != nil,
+                  let workspace = repositories[root]?.repository?.activeWorkspace ?? workspaces[root]?.workspace
+            else { continue }
+            return workspace
+        }
+        return nil
+    }
+
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
         return noteStores[repositoryRoot(for: projectRoot)]?.noteStore
@@ -956,6 +979,8 @@ final class ProjectWindowRegistry {
     }
 
     private func repositoryRoot(for projectRoot: String) -> String {
+        // A project on another Mac is its key, never a path here.
+        if ProjectLocation.isRemoteKey(projectRoot) { return ProjectLocation(key: projectRoot).key }
         let standardizedRoot = URL(
             fileURLWithPath: projectRoot,
             isDirectory: true
@@ -1093,6 +1118,11 @@ private final class WeakChromeState {
     }
 }
 
+/// A device a sheet is about (`ProjectWindowChromeState.addProjectDevice`).
+struct RemoteDeviceReference: Identifiable, Equatable {
+    let id: UUID
+}
+
 @MainActor
 final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarHidden = false
@@ -1101,6 +1131,13 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarAnimating = false
     @Published var isCommandPalettePresented = false
     @Published var isHostedSessionsPresented = false
+    /// The host the Persistent Sessions sheet opens on (a device's, from
+    /// the picker), taken by the sheet when it appears.
+    @Published var hostedSessionsInitialHost: HostedSessionHost?
+    /// Add Mac… (docs/specs/remote-devices.md).
+    @Published var isAddDevicePresented = false
+    /// Add Project on <Mac>…: the device.
+    @Published var addProjectDevice: RemoteDeviceReference?
     @Published var isNewWorktreePresented = false
     @Published var isWorktreeManagerPresented = false
     @Published var worktreeToRename: GitWorktree?

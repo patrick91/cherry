@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Devices (docs/specs/remote-devices.md) over a real SSH connection to this
+# Mac, without admin rights: a private sshd on 127.0.0.1, run as you, with its
+# own host key, authorized key and config under a temporary directory.
+#
+#   Scripts/test-remote-mac-loopback
+#
+# It needs /usr/sbin/sshd (it runs as you; no Remote Login setting changes)
+# and the debug helpers (Scripts/build-host debug, or CARGO_TARGET_DIR).
+#
+# Nothing of yours is used or changed:
+# - ssh always runs with `-F` and a private config (its own key, known_hosts
+#   file and no agent), so ~/.ssh is never read;
+# - sshd forces every command through a wrapper that sets a private HOME and
+#   CHERRY_HOST_SOCKET, and refuses a gateway without an explicit --socket;
+#   every `cherry` here passes that private socket too, so the daemon it
+#   talks to is a private one this script starts and stops (never
+#   /tmp/cherry-host-$UID);
+# - sshd listens on 127.0.0.1 only, and everything it started is stopped by
+#   its pid or by the private socket path when the script ends.
+#
+# It checks what the app does over SSH for a device: a BatchMode login, the
+# Add Mac check (`cherry-host version --json` and `status --json` through
+# `sh -s`), and sessions created, listed and ended through `cherry --host`,
+# with and without --remote-host-path. Exits 2 when sshd cannot run here
+# (then use Scripts/fake-remote-mac, which the Swift tests use).
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+binaries=${CHERRY_FAKE_REMOTE_BIN:-${CARGO_TARGET_DIR:-$root/Host/target}/debug}
+for tool in cherry cherry-host; do
+  if [ ! -x "$binaries/$tool" ]; then
+    echo "error: $binaries/$tool is missing; run Scripts/build-host debug" >&2
+    exit 1
+  fi
+done
+sshd=/usr/sbin/sshd
+[ -x "$sshd" ] || { echo "sshd is not available here" >&2; exit 2; }
+
+dir=$(mktemp -d "${TMPDIR:-/tmp}/ch-lb.XXXXXX")
+dir=$(cd "$dir" && pwd -P)
+chmod 700 "$dir"
+mkdir -p "$dir/bin" "$dir/remote/home" "$dir/remote/bin"
+chmod 700 "$dir/remote" "$dir/remote/home"
+socket="$dir/remote/host.sock"
+sshd_pid=
+
+cleanup() {
+  if [ -n "$sshd_pid" ]; then kill "$sshd_pid" 2>/dev/null || true; fi
+  pkill -TERM -f "serve --socket $socket" 2>/dev/null || true
+  sleep 0.2
+  pkill -KILL -f "hold --socket $socket" 2>/dev/null || true
+  pkill -KILL -f "serve --socket $socket" 2>/dev/null || true
+  rm -rf "$dir"
+}
+trap cleanup EXIT
+
+ln -s "$binaries/cherry-host" "$dir/remote/bin/cherry-host"
+ln -s "$binaries/cherry" "$dir/remote/bin/cherry"
+
+ssh-keygen -q -t ed25519 -N '' -f "$dir/host_key" -C cherry-loopback-host
+ssh-keygen -q -t ed25519 -N '' -f "$dir/client_key" -C cherry-loopback-client
+cp "$dir/client_key.pub" "$dir/authorized_keys"
+chmod 600 "$dir/authorized_keys"
+
+# Every command sshd runs goes through this, with the private environment.
+cat > "$dir/force-command" <<EOF
+#!/bin/sh
+HOME='$dir/remote/home'
+CHERRY_HOST_SOCKET='$socket'
+PATH='$dir/remote/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+SHELL=/bin/sh
+export HOME CHERRY_HOST_SOCKET PATH SHELL
+case "\$SSH_ORIGINAL_COMMAND" in
+  *gateway*)
+    case "\$SSH_ORIGINAL_COMMAND" in
+      *"--socket '$socket'"*) ;;
+      *) echo "loopback: refusing a gateway without this script's --socket" >&2; exit 1 ;;
+    esac ;;
+esac
+exec /bin/sh -c "\$SSH_ORIGINAL_COMMAND"
+EOF
+chmod 700 "$dir/force-command"
+
+port=$((20000 + RANDOM % 20000))
+cat > "$dir/sshd_config" <<EOF
+ListenAddress 127.0.0.1
+Port $port
+HostKey $dir/host_key
+PidFile $dir/sshd.pid
+AuthorizedKeysFile $dir/authorized_keys
+AllowUsers $(id -un)
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+PermitTTY no
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+PermitUserEnvironment no
+ForceCommand $dir/force-command
+EOF
+
+if ! "$sshd" -t -f "$dir/sshd_config" 2>"$dir/sshd-test.log"; then
+  echo "sshd cannot run here without admin rights:" >&2
+  cat "$dir/sshd-test.log" >&2
+  exit 2
+fi
+"$sshd" -D -e -f "$dir/sshd_config" 2>"$dir/sshd.log" &
+sshd_pid=$!
+
+cat > "$dir/ssh_config" <<EOF
+Host loopback
+  HostName 127.0.0.1
+  Port $port
+  User $(id -un)
+  IdentityFile $dir/client_key
+  IdentitiesOnly yes
+  IdentityAgent none
+  UserKnownHostsFile $dir/known_hosts
+  GlobalKnownHostsFile /dev/null
+  StrictHostKeyChecking accept-new
+  UpdateHostKeys no
+  ControlMaster no
+  ControlPath none
+EOF
+# The only ssh on PATH for everything below.
+cat > "$dir/bin/ssh" <<EOF
+#!/bin/sh
+exec /usr/bin/ssh -F '$dir/ssh_config' "\$@"
+EOF
+chmod 700 "$dir/bin/ssh"
+export PATH="$dir/bin:/usr/bin:/bin"
+
+# Wait for sshd to answer.
+for _ in $(seq 1 50); do
+  if ssh -o BatchMode=yes -o ConnectTimeout=2 loopback true 2>/dev/null; then break; fi
+  if ! kill -0 "$sshd_pid" 2>/dev/null; then
+    echo "sshd did not start:" >&2
+    cat "$dir/sshd.log" >&2
+    exit 2
+  fi
+  sleep 0.1
+done
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "ok - $*"; }
+
+ssh -o BatchMode=yes loopback true || fail "a BatchMode login"
+pass "BatchMode login to 127.0.0.1:$port"
+
+# The Add Mac check: sh -s with the script on standard input.
+check=$(ssh -T -o BatchMode=yes -a -- loopback 'sh -s' <<EOF
+printf 'home=%s\n' "\$HOME"
+host=\$(command -v cherry-host)
+printf 'hostpath=%s\n' "\$host"
+printf 'version=%s\n' "\$("\$host" version --json | tr -d '\n')"
+printf 'status=%s\n' "\$("\$host" status --json --socket "\$CHERRY_HOST_SOCKET" | tr -d '\n')"
+EOF
+)
+printf '%s\n' "$check" | grep -q "^home=$dir/remote/home\$" || fail "the check ran with the private HOME: $check"
+printf '%s\n' "$check" | grep -q '^version={"protocol":' || fail "cherry-host version --json: $check"
+printf '%s\n' "$check" | grep -q '^status={"running":false' || fail "cherry-host status --json (no daemon yet): $check"
+pass "the Add Mac check through sh -s"
+
+cli() { "$binaries/cherry" --host loopback --socket "$socket" "$@"; }
+
+session=$(cli new --cwd "~" --name loopback-test --owner "Cherry@00000000-0000-0000-0000-000000000000" \
+  --tag cherry.project="device:00000000-0000-0000-0000-000000000000:$dir/remote/home" -- /bin/sh -c 'sleep 600')
+id=$(printf '%s' "$session" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+[ -n "$id" ] || fail "cherry --host loopback new: $session"
+cli list | grep -q "$id" || fail "the new session is listed"
+pass "a session created and listed through cherry --host (gateway, private daemon)"
+
+"$binaries/cherry" --host loopback --socket "$socket" --remote-host-path "$dir/remote/bin/cherry-host" list | grep -q "$id" \
+  || fail "--remote-host-path"
+pass "--remote-host-path"
+
+cli kill "$id" >/dev/null || fail "cherry kill"
+for _ in $(seq 1 50); do
+  if ! cli list | grep "$id" | grep -q running; then break; fi
+  sleep 0.1
+done
+cli remove "$id" >/dev/null 2>&1 || true
+pass "the session ended"
+
+# The daemon it started is this script's private one.
+pgrep -f "serve --socket $socket" >/dev/null || fail "a private daemon served $socket"
+pass "only the private daemon at $socket was used"
+echo "All loopback checks passed."

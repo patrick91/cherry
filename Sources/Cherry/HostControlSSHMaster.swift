@@ -70,7 +70,8 @@ final class HostSSHMasterManager: @unchecked Sendable {
         /// when a slot frees. `cherry` also connects directly when a
         /// master refuses a session anyway (a server with a lower
         /// `MaxSessions`).
-        var maxChannelsPerMaster = 8
+        var maxChannelsPerMaster = Configuration.defaultMaxChannelsPerMaster
+        static let defaultMaxChannelsPerMaster = 8
     }
 
     enum Phase: Equatable, Sendable {

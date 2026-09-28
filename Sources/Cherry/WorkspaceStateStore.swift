@@ -168,6 +168,13 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// whose answer (or new binding) was never saved still comes back.
     /// Older builds ignore it.
     var launchRequestID: String?
+    /// The host (`HostedSessionHost.id`) a persistent tab's session was
+    /// being created on when it was saved without a binding (its Create had
+    /// not answered): set for another Mac's host (a device's tab,
+    /// docs/specs/remote-devices.md), so a relaunch looks for that session
+    /// on its device, never on This Mac. Nil: This Mac (and every record
+    /// with a binding, which names its host). Older builds ignore it.
+    var hostKey: String?
     /// The tab's session was ended by the system (a restart or log out)
     /// while Cherry was closed: it comes back ended, with Restart and
     /// Close, until it restarts or closes (`SystemEndedSessions`). Such a
@@ -205,6 +212,7 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         projectRoot: String? = nil,
         hosted: HostedSessionBindingRecord? = nil,
         launchRequestID: String? = nil,
+        hostKey: String? = nil,
         systemEnd: SystemSessionEnd? = nil,
         exitStatus: Int32? = nil,
         savedAt: Date? = nil,
@@ -225,6 +233,7 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
         self.projectRoot = projectRoot
         self.hosted = hosted
         self.launchRequestID = launchRequestID
+        self.hostKey = hostKey
         self.systemEnd = systemEnd
         self.exitStatus = exitStatus
         self.savedAt = savedAt
@@ -251,21 +260,29 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     }
 
     /// A saved tab that may own a session of `host`: bound to one of its
-    /// sessions it did not only attach to, or (This Mac only, until records
-    /// name the host a Create went to) saved while its Create was under
-    /// way. A binding to another Mac's host counts only when it says it
-    /// owned the session: bindings saved before `owned` existed were SSH
-    /// attachments.
+    /// sessions it did not only attach to, or saved while its Create on
+    /// that host was under way (`hostKey`, This Mac when nil). A binding to
+    /// another Mac's host counts only when it says it owned the session:
+    /// bindings saved before `owned` existed were SSH attachments.
     func mayOwnSession(on host: HostedSessionHost) -> Bool {
-        guard let binding = hosted else { return host == .local && launchRequestID != nil }
+        guard let binding = hosted else { return creationHostKey == host.id && launchRequestID != nil }
         guard binding.host == host.id else { return false }
         return host == .local ? binding.owned != false : binding.owned == true
     }
 
+    /// The host a record without a binding was being created on
+    /// (`hostKey`): This Mac's unless it names another.
+    var creationHostKey: String {
+        hostKey?.nilIfEmpty ?? HostedSessionHost.local.id
+    }
+
     /// A saved tab that owned a session of another Mac's host (a device's
-    /// tab, docs/specs/remote-devices.md).
+    /// tab, docs/specs/remote-devices.md), or was creating one there when
+    /// it was saved.
     var ownsRemoteSession: Bool {
-        guard let binding = hosted else { return false }
+        guard let binding = hosted else {
+            return creationHostKey != HostedSessionHost.local.id && launchRequestID != nil
+        }
         return binding.host != HostedSessionHost.local.id && binding.owned == true
     }
 
@@ -280,7 +297,8 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
             workingDirectory: workingDirectory,
             projectRoot: projectRoot,
             hosted: hosted,
-            launchRequestID: launchRequestID
+            launchRequestID: launchRequestID,
+            hostKey: hostKey
         )
     }
 
@@ -311,6 +329,11 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
                 HostedSessionBindingRecord($0, owned: session.isPersistentLocalSession)
             },
             launchRequestID: session.isPersistentLocalSession ? session.persistentLaunchRequestID : nil,
+            // A device's tab saved while its Create was under way names the
+            // device it was being created on.
+            hostKey: session.hostedSessionBinding == nil && session.persistentLaunchRequestID != nil
+                ? session.persistentHosting.flatMap { $0.profile.isThisMac ? nil : $0.profile.host.id }
+                : nil,
             systemEnd: session.systemSessionEnd,
             exitStatus: session.savedExitStatus,
             hasUnreadNotification: session.hasUnreadNotification ? true : nil
@@ -736,13 +759,18 @@ final class WorkspaceStateStore: @unchecked Sendable {
     }
 
     /// Windows to reopen at launch: saved ones whose directory still exists
-    /// and whose workspace had tabs.
-    func projectWindowRootsToReopen() -> [String] {
+    /// and whose workspace had tabs. A project on another Mac (a
+    /// `ProjectLocation` key) is never looked for on this Mac's disk: it is
+    /// reopened while its device is still known (`remoteProjectIsKnown`).
+    func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
         var seen = Set<String>()
         return loadOpenProjectWindowRoots().filter { root in
+            guard seen.insert(root).inserted else { return false }
+            if ProjectLocation.isRemoteKey(root) {
+                return remoteProjectIsKnown(root) && hasSavedTabs(repositoryRoot: root)
+            }
             var isDirectory: ObjCBool = false
-            return seen.insert(root).inserted
-                && FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory)
+            return FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory)
                 && isDirectory.boolValue
                 && hasSavedTabs(repositoryRoot: root)
         }
@@ -927,7 +955,9 @@ final class WorkspaceStateStore: @unchecked Sendable {
             if let lostBefore = ended.lostBefore, (record.savedAt ?? fallbackSavedAt ?? .distantPast) <= lostBefore {
                 return true
             }
-            guard let binding = record.hosted, binding.host == HostedSessionHost.local.id else { return false }
+            // Any host's: entries are keyed by host identity, so This Mac's
+            // and each device's stay apart.
+            guard let binding = record.hosted else { return false }
             return ended.entries.contains { $0.hostID == binding.hostID && $0.sessionID == binding.sessionID }
         }
     }
@@ -1063,8 +1093,8 @@ final class WorkspaceStateStore: @unchecked Sendable {
         "\(hostID)\u{0}\(sessionID)"
     }
 
-    /// Every session of This Mac a saved state file (of this version) names.
-    /// Only on `queue`.
+    /// Every session a saved state file (of this version) names, This
+    /// Mac's and devices' (keyed by host identity). Only on `queue`.
     private func namedLocalSessionsLocked() -> Set<String> {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
         var named = Set<String>()
@@ -1074,7 +1104,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
             guard case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: url) else { continue }
             for worktree in state.worktrees {
                 for session in worktree.sessions {
-                    guard let binding = session.hosted, binding.host == HostedSessionHost.local.id else { continue }
+                    guard let binding = session.hosted else { continue }
                     named.insert(Self.key(hostID: binding.hostID, sessionID: binding.sessionID))
                 }
             }
@@ -1335,23 +1365,34 @@ enum SystemSessionEnd: String, Codable, Equatable, Sendable {
     case restart
     /// The user logged out since: the system ended their processes.
     case logout
+    /// Another Mac's host (a device, docs/specs/remote-devices.md) reported
+    /// the session lost: its holder was killed, as a restart or log out of
+    /// that Mac does. Only a device's tab ends this way.
+    case hostRestart = "hostRestart"
 
-    /// What the ended tab says (`PersistentSessionEndedBar`).
-    var message: String {
+    /// What the ended tab says (`PersistentSessionEndedBar`). `machine`:
+    /// the device a `hostRestart` names ("Ended when Studio restarted").
+    func message(machine: String? = nil) -> String {
         switch self {
         case .restart: "Ended when the Mac restarted"
         case .logout: "Ended when you logged out"
+        case .hostRestart: "Ended when \(machine ?? "the other Mac") restarted"
         }
     }
 
+    var message: String { message() }
+
     /// The window's toast after its tab count: "3 tabs ended when the Mac
     /// restarted".
-    var predicate: String {
+    func predicate(machine: String? = nil) -> String {
         switch self {
         case .restart: " ended when the Mac restarted"
         case .logout: " ended when you logged out"
+        case .hostRestart: " ended when \(machine ?? "the other Mac") restarted"
         }
     }
+
+    var predicate: String { predicate() }
 }
 
 /// Decides whether the system ended a saved tab's session while Cherry was
@@ -1421,8 +1462,10 @@ struct SystemEndedSessions {
                     || recordedLostSessions(binding.hostID).contains(binding.sessionID))
         } ?? false
         if remote {
-            // This Mac's boot time and quits are not that Mac's.
-            return Self.end(savedAt: nil, bootTime: nil, systemQuits: [], lostByHost: lost)
+            // This Mac's boot time and quits are not that Mac's: only the
+            // device's own word that it lost the session ("Ended when
+            // <Mac> restarted").
+            return lost ? .hostRestart : nil
         }
         return Self.end(savedAt: savedAt(of: record), bootTime: bootTime, systemQuits: systemQuits, lostByHost: lost)
     }
@@ -1520,7 +1563,8 @@ struct OrphanedSessionCriteria: Sendable {
         savedState: RepositoryStateRecord?,
         setAside: SetAsideStateSummary? = nil,
         sessionsToEnd: [WorkspaceSessionRecord] = [],
-        createdBefore: Date
+        createdBefore: Date,
+        host: HostedSessionHost = .local
     ) {
         self.owner = owner
         self.createdBefore = createdBefore
@@ -1536,7 +1580,7 @@ struct OrphanedSessionCriteria: Sendable {
         namedTabIDs = Set(records.filter { $0.mayComeBack && $0.systemEnd == nil }.map(\.id))
             .union(sessionsToEnd.map(\.id))
         namedSessionIDs = Set((records + sessionsToEnd).compactMap { record in
-            record.hosted.flatMap { $0.host == HostedSessionHost.local.id ? $0.sessionID : nil }
+            record.hosted.flatMap { $0.host == host.id ? $0.sessionID : nil }
         })
         namedLaunchIDs = Set((records + sessionsToEnd).compactMap { $0.launchRequestID?.lowercased() })
         recoveredTabIDs = recovered?.tabIDs ?? []

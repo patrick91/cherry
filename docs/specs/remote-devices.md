@@ -1,7 +1,9 @@
 # Devices: projects on your other Macs
 
-Status: phase 0 (groundwork) implemented on `codex/persistent-sessions`;
-phases 1 to 4 are the plan. Builds on
+Status: phase 0 (groundwork) and phase 1 (devices and remote project
+windows, with Add Mac… connecting and checking only) implemented on
+`codex/persistent-sessions`; phases 2 to 4 are the plan. Phase 1 as built,
+and where it differs from the plan below, is in *Phase 1 as built*. Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
 [remote-session-host.md](remote-session-host.md) (SSH transport, gateway,
@@ -190,7 +192,157 @@ No user-visible change for local tabs. What exists:
   CLI retries once without its ControlPath when ssh reports "Session open
   refused by peer" before the gateway preamble.
 
-## Phase 1: devices and remote project windows
+## Phase 1 as built
+
+What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
+`RemoteDeviceViews.swift`, `TitlebarProjectMenuModel.swift`):
+
+- **`RemoteDeviceStore`** (not `DeviceStore`): `devices.json` in the
+  identity's Application Support (`{version: 1, devices: [...]}`), written
+  atomically by the instance-lock holder only. A `RemoteDevice` has `id`,
+  `name`, `sshDestination`, `remoteHostPath?`, `machineNames`,
+  `homeDirectory?`, `addedProjects`, `hiddenProjects`, `lastSeen`, `hostID`
+  (its host's identity from `status --json`) and `createdHostEntry`
+  (`installedHostPath` and `lastProbe` wait for phase 2). Each destination
+  is also a saved host of `HostedSessionHostStore`, whose trusted
+  identities pin it; Remove ends nothing, and forgets that saved host and
+  its pin only when Add Mac… created it (never a host the user had saved).
+  Every change (add, remove, rename, hide, add project, trust) needs the
+  instance lock (`canModify`); without it the picker's changing items are
+  off. An alias of a Mac already added (the same host identity, recorded or
+  pinned) is refused, and so is a destination containing `@-`. The store
+  sets `HostedRemoteHostPaths.shared`'s resolver and makes one
+  `PersistentHostSessions.remote(…)` per device, registered in
+  `PersistentHostingRegistry` (all of them at launch). A device keeps one
+  hosting by id across renames (the hosting takes the new name); removing
+  a device whose hosting is in use (open tabs, a window whose saved tabs
+  wait or are being restored, ends under way) leaves it registered, and
+  adding that Mac again takes it back instead of making a second one.
+- **Add Mac…** (phase 1 connects and checks only): the SSH host field
+  suggests the non-wildcard `Host` aliases of `~/.ssh/config` (and the files
+  it `Include`s). **Check** runs one BatchMode `ssh -a -x … HOST 'sh -s'`
+  (`RemoteDeviceShell`, script on standard input so any login shell runs
+  it) that reports `uname -sm`, `sw_vers`, ComputerName, host names, `$HOME`,
+  `$SHELL`, the `cherry-host` it finds (`remoteHostPath`, else `PATH`, else
+  the two known install places) with `version --json` and `status --json`,
+  and whether a protected folder (Full Disk Access) and the login keychain
+  can be read. The checklist (`RemoteDeviceChecklist`): SSH ok or why not
+  (a host key → **Open in Terminal**, which runs `ssh -- '<host>'` in a tab
+  of the frontmost This Mac project window; a refused login → keys and
+  agent help; unknown host; unreachable), the Mac, the session host (same
+  protocol, another one, a running daemon of another protocol, or missing:
+  phase 2's installer is coming, with manual copy instructions), and Full
+  Disk Access / keychain warnings. Then a name (default ComputerName) and
+  **Add**, for exactly what was checked (editing the host or its
+  cherry-host path asks for a new check). A cherry-host found in a known
+  install place is kept as `remoteHostPath` (`~/…`).
+- **Picker** (`TitlebarProjectMenuModel`, pure and tested by snapshot;
+  `TitlebarProjectMenuController` builds the `NSMenu`): after This Mac's
+  projects (remote keys never listed there), **Devices**, each Mac with a
+  status dot and subtitle (`RemoteDeviceConnectionState`: not checked /
+  last seen, connecting, connected · N sessions, offline, identity changed,
+  login refused, another protocol) and a submenu: its projects, which are
+  the `cherry.project` tags of every owner's sessions on its host (a device
+  key's path, or a plain path from that Mac's own Cherry) with counts, plus
+  `addedProjects`, minus `hiddenProjects` (an Option-alternate item hides
+  one); **Other sessions** (untagged; the Persistent Sessions sheet on that
+  host); **Open Home Folder**; **Add Project on <Mac>…** (a path, checked
+  there with `test -d` and `pwd -P`; there is no remote folder browser and
+  no `ListDir` request); a state row with **Reconnect** / **Trust New
+  Identity…**; **Persistent Sessions on <Mac>…**; **Rename…**;
+  **Remove…**. Then **Add Mac…**. The menu is built from what the hosts'
+  `HostControl`s last listed and, while open, lists each host again without
+  a lease (never one whose SSH login was refused, nor one another identity
+  or protocol answers) and updates each device's item in place.
+- **Remote windows**: `ProjectWorkspaceView` gives a `device:` key the
+  device's hosting (`SessionBackendPolicy.remote`) and
+  `hostedByDefault(localSessions: device hosting)`. A key of a device the
+  store no longer knows gets a stand-in hosting (`isKnownDevice` false)
+  whose control never runs a helper (no ssh to a made-up host) and whose
+  tabs fail ("Couldn't start on an unknown Mac: …"), never local ones; its
+  window keeps its saved tabs exactly as saved (no restore, no lease) until
+  the device is known again. `RepositoryWorkspace` keeps the key
+  (`isRemote`: no git, no worktrees, no auto-start commands; the sidebar
+  hides project commands; Open in an editor is hidden), marks the hosting
+  in use while open, holds a lease on the device's control connection
+  while the window has tabs, and starts `HostedReconnects` wake/network
+  monitoring. Title "<project> — <Mac>" with a computer glyph in the picker
+  (and the window title); each tab row has a device chip. The restore
+  routes records of the window's own host (`localSessions.profile.host`,
+  not only `.local`) to the owning restore, so a device's tabs come back as
+  its own; unbound records are looked for only on the host their `hostKey`
+  names. A device window runs no orphan scan (its criteria compare
+  creation times with This Mac's clock): its unshown sessions are listed
+  under **Not open here**, the project's sessions on that Mac that no tab
+  shows: this Cherry's own get **Reopen** (owned adoption, now for any
+  hosting's host), other owners' **Attach** (attach-only; closing
+  disconnects; its help says it may resize the session on that Mac while
+  both show it). **Couldn't start on <Mac>: …** shows in a bar with
+  **Retry** (`RemoteLaunchFailureBar`).
+- **Offline**: a device tab's adapter is launched again only while its
+  `HostControl` is connected (otherwise it waits for the connection, which
+  its lease keeps retrying; `state` shows disconnected); once it answers,
+  waiting tabs' adapters launch a batch at a time (at most the SSH master's
+  channel cap, 8, then a jittered pause). The bars of its tabs and of a
+  window whose saved tabs wait say what stands in the way and offer what
+  helps (`RemoteDeviceAvailability`): "<Mac> is offline, reconnecting…"
+  (Reconnect Now), a refused SSH login (Retry; not retried on a timer),
+  another identity (Trust New Identity…), another protocol (Update…), or a
+  reason nothing retries (a missing helper, an unknown device: Check
+  Again). Keys typed while the adapter is away go only over the connection
+  that is up (`HostControl.sendKeysOnCurrentConnection`: never a new
+  connection, an answer within 3 s); when the Mac cannot be reached or a
+  key fails, it is not sent, nor are the keys queued behind it, and the
+  bar says so (`offlineInputRejectedAt`). A restore that cannot list the
+  device keeps the records and retries through `HostControl.availability()`
+  (the batch B machinery: leased backoff, wake and network triggers, a
+  refused login waits); the window opens no default shell meanwhile and
+  says how many tabs wait (`remoteTabsWaitingCount`). Every end of a device
+  session (a close, End Sessions, a quit that ends sessions) is first
+  recorded in `sessions-to-end.json` (an entry naming that host and
+  identity's session, id `PersistentHostSessions.endRecordID`) and dropped
+  once done. What could not be done is finished whenever Cherry next
+  connects to that Mac for any reason (a window, the picker, Persistent
+  Sessions; in this run or a later one): `resumeRecordedEndsOnConnection`,
+  set up for every device at launch. A session whose tab's close can still
+  be undone is never ended that way (its close ends it, or ⌘Z keeps it). A
+  quit does not wait for an offline device's ends.
+- **Restore wording**: a device session its host reports lost comes back as
+  `SystemSessionEnd.hostRestart`, "Ended when <Mac> restarted" (toast "N
+  tabs ended when <Mac> restarted"). This Mac's boot and quits are never
+  evidence for it.
+- **Records**: `WorkspaceSessionRecord.hostKey` is the device's
+  `HostedSessionHost.id` for a device tab saved while its Create ran (nil
+  means This Mac, as before); `mayOwnSession(on:)`, `ownsRemoteSession`,
+  sessions to end and the restore use it. `wasEndedOnPurpose` and the ended
+  and lost session files are keyed by host identity for every host.
+- **Tests**: `RemoteDeviceTests` (store, SSH config, check parsing and
+  checklist, SSH error mapping, picker snapshots per state and the live
+  `NSMenu` update, discovery grouping, restore wording, reopen, records,
+  offline adapter wait and keys, ends recorded offline, detach/⌘Z/quit
+  count) and `RemoteDeviceRealHost*` (real helpers through
+  `Scripts/fake-remote-mac`: Add Mac check and its SSH failures, a bare Mac
+  without cherry-host, tabs created and typed into over the shim, discovery
+  of all owners and Other sessions, owner isolation with the device's own
+  "Cherry" on the same daemon both ways, Not open here / Reopen / Attach,
+  restore after This Mac restarted, a device restart ending tabs as
+  "Ended when Studio restarted", an offline device keeping tabs pending
+  without native fallback until it answers, End Sessions while offline
+  finished later). Group `RemoteDevice` in `Scripts/test-session-suites`;
+  real-host mode requires a `RemoteDeviceRealHost*` pass.
+  `Scripts/test-remote-mac-loopback` runs the check and `cherry --host`
+  flows over real SSH to 127.0.0.1 with a private sshd (no admin rights).
+
+Deviations from the plan below: Add Mac… (connect and check) is in phase
+1; projects come from the device's session tags and added folders, not
+`AgentSettings.projects`, and "Open Folder on <Mac>…" is Open Home Folder
+plus Add Project on <Mac>… (no `ListDir`); sidebar path labels do not use
+the device's home yet; Settings › Sessions does not list each device's
+status; the quit question counts device sessions with This Mac's but does
+not say "on 2 Macs"; file paste and drop into a device tab still insert
+This Mac's paths (phase 3).
+
+## Phase 1: devices and remote project windows (the plan)
 
 No Add Mac yet: devices are added from a hidden debug menu or `defaults`
 for development, with a working SSH alias and a `cherry-host` already on

@@ -2252,12 +2252,13 @@ private func beforeTheLastBoot() throws -> Date {
     // That says nothing about the other Mac: the remote tab is dropped...
     let remoteList = HostedSessionList(hostID: "host-studio", sessions: [])
     #expect(evidence.end(of: remote, missingFrom: remoteList) == nil)
-    // ...unless its own host reported the session lost, now or earlier.
+    // ...unless its own host reported the session lost, now or earlier:
+    // "Ended when <Mac> restarted" (phase 1 words it for the device).
     let lostNow = HostedSessionList(hostID: "host-studio", sessions: [], lostSessionIDs: ["s-remote"])
-    #expect(evidence.end(of: remote, missingFrom: lostNow) == .logout)
+    #expect(evidence.end(of: remote, missingFrom: lostNow) == .hostRestart)
     var recorded = evidence
     recorded.recordedLostSessions = { $0 == "host-studio" ? ["s-remote"] : [] }
-    #expect(recorded.end(of: remote, missingFrom: remoteList) == .logout)
+    #expect(recorded.end(of: remote, missingFrom: remoteList) == .hostRestart)
     // Another identity's report of the same session id says nothing.
     let otherHost = HostedSessionList(hostID: "host-other", sessions: [], lostSessionIDs: ["s-remote"])
     #expect(evidence.end(of: remote, missingFrom: otherHost) == nil)

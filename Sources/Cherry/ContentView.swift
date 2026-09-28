@@ -353,6 +353,20 @@ struct ContentView: View {
         .sheet(isPresented: $chromeState.isHostedSessionsPresented) {
             HostedSessionsSheet(workspace: workspace, chromeState: chromeState)
         }
+        .sheet(isPresented: $chromeState.isAddDevicePresented) {
+            AddDeviceSheet(model: AddDeviceModel()) { device in
+                // Its home folder opens, where Add Project on <Mac>… and its
+                // sessions' projects are one menu away.
+                if let home = device.homeDirectory {
+                    openProject(CherryProject(root: device.projectKey(path: home)))
+                }
+            }
+        }
+        .sheet(item: $chromeState.addProjectDevice) { reference in
+            AddDeviceProjectSheet(deviceID: reference.id, store: .shared) { key in
+                openProject(CherryProject(root: key))
+            }
+        }
         .sheet(isPresented: $chromeState.isNewWorktreePresented) {
             NewWorktreeSheet(
                 repository: repository,
@@ -3426,7 +3440,8 @@ private struct CommandPaletteOverlay: View {
             projects: settings.projects,
             installedEditors: editorDiscovery.installedEditors,
             defaultEditorID: terminalSettings.defaultEditorID,
-            hasOpenProject: project.validProjectRoot != nil,
+            // Open in an editor is This Mac's (a device's project is phase 3).
+            hasOpenProject: project.validProjectRoot.map { !ProjectLocation.isRemoteKey($0) } ?? false,
             supportsWorktrees: repository.supportsWorktrees,
             usageScores: usageScores
         )
@@ -5005,7 +5020,10 @@ private struct SidebarTabsPage: View {
         let visibleAgentItems = agentTree.visibleItems(
             collapsedIDs: chromeState.collapsedAgentGroupIDs
         )
-        let commands = agentSettings.launchableProjectCommands(for: projectRoot)
+        // A device's project has no commands here in phase 1: its
+        // cherry.toml is on that Mac (docs/specs/remote-devices.md).
+        let isRemote = projectRoot.map(ProjectLocation.isRemoteKey) ?? false
+        let commands = isRemote ? [] : agentSettings.launchableProjectCommands(for: projectRoot)
         let palette = SidebarPalette(
             themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
             fallbackColorScheme: colorScheme,
@@ -5045,18 +5063,25 @@ private struct SidebarTabsPage: View {
                 )
                 .id("terminals-\(projectRoot ?? "")")
 
-                SidebarCommandSection(
-                    settings: agentSettings,
-                    workspace: workspace,
-                    chromeState: chromeState,
-                    projectRoot: projectRoot,
-                    presentation: presentation,
-                    palette: palette,
-                    commands: commands,
-                    shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
-                    showShortcutHints: chromeState.isCommandKeyPressed
-                )
-                .id("commands-\(projectRoot ?? "")")
+                if isRemote, let hosting = workspace.backendPolicy.localSessions, !hosting.profile.isThisMac {
+                    RemoteNotOpenSection(workspace: workspace, hosting: hosting)
+                        .id("not-open-\(projectRoot ?? "")")
+                }
+
+                if !isRemote {
+                    SidebarCommandSection(
+                        settings: agentSettings,
+                        workspace: workspace,
+                        chromeState: chromeState,
+                        projectRoot: projectRoot,
+                        presentation: presentation,
+                        palette: palette,
+                        commands: commands,
+                        shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
+                        showShortcutHints: chromeState.isCommandKeyPressed
+                    )
+                    .id("commands-\(projectRoot ?? "")")
+                }
 
                 if features.todosEnabled {
                     SidebarTodosSection(
@@ -6750,93 +6775,20 @@ private struct TitlebarProjectPicker: View {
     }
 
     private func presentMenu() {
-        let menu = NSMenu()
-        var targets: [TitlebarProjectMenuTarget] = []
-
-        if repository.supportsWorktrees {
-            menu.addItem(NSMenuItem.sectionHeader(title: "Worktrees"))
-            for worktree in repository.worktrees {
-                let item = NSMenuItem(title: worktree.displayName, action: nil, keyEquivalent: "")
-                item.state = worktree.root == repository.activeWorktreeRoot ? .on : .off
-                if repository.hiddenWorktreeRoots.contains(worktree.root) {
-                    item.title += " — Hidden"
-                }
-                let target = TitlebarProjectMenuTarget {
-                    _ = repository.activate(
-                        worktreeRoot: worktree.root,
-                        chromeState: chromeState
-                    )
-                }
-                targets.append(target)
-                item.target = target
-                item.action = #selector(TitlebarProjectMenuTarget.invoke)
-                menu.addItem(item)
-            }
-
-            let newWorktreeItem = NSMenuItem(title: "New Worktree...", action: nil, keyEquivalent: "")
-            let newWorktreeTarget = TitlebarProjectMenuTarget {
-                isNewWorktreePresented = true
-            }
-            targets.append(newWorktreeTarget)
-            newWorktreeItem.target = newWorktreeTarget
-            newWorktreeItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-            menu.addItem(newWorktreeItem)
-
-            let manageWorktreesItem = NSMenuItem(title: "Manage Worktrees...", action: nil, keyEquivalent: "")
-            let manageWorktreesTarget = TitlebarProjectMenuTarget {
-                isWorktreeManagerPresented = true
-            }
-            targets.append(manageWorktreesTarget)
-            manageWorktreesItem.target = manageWorktreesTarget
-            manageWorktreesItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-            menu.addItem(manageWorktreesItem)
-
-            menu.addItem(.separator())
-        }
-
-        if settings.projects.isEmpty {
-            let item = NSMenuItem(title: "No Projects", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            menu.addItem(NSMenuItem.sectionHeader(title: "Projects"))
-
-            for project in settings.projects {
-                let item = NSMenuItem(title: project.name, action: nil, keyEquivalent: "")
-                if selectedProject?.id == project.id {
-                    item.state = .on
-                }
-                let target = TitlebarProjectMenuTarget { [openProject] in
-                    openProject(project)
-                }
-                targets.append(target)
-                item.target = target
-                item.action = #selector(TitlebarProjectMenuTarget.invoke)
-                menu.addItem(item)
-            }
-        }
-
-        menu.addItem(.separator())
-
-        let addItem = NSMenuItem(title: "Add Project...", action: nil, keyEquivalent: "")
-        let addTarget = TitlebarProjectMenuTarget(chooseProjectRoot)
-        targets.append(addTarget)
-        addItem.target = addTarget
-        addItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-        menu.addItem(addItem)
-
-        let editItem = NSMenuItem(title: "Edit Projects...", action: nil, keyEquivalent: "")
-        let editTarget = TitlebarProjectMenuTarget(openSettings)
-        targets.append(editTarget)
-        editItem.target = editTarget
-        editItem.action = #selector(TitlebarProjectMenuTarget.invoke)
-        menu.addItem(editItem)
+        let controller = TitlebarProjectMenuController(
+            makeModel: makeMenuModel,
+            controls: {
+                RemoteDeviceStore.shared.devices.compactMap { $0.host.map { HostControlRegistry.shared.control(for: $0) } }
+            },
+            perform: performMenuAction
+        )
+        let menu = controller.menu
 
         // Anchor the menu's top-left to the bottom-leading corner of the
         // button, with a 4pt gap. NSMenuItem.target is `weak`, but
         // `popUp(positioning:at:in:)` is synchronous: actions fire before
-        // the call returns, so the local `targets` array keeps them alive
-        // long enough.
+        // the call returns, so the controller (which keeps the targets)
+        // lives long enough.
         if let anchor = anchorRef.view {
             let bounds = anchor.bounds
             let point: NSPoint = anchor.isFlipped
@@ -6847,7 +6799,98 @@ private struct TitlebarProjectPicker: View {
             menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
         }
 
-        _ = targets
+        withExtendedLifetime(controller) {}
+    }
+
+    /// The picker's contents now, from cached state: the worktrees, This
+    /// Mac's projects, and each device with what its host last listed.
+    private func makeMenuModel() -> TitlebarProjectMenuModel {
+        let worktrees = repository.supportsWorktrees
+            ? repository.worktrees.map { worktree in
+                TitlebarProjectMenuModel.Worktree(
+                    root: worktree.root,
+                    name: worktree.displayName,
+                    isActive: worktree.root == repository.activeWorktreeRoot,
+                    isHidden: repository.hiddenWorktreeRoots.contains(worktree.root)
+                )
+            }
+            : nil
+        let projects = settings.projects
+            .filter { !ProjectLocation.isRemoteKey($0.root) }
+            .map { project in
+                TitlebarProjectMenuModel.Project(
+                    root: project.root, name: project.name, isSelected: selectedProject?.id == project.id
+                )
+            }
+        let store = RemoteDeviceStore.shared
+        let devices = store.devices.map { device -> TitlebarProjectMenuModel.Device in
+            guard let host = device.host else {
+                return .init(device: device, state: .offline(reason: "Its SSH destination is not valid."), sessions: [])
+            }
+            let control = HostControlRegistry.shared.control(for: host)
+            if control.state == .connected { store.noteSeen(device.id) }
+            return .init(
+                device: device,
+                state: RemoteDeviceConnectionState(
+                    control: control.state, sessionCount: control.sessions.count, lastSeen: device.lastSeen
+                ),
+                sessions: control.sessions
+            )
+        }
+        return TitlebarProjectMenuModel(
+            worktrees: worktrees,
+            projects: projects,
+            devices: devices,
+            currentProjectKey: repository.repositoryRoot,
+            canModifyDevices: store.canModify
+        )
+    }
+
+    private func performMenuAction(_ action: TitlebarProjectMenuModel.Action) {
+        let store = RemoteDeviceStore.shared
+        switch action {
+        case .activateWorktree(let root):
+            _ = repository.activate(worktreeRoot: root, chromeState: chromeState)
+        case .newWorktree:
+            isNewWorktreePresented = true
+        case .manageWorktrees:
+            isWorktreeManagerPresented = true
+        case .openProject(let root):
+            if let project = settings.projects.first(where: { $0.root == root }) { openProject(project) }
+        case .addProject:
+            chooseProjectRoot()
+        case .editProjects:
+            openSettings()
+        case .openDeviceProject(let deviceID, let path):
+            openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: path).key))
+        case .openDeviceHome(let deviceID):
+            guard let home = store.device(id: deviceID)?.homeDirectory else { return }
+            openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: home).key))
+        case .openDeviceSessions(let deviceID):
+            guard let host = store.device(id: deviceID)?.host else { return }
+            chromeState.hostedSessionsInitialHost = host
+            chromeState.isHostedSessionsPresented = true
+        case .addDeviceProject(let deviceID):
+            chromeState.addProjectDevice = RemoteDeviceReference(id: deviceID)
+        case .hideDeviceProject(let deviceID, let path):
+            store.hideProject(path: path, on: deviceID)
+        case .reconnectDevice(let deviceID):
+            guard let host = store.device(id: deviceID)?.host else { return }
+            let control = HostControlRegistry.shared.control(for: host)
+            if case .waitingToReconnect = control.state {
+                control.reconnectNow()
+            } else {
+                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
+            }
+        case .trustDeviceIdentity(let deviceID):
+            RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
+        case .renameDevice(let deviceID):
+            RemoteDeviceAlerts.rename(deviceID, store: store)
+        case .removeDevice(let deviceID):
+            RemoteDeviceAlerts.confirmRemove(deviceID, store: store)
+        case .addMac:
+            chromeState.isAddDevicePresented = true
+        }
     }
 
     private func chooseProjectRoot() {
@@ -6877,6 +6920,9 @@ private struct TitlebarProjectPicker: View {
     }
 
     private var repositoryTitle: String {
+        if let deviceName {
+            return "\(repository.repositoryName) — \(deviceName)"
+        }
         let name = selectedProject?.name ?? repository.repositoryName
         return name.isEmpty ? "No Project" : name
     }
@@ -6931,11 +6977,29 @@ private struct TitlebarProjectPicker: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        } else if deviceName != nil {
+            // A device's project: "<project> — <Mac>" with a device glyph.
+            HStack(spacing: Self.deviceGlyphSpacing) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: Self.deviceGlyphWidth)
+                Text(repositoryTitle)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
         } else {
             Text(repositoryTitle)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
+    }
+
+    private static let deviceGlyphWidth: CGFloat = 14
+    private static let deviceGlyphSpacing: CGFloat = 4
+
+    /// The device a remote project's window runs on.
+    private var deviceName: String? {
+        RemoteDeviceStore.shared.device(forProjectKey: repository.repositoryRoot)?.name
     }
 
     private func worktreeLine(
@@ -6969,6 +7033,8 @@ private struct TitlebarProjectPicker: View {
                     + Self.worktreeLineSpacing
                     + max(Self.measuredTitleWidth(worktreeName), targetWidth)
             )
+        } else if deviceName != nil {
+            titleWidth = Self.deviceGlyphWidth + Self.deviceGlyphSpacing + Self.measuredTitleWidth(repositoryTitle)
         } else {
             titleWidth = Self.measuredTitleWidth(repositoryTitle)
         }
@@ -9709,6 +9775,10 @@ private struct SidebarTabRow: View {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 
+            if let machine = rowState.remoteMachineName {
+                RemoteDeviceChip(name: machine, isSelected: isSelected)
+            }
+
             if rowState.isShared {
                 Image(systemName: "person.2.fill")
                     .font(.system(size: 9, weight: .medium))
@@ -9790,6 +9860,8 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
     /// Its session is shared with other clients (`TerminalSession.sharedSessionBar`).
     @Published private(set) var isShared = false
+    /// The device its program runs on (docs/specs/remote-devices.md).
+    let remoteMachineName: String?
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -9811,6 +9883,7 @@ private final class SidebarTabRowState: ObservableObject {
         self.attentionClassifierPrediction = session.attentionClassifierPrediction
         self.hasUnacknowledgedAttention = session.hasUnacknowledgedAttention
         self.nixShellEnvironment = session.nixShellEnvironment
+        self.remoteMachineName = session.remoteMachineName
 
         observe(session)
     }
@@ -12081,6 +12154,15 @@ private struct TerminalSceneView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
 
+            // A device's tab: its Mac offline, or it could not start there.
+            RemoteHostStateBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
+            RemoteLaunchFailureBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
             SharedSessionBar(session: session)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.top, 8)
@@ -12409,7 +12491,8 @@ private struct PersistentSessionReconnectBar: View {
     @ObservedObject var session: TerminalSession
 
     var body: some View {
-        if session.isPersistentLocalSession, session.state == .disconnected {
+        // A device's tab says so in RemoteHostStateBar.
+        if session.isPersistentLocalSession, session.remoteMachineName == nil, session.state == .disconnected {
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 12, weight: .medium))

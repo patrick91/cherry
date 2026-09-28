@@ -287,12 +287,21 @@ struct HostedSessionsSheet: View {
         PersistentLocalSessions.shared.noteEndedOnPurpose(hostID: hostID, sessionID: sessionID)
     })
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedHost = HostedSessionHost.local
+    @State private var selectedHost: HostedSessionHost
     @State private var newHost = ""
     @State private var sessionName = ""
     @State private var workingDirectory = ""
     @State private var selectedSessionID: String?
     @State private var terminationCandidate: HostedSessionInfo?
+
+    /// Opens on the host the picker asked for (Persistent Sessions on
+    /// <Mac>…, Other sessions), else a device window's own Mac, else This Mac.
+    init(workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState) {
+        self.workspace = workspace
+        self.chromeState = chromeState
+        let deviceHost = workspace.backendPolicy.localSessions.flatMap { $0.profile.isThisMac ? nil : $0.profile.host }
+        _selectedHost = State(initialValue: chromeState.hostedSessionsInitialHost ?? deviceHost ?? .local)
+    }
 
     private var selectedSession: HostedSessionInfo? {
         controller.sessions.first { $0.id == selectedSessionID }
@@ -482,6 +491,7 @@ struct HostedSessionsSheet: View {
         }
         .padding(24)
         .frame(width: 720, height: 640)
+        .onAppear { chromeState.hostedSessionsInitialHost = nil }
         .task(id: selectedHost.id) {
             selectedSessionID = nil
             await controller.refresh(selectedHost)

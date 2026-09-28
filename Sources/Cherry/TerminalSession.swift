@@ -1593,9 +1593,11 @@ final class TerminalWorkspace: ObservableObject {
             }
             return existing
         }
-        if attachment.host == .local,
+        // A session of the host this workspace runs its persistent tabs on
+        // (This Mac's, or a device's in its window).
+        if let hosting = backendPolicy.localSessions,
+           attachment.host == hosting.profile.host,
            launchBackend == .nativePTY,
-           let hosting = backendPolicy.localSessions,
            let info = info ?? hosting.sessionInfo(attachment.sessionID),
            info.id == attachment.sessionID,
            hosting.canAdopt(info) {
@@ -1608,7 +1610,7 @@ final class TerminalWorkspace: ObservableObject {
             // stays one (MCP's permission-prompt guard) and the next save
             // keeps what it runs.
             var record = OrphanedSessionCriteria.record(
-                for: info, tabID: unusedSessionID(startedFor ?? id), hostID: attachment.hostID
+                for: info, tabID: unusedSessionID(startedFor ?? id), hostID: attachment.hostID, host: attachment.host
             )
             if record.title.isEmpty { record.title = attachment.name.nilIfEmpty ?? info.displayName }
             if record.projectRoot == nil { record.projectRoot = projectRoot }
@@ -1815,22 +1817,35 @@ final class TerminalWorkspace: ObservableObject {
         case .terminal: "\(ShellProcessController.defaultShellName) login shell"
         case .agent, .command: record.launchCommand ?? ""
         }
-        let directory = [record.workingDirectory, record.launchWorkingDirectory, record.projectRoot]
-            .compactMap { $0 }
-            .first { path in
-                var isDirectory: ObjCBool = false
-                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-            }
-        let hosting = launchBackend == .nativePTY && backendPolicy.prefersPersistentLocalSessions
+        // A device's tab (docs/specs/remote-devices.md): its directories
+        // are that Mac's, never looked for here, and Restart starts it on
+        // the device again whatever the local setting.
+        let remoteHosting = backendPolicy.localSessions.flatMap { $0.profile.allowsNativeFallback ? nil : $0 }
+        let workingDirectory: String
+        if let remoteHosting {
+            workingDirectory = Self.startingDirectory(
+                record.workingDirectory.nilIfEmpty ?? record.launchWorkingDirectory ?? launchRoot,
+                hosting: remoteHosting
+            )
+        } else {
+            let directory = [record.workingDirectory, record.launchWorkingDirectory, record.projectRoot]
+                .compactMap { $0 }
+                .first { path in
+                    var isDirectory: ObjCBool = false
+                    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+                }
+            workingDirectory = Self.resolvedWorkingDirectory(directory)
+        }
+        let hosting = remoteHosting ?? (launchBackend == .nativePTY && backendPolicy.prefersPersistentLocalSessions
             ? backendPolicy.localSessions
-            : nil
+            : nil)
         let session = TerminalSession(
             id: record.id,
             title: record.title.nilIfEmpty ?? record.commandName ?? record.agentName ?? "Shell",
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
             subtitle: subtitle,
             tint: Self.palette[sessions.count % Self.palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(directory),
+            workingDirectory: workingDirectory,
             projectRoot: record.projectRoot,
             launchShell: false,
             kind: record.kind,
@@ -3493,6 +3508,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var persistentReconnectFailures = 0
     private var persistentReconnectMisses = 0
     private var persistentReconnect: DispatchWorkItem?
+    /// A device's tab waits for its host's control connection before its
+    /// adapter is launched again (`schedulePersistentReconnect`).
+    private var remoteHostWait: AnyCancellable?
+    /// When keys typed into a device's tab were last not sent because its
+    /// Mac could not be reached (`noteInputNotSentWhileOffline`): the
+    /// offline bar says so for a moment.
+    @Published private(set) var offlineInputRejectedAt: Date?
     /// Checks whether a session missing from the host's list is really gone.
     private var persistentDisappearanceCheck: Task<Void, Never>?
     /// Where this tab was registered as an open persistent tab (it stays
@@ -4201,6 +4223,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// (it looks and behaves like a native tab).
     var isPersistentLocalSession: Bool {
         persistentHosting != nil
+    }
+
+    /// The device this tab's program runs on (docs/specs/remote-devices.md),
+    /// by its name; nil for This Mac's tabs.
+    var remoteMachineName: String? {
+        persistentHosting.flatMap { $0.profile.isThisMac ? nil : $0.profile.displayName }
     }
 
     /// The directories the program reports (OSC 7) are on This Mac: a
@@ -6137,6 +6165,15 @@ final class TerminalSession: ObservableObject, Identifiable {
                   self.persistentSession == binding
             else { return }
             self.persistentReconnect = nil
+            // A device's adapter is launched again only while its Mac
+            // answers: an ssh per attempt to a Mac that is offline only
+            // fails (and a login refused on a timer can get the address
+            // blocked). The tab waits for the control connection, which its
+            // lease keeps trying (backoff, wake and network changes).
+            if !hosting.profile.isThisMac, hosting.control.state != .connected {
+                self.waitForRemoteHost(launchID: launchID, binding: binding, hosting: hosting)
+                return
+            }
             switch hosting.programState(of: binding) {
             case .exited(let status):
                 self.finishPersistentProgram(status: status, launchID: launchID)
@@ -6161,6 +6198,57 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func cancelPersistentReconnect() {
         persistentReconnect?.cancel()
         persistentReconnect = nil
+        remoteHostWait = nil
+    }
+
+    /// Launches the adapter again once the device's control connection is
+    /// up (`schedulePersistentReconnect`).
+    private func waitForRemoteHost(launchID: UUID, binding: HostedSessionAttachment, hosting: PersistentLocalSessions) {
+        if case .live = state {
+            state = .disconnected
+            bumpRevision()
+        }
+        let control = hosting.control
+        if case .failed = control.state {
+            // Nothing leases it into trying again by itself: ask once.
+            Task { _ = try? await control.connect() }
+        }
+        remoteHostWait = control.$state
+            .dropFirst()
+            .filter { $0 == .connected }
+            .first()
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.remoteHostWait = nil
+                    guard self.activeLaunchID == launchID, self.persistentSession == binding else { return }
+                    // A few at a time: every tab of the device waited.
+                    hosting.enqueueAdapterRelaunch { [weak self] in
+                        guard let self, self.activeLaunchID == launchID, self.persistentSession == binding,
+                              self.persistentPhase == .reconnecting
+                        else { return }
+                        self.persistentReconnectFailures = 0
+                        self.schedulePersistentReconnect(launchID: launchID, binding: binding, hosting: hosting, immediately: true)
+                    }
+                }
+            }
+    }
+
+    /// Keys typed into a device's tab while its Mac cannot be reached are
+    /// not sent (nothing would take them, and sending them later would type
+    /// them into whatever runs then): the Mac beeps and the tab's offline
+    /// bar says so.
+    private func noteInputNotSentWhileOffline() {
+        // Only for someone typing into the app (not a test run in the
+        // background).
+        if NSApp?.isActive == true { NSSound.beep() }
+        offlineInputRejectedAt = Date()
+    }
+
+    /// Whether this is a device's tab whose Mac cannot be reached now.
+    var isRemoteHostUnreachable: Bool {
+        guard let persistentHosting, !persistentHosting.profile.isThisMac else { return false }
+        return persistentHosting.control.state != .connected
     }
 
     /// Asks the tab's attach adapter, which reconnects by itself, to try
@@ -6501,16 +6589,36 @@ final class TerminalSession: ObservableObject, Identifiable {
             return true
         case .reconnecting:
             guard let binding = persistentSession else { return false }
-            persistentHosting.sendInput(data, to: binding)
+            sendKeyboardInputThroughHost(data, to: binding, hosting: persistentHosting)
             return true
         case .attached:
             // An adapter that reconnects by itself does not reach the
             // program meanwhile; the host does.
             guard adapterLiveStatus?.reconnecting == true, let binding = persistentSession else { return false }
-            persistentHosting.sendInput(data, to: binding)
+            sendKeyboardInputThroughHost(data, to: binding, hosting: persistentHosting)
             return true
         case .idle:
             return false
+        }
+    }
+
+    /// Typed keys for the program through its host. A device's keys fail
+    /// visibly when its Mac cannot be reached (`noteInputNotSentWhileOffline`),
+    /// now or when the host did not take them.
+    private func sendKeyboardInputThroughHost(_ data: Data, to binding: HostedSessionAttachment, hosting: PersistentLocalSessions) {
+        guard !hosting.profile.isThisMac else {
+            hosting.sendInput(data, to: binding)
+            return
+        }
+        guard hosting.control.state == .connected else {
+            noteInputNotSentWhileOffline()
+            return
+        }
+        // Over the connection that is up only, briefly: keys must never
+        // reach the program long after they were typed.
+        let task = hosting.sendKeys(data, to: binding)
+        Task { @MainActor [weak self] in
+            if case .failure = await task.result { self?.noteInputNotSentWhileOffline() }
         }
     }
 
@@ -6678,7 +6786,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     var persistentSessionEndedMessage: String? {
         if let systemSessionEnd, !isRunning {
             return systemEndExitStatus.map { HostedAttachmentStatus.exited(code: $0, signal: nil).summary }
-                ?? systemSessionEnd.message
+                ?? systemSessionEnd.message(machine: remoteMachineName)
         }
         guard isPersistentLocalSession, kind != .command, !isRunning, persistentSession != nil,
               case .exited(let status) = state

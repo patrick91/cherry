@@ -1291,6 +1291,33 @@ final class HostControl: ObservableObject {
         } while offset < data.endIndex
     }
 
+    /// Typed keys, over the connection that is up now only: never
+    /// connects (keys must not reach a program seconds or minutes after they
+    /// were typed), and waits at most `timeout` for the answer. Throws
+    /// `.unavailable` when not connected (nothing was sent), or as
+    /// `sendInput` does.
+    func sendKeysOnCurrentConnection(
+        _ id: String,
+        _ data: Data,
+        expectedHostID: String? = nil,
+        timeout: Duration = .seconds(3)
+    ) async throws {
+        guard state == .connected, let connection else {
+            throw HostedSessionError.unavailable("The session host cannot be reached now.")
+        }
+        if let expectedHostID, hostID != expectedHostID {
+            throw HostedSessionError.identityMismatch("Expected host identity \(expectedHostID), received \(hostID ?? "none").")
+        }
+        var offset = data.startIndex
+        repeat {
+            let end = data.index(offset, offsetBy: HostProtocol.maxInputBytes, limitedBy: data.endIndex) ?? data.endIndex
+            try expectOK(try Self.checked(try await send(
+                .sendInput(id: id, data: Data(data[offset..<end])), on: connection, timeout: timeout
+            )))
+            offset = end
+        } while offset < data.endIndex
+    }
+
     /// The session's screen as text; with `scrollback`, its retained
     /// history first. `maxLines`: only the last this many lines of that
     /// (a host that does not know the limit sends all of them).

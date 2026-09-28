@@ -130,6 +130,50 @@ their kind, project and what they run, and one already open in a tab offers
 the host, the `cherry` CLI, service setup, updates, the protocol, and current
 limits are documented in [Host/README.md](Host/README.md).
 
+### Your other Macs
+
+The project picker in the title bar lists your other Macs under **Devices**
+(docs/specs/remote-devices.md). **Add Mac…** takes an SSH host (it suggests
+the aliases in `~/.ssh/config`), checks it without a password prompt
+(BatchMode) and shows what it found: whether SSH works (a host key it does
+not trust yet offers **Open in Terminal**, which runs `ssh <host>` in a tab
+on this Mac; a refused login says how to set up keys), the Mac's name,
+macOS version and architecture, whether its `cherry-host` speaks this
+Cherry's protocol, and whether programs started over SSH there lack Full
+Disk Access or a keychain. Cherry does not install anything there yet: when
+`cherry-host` is missing or of another protocol, the check says how to copy
+this Cherry's helpers there (an installer is coming). Name it and **Add**.
+
+Each Mac's submenu, with a status dot and a subtitle, lists its projects:
+the folders its sessions belong to (this Cherry's, that Mac's own Cherry's,
+any other's), with how many sessions each has, and the folders you added
+(**Add Project on <Mac>…** checks a path there). Hold Option to hide one.
+**Other sessions** (sessions of no project) and **Persistent Sessions on
+<Mac>…** open Persistent Sessions on that Mac; **Open Home Folder**,
+**Reconnect**, **Trust New Identity…** (after its host identity changed),
+**Rename…** and **Remove…** do what they say (Remove keeps an SSH host you
+had saved yourself). Another alias of a Mac you already added is refused. The menu shows what Cherry
+knew when it opened and updates as each Mac answers.
+
+A project on another Mac opens in its own window ("app — Studio", with a
+computer glyph; each tab's row names the Mac): its terminal and agent tabs
+run there, in its `cherry-host`, and close, detach, **Cmd-Z**, the quit
+question and relaunches work as for this Mac's tabs. Its project commands,
+worktrees and **Open in** an editor are not available yet. A tab that cannot
+start there says so ("Couldn't start on Studio: …", with **Retry**), never
+running a shell on this Mac instead. **Not open here** in the sidebar lists
+that project's sessions on the Mac that no tab shows: **Reopen** for this
+Cherry's own, **Attach** for another app's (closing that tab only
+disconnects it; Cherry never takes over the other Mac's own Cherry's
+sessions, nor it Cherry's). While the Mac is offline its tabs say "Studio is
+offline, reconnecting…", keys typed into them are not sent (the Mac beeps),
+and saved tabs wait for it (Cherry keeps trying, at once on a wake or a
+network change); ending sessions meanwhile is remembered and done the next
+time Cherry connects to it. Keys it does not take within a few seconds are
+never sent later. A tab whose session ended because that Mac restarted comes
+back as "Ended when Studio restarted". A restart of this Mac ends nothing
+there.
+
 To build a disk image for testing on this Mac:
 
 ```bash

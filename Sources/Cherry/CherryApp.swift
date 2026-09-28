@@ -17,6 +17,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     func applicationWillFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
             Self.configureSessionRecords(localSessions: .shared, store: .shared)
+            // Each device's hosting records the same (docs/specs/remote-devices.md).
+            RemoteDeviceStore.shared.endedSessionsStore = .shared
         }
     }
 
@@ -51,6 +53,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 SessionBackendPolicy.userSettings.persistentHostingForNewTab()?.warmUp()
                 // The menu bar's Background Sessions list; it starts no host.
                 BackgroundSessionsModel.shared.start()
+                // Each device's hosting, which finishes the ends it could
+                // not do while its Mac was offline once that Mac answers
+                // (it connects to none now).
+                RemoteDeviceStore.shared.registerHostings()
                 DispatchQueue.main.async {
                     NSApp.activate(ignoringOtherApps: true)
                     Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
@@ -827,6 +833,10 @@ struct CherryApp: App {
 
     init() {
         RemoteViewCrashGuard.installIfNeeded()
+        // Saved windows of a device's projects reopen while it is known.
+        ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
+            RemoteDeviceStore.shared.device(forProjectKey: key) != nil
+        }
         ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
         ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
     }
@@ -1265,11 +1275,26 @@ private struct ProjectWorkspaceView: View {
     init(projectRoot: String) {
         sidebarWidthProjectRoot = projectRoot
         _storedSidebarWidth = State(initialValue: ProjectSidebarWidthStore().width(projectRoot: projectRoot))
+        // A project on another Mac runs its tabs on that Mac's host
+        // (docs/specs/remote-devices.md); a device Cherry no longer knows
+        // gets a hosting whose tabs fail, saying so, never local ones.
+        let hosting: PersistentHostSessions = if ProjectLocation.isRemoteKey(projectRoot) {
+            RemoteDeviceStore.shared.device(forProjectKey: projectRoot).flatMap { RemoteDeviceStore.shared.hosting(for: $0.id) }
+                ?? RemoteDeviceStore.unavailableHosting(
+                    for: projectRoot,
+                    reason: "This Mac is not among your devices any more (or this copy of Cherry cannot run its tabs). Add it again from the project menu."
+                )
+        } else {
+            .shared
+        }
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
             projectRoot: projectRoot,
-            backendPolicy: .userSettings,
+            backendPolicy: hosting.profile.isThisMac ? .userSettings : .remote(hosting),
             stateStore: .shared,
-            sessionRestorer: WorkspaceSessionRestorers.hostedByDefault(localSessions: .shared)
+            // An unknown device's saved tabs stay saved as they are.
+            sessionRestorer: hosting.profile.isKnownDevice
+                ? WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting)
+                : RemoteDeviceStore.keepingRestorer
         ))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(
             projectRoot: projectRoot,
@@ -1278,9 +1303,12 @@ private struct ProjectWorkspaceView: View {
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
-    /// Folder name of the project, or "Cherry" for a project-less window.
+    /// Folder name of the project, or "Cherry" for a project-less window;
+    /// "<project> — <Mac>" for a project on another Mac.
     private var projectName: String {
-        repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
+        let name = repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
+        guard let device = RemoteDeviceStore.shared.device(forProjectKey: repository.repositoryRoot) else { return name }
+        return "\(name) — \(device.name)"
     }
 
     private var workspace: TerminalWorkspace {
@@ -1310,6 +1338,11 @@ private struct ProjectWorkspaceView: View {
             isCursorOverSidebar: $chromeState.isCursorOverSidebar,
             storedSidebarWidth: $storedSidebarWidth
         )
+        .overlay(alignment: .bottom) {
+            // A device window whose saved tabs wait for the device.
+            RemoteWindowWaitingBar(repository: repository)
+                .padding(.bottom, 14)
+        }
         .background(ProjectWindowBinder(
             projectRoot: repository.repositoryRoot,
             workspace: workspace,

@@ -150,7 +150,9 @@ private final class ControlPlaneRestore {
         for record in request.records where record.systemEnd == nil {
             // A record for a host that is not valid can never come back.
             guard let host = record.hosted?.hostedSessionHost else { continue }
-            if host == .local {
+            // The host whose persistent tabs this window runs (This Mac's,
+            // or a device's in its window) restores them as its own.
+            if host == localSessions.profile.host {
                 localRecords.append(record)
             } else if let index = remoteGroups.firstIndex(where: { $0.host == host }) {
                 remoteGroups[index].records.append(record)
@@ -158,7 +160,11 @@ private final class ControlPlaneRestore {
                 remoteGroups.append((host, [record]))
             }
         }
-        let unbound = request.unboundRecords.filter { $0.hosted == nil && $0.systemEnd == nil }
+        // Only records whose Create went to this window's host
+        // (`WorkspaceSessionRecord.hostKey`) name a session to look for.
+        let unbound = request.unboundRecords.filter {
+            $0.hosted == nil && $0.systemEnd == nil && $0.creationHostKey == localSessions.profile.host.id
+        }
         var parts: [RestorePart] = []
         if !systemEnded.isEmpty {
             parts.append(start(Self.ids(systemEnded)) { [self] in await restoreSystemEnded(systemEnded) })
@@ -389,7 +395,13 @@ private final class ControlPlaneRestore {
                 let kept = records + unboundMayComeBack
                 var result = WorkspaceRestoreResult.keeping(kept)
                 if !kept.isEmpty {
-                    result.retryWhenAvailable = localSessions.hostAvailability(after: generation)
+                    // Another Mac's host is kept trying (leased until it
+                    // answers, at once on a wake or network change, and not
+                    // after a refused SSH login until then), as SSH hosts'
+                    // restores are; This Mac's comes up with its next use.
+                    result.retryWhenAvailable = localSessions.profile.isThisMac
+                        ? localSessions.hostAvailability(after: generation)
+                        : localSessions.control.availability()
                 }
                 return result
             }

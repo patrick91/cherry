@@ -1,3 +1,4 @@
+import CherryControl
 import Combine
 import Darwin
 import Foundation
@@ -118,6 +119,14 @@ final class RepositoryWorkspace: ObservableObject {
     /// since belong to this run's tabs, never to a tab whose record was lost.
     private static let appRunStartedAt = Date()
     private var persistenceSubscriptions: [ObjectIdentifier: AnyCancellable] = [:]
+    /// A device's window keeps its host's control connection up while it
+    /// has tabs (`updateRemoteLease`): its tabs follow their programs, and
+    /// an offline Mac is retried (backoff, wake, network changes).
+    private var remoteLease: HostControlLease?
+    private var remoteLeaseSubscriptions: [ObjectIdentifier: AnyCancellable] = [:]
+    /// Saved tabs of a device's window a restore kept because the device
+    /// could not be reached: they come back once it answers.
+    @Published private(set) var remoteTabsWaitingCount = 0
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
     /// The registry this repository's window registered with
@@ -135,17 +144,31 @@ final class RepositoryWorkspace: ObservableObject {
         stateStore: WorkspaceStateStore? = nil,
         sessionRestorer: @escaping WorkspaceSessionRestorer = WorkspaceSessionRestorers.none,
         autoStartCommands: @escaping @MainActor (String) -> [ProjectCommandDefinition] = { root in
-            AgentSettings.shared.launchableProjectCommands(for: root).filter(\.autoStart)
+            // A device's project has no commands in phase 1: its cherry.toml
+            // is on the other Mac (docs/specs/remote-devices.md).
+            guard !ProjectLocation.isRemoteKey(root) else { return [] }
+            return AgentSettings.shared.launchableProjectCommands(for: root).filter(\.autoStart)
         },
         restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared
     ) {
         let runStartedAt = Self.appRunStartedAt
-        let root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-        let savedRoot = TerminalSettings.shared.worktreeSpacesEnabled
-            ? AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
-            : root
-        let existingRoot = FileManager.default.fileExists(atPath: savedRoot) ? savedRoot : root
-        let initialRoot = Self.resolvedPath(existingRoot)
+        // A project on another Mac (docs/specs/remote-devices.md) keeps its
+        // key: no directory here, no git and no worktrees.
+        let location = ProjectLocation(key: projectRoot)
+        let root: String
+        let initialRoot: String
+        if location.isRemote {
+            root = location.key
+            initialRoot = root
+        } else {
+            root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
+            let savedRoot = TerminalSettings.shared.worktreeSpacesEnabled
+                ? AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
+                : root
+            let existingRoot = FileManager.default.fileExists(atPath: savedRoot) ? savedRoot : root
+            initialRoot = Self.resolvedPath(existingRoot)
+        }
+        isRemote = location.isRemote
         repositoryRoot = root
         initialWorktreeRoot = initialRoot
         self.service = service
@@ -188,7 +211,8 @@ final class RepositoryWorkspace: ObservableObject {
                 // saved and which tabs it had.
                 setAside: savedState == nil ? stateStore.setAsideState(repositoryRoot: root) : nil,
                 sessionsToEnd: sessionsToEnd,
-                createdBefore: runStartedAt
+                createdBefore: runStartedAt,
+                host: localSessions.profile.host
             )
             // As the window opened: ending them (`resumeEndingSessions`)
             // takes them out of the store once their sessions are gone.
@@ -220,7 +244,7 @@ final class RepositoryWorkspace: ObservableObject {
         initialResolvedPaths[initialRoot] = initialRoot
         resolvedPathsByInput = initialResolvedPaths
         loadedWorktreeRoots = [initialRoot]
-        hiddenWorktreeRoots = Set(
+        hiddenWorktreeRoots = location.isRemote ? [] : Set(
             AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath)
         )
         worktrees = [GitWorktree(
@@ -235,6 +259,43 @@ final class RepositoryWorkspace: ObservableObject {
         )]
         closeTabsAfterCleanExit(in: initialWorkspace)
         observePersistentState(of: initialWorkspace)
+        observeRemoteTabs(of: initialWorkspace)
+        if let hosting = remoteHosting {
+            // A wake or a network change reconnects the device at once
+            // (its restore may be waiting for it with no tab open yet).
+            backendPolicy.hostReconnects?.startMonitoringSystem()
+            // In use while this window is open, tabs or not.
+            hosting.beginUse()
+            usesRemoteHosting = true
+        }
+    }
+
+    /// A device's window: follows whether it has tabs (`updateRemoteLease`).
+    private func observeRemoteTabs(of workspace: TerminalWorkspace) {
+        guard isRemote else { return }
+        remoteLeaseSubscriptions[ObjectIdentifier(workspace)] = workspace.$sessions
+            .dropFirst()
+            .sink { [weak self] _ in
+                // `$sessions` fires before the change.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.updateRemoteLease() }
+                }
+            }
+    }
+
+    /// Holds the device's control connection while this window has tabs
+    /// (and is not torn down), releasing it otherwise.
+    func updateRemoteLease() {
+        guard let hosting = remoteHosting else { return }
+        let hasTabs = !isTearingDown && workspaces.values.contains { !$0.isTornDown && !$0.sessions.isEmpty }
+        if hasTabs, remoteLease == nil {
+            remoteLease = hosting.control.retain()
+            // Wakes and network changes reconnect it at once.
+            backendPolicy.hostReconnects?.startMonitoringSystem()
+        } else if !hasTabs, let lease = remoteLease {
+            lease.release()
+            remoteLease = nil
+        }
     }
 
     var activeWorkspace: TerminalWorkspace {
@@ -254,8 +315,33 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     var repositoryName: String {
-        URL(fileURLWithPath: repositoryRoot, isDirectory: true).lastPathComponent
+        let path = ProjectLocation.launchPath(forKey: repositoryRoot)
+        return URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
     }
+
+    /// A project on another Mac (docs/specs/remote-devices.md): its tabs run
+    /// there, and it has no git, worktrees or project commands here.
+    let isRemote: Bool
+
+    /// The device's hosting when this is another Mac's project.
+    /// Nil for a device Cherry no longer knows (its stand-in hosting holds
+    /// no connection).
+    var remoteHosting: PersistentHostSessions? {
+        guard isRemote, let hosting = backendPolicy.localSessions, !hosting.profile.isThisMac,
+              hosting.profile.isKnownDevice
+        else { return nil }
+        return hosting
+    }
+
+    /// A device window's hosting, known device or not (its bar says why
+    /// its tabs wait).
+    var deviceHosting: PersistentHostSessions? {
+        guard isRemote, let hosting = backendPolicy.localSessions, !hosting.profile.isThisMac else { return nil }
+        return hosting
+    }
+
+    /// Whether this window told its device's hosting it uses it.
+    private var usesRemoteHosting = false
 
     var supportsWorktrees: Bool {
         TerminalSettings.shared.worktreeSpacesEnabled && commonDirectory != nil
@@ -275,7 +361,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     func refresh() async {
-        guard TerminalSettings.shared.worktreeSpacesEnabled else { return }
+        guard TerminalSettings.shared.worktreeSpacesEnabled, !isRemote else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
@@ -619,6 +705,15 @@ final class RepositoryWorkspace: ObservableObject {
         }
         workspaces.values.forEach(close)
         if intent.tearsDownWorkspace {
+            remoteLeaseSubscriptions.removeAll()
+            remoteLease?.release()
+            remoteLease = nil
+            if usesRemoteHosting {
+                usesRemoteHosting = false
+                remoteHosting?.endUse()
+            }
+        }
+        if intent.tearsDownWorkspace {
             // After the workspaces closed: restores under way end the tabs
             // they built with the same intent, and build no more.
             let cancellations = restoreCancellations.values.flatMap { $0 }
@@ -679,6 +774,7 @@ final class RepositoryWorkspace: ObservableObject {
         loadedWorktreeRoots.insert(root)
         closeTabsAfterCleanExit(in: workspace)
         observePersistentState(of: workspace)
+        observeRemoteTabs(of: workspace)
         return workspace
     }
 
@@ -904,7 +1000,9 @@ final class RepositoryWorkspace: ObservableObject {
             hosting.hasOpenTab(withID: id) || OpenHostedTabs.shared.hasOpenTab(withID: id)
                 || workspace.session(withID: id) != nil ? nil : id
         } ?? UUID()
-        let record = OrphanedSessionCriteria.record(for: info, tabID: tabID, hostID: launch.attachment.hostID)
+        let record = OrphanedSessionCriteria.record(
+            for: info, tabID: tabID, hostID: launch.attachment.hostID, host: launch.attachment.host
+        )
         let tab = workspace.makeRestoredPersistentSession(launch, record: record, hosting: hosting, deferringLaunch: true)
         applyRestoreStep(
             root: root,
@@ -978,9 +1076,10 @@ final class RepositoryWorkspace: ObservableObject {
     /// The saved tabs no open tab shows that may own a session of This Mac
     /// (`endSavedSessionsNotOpen`).
     private func savedRecordsWhoseSessionsEndWithTheWindow() -> [WorkspaceSessionRecord] {
-        guard backendPolicy.localSessions != nil, backendPolicy.hostedLocalTabsFollowSettings else { return [] }
+        guard let hosting = backendPolicy.localSessions, backendPolicy.hostedLocalTabsFollowSettings else { return [] }
         let roots = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys)
-        return roots.sorted().flatMap(savedRecordsNotOpen(root:)).filter(\.mayOwnLocalSession)
+        let host = hosting.profile.host
+        return roots.sorted().flatMap(savedRecordsNotOpen(root:)).filter { $0.mayOwnSession(on: host) }
     }
 
     // MARK: Orphaned sessions
@@ -1001,6 +1100,11 @@ final class RepositoryWorkspace: ObservableObject {
         guard didBeginRestore, !isTearingDown, orphanScanTask == nil, orphanScanRetry == nil,
               let criteria = orphanCriteria,
               let localSessions = backendPolicy.localSessions,
+              // Only This Mac's: the criteria compare sessions' creation
+              // times with this Mac's clock, which says nothing of another
+              // Mac's. A device window lists its unshown sessions under
+              // Not open here instead.
+              localSessions.profile.isThisMac,
               backendPolicy.prefersPersistentLocalSessions,
               localSessions.installationProblem() == nil
         else { return }
@@ -1063,7 +1167,9 @@ final class RepositoryWorkspace: ObservableObject {
                   let project = OrphanedSessionCriteria.projectRoot(of: info),
                   let root = Self.worktreeRoot(forProjectRoot: project, among: roots)
             else { continue }
-            found[root, default: []].append((info, OrphanedSessionCriteria.record(for: info, tabID: tabID, hostID: list.hostID)))
+            found[root, default: []].append((info, OrphanedSessionCriteria.record(
+                for: info, tabID: tabID, hostID: list.hostID, host: localSessions.profile.host
+            )))
         }
         let listing = localSessions.listing(of: list)
         if backendPolicy.settings().closeTabsOnCleanExit {
@@ -1103,6 +1209,11 @@ final class RepositoryWorkspace: ObservableObject {
 
     /// The worktree among `roots` a tab's project root names.
     private static func worktreeRoot(forProjectRoot project: String, among roots: Set<String>) -> String? {
+        // A device's session names its project by key.
+        if ProjectLocation.isRemoteKey(project) {
+            let key = ProjectLocation(key: project).key
+            return roots.contains(key) ? key : nil
+        }
         let standardized = URL(fileURLWithPath: project, isDirectory: true).standardizedFileURL.path
         for candidate in [project, standardized, resolvedPath(standardized)] where roots.contains(candidate) {
             return candidate
@@ -1386,7 +1497,11 @@ final class RepositoryWorkspace: ObservableObject {
             selectionsAwaitingRestore[root] = nil
             // The window's default shell, once nothing more is coming. After
             // a remainder, auto-start may have added commands meanwhile.
-            if root == initialWorktreeRoot {
+            // A device's window whose saved tabs wait for the device to
+            // answer opens no new tab there meanwhile (it could not start
+            // either): they come back once it answers.
+            let waitsForDevice = isRemote && !(keptWorktreeRecords[root]?.sessions.isEmpty ?? true)
+            if root == initialWorktreeRoot, !waitsForDevice {
                 switch step {
                 case .initial: workspace.addInitialSessionIfEmpty()
                 case .remainder: workspace.addInitialSessionIfEmpty(ignoringCommands: true)
@@ -1443,7 +1558,8 @@ final class RepositoryWorkspace: ObservableObject {
             + tabs.map(WeakSession.init)
         let ended = systemEndedTabs.compactMap(\.session)
         guard let end = ended.first?.systemSessionEnd else { return }
-        chromeState.toasts.show(ProjectWindowToast.systemEndedTabs(count: ended.count, end: end) { [weak self] in
+        let machine = ended.first?.persistentHosting.flatMap { $0.profile.isThisMac ? nil : $0.profile.displayName }
+        chromeState.toasts.show(ProjectWindowToast.systemEndedTabs(count: ended.count, end: end, machine: machine) { [weak self] in
             self?.restartSystemEndedTabs()
         })
     }
@@ -1474,6 +1590,10 @@ final class RepositoryWorkspace: ObservableObject {
         inFlightRecordIDs[root] = inFlight.isEmpty ? nil : inFlight
         let aside = (setAsideRecordIDs[root] ?? []).union(setAside).intersection(remaining)
         setAsideRecordIDs[root] = aside.isEmpty ? nil : aside
+        if isRemote {
+            let waiting = keptWorktreeRecords.values.reduce(0) { $0 + $1.sessions.count }
+            if remoteTabsWaitingCount != waiting { remoteTabsWaitingCount = waiting }
+        }
     }
 
     /// Adds what a restore's remainder brings back once it answers.
@@ -1663,6 +1783,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     private func standardized(_ root: String) -> String {
+        if ProjectLocation.isRemoteKey(root) { return ProjectLocation(key: root).key }
         let standardized = URL(fileURLWithPath: root, isDirectory: true)
             .standardizedFileURL
             .path

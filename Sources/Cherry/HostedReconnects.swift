@@ -172,7 +172,9 @@ final class HostedReconnects: ObservableObject {
         for control in controls() { control.reconnectNow() }
     }
 
-    private func startMonitoringSystem() {
+    /// Follows the Mac's wakes and network changes from now on (a device's
+    /// window, whose control connection they reconnect at once).
+    func startMonitoringSystem() {
         guard monitorsSystem, wakeObserver == nil else { return }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main

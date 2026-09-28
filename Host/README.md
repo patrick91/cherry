@@ -427,6 +427,22 @@ single quotes, and csh and tcsh expand `!` as history there). The Mac app passes
 for a destination its device list gives a path for
 (`HostedRemoteHostPaths`).
 
+The Mac app's devices (**Add Mac…** in the project picker,
+[remote-devices.md](../docs/specs/remote-devices.md)) use exactly this. Their
+check runs `ssh -T -o ControlMaster=no -o RemoteCommand=none
+-o ClearAllForwardings=yes -o PermitLocalCommand=no -o BatchMode=yes
+-o ConnectTimeout=10 -a -- HOST 'sh -s'` with a POSIX script on standard
+input (so any login shell runs it), which prints the Mac's system,
+`cherry-host version --json` and `cherry-host status --json` (from
+`--remote-host-path`, the remote `PATH`, `~/Library/Application
+Support/Cherry/bin` or `/Applications/Cherry.app/Contents/MacOS`; never
+starting or replacing a daemon), and whether a protected folder and the
+login keychain can be read over SSH. Add Project on a Mac checks the folder
+the same way (`test -d`, `pwd -P`). A device's tabs are sessions of the
+daemon on that Mac's default socket, which that Mac's own Cherry shares:
+they are created with the owner `<app>@<installation id>`, so neither app
+adopts the other's sessions (the other's are attached, never owned).
+
 An SSH server allows a limited number of sessions on one connection
 (`MaxSessions`, 10 by default). When ssh reports that the master connection
 at `--ssh-control-path` refused a session (`Session open refused by peer`)
@@ -1576,7 +1592,8 @@ Scripts/test-session-suites real-host
 (`PersistentLocal`, `PersistentTab`, `WorkspacePersistence`,
 `WorkspaceRestore`, `HostControl`, `HostedSession`, `HostedLaunchSpec`,
 `NativeSurfaceRelaunch`, `MultiplexerSafety`, `AdapterAwayKeyInput`,
-`AgentInputSafety`, `SessionCloseFlow`, `AppIdentity`) on its own. Each group must pass at least
+`AgentInputSafety`, `SessionCloseFlow`, `BackgroundSession`, `AppIdentity`,
+`RemoteDevice`) on its own. Each group must pass at least
 one test; a session test file not named after a group, or a skipped test
 that is not a `RealHost` test, fails the run, so a new session suite must be
 added to the groups in `Scripts/test-session-suites`. Swift Testing's
@@ -1584,9 +1601,19 @@ added to the groups in `Scripts/test-session-suites`. Swift Testing's
 selects every test in the files named after it. `real-host` sets
 `CHERRY_TEST_HOST_INTEGRATION=1` and runs every test whose ID contains
 `RealHost` (`HostedSessionRealHost`, `PersistentLocalRealHost`,
-`AgentInputRealHost`, …) against the helpers in `Host/target/debug` (or
-`CARGO_TARGET_DIR`), each with its own daemon on a private socket and a
-private `HOME`; a skipped test fails the run. Without `--skip-build` it builds
+`AgentInputRealHost`, `RemoteDeviceRealHost`, …) against the helpers in
+`Host/target/debug` (or `CARGO_TARGET_DIR`), each with its own daemon on a
+private socket and a private `HOME`; a skipped test fails the run.
+`RemoteDeviceRealHost*` reach their daemon as a device through
+`Scripts/fake-remote-mac`, a fake remote Mac: an `ssh` shim (the only entry
+on the helpers' `PATH`) that refuses master connections, never runs the real
+ssh, and runs the remote command with `/bin/sh -c` under `env -i` with that
+Mac's private `HOME`, `PATH` and `CHERRY_HOST_SOCKET`; files named `offline`,
+`hostkey` and `denied` in its directory make it fail as ssh would.
+`Scripts/test-remote-mac-loopback` checks the same over real SSH to this Mac
+without admin rights: a private `sshd` on 127.0.0.1 run as you, with its own
+keys and a forced command that sets a private `HOME` and socket, and an ssh
+that only ever reads its private config (never `~/.ssh`). Without `--skip-build` it builds
 the Swift tests first, and for `real-host` the Rust helpers too.
 
 The 20 ignored `real_host` tests run the `cherry` that `cargo test` builds

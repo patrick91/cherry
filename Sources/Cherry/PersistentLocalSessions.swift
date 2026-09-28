@@ -1,5 +1,6 @@
 import CherryControl
 import Combine
+import CryptoKit
 import Foundation
 
 /// What a local tab asks the host to start for its program.
@@ -120,6 +121,10 @@ struct PersistentHostProfile: Sendable {
     /// The names the host's machine goes by, which its programs' directory
     /// reports (OSC 7) may name (`HostedSessionInfo.workingDirectory(onMachineNamed:)`).
     var machineNames: @Sendable () -> Set<String>
+    /// False for the stand-in hosting of a window whose device Cherry no
+    /// longer knows (`RemoteDeviceStore.unavailableHosting`): its window
+    /// holds no connection and restores nothing until the device is known.
+    var isKnownDevice = true
 
     /// This Mac's own host.
     static let thisMac = PersistentHostProfile(
@@ -270,6 +275,13 @@ final class PersistentHostSessions {
         /// were recorded in a store (`SessionsToEndRecord`); the Persistent
         /// Sessions sheet shows them meanwhile.
         var forgottenTabsWindow: Duration = .seconds(300)
+        /// Another Mac's: typed keys wait this long at most for the host
+        /// (over the connection that is up; never a new one).
+        var keyInputTimeout: Duration = .seconds(3)
+        /// Another Mac's: adapters launched again after it answered, per
+        /// batch, and the pause between batches.
+        var relaunchBatchSize = HostSSHMasterManager.Configuration.defaultMaxChannelsPerMaster
+        var relaunchBatchInterval: TimeInterval = 0.5
 
         /// Another Mac's host: its Create goes over SSH (a login, maybe a
         /// daemon to start there), so a tab waits longer before it says
@@ -329,7 +341,7 @@ final class PersistentHostSessions {
 
     let owner: String
     /// The host and what it means for its tabs (This Mac, or a device).
-    let profile: PersistentHostProfile
+    private(set) var profile: PersistentHostProfile
     let configuration: Configuration
     /// Where the sessions this app ends on purpose are recorded
     /// (`WorkspaceStateStore.addEndedSessions`), so a saved tab that names
@@ -417,6 +429,10 @@ final class PersistentHostSessions {
     var backgroundSignalHandler: (@MainActor (HostedSessionInfo, PersistentHostSignal) -> Bool)?
     private var lease: HostControlLease?
     private var eventSubscription: AnyCancellable?
+    /// Another Mac's: finishes recorded ends when its connection comes up
+    /// (`resumeRecordedEndsOnConnection`).
+    private var connectionSubscription: AnyCancellable?
+    private var isResumingRecordedEnds = false
     /// What a new session's terminal reports of its colours and appearance
     /// (`HostCreateRequest.colors`).
     private let terminalColors: @MainActor () -> HostTerminalColors?
@@ -679,6 +695,12 @@ final class PersistentHostSessions {
         configuration launch: ShellProcessController.Configuration
     ) async throws -> PersistentSessionLaunch {
         if let reason = instanceUnavailableReason { throw HostedSessionError.unavailable(reason) }
+        // Another Mac's tab fails at once when this app cannot reach it at
+        // all (no helper, or a device no longer in the list); This Mac's
+        // tabs were checked before they chose this host.
+        if !profile.allowsNativeFallback, let reason = installationUnavailableReason() {
+            throw HostedSessionError.unavailable(reason)
+        }
         creatingCount += 1
         updateLease()
         defer {
@@ -861,10 +883,17 @@ final class PersistentHostSessions {
         searchAndEndSessions(ofForgottenTabs: records, recordedIn: store)
     }
 
-    private func searchAndEndSessions(ofForgottenTabs targets: [WorkspaceSessionRecord], recordedIn store: WorkspaceStateStore?) {
+    private func searchAndEndSessions(
+        ofForgottenTabs targets: [WorkspaceSessionRecord],
+        recordedIn store: WorkspaceStateStore?,
+        completion: (@MainActor () -> Void)? = nil
+    ) {
         // This copy cannot reach the local host at all (a disk image copy,
         // no helper): a copy that can will end them.
-        guard installationProblem() == nil else { return }
+        guard installationProblem() == nil else {
+            completion?()
+            return
+        }
         forgottenTabSearches += 1
         let search = UUID()
         forgottenTabTargets[search] = targets
@@ -878,8 +907,10 @@ final class PersistentHostSessions {
                 if let list = try? await completeList() {
                     let endings = endListedSessions(ofForgottenTabs: targets, in: list)
                     if endings.isEmpty, !list.awaitsHolders {
-                        // None of them is left.
-                        store?.removeSessionsToEnd(ids: ids)
+                        // None of them is left (a session waiting for its
+                        // tab's undo keeps its record: its close ends it).
+                        let waiting = Set(deferredEnds.values.map(\.record.id))
+                        store?.removeSessionsToEnd(ids: ids.subtracting(waiting))
                         break
                     }
                     // Listed again after these: an ending that gave up (the
@@ -893,6 +924,7 @@ final class PersistentHostSessions {
             forgottenTabSearches -= 1
             forgottenTabTargets[search] = nil
             updateLease()
+            completion?()
         }
     }
 
@@ -901,7 +933,11 @@ final class PersistentHostSessions {
     private func endListedSessions(ofForgottenTabs records: [WorkspaceSessionRecord], in list: HostedSessionList) -> [Task<Void, Never>] {
         let listing = listing(of: list)
         var endings: [Task<Void, Never>] = []
-        for info in list.sessions where info.owner == owner && owningTab(of: info.id) == nil {
+        // A session whose tab's close can still be undone (`deferEnd`) is
+        // ended by that close once it cannot, never here: ⌘Z would find it
+        // gone.
+        for info in list.sessions where info.owner == owner && owningTab(of: info.id) == nil
+            && deferredEnds[info.id] == nil {
             let named = records.contains {
                 Self.record($0, names: info, hostID: list.hostID, owner: owner, host: profile.host)
             }
@@ -966,6 +1002,69 @@ final class PersistentHostSessions {
     func owningTab(of sessionID: String) -> TerminalSession? {
         openTabs.values.lazy.compactMap(\.session).first { tab in
             tab.isPersistentLocalSession && tab.persistentSession?.sessionID == sessionID
+        }
+    }
+
+    /// Whether any tab built to run as a persistent session here is open.
+    var hasOpenTabs: Bool {
+        openTabs.values.contains { $0.session != nil }
+    }
+
+    /// Windows that use this hosting (`beginUse`), even while they have no
+    /// tab yet: their saved tabs wait for, or are being restored from, it.
+    private(set) var windowUses = 0
+
+    /// A window runs its tabs here from now until `endUse`.
+    func beginUse() { windowUses += 1 }
+    func endUse() { windowUses = max(0, windowUses - 1) }
+
+    /// Whether anything still needs this hosting: an open tab, a window
+    /// that uses it, or sessions being ended or waiting for an undo.
+    var isInUse: Bool {
+        hasOpenTabs || windowUses > 0 || !endings.isEmpty || !deferredEnds.isEmpty || forgottenTabSearches > 0
+    }
+
+    /// The device was renamed: messages and new tabs use the new name.
+    func updateDisplayName(_ name: String) {
+        profile.displayName = name
+    }
+
+    // MARK: Adapter relaunches after a reconnect
+
+    private var relaunches: [@MainActor () -> Void] = []
+    private var relaunchesScheduled = false
+
+    /// Runs `relaunch` (a tab's adapter launch after its Mac answered
+    /// again) at most `relaunchBatchSize` at a time, `relaunchBatchInterval`
+    /// apart, with a little jitter, so a reconnect does not open an ssh per
+    /// tab at once (a master carries at most
+    /// `HostSSHMasterManager.Configuration.maxChannelsPerMaster`).
+    func enqueueAdapterRelaunch(_ relaunch: @escaping @MainActor () -> Void) {
+        relaunches.append(relaunch)
+        guard !relaunchesScheduled else { return }
+        relaunchesScheduled = true
+        // On the next turn, so the tabs that waited for the same connection
+        // are batched together.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.runRelaunchBatch() }
+        }
+    }
+
+    /// Relaunches waiting (tests).
+    var pendingAdapterRelaunches: Int { relaunches.count }
+
+    private func runRelaunchBatch() {
+        let batch = relaunches.prefix(max(1, configuration.relaunchBatchSize))
+        relaunches.removeFirst(batch.count)
+        for relaunch in batch { relaunch() }
+        guard !relaunches.isEmpty else {
+            relaunchesScheduled = false
+            return
+        }
+        let interval = configuration.relaunchBatchInterval
+        let delay = interval + Double.random(in: 0...(interval / 4))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            MainActor.assumeIsolated { self?.runRelaunchBatch() }
         }
     }
 
@@ -1117,9 +1216,16 @@ final class PersistentHostSessions {
         guard instanceUnavailableReason == nil else { return Task {} }
         noteEndedOnPurpose(hostID: binding.hostID, sessionID: binding.sessionID)
         let timeout = timeout ?? configuration.terminationTimeout
+        // Another Mac may be offline, or go away before the end is
+        // through: the end is recorded first (`SessionsToEndRecord`, keyed
+        // by the host and its identity), and finished on the next
+        // connection to that host (`resumeRecordedEndsOnConnection`) or the
+        // next launch when it cannot be now.
+        let recorded = profile.isThisMac ? nil : recordEnd(of: binding)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await terminateAndRemove(binding, timeout: timeout)
+            let finished = await terminateAndRemove(binding, timeout: timeout)
+            if finished, let recorded { endedSessionsStore?.removeSessionsToEnd(ids: [recorded]) }
             endings[binding.sessionID] = nil
             updateLease()
         }
@@ -1132,7 +1238,73 @@ final class PersistentHostSessions {
         return task
     }
 
-    var hasPendingEnds: Bool { !endings.isEmpty }
+    /// Whether sessions are being ended that a quit waits for. Another
+    /// Mac's ends while its host cannot be reached are not waited for:
+    /// they are recorded, and finished on the next connection.
+    var hasPendingEnds: Bool {
+        !endings.isEmpty && (profile.isThisMac || control.state == .connected)
+    }
+
+    /// The sessions-to-end record for ending `binding`'s session of another
+    /// Mac: an entry that names only that session (its id is derived from
+    /// the host identity and session id). Returns its id.
+    private func recordEnd(of binding: HostedSessionAttachment) -> UUID? {
+        guard let store = endedSessionsStore else { return nil }
+        let id = Self.endRecordID(hostID: binding.hostID, sessionID: binding.sessionID)
+        store.addSessionsToEnd([WorkspaceSessionRecord(
+            id: id,
+            kind: .terminal,
+            title: binding.name,
+            workingDirectory: binding.remoteWorkingDirectory,
+            hosted: HostedSessionBindingRecord(binding, owned: true)
+        )])
+        return id
+    }
+
+    /// A stable id for the sessions-to-end entry of one host session.
+    nonisolated static func endRecordID(hostID: String, sessionID: String) -> UUID {
+        let digest = Array(SHA256.hash(data: Data("cherry.end\u{0}\(hostID)\u{0}\(sessionID)".utf8)))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+
+    /// Another Mac's host: each time its control connection comes up, the
+    /// ends recorded for it that are still to do (`SessionsToEndRecord`:
+    /// End Sessions while it was offline, closed tabs, forgotten ones) are
+    /// finished. The device store turns this on once it set
+    /// `endedSessionsStore`.
+    func resumeRecordedEndsOnConnection() {
+        guard !profile.isThisMac, connectionSubscription == nil else { return }
+        connectionSubscription = control.$state
+            .removeDuplicates()
+            .filter { $0 == .connected }
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.resumeRecordedEndsNow() }
+            }
+    }
+
+    /// Ends what the store still records for this host, unless a search
+    /// for them runs already.
+    func resumeRecordedEndsNow() {
+        guard let store = endedSessionsStore, instanceUnavailableReason == nil, !isResumingRecordedEnds else { return }
+        let host = profile.host
+        // Not the tabs closed during this run whose close can still be
+        // undone: their close ends them (`endDeferred`), or ⌘Z keeps them.
+        let waiting = Set(deferredEnds.values.map(\.record.id))
+        let deferredSessions = Set(deferredEnds.keys)
+        let records = store.loadSessionsToEnd().filter { record in
+            record.mayOwnSession(on: host) && !waiting.contains(record.id)
+                && !(record.hosted.map { deferredSessions.contains($0.sessionID) } ?? false)
+        }
+        guard !records.isEmpty else { return }
+        isResumingRecordedEnds = true
+        searchAndEndSessions(ofForgottenTabs: records, recordedIn: store) { [weak self] in
+            self?.isResumingRecordedEnds = false
+        }
+    }
 
     /// A bell or notification of this session reached no tab (it is in
     /// the background): recorded in `endedSessionsStore` (the app's store),
@@ -1235,10 +1407,10 @@ final class PersistentHostSessions {
     @discardableResult
     func waitForPendingEnds(timeout: Duration) async -> Bool {
         let deadline = ContinuousClock.now + timeout
-        while !endings.isEmpty, ContinuousClock.now < deadline {
+        while hasPendingEnds, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(25))
         }
-        return endings.isEmpty
+        return !hasPendingEnds
     }
 
     /// What to do after a Kill or Remove failed.
@@ -1267,7 +1439,11 @@ final class PersistentHostSessions {
         }
     }
 
-    private func terminateAndRemove(_ binding: HostedSessionAttachment, timeout: Duration) async {
+    /// True when the session is gone, or the host took its end (a program
+    /// still running is left to the host's kill escalation); false when
+    /// the host could not be reached in time: the end is left to do.
+    @discardableResult
+    private func terminateAndRemove(_ binding: HostedSessionAttachment, timeout: Duration) async -> Bool {
         let control = control
         let id = binding.sessionID
         let deadline = ContinuousClock.now + configuration.endRetryWindow
@@ -1289,19 +1465,19 @@ final class PersistentHostSessions {
                 }) ?? false
                 // Still running: the host's own kill escalation goes on, and
                 // the session stays listed (ended) until removed.
-                guard exited else { return }
+                guard exited else { return true }
                 break
             } catch {
                 switch Self.endStep(after: error) {
                 case .gone:
-                    return
+                    return true
                 case .stop:
                     SessionLog.error("could not end session \(id): \(error.localizedDescription)")
-                    return
+                    return true
                 case .retry:
                     guard await backOff() else {
                         SessionLog.error("gave up ending session \(id) (\(error.localizedDescription)); it may still run")
-                        return
+                        return false
                     }
                 }
             }
@@ -1310,9 +1486,11 @@ final class PersistentHostSessions {
         while true {
             do {
                 try await control.remove(id, expectedHostID: binding.hostID)
-                return
+                return true
             } catch {
-                guard Self.endStep(after: error) == .retry, await backOff() else { return }
+                guard Self.endStep(after: error) == .retry else { return true }
+                // Ended, not removed: its final screen stays listed.
+                guard await backOff() else { return true }
             }
         }
     }
@@ -1356,6 +1534,45 @@ final class PersistentHostSessions {
         updateLease()
         return task
     }
+
+    /// Typed keys for another Mac's session while its tab's adapter is
+    /// away: over the connection that is up now only (never a new one),
+    /// waiting `keyInputTimeout` at most, in order. Once one fails, the keys
+    /// queued behind it are dropped too (a later key would reach the
+    /// program without the ones before it); keys typed after that are sent
+    /// again as usual.
+    @discardableResult
+    func sendKeys(_ data: Data, to binding: HostedSessionAttachment) -> Task<Void, Error> {
+        let id = binding.sessionID
+        let previous = keyChains[id]
+        // Never reused for a session: a failure's cutoff stays meaningful.
+        let generation = (keyGenerations[id] ?? 0) + 1
+        keyGenerations[id] = generation
+        let control = control
+        let timeout = configuration.keyInputTimeout
+        let task = Task { @MainActor [weak self] in
+            _ = await previous?.task.result
+            guard let self else { throw CancellationError() }
+            defer {
+                if keyChains[id]?.generation == generation { keyChains[id] = nil }
+            }
+            if let cutoff = keyFailureCutoff[id], generation <= cutoff {
+                throw HostedSessionError.unavailable("Keys typed before this were not sent.")
+            }
+            do {
+                try await control.sendKeysOnCurrentConnection(id, data, expectedHostID: binding.hostID, timeout: timeout)
+            } catch {
+                keyFailureCutoff[id] = keyGenerations[id] ?? generation
+                throw error
+            }
+        }
+        keyChains[id] = (task, generation)
+        return task
+    }
+
+    private var keyChains: [String: (task: Task<Void, Error>, generation: Int)] = [:]
+    private var keyFailureCutoff: [String: Int] = [:]
+    private var keyGenerations: [String: Int] = [:]
 
     /// The session's screen as its host has it, with the retained history
     /// first: what a tab shows while no attach adapter does. `maxLines`:

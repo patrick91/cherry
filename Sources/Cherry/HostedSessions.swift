@@ -13,7 +13,8 @@ struct HostedSessionHost: Codable, Hashable, Identifiable, Sendable {
     static func ssh(_ input: String) throws -> HostedSessionHost {
         let destination = input.trimmingCharacters(in: .whitespacesAndNewlines)
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@:[%]")
-        guard !destination.isEmpty, !destination.hasPrefix("-"),
+        // Nor `user@-…`: ssh would read the host part as an option.
+        guard !destination.isEmpty, !destination.hasPrefix("-"), !destination.contains("@-"),
               destination.utf8.count <= 512,
               destination.unicodeScalars.allSatisfy({ allowed.contains($0) })
         else {

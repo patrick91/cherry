@@ -137,11 +137,12 @@ extension ProjectWindowToast {
     static func systemEndedTabs(
         count: Int,
         end: SystemSessionEnd,
+        machine: String? = nil,
         restartAll: @escaping @MainActor () -> Void
     ) -> ProjectWindowToast {
         ProjectWindowToast(
             name: count == 1 ? "1 tab" : "\(count) tabs",
-            predicate: end.predicate,
+            predicate: end.predicate(machine: machine),
             actions: [ProjectWindowToast.Action(title: "Restart All", perform: restartAll)],
             isUnprompted: true,
             symbolName: "power.circle.fill"

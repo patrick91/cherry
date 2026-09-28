@@ -1,0 +1,148 @@
+#!/bin/sh
+# A stand-in for another Mac reached over SSH, for tests of devices
+# (docs/specs/remote-devices.md). It never runs the real ssh and never
+# touches the user's session host, ~/.ssh or Application Support.
+#
+#   Scripts/fake-remote-mac setup DIR NAME [NAME...]
+#   Scripts/fake-remote-mac stop DIR
+#
+# setup writes DIR/bin/ssh, an `ssh` to put first on PATH (alone: PATH=DIR/bin),
+# and one fake Mac per NAME under DIR/hosts/NAME:
+#   home/        its private HOME
+#   bin/         first on its PATH: cherry and cherry-host (links to the
+#                debug builds, or $CHERRY_FAKE_REMOTE_BIN), and stand-ins for
+#                `scutil` (ComputerName "Fake NAME") and `security` (a locked
+#                keychain), so a check reads nothing of this Mac's
+#   host.sock    its session host's socket (CHERRY_HOST_SOCKET there)
+#
+# The shim takes ssh's options, refuses master connections (-M, -O: masters
+# are off, as FakeSSH in HostControlSSHMasterTests), and runs the remote
+# command with /bin/sh -c under `env -i` with that Mac's HOME, PATH, SHELL
+# and CHERRY_HOST_SOCKET, so its cherry-host gateway serves the private
+# daemon. Standard input and output pass through (the gateway's frames, a
+# check's script). Behaviour switches, files in DIR/hosts/NAME:
+#   offline   ssh: connect to host NAME port 22: Connection timed out (255)
+#   hostkey   Host key verification failed. (255)
+#   denied    NAME: Permission denied (publickey). (255)
+# A NAME that is a symlink to another fake Mac's directory is that Mac (an
+# alias). An unknown NAME: Could not resolve hostname (255). Every call is logged
+# to DIR/calls.
+#
+# stop ends the daemons and holders serving DIR's sockets (matched by their
+# private socket paths, never by name) and removes nothing else.
+set -eu
+
+usage() {
+  echo "Usage: Scripts/fake-remote-mac setup DIR NAME [NAME...] | stop DIR" >&2
+  exit 2
+}
+
+[ $# -ge 2 ] || usage
+command=$1
+dir=$2
+shift 2
+
+case "$command" in
+  setup)
+    [ $# -ge 1 ] || usage
+    root=$(cd "$(dirname "$0")/.." && pwd)
+    binaries=${CHERRY_FAKE_REMOTE_BIN:-${CARGO_TARGET_DIR:-$root/Host/target}/debug}
+    mkdir -p "$dir/bin" "$dir/hosts"
+    chmod 700 "$dir" "$dir/bin" "$dir/hosts"
+    dir=$(cd "$dir" && pwd -P)
+    for name in "$@"; do
+      case "$name" in
+        *[!A-Za-z0-9._-]*|'') echo "fake-remote-mac: bad name $name" >&2; exit 2 ;;
+      esac
+      host="$dir/hosts/$name"
+      mkdir -p "$host/home" "$host/bin"
+      chmod 700 "$host" "$host/home" "$host/bin"
+      if [ "${CHERRY_FAKE_REMOTE_NO_HOST:-}" != 1 ]; then
+        for tool in cherry cherry-host; do
+          if [ -x "$binaries/$tool" ]; then ln -sf "$binaries/$tool" "$host/bin/$tool"; fi
+        done
+      fi
+      cat > "$host/bin/scutil" <<EOF
+#!/bin/sh
+case "\$*" in
+  "--get ComputerName") echo "Fake $name" ;;
+  "--get LocalHostName") echo "fake-$name" ;;
+  *) exit 1 ;;
+esac
+EOF
+      cat > "$host/bin/security" <<'EOF'
+#!/bin/sh
+echo "security: SecKeychainCopySettings: User interaction is not allowed." >&2
+exit 36
+EOF
+      chmod 700 "$host/bin/scutil" "$host/bin/security"
+    done
+    quoted=$(printf "%s" "$dir" | sed "s/'/'\\\\''/g")
+    cat > "$dir/bin/ssh" <<EOF
+#!/bin/sh
+dir='$quoted'
+EOF
+    cat >> "$dir/bin/ssh" <<'EOF'
+printf '%s\n' "$*" >> "$dir/calls"
+destination=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; destination=${1-}; [ $# -gt 0 ] && shift; break ;;
+    -M|-O*) echo "fake-remote-mac: SSH master connections are off" >&2; exit 255 ;;
+    -[BbcDEeFIiJLlmopQRSWw]) shift ;;
+    -*) ;;
+    *) destination=$1; shift; break ;;
+  esac
+  shift
+done
+name=${destination#*@}
+host="$dir/hosts/$name"
+if [ -z "$name" ] || [ ! -d "$host" ]; then
+  echo "ssh: Could not resolve hostname $name: nodename nor servname provided, or not known" >&2
+  exit 255
+fi
+# Another name for the same Mac (a symlink) is that Mac.
+host=$(cd "$host" && pwd -P)
+if [ -f "$host/offline" ]; then
+  echo "ssh: connect to host $name port 22: Connection timed out" >&2
+  exit 255
+fi
+if [ -f "$host/hostkey" ]; then
+  echo "No ED25519 host key is known for $name and you have requested strict checking." >&2
+  echo "Host key verification failed." >&2
+  exit 255
+fi
+if [ -f "$host/denied" ]; then
+  echo "$name: Permission denied (publickey)." >&2
+  exit 255
+fi
+if [ $# -eq 0 ]; then
+  echo "fake-remote-mac: no remote command (interactive logins are not faked)" >&2
+  exit 255
+fi
+exec /usr/bin/env -i \
+  HOME="$host/home" \
+  USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
+  PATH="$host/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  SHELL=/bin/sh \
+  LANG="${LANG:-en_US.UTF-8}" \
+  TMPDIR="${TMPDIR:-/tmp}" \
+  CHERRY_HOST_SOCKET="$host/host.sock" \
+  /bin/sh -c "$*"
+EOF
+    chmod 700 "$dir/bin/ssh"
+    echo "$dir/bin"
+    ;;
+  stop)
+    [ -d "$dir/hosts" ] || exit 0
+    for host in "$dir"/hosts/*; do
+      [ -d "$host" ] || continue
+      socket="$host/host.sock"
+      pkill -TERM -f "serve --socket $socket" 2>/dev/null || true
+      pkill -KILL -f "hold --socket $socket" 2>/dev/null || true
+    done
+    ;;
+  *)
+    usage
+    ;;
+esac

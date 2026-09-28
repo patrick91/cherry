@@ -180,8 +180,26 @@ struct SessionBackendPolicy {
 
     /// Whether new local tabs should be persistent sessions (the setting;
     /// `persistentHostingForNewTab()` also checks the host can run them).
+    /// A device's window (its host allows no native fallback) always runs
+    /// its tabs as persistent sessions there.
     var prefersPersistentLocalSessions: Bool {
-        settings().persistLocalSessions
+        localSessions?.profile.allowsNativeFallback == false || settings().persistLocalSessions
+    }
+
+    /// A device's window (docs/specs/remote-devices.md): its tabs run on
+    /// another Mac's host, `localSessions`.
+    static func remote(
+        _ hosting: PersistentHostSessions,
+        settings: @escaping @MainActor () -> SessionPersistenceSettings = { TerminalSettings.shared.sessionPersistenceSettings },
+        hostReconnects: HostedReconnects? = .shared
+    ) -> SessionBackendPolicy {
+        precondition(!hosting.profile.allowsNativeFallback, "a device's hosting never falls back to native tabs")
+        return SessionBackendPolicy(
+            settings: settings,
+            localSessions: hosting,
+            rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
+            hostReconnects: hostReconnects
+        )
     }
 
     /// Where a new local tab runs its program: the local host, when the

@@ -1,0 +1,521 @@
+import CherryControl
+import Darwin
+import Foundation
+
+// Add Mac… (docs/specs/remote-devices.md, phase 1: connect and check only).
+// One `ssh -T -o BatchMode=yes <host> sh -s` runs a POSIX script on the other
+// Mac (whatever its login shell), which reports the system, the session
+// host it finds (`cherry-host version --json` and `status --json`, never
+// starting or replacing anything) and the permissions tabs there will have.
+// Nothing is installed: a missing or mismatched cherry-host is reported with
+// manual instructions until phase 2's installer.
+
+/// Runs a script on another Mac through the user's ssh, without a terminal:
+/// BatchMode (no prompts), no forwarding, a connect timeout. The script goes
+/// on standard input to `sh -s`, so any login shell (fish, csh) runs it.
+struct RemoteDeviceShell: Sendable {
+    /// The ssh the app runs (the login shell's `ssh` on PATH, else
+    /// /usr/bin/ssh). Tests pass a fake one.
+    var sshExecutable: String
+    /// Cherry's environment with the login shell's variables (its
+    /// SSH_AUTH_SOCK and PATH for ProxyCommand tools).
+    var environment: [String: String]
+    var connectTimeout: Int = 10
+    var timeout: TimeInterval = 30
+
+    struct Output: Equatable, Sendable {
+        var status: Int32
+        var standardOutput: String
+        var standardError: String
+        var timedOut = false
+    }
+
+    /// The app's: resolves the login environment (off the main actor).
+    static func app() async -> RemoteDeviceShell {
+        await Task.detached(priority: .userInitiated) {
+            let login = HostedSessionLoginEnvironment.shared.resolve()?.environment
+            let environment = HostedSessionLoginEnvironment.helperEnvironment(
+                base: ProcessInfo.processInfo.environment, login: login
+            )
+            return RemoteDeviceShell(sshExecutable: sshExecutable(environment: environment), environment: environment)
+        }.value
+    }
+
+    /// `ssh` on the environment's PATH, else /usr/bin/ssh.
+    static func sshExecutable(environment: [String: String]) -> String {
+        for directory in (environment["PATH"] ?? "").split(separator: ":") where !directory.isEmpty {
+            let candidate = "\(directory)/ssh"
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return "/usr/bin/ssh"
+    }
+
+    /// The ssh arguments for running `sh -s` on `destination`.
+    func arguments(destination: String) -> [String] {
+        [
+            "-T",
+            "-o", "ControlMaster=no",
+            "-o", "RemoteCommand=none",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "PermitLocalCommand=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=\(connectTimeout)",
+            // No agent or X11 forwarding.
+            "-a", "-x",
+            "--", destination, "sh -s",
+        ]
+    }
+
+    /// Runs `script` on `destination`. Never on the main actor's time: the
+    /// process is waited for on a detached task.
+    func run(_ script: String, on destination: String) async -> Output {
+        let host: HostedSessionHost
+        do {
+            host = try HostedSessionHost.ssh(destination)
+        } catch {
+            return Output(status: 255, standardOutput: "", standardError: error.localizedDescription)
+        }
+        let arguments = arguments(destination: host.sshDestination ?? destination)
+        let executable = sshExecutable
+        let environment = environment
+        let timeout = timeout
+        return await Task.detached(priority: .userInitiated) {
+            Self.runProcess(executable: executable, arguments: arguments, environment: environment, input: script, timeout: timeout)
+        }.value
+    }
+
+    private static func runProcess(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        input: String,
+        timeout: TimeInterval
+    ) -> Output {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.environment = environment
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do {
+            try process.run()
+        } catch {
+            return Output(status: 255, standardOutput: "", standardError: "Could not run ssh: \(error.localizedDescription)")
+        }
+        let group = DispatchGroup()
+        let outData = OutputBox()
+        let errData = OutputBox()
+        group.enter()
+        DispatchQueue.global().async {
+            outData.data = stdout.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global().async {
+            errData.data = stderr.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        stdin.fileHandleForWriting.write(Data(input.utf8))
+        try? stdin.fileHandleForWriting.close()
+        var timedOut = false
+        if group.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if group.wait(timeout: .now() + 2) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = group.wait(timeout: .now() + 2)
+            }
+        }
+        process.waitUntilExit()
+        return Output(
+            status: timedOut ? 255 : process.terminationStatus,
+            standardOutput: String(decoding: outData.data, as: UTF8.self),
+            standardError: String(decoding: errData.data, as: UTF8.self),
+            timedOut: timedOut
+        )
+    }
+}
+
+/// One reader's output: written by its reader before the group is left,
+/// read after the wait.
+private final class OutputBox: @unchecked Sendable {
+    var data = Data()
+}
+
+/// How ssh failed, as Add Mac… explains it.
+enum RemoteDeviceSSHFailure: Equatable, Sendable {
+    /// The host's key is unknown or changed: "Open in Terminal" runs
+    /// `ssh <host>` in a local tab to check and accept it.
+    case hostKey(String)
+    /// The login was refused (keys or agent not set up).
+    case permissionDenied(String)
+    /// The name does not resolve.
+    case unknownHost(String)
+    /// No answer (offline, asleep, firewall, Remote Login off).
+    case unreachable(String)
+    case other(String)
+
+    /// From ssh's standard error (and exit status 255).
+    static func classify(_ standardError: String, timedOut: Bool = false) -> RemoteDeviceSSHFailure {
+        let text = standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        let last = text.components(separatedBy: .newlines).last { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? text
+        if timedOut { return .unreachable("ssh did not finish within the time allowed.") }
+        let lowered = text.lowercased()
+        if lowered.contains("host key verification failed") || lowered.contains("remote host identification has changed")
+            || lowered.contains("no ecdsa host key is known") || lowered.contains("no ed25519 host key is known")
+            || lowered.contains("host key is known") || lowered.contains("host key for") {
+            return .hostKey(last)
+        }
+        if lowered.contains("permission denied") || lowered.contains("too many authentication failures")
+            || lowered.contains("no more authentication methods") {
+            return .permissionDenied(last)
+        }
+        if lowered.contains("could not resolve hostname") || lowered.contains("nodename nor servname") {
+            return .unknownHost(last)
+        }
+        if lowered.contains("timed out") || lowered.contains("connection refused") || lowered.contains("no route to host")
+            || lowered.contains("network is unreachable") || lowered.contains("host is down")
+            || lowered.contains("connection closed") || lowered.contains("connection reset") {
+            return .unreachable(last)
+        }
+        return .other(last.isEmpty ? "ssh failed." : last)
+    }
+
+    var message: String {
+        switch self {
+        case .hostKey(let detail): "SSH does not trust this Mac's host key yet (\(detail))."
+        case .permissionDenied(let detail): "SSH could not log in (\(detail))."
+        case .unknownHost(let detail): "SSH could not find this host (\(detail))."
+        case .unreachable(let detail): "The Mac did not answer (\(detail))."
+        case .other(let detail): detail
+        }
+    }
+
+    /// What to do about it.
+    var help: String {
+        switch self {
+        case .hostKey:
+            "Open a terminal to it once, check the fingerprint and accept the key; then check again."
+        case .permissionDenied:
+            "Set up key-based login: add your public key to ~/.ssh/authorized_keys on the other Mac (ssh-copy-id), and make sure your SSH agent has the key (ssh-add -l). Cherry never types passwords."
+        case .unknownHost:
+            "Use an alias from ~/.ssh/config, or user@hostname (a .local name works on the same network)."
+        case .unreachable:
+            "Make sure the Mac is awake and on the network, and that Remote Login is on in System Settings › General › Sharing."
+        case .other:
+            "Try `ssh <host>` in a terminal to see what it needs."
+        }
+    }
+}
+
+/// `cherry-host version --json`.
+struct RemoteHostVersionReport: Codable, Equatable, Sendable {
+    var `protocol`: UInt32
+    var build: String?
+    var version: String?
+    var os: String?
+    var arch: String?
+    var min_macos: String?
+}
+
+/// `cherry-host status --json`.
+struct RemoteHostStatusReport: Codable, Equatable, Sendable {
+    var running: Bool
+    var state: String
+    var `protocol`: UInt32?
+    var build: String?
+    var host_id: String?
+    var error: String?
+}
+
+/// What the check found on the other Mac.
+struct RemoteDeviceProbeResult: Equatable, Sendable {
+    var sshFailure: RemoteDeviceSSHFailure?
+    /// `uname -sm`, e.g. "Darwin arm64".
+    var uname: String?
+    /// `sw_vers -productVersion`; nil on anything but macOS.
+    var macOSVersion: String?
+    var computerName: String?
+    var hostName: String?
+    var localHostName: String?
+    var homeDirectory: String?
+    var shell: String?
+    /// The cherry-host it ran (the given path, or the one it found).
+    var hostPath: String?
+    var hostVersion: RemoteHostVersionReport?
+    var hostStatus: RemoteHostStatusReport?
+    /// Whether a folder only Full Disk Access opens could be read.
+    var fullDiskAccess: Bool?
+    /// Whether the login keychain could be read in an SSH session.
+    var keychainUnlocked: Bool?
+
+    var architecture: String? {
+        uname?.split(separator: " ").last.map(String.init)
+    }
+
+    var isMac: Bool {
+        uname?.hasPrefix("Darwin") == true
+    }
+
+    /// The names its programs may give it in OSC 7 reports.
+    var machineNames: [String] {
+        var names: [String] = []
+        for name in [hostName, localHostName, localHostName.map { "\($0).local" }] {
+            guard let name = name?.trimmingCharacters(in: .whitespaces), !name.isEmpty, !names.contains(name) else { continue }
+            names.append(name)
+        }
+        return names
+    }
+}
+
+/// Runs the check.
+enum RemoteDeviceProbe {
+    static let beginMarker = "CHERRY-PROBE 1"
+    static let endMarker = "CHERRY-PROBE-END"
+
+    /// The POSIX script run on the other Mac. `remoteHostPath`: the
+    /// cherry-host to check (else PATH, then the known install places).
+    static func script(remoteHostPath: String?) -> String {
+        var lines = [
+            "printf '%s\\n' '\(beginMarker)'",
+            "printf 'uname=%s\\n' \"$(uname -sm 2>/dev/null)\"",
+            "printf 'macos=%s\\n' \"$(sw_vers -productVersion 2>/dev/null)\"",
+            "printf 'computer=%s\\n' \"$(scutil --get ComputerName 2>/dev/null)\"",
+            "printf 'localhost=%s\\n' \"$(scutil --get LocalHostName 2>/dev/null)\"",
+            "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null)\"",
+            "printf 'home=%s\\n' \"$HOME\"",
+            "printf 'shell=%s\\n' \"$SHELL\"",
+        ]
+        if let remoteHostPath = remoteHostPath?.nilIfEmpty {
+            lines.append("host=\(shellWord(remoteHostPath))")
+        } else {
+            lines += [
+                "host=$(command -v cherry-host 2>/dev/null)",
+                "for candidate in \"$HOME/Library/Application Support/Cherry/bin/cherry-host\" /Applications/Cherry.app/Contents/MacOS/cherry-host; do",
+                "  [ -n \"$host\" ] && break",
+                "  [ -x \"$candidate\" ] && host=$candidate",
+                "done",
+            ]
+        }
+        lines += [
+            "printf 'hostpath=%s\\n' \"$host\"",
+            "if [ -n \"$host\" ] && [ -x \"$host\" ]; then",
+            "  printf 'version=%s\\n' \"$(\"$host\" version --json 2>/dev/null | tr -d '\\n')\"",
+            "  printf 'status=%s\\n' \"$(\"$host\" status --json 2>/dev/null | tr -d '\\n')\"",
+            "fi",
+            "if ls \"$HOME/Library/Safari\" >/dev/null 2>&1; then echo fda=yes; else echo fda=no; fi",
+            "if security show-keychain-info >/dev/null 2>&1; then echo keychain=unlocked; else echo keychain=locked; fi",
+            "printf '%s\\n' '\(endMarker)'",
+        ]
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// `~/…` as `"$HOME"/'…'`, anything else single-quoted, for sh.
+    static func shellWord(_ path: String) -> String {
+        if let rest = path.nilIfEmpty.flatMap({ $0.hasPrefix("~/") ? String($0.dropFirst(2)) : nil }) {
+            return "\"$HOME\"/" + singleQuoted(rest)
+        }
+        if path == "~" { return "\"$HOME\"" }
+        return singleQuoted(path)
+    }
+
+    nonisolated static func singleQuoted(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Parses what the script printed (and how ssh ended).
+    static func parse(_ output: RemoteDeviceShell.Output) -> RemoteDeviceProbeResult {
+        var result = RemoteDeviceProbeResult()
+        let lines = output.standardOutput.components(separatedBy: "\n")
+        guard let begin = lines.firstIndex(of: beginMarker) else {
+            result.sshFailure = output.status == 255 || output.timedOut
+                ? RemoteDeviceSSHFailure.classify(output.standardError, timedOut: output.timedOut)
+                : .other(output.standardError.nilIfEmpty?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ?? "The other Mac's shell did not run the check (exit \(output.status)).")
+            return result
+        }
+        let decoder = JSONDecoder()
+        for line in lines[lines.index(after: begin)...] {
+            if line == endMarker { break }
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<equals])
+            let value = String(line[line.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "uname": result.uname = value.nilIfEmpty
+            case "macos": result.macOSVersion = value.nilIfEmpty
+            case "computer": result.computerName = value.nilIfEmpty
+            case "localhost": result.localHostName = value.nilIfEmpty
+            case "hostname": result.hostName = value.nilIfEmpty
+            case "home": result.homeDirectory = value.nilIfEmpty
+            case "shell": result.shell = value.nilIfEmpty
+            case "hostpath": result.hostPath = value.nilIfEmpty
+            case "version": result.hostVersion = try? decoder.decode(RemoteHostVersionReport.self, from: Data(value.utf8))
+            case "status": result.hostStatus = try? decoder.decode(RemoteHostStatusReport.self, from: Data(value.utf8))
+            case "fda": result.fullDiskAccess = value == "yes"
+            case "keychain": result.keychainUnlocked = value == "unlocked"
+            default: break
+            }
+        }
+        return result
+    }
+
+    static func run(destination: String, remoteHostPath: String?, shell: RemoteDeviceShell) async -> RemoteDeviceProbeResult {
+        parse(await shell.run(script(remoteHostPath: remoteHostPath), on: destination))
+    }
+
+    /// Checks a folder on the device for Add Project on <Mac>…: its
+    /// physical path (`pwd -P`), or why not.
+    static func resolveDirectory(_ path: String, on destination: String, shell: RemoteDeviceShell) async -> Result<String, RemoteDirectoryError> {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") || trimmed == "~" || trimmed.hasPrefix("~/") else {
+            return .failure(.message("Enter an absolute path (or one starting with ~/)."))
+        }
+        let script = """
+        printf '%s\\n' '\(beginMarker)'
+        dir=\(shellWord(trimmed))
+        if [ -d "$dir" ] && cd "$dir" 2>/dev/null; then printf 'dir=%s\\n' "$(pwd -P)"; else echo missing=1; fi
+        printf '%s\\n' '\(endMarker)'
+
+        """
+        let output = await shell.run(script, on: destination)
+        let lines = output.standardOutput.components(separatedBy: "\n")
+        guard lines.contains(beginMarker) else {
+            return .failure(.ssh(RemoteDeviceSSHFailure.classify(output.standardError, timedOut: output.timedOut)))
+        }
+        if let line = lines.first(where: { $0.hasPrefix("dir=") }), line.count > 4, line.dropFirst(4).hasPrefix("/") {
+            return .success(String(line.dropFirst(4)))
+        }
+        return .failure(.message("There is no folder at \(trimmed) on that Mac."))
+    }
+
+    enum RemoteDirectoryError: Error, Equatable {
+        case ssh(RemoteDeviceSSHFailure)
+        case message(String)
+
+        var message: String {
+            switch self {
+            case .ssh(let failure): failure.message
+            case .message(let message): message
+            }
+        }
+    }
+}
+
+/// Add Mac…'s checklist: each line, and whether the Mac can be added.
+struct RemoteDeviceChecklist: Equatable {
+    enum Status: Equatable {
+        case ok, warning, failure
+    }
+
+    enum Action: Equatable {
+        /// Run `ssh <host>` in a local terminal tab (a host key to accept).
+        case openInTerminal
+    }
+
+    struct Item: Equatable, Identifiable {
+        let id: String
+        let status: Status
+        let title: String
+        var detail: String?
+        var action: Action?
+    }
+
+    let items: [Item]
+    /// Whether Add is offered: SSH works and it is a Mac. A missing or
+    /// mismatched cherry-host is reported, not refused: tabs there fail,
+    /// saying why, until it is installed (phase 2 installs it).
+    let canAdd: Bool
+    /// The name field's default (its ComputerName).
+    let suggestedName: String?
+    /// Whether the device's cherry-host speaks this Cherry's protocol.
+    let hostIsCompatible: Bool
+
+    /// Manual installation until phase 2's installer.
+    static func manualInstallInstructions(destination: String) -> String {
+        """
+        Cherry's installer for other Macs is coming. Until then, copy this Cherry's helpers there:
+          ssh \(destination) 'mkdir -p "$HOME/Library/Application Support/Cherry/bin"'
+          scp /Applications/Cherry.app/Contents/MacOS/cherry /Applications/Cherry.app/Contents/MacOS/cherry-host \(destination):'Library/Application Support/Cherry/bin/'
+        or install the same version of Cherry on that Mac, then check again.
+        """
+    }
+
+    init(result: RemoteDeviceProbeResult, destination: String, localProtocol: UInt32 = HostProtocol.version) {
+        var items: [Item] = []
+        if let failure = result.sshFailure {
+            items.append(Item(
+                id: "ssh", status: .failure, title: "SSH", detail: failure.message + " " + failure.help,
+                action: { if case .hostKey = failure { return .openInTerminal } else { return nil } }()
+            ))
+            self.items = items
+            canAdd = false
+            suggestedName = nil
+            hostIsCompatible = false
+            return
+        }
+        items.append(Item(id: "ssh", status: .ok, title: "SSH", detail: "Logged in to \(destination) without a password."))
+        if result.isMac {
+            let version = result.macOSVersion.map { "macOS \($0)" } ?? "macOS"
+            let parts = [result.computerName, version, result.architecture].compactMap { $0 }
+            items.append(Item(id: "system", status: .ok, title: "Mac", detail: parts.joined(separator: " · ")))
+        } else {
+            items.append(Item(
+                id: "system", status: .failure, title: "Mac",
+                detail: "\(result.uname ?? "This machine") is not a Mac. Other systems are not supported in the picker yet; use Persistent Sessions for its sessions."
+            ))
+        }
+        var compatible = false
+        if let version = result.hostVersion {
+            let path = result.hostPath.map { " (\($0))" } ?? ""
+            if version.protocol == localProtocol {
+                compatible = true
+                let running = result.hostStatus.map { status in
+                    status.running ? "; its session host runs" : "; its session host starts with the first tab"
+                } ?? ""
+                items.append(Item(
+                    id: "host", status: .ok, title: "Session host",
+                    detail: "cherry-host \(version.version ?? version.build ?? "") speaks protocol \(version.protocol), as this Cherry does\(path)\(running)."
+                ))
+            } else {
+                items.append(Item(
+                    id: "host", status: .failure, title: "Session host",
+                    detail: "cherry-host there speaks protocol \(version.protocol), this Cherry speaks \(localProtocol)\(path). Update Cherry on the Mac with the older one. "
+                        + Self.manualInstallInstructions(destination: destination)
+                ))
+            }
+            if let status = result.hostStatus, status.running, let running = status.protocol, running != localProtocol {
+                compatible = false
+                items.append(Item(
+                    id: "daemon", status: .failure, title: "Running host",
+                    detail: "Its running session host speaks protocol \(running) (another Cherry there runs it). Update Cherry on that Mac or here so both speak the same protocol."
+                ))
+            }
+        } else {
+            items.append(Item(
+                id: "host", status: .warning, title: "Session host",
+                detail: "No cherry-host was found\(result.hostPath.map { " at \($0)" } ?? " on its PATH"). "
+                    + Self.manualInstallInstructions(destination: destination)
+            ))
+        }
+        if result.fullDiskAccess == false {
+            items.append(Item(
+                id: "fda", status: .warning, title: "Full Disk Access",
+                detail: "Programs started over SSH cannot open protected folders (Desktop, Documents, Downloads, Mail…). To allow it, turn on \"Allow full disk access for remote users\" in System Settings › General › Sharing › Remote Login on that Mac."
+            ))
+        }
+        if result.keychainUnlocked == false {
+            items.append(Item(
+                id: "keychain", status: .warning, title: "Keychain",
+                detail: "Its login keychain is locked in SSH sessions: tools that keep credentials there (git, gh, agents) may ask again or fail. Unlock it with `security unlock-keychain` in a tab if needed."
+            ))
+        }
+        self.items = items
+        canAdd = result.isMac
+        suggestedName = result.computerName ?? result.localHostName ?? result.hostName
+        hostIsCompatible = compatible
+    }
+}

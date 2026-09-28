@@ -543,6 +543,11 @@ pub struct HolderHello {
     /// than `REFUSED`, or kept the link for a while (two seconds).
     #[serde(default)]
     pub events: Vec<serde_json::Value>,
+    /// The holder's build (`cherry_protocol::BUILD`): the code it runs,
+    /// which it keeps when the daemon is updated. None from a holder older
+    /// than the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 /// Daemon to holder, first on the link a new holder starts with. The data

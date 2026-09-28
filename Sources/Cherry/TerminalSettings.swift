@@ -163,6 +163,10 @@ struct SessionBackendPolicy {
     /// host session id. Tests record it; only the app's policy tells the
     /// app's notice.
     var sessionDetached: @MainActor (String) -> Void = { _ in }
+    /// Brings back tabs attached to an SSH host's sessions once their
+    /// adapter gave up and the host answers again. Nil keeps such a tab
+    /// disconnected until Reconnect.
+    var hostReconnects: HostedReconnects?
 
     static let native = SessionBackendPolicy(settings: { .native })
 
@@ -170,7 +174,8 @@ struct SessionBackendPolicy {
         settings: { TerminalSettings.shared.sessionPersistenceSettings },
         localSessions: .shared,
         rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
-        sessionDetached: { ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold([$0]) }
+        sessionDetached: { ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold([$0]) },
+        hostReconnects: .shared
     )
 
     /// Whether new local tabs should be persistent sessions (the setting;

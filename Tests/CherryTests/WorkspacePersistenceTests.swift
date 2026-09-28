@@ -573,15 +573,17 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let restorer = WorkspaceSessionRestorers.hostedByDefault(localSessions: localSessions, control: { host in
         makeFakeHostControl(fake, host: host, hostStore: hostStore)
     })
-    let result = await restorer(request)
+    var result = await restorer(request)
     #expect(result.sessions.isEmpty)
     #expect(result.keptRecordIDs == [local.id, remote.id])
     // Only a later launch can bring back the local tab: this app cannot
-    // run sessions at all, so nothing to wait for during this run.
-    #expect(result.retryWhenAvailable == nil)
-    // The local host was never asked; the SSH host once.
-    #expect(fake.launches.count == 1)
-    #expect(fake.launches.first?.arguments.contains("devbox") == true)
+    // run sessions at all. The SSH host's tab comes back once that host
+    // answers during this run (its control keeps trying meanwhile).
+    #expect(result.retryWhenAvailable != nil)
+    result.retryWhenAvailable = nil
+    // The local host was never asked; only the SSH host was.
+    #expect(!fake.launches.isEmpty)
+    #expect(fake.launches.allSatisfy { $0.arguments.contains("devbox") })
 
     let none = await WorkspaceSessionRestorers.none(request)
     #expect(none.sessions.isEmpty)

@@ -29,7 +29,7 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// How many connections the daemon serves at once: well above
@@ -74,11 +74,216 @@ const INPUT_WAIT: Duration = Duration::from_secs(5);
 /// a much shorter while (see `outbox::IDLE_AFTER`).
 const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// `host.log` is moved aside to `host.log.1` (replacing the one there) when
+/// a daemon starts and finds it longer than this. `CHERRY_HOST_LOG_MAX_BYTES`
+/// overrides it for tests.
+pub const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Which process of the host writes to the log: the daemon, and the
+/// holders it starts, share its stderr (`host.log` when `cherry-host start`
+/// started it, or a systemd unit's journal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Daemon,
+    Holder,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Role::Daemon => "daemon",
+            Role::Holder => "holder",
+        })
+    }
+}
+
+static ROLE: OnceLock<Role> = OnceLock::new();
+
+/// Name this process's log lines (see `log`); set once, at startup.
+pub fn set_log_role(role: Role) {
+    let _ = ROLE.set(role);
+}
+
 /// Write one line to the daemon's log (its stderr). A failed write, such as
 /// a full disk or a closed journal stream, is ignored: unlike `eprintln!`,
 /// logging never panics, and the daemon never ends because of it.
+///
+/// The daemon's and holders' lines say when, who and which build
+/// (`log_line`). Anything else (`start`, the gateway) writes to a terminal
+/// or to the client that ran it, which reads `cherry-host: <message>`.
 pub fn log(message: impl std::fmt::Display) {
-    let _ = writeln!(io::stderr().lock(), "cherry-host: {message}");
+    // After a rotation, the daemon's and holders' lines go to the new file.
+    if let Some(path) = LOG_FILE.get() {
+        reopen_if_moved(path, libc::STDERR_FILENO);
+    }
+    let line = match ROLE.get() {
+        Some(&role) => log_line(role, SystemTime::now(), std::process::id(), &message),
+        None => format!("cherry-host: {message}"),
+    };
+    let _ = writeln!(io::stderr().lock(), "{line}");
+}
+
+/// `2026-09-27T10:15:00.123Z cherry-host[1234] daemon 20260927101500.abc1234: message`:
+/// the UTC time, the process, its role and this build.
+pub fn log_line(role: Role, at: SystemTime, pid: u32, message: &dyn std::fmt::Display) -> String {
+    format!(
+        "{} cherry-host[{pid}] {role} {}: {message}",
+        utc_timestamp(at),
+        build()
+    )
+}
+
+/// The message of a line `log_line` wrote, or the line as it is.
+pub fn logged_message(line: &str) -> &str {
+    let decorated = line
+        .split_once(" cherry-host[")
+        .filter(|(time, _)| time.ends_with('Z') && time.len() == 24)
+        .and_then(|(_, rest)| rest.split_once(": "))
+        .map(|(_, message)| message);
+    decorated
+        .or_else(|| line.strip_prefix("cherry-host: "))
+        .unwrap_or(line)
+}
+
+/// This process's build (`cherry_protocol::BUILD`). `CHERRY_HOST_TEST_BUILD`
+/// replaces it, so that tests can run a daemon or holder of another build.
+pub fn build() -> &'static str {
+    static BUILD: OnceLock<String> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        std::env::var("CHERRY_HOST_TEST_BUILD")
+            .ok()
+            .filter(|build| !build.is_empty())
+            .unwrap_or_else(|| cherry_protocol::BUILD.to_owned())
+    })
+}
+
+/// What `--version` prints after the name: the package version and
+/// `build()`, which a client reads to learn which build it would start.
+pub fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| format!("{} (build {})", env!("CARGO_PKG_VERSION"), build()))
+}
+
+/// `at` as an ISO 8601 UTC timestamp to the millisecond.
+pub fn utc_timestamp(at: SystemTime) -> String {
+    let since = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since.as_secs();
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60,
+        since.subsec_millis()
+    )
+}
+
+/// How often a running daemon checks whether its log passed
+/// `MAX_LOG_BYTES`. `CHERRY_HOST_LOG_CHECK_MS` overrides it for tests.
+const LOG_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The log this process writes to (its stderr), when that is the state
+/// directory's `host.log` (or was, before a rotation): each line goes to
+/// whatever file has that name now (`reopen_if_moved`).
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Follow `host.log` across rotations from now on (see `log`).
+pub fn follow_log_file(path: PathBuf) {
+    let _ = LOG_FILE.set(path);
+}
+
+/// The file `fd` writes to, as (device, inode).
+fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut stat) } == 0).then_some((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+/// Whether `fd` writes to `path` itself or to `path` + `.1` (the log, or
+/// the log before a rotation).
+pub fn writes_to_log(path: &Path, fd: libc::c_int) -> bool {
+    let Some(identity) = fd_identity(fd) else {
+        return false;
+    };
+    [path.to_path_buf(), rotated(path)].iter().any(|candidate| {
+        fs::metadata(candidate).is_ok_and(|meta| (meta.dev(), meta.ino()) == identity)
+    })
+}
+
+/// Whether two open files are one.
+pub fn same_file(a: &File, b: &File) -> bool {
+    fd_identity(a.as_raw_fd()).is_some() && fd_identity(a.as_raw_fd()) == fd_identity(b.as_raw_fd())
+}
+
+fn rotated(path: &Path) -> PathBuf {
+    let mut old = path.as_os_str().to_owned();
+    old.push(".1");
+    PathBuf::from(old)
+}
+
+/// Point `fd` at `path` again (opened to append, as a log is) when `path`
+/// no longer names the file `fd` writes to: the log was moved aside. True
+/// when it did. Nothing happens while `path` does not exist.
+pub fn reopen_if_moved(path: &Path, fd: libc::c_int) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || fd_identity(fd) == Some((meta.dev(), meta.ino())) {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    unsafe { libc::dup2(file.as_raw_fd(), fd) >= 0 }
+}
+
+/// The size past which the log is moved aside (`MAX_LOG_BYTES`).
+fn log_limit() -> u64 {
+    std::env::var("CHERRY_HOST_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(MAX_LOG_BYTES)
+}
+
+/// Move `host.log` aside to `host.log.1` (replacing the one there) when it
+/// is longer than `MAX_LOG_BYTES` (`CHERRY_HOST_LOG_MAX_BYTES`). Only the
+/// daemon does, while it holds the state directory's lock: when it starts
+/// and, while it runs, every `LOG_CHECK_INTERVAL`. The daemon and its
+/// holders then write to a new `host.log` (`log` reopens it), so the moved
+/// file is never written to by one of them again, nor moved a second time
+/// while one does. True when it moved the log.
+pub fn rotate_log(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file()
+        || meta.len() <= log_limit()
+        || fs::rename(path, rotated(path)).is_err()
+    {
+        return false;
+    }
+    // A new, empty log for the next lines to go to.
+    let _ = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+    true
 }
 
 /// Tunables read once when `serve` starts. The environment overrides exist
@@ -105,6 +310,8 @@ pub struct Config {
     /// How long a client that takes none of its output holds the session's
     /// output back (see `STALL_TIMEOUT`).
     pub stall_timeout: Duration,
+    /// How often the log's size is checked (`LOG_CHECK_INTERVAL`).
+    pub log_check: Duration,
 }
 
 pub fn config() -> &'static Config {
@@ -132,6 +339,7 @@ pub fn config() -> &'static Config {
             agent_grace: millis("CHERRY_HOST_AGENT_GRACE_MS").unwrap_or(AGENT_RELEASE_GRACE),
             holder_wait: millis("CHERRY_HOST_HOLDER_WAIT_MS").unwrap_or(HOLDER_WAIT),
             stall_timeout: millis("CHERRY_HOST_STALL_TIMEOUT_MS").unwrap_or(STALL_TIMEOUT),
+            log_check: millis("CHERRY_HOST_LOG_CHECK_MS").unwrap_or(LOG_CHECK_INTERVAL),
         }
     })
 }
@@ -142,6 +350,78 @@ static CHILD_FD_LIMIT: OnceLock<libc::rlimit> = OnceLock::new();
 /// before raising its own.
 pub fn child_fd_limit() -> Option<libc::rlimit> {
     CHILD_FD_LIMIT.get().copied()
+}
+
+/// This process's soft descriptor limit, when it can be read.
+fn fd_limit() -> Option<u64> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0).then_some(limit.rlim_cur)
+}
+
+/// The daemon's PID file in its state directory, for `cherry doctor`: its
+/// pid and its start identity, build, start time and socket, written once it holds the lock and
+/// removed when it exits normally. One whose process is gone is stale.
+pub const PID_FILE: &str = "host.pid";
+
+#[derive(serde::Serialize)]
+struct PidFile<'a> {
+    pid: u32,
+    /// When the process started (`processes::start_identity`): a process
+    /// that got the pid later is not the daemon.
+    started: Option<String>,
+    build: &'a str,
+    started_at: u64,
+    socket: &'a Path,
+}
+
+/// Removes the PID file this daemon wrote, unless another daemon's
+/// replaced it.
+struct PidFileGuard(PathBuf);
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        #[derive(serde::Deserialize)]
+        struct Pid {
+            pid: u32,
+        }
+        let ours = fs::read(&self.0)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Pid>(&bytes).ok())
+            .is_some_and(|file| file.pid == std::process::id());
+        if ours {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}
+
+fn write_pid_file(state: &Path, socket: &Path, started_at: u64) -> Option<PidFileGuard> {
+    let path = state.join(PID_FILE);
+    let record = PidFile {
+        pid: std::process::id(),
+        started: processes::start_identity(unsafe { libc::getpid() }),
+        build: build(),
+        started_at,
+        socket,
+    };
+    let bytes = serde_json::to_vec(&record).ok()?;
+    let temporary = state.join(format!(".{PID_FILE}.{}.tmp", std::process::id()));
+    let written = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(&bytes))
+        .and_then(|()| fs::rename(&temporary, &path));
+    match written {
+        Ok(()) => Some(PidFileGuard(path)),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            log(format_args!("cannot write {}: {error}", path.display()));
+            None
+        }
+    }
 }
 
 /// Raise the soft descriptor limit toward the hard limit. macOS shells start
@@ -230,6 +510,10 @@ pub struct Host {
     pub stopping: AtomicBool,
     pub next_lease: AtomicU64,
     pub connections: AtomicUsize,
+    /// When this daemon started: on the clock that stops during sleep, and
+    /// in milliseconds since the Unix epoch.
+    started: Instant,
+    started_at: u64,
     stop: UnixStream,
     /// Set once a stopping daemon removed its socket and released its lock.
     released: Mutex<bool>,
@@ -262,6 +546,52 @@ struct Client {
 }
 
 impl Host {
+    /// What `Status` answers.
+    pub fn status(&self) -> cherry_protocol::HostStatus {
+        let (sessions, running, linked) = {
+            let registry = self.registry();
+            let running = registry
+                .sessions
+                .values()
+                .filter(|session| session.is_running())
+                .count();
+            let linked = registry
+                .sessions
+                .values()
+                .filter(|session| session.is_linked())
+                .count();
+            (registry.sessions.len(), running, linked)
+        };
+        let (executable, executable_changed) = session::executable_status();
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        cherry_protocol::HostStatus {
+            host_id: self.id.clone(),
+            version: cherry_protocol::PROTOCOL_VERSION,
+            build: build().to_owned(),
+            pid: std::process::id(),
+            started_at: self.started_at,
+            uptime_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            socket: self.socket.display().to_string(),
+            state_dir: self.state.display().to_string(),
+            log_path: self
+                .log_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            executable: executable.map(|path| path.display().to_string()),
+            executable_changed,
+            sessions: count(sessions),
+            running_sessions: count(running),
+            max_sessions: count(connection::MAX_SESSIONS),
+            // This request's own connection is one of them.
+            connections: count(self.connections.load(Ordering::SeqCst)),
+            max_connections: count(config().max_connections),
+            holders_registered: count(linked),
+            holders_expected: self.pending_holders(),
+            lost_sessions: count(self.lost.len()),
+            fd_limit: fd_limit(),
+        }
+    }
+
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let _ = (&self.stop).write(&[1]);
@@ -732,6 +1062,14 @@ pub fn serve(path: &Path) -> Result<()> {
             lock_path.display()
         );
     }
+    // Under the lock: no other daemon moves the log meanwhile.
+    let log_path = stderr_log(&state);
+    if let Some(log_file) = &log_path {
+        if rotate_log(log_file) {
+            reopen_if_moved(log_file, libc::STDERR_FILENO);
+        }
+        follow_log_file(log_file.clone());
+    }
     remove_stale_socket(path)?;
     let id = paths::host_id(&state)?;
     // Holders that outlived the last daemon register again; wait for them
@@ -761,7 +1099,20 @@ pub fn serve(path: &Path) -> Result<()> {
     let (stop, stopped) = UnixStream::pair()?;
     stop.set_nonblocking(true)?;
     let (agents_wake, agents_woken) = mpsc::sync_channel(1);
-    let log_path = stderr_log(&state);
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    let pid_file = write_pid_file(&state, path, started_at);
+    log(format_args!(
+        "started (protocol {}, pid {}, socket {}, state {}, {} holders expected, {} sessions lost, descriptor limit {})",
+        cherry_protocol::PROTOCOL_VERSION,
+        std::process::id(),
+        path.display(),
+        state.display(),
+        expected.len(),
+        lost.len(),
+        fd_limit().map_or_else(|| "unknown".to_string(), |limit| limit.to_string()),
+    ));
     let host = Arc::new(Host {
         id,
         socket: path.to_path_buf(),
@@ -780,6 +1131,8 @@ pub fn serve(path: &Path) -> Result<()> {
         stopping: AtomicBool::new(false),
         next_lease: AtomicU64::new(1),
         connections: AtomicUsize::new(0),
+        started: Instant::now(),
+        started_at,
         stop,
         released: Mutex::new(false),
         released_changed: Condvar::new(),
@@ -804,6 +1157,7 @@ pub fn serve(path: &Path) -> Result<()> {
     // and register with the successor.
     drop(listener);
     drop(socket);
+    drop(pid_file);
     drop(lock);
     host.set_released();
     // Let shutdown replies reach their clients before the process ends.
@@ -915,6 +1269,8 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
     let mut over_limit = Diagnostics::default();
     let interval = config().touch_interval;
     let mut next_touch = Instant::now() + interval;
+    let log_check = config().log_check;
+    let mut next_log_check = Instant::now() + log_check;
     while !host.stopping.load(Ordering::SeqCst) {
         let now = Instant::now();
         if now >= next_touch {
@@ -924,7 +1280,21 @@ fn accept_loop(listener: &UnixListener, stopped: &UnixStream, host: &Arc<Host>, 
             }
             next_touch = now + interval;
         }
+        if now >= next_log_check {
+            if let Some(log_file) = &host.log_path {
+                if rotate_log(log_file) {
+                    // The next line (this one) starts the new file.
+                    log(format_args!(
+                        "moved the log past {} bytes aside to {}",
+                        log_limit(),
+                        rotated(log_file).display()
+                    ));
+                }
+            }
+            next_log_check = now + log_check;
+        }
         let timeout = next_touch
+            .min(next_log_check)
             .saturating_duration_since(now)
             .as_millis()
             .min(i32::MAX as u128) as libc::c_int;
@@ -1033,5 +1403,83 @@ fn admit(
             });
         }
         diagnostics.report(format_args!("cannot start a connection thread: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_lines_say_when_who_and_which_build() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_000_000_123);
+        let line = log_line(Role::Holder, at, 42, &"session s: it exited");
+        assert_eq!(
+            line,
+            format!(
+                "2026-09-21T14:13:20.123Z cherry-host[42] holder {}: session s: it exited",
+                build()
+            )
+        );
+        assert!(log_line(Role::Daemon, at, 7, &"x").contains(" cherry-host[7] daemon "));
+        // What a client shows of a line is the message.
+        assert_eq!(logged_message(&line), "session s: it exited");
+        assert_eq!(logged_message("cherry-host: plain"), "plain");
+        assert_eq!(
+            logged_message("thread 'main' panicked"),
+            "thread 'main' panicked"
+        );
+        assert_eq!(
+            utc_timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn a_long_log_is_moved_aside_keeping_one_old_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("host.log");
+        let old = dir.path().join("host.log.1");
+        fs::write(&log, vec![b'x'; 100]).unwrap();
+        // Within the limit it stays.
+        rotate_log(&log);
+        assert!(log.exists() && !old.exists());
+        fs::write(&log, vec![b'y'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
+        fs::write(&old, b"older").unwrap();
+        assert!(rotate_log(&log));
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0);
+        assert_eq!(fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&old).unwrap().len(), MAX_LOG_BYTES + 1);
+        // The new log is short: nothing moves it again.
+        assert!(!rotate_log(&log));
+        assert_eq!(fs::metadata(&old).unwrap().len(), MAX_LOG_BYTES + 1);
+    }
+
+    #[test]
+    fn a_writer_of_a_moved_log_follows_it_to_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("host.log");
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let fd = writer.as_raw_fd();
+        writer.write_all(b"before\n").unwrap();
+        assert!(writes_to_log(&log, fd));
+        // Not moved: nothing to do.
+        assert!(!reopen_if_moved(&log, fd));
+        fs::write(&log, vec![b'x'; 16]).unwrap();
+        fs::rename(&log, rotated(&log)).unwrap();
+        assert!(writes_to_log(&log, fd), "the moved log still counts");
+        // Gone, and not made again yet: it keeps writing where it did.
+        assert!(!reopen_if_moved(&log, fd));
+        fs::write(&log, b"").unwrap();
+        assert!(reopen_if_moved(&log, fd));
+        writer.write_all(b"after\n").unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "after\n");
+        assert!(!fs::read_to_string(rotated(&log)).unwrap().contains("after"));
+        let elsewhere = dir.path().join("other");
+        assert!(!writes_to_log(&elsewhere, fd));
     }
 }

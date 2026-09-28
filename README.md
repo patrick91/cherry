@@ -86,6 +86,18 @@ run new tabs as ordinary native tabs. Tabs are ordinary tabs anyway while the
 app runs from a disk image, has no `cherry` helper, or cannot start a
 session, and in a second copy of the app that shares the first one's app
 data (Settings › Sessions says why). Sessions on SSH hosts always keep running when you close a tab, close a window or quit.
+A tab of an SSH host that lost its connection, or could not reach the host,
+waits for it ("3 tabs waiting for my-server", with **Retry Now**) and
+attaches again once the host answers: Cherry asks the host with growing
+delays, and at once when the Mac wakes or a network comes back. Tabs of a
+host that was unreachable when their window opened come back once it
+answers.
+
+**Settings › Sessions › Session Host** shows the local host's build, uptime
+and sessions, and offers **Reveal Log**, **Copy Diagnostics** (what `cherry
+status` and `cherry doctor` report, for a bug report) and **Restart Host…**
+(your programs keep running). In a terminal, `cherry status` describes the
+host and `cherry doctor` checks it for problems and says how to fix them.
 
 Sessions of windows or tabs you closed that keep running are listed under
 **Background sessions** in the Cherry menu bar icon: click one to show it in a
@@ -142,8 +154,9 @@ includes the helpers, so building it needs the same tools as the installer
 below.
 
 Updating the app does not end sessions. The first `cherry` of the new version
-that connects replaces a daemon speaking an older protocol, and the sessions
-carry on in their holders. On a remote host, put the new `cherry-host` on its
+that connects replaces a daemon speaking an older protocol, or the same
+protocol but an older build, and the sessions carry on in their holders
+(each keeps the build it started with until it ends). On a remote host, put the new `cherry-host` on its
 SSH command `PATH`; the next connection upgrades it the same way. A daemon
 that speaks a newer protocol than the app is reported, never replaced, so
 build Cherry and Cherry Sessions from the same version. A daemon from before

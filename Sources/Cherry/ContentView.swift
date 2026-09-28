@@ -12073,6 +12073,10 @@ private struct TerminalSceneView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
 
+            HostWaitingBar(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 14)
+
             PersistentSessionFallbackBar(session: session)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 14)
@@ -12432,6 +12436,55 @@ private struct PersistentSessionReconnectBar: View {
             .frame(maxWidth: 460)
             .projectWindowToastObstacle()
         }
+    }
+}
+
+// A tab attached to an SSH host's session whose adapter gave up (the host
+// did not answer for a while, or could not be reached) waits for its host
+// (`HostedReconnects`): this says how many tabs wait for that host, and
+// offers to try now instead of at the next backoff step.
+private struct HostWaitingBar: View {
+    @ObservedObject var session: TerminalSession
+
+    var body: some View {
+        if session.isWaitingForHost, let reconnects = session.hostReconnects,
+           let host = session.hostedAttachment?.host {
+            HostWaitingBarContent(reconnects: reconnects, host: host)
+        }
+    }
+}
+
+private struct HostWaitingBarContent: View {
+    @ObservedObject var reconnects: HostedReconnects
+    let host: HostedSessionHost
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network.slash")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.orange)
+
+            Text(HostedReconnects.waitingText(count: max(1, reconnects.waitingCounts[host.id] ?? 0), host: host))
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(reconnects.pausedReasons[host.id].map { "Paused until you retry: \($0)" } ?? "")
+
+            Button("Retry Now") {
+                reconnects.retryNow(host)
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+        .frame(maxWidth: 460)
+        .projectWindowToastObstacle()
     }
 }
 

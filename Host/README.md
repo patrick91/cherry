@@ -140,7 +140,53 @@ and leaves the daemon running, when it finds no cherry-host it could start): the
 daemon makes way as for an update (below), its sessions carry on in their
 holders, and the new one adopts them. Use it when an update of the same
 protocol version replaced or removed the running daemon's executable, which
-then starts new sessions from whatever build is installed, or none.
+then starts new sessions from whatever build is installed, or none. (`list`,
+`new`, `attach` and `control` do it themselves when the daemon reports an
+older build than theirs; see [Updates](#updates).)
+
+`cherry status` describes the daemon and never starts one:
+
+```sh
+cherry status
+cherry status --json
+cherry --host my-server status
+```
+
+It prints the daemon's build and protocol, pid and uptime, its socket, state
+directory and log, its sessions against the limit of 128 (exited ones
+included) and how many run, its connections against the limit of 1024, its
+holders (registered, still expected after a restart, lost when it started),
+its descriptor limit, whether its executable was replaced or removed since
+it started, this `cherry`'s build, and each session with the build of the
+holder that runs it (holders keep the build they started with; see
+[Updates](#updates)). `--json` prints `{"running": true, "build", "host_id",
+"protocol", "host": {…}, "pending_holders", "sessions": [{"id", "name",
+"state", "pid", "exit_code", "clients", "owner", "created_at",
+"holder_build"}], "client": {"build", "protocol"}}`; `host` is null for a
+daemon that predates `status` (its sessions are still listed). With no
+daemon running it says so (`{"running": false, "socket", "state_dir",
+"log_path", "client"}`) and exits with status 3.
+
+`cherry doctor` checks the local host and says how to fix what it finds,
+without starting one:
+
+```sh
+cherry doctor
+```
+
+It checks this `cherry` and the `cherry-host` it would start (a translocated
+or disk image copy, a missing one, a build other than its own), the socket
+directory and socket (owner and mode, a stale socket nothing listens on, one
+another account serves, a daemon that does not answer), the running daemon
+(its protocol and build against this `cherry`'s, an executable an update
+replaced or removed, or one on a disk image, its descriptor limit against
+its connection limit, and its session and connection limits), the state
+directory, the daemon's PID file (`host.pid`: stale, or naming another
+process than the daemon that serves), the size of `host.log`, and, when no
+daemon runs, sessions whose holders still run without one. Each line is `ok`
+or `PROBLEM` followed by a `fix:` line; it exits with status 1 when it found
+a problem and 0 otherwise. With `--host` it refuses: run it on that machine
+(`ssh my-server cherry doctor`).
 
 `cherry control` connects as `list` does (starting a host, or replacing one
 that speaks an older protocol, when needed) and then relays protocol frames
@@ -319,7 +365,12 @@ Attaching to a session from inside that same session is refused.
   the same `--client-id` replaced this one; the session keeps running), or
   `failed` (the CLI could not attach, or rejected its command line). `message` explains every outcome except
   `exited` and a confirmed detach, where it is `null`. A final outcome has no
-  `viewport` or `reconnecting` field.
+  `viewport` or `reconnecting` field. A `disconnected` or `failed` outcome
+  that connecting again can never resolve adds `"reconnectable": false`:
+  another host identity answered, a host speaking a protocol this `cherry`
+  can neither use nor replace, or a host that no longer has the session. The
+  Mac app then stops trying to bring the tab back (see
+  [Persistent Sessions](#persistent-sessions)).
 - **Exit status.** `attach` exits with the session's exit code when the program
   ended, 0 when it detached (also without the host's confirmation) or was
   replaced by another attachment of its client, 1 for
@@ -569,6 +620,23 @@ ended and offers **Remove from Host** (deletes the exited record and closes the
 tab) and **Close Tab** instead; a workspace's last tab stays open. Reconnect in
 the menu bar and the sidebar is disabled for such a tab.
 
+A tab of an SSH host whose `cherry attach` gave up (it reconnects by itself
+for 30 seconds of awake time after a lost connection) or could not reach the
+host waits for that host instead of staying disconnected: its bar says
+"Waiting for the host to answer…", and a bar over the terminal says how many
+tabs wait for the host ("3 tabs waiting for my-server") with **Retry Now**.
+Cherry asks the host, once for all of its waiting tabs, after 0.25 seconds,
+then after doubling delays up to 8 seconds, and at once when the Mac wakes
+from sleep or a network becomes available (after SSH could not sign in, or
+refused the host's key, only then or on Retry Now, since every try is a
+login); once it answers, each tab whose
+session it still lists attaches again. A tab stops waiting, and says why,
+when another host identity answers, the host speaks a protocol this Cherry
+cannot use, or it no longer has the session. Disconnect, Reconnect and
+closing the tab end the wait. Tabs of an SSH host that could not be reached
+when a project window opened stay saved, and come back once the host answers
+while Cherry runs.
+
 **Create & Attach** uses one request ID per creation. After a connection
 failure Cherry retries once with the same ID, so the host creates at most one
 session. When the retry also fails, Cherry asks you to refresh before trying
@@ -616,7 +684,19 @@ and **This Mac** is unavailable in Persistent Sessions; SSH hosts still work.
 `Scripts/install-local-app` bundles `cherry` and `cherry-host` beside the Mac
 app executable. It needs Rust for that; `CHERRY_SKIP_HOST=1` installs the app
 without them, and Persistent Sessions is then unavailable in that copy (its
-local tabs run natively).
+local tabs run natively). It builds them with the app's CFBundleVersion as
+their build (`CHERRY_BUILD_ID`), so the updated app's helpers hand the
+running daemon over to the new build (see [Updates](#updates)).
+
+**Settings › Sessions › Session Host** shows the local daemon's status (what
+`cherry status` reports: build, uptime, sessions and connections, sessions
+whose holder runs another build) and offers **Reveal Log** (`host.log` in the
+Finder), **Copy Diagnostics** (Cherry's version and what `cherry status` and
+`cherry doctor` print, for a bug report) and **Restart Host…** (`cherry
+restart`, after asking; running programs keep running and tabs reconnect).
+Cherry's own messages about tabs and sessions are in the unified log,
+subsystem the app's bundle identifier and category `Sessions` (`log stream
+--predicate 'category == "Sessions"'`).
 
 Cherry looks for the `cherry` client in this order:
 
@@ -684,8 +764,22 @@ holds:
   `/tmp` cleanup; deleting it gives the next daemon a new identity.
 - `host.lock`: held while a daemon serves that socket; a second daemon for the
   same socket refuses to start.
-- `host.log`: the stderr of a daemon started by a client. Under systemd, stderr
-  goes to the journal instead.
+- `host.log`: the stderr of a daemon started by a client, and of the holders
+  it starts. Under systemd, stderr goes to the journal instead. Each line of
+  the daemon's and holders' says when (UTC), which process, its role and
+  build: `2026-09-27T10:15:00.123Z cherry-host[1234] daemon 20260927101500.abc1234: started (…)`
+  (`holder` for a holder). A daemon logs such a startup line (protocol, pid,
+  socket, state directory, holders expected, sessions lost, descriptor
+  limit). When `host.log` is over 8 MiB the daemon moves it to `host.log.1`
+  (replacing an older one), while it holds `host.lock`: when it starts and,
+  checking every minute, while it runs. It and its holders then write to a
+  new `host.log`.
+- `handover.json`: the last same-protocol handover whose replacement was
+  not the newer build (see [Updates](#updates)).
+- `host.pid`: the running daemon's pid and when it started, its build, start time and socket, written
+  once it holds the lock and removed when it exits normally. One whose process
+  is gone is stale (`cherry doctor` reports it); the next daemon writes it
+  again.
 - `sessions/<id>.json`: one manifest per holder (the session ID, the holder's
   process ID and start time, when it was created, its link version), so that
   a daemon that starts knows which holders to expect. A holder removes its
@@ -883,8 +977,29 @@ of the new version replaces it. Nothing needs to be stopped first:
    list`, `new`, `attach` and `control`, and the Mac app's tabs and control
    connection, upgrade a remote host once its `cherry-host` is updated.
 
+The same holds for an update that keeps the protocol version: every
+`cherry` and `cherry-host` reports its build (`--version`, the daemon's
+`Welcome`, `cherry status`): a time and a revision (`20260927101500.abc1234`)
+when it was built with `CHERRY_BUILD_ID` (`Scripts/install-local-app` passes
+the Mac app's CFBundleVersion), or a development build
+(`dev-<commit time>.<revision>`) otherwise, which is never newer or older
+than another. Locally, the next `cherry list`, `new` or `control` (never
+`attach`) that finds a daemon of its protocol but an older build asks it to
+make way (`Restart`) and starts its own `cherry-host`, once, when that
+`cherry-host` is newer than the daemon's too and is the daemon's own
+executable (updated in place), or the daemon reports its executable was
+replaced or removed; the sessions carry on as above. It is not done while a
+systemd user service manages the daemon, nor, for an hour, again between two
+builds whose last handover came back with the older build still answering
+(recorded in `handover.json` in the state directory). A daemon of a newer
+build, of a development build, one of another installation, or one that does
+not report its build is left running, so two copies of Cherry never take
+turns replacing the daemon; `cherry restart` moves it to this build. The
+gateway does not do this for a remote host: run `cherry restart` there.
+
 Running sessions keep the holders, and so the code, of the build that created
-them until they are removed; new sessions run the new build. A daemon speaks
+them until they are removed; new sessions run the new build (`cherry status`
+shows each session's holder build). A daemon speaks
 every holder link version a live holder may use, and a session reports only
 what its holder knows (one whose holder predates `application_cursor_keys`
 lists it as false, one that predates `bracketed_paste` leaves it out, and
@@ -1432,7 +1547,7 @@ selects every test in the files named after it. `real-host` sets
 private `HOME`; a skipped test fails the run. Without `--skip-build` it builds
 the Swift tests first, and for `real-host` the Rust helpers too.
 
-The 16 ignored `real_host` tests run the `cherry` that `cargo test` builds
+The 20 ignored `real_host` tests run the `cherry` that `cargo test` builds
 and the `cherry-host` beside it (hence `cargo build --bins` first; set
 `CHERRY_TEST_HOST` to use another), each daemon with a private socket and a
 temporary `HOME`. They cover shared attachment and takeover, only the
@@ -1444,7 +1559,11 @@ control` relaying requests with IDs and starting a remote host, and, through
 the real gateway behind a fake `ssh`: remote `kill`, `remove`, and
 `shutdown` never starting a host, replacing an older remote daemon and
 reporting a newer one, leaving a host of another identity to the client, and
-a fake remote leaving nothing behind. The
+a fake remote leaving nothing behind, `cherry status` and `cherry doctor`
+against a running daemon, and a client handing a daemon of an older build of
+its protocol over to its own build (leaving a newer, development or foreign
+build alone, never from an attachment, and not again after the old build
+won the race). The
 ignored Neovim tests in `cherry-host` and `cherry-vt` need `nvim` on PATH: they
 run real Neovim on a PTY, reconstruct its state in a second terminal (or
 reattach through the host at a new size), and check returning to the shell.
@@ -1465,8 +1584,14 @@ Tests shorten the host's timing with `CHERRY_HOST_*_MS` variables read when
 `List` and requests naming a session wait for the holders a restarted daemon
 expects, 1000 ms by default, and `STALL_TIMEOUT`, how long a client that
 takes none of its output holds a session's output back at most, 2000 ms by
-default; `CHERRY_HOST_MAX_CONNECTIONS` lowers the connection limit), and the
-CLI's with `CHERRY_CLI_*_MS`
+default; `CHERRY_HOST_MAX_CONNECTIONS` lowers the connection limit,
+`CHERRY_HOST_LOG_MAX_BYTES` the size past which the daemon moves `host.log`
+aside and `CHERRY_HOST_LOG_CHECK_MS` how often it checks, both passed on by
+`cherry-host start`, `CHERRY_HOST_TEST_BUILD` makes a daemon, the holders it
+starts and `cherry-host --version` report another build, and
+`CHERRY_HOST_TEST_SERVE_BUILD` makes the daemon `cherry-host start` starts
+report one), and the CLI's with `CHERRY_TEST_BUILD` (the build it acts as)
+and `CHERRY_CLI_*_MS`
 (`CONNECT_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`,
 `ESCAPE_WAIT`, `GRID_WAIT`, `RESIZE_COALESCE`, `DETACH_WAIT`, `REPORT_WAIT`,
 `CLOSED_WAIT`, `QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects),

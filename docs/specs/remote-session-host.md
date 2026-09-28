@@ -65,7 +65,13 @@ What exists, relative to the design:
   large pastes, and Detach is ordered after earlier input. Snapshots are
   limited to 8 MiB by dropping the oldest history. `cherry attach`
   reconnects by itself for 30 seconds after a lost connection, never
-  resending input.
+  resending input. After that the Mac app keeps an SSH tab waiting for its
+  host, probing it with backoff (and at once when the Mac wakes or the
+  network comes back) and reattaching once it answers, unless another
+  identity answers, its protocol cannot be used, or the session is gone
+  (docs/specs/multiplexer-default.md, "SSH tabs wait for their host"). A
+  restore that could not reach an SSH host brings its tabs back once the
+  host answers during the same run.
 - **Termination.** Kill escalates from SIGHUP to SIGTERM to SIGKILL across the
   session's processes. A natural exit is a hangup, so `nohup`'d jobs survive.
   Signal deaths report 128 plus the signal, with the signal itself.
@@ -86,6 +92,12 @@ What exists, relative to the design:
 - **Service setup.** A systemd user unit (`Restart=on-failure`,
   `KillMode=process`) is provided; while it is enabled, clients start it
   instead of a daemon of their own. No launchd agent is provided for macOS.
+- **Diagnostics.** `cherry status [--json]` (also `--host H`) describes the
+  daemon: pid, uptime, build, protocol, socket, state directory, log, the
+  sessions and connections against their limits, holders, and each
+  session's holder build. `cherry doctor` checks the local host and says
+  how to fix what it finds. Daemon and holder log lines carry a timestamp,
+  pid, role and build; `host.log` is rotated when a daemon is started.
 
 Remote project/Git/worktree integration, previews, port forwarding, file
 transfer, remote MCP support, and host-reboot recovery remain deferred. The app

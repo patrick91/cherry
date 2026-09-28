@@ -445,7 +445,8 @@ session state that cannot be rebuilt from holders.
 Exact version match for normal operation (the bundled CLI, app and host ship
 together). Frozen forever: `Hello{version}`, `Welcome{version, host_id}` (sent
 for every Hello, even across versions — only `Replace` and disconnect are allowed
-after a mismatch), `Replace`, `Ok`, `Error{code, message}`.
+after a mismatch; since protocol 7 it may add `build`, which every version
+ignores), `Replace`, `Ok`, `Error{code, message}`.
 
 - Request ids: any request may carry `"req": <u64>`; its reply echoes it. Events
   and attachment traffic carry none. One connection can have several requests in
@@ -637,6 +638,48 @@ differs from the design above.
   the daemon stop as for `Replace` whatever sessions run, so `cherry restart`
   can start this build's daemon after an update of the same protocol
   replaced or removed the running one's executable.
+- **Builds and diagnostics.** Every cherry and cherry-host carries a build
+  id (`cherry_protocol::BUILD`, set by `crates/cherry-protocol/build.rs`):
+  `CHERRY_BUILD_ID` at build time when set (Scripts/install-local-app passes
+  the app's CFBundleVersion, `<YYYYMMDDHHMMSS>.<revision>`), else a
+  development build, `dev-<commit time>.<revision>` (or `dev-<package
+  version>` outside git). `--version` prints it (`cherry-host 0.1.0
+  (build …)`; a daemon's stand-in build under `CHERRY_HOST_TEST_BUILD`). The daemon sends it in `Welcome.build` (the one field added
+  to the frozen Welcome; every version ignores it), and each session
+  reports its holder's in `SessionInfo.holder_build` (from the holder's
+  hello and manifest; None for a holder older than the field): a holder
+  keeps the code it started with when the daemon is updated. Builds order
+  by their time (`build_is_newer`), and only builds given an explicit id
+  have one: two builds of the same time, or a development build, are
+  neither newer nor older than any other. `CHERRY_HOST_TEST_BUILD` makes a
+  daemon (and the holders it starts, and its `--version`) report another
+  build, and `CHERRY_TEST_BUILD` makes the CLI act as one, for tests.
+- `Status` (protocol 7, additive; an older host of the same version answers
+  `unsupported_operation`) answers `HostStatus`: identity, version, build,
+  pid, start time and uptime (on the clock that stops while the Mac sleeps),
+  socket, state directory, log path (when its stderr is `host.log`), its
+  executable and whether an update replaced or removed it since it started,
+  sessions (running) against `MAX_SESSIONS` (128), connections against
+  `MAX_CONNECTIONS` (1024), holders registered and still expected, lost
+  sessions and its descriptor limit.
+- The daemon writes `host.pid` in its state directory (JSON: pid, its
+  start identity (`processes::start_identity`), build, start time, socket)
+  once it holds the lock, and removes it when it exits normally. Its log lines and its holders' say when, who and which build:
+  `2026-09-27T10:15:00.123Z cherry-host[1234] daemon <build>: <message>`
+  (`holder` for a holder); other roles (`start`, the gateway) still write
+  `cherry-host: <message>` to the terminal or client that ran them, which
+  the CLI's stderr relay reads. A daemon logs a startup line (protocol, pid,
+  socket, state, holders expected, sessions lost, descriptor limit).
+  The daemon moves `host.log` aside to `host.log.1` (replacing an older
+  one) when it is over 8 MiB, only while it holds the state directory's
+  lock: when it starts, and every minute while it runs
+  (`CHERRY_HOST_LOG_MAX_BYTES`, `CHERRY_HOST_LOG_CHECK_MS` for tests, which
+  `cherry-host start` passes on). It then writes to a new `host.log`, and so
+  do its holders: a daemon or holder whose stderr is the log reopens
+  `host.log` (append) before a line when the name no longer names the file
+  it writes to (`reopen_if_moved`), so nothing writes to `host.log.1` once
+  it has logged again, and the moved copy is not moved a second time while
+  one does.
 - The holder's terminal matches the tab's Ghostty: grapheme clustering
   (2027) is on by default (`GHOSTTY_TERMINAL_OPT_MODE_DEFAULT`, so RIS keeps
   it), snapshots set 2027 on or off before their content, and `modes()` and
@@ -700,6 +743,53 @@ differs from the design above.
   read-only copy) and refuses, leaving the host running, when there is
   none; then it sends `Restart` and starts that daemon, which adopts the
   running sessions from their holders.
+- **Same-protocol updates hand over by build** (`cherry-cli/src/handover.rs`).
+  Locally, `list`, `new` and `control` (the app's control helper), never an
+  attachment, send `Restart` and start their cherry-host, once per
+  connection, when all of these hold: the daemon's `Welcome.build` is
+  older than this cherry's build; the cherry-host to start (as `cherry
+  restart` finds it) says with `--version` a build newer than the daemon's;
+  that cherry-host is the daemon's own executable (the same file as
+  `HostStatus.executable`), or the daemon reports it replaced or removed;
+  no systemd user service manages the daemon (Linux); and no handover
+  between the same two builds came back within the last hour with a
+  replacement that was not newer (another client of the old build started
+  the next daemon first), which `handover.json` in the state directory
+  records. So an app update gets new daemon code, sessions carry on in
+  their holders (which keep their builds), a development build (CherryDev,
+  `swift run Cherry`) never takes over the shared daemon, and clients of
+  two builds never take turns restarting it. A refusal is reported on
+  stderr and the connection goes on. The gateway does not do this for a
+  remote host (see Not done yet).
+- `cherry status [--json]` never starts a host. It prints the daemon's
+  `Status` (a host that predates it: its identity and sessions only), this
+  cherry's build, and each session with its holder's build; `--json` has
+  `running`, `build`, `host` (the `HostStatus`), `sessions` (id, name,
+  state, pid, exit code, clients, owner, created at, `holder_build`) and
+  `client`. With no host running it prints so (JSON: `running: false`,
+  `socket`, `state_dir`, `log_path`) and exits with status 3. It works with
+  `--host` through `gateway --no-start`.
+- `cherry doctor` (local only, never starts a host) checks this cherry and
+  the cherry-host it would start (a translocated or disk image location, a
+  missing one, another build), the socket directory and socket (owner,
+  mode, a stale socket nothing listens on, one another account serves, a
+  listener that does not answer), the daemon (protocol and build against
+  this cherry's, an executable that was replaced, removed or runs from a
+  disk image, its descriptor limit against its connection limit, the
+  session and connection limits), the state directory, `host.pid` (stale:
+  its pid gone or, by its start identity, now another process's; or
+  naming another process than the one serving), the log's size (over
+  64 MiB), and, with no daemon running, holders whose manifests name live
+  processes (sessions with no host; a manifest whose holder is gone is only
+  noted: the next daemon reports it lost). Each finding is `ok` or
+  `PROBLEM` with a `fix:` line; it exits with status 1 when it found a
+  problem.
+- The status file's final `disconnected` or `failed` outcome says
+  `"reconnectable": false` when connecting again can never resume the
+  attachment (another identity, a protocol this cherry cannot use or
+  replace, a session the host no longer has: the `Unresolvable` failures
+  and an Attach refused with `unknown_session`); the reconnection keeps the
+  error's kind so that this is known.
 - A negotiated connection answers a JSON request the host cannot decode
   (an unknown `op`: `unsupported_operation`; fields it cannot take, such as
   a colour that is not ASCII `#rrggbb`: `request_failed`) with an `Error`,
@@ -806,6 +896,62 @@ differs from the design above.
   given (renamed while its Create was under way, or while Cherry was
   closed) sends it once bound. A failed `Update` is logged; the next rename
   sends it again.
+
+- **Session host diagnostics.** Settings › Sessions has a "Session Host"
+  card (`SessionHostDiagnostics`): the local host's status from `cherry
+  status --json` (running, build, uptime, sessions against the limit,
+  connections, sessions whose holder runs another build, pid), read when
+  the pane opens; Reveal Log (the daemon's `host.log` in the Finder); Copy
+  Diagnostics (the app's version, then what `cherry status` and `cherry
+  doctor` print); and Restart Host… (`cherry restart`, after an alert that
+  says running programs keep running and tabs reconnect). Where local
+  sessions cannot run (a disk image copy) it runs nothing and says why. The
+  app's session diagnostics (the tab and session messages it wrote to
+  standard error) go to the unified log (`SessionLog`: subsystem the bundle
+  identifier, category "Sessions"; the `CHERRY_DEBUG_*` traces at debug
+  level, and what was typed or printed in them as private data:
+  `SessionLog.debugContent`).
+- **SSH tabs wait for their host.** A tab attached to an SSH host's session
+  whose adapter ended `disconnected` (it gave up reconnecting after its 30 s
+  window) or `failed` (it could not attach: ssh could not reach the host),
+  unless the status file says `"reconnectable": false`, waits for its host
+  (`HostedReconnects`, the workspace policy's `hostReconnects`; workspaces
+  without it, as in most tests, leave such tabs disconnected). Waiting tabs
+  are grouped per host: each group is probed with one `HostControl.list()`
+  (one control connection, however many tabs wait) after 0.25 s, doubling
+  to 8 s (`PersistentLocalSessions.Configuration.reconnectDelay`, as local
+  persistent tabs), starting over once a tab of that host attaches again,
+  and at once, starting over, when the Mac wakes
+  (`NSWorkspace.didWakeNotification`), when NWPathMonitor reports a
+  satisfied path after it was not, or on Retry Now. Once the host answers,
+  each waiting tab whose session it lists launches its adapter again
+  (`reconnectHostedSession`); a tab stops waiting, with the reason as its
+  status (`.failed`), when another identity answers, the host speaks a
+  protocol this app cannot use, or it no longer lists the session (and
+  expects no more holders). A detach, a takeover, a replacement, an exit,
+  or the tab's own stop, disconnect, reconnect or close never waits or ends
+  the wait. A probe that SSH could not sign in for ("Permission denied",
+  "Host key verification failed", a changed host key, too many
+  authentication failures: `HostedSessionError.isAuthenticationFailure`)
+  stops the timer for that host (`pausedReasons`, shown on the bar's help)
+  until a wake, a network change or Retry Now, which try once more: each
+  probe is a login, and repeated failed logins can get the address
+  blocked. The tab's connection bar says "Waiting for the host to answer…"
+  (with Reconnect), and a bar over its pane says "3 tabs waiting for
+  devbox" with Retry Now. The wake and network triggers also make a leased
+  `HostControl` waiting to reconnect try at once (`reconnectNow`).
+- A restore that cannot reach an SSH host keeps its records (as before)
+  and now also restores them once that host answers during this run:
+  `retryWhenAvailable` is `HostControl.availability()`, which leases the
+  host's control connection (so it reconnects with its backoff, and at once
+  on a wake or a network change) and fires once it is connected. A host
+  that answers with another identity, or speaks a protocol this app cannot
+  use, is not waited for; `availability()` completes without firing, and
+  releases its lease, once the connection fails for good. A leased
+  `HostControl` treats a protocol mismatch as permanent (`.failed`, no
+  reconnect), and after a refused SSH login waits in
+  `.waitingToReconnect` without a timer until `reconnectNow` (a wake, a
+  network change).
 
 ### App: hosted-by-default tabs
 
@@ -1524,11 +1670,10 @@ differs from the design above.
   host at once as `ESC [ x` instead of waiting for the adapter, and so do
   cursor keys typed while its adapter is away. An optional field, left out
   when unknown, would let the app keep the adapter fallback for such
-  sessions. On a machine that ran an earlier build of this branch, the
-  protocol-4 daemon still running is not replaced (the field did not change
-  `PROTOCOL_VERSION`) and leaves the field out, so the app takes the mode as
-  unknown until that daemon restarts (`cherry shutdown` when idle, or kill
-  its `cherry-host serve`; sessions carry on in their holders).
+  sessions. A daemon of this protocol is replaced by a newer build only
+  when it reports its build (`Welcome.build`); one from before builds were
+  reported is used as it is until it restarts (`cherry restart`, or Restart
+  Host in Settings › Sessions; sessions carry on in their holders).
 - Keys typed while an adapter is away that `HostRoutedKeyEncoder` does not
   send (input-method composition, F13 and above, Option dead keys when
   Option does not act as Alt) still reach the dead surface and are lost.
@@ -1623,8 +1768,10 @@ differs from the design above.
   (`CSI ?997;…n` for mode 2031) of its own. `ClearHistory` clears
   nothing on the alternate screen (like ED 3 and Ghostty's own clear), and
   Clear Scrollback on a tab only attached to a session (another app's, the
-  CLI's or an SSH host's) leaves that host's history alone. The app does not
-  run `cherry restart` by itself.
+  CLI's or an SSH host's) leaves that host's history alone. The helper
+  replaces a daemon of the same protocol only by build (above): a daemon
+  whose executable was replaced by the same build is not restarted by
+  itself (Settings › Sessions offers Restart Host).
 - **Sessions the system ended.** A session of this app killed outside it
   (`cherry kill`, a `kill -9` of its holder while a daemon runs, `cherry
   shutdown` removing it once ended) is not recorded as ended on purpose: if
@@ -1639,5 +1786,28 @@ differs from the design above.
   when the restore asks (a restarted daemon whose holders have not
   registered yet leaves the tab ended). An exit is saved with the next save
   after the host reports it; a restart within that half second loses it.
+- **Diagnostics.** The build handover is local: the SSH gateway does not
+  replace a remote daemon of the same protocol and an older build (`cherry
+  --host H status` shows it; `ssh H cherry restart` hands it over). Holders
+  keep their builds until their sessions end; nothing restarts them. The
+  log is rotated only by a daemon whose stderr is `host.log` (not under a
+  systemd unit, whose log is the journal), at most once a minute, keeping
+  one old copy; a holder that logs nothing after a rotation, and output a
+  program prints to stderr without going through `log` (none does), stay
+  in `host.log.1` until its next line. `cherry doctor` is local only and reads the PID
+  file and manifests without locking; it cannot tell a PID file of a
+  daemon that just started from a stale one in the moment before the daemon
+  binds its socket. A handover the old build won is not tried again for an
+  hour, even when the old build's client is gone by then. The Settings card, its alert, and the waiting bar are
+  tested through their models (`SessionHostDiagnostics`,
+  `SessionHostStatus`, `HostedReconnects`, `HostedConnectionBarState`), not
+  as SwiftUI views; the wake notification and NWPathMonitor are tested
+  through the calls they make (`systemDidWake`, `networkBecameAvailable`).
+- **SSH tabs.** A tab that waits for its host after its adapter failed
+  (`failed`) for a reason other than the host (a usage error, a missing
+  helper) is retried like one that could not reach its host. Tabs of one
+  host are probed together but each launches its own adapter (and ssh,
+  unless the app's master runs). A probe that succeeds while the adapter
+  then fails again keeps the backoff growing until a tab attaches.
 - Nice-to-haves (none blocks): sequence ids on bell and notification events,
   for exact deduplication; per-client sizes in `SessionInfo`.

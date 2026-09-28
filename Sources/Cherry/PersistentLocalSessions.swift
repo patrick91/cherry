@@ -884,7 +884,7 @@ final class PersistentLocalSessions {
     /// its owner follows a session; another tab is never bound in its place.
     func bind(_ session: TerminalSession, to sessionID: String) {
         if let bound = boundTabs[sessionID]?.session, bound !== session {
-            fputs("Cherry: session \(sessionID) already belongs to tab \(bound.id.uuidString); tab \(session.id.uuidString) does not follow it\n", stderr)
+            SessionLog.notice("session \(sessionID) already belongs to tab \(bound.id.uuidString); tab \(session.id.uuidString) does not follow it")
             return
         }
         boundTabs[sessionID] = WeakTab(session)
@@ -1173,11 +1173,11 @@ final class PersistentLocalSessions {
                 case .gone:
                     return
                 case .stop:
-                    fputs("Cherry: could not end session \(id): \(error.localizedDescription)\n", stderr)
+                    SessionLog.error("could not end session \(id): \(error.localizedDescription)")
                     return
                 case .retry:
                     guard await backOff() else {
-                        fputs("Cherry: gave up ending session \(id) (\(error.localizedDescription)); it may still run\n", stderr)
+                        SessionLog.error("gave up ending session \(id) (\(error.localizedDescription)); it may still run")
                         return
                     }
                 }
@@ -1255,7 +1255,7 @@ final class PersistentLocalSessions {
             do {
                 try await control.update(binding.sessionID, name: name, expectedHostID: binding.hostID)
             } catch {
-                fputs("Cherry: could not rename session \(binding.sessionID): \(Self.errorMessage(error))\n", stderr)
+                SessionLog.error("could not rename session \(binding.sessionID): \(Self.errorMessage(error))")
             }
         }
     }

@@ -2576,6 +2576,7 @@ mod tests {
             request_id: None,
             ended_by: None,
             holder_log: None,
+            holder_build: None,
         };
         let running = SessionEvent::Changed {
             session: session(cherry_protocol::SessionState::Running, None),

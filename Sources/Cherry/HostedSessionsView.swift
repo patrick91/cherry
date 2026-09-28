@@ -624,14 +624,20 @@ struct HostedConnectionBarState: Equatable {
 
     /// `reconnecting`: the running adapter has been reconnecting by itself
     /// for a while (its host restarted); it keeps the tab's screen.
+    /// `waitingForHost`: its adapter gave up, and the tab reconnects once
+    /// its host answers (`HostedReconnects`).
     init(
         isRunning: Bool,
         status: HostedAttachmentStatus?,
         removedFromHost: Bool,
         canClose: Bool,
-        reconnecting: Bool = false
+        reconnecting: Bool = false,
+        waitingForHost: Bool = false
     ) {
-        if isRunning {
+        if waitingForHost, !isRunning {
+            message = "Waiting for the host to answer…"
+            actions = [.reconnect]
+        } else if isRunning {
             message = reconnecting ? "Reconnecting…" : nil
             actions = [.disconnect]
         } else if let status, status.sessionEnded {
@@ -662,7 +668,8 @@ struct HostedSessionConnectionBar: View {
                 status: session.hostedAttachmentStatus,
                 removedFromHost: session.hostedSessionRemovedFromHost,
                 canClose: close != nil,
-                reconnecting: session.isAdapterReconnecting
+                reconnecting: session.isAdapterReconnecting,
+                waitingForHost: session.isWaitingForHost
             )
             HStack(spacing: 10) {
                 Image(systemName: attachment.host.sshDestination == nil ? "desktopcomputer" : "network")

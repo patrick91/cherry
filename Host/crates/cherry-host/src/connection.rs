@@ -293,6 +293,7 @@ fn run(mut stream: UnixStream, host: &Arc<Host>) -> Result<()> {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: host.id.clone(),
+                build: Some(daemon::build().to_owned()),
             },
         ),
     )?;
@@ -638,6 +639,9 @@ impl Connection {
                 }
             }
             ClientMessage::Ping => ServerMessage::Pong,
+            ClientMessage::Status => ServerMessage::Status {
+                status: self.host.status(),
+            },
             ClientMessage::List => {
                 // A daemon that just started lists the sessions of holders
                 // still registering again, as it would a moment later.

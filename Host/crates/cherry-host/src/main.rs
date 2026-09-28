@@ -20,7 +20,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "Portable persistent terminal host for Cherry", version)]
+#[command(
+    about = "Portable persistent terminal host for Cherry",
+    version = daemon::version()
+)]
 struct Args {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
@@ -61,7 +64,10 @@ fn run() -> Result<()> {
     let path = args.socket.unwrap_or_else(default_socket_path);
     match args.command {
         Action::Start => launch::start(&path),
-        Action::Serve => daemon::serve(&path),
+        Action::Serve => {
+            daemon::set_log_role(daemon::Role::Daemon);
+            daemon::serve(&path)
+        }
         Action::Gateway { no_start } => {
             // Set by the CLI (see `cherry_protocol::EXPECTED_HOST_ID_VAR`).
             let expected = std::env::var(cherry_protocol::EXPECTED_HOST_ID_VAR)
@@ -69,6 +75,9 @@ fn run() -> Result<()> {
                 .filter(|id| !id.is_empty());
             launch::gateway(&path, !no_start, expected.as_deref())
         }
-        Action::Hold => holder::hold(&path),
+        Action::Hold => {
+            daemon::set_log_role(daemon::Role::Holder);
+            holder::hold(&path)
+        }
     }
 }

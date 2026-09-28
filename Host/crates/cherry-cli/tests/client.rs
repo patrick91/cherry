@@ -121,6 +121,7 @@ fn accept(listener: UnixListener) -> UnixStream {
         &ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             host_id: "host-1".into(),
+            build: None,
         },
     )
     .unwrap();
@@ -1156,6 +1157,7 @@ fn a_detach_ends_once_a_host_that_stopped_reading_sent_nothing_more() {
                 ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     host_id: "remote".into(),
+                    build: None,
                 },
                 ServerMessage::Attached {
                     reason: AttachReason::Attach,
@@ -1300,6 +1302,7 @@ fn unsolicited_pongs_are_ignored_at_any_time() {
                 &ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     host_id: "host-1".into(),
+                    build: None,
                 },
             )
             .unwrap();
@@ -1651,6 +1654,67 @@ fn a_lost_connection_is_reported_as_disconnected() {
         .as_str()
         .unwrap()
         .contains("connection lost"));
+    // Connecting again may resolve it: nothing says otherwise.
+    assert!(value.get("reconnectable").is_none(), "{value}");
+}
+
+#[test]
+fn an_attachment_nothing_can_resume_says_it_is_not_reconnectable() {
+    // The host no longer has the session.
+    let (directory, gone, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let server = thread::spawn(move || {
+        let mut stream = accept(gone);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Attach { .. })
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::error("unknown_session", "no session test-session"),
+        )
+        .unwrap();
+    });
+    let output = command
+        .args(["attach", "test-session", "--status-file"])
+        .arg(&status)
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    server.join().unwrap();
+    let value = read_status(&status);
+    assert_eq!(value["outcome"], "failed");
+    assert_eq!(value["reconnectable"], false, "{value}");
+
+    // Another host identity answers.
+    let (directory, other, mut command) = listener();
+    let status = directory.path().join("status.json");
+    let server = thread::spawn(move || drop(accept(other)));
+    let output = command
+        .args([
+            "--expected-host-id",
+            "12345678-1234-4234-8234-123456789abc",
+            "attach",
+            "test-session",
+            "--status-file",
+        ])
+        .arg(&status)
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    server.join().unwrap();
+    let value = read_status(&status);
+    assert_eq!(value["outcome"], "failed");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("host identity changed"),
+        "{value}"
+    );
+    assert_eq!(value["reconnectable"], false, "{value}");
 }
 
 #[test]
@@ -2737,6 +2801,7 @@ fn ssh_shell_output_before_the_gateway_preamble_is_skipped() {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: "remote".into(),
+                build: None,
             },
             sessions_reply("remote", vec![session()]),
         ]),
@@ -3000,6 +3065,7 @@ fn version_mismatches_name_both_versions() {
         ServerMessage::Welcome {
             version: 99,
             host_id: "host-1".into(),
+            build: None,
         },
         ServerMessage::error(
             "version_mismatch",
@@ -4090,6 +4156,7 @@ fn welcome(host_id: &str) -> Vec<u8> {
     encoded(&ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
         host_id: host_id.into(),
+        build: None,
     })
 }
 
@@ -4440,6 +4507,7 @@ fn control_writes_nothing_to_standard_output_when_it_cannot_connect() {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: "host-1".into(),
+                build: None,
             },
             "host identity changed",
         ),
@@ -4448,6 +4516,7 @@ fn control_writes_nothing_to_standard_output_when_it_cannot_connect() {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION + 1,
                 host_id: "host-1".into(),
+                build: None,
             },
             "protocol version mismatch",
         ),
@@ -4584,6 +4653,7 @@ fn control_over_ssh_relays_what_follows_the_gateway_preamble_and_forwards_the_ag
             &frames(&[ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: "remote".into(),
+                build: None,
             }]),
             &event,
             &pong,
@@ -4758,6 +4828,7 @@ fn older_host_making_way(
             &ServerMessage::Welcome {
                 version: PROTOCOL_VERSION - 1,
                 host_id: "host-1".into(),
+                build: None,
             },
         )
         .unwrap();
@@ -4789,6 +4860,7 @@ fn older_host_making_way(
             &ServerMessage::Welcome {
                 version,
                 host_id: "host-1".into(),
+                build: None,
             },
         )
         .unwrap();
@@ -4945,6 +5017,7 @@ fn replacing_an_older_host_and_connecting_again_share_one_deadline() {
             &ServerMessage::Welcome {
                 version: PROTOCOL_VERSION - 1,
                 host_id: "host-1".into(),
+                build: None,
             },
         )
         .unwrap();
@@ -5026,6 +5099,7 @@ fn kill_remove_and_shutdown_never_replace_an_older_host() {
                 &ServerMessage::Welcome {
                     version: PROTOCOL_VERSION - 1,
                     host_id: "host-1".into(),
+                    build: None,
                 },
             )
             .unwrap();
@@ -5068,6 +5142,7 @@ fn an_older_host_that_refuses_to_make_way_is_reported_and_left_alone() {
                 &ServerMessage::Welcome {
                     version: PROTOCOL_VERSION - 1,
                     host_id: "host-1".into(),
+                    build: None,
                 },
             )
             .unwrap();
@@ -5125,6 +5200,7 @@ fn newer_hosts_and_other_hosts_are_never_replaced() {
                     &ServerMessage::Welcome {
                         version,
                         host_id: "host-1".into(),
+                        build: None,
                     },
                 )
                 .unwrap();
@@ -5156,6 +5232,7 @@ fn an_older_host_behind_a_gateway_makes_way_and_the_next_gateway_starts_a_new_on
                 ServerMessage::Welcome {
                     version: PROTOCOL_VERSION - 1,
                     host_id: "remote".into(),
+                    build: None,
                 },
                 then.clone(),
             ]),
@@ -5169,6 +5246,7 @@ fn an_older_host_behind_a_gateway_makes_way_and_the_next_gateway_starts_a_new_on
                 ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     host_id: "remote".into(),
+                    build: None,
                 },
                 then.clone(),
             ]),
@@ -5780,6 +5858,7 @@ fn another_host_identity_or_a_newer_protocol_ends_the_reconnection_at_once() {
             &ServerMessage::Welcome {
                 version,
                 host_id: host_id.into(),
+                build: None,
             },
         )
         .unwrap();
@@ -6009,6 +6088,7 @@ fn reconnecting_over_ssh_runs_ssh_in_batch_mode_so_it_never_prompts_in_the_sessi
         frames(&[ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             host_id: "remote".into(),
+            build: None,
         }]),
     ]
     .concat();
@@ -6121,6 +6201,7 @@ fn a_remote_host_of_another_version_ends_the_reconnection_at_once() {
                 ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     host_id: "remote".into(),
+                    build: None,
                 },
                 ServerMessage::Attached {
                     reason: AttachReason::Attach,
@@ -6198,6 +6279,7 @@ fn serve_attach(mut stream: UnixStream, snapshot: &[u8]) -> Option<UnixStream> {
         &ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             host_id: "host-1".into(),
+            build: None,
         },
     )
     .ok()?;
@@ -6410,6 +6492,7 @@ fn what_ssh_says_while_reconnecting_never_reaches_the_screen() {
         frames(&[ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             host_id: "remote".into(),
+            build: None,
         }]),
     ]
     .concat();
@@ -6796,6 +6879,7 @@ fn a_gateway_that_stopped_reading_is_connected_to_again() {
         frames(&[ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             host_id: "remote".into(),
+            build: None,
         }]),
     ]
     .concat();
@@ -7486,4 +7570,360 @@ fn sigusr1_makes_a_reconnecting_attachment_try_again_at_once_and_is_ignored_whil
         "{}",
         stderr_of(&mut child)
     );
+}
+
+/// Accept a connection that says Hello, welcoming it with `build`.
+fn accept_with_build(listener: UnixListener, build: Option<&str>) -> UnixStream {
+    let mut stream = accept_raw(listener);
+    assert!(matches!(
+        read_frame(&mut stream).unwrap(),
+        Some(ClientMessage::Hello {
+            version: PROTOCOL_VERSION
+        })
+    ));
+    write_frame(
+        &mut stream,
+        &ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            host_id: "host-1".into(),
+            build: build.map(str::to_owned),
+        },
+    )
+    .unwrap();
+    stream
+}
+
+fn host_status() -> cherry_protocol::HostStatus {
+    serde_json::from_value(serde_json::json!({
+        "host_id": "host-1",
+        "version": PROTOCOL_VERSION,
+        "build": "20260101000000.abcdef0",
+        "pid": 4242,
+        "started_at": 1,
+        "uptime_ms": 7_500_000,
+        "socket": "/tmp/x/host.sock",
+        "state_dir": "/state",
+        "log_path": "/state/host.log",
+        "sessions": 1,
+        "running_sessions": 1,
+        "max_sessions": 128,
+        "connections": 3,
+        "max_connections": 1024,
+        "holders_registered": 1,
+        "holders_expected": 0,
+        "fd_limit": 16384,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn status_reports_the_host_its_limits_and_each_holders_build() {
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_build(listener, Some("20260101000000.abcdef0"));
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Status)
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::Status {
+                status: host_status(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::List)
+        ));
+        let mut held = session();
+        held.holder_build = Some("20250101000000.0123456".into());
+        write_frame(&mut stream, &sessions_reply("host-1", vec![held])).unwrap();
+    });
+    let result = command.args(["status", "--json"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    server.join().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["running"], true);
+    assert_eq!(value["build"], "20260101000000.abcdef0");
+    assert_eq!(value["host"]["pid"], 4242);
+    assert_eq!(value["host"]["log_path"], "/state/host.log");
+    assert_eq!(value["host"]["max_connections"], 1024);
+    assert_eq!(value["client"]["build"], cherry_protocol::BUILD);
+    assert_eq!(value["sessions"][0]["id"], "test-session");
+    assert_eq!(
+        value["sessions"][0]["holder_build"],
+        "20250101000000.0123456"
+    );
+}
+
+#[test]
+fn status_of_a_host_that_predates_it_still_lists_the_sessions() {
+    let (_directory, listener, mut command) = listener();
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_build(listener, None);
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::Status)
+        ));
+        write_frame(
+            &mut stream,
+            &ServerMessage::error("unsupported_operation", "unknown op"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_client(&mut stream),
+            Some(ClientMessage::List)
+        ));
+        write_frame(&mut stream, &sessions_reply("host-1", vec![session()])).unwrap();
+    });
+    let result = command.arg("status").output().unwrap();
+    assert!(result.status.success());
+    server.join().unwrap();
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains("it predates `status`"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("test-session") && line.contains("running")),
+        "{text}"
+    );
+}
+
+#[test]
+fn status_never_starts_a_host_and_says_none_runs() {
+    let directory = private_directory();
+    let socket = directory.path().join("host.sock");
+    let home = directory.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    // A cherry-host that records every run: status must never start one.
+    let host = directory.path().join("cherry-host");
+    let ran = directory.path().join("ran");
+    script(
+        &host,
+        &format!("echo \"$@\" >> '{}'\nexit 1\n", ran.display()),
+    );
+    let run = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cherry"));
+        command
+            .args(["--socket", socket.to_str().unwrap(), "status"])
+            .env("HOME", &home)
+            .env("CHERRY_HOST_PATH", &host);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+    let text = run(false);
+    assert_eq!(text.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&text.stdout).starts_with(&format!(
+        "cherry-host is not running at {}",
+        socket.display()
+    )));
+    let json = run(true);
+    assert_eq!(json.status.code(), Some(3));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["running"], false);
+    assert_eq!(value["socket"], socket.to_str().unwrap());
+    assert!(value["state_dir"]
+        .as_str()
+        .unwrap()
+        .starts_with(home.to_str().unwrap()));
+    assert!(!socket.exists());
+    assert!(
+        !ran.exists(),
+        "status ran cherry-host: {:?}",
+        std::fs::read_to_string(&ran)
+    );
+}
+
+/// A private socket directory and HOME for `cherry doctor`, with a fake
+/// cherry-host of this build to start.
+struct DoctorSandbox {
+    directory: tempfile::TempDir,
+    socket: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    host: PathBuf,
+}
+
+impl DoctorSandbox {
+    fn new() -> Self {
+        let directory = private_directory();
+        let socket = directory.path().join("s/host.sock");
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let base = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/cherry-host")
+        } else {
+            home.join(".local/state/cherry-host")
+        };
+        let state = base.join(cherry_protocol::state_key(&socket));
+        let host = directory.path().join("cherry-host");
+        script(
+            &host,
+            &format!("echo 'cherry-host {}'\n", cherry_protocol::VERSION),
+        );
+        Self {
+            directory,
+            socket,
+            home,
+            state,
+            host,
+        }
+    }
+
+    fn private_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn doctor(&self) -> (Option<i32>, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .args(["--socket", self.socket.to_str().unwrap(), "doctor"])
+            .env("HOME", &self.home)
+            .env_remove("XDG_STATE_HOME")
+            .env("CHERRY_HOST_PATH", &self.host)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+}
+
+#[test]
+fn doctor_finds_nothing_wrong_where_no_host_ever_ran() {
+    let sandbox = DoctorSandbox::new();
+    let (code, report) = sandbox.doctor();
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.contains("no socket directory"), "{report}");
+    assert!(report.ends_with("No problems found.\n"), "{report}");
+    assert!(!sandbox.socket.parent().unwrap().exists());
+}
+
+#[test]
+fn doctor_reports_stale_sockets_and_pid_files_and_holders_without_a_host() {
+    let sandbox = DoctorSandbox::new();
+    DoctorSandbox::private_dir(sandbox.socket.parent().unwrap());
+    // A socket nothing listens on any more.
+    drop(UnixListener::bind(&sandbox.socket).unwrap());
+    std::fs::set_permissions(&sandbox.socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    DoctorSandbox::private_dir(&sandbox.state);
+    // A PID file whose daemon is gone.
+    let mut gone = Command::new("true").spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::write(
+        sandbox.state.join("host.pid"),
+        format!(r#"{{"pid":{gone_pid},"build":"x","started_at":1,"socket":"/x"}}"#),
+    )
+    .unwrap();
+    // A holder that still runs, and one that is gone.
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
+    DoctorSandbox::private_dir(&sandbox.state.join("sessions"));
+    let held = "7b0c7d16-5f5c-4a8e-9a5a-111111111111";
+    let lost = "7b0c7d16-5f5c-4a8e-9a5a-222222222222";
+    for (id, pid) in [(held, holder.id()), (lost, gone_pid)] {
+        std::fs::write(
+            sandbox.state.join(format!("sessions/{id}.json")),
+            format!(r#"{{"id":"{id}","holder_pid":{pid},"created_at":1,"link_version":7}}"#),
+        )
+        .unwrap();
+    }
+    let (code, report) = sandbox.doctor();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  stale socket {}: nothing listens on it",
+            sandbox.socket.display()
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  stale PID file {}",
+            sandbox.state.join("host.pid").display()
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  1 session is held by holders with no host running: {held} (pid {})",
+            holder.id()
+        )),
+        "{report}"
+    );
+    assert!(report.contains("fix: `cherry start`"), "{report}");
+    // The gone holder is only noted: the next host reports it as lost.
+    assert!(
+        report.contains("ok       1 session manifest names holders that are gone"),
+        "{report}"
+    );
+    assert!(report.ends_with("3 problems found.\n"), "{report}");
+}
+
+#[test]
+fn doctor_takes_a_pid_file_whose_pid_another_process_got_for_stale() {
+    let sandbox = DoctorSandbox::new();
+    DoctorSandbox::private_dir(&sandbox.state);
+    // The pid runs, but the process started at another time than the
+    // daemon that wrote the file: the pid was reused.
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    std::fs::write(
+        sandbox.state.join("host.pid"),
+        format!(
+            r#"{{"pid":{},"started":"1.000000","build":"x","started_at":1,"socket":"/x"}}"#,
+            other.id()
+        ),
+    )
+    .unwrap();
+    let (code, report) = sandbox.doctor();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  stale PID file {}: pid {} is gone",
+            sandbox.state.join("host.pid").display(),
+            other.id()
+        )),
+        "{report}"
+    );
+}
+
+#[test]
+fn doctor_reports_directories_others_can_reach_and_a_mismatched_host_executable() {
+    let sandbox = DoctorSandbox::new();
+    let dir = sandbox.socket.parent().unwrap();
+    std::fs::create_dir(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script(
+        &sandbox.host,
+        "echo 'cherry-host 0.1.0 (build 20000101000000.0ld0000)'\n",
+    );
+    let (code, report) = sandbox.doctor();
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  socket directory {} is not usable",
+            dir.display()
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  the cherry-host it starts ({}) is build 20000101000000.0ld0000, not this cherry's {}",
+            sandbox.host.display(),
+            cherry_protocol::BUILD
+        )),
+        "{report}"
+    );
+    let _ = &sandbox.directory;
 }

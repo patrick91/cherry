@@ -1,5 +1,7 @@
 mod attach;
 mod control;
+mod diagnose;
+mod handover;
 mod input;
 mod passthrough;
 mod status;
@@ -39,7 +41,7 @@ const MAX_SSH_CONTROL_PATH_BYTES: usize = 100;
 #[derive(Parser, Debug)]
 #[command(
     name = "cherry",
-    version,
+    version = cherry_protocol::VERSION,
     about = "Persistent Cherry terminal sessions, locally or over SSH"
 )]
 struct Cli {
@@ -133,6 +135,21 @@ enum Action {
     /// and output until either side closes, for Cherry. Standard output
     /// starts with the host's Welcome; send requests, not Hello.
     Control,
+    /// Describe the host daemon: its pid, uptime, build and protocol, its
+    /// socket, state directory and log, its sessions and connections against
+    /// their limits, its holders, and the build each session's holder runs.
+    /// Never starts a host; exits with status 3 when none is running.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check the local host for problems: socket and state permissions,
+    /// stale sockets and PID files, a daemon whose executable was moved,
+    /// replaced or runs from a disk image, a protocol or build that differs
+    /// from this cherry's, the descriptor limit, the log's size, and holders
+    /// left without a daemon. Says how to fix each; exits with status 1 when
+    /// it found any. Never starts a host.
+    Doctor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,7 +165,7 @@ impl Action {
     fn kind(&self) -> Kind {
         match self {
             Action::Start => Kind::Start,
-            Action::List { .. } => Kind::Query,
+            Action::List { .. } | Action::Status { .. } | Action::Doctor => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
             Action::Control => Kind::Control,
             Action::Shutdown
@@ -213,7 +230,7 @@ fn main() -> ExitCode {
         Err(error) => Err(error),
     };
     let message = failure_message(kind, &result);
-    status.finish(message.as_deref());
+    status.finish(message.as_deref(), final_failure(&result));
     match result {
         Ok(code) => ExitCode::from(code.min(255) as u8),
         Err(_) => {
@@ -230,6 +247,15 @@ fn failure_message(kind: Kind, result: &Result<u32>) -> Option<String> {
         Some(signal) => interruption_message(kind, signal),
         None => format!("{error:#}"),
     })
+}
+
+/// A failure that connecting again can never resolve (see
+/// `attach::is_final`); an interruption never is.
+fn final_failure(result: &Result<u32>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|error| sys::termination_signal().is_none() && attach::is_final(error))
 }
 
 fn interruption_message(kind: Kind, signal: i32) -> String {
@@ -251,7 +277,10 @@ fn run(cli: Cli, status: &mut StatusFile) -> Result<u32> {
     let kind = cli.command.kind();
     let mut transport = None;
     let result = execute(cli, &mut transport, status);
-    status.finish(failure_message(kind, &result).as_deref());
+    status.finish(
+        failure_message(kind, &result).as_deref(),
+        final_failure(&result),
+    );
     drop(transport);
     result
 }
@@ -268,6 +297,13 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         )?;
         return Ok(0);
     }
+    if let Action::Doctor = cli.command {
+        if cli.host.is_some() {
+            bail!("doctor is local only; run it on the remote machine (ssh HOST cherry doctor)");
+        }
+        return diagnose::doctor(&transport::local_socket_path(cli.socket.as_deref())?);
+    }
+
     // Where to start the next host once this one made way.
     let restart_socket = match cli.command {
         Action::Restart if cli.host.is_some() => {
@@ -308,7 +344,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     // One limit for all of it, replacing a host and connecting again
     // included; an attachment may wait for ssh to prompt instead.
     let deadline = (mode != Mode::Attach).then(|| Instant::now() + timing().connect_timeout);
-    let host_id = connect(
+    let connected = connect(
         slot,
         &target,
         mode,
@@ -316,11 +352,34 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         links_agent,
         cli.expected_host_id.map(|id| id.to_string()).as_deref(),
         deadline,
-    )?;
+    );
+    let Welcomed {
+        host_id,
+        build: host_build,
+    } = match (connected, &cli.command) {
+        // No host to describe: `status` says so rather than failing.
+        (Err(error), Action::Status { json }) if target.host.is_none() => {
+            let socket = transport::local_socket_path(target.socket)?;
+            if !diagnose::listening(&socket) {
+                return diagnose::not_running(&socket, *json);
+            }
+            return Err(error);
+        }
+        (connected, _) => connected?,
+    };
     let transport = slot.as_mut().expect("connected");
 
     match cli.command {
-        Action::Start => unreachable!(),
+        Action::Start | Action::Doctor => unreachable!(),
+        Action::Status { json } => diagnose::status(
+            transport,
+            &diagnose::Greeting {
+                host_id: &host_id,
+                build: host_build.as_deref(),
+                remote: target.host,
+            },
+            json,
+        ),
         Action::Shutdown => {
             transport.send(&ClientMessage::Shutdown)?;
             expect_ok(transport, "shutdown acknowledgement")
@@ -456,7 +515,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         }
         Action::Control => {
             transport.clear_deadline();
-            control::relay(transport, host_id)
+            control::relay(transport, host_id, host_build)
         }
     }
 }
@@ -535,6 +594,12 @@ pub(crate) fn is_unresolvable(error: &anyhow::Error) -> bool {
 /// identity is checked before its version. The remote gateway is told the
 /// expected identity, and relays such a host untouched for this to refuse.
 ///
+/// Locally, `list`, `new` and `control` (never an attachment) also hand a
+/// daemon of this protocol over to a newer build of its own installation
+/// (see `handover`): they ask it to make way (`Restart`) and start the new
+/// one, once. Its sessions carry on in their holders, which keep their own
+/// builds.
+///
 /// `deadline` limits all of it, replacing a host and connecting again
 /// included. Failures that connecting again cannot resolve are
 /// `Unresolvable`.
@@ -546,8 +611,9 @@ fn connect(
     links_agent: bool,
     expected_host_id: Option<&str>,
     deadline: Option<Instant>,
-) -> Result<String> {
+) -> Result<Welcomed> {
     let mut replaced = None;
+    let mut handing_over: Option<handover::Attempt> = None;
     let made_way = |version: u32| {
         format!(
             "the cherry-host speaking protocol {version} was asked to make way, but no cherry-host speaking protocol {PROTOCOL_VERSION} could be reached"
@@ -568,7 +634,33 @@ fn connect(
             (Err(error), Some(version)) => return Err(error.context(made_way(version))),
         };
         let version = match (handshake(transport, expected_host_id, mode), replaced) {
-            (Ok(Greeting::Ready { host_id }), _) => return Ok(host_id),
+            (Ok(Greeting::Ready { host_id, build }), _) => {
+                let hands_over = starts_host
+                    && target.host.is_none()
+                    && matches!(mode, Mode::Command | Mode::Control);
+                if !hands_over {
+                    return Ok(Welcomed { host_id, build });
+                }
+                let socket = transport::local_socket_path(target.socket)?;
+                if let Some(attempt) = handing_over.take() {
+                    handover::note_outcome(&socket, &attempt, build.as_deref());
+                    return Ok(Welcomed { host_id, build });
+                }
+                let Some((executable, attempt)) =
+                    handover::candidate(transport, &socket, build.as_deref())
+                else {
+                    return Ok(Welcomed { host_id, build });
+                };
+                if !restart_for_build(transport, &attempt) {
+                    // It refused, and keeps serving this connection.
+                    return Ok(Welcomed { host_id, build });
+                }
+                *slot = None;
+                transport::start_local_host_from(&executable, &socket, deadline, false)
+                    .context("the cherry-host of an older build was asked to make way, but its replacement did not start")?;
+                handing_over = Some(attempt);
+                continue;
+            }
             (Ok(Greeting::Older { version }), _) => version,
             (Err(error), None) => return Err(error),
             (Err(error), Some(previous)) => return Err(error.context(made_way(previous))),
@@ -590,9 +682,37 @@ fn connect(
     }
 }
 
+/// Who answered a connection: the host's identity and build.
+struct Welcomed {
+    host_id: String,
+    build: Option<String>,
+}
+
+/// Ask a daemon of this protocol but an older build to make way
+/// (`Restart`). True once it did (its Ok, or the end of the connection when
+/// another client asked first); false when it refused and keeps running.
+fn restart_for_build(transport: &mut Transport, attempt: &handover::Attempt) -> bool {
+    if transport.send(&ClientMessage::Restart).is_err() {
+        return true;
+    }
+    match transport.receive_unless_closed(RPC_TIMEOUT) {
+        Ok(Some(ServerMessage::Error { code, message })) => {
+            eprintln!(
+                "cherry: the cherry-host of build {} did not make way for build {} ({code}: {message}); using it",
+                attempt.from, attempt.to
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 enum Greeting {
     /// The host speaks this protocol.
-    Ready { host_id: String },
+    Ready {
+        host_id: String,
+        build: Option<String>,
+    },
     /// The host speaks an older protocol; nothing but `Replace` may follow.
     Older { version: u32 },
 }
@@ -609,7 +729,11 @@ fn handshake(
     } else {
         timing().connect_timeout
     })? {
-        ServerMessage::Welcome { version, host_id } => {
+        ServerMessage::Welcome {
+            version,
+            host_id,
+            build,
+        } => {
             // Before anything else: a host that is not the intended one is
             // neither used nor replaced.
             if let Some(expected) = expected_host_id {
@@ -618,7 +742,7 @@ fn handshake(
                 }
             }
             match version.cmp(&PROTOCOL_VERSION) {
-                Ordering::Equal => Ok(Greeting::Ready { host_id }),
+                Ordering::Equal => Ok(Greeting::Ready { host_id, build }),
                 Ordering::Less => Ok(Greeting::Older { version }),
                 Ordering::Greater => Err(unresolvable(format!(
                     "protocol version mismatch: cherry-host speaks version {version}, this cherry speaks version {PROTOCOL_VERSION}; install the same Cherry version on both machines"
@@ -679,7 +803,7 @@ fn listed_state(session: &SessionInfo) -> String {
     }
 }
 
-fn print(text: &str) -> Result<()> {
+pub(crate) fn print(text: &str) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(text.as_bytes())
@@ -764,6 +888,7 @@ pub(crate) fn message_kind(message: &ServerMessage) -> &'static str {
         ServerMessage::Error { .. } => "error",
         ServerMessage::Event { .. } => "event",
         ServerMessage::ScreenText { .. } => "screen text",
+        ServerMessage::Status { .. } => "status",
     }
 }
 

@@ -25,7 +25,7 @@
 //! (`link::Refused`). A manifest in the state directory (`paths::Manifest`)
 //! tells a starting daemon to expect it.
 use crate::{
-    daemon::log,
+    daemon::{self, log, utc_timestamp},
     environment,
     link::{self, kind, Frame},
     paths, processes, screen, signals,
@@ -139,6 +139,14 @@ const FOREGROUND_CHECKS: [Duration; 3] = [
 /// and hold it until it has exited and been removed.
 pub fn hold(socket: &Path) -> Result<()> {
     install_panic_hook();
+    // Its stderr is the daemon's log when `cherry-host start` started the
+    // daemon: its lines follow that log when the daemon moves it aside.
+    if let Ok(state) = paths::state_dir(socket) {
+        let log_file = state.join("host.log");
+        if daemon::writes_to_log(&log_file, libc::STDERR_FILENO) {
+            daemon::follow_log_file(log_file);
+        }
+    }
     // Its threads (its loop and its terminal's, see `terminal_thread`) run
     // at interactive priority while a client is attached
     // (`link::Attended`), and at the default class otherwise; the program it
@@ -220,35 +228,9 @@ fn panic_report(session: Option<&str>, at: SystemTime, panic: &str) -> String {
         session.unwrap_or("(not launched yet)"),
         std::process::id(),
         utc_timestamp(at),
-        env!("CARGO_PKG_VERSION"),
+        cherry_protocol::VERSION,
         link::LINK_VERSION,
         cherry_protocol::PROTOCOL_VERSION,
-    )
-}
-
-/// `at` as an ISO 8601 UTC timestamp to the millisecond.
-fn utc_timestamp(at: SystemTime) -> String {
-    let since = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = since.as_secs();
-    let (days, rest) = (secs / 86_400, secs % 86_400);
-    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rest / 3_600,
-        rest % 3_600 / 60,
-        rest % 60,
-        since.subsec_millis()
     )
 }
 
@@ -791,6 +773,7 @@ impl Holder {
             created_at,
             link_version: link::LINK_VERSION,
             holder_started: processes::start_identity(unsafe { libc::getpid() }),
+            build: Some(daemon::build().to_owned()),
         };
         let manifest = match paths::write_manifest(Path::new(&state_dir), &manifest) {
             Ok(path) => Some(path),
@@ -898,6 +881,7 @@ impl Holder {
             session: self.state.clone(),
             offset: self.offset,
             receipt: self.receipt.clone(),
+            build: Some(daemon::build().to_owned()),
             events: offered
                 .iter()
                 .filter_map(|event| serde_json::to_value(event).ok())
@@ -2067,7 +2051,7 @@ mod tests {
             report.starts_with(&format!(
                 "holder of session 3f6c (pid {}) panicked at 2026-09-21T14:13:20.123Z; build cherry-host {} (link {}, protocol {},",
                 std::process::id(),
-                env!("CARGO_PKG_VERSION"),
+                cherry_protocol::VERSION,
                 link::LINK_VERSION,
                 cherry_protocol::PROTOCOL_VERSION
             )),

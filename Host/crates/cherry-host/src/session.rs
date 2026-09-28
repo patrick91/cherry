@@ -293,6 +293,19 @@ pub fn note_executable() {
     );
 }
 
+/// Where this daemon's executable is now (or was, when it is gone), and
+/// whether that is no longer the file it started from: an update replaced
+/// or removed it (`HostStatus::executable_changed`).
+pub fn executable_status() -> (Option<PathBuf>, bool) {
+    let found = installed_executable().ok();
+    let identity = found
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| (meta.dev(), meta.ino()));
+    let changed = matches!(EXECUTABLE.get(), Some(Some(started)) if identity != Some(*started));
+    (found.or_else(|| std::env::current_exe().ok()), changed)
+}
+
 /// Where this daemon's executable is now. macOS follows it when it (or the
 /// app bundle holding it) moves; elsewhere it is the path it was started
 /// from.
@@ -370,6 +383,10 @@ fn start_holder(
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null());
+    // A test daemon's stand-in build is its holders' too (`daemon::build`).
+    if let Some(build) = std::env::var_os("CHERRY_HOST_TEST_BUILD") {
+        command.env("CHERRY_HOST_TEST_BUILD", build);
+    }
     let fd = theirs.as_raw_fd();
     let limit = daemon::child_fd_limit();
     unsafe {
@@ -634,6 +651,7 @@ impl Session {
             offset,
             events,
             receipt,
+            build,
         } = hello;
         // Taken while the holder is linked, so that what is left of the
         // program after a crash of the holder is ended (see `lost`), and no
@@ -679,6 +697,7 @@ impl Session {
             request_id: receipt.map(|receipt| receipt.request_id),
             ended_by: None,
             holder_log: None,
+            holder_build: build,
         }));
         let (wake, wake_rx) = Wake::pair()?;
         let (tx, rx) = mpsc::sync_channel(64);

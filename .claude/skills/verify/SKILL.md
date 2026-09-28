@@ -32,7 +32,13 @@ directly (or with `open --env`).
   installed Cherry. Never `shutdown`, `kill` or remove sessions there, and never touch that
   directory. A rebuilt CherryDev whose helpers speak a newer protocol replaces that daemon (the
   user's sessions carry on, but the user's older Cherry can then no longer use it), and one of the
-  same protocol keeps the old daemon's code, so test host changes on a private daemon.
+  same protocol keeps the old daemon's code, so test host changes on a private daemon. The helpers
+  `build-host` makes without `CHERRY_BUILD_ID` report a development build (`dev-<commit
+  time>.<rev>`), which never counts as newer than another: CherryDev and `swift run Cherry` never
+  hand the shared daemon over to their own cherry-host (only `list`, `new` and `control` of an
+  explicitly numbered build do, and only to the daemon's own executable updated in place), so
+  removing `dist/CherryDev.app` never removes the running daemon's executable. Never set
+  `CHERRY_BUILD_ID` (or the test-only `CHERRY_TEST_BUILD`) for a run that uses the default socket.
 - For an isolated daemon, launch the binary directly (`open` drops exported variables) with a
   private `HOME` and sockets in a private directory:
   `dir=$(mktemp -d); chmod 700 "$dir"; mkdir "$dir/home"; HOME="$dir/home" CFFIXED_USER_HOME="$dir/home" CHERRY_HOST_SOCKET="$dir/host.sock" CHERRY_CONTROL_SOCKET="$dir/control.sock" dist/CherryDev.app/Contents/MacOS/CherryDev &`

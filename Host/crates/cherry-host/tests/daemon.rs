@@ -61,6 +61,7 @@ fn welcome() -> ServerMessage {
     ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
         host_id: Uuid::new_v4().to_string(),
+        build: None,
     }
 }
 
@@ -907,6 +908,7 @@ fn only_a_client_speaking_a_newer_protocol_replaces_the_daemon() {
                 message: ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     host_id,
+                    ..
                 },
             }) if host_id == id
         ));
@@ -981,6 +983,7 @@ fn start_and_gateway_never_start_a_second_daemon_beside_another_version() {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION + 1,
                 host_id: Uuid::new_v4().to_string(),
+                build: None,
             },
             format!("protocol {}", PROTOCOL_VERSION + 1),
             "newer than this cherry-host",
@@ -1043,6 +1046,7 @@ fn host_speaking(
                     ClientMessage::Hello { .. } => ServerMessage::Welcome {
                         version,
                         host_id: host_id.clone(),
+                        build: None,
                     },
                     ClientMessage::Replace => {
                         fs::remove_file(&path).unwrap();
@@ -1103,7 +1107,9 @@ fn only_the_gateway_replaces_a_daemon_speaking_an_older_protocol_and_starts_its_
     );
     let mut relayed = &output.stdout[preamble.len()..];
     match read_frame::<_, ServerMessage>(&mut relayed).unwrap() {
-        Some(ServerMessage::Welcome { version, host_id }) => {
+        Some(ServerMessage::Welcome {
+            version, host_id, ..
+        }) => {
             assert_eq!(version, PROTOCOL_VERSION);
             assert_ne!(host_id, "older-host");
         }
@@ -1250,7 +1256,9 @@ fn a_gateway_neither_replaces_nor_reports_a_host_of_another_identity() {
         );
         let mut relayed = &output.stdout[preamble.len()..];
         match read_frame::<_, ServerMessage>(&mut relayed).unwrap() {
-            Some(ServerMessage::Welcome { version, host_id }) => (version, host_id),
+            Some(ServerMessage::Welcome {
+                version, host_id, ..
+            }) => (version, host_id),
             other => panic!("expected a welcome, not {other:?}"),
         }
     };

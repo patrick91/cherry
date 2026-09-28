@@ -504,6 +504,52 @@ final class HostControl: ObservableObject {
         return try await attempt.value
     }
 
+    /// Connects again at once, starting the backoff over, when a lease keeps
+    /// the connection up and it waits to reconnect: the Mac woke, or the
+    /// network came back (`HostedReconnects`).
+    func reconnectNow() {
+        guard case .waitingToReconnect = state, connectAttempt == nil else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectFailures = 0
+        Task { _ = try? await self.connect() }
+    }
+
+    /// Fires once the host answers (at once while connected), keeping the
+    /// connection leased until then, so it reconnects with backoff (and at
+    /// once on a wake or a network change, `reconnectNow`; after a refused
+    /// SSH login only then). Completes without firing, releasing the lease,
+    /// once the connection fails for good: another identity, or a protocol
+    /// this app cannot use. A restore that could not reach an SSH host
+    /// brings its tabs back with it.
+    func availability() -> AnyPublisher<Void, Never> {
+        let lease = retain()
+        let states = $state
+        let outcome = Deferred { [weak self] () -> AnyPublisher<Bool, Never> in
+            // Read when the caller subscribes (on the main actor): connected
+            // by then fires at once; otherwise the state it sees then may be
+            // an earlier failure, and only later ones count.
+            let connected = MainActor.assumeIsolated { self?.state == .connected }
+            if connected { return Just(true).eraseToAnyPublisher() }
+            return states
+                .dropFirst()
+                .compactMap { state -> Bool? in
+                    switch state {
+                    case .connected: true
+                    case .failed: false
+                    case .idle, .connecting, .waitingToReconnect: nil
+                    }
+                }
+                .eraseToAnyPublisher()
+        }
+        return outcome
+            .first()
+            .filter { $0 }
+            .map { _ in () }
+            .handleEvents(receiveCompletion: { _ in lease.release() }, receiveCancel: { lease.release() })
+            .eraseToAnyPublisher()
+    }
+
     /// Closes the connection; the next request (or lease) connects again.
     func disconnect() {
         reconnectTask?.cancel()
@@ -658,10 +704,19 @@ final class HostControl: ObservableObject {
     }
 
     private func connectionFailed(with error: HostedSessionError) {
-        let permanent = error.isIdentityMismatch || (error.isUnavailable && unavailableReason != nil)
+        let permanent = error.isIdentityMismatch || error.isVersionMismatch
+            || (error.isUnavailable && unavailableReason != nil)
         if case .message = error {
             // Nothing a retry can fix without a change in the app.
             state = .failed(error)
+        } else if leaseCount > 0, !permanent, error.isAuthenticationFailure {
+            // Waits for `reconnectNow` (a wake, a network change, Retry):
+            // another login on a timer would fail the same way.
+            reconnectFailures += 1
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            state = .waitingToReconnect(error)
+            return
         } else if leaseCount > 0, !permanent {
             scheduleReconnect(after: error)
             return

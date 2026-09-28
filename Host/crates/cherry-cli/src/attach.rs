@@ -253,6 +253,17 @@ struct Snapshot {
     refreshes: bool,
 }
 
+/// Whether an attachment that ended with `error` can never be resumed by
+/// connecting again: another host identity answers, one speaking a protocol
+/// this cherry cannot use or replace, or the host no longer has the session
+/// (the status file's `reconnectable`).
+pub fn is_final(error: &anyhow::Error) -> bool {
+    is_unresolvable(error)
+        || error
+            .downcast_ref::<Refused>()
+            .is_some_and(|refused| refused.code == error_code::UNKNOWN_SESSION)
+}
+
 /// The host answered an Attach with an error.
 #[derive(Debug)]
 struct Refused {
@@ -1068,7 +1079,9 @@ impl Attachment<'_> {
                 Attempted::Done(Ok(reattached)) => return Ok(Reconnected::Attached(reattached)),
                 // Nothing that trying again could change.
                 Attempted::Done(Err(error)) if is_unresolvable(&error) => {
-                    return Err(anyhow!("{lost:#}; could not reconnect: {error:#}"));
+                    return Err(unresolvable(format!(
+                        "{lost:#}; could not reconnect: {error:#}"
+                    )));
                 }
                 Attempted::Done(Err(error)) => {
                     streak.failure = Some(error);

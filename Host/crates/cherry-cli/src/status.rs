@@ -9,7 +9,9 @@
 //! so a supervisor can signal this process itself rather than a wrapper
 //! that runs it (SIGUSR1: reconnect now) after checking the pid is still
 //! this process's. The final outcome
-//! replaces it when the command ends. A reader never sees a partial file.
+//! replaces it when the command ends; a `disconnected` or `failed` one that
+//! connecting again can never resolve says `"reconnectable":false`. A reader
+//! never sees a partial file.
 use serde::Serialize;
 use std::{
     io::Write,
@@ -38,6 +40,13 @@ pub struct Status {
     pub exit_code: Option<u32>,
     pub signal: Option<i32>,
     pub message: Option<String>,
+    /// With a `disconnected` or `failed` outcome: false when connecting
+    /// again can never resume the attachment (another host identity
+    /// answers, a protocol this cherry cannot use, or the host no longer
+    /// has the session), so a supervisor stops retrying. Left out
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnectable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +79,7 @@ impl Status {
             exit_code: None,
             signal: None,
             message,
+            reconnectable: None,
         }
     }
 
@@ -178,9 +188,10 @@ impl StatusFile {
         self.status = Some(status);
     }
 
-    /// Write the recorded outcome, or one derived from `error`. Only the first
-    /// call writes.
-    pub fn finish(&mut self, error: Option<&str>) {
+    /// Write the recorded outcome, or one derived from `error`; `is_final`:
+    /// connecting again can never resolve the failure (see
+    /// `Status::reconnectable`). Only the first call writes.
+    pub fn finish(&mut self, error: Option<&str>, is_final: bool) {
         if self.written {
             return;
         }
@@ -198,6 +209,12 @@ impl StatusFile {
                 },
                 Some(message.unwrap_or("the attachment ended").to_owned()),
             ),
+        };
+        let status = Status {
+            reconnectable: (is_final
+                && matches!(status.outcome, Outcome::Disconnected | Outcome::Failed))
+            .then_some(false),
+            ..status
         };
         if let Err(error) = write_atomically(&path, &status) {
             eprintln!(
@@ -354,7 +371,7 @@ mod tests {
         file.live(live(true, false));
         assert_eq!(read()["viewport"], true);
         assert_eq!(read()["reconnecting"], false);
-        file.finish(Some("connection lost"));
+        file.finish(Some("connection lost"), false);
         let last = read();
         assert_eq!(last["outcome"], "disconnected");
         assert!(last.get("viewport").is_none() && last.get("reconnecting").is_none());
@@ -380,17 +397,40 @@ mod tests {
         std::fs::write(&path, b"old").unwrap();
         let mut file = StatusFile::new(Some(path.clone()));
         file.attached = true;
-        file.finish(Some("connection lost"));
+        file.finish(Some("connection lost"), false);
         file.set(Status::new(Outcome::Detached, None));
-        file.finish(None);
+        file.finish(None, false);
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["outcome"], "disconnected");
         assert_eq!(value["message"], "connection lost");
+        assert!(value.get("reconnectable").is_none(), "{value}");
         let names: Vec<_> = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["status.json"], "temporary file left behind");
+    }
+
+    #[test]
+    fn an_ending_no_reconnection_can_resolve_says_so() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(directory.path().join(name)).unwrap()).unwrap()
+        };
+        let mut lost = StatusFile::new(Some(directory.path().join("lost.json")));
+        lost.attached = true;
+        lost.finish(Some("host identity changed"), true);
+        assert_eq!(read("lost.json")["outcome"], "disconnected");
+        assert_eq!(read("lost.json")["reconnectable"], false);
+        let mut refused = StatusFile::new(Some(directory.path().join("refused.json")));
+        refused.finish(Some("the host no longer has session s"), true);
+        assert_eq!(read("refused.json")["outcome"], "failed");
+        assert_eq!(read("refused.json")["reconnectable"], false);
+        // An outcome recorded before (an exit) never says it.
+        let mut exited = StatusFile::new(Some(directory.path().join("exited.json")));
+        exited.set(Status::exited(0, None));
+        exited.finish(None, true);
+        assert!(read("exited.json").get("reconnectable").is_none());
     }
 }

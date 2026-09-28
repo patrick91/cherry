@@ -3,7 +3,9 @@ import Combine
 import Darwin
 import Foundation
 
-private let inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
+/// `CHERRY_DEBUG_INPUT=1`: trace typed input and the buffer's tail to the
+/// unified log (as private data). Tests switch it on.
+nonisolated(unsafe) var inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
 private let activityDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_ACTIVITY_DEBUG"] == "1"
 private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
 private let prototypeProcessorDisabledForPerf =
@@ -23,7 +25,7 @@ private final class TerminalTraceRecorder {
         do {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         } catch {
-            fputs("[pty trace] failed to create \(directoryURL.path): \(error.localizedDescription)\n", stderr)
+            SessionLog.debug("[pty trace] failed to create \(directoryURL.path): \(error.localizedDescription)")
             return nil
         }
 
@@ -35,11 +37,11 @@ private final class TerminalTraceRecorder {
         do {
             outputHandle = try FileHandle(forWritingTo: outputURL)
         } catch {
-            fputs("[pty trace] failed to open \(outputURL.path): \(error.localizedDescription)\n", stderr)
+            SessionLog.debug("[pty trace] failed to open \(outputURL.path): \(error.localizedDescription)")
             return nil
         }
 
-        fputs("[pty trace] writing raw PTY output to \(outputURL.path)\n", stderr)
+        SessionLog.debug("[pty trace] writing raw PTY output to \(outputURL.path)")
     }
 
     deinit {
@@ -1240,7 +1242,7 @@ final class TerminalWorkspace: ObservableObject {
     /// new tab gets a fresh id instead.
     private func unusedSessionID(_ id: UUID) -> UUID {
         guard sessions.contains(where: { $0.id == id }) else { return id }
-        fputs("Cherry: tab id \(id.uuidString) is already open; the new tab gets another id\n", stderr)
+        SessionLog.notice("tab id \(id.uuidString) is already open; the new tab gets another id")
         return UUID()
     }
 
@@ -1709,6 +1711,9 @@ final class TerminalWorkspace: ObservableObject {
         if attachment.host == .local, let hosting = backendPolicy.localSessions {
             session.attachedHostControlProvider = { _ in hosting.control }
         }
+        if attachment.host.sshDestination != nil {
+            session.hostReconnects = backendPolicy.hostReconnects
+        }
         if let info {
             session.noteAttachedLocalSession(info)
         }
@@ -1895,7 +1900,7 @@ final class TerminalWorkspace: ObservableObject {
                 if let incumbent {
                     guard !Self.commandProgramRuns(incumbent), Self.commandProgramRuns(session) else {
                         if Self.commandProgramRuns(session) {
-                            fputs("Cherry: command '\(name)' already has a tab; its restored tab \(session.id.uuidString) is set aside and stays saved\n", stderr)
+                            SessionLog.notice("command '\(name)' already has a tab; its restored tab \(session.id.uuidString) is set aside and stays saved")
                             setAside.insert(session.id)
                         }
                         finishClosing(session, intent: .duplicateWindowTeardown)
@@ -3371,6 +3376,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The SSH master the latest adapter launch of an SSH-hosted tab shares,
     /// registered once for that launch in `startShell`; nil for its own ssh.
     private var hostedLaunchSSHControlPath: String?
+    /// The latest adapter's outcome may be resumed by launching it again
+    /// (`HostedAttachmentStatusFile.isRetryable`).
+    private var hostedLaunchRetryable = false
+    /// Brings this tab back when its adapter gave up while attached to an
+    /// SSH host's session (`HostedReconnects`): the workspace's
+    /// `SessionBackendPolicy.hostReconnects`. Nil: a disconnected tab waits
+    /// for Reconnect.
+    var hostReconnects: HostedReconnects?
+    /// Waiting for its host to answer (`HostedReconnects`), after its adapter
+    /// lost the connection or could not attach.
+    @Published private(set) var isWaitingForHost = false
 
     // MARK: Persistent local session (docs/specs/multiplexer-default.md)
 
@@ -4334,7 +4350,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             noteInputBurst(data)
         }
         if inputDebugEnabled {
-            fputs("[send text] \(text.debugDescription)\n", stderr)
+            SessionLog.debugContent("[send text] \(text.debugDescription)")
         }
         if routePersistentInput(data) { return }
         if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
@@ -4369,7 +4385,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if inputDebugEnabled {
             let rendered = outboundData.map { String(format: "%02x", $0) }.joined(separator: " ")
-            fputs("[send data] \(rendered) shellProcess=\(shellProcess != nil)\n", stderr)
+            SessionLog.debugContent("[send data] \(rendered) shellProcess=\(shellProcess != nil)")
         }
         if routePersistentInput(outboundData) { return }
         if toSurface {
@@ -4648,7 +4664,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func sendInterrupt() {
         guard acceptsInput else { return }
         if inputDebugEnabled {
-            fputs("[send interrupt] shellProcess=\(shellProcess != nil)\n", stderr)
+            SessionLog.debug("[send interrupt] shellProcess=\(shellProcess != nil)")
         }
         noteAgentDraftCleared()
         noteAgentTurnInterrupted()
@@ -4711,7 +4727,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 return nil
             } catch {
                 let reason = (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
-                fputs("Cherry: the host kept the history of tab \(tabID.uuidString): \(reason)\n", stderr)
+                SessionLog.notice("the host kept the history of tab \(tabID.uuidString): \(reason)")
                 return reason
             }
         }
@@ -4869,6 +4885,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func stop(keepingSession: Bool = false) {
         pendingAutoRestart?.cancel()
         pendingAutoRestart = nil
+        hostReconnects?.stopWaiting(self)
         // A restored tab stopped before its adapter launched: it never will.
         let wasAwaitingAttach = hostedLaunchDeferred
         hostedLaunchDeferred = false
@@ -5089,11 +5106,30 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// launch's live state is forgotten.
     private func consumeHostedLaunchStatus(removingAfter delay: TimeInterval) -> HostedAttachmentStatus? {
         stopWatchingAdapterStatus()
+        hostedLaunchRetryable = false
         guard let directory = hostedPendingStatusDirectory else { return nil }
         hostedPendingStatusDirectory = nil
-        let status = HostedAttachmentStatusFile.read(from: directory)
+        let ending = HostedAttachmentStatusFile.readEnding(from: directory)
+        hostedLaunchRetryable = ending?.retryable ?? false
         HostedAttachmentStatusFile.removeLaunchDirectory(directory, after: delay)
-        return status
+        return ending?.status
+    }
+
+    /// `HostedReconnects` put this tab in (or took it out of) its wait for
+    /// the host.
+    func setWaitingForHost(_ waiting: Bool) {
+        guard isWaitingForHost != waiting else { return }
+        isWaitingForHost = waiting
+        bumpRevision()
+    }
+
+    /// Its host answered in a way connecting again cannot resolve (another
+    /// identity, a protocol this app cannot use, a session it no longer
+    /// has): the tab stops waiting and says why; Reconnect tries again.
+    func stopWaitingForHost(because reason: String) {
+        setWaitingForHost(false)
+        guard hostedAttachment != nil, !isRunning else { return }
+        applyHostedStatus(.failed(reason))
     }
 
     private func stopWatchingAdapterStatus() {
@@ -5123,6 +5159,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard launchDirectory == hostedPendingStatusDirectory, isRunning else { return }
         let wasFollowing = adapterLiveStatus?.followsProgram ?? false
         adapterLiveStatus = status
+        if hostedAttachment != nil, status.followsProgram {
+            hostReconnects?.tabAttached(self)
+        }
         if status.reconnecting {
             scheduleAdapterReconnectingNotice()
         } else {
@@ -5808,7 +5847,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                     if let delivery {
                         delivery.resolve(.failure(Self.controlInputError(error)))
                     } else {
-                        fputs("Cherry: input typed into tab \(tabID.uuidString) while its session started did not reach it: \(reason)\n", stderr)
+                        SessionLog.error("input typed into tab \(tabID.uuidString) while its session started did not reach it: \(reason)")
                     }
                 }
             }
@@ -5891,7 +5930,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func persistentLaunchFailed(_ error: Error, launchID: UUID) {
         guard activeLaunchID == launchID else { return }
         persistentHosting?.noteLaunchFailure(error)
-        fputs("Cherry: tab \(id.uuidString) runs natively; its persistent session could not start: \(error.localizedDescription)\n", stderr)
+        SessionLog.error("tab \(id.uuidString) runs natively; its persistent session could not start: \(error.localizedDescription)")
         persistentFallbackHosting = persistentHosting
         persistentFallbackReason = PersistentLocalSessions.launchFailureReason(error)
         persistentHosting = nil
@@ -6082,7 +6121,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let end = end ?? persistentSession.flatMap { persistentHosting?.sessionInfo($0.sessionID)?.end }
         if let end, end.isHolderLost, hostSessionEnd != end {
             hostSessionEnd = end
-            fputs("Cherry: tab \(id.uuidString): \(end.message)\n", stderr)
+            SessionLog.notice("tab \(id.uuidString): \(end.message)")
         }
         // A restored tab whose adapter never ran: no surface showed the
         // program, so its final screen comes from the host.
@@ -6370,7 +6409,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let queued = pendingPersistentInput.reduce(0) { $0 + ($1.delivery == nil ? $1.data.count : 0) }
         guard queued + data.count <= Self.maxQueuedKeyboardInputBytes else {
             if queued < Self.maxQueuedKeyboardInputBytes {
-                fputs("Cherry: tab \(id.uuidString) queues no more than \(Self.maxQueuedKeyboardInputBytes) bytes of input while its session starts; the rest was dropped.\n", stderr)
+                SessionLog.error("tab \(id.uuidString) queues no more than \(Self.maxQueuedKeyboardInputBytes) bytes of input while its session starts; the rest was dropped.")
             }
             return
         }
@@ -6470,6 +6509,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             // The adapter's own exit status does not say whether the hosted
             // program ended; its status file does.
             applyHostedStatus(consumeHostedLaunchStatus(removingAfter: 0) ?? .disconnected(nil))
+            // It gave up on its host, which may answer later: wait for it.
+            if hostedLaunchRetryable {
+                hostReconnects?.wait(self)
+            }
             return
         }
         state = .exited(status)
@@ -6482,7 +6525,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 if let hostSessionEnd {
                     // Not the command's own failure: restarting it would
                     // hide the crash. Its bar says so, with Restart.
-                    fputs("Cherry: command tab \(id.uuidString) is not restarted: \(hostSessionEnd.message)\n", stderr)
+                    SessionLog.notice("command tab \(id.uuidString) is not restarted: \(hostSessionEnd.message)")
                 } else {
                     scheduleAutoRestartAfterExit()
                 }
@@ -6739,7 +6782,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if inputDebugEnabled {
             let tailStart = max(0, processor.lineCount - 4)
             let tail = processor.snapshot(range: tailStart..<processor.lineCount)
-            fputs("[buffer tail] \(tail.map(\.debugDescription).joined(separator: " | "))\n", stderr)
+            SessionLog.debugContent("[buffer tail] \(tail.map(\.debugDescription).joined(separator: " | "))")
         }
         if case .launching = state {
             state = .live
@@ -8016,7 +8059,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func recheckAgentActivityAfterQuiet() {
         if activityDebugEnabled {
-            fputs("[activity] recheck state=\(agentActivityState) source=\(agentActivitySource) marker=\(renderedOutputShowsAgentWorkingMarker()) spinner=\(titleSpinnerEvidenceIsActive) prompt=\(renderedOutputShowsAgentInputPrompt())\n", stderr)
+            SessionLog.debug("[activity] recheck state=\(agentActivityState) source=\(agentActivitySource) marker=\(renderedOutputShowsAgentWorkingMarker()) spinner=\(titleSpinnerEvidenceIsActive) prompt=\(renderedOutputShowsAgentInputPrompt())")
         }
         guard kind == .agent, agentActivityState == .working else { return }
         guard agentActivitySource != .processExit else { return }

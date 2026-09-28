@@ -726,12 +726,25 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     let unreachable = await harness.restore([missing], into: harness.workspace(), control: { _ in control })
     #expect(unreachable.sessions.isEmpty)
     #expect(unreachable.keptRecordIDs == [missing.id])
-    #expect(unreachable.retryWhenAvailable == nil)
+    // Unreachable ones are restored again once the host answers during this
+    // run: the retry keeps its control connection leased, so it reconnects.
+    let retry = try #require(unreachable.retryWhenAvailable)
+    let retried = Recorder(false)
+    let subscription = retry.sink { retried.value = true }
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(!retried.value)
+    #expect(control.state != .connected)
     remote.launchFailure = nil
+    #expect(await harness.fake.wait { retried.value })
+    #expect(control.state == .connected)
+    subscription.cancel()
+    control.disconnect()
     remote.hostID = "host-impostor"
     let impostor = await harness.restore([missing], into: harness.workspace(), control: { _ in control })
     #expect(impostor.sessions.isEmpty)
     #expect(impostor.keptRecordIDs == [missing.id])
+    // Another identity is not the host they ran on: nothing to wait for.
+    #expect(impostor.retryWhenAvailable == nil)
 }
 
 // MARK: - Slow and restarted hosts

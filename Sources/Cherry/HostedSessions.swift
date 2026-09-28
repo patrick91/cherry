@@ -711,9 +711,10 @@ enum HostedAttachmentStatusFile {
         let reconnecting: Bool?
         let pid: Int32?
         let started: String?
+        let reconnectable: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case outcome, signal, message, viewport, reconnecting, pid, started
+            case outcome, signal, message, viewport, reconnecting, pid, started, reconnectable
             case exitCode = "exit_code"
         }
     }
@@ -808,6 +809,29 @@ enum HostedAttachmentStatusFile {
             // connection, says what happened.
             return .disconnected(message)
         }
+    }
+
+    /// Whether an adapter that ended with this status file may be launched
+    /// again to resume its attachment once the host answers: it lost its
+    /// connection and gave up reconnecting (`disconnected`), or could not
+    /// attach (`failed`, such as an SSH host it could not reach), and did
+    /// not say that connecting again can never resolve it
+    /// (`"reconnectable": false`: another host identity answered, one
+    /// speaking a protocol it cannot use, or the host no longer has the
+    /// session). A detach, a takeover, a replacement, an exit, or a file it
+    /// never finished is never retried.
+    static func isRetryable(from data: Data) -> Bool {
+        guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return false }
+        return ["disconnected", "failed"].contains(record.outcome) && record.reconnectable != false
+    }
+
+    /// The final outcome in `directory`, and whether it may be retried
+    /// (`isRetryable`); nil when the adapter has not written one.
+    static func readEnding(from directory: URL) -> (status: HostedAttachmentStatus, retryable: Bool)? {
+        guard let data = try? Data(contentsOf: statusFileURL(in: directory)), liveStatus(from: data) == nil else {
+            return nil
+        }
+        return (status(from: data), isRetryable(from: data))
     }
 
     /// An adapter that is being stopped may still write its status while it
@@ -930,6 +954,27 @@ enum HostedSessionError: LocalizedError, Equatable {
     var hostErrorCode: String? {
         if case .rejected(let code, _) = self { return code }
         return nil
+    }
+
+    /// SSH could not sign in to the host (its key or password was refused)
+    /// or refused the host's key: trying again on a timer only repeats the
+    /// failed login (which can get the address blocked), so it waits for a
+    /// wake, a network change or the user.
+    var isAuthenticationFailure: Bool {
+        let text = errorDescription ?? ""
+        return [
+            "Permission denied", "Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED",
+            "Too many authentication failures", "No more authentication methods",
+        ].contains { text.contains($0) }
+    }
+
+    /// The host speaks a protocol this app's helper can neither use nor
+    /// replace (the helper's and the app's messages say so): connecting
+    /// again cannot resolve it until one side is updated.
+    var isVersionMismatch: Bool {
+        if hostErrorCode == HostProtocol.ErrorCode.versionMismatch { return true }
+        let text = errorDescription ?? ""
+        return ["protocol version mismatch", "speaks protocol", "(version_mismatch)"].contains { text.contains($0) }
     }
 }
 

@@ -57,7 +57,8 @@
 //!
 //! - `{"op":"hello","version":<u32>}`
 //! - `{"type":"welcome","version":<u32>,"host_id":"<host id>"}`, the answer
-//!   to every `Hello`, whatever its version
+//!   to every `Hello`, whatever its version; a host of protocol 7 may add
+//!   `"build":"<build>"` (see [`BUILD`]), which every version ignores
 //! - `{"op":"replace"}`, only after a `Welcome` with a lower version
 //! - `{"type":"ok"}`
 //! - `{"type":"error","code":"<code>","message":"<text>"}`
@@ -112,6 +113,46 @@ use std::{
 pub mod priority;
 
 pub const PROTOCOL_VERSION: u32 = 7;
+/// This build of cherry and cherry-host: `<YYYYMMDDHHMMSS>.<revision>` when
+/// it was given at build time (`CHERRY_BUILD_ID`: the app's
+/// CFBundleVersion), otherwise `dev-<commit time>.<revision>`, a development
+/// build that never orders against another (`build_is_newer`). Set by
+/// `build.rs`; the daemon reports it in `Welcome` and each session its
+/// holder's (`SessionInfo::holder_build`).
+pub const BUILD: &str = env!("CHERRY_BUILD_ID");
+/// What `--version` prints after the program's name.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build ",
+    env!("CHERRY_BUILD_ID"),
+    ")"
+);
+
+/// When a build was made, as `YYYYMMDDHHMMSS` read as a number: the part of
+/// a `BUILD` before its first `.`, when it has exactly 14 digits. None for a
+/// build that does not say (a package version).
+pub fn build_stamp(build: &str) -> Option<u64> {
+    let stamp = build.split('.').next()?;
+    (stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| stamp.parse().ok())
+        .flatten()
+}
+
+/// Whether `build` was made after `other`: both carry a build time
+/// (`build_stamp`) and `build`'s is later. Builds that cannot be ordered
+/// (either has no time, or the times are equal) are neither newer nor
+/// older, so two copies never take turns replacing each other's daemon.
+pub fn build_is_newer(build: &str, other: &str) -> bool {
+    matches!((build_stamp(build), build_stamp(other)), (Some(a), Some(b)) if a > b)
+}
+
+/// The build a `--version` line names (`cherry-host 0.1.0 (build B)`).
+pub fn build_in_version(line: &str) -> Option<&str> {
+    let start = line.find("(build ")? + "(build ".len();
+    let end = start + line[start..].find(')')?;
+    let build = line[start..end].trim();
+    (!build.is_empty()).then_some(build)
+}
 /// The environment variable in which the CLI tells a remote
 /// `cherry-host gateway` which host identity it expects
 /// (`--expected-host-id`, or the host an attachment reconnects to). The
@@ -286,6 +327,12 @@ pub struct SessionInfo {
     /// (its panic, if it panicked), when the host writes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_log: Option<String>,
+    /// The build of the process that holds the session (its holder, see
+    /// [`BUILD`]), which keeps the code it started with when the daemon is
+    /// updated. None for a holder that does not say (older than this field)
+    /// and from an older host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_build: Option<String>,
 }
 
 /// The colours a session's terminal reports (`ClientMessage::Create`'s
@@ -539,6 +586,9 @@ pub enum ClientMessage {
     ClearHistory {
         id: String,
     },
+    /// Describe the host (protocol 7): answered `Status`. An older host of
+    /// this version answers `Error{unsupported_operation}`.
+    Status,
     /// Rename a session or replace its tags (the whole map); answered `Ok`.
     /// A field left out is kept.
     Update {
@@ -586,10 +636,16 @@ pub enum AttachReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// The answer to every `Hello`, with the host's own version. Frozen.
+    /// The answer to every `Hello`, with the host's own version. Frozen:
+    /// `build` is the one field added to it, which every version ignores.
     Welcome {
         version: u32,
         host_id: String,
+        /// The daemon's build ([`BUILD`]). None from a host older than the
+        /// field. A client of the same version replaces a daemon of an
+        /// older build only through `Restart` (see the CLI).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     Sessions {
         host_id: String,
@@ -712,6 +768,60 @@ pub enum ServerMessage {
         cursor_col: u16,
         alternate_screen: bool,
     },
+    /// The answer to `Status`.
+    Status {
+        status: HostStatus,
+    },
+}
+
+/// What a daemon says about itself (`ServerMessage::Status`, `cherry
+/// status`). Fields a newer host adds are ignored by an older client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostStatus {
+    pub host_id: String,
+    /// Its protocol version.
+    pub version: u32,
+    /// Its build ([`BUILD`]).
+    pub build: String,
+    pub pid: u32,
+    /// When it started, in milliseconds since the Unix epoch.
+    pub started_at: u64,
+    /// How long it has run, in milliseconds (on the clock that stops while
+    /// the machine sleeps).
+    pub uptime_ms: u64,
+    pub socket: String,
+    pub state_dir: String,
+    /// The log it writes to, when that is a file (`host.log`).
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// Where its executable is now, when it can tell.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Its executable was removed or replaced (by an update) since it
+    /// started: new sessions run the executable found there now, or fail
+    /// when there is none.
+    #[serde(default)]
+    pub executable_changed: bool,
+    /// Sessions it serves, and how many of them run.
+    pub sessions: u32,
+    pub running_sessions: u32,
+    /// The most sessions it keeps, exited ones included.
+    pub max_sessions: u32,
+    /// Open connections (clients and holders' links) and the most it serves.
+    pub connections: u32,
+    pub max_connections: u32,
+    /// Sessions whose holders are connected to it.
+    pub holders_registered: u32,
+    /// Holders that outlived the previous daemon and have not registered
+    /// with this one yet (`Sessions::pending_holders`).
+    pub holders_expected: u32,
+    /// Sessions whose holders were gone when it started
+    /// (`Sessions::lost_sessions`).
+    #[serde(default)]
+    pub lost_sessions: u32,
+    /// Its descriptor limit (the soft `RLIMIT_NOFILE`), when known.
+    #[serde(default)]
+    pub fd_limit: Option<u64>,
 }
 
 impl ServerMessage {
@@ -828,6 +938,90 @@ pub fn default_socket_path() -> PathBuf {
 
 fn euid() -> u32 {
     unsafe { libc::geteuid() }
+}
+
+/// The socket path used when neither --socket nor CHERRY_HOST_SOCKET is set.
+pub fn builtin_socket_path() -> PathBuf {
+    PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", euid()))
+}
+
+/// Where the host serving `socket` keeps its durable state (identity, lock,
+/// log, PID file and session manifests), without creating it:
+/// `~/Library/Application Support/cherry-host/<key>` on macOS and
+/// `${XDG_STATE_HOME:-~/.local/state}/cherry-host/<key>` elsewhere. The key
+/// is `default` for the built-in socket and a stable hash of any other
+/// socket path.
+pub fn state_dir(socket: &Path) -> io::Result<PathBuf> {
+    let home = home_dir()?;
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local/state"));
+    Ok(base.join("cherry-host").join(state_key(socket)))
+}
+
+/// The last part of `state_dir`.
+pub fn state_key(socket: &Path) -> String {
+    if socket == builtin_socket_path() {
+        return "default".into();
+    }
+    // FNV-1a: stable across builds and platforms, unlike std's hasher.
+    let hash = socket
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}")
+}
+
+/// HOME when it is an absolute path, otherwise the password database entry.
+pub fn home_dir() -> io::Result<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
+        return Ok(home);
+    }
+    passwd_field(|entry| entry.pw_dir)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::other("cannot determine this user's home directory (HOME is not set)")
+        })
+}
+
+/// A field of this user's password database entry, when it is not empty.
+pub fn passwd_field(
+    field: impl Fn(&libc::passwd) -> *mut libc::c_char,
+) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            euid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    let value = field(&entry);
+    if value.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(value) }
+        .to_bytes()
+        .to_vec();
+    (!bytes.is_empty()).then(|| std::ffi::OsString::from_vec(bytes))
 }
 
 /// The directory must exist, not be a symlink, be owned by this user and be
@@ -1999,6 +2193,7 @@ mod tests {
         let welcome = ServerMessage::Welcome {
             version: 4,
             host_id: "0b7e3c4a-6f1d-4d0e-9a51-2f3c4d5e6f70".into(),
+            build: None,
         };
         let error = ServerMessage::error("version_mismatch", "expected 5");
         let frozen = [
@@ -2056,7 +2251,7 @@ mod tests {
         ] {
             assert!(matches!(
                 serde_json::from_str::<Response>(text).unwrap().message,
-                ServerMessage::Welcome { version: 2, host_id } if host_id == "h"
+                ServerMessage::Welcome { version: 2, host_id, .. } if host_id == "h"
             ));
         }
         assert_eq!(
@@ -2066,6 +2261,114 @@ mod tests {
             .unwrap(),
             Response::from(ServerMessage::error("c", "m"))
         );
+    }
+
+    #[test]
+    fn welcome_and_sessions_carry_builds_that_older_peers_ignore() {
+        let welcome = ServerMessage::Welcome {
+            version: 7,
+            host_id: "h".into(),
+            build: Some("20260927101500.abc1234".into()),
+        };
+        let text = json(&welcome);
+        assert_eq!(
+            text,
+            r#"{"type":"welcome","version":7,"host_id":"h","build":"20260927101500.abc1234"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&text).unwrap(),
+            welcome
+        );
+        // An older host's Welcome has none.
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(
+                r#"{"type":"welcome","version":7,"host_id":"h"}"#
+            )
+            .unwrap(),
+            ServerMessage::Welcome { build: None, .. }
+        ));
+        let old = r#"{"id":"s","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"running","pid":1,"exit_code":null,"attached":false,"exit_signal":null}"#;
+        let mut session: SessionInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(session.holder_build, None);
+        assert!(!json(&session).contains("holder_build"));
+        session.holder_build = Some("20260101000000.old1234".into());
+        assert!(json(&session).contains(r#""holder_build":"20260101000000.old1234""#));
+    }
+
+    #[test]
+    fn status_is_asked_and_answered() {
+        assert_eq!(json(&ClientMessage::Status), r#"{"op":"status"}"#);
+        let status = HostStatus {
+            host_id: "h".into(),
+            version: PROTOCOL_VERSION,
+            build: BUILD.into(),
+            pid: 42,
+            started_at: 1,
+            uptime_ms: 2,
+            socket: "/tmp/x/host.sock".into(),
+            state_dir: "/state".into(),
+            log_path: Some("/state/host.log".into()),
+            executable: None,
+            executable_changed: false,
+            sessions: 3,
+            running_sessions: 2,
+            max_sessions: 128,
+            connections: 4,
+            max_connections: 1024,
+            holders_registered: 3,
+            holders_expected: 0,
+            lost_sessions: 0,
+            fd_limit: Some(16384),
+        };
+        let reply = ServerMessage::Status {
+            status: status.clone(),
+        };
+        let text = json(&Response::new(Some(3), reply.clone()));
+        assert!(
+            text.starts_with(r#"{"type":"status","status":{"host_id":"h""#),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&text).unwrap(),
+            Response::new(Some(3), reply)
+        );
+    }
+
+    #[test]
+    fn builds_order_by_their_time_and_only_then() {
+        assert_eq!(build_stamp("20260927101500.abc1234"), Some(20260927101500));
+        assert_eq!(build_stamp("20260927101500"), Some(20260927101500));
+        for unordered in [
+            "0.1.0",
+            "",
+            "2026092710150.abc",
+            "2026092710150x.abc",
+            "local",
+        ] {
+            assert_eq!(build_stamp(unordered), None, "{unordered}");
+        }
+        let old = "20260101000000.aaaaaaa";
+        let new = "20260927101500.bbbbbbb";
+        assert!(build_is_newer(new, old));
+        assert!(!build_is_newer(old, new));
+        // The same time, or a build without one, is never newer.
+        assert!(!build_is_newer("20260101000000.bbbbbbb", old));
+        assert!(!build_is_newer(new, "0.1.0"));
+        assert!(!build_is_newer("0.1.0", old));
+        assert_eq!(
+            build_in_version("cherry-host 0.1.0 (build 20260927101500.abc1234)\n"),
+            Some("20260927101500.abc1234")
+        );
+        assert_eq!(build_in_version("cherry-host 0.1.0"), None);
+        assert_eq!(build_in_version(&format!("cherry {VERSION}")), Some(BUILD));
+        assert!(!BUILD.is_empty());
+        // A development build (no CHERRY_BUILD_ID) never orders.
+        let dev = "dev-20260927221521.96a826b";
+        assert_eq!(build_stamp(dev), None);
+        assert!(!build_is_newer(dev, old) && !build_is_newer(old, dev));
+        if BUILD.starts_with("dev-") {
+            assert_eq!(build_stamp(BUILD), None);
+        }
     }
 
     #[test]
@@ -2142,6 +2445,7 @@ mod tests {
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
             ended_by: None,
             holder_log: None,
+            holder_build: None,
         }
     }
 
@@ -2307,6 +2611,7 @@ mod tests {
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 host_id: "h".into(),
+                build: None,
             },
             ServerMessage::Sessions {
                 host_id: "h".into(),

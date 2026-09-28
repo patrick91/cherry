@@ -6,7 +6,7 @@ use cherry_protocol::{read_frame, write_frame, ClientMessage, ServerMessage, PRO
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Seek, Write},
-    os::unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd, net::UnixStream, process::CommandExt},
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -82,10 +82,12 @@ pub fn probe(path: &Path) -> Result<Probe> {
         }
         // Only a host speaking protocol 4 or later welcomes a Hello of
         // another version, and every one of them makes way when asked.
-        Ok(Some(ServerMessage::Welcome { version, host_id })) if version < PROTOCOL_VERSION => {
-            Probe::Older { version, host_id }
-        }
-        Ok(Some(ServerMessage::Welcome { version, host_id })) => Probe::OtherVersion {
+        Ok(Some(ServerMessage::Welcome {
+            version, host_id, ..
+        })) if version < PROTOCOL_VERSION => Probe::Older { version, host_id },
+        Ok(Some(ServerMessage::Welcome {
+            version, host_id, ..
+        })) => Probe::OtherVersion {
             version: Some(version),
             host_id: Some(host_id),
         },
@@ -206,6 +208,7 @@ pub fn start(path: &Path) -> Result<()> {
         return systemd::start(path);
     }
     let state = paths::open_state_dir(path)?;
+    // The daemon moves it aside when it is long, under its lock.
     let log_path = state.join("host.log");
     let mut log = OpenOptions::new()
         .create(true)
@@ -229,6 +232,16 @@ pub fn start(path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log.try_clone()?);
+    // Test tunables of the log, and a stand-in build for the daemon
+    // (`daemon::build`), which a client's own stand-in does not set.
+    for name in ["CHERRY_HOST_LOG_MAX_BYTES", "CHERRY_HOST_LOG_CHECK_MS"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if let Some(build) = std::env::var_os("CHERRY_HOST_TEST_SERVE_BUILD") {
+        command.env("CHERRY_HOST_TEST_BUILD", build);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -257,11 +270,19 @@ pub fn start(path: &Path) -> Result<()> {
             let mut output = String::new();
             let _ = log.seek(io::SeekFrom::Start(log_start));
             let _ = (&mut log).take(64 * 1024).read_to_string(&mut output);
+            // A daemon that moved the log aside wrote the rest to a new one.
+            if let Ok(mut current) = fs::File::open(&log_path) {
+                let moved = crate::daemon::writes_to_log(&log_path, log.as_raw_fd())
+                    && !crate::daemon::same_file(&current, &log);
+                if moved {
+                    let _ = (&mut current).take(64 * 1024).read_to_string(&mut output);
+                }
+            }
             let reason = output
                 .lines()
                 .rev()
                 .find(|line| !line.trim().is_empty())
-                .unwrap_or("no output");
+                .map_or("no output", crate::daemon::logged_message);
             bail!(
                 "host exited ({status}): {reason} (log: {})",
                 log_path.display()
@@ -482,7 +503,7 @@ mod systemd {
             // A quoted (unusual) value never matches, and the client then
             // starts its own daemon as without systemd.
             Some(value) => Some(PathBuf::from(value)).filter(|path| path.is_absolute()),
-            None => Some(paths::builtin_socket_path()),
+            None => Some(cherry_protocol::builtin_socket_path()),
         }
     }
 

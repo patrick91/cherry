@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the native cherry and cherry-host executables.
+# Build the native cherry and cherry-host executables. CHERRY_BUILD_ID, when
+# set, is the build they report (Host/crates/cherry-protocol/build.rs);
+# otherwise the checked-out commit's time and revision.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 configuration=${1:-release}

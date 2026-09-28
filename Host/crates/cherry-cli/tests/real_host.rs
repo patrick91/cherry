@@ -36,12 +36,19 @@ struct Host {
 
 impl Host {
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// A daemon with extra environment, such as `CHERRY_HOST_TEST_BUILD`.
+    fn start_with(env: &[(&str, &str)]) -> Self {
         let directory = private_directory();
         let socket = directory.path().join("host.sock");
         // The daemon keeps its state under HOME; never the real one.
         let home = directory.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        let child = Self::serve(&socket, &home);
+        let mut command = Self::serve_command(&socket, &home);
+        command.envs(env.iter().copied());
+        let child = command.spawn().unwrap();
         let mut host = Self {
             _directory: directory,
             socket,
@@ -60,7 +67,12 @@ impl Host {
     }
 
     fn serve(socket: &Path, home: &Path) -> Child {
-        Command::new(host_binary())
+        Self::serve_command(socket, home).spawn().unwrap()
+    }
+
+    fn serve_command(socket: &Path, home: &Path) -> Command {
+        let mut command = Command::new(host_binary());
+        command
             .arg("serve")
             .arg("--socket")
             .arg(socket)
@@ -68,9 +80,8 @@ impl Host {
             .env_remove("XDG_STATE_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap()
+            .stderr(Stdio::inherit());
+        command
     }
 
     fn wait_ready(&mut self) {
@@ -1033,6 +1044,7 @@ fn daemon_speaking(
                         ServerMessage::Welcome {
                             version,
                             host_id: host_id.clone(),
+                            build: None,
                         }
                     }
                     ClientMessage::Replace if hello.is_some_and(|client| client > version) => {
@@ -1354,6 +1366,7 @@ fn control_lists_and_kills(mut command: Command, host_id: Option<&str>, kill: Op
     let ServerMessage::Welcome {
         version,
         host_id: welcomed,
+        ..
     } = welcome.message
     else {
         panic!("expected welcome, received {welcome:?}");
@@ -1533,20 +1546,6 @@ fn an_attachment_reconnects_by_itself_after_the_daemon_is_killed_and_restarted()
 #[test]
 #[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
 fn restart_replaces_the_daemon_and_keeps_its_running_sessions() {
-    /// Kills whatever daemon serves the socket when the test ends, however
-    /// it ends: the one `restart` starts is not the test's child.
-    struct Daemons(PathBuf);
-    impl Drop for Daemons {
-        fn drop(&mut self) {
-            for (pid, command) in processes_using(&self.0) {
-                if command.contains(" serve ") {
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                }
-            }
-        }
-    }
     let mut host = Host::start();
     // Dropped before `host`, whose cleanup then ends the holders.
     let _daemons = Daemons(host.socket.clone());
@@ -1562,13 +1561,7 @@ fn restart_replaces_the_daemon_and_keeps_its_running_sessions() {
         "exec sleep 60",
     ]);
     let id = created["id"].as_str().unwrap().to_owned();
-    let daemons = |host: &Host| -> Vec<i32> {
-        processes_using(&host.socket)
-            .into_iter()
-            .filter(|(_, command)| command.contains(" serve "))
-            .map(|(pid, _)| pid)
-            .collect()
-    };
+    let daemons = |host: &Host| serving_daemons(&host.socket);
     assert_eq!(daemons(&host), [host.child.id() as i32]);
     // No cherry-host could be started (this command's CHERRY_HOST_PATH
     // names nothing): the restart is refused, and the host keeps running.
@@ -1743,4 +1736,339 @@ fn a_slow_terminal_holds_back_neither_the_program_nor_a_faster_window() {
     let _ = slow.child.kill();
     let _ = fast.child.wait();
     let _ = slow.child.wait();
+}
+
+/// Kills whatever daemon serves `socket` when a test ends, however it ends:
+/// one that the CLI started (a restart, a handover) is not the test's child.
+struct Daemons(PathBuf);
+
+impl Drop for Daemons {
+    fn drop(&mut self) {
+        for (pid, command) in processes_using(&self.0) {
+            if command.contains(" serve ") {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+fn serving_daemons(socket: &Path) -> Vec<i32> {
+    processes_using(socket)
+        .into_iter()
+        .filter(|(_, command)| command.contains(" serve "))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn status_and_doctor_describe_a_running_host() {
+    let host = Host::start();
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec sleep 60",
+    ]);
+    let status = host.json(&["status", "--json"]);
+    assert_eq!(status["running"], true);
+    assert_eq!(status["build"], cherry_protocol::BUILD);
+    assert_eq!(status["client"]["build"], cherry_protocol::BUILD);
+    assert_eq!(status["host"]["pid"], host.child.id());
+    assert_eq!(status["host"]["build"], cherry_protocol::BUILD);
+    assert_eq!(status["host"]["socket"], host.socket.display().to_string());
+    assert_eq!(status["host"]["sessions"], 1);
+    assert_eq!(status["host"]["max_sessions"], 128);
+    assert_eq!(status["host"]["holders_registered"], 1);
+    assert!(status["host"]["uptime_ms"].as_u64().is_some());
+    assert!(status["host"]["state_dir"]
+        .as_str()
+        .unwrap()
+        .starts_with(host.home.to_str().unwrap()));
+    let sessions = status["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["id"], created["id"]);
+    assert_eq!(sessions[0]["holder_build"], cherry_protocol::BUILD);
+    let text = host.command().arg("status").output().unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.starts_with(&format!(
+            "cherry-host {}, protocol {}, pid {}, up ",
+            cherry_protocol::BUILD,
+            cherry_protocol::PROTOCOL_VERSION,
+            host.child.id()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("sessions     1 of 128 (1 running)"), "{text}");
+
+    let doctor = host
+        .command()
+        .arg("doctor")
+        .env("CHERRY_HOST_PATH", host_binary())
+        .env("HOME", &host.home)
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor.status.success(), "{report}");
+    assert!(
+        report.contains("the host runs this cherry's build and protocol"),
+        "{report}"
+    );
+    assert!(report.contains("PID file"), "{report}");
+    assert!(report.ends_with("No problems found.\n"), "{report}");
+
+    // An older build of this protocol is a problem doctor names.
+    drop(host);
+    let host = Host::start_with(&[("CHERRY_HOST_TEST_BUILD", OLD_BUILD)]);
+    let doctor = handing_over(&host, None).arg("doctor").output().unwrap();
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(doctor.status.code(), Some(1), "{report}");
+    assert!(
+        report.contains(&format!(
+            "PROBLEM  the host runs build {OLD_BUILD}, older than this cherry's {NEW_BUILD}"
+        )),
+        "{report}"
+    );
+    assert!(report.contains("fix: `cherry restart`"), "{report}");
+}
+
+/// A build older than `NEW_BUILD`, which the daemons of these tests report.
+const OLD_BUILD: &str = "20000101000000.0ld0000";
+/// The build the CLI acts as (`CHERRY_TEST_BUILD`), and the cherry-host it
+/// would start says (`CHERRY_HOST_TEST_BUILD`, read by its `--version`).
+const NEW_BUILD: &str = "20300101000000.n3w0000";
+
+/// A `cherry` for `host` that could hand its daemon over: it acts as
+/// `NEW_BUILD`, its cherry-host to start is the test's (the daemon's own
+/// executable) and says `NEW_BUILD`, and everything uses the host's private
+/// HOME. The daemon it starts reports `serve_build` (none: this build's).
+fn handing_over(host: &Host, serve_build: Option<&str>) -> Command {
+    let mut command = host.command();
+    command
+        .env("CHERRY_HOST_PATH", host_binary())
+        .env("HOME", &host.home)
+        .env_remove("XDG_STATE_HOME")
+        .env("CHERRY_TEST_BUILD", NEW_BUILD)
+        .env("CHERRY_HOST_TEST_BUILD", NEW_BUILD);
+    match serve_build {
+        Some(build) => command.env("CHERRY_HOST_TEST_SERVE_BUILD", build),
+        None => command.env_remove("CHERRY_HOST_TEST_SERVE_BUILD"),
+    };
+    command
+}
+
+fn wait_for_exit(child: &mut Child, what: &str) -> std::process::ExitStatus {
+    // Bounded, so that a client that never hands over fails rather than
+    // waits for good.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_client_hands_an_older_build_of_its_protocol_over_to_its_own() {
+    let mut host = Host::start_with(&[("CHERRY_HOST_TEST_BUILD", OLD_BUILD)]);
+    let _daemons = Daemons(host.socket.clone());
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec sleep 60",
+    ]);
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["holder_build"], OLD_BUILD);
+    // A client that may not start a host (status) leaves it alone, though it
+    // could start the newer build, and so does a development build (this
+    // tree's own, which never orders against another).
+    let status = handing_over(&host, Some(NEW_BUILD))
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["build"], OLD_BUILD);
+    assert!(host
+        .command()
+        .arg("list")
+        .env("CHERRY_HOST_PATH", host_binary())
+        .env("HOME", &host.home)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(serving_daemons(&host.socket), [host.child.id() as i32]);
+    // `list` of a newer build, whose cherry-host is the daemon's own
+    // executable updated, hands the daemon over.
+    let listed = handing_over(&host, Some(NEW_BUILD))
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let replaced = wait_for_exit(
+        &mut host.child,
+        "the daemon of the older build was not replaced",
+    );
+    assert!(replaced.success(), "{replaced}");
+    let now = serving_daemons(&host.socket);
+    assert_eq!(now.len(), 1, "{now:?}");
+    let status = host.json(&["status", "--json"]);
+    assert_eq!(status["build"], NEW_BUILD);
+    assert_eq!(status["host_id"].as_str(), host.host_id.as_deref());
+    // The session carries on in its holder, which keeps its own build.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = loop {
+        let listing = host.json(&["status", "--json"]);
+        if let Some(session) = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id.as_str())
+        {
+            break session.clone();
+        }
+        assert!(Instant::now() < deadline, "the session was not adopted");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["pid"], created["pid"]);
+    assert_eq!(session["holder_build"], OLD_BUILD);
+    // Connecting again changes nothing: the daemon is that build now.
+    assert!(handing_over(&host, Some(NEW_BUILD))
+        .arg("list")
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(serving_daemons(&host.socket), now);
+    host.end_sessions();
+    assert!(host.command().arg("shutdown").status().unwrap().success());
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_handover_the_old_build_wins_is_not_tried_again() {
+    let mut host = Host::start_with(&[("CHERRY_HOST_TEST_BUILD", OLD_BUILD)]);
+    let _daemons = Daemons(host.socket.clone());
+    // The replacement comes back as the old build, as when a client of the
+    // old build started the next daemon first.
+    let listed = handing_over(&host, Some(OLD_BUILD))
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&listed.stderr).contains("not trying again for an hour"),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    wait_for_exit(&mut host.child, "the daemon was not asked to make way");
+    let after_first = serving_daemons(&host.socket);
+    assert_eq!(after_first.len(), 1, "{after_first:?}");
+    let status = host.json(&["status", "--json"]);
+    assert_eq!(status["build"], OLD_BUILD);
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            PathBuf::from(status["host"]["state_dir"].as_str().unwrap()).join("handover.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["from"], OLD_BUILD);
+    assert_eq!(record["to"], NEW_BUILD);
+    // Every later client of the new build leaves it alone: no loop.
+    for command in [
+        &["list"][..],
+        &["list", "--json"],
+        &["new", "--cwd", "/tmp", "--", "true"],
+    ] {
+        let output = handing_over(&host, Some(OLD_BUILD))
+            .args(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(serving_daemons(&host.socket), after_first);
+    }
+    host.end_sessions();
+    assert!(host.command().arg("shutdown").status().unwrap().success());
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_client_never_replaces_a_newer_unordered_or_foreign_daemon() {
+    for build in [
+        "99990101000000.future0",
+        "0.1.0-elsewhere",
+        "dev-20000101000000.0ld0000",
+    ] {
+        let host = Host::start_with(&[("CHERRY_HOST_TEST_BUILD", build)]);
+        let _daemons = Daemons(host.socket.clone());
+        let listed = handing_over(&host, Some(NEW_BUILD))
+            .arg("list")
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert_eq!(serving_daemons(&host.socket), [host.child.id() as i32]);
+        assert_eq!(host.json(&["status", "--json"])["build"], build);
+    }
+    // An older build of another installation (a copy of cherry-host that
+    // is not the daemon's executable) is left alone too.
+    let host = Host::start_with(&[("CHERRY_HOST_TEST_BUILD", OLD_BUILD)]);
+    let _daemons = Daemons(host.socket.clone());
+    let copy = host.home.join("cherry-host");
+    std::fs::copy(host_binary(), &copy).unwrap();
+    let listed = handing_over(&host, Some(NEW_BUILD))
+        .env("CHERRY_HOST_PATH", &copy)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert_eq!(serving_daemons(&host.socket), [host.child.id() as i32]);
+    // An attachment never hands over, even of its own installation.
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec sleep 60",
+    ]);
+    let attached = handing_over(&host, Some(NEW_BUILD))
+        .args(["attach", created["id"].as_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        attached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    assert_eq!(serving_daemons(&host.socket), [host.child.id() as i32]);
+    assert_eq!(host.json(&["status", "--json"])["build"], OLD_BUILD);
 }

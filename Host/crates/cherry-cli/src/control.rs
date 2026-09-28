@@ -37,10 +37,11 @@ pub const QUIET_WAIT: Duration = RPC_TIMEOUT;
 /// `HIGH_WATER` bytes wait for it; the app's own request timeouts judge it.
 /// A closed standard output ends the relay too, successfully: nothing can
 /// be relayed any more.
-pub fn relay(transport: &mut Transport, host_id: String) -> Result<u32> {
+pub fn relay(transport: &mut Transport, host_id: String, build: Option<String>) -> Result<u32> {
     let welcome = encode_frame(&ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
         host_id,
+        build,
     })
     .context("could not encode the host's welcome")?;
     let mut output = Output::new(libc::STDOUT_FILENO)?;

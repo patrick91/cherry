@@ -47,8 +47,11 @@ extension WorkspaceSessionRestorers {
     ///   saved as one (`WorkspaceSessionRecord.systemEnd`), with nothing to
     ///   ask its host.
     /// - Host unreachable (or This Mac cannot run sessions): the record stays
-    ///   saved for the next launch; for This Mac, also until the host comes
-    ///   up during this run (`WorkspaceRestoreResult.retryWhenAvailable`).
+    ///   saved for the next launch, and is restored once the host comes up
+    ///   during this run (`WorkspaceRestoreResult.retryWhenAvailable`; an SSH
+    ///   host's control connection is leased until then:
+    ///   `HostControl.availability()`). A host that answers with another
+    ///   identity is not waited for.
     ///
     /// Hosts are listed at the same time. The result has what the hosts
     /// that answered within `initialWait` brought back; the others (and the
@@ -563,13 +566,31 @@ private final class ControlPlaneRestore {
         // Unreachable, or answering with an identity other than the trusted
         // one: the sessions may still run there.
         let listed: HostedSessionList?
+        var failure: Error?
         if let given {
             listed = given
         } else {
-            listed = try? await control.list()
+            do {
+                listed = try await control.list()
+            } catch {
+                listed = nil
+                failure = error
+            }
         }
         guard let list = listed, let executable = control.executableURL, !isStopped else {
-            return .keeping(records)
+            var result = WorkspaceRestoreResult.keeping(records)
+            // Unreachable: restored again once the host answers during this
+            // run (its control connection is leased until then, so it keeps
+            // trying, with backoff and at once on a wake or a network
+            // change; after a refused SSH login only then). Another identity
+            // is not the host they ran on, and a protocol this app cannot
+            // use does not change by itself.
+            let hosted = failure as? HostedSessionError
+            let never = hosted?.isIdentityMismatch == true || hosted?.isVersionMismatch == true
+            if listed == nil, !isStopped, !records.isEmpty, !never {
+                result.retryWhenAvailable = control.availability()
+            }
+            return result
         }
         // Adapters for this host use the control connection's helper and
         // login environment (its SSH agent).

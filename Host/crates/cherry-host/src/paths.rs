@@ -9,10 +9,10 @@
 //! `default` for the default socket and a stable hash of any other socket path.
 use anyhow::{bail, Context, Result};
 use std::{
-    ffi::{CStr, CString, OsString},
+    ffi::{CString, OsString},
     fs, io,
     os::unix::{
-        ffi::{OsStrExt, OsStringExt},
+        ffi::OsStrExt,
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
@@ -20,11 +20,6 @@ use std::{
 
 /// sockaddr_un holds 104 bytes on macOS; stay below it everywhere.
 const MAX_SOCKET_PATH: usize = 100;
-
-/// The socket path used when neither --socket nor CHERRY_HOST_SOCKET is set.
-pub fn builtin_socket_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", euid()))
-}
 
 pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
@@ -129,17 +124,10 @@ fn ensure_private_dir(dir: &Path, parents: bool) -> io::Result<()> {
     cherry_protocol::verify_private_dir(dir)
 }
 
-/// The state directory for `socket`, without creating it.
+/// The state directory for `socket`, without creating it
+/// (`cherry_protocol::state_dir`).
 pub fn state_dir(socket: &Path) -> Result<PathBuf> {
-    let home = home_dir()?;
-    #[cfg(target_os = "macos")]
-    let base = home.join("Library/Application Support");
-    #[cfg(not(target_os = "macos"))]
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".local/state"));
-    Ok(base.join("cherry-host").join(state_key(socket)))
+    Ok(cherry_protocol::state_dir(socket)?)
 }
 
 /// Create (mode 0700) or verify the state directory for `socket`.
@@ -154,61 +142,19 @@ pub fn open_state_dir(socket: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+#[cfg(test)]
 fn state_key(socket: &Path) -> String {
-    if socket == builtin_socket_path() {
-        return "default".into();
-    }
-    // FNV-1a: stable across builds and platforms, unlike std's hasher.
-    let hash = socket
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-        });
-    format!("{hash:016x}")
+    cherry_protocol::state_key(socket)
 }
 
 /// HOME when it is an absolute path, otherwise the password database entry.
 pub fn home_dir() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-    {
-        return Ok(home);
-    }
-    passwd_field(|entry| entry.pw_dir)
-        .map(PathBuf::from)
-        .context("cannot determine this user's home directory (HOME is not set)")
+    Ok(cherry_protocol::home_dir()?)
 }
 
 /// The login shell from the password database.
 pub fn passwd_shell() -> Option<OsString> {
-    passwd_field(|entry| entry.pw_shell)
-}
-
-fn passwd_field(field: impl Fn(&libc::passwd) -> *mut libc::c_char) -> Option<OsString> {
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result = std::ptr::null_mut();
-    let status = unsafe {
-        libc::getpwuid_r(
-            euid(),
-            &mut entry,
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut result,
-        )
-    };
-    if status != 0 || result.is_null() {
-        return None;
-    }
-    let value = field(&entry);
-    if value.is_null() {
-        return None;
-    }
-    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
-    (!bytes.is_empty()).then(|| OsString::from_vec(bytes))
+    cherry_protocol::passwd_field(|entry| entry.pw_shell)
 }
 
 /// Sessions outlive the daemon in their holders, and each holder keeps a
@@ -228,6 +174,9 @@ pub struct Manifest {
     /// process that got its PID later, or after a reboot, is not it.
     #[serde(default)]
     pub holder_started: Option<String>,
+    /// The holder's build (`cherry_protocol::BUILD`), for `cherry doctor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 /// Where the manifest of session `id` lives.
@@ -360,7 +309,10 @@ mod tests {
 
     #[test]
     fn state_keys_are_stable_and_distinguish_sockets() {
-        assert_eq!(state_key(&builtin_socket_path()), "default");
+        assert_eq!(
+            state_key(&cherry_protocol::builtin_socket_path()),
+            "default"
+        );
         let key = state_key(Path::new("/tmp/elsewhere/host.sock"));
         assert_eq!(key.len(), 16);
         assert_eq!(key, state_key(Path::new("/tmp/elsewhere/host.sock")));

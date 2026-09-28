@@ -5,12 +5,15 @@ struct SessionsSettingsPane: View {
     @ObservedObject var settings: TerminalSettings
     @ObservedObject var status: PersistentSessionsStatus
     @ObservedObject var backgroundSessions: BackgroundSessionsSummary
+    @ObservedObject var hostDiagnostics: SessionHostDiagnostics
     let endBackgroundSessions: () -> Void
+    @State private var confirmsHostRestart = false
 
     init(
         settings: TerminalSettings,
         status: PersistentSessionsStatus = .shared,
         backgroundSessions: BackgroundSessionsSummary = BackgroundSessionsModel.shared.summary,
+        hostDiagnostics: SessionHostDiagnostics = .shared,
         // On the Settings window, where it was asked (the window it was
         // clicked in is key).
         endBackgroundSessions: @escaping () -> Void = { BackgroundSessionsModel.shared.confirmEndAll(from: NSApp.keyWindow) }
@@ -18,6 +21,7 @@ struct SessionsSettingsPane: View {
         self.settings = settings
         self.status = status
         self.backgroundSessions = backgroundSessions
+        self.hostDiagnostics = hostDiagnostics
         self.endBackgroundSessions = endBackgroundSessions
     }
 
@@ -109,6 +113,40 @@ struct SessionsSettingsPane: View {
                 }
             }
 
+            SettingsCard("Session Host") {
+                SettingsRow(sessionHostTitle, subtitle: sessionHostSubtitle) {
+                    if hostDiagnostics.isRestarting {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+
+                SettingsDivider()
+
+                SettingsRow(
+                    "Diagnostics",
+                    subtitle: "Copy Diagnostics copies what cherry status and cherry doctor report, for a bug report. Restarting the host keeps your sessions running: tabs reconnect to the new host in a moment."
+                ) {
+                    HStack(spacing: 8) {
+                        Button("Reveal Log") { hostDiagnostics.revealLog() }
+                            .disabled(hostDiagnostics.status?.logPath == nil)
+                        Button("Copy Diagnostics") {
+                            Task { await hostDiagnostics.copyDiagnostics() }
+                        }
+                        Button("Restart Host…") { confirmsHostRestart = true }
+                            .disabled(hostDiagnostics.isRestarting || hostDiagnostics.status?.running != true)
+                    }
+                }
+            }
+            .alert("Restart the session host?", isPresented: $confirmsHostRestart) {
+                Button("Restart Host") {
+                    Task { await hostDiagnostics.restartHost() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The host that runs your persistent sessions stops and starts again. Your programs keep running, and their tabs reconnect in a moment.")
+            }
+
             Text("Sessions on SSH hosts always keep running when you close a tab, close a window or quit. Manage them from File › Persistent Sessions.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -119,10 +157,24 @@ struct SessionsSettingsPane: View {
             // Checks the installation (disk image, helper) now; cheap.
             PersistentLocalSessions.shared.refreshStatus()
         }
+        .task {
+            // `cherry status` never starts a host.
+            await hostDiagnostics.refresh()
+        }
     }
 }
 
 extension SessionsSettingsPane {
+    /// "Running · build … · up 2h 5m", or why it is not known.
+    var sessionHostTitle: String {
+        if let failure = hostDiagnostics.restartFailure { return "Restart failed: \(failure)" }
+        return hostDiagnostics.status?.headline ?? (hostDiagnostics.problem == nil ? "Checking…" : "Unknown")
+    }
+
+    var sessionHostSubtitle: String? {
+        hostDiagnostics.status?.detail ?? hostDiagnostics.problem
+    }
+
     /// "3 sessions are running in the background", or the ended ones when
     /// none runs.
     var backgroundSessionsTitle: String {

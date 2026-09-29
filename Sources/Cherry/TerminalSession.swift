@@ -3748,6 +3748,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var pendingResolvedCommandLine: String?
 
     @Published private(set) var revision = 0
+    /// `ghosttyBridge` is launching a restored tab's adapter for a view
+    /// being built: `bumpRevision` publishes on the next turn instead.
+    private var isBuildingBridgeForView = false
+    private var isRevisionBumpScheduled = false
 
     private let processor: TerminalProcessor
     private let rawOutputStore = TerminalRawOutputStore()
@@ -5433,8 +5437,13 @@ final class TerminalSession: ObservableObject, Identifiable {
             return ghosttyBridgeStorage
         }
         // A restored tab being shown attaches now, ahead of the restore's
-        // queue: its adapter's surface is the one to show.
-        if launchDeferredAdapterIfNeeded(), let ghosttyBridgeStorage {
+        // queue: its adapter's surface is the one to show. The surface view
+        // asks from inside a SwiftUI view update, where publishing is not
+        // allowed: the revision bump waits for the next turn.
+        isBuildingBridgeForView = true
+        let launched = launchDeferredAdapterIfNeeded()
+        isBuildingBridgeForView = false
+        if launched, let ghosttyBridgeStorage {
             return ghosttyBridgeStorage
         }
 
@@ -8846,6 +8855,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func bumpRevision() {
-        revision &+= 1
+        guard isBuildingBridgeForView else {
+            revision &+= 1
+            return
+        }
+        guard !isRevisionBumpScheduled else { return }
+        isRevisionBumpScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.isRevisionBumpScheduled = false
+                self.revision &+= 1
+            }
+        }
     }
 }

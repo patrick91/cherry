@@ -1495,6 +1495,38 @@ struct WorkspaceRegistryPersistenceTests {
         #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map(\.path)))
     }
 
+    /// Saved windows open at once at launch (`savedWindowsLaunchPlan`);
+    /// only the default project's window waits a moment for a deep link's.
+    @Test func savedWindowsOpenWithoutWaitingForTheDefaultWindowDecision() throws {
+        let directory = try makeCanonicalTemporaryDirectory("cherry-saved-windows-now")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
+
+        // Nothing saved: nothing opens at once; the default window is
+        // decided later.
+        let empty = ProjectWindowRegistry()
+        empty.configureWorkspacePersistence(store: store)
+        #expect(empty.savedWindowsLaunchPlan() == nil)
+        #expect(empty.launchWindowPlan(hasVisibleWindow: false) == .openDefault)
+
+        let projects = ["a", "b"].map { directory.appendingPathComponent($0, isDirectory: true) }
+        for project in projects {
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            store.saveSynchronously(RepositoryStateRecord(
+                repositoryRoot: project.path,
+                activeWorktreeRoot: project.path,
+                worktrees: [WorktreeStateRecord(root: project.path, sessions: [nativeRecord(title: "Shell 1")])]
+            ))
+        }
+        store.saveOpenProjectWindowRoots(projects.map(\.path), synchronously: true)
+        let registry = ProjectWindowRegistry()
+        registry.configureWorkspacePersistence(store: store)
+        #expect(registry.savedWindowsLaunchPlan() == .reopen(projects.map(\.path)))
+        // Taken once.
+        #expect(registry.savedWindowsLaunchPlan() == nil)
+        #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+    }
+
     @Test func launchOpensTheDefaultWindowOnlyWhenNothingElseOpens() throws {
         let directory = try makeCanonicalTemporaryDirectory("cherry-default-window")
         defer { try? FileManager.default.removeItem(at: directory) }

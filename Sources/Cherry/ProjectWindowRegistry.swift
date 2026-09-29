@@ -55,6 +55,14 @@ final class ProjectWindowRegistry {
     var windowIsOnScreen: @MainActor (NSWindow) -> Bool = { window in
         window.isVisible && !window.isMiniaturized
     }
+    /// How long a newly registered window whose saved tabs are still being
+    /// restored stays off screen waiting for them (`ProjectWindowReveal`);
+    /// nil shows it at once.
+    var windowRevealMaximumWait: Duration? = ProjectWindowReveal.defaultMaximumWait
+    /// Hides the windows the launch opens from the moment AppKit orders them
+    /// in, before they register (`LaunchWindowCover`). The app sets it;
+    /// tests leave it nil or give their own.
+    var launchWindowCover: LaunchWindowCover?
     /// Where each project window's frame is saved. The app sets it
     /// (`configureWindowFrames`); tests leave it nil unless they give their
     /// own, so the app's defaults are never written.
@@ -108,6 +116,16 @@ final class ProjectWindowRegistry {
         if !roots.isEmpty { return .reopen(roots) }
         if hasRegisteredProjectWindow || hasVisibleWindow { return .nothing }
         return .openDefault
+    }
+
+    /// The saved windows to reopen, taken now (`launchWindowPlan`), or nil
+    /// when there are none. They open at once at launch: a window a deep
+    /// link opens meanwhile for the same project is the same window (one
+    /// window per project), so they need not wait for it. Only opening the
+    /// default project's window waits a moment for such a window.
+    func savedWindowsLaunchPlan() -> LaunchWindowPlan? {
+        guard projectWindowRootsToReopenAtLaunch.contains(where: { !hasWindow(for: $0) }) else { return nil }
+        return launchWindowPlan(hasVisibleWindow: false)
     }
 
     /// The sessions a quit that ends sessions would end, in every project
@@ -628,6 +646,20 @@ final class ProjectWindowRegistry {
             // Newly claimed (a window registers again on every update): it
             // takes the frame its project's window last had.
             adoptSavedFrame(of: window, projectRoot: projectRoot)
+            let name = URL(fileURLWithPath: projectRoot).lastPathComponent
+            LaunchTimeline.mark("window registered \(name) visible=\(window.isVisible)")
+            // A window whose saved tabs are still being restored stays off
+            // screen until they are in place (at most a second): it never
+            // shows empty first. It registers before AppKit first draws it.
+            let coveredAtLaunch = launchWindowCover?.claim(window) ?? false
+            if let maximumWait = windowRevealMaximumWait {
+                ProjectWindowReveal.hold(
+                    window, until: repository, name: name, alreadyHidden: coveredAtLaunch, maximumWait: maximumWait
+                )
+            } else if coveredAtLaunch {
+                window.alphaValue = 1
+                window.ignoresMouseEvents = false
+            }
         }
         windows[projectRoot] = WeakWindow(window)
         workspaces[projectRoot] = WeakWorkspace(workspace)
@@ -924,10 +956,13 @@ final class ProjectWindowRegistry {
         activeTodoStore = todoStore
         activeChromeState = chromeState
         if recordsOpening {
-            AgentSettings.shared.markWorktreeOpened(
-                effectiveRoot,
-                repositoryRoot: repositoryRoot(for: projectRoot)
-            )
+            // On the next turn: a window registers (and activates) from
+            // inside a SwiftUI view update, where changing the settings'
+            // published values is not allowed.
+            let repositoryRoot = repositoryRoot(for: projectRoot)
+            DispatchQueue.main.async {
+                AgentSettings.shared.markWorktreeOpened(effectiveRoot, repositoryRoot: repositoryRoot)
+            }
         }
 
         if NSApplication.shared.isActive,

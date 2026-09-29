@@ -761,6 +761,13 @@ enum HostedAttachmentStatusFile {
         }
     }
 
+    /// Removes the launch directories of apps that ended (once per run) on a
+    /// background queue, so the first adapter a launch attaches does not
+    /// sweep the temporary directory on the main thread.
+    static func removeAbandonedLaunchDirectoriesInBackground() {
+        DispatchQueue.global(qos: .utility).async { _ = abandonedDirectoriesRemoved }
+    }
+
     static func makeLaunchDirectory() throws -> URL {
         _ = abandonedDirectoriesRemoved
         return try makeLaunchDirectory(in: FileManager.default.temporaryDirectory)

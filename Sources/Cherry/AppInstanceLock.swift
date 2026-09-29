@@ -286,6 +286,7 @@ enum InstanceLockLaunchWait {
         then launch: @escaping @MainActor () -> Void
     ) -> Task<Void, Never>? {
         if lock.isResolved {
+            LaunchTimeline.mark("instance lock was resolved already")
             launch()
             return nil
         }

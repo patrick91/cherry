@@ -15,6 +15,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private var didScheduleInitialWindowOpen = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        LaunchTimeline.mark("will finish launching")
         MainActor.assumeIsolated {
             Self.configureSessionRecords(localSessions: .shared, store: .shared)
             // Each device's hosting records the same (docs/specs/remote-devices.md).
@@ -31,6 +32,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchTimeline.mark("did finish launching")
         MainActor.assumeIsolated {
             Self.observeQuitReasons()
         }
@@ -45,8 +47,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         MainActor.assumeIsolated {
             Self.startLaunchHousekeeping()
         }
+        // Before the first restored tab attaches (it would sweep on the main
+        // thread).
+        HostedAttachmentStatusFile.removeAbandonedLaunchDirectoriesInBackground()
         MainActor.assumeIsolated {
             Self.finishLaunchingAfterInstanceLock(lock: .shared, store: .shared) {
+                LaunchTimeline.mark("instance lock resolved")
+                // The windows to reopen, read before any window registers.
+                ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
                 // Reach the local session host now, in the background, so
                 // the first persistent tabs do not wait for its helper,
                 // login environment and daemon to start.
@@ -57,6 +65,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 // not do while its Mac was offline once that Mac answers
                 // (it connects to none now).
                 RemoteDeviceStore.shared.registerHostings()
+                LaunchTimeline.mark("warm-up and background sessions started")
                 DispatchQueue.main.async {
                     NSApp.activate(ignoringOtherApps: true)
                     Self.firstProjectCapableWindow?.makeKeyAndOrderFront(nil)
@@ -672,30 +681,33 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private static let quitReplyDeadline: TimeInterval = 10
     @MainActor private static var hasRepliedToTermination = false
 
+    /// How long the launch waits before it decides whether to open the
+    /// default project's window: a window a deep link opens (its URL
+    /// arrives just after launch) is then there, and none is opened.
+    static let defaultWindowDecisionDelay: Duration = .milliseconds(250)
+
+    @MainActor
     private func scheduleDefaultWindowOpenIfNeeded() {
         guard !didScheduleInitialWindowOpen else { return }
         didScheduleInitialWindowOpen = true
         let openDefaultProjectWindow = openDefaultProjectWindow
         let openProjectWindow = openProjectWindow
 
-        Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(250))
-            } catch {
-                return
-            }
-
-            // Windows that had tabs come back from the app's own list: AppKit
-            // restores no project window. One a deep link opened meanwhile
-            // is skipped, and opening a scene value that has a window only
-            // focuses it.
-            let plan = ProjectWindowRegistry.shared.launchWindowPlan(
-                hasVisibleWindow: NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
-            )
+        let open: @MainActor (LaunchWindowPlan) -> Void = { plan in
+            LaunchTimeline.mark({
+                switch plan {
+                case .reopen(let roots): "window plan: reopen \(roots.count)"
+                case .openDefault: "window plan: default window"
+                case .nothing: "window plan: nothing"
+                }
+            }())
             var reopened: [String] = []
             switch plan {
             case .reopen(let projectRoots):
                 if let openProjectWindow {
+                    // Off screen from the moment AppKit orders them in until
+                    // their saved tabs are back (`ProjectWindowReveal`).
+                    ProjectWindowRegistry.shared.launchWindowCover?.expect(projectRoots.count)
                     projectRoots.forEach(openProjectWindow)
                     reopened = projectRoots
                 } else {
@@ -709,6 +721,26 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             // Once those windows restored their tabs: sessions of closed
             // windows or tabs that still run.
             ProjectWindowRegistry.shared.backgroundSessionsNotice?.launchWindowsOpened(expecting: reopened)
+        }
+
+        // Windows that had tabs come back from the app's own list (AppKit
+        // restores no project window), at once: opening a scene value that
+        // has a window (one a deep link opened) only focuses it.
+        if let plan = ProjectWindowRegistry.shared.savedWindowsLaunchPlan() {
+            open(plan)
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await Task.sleep(for: Self.defaultWindowDecisionDelay)
+            } catch {
+                return
+            }
+            // The default project's window, unless a deep link opened one
+            // meanwhile.
+            open(ProjectWindowRegistry.shared.launchWindowPlan(
+                hasVisibleWindow: NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
+            ))
         }
     }
 
@@ -832,15 +864,25 @@ struct CherryApp: App {
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
     init() {
+        LaunchTimeline.isEnabled = true
+        LaunchTimeline.mark("app init")
         RemoteViewCrashGuard.installIfNeeded()
         // Saved windows of a device's projects reopen while it is known.
         ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key) != nil
         }
-        ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
+        // The saved state (`configureWorkspacePersistence`) is read once the
+        // instance lock is resolved, off this thread (`applicationDidFinishLaunching`):
+        // reading it here would take the lock on the main thread, blocking
+        // the launch while a previous copy quits.
         ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
         // The Omni bar's Projects › Recent and project frecency.
         ProjectWindowRegistry.shared.projectRecency = .shared
+        ProjectWindowRegistry.shared.launchWindowCover = LaunchWindowCover { window in
+            // A window of the project scene (SwiftUI names them after it).
+            !(window is NSPanel) && (window.identifier?.rawValue.hasPrefix(Self.projectWindowSceneID) ?? false)
+        }
+        LaunchTimeline.mark("app init done")
     }
 
     // Menu actions resolve their target from the key window, not the
@@ -1358,6 +1400,11 @@ private struct ProjectWorkspaceView: View {
         .overlay(alignment: .bottom) {
             // A device window whose saved tabs wait for the device.
             RemoteWindowWaitingBar(repository: repository)
+                .padding(.bottom, 14)
+        }
+        .overlay(alignment: .bottom) {
+            // A window that had to show before its saved tabs were back.
+            WindowRestoringBar(repository: repository)
                 .padding(.bottom, 14)
         }
         .background(ProjectWindowBinder(

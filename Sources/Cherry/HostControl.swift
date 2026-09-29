@@ -491,6 +491,21 @@ final class HostControl: ObservableObject {
         scheduleIdleDisconnectIfUnused()
     }
 
+    /// Starts capturing the login environment a connection needs
+    /// (`HostedSessionClient.resolvedLoginEnvironment`, the user's login
+    /// shell) off the main actor now, unless connected or connecting: the
+    /// connection that follows finds it captured, or waits for this
+    /// capture, instead of starting the shell only once its own task gets
+    /// the main actor (at launch, after the windows are built).
+    func prefetchLoginEnvironment() {
+        guard connection == nil, connectAttempt == nil, unavailableReason == nil, !isShutDown,
+              let client = try? clientProvider()
+        else { return }
+        Task.detached(priority: .userInitiated) {
+            _ = await client.resolvedLoginEnvironment()
+        }
+    }
+
     /// Connects unless connected. `retryingLoginEnvironment` makes a new
     /// connection try the login shell again at once (an explicit refresh).
     @discardableResult
@@ -601,12 +616,14 @@ final class HostControl: ObservableObject {
     }
 
     private func establishConnection(retryingLoginEnvironment: Bool) async throws -> HostControlConnection {
+        LaunchTimeline.mark("host connecting \(host.id)")
         state = .connecting
         do {
             let connection = try await openConnection(retryingLoginEnvironment: retryingLoginEnvironment)
             reconnectFailures = 0
             connectionCount += 1
             state = .connected
+            LaunchTimeline.mark("host connected \(host.id)")
             startHeartbeat(on: connection)
             scheduleIdleDisconnectIfUnused()
             return connection
@@ -633,6 +650,7 @@ final class HostControl: ObservableObject {
         }
         executableURL = client.executableURL
         let capture = await client.resolvedLoginEnvironment(retryingNow: retryingLoginEnvironment)
+        LaunchTimeline.mark("host login environment \(host.id)")
         try checkNotShutDown()
         loginEnvironment = capture
         let environment = HostedSessionLoginEnvironment.helperEnvironment(

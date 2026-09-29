@@ -805,6 +805,7 @@ final class RestoredTabLaunchQueue {
         while launched < max(1, batchSize), let tab = next() {
             if tab.launchDeferredAdapterIfNeeded() {
                 launched += 1
+                LaunchTimeline.mark("adapter launched \(tab.title)")
             }
         }
         if !shown.isEmpty || !background.isEmpty {

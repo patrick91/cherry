@@ -127,6 +127,13 @@ final class RepositoryWorkspace: ObservableObject {
     /// Saved tabs of a device's window a restore kept because the device
     /// could not be reached: they come back once it answers.
     @Published private(set) var remoteTabsWaitingCount = 0
+    /// Whether the restore that opens the window's first worktree has not
+    /// brought its saved tabs back yet: the window stays off screen until it
+    /// has (`ProjectWindowReveal`), and says it is restoring them if it has
+    /// to show first (`WindowRestoringBar`). False for a window with nothing
+    /// to restore.
+    @Published private(set) var isAwaitingInitialRestore: Bool
+    private var initialRestoreWaiters: [@MainActor () -> Void] = []
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
     /// The registry this repository's window registered with
@@ -206,6 +213,7 @@ final class RepositoryWorkspace: ObservableObject {
             pendingRecords[record.root] = record
         }
         pendingWorktreeRecords = pendingRecords
+        isAwaitingInitialRestore = pendingRecords[initialRoot] != nil
         if let stateStore, stateStore.isEnabled, let localSessions = backendPolicy.localSessions {
             let sessionsToEnd = stateStore.loadSessionsToEnd()
             orphanCriteria = OrphanedSessionCriteria(
@@ -906,6 +914,7 @@ final class RepositoryWorkspace: ObservableObject {
             orphanScanTask?.cancel()
             orphanScanTask = nil
             orphanScanRetry = nil
+            settleInitialRestore()
         }
         workspaces.values.forEach(close)
         if intent.tearsDownWorkspace {
@@ -1611,8 +1620,11 @@ final class RepositoryWorkspace: ObservableObject {
         let restorer = sessionRestorer
         restoreCancellations[root, default: []].append(request.cancellation)
         restoreTaskRecordIDs[root] = asked
+        let name = URL(fileURLWithPath: root).lastPathComponent
+        LaunchTimeline.mark("restore began \(name) records=\(asked.count)")
         restoreTasks[root] = Task { @MainActor [weak self] in
             let result = await restorer(request)
+            LaunchTimeline.mark("restore answered \(name) tabs=\(result.sessions.count) pending=\(result.pendingRecordIDs.count)")
             guard let self else {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
@@ -1631,6 +1643,8 @@ final class RepositoryWorkspace: ObservableObject {
     ) {
         restoreTasks[root] = nil
         restoreTaskRecordIDs[root] = nil
+        // Whatever happens next, the window waits for nothing more.
+        defer { if root == initialWorktreeRoot { settleInitialRestore() } }
         guard !isTearingDown, workspaces[root] === workspace else {
             // The window closed, the app quit or the worktree was removed
             // meanwhile: end these tabs the way that close ended the others.
@@ -1641,6 +1655,27 @@ final class RepositoryWorkspace: ObservableObject {
         // Every record asked for stays saved until the restore answers for it.
         keptWorktreeRecords[root] = record.restricted(to: asked)
         applyRestoreStep(root: root, asked: asked, result: result, layout: record, workspace: workspace, step: .initial)
+    }
+
+    /// Runs `body` once the restore that opens the window's first worktree
+    /// has put its tabs, layout and selection in place (or the window was
+    /// torn down first): at once when there is nothing to wait for. Hosts
+    /// that did not answer within the restore's initial wait come back
+    /// later, into the window already shown.
+    func whenInitialRestoreSettles(_ body: @escaping @MainActor () -> Void) {
+        guard isAwaitingInitialRestore else {
+            body()
+            return
+        }
+        initialRestoreWaiters.append(body)
+    }
+
+    private func settleInitialRestore() {
+        guard isAwaitingInitialRestore else { return }
+        isAwaitingInitialRestore = false
+        let waiters = initialRestoreWaiters
+        initialRestoreWaiters.removeAll()
+        waiters.forEach { $0() }
     }
 
     private enum RestoreStep: Equatable {

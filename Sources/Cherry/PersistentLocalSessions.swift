@@ -549,6 +549,9 @@ final class PersistentHostSessions {
     func warmUp() {
         guard canHostNewTabs() else { return }
         let control = control
+        // The login shell is the slow part: it starts now, not behind the
+        // launch's windows (the connect task below waits for the main actor).
+        control.prefetchLoginEnvironment()
         Task { @MainActor in
             _ = try? await control.connect()
         }

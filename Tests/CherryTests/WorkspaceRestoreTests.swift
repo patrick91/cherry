@@ -2284,3 +2284,250 @@ private func beforeTheLastBoot() throws -> Date {
     #expect(local.hosted?.host == HostedSessionHost.local.id)
     #expect(local.mayOwnLocalSession)
 }
+
+// MARK: - Restored windows come on screen with their tabs
+
+private func makeRevealTestWindow() -> NSWindow {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    return window
+}
+
+/// Waits (at most `timeout`) for `condition`, turning the main loop.
+@MainActor
+private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while !condition() {
+        guard ContinuousClock.now < deadline else { return false }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return true
+}
+
+/// A window whose saved tabs are still being restored registers off screen
+/// (transparent, letting clicks through) and comes on screen only once they
+/// are in place, never empty first.
+@Test @MainActor func aRestoredWindowStaysOffScreenUntilItsTabsAreBack() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-reveal-restored")
+    let storeDirectory = try canonicalDirectory("cherry-reveal-restored-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
+    harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
+    ))
+    let gate = RestorerGate()
+    let restorer = harness.restorer
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: { request in
+            await gate.wait()
+            return await restorer(request)
+        },
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    let registry = ProjectWindowRegistry()
+    registry.windowRevealMaximumWait = .seconds(60)
+    let window = makeRevealTestWindow()
+    defer {
+        gate.open()
+        registry.unregister(window: window, projectRoot: root.path)
+        window.close()
+        repository.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    #expect(repository.isAwaitingInitialRestore)
+    #expect(registry.register(
+        window: window,
+        projectRoot: root.path,
+        workspace: repository.activeWorkspace,
+        repository: repository,
+        noteStore: nil,
+        todoStore: nil,
+        chromeState: nil
+    ))
+    #expect(window.alphaValue == 0)
+    #expect(window.ignoresMouseEvents)
+    // What the window has once it may show.
+    var tabsWhenSettled: [UUID]?
+    repository.whenInitialRestoreSettles { tabsWhenSettled = repository.activeWorkspace.sessions.map(\.id) }
+
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    #expect(await harness.fake.wait { gate.waiting == 1 })
+    // The host has not answered: still off screen, and empty.
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(window.alphaValue == 0)
+    #expect(repository.activeWorkspace.sessions.isEmpty)
+    #expect(tabsWhenSettled == nil)
+
+    gate.open()
+    await repository.waitForPendingRestores()
+    #expect(!repository.isAwaitingInitialRestore)
+    #expect(tabsWhenSettled == [shell.id])
+    // On the next turn, with its tab.
+    #expect(await eventually { window.alphaValue == 1 })
+    #expect(!window.ignoresMouseEvents)
+    #expect(repository.activeWorkspace.sessions.map(\.id) == [shell.id])
+}
+
+/// A host that is slow to answer never leaves the user without the window:
+/// after the wait it shows anyway, still restoring (`WindowRestoringBar`),
+/// and the tabs come into it when the host answers.
+@Test @MainActor func aSlowRestoreShowsItsWindowOnceTheWaitRunsOut() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-reveal-slow")
+    let storeDirectory = try canonicalDirectory("cherry-reveal-slow-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
+    harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
+    ))
+    let gate = RestorerGate()
+    let restorer = harness.restorer
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: { request in
+            await gate.wait()
+            return await restorer(request)
+        },
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    let registry = ProjectWindowRegistry()
+    registry.windowRevealMaximumWait = .milliseconds(100)
+    let window = makeRevealTestWindow()
+    defer {
+        gate.open()
+        registry.unregister(window: window, projectRoot: root.path)
+        window.close()
+        repository.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    let registeredAt = ContinuousClock.now
+    #expect(registry.register(
+        window: window,
+        projectRoot: root.path,
+        workspace: repository.activeWorkspace,
+        repository: repository,
+        noteStore: nil,
+        todoStore: nil,
+        chromeState: nil
+    ))
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    #expect(window.alphaValue == 0)
+    #expect(await eventually { window.alphaValue == 1 })
+    #expect(ContinuousClock.now - registeredAt >= .milliseconds(100))
+    #expect(!window.ignoresMouseEvents)
+    // On screen while its tabs are still coming: it says so.
+    #expect(repository.isAwaitingInitialRestore)
+    #expect(gate.waiting == 1)
+
+    gate.open()
+    await repository.waitForPendingRestores()
+    #expect(!repository.isAwaitingInitialRestore)
+    #expect(repository.activeWorkspace.sessions.map(\.id) == [shell.id])
+    #expect(window.alphaValue == 1)
+}
+
+/// A window with nothing to restore shows at once, and a window closed
+/// while its restore waits lets its waiters go.
+@Test @MainActor func aWindowWithNothingToRestoreShowsAtOnce() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-reveal-nothing")
+    let storeDirectory = try canonicalDirectory("cherry-reveal-nothing-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: harness.restorer,
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    let registry = ProjectWindowRegistry()
+    let window = makeRevealTestWindow()
+    defer {
+        registry.unregister(window: window, projectRoot: root.path)
+        window.close()
+        repository.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    #expect(!repository.isAwaitingInitialRestore)
+    var settled = false
+    repository.whenInitialRestoreSettles { settled = true }
+    #expect(settled)
+    #expect(registry.register(
+        window: window,
+        projectRoot: root.path,
+        workspace: repository.activeWorkspace,
+        repository: repository,
+        noteStore: nil,
+        todoStore: nil,
+        chromeState: nil
+    ))
+    #expect(window.alphaValue == 1)
+    #expect(!window.ignoresMouseEvents)
+}
+
+@Test @MainActor func closingAWindowWhoseRestoreWaitsSettlesIt() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalDirectory("cherry-reveal-closed")
+    let storeDirectory = try canonicalDirectory("cherry-reveal-closed-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
+    harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: repositoryKey(root),
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
+    ))
+    let gate = RestorerGate()
+    let restorer = harness.restorer
+    let repository = RepositoryWorkspace(
+        projectRoot: root.path,
+        backendPolicy: harness.policy,
+        stateStore: store,
+        sessionRestorer: { request in
+            await gate.wait()
+            return await restorer(request)
+        },
+        autoStartCommands: { _ in [] },
+        restoredTabLaunchQueue: RestoredTabLaunchQueue()
+    )
+    defer {
+        gate.open()
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    var settled = false
+    repository.whenInitialRestoreSettles { settled = true }
+    repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    #expect(await harness.fake.wait { gate.waiting == 1 })
+    #expect(!settled)
+    repository.closeAllSessions(intent: .windowClosed)
+    #expect(settled)
+    #expect(!repository.isAwaitingInitialRestore)
+}

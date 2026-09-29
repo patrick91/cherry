@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import GhosttyTerminal
 import Testing
 @testable import Cherry
 
@@ -47,4 +48,44 @@ import Testing
     #expect(bridge.terminalView.configuration.workingDirectory == changedDirectory.path)
     let relaunched = try await waitForLeader(otherThan: leader)
     #expect(kill(relaunched, 0) == 0)
+}
+
+// A bridge builds its surface once it has a controller, from the options it
+// has then. It once got the controller first, so every bridge built a surface
+// with the view's default options (an EXEC surface of Ghostty's default
+// command: the user's login shell), then replaced it with the tab's in the same
+// main-thread turn: a login shell started and killed for each tab, and the
+// freed surface's queued messages could reach the replacement.
+@Test @MainActor func aNewNativeTabBuildsOnlyItsOwnSurface() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cherry-native-first-surface-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let session = TerminalSession(title: "Shell", subtitle: "", tint: .systemBlue, workingDirectory: directory.path)
+    defer {
+        session.stop()
+        session.releaseGhosttyBridge()
+        try? FileManager.default.removeItem(at: directory)
+    }
+    #expect(session.usesNativePTYBackend)
+    let view = session.ghosttyBridge.terminalView
+    #expect(view.surfaceBuildCount == 1)
+    guard case .exec = view.configuration.backend else {
+        Issue.record("A native tab's surface is an EXEC surface")
+        return
+    }
+    #expect(view.configuration.workingDirectory == directory.path)
+    #expect(view.configuration.execCommand != nil)
+}
+
+// A tab that runs nothing gets an in-memory surface, which is built only in a
+// window: detached, its bridge builds none, and so starts no process.
+@Test @MainActor func aBridgeOfATabThatRunsNothingStartsNoProcess() {
+    let session = TerminalSession(title: "Idle", subtitle: "", tint: .systemBlue, launchShell: false)
+    defer { session.releaseGhosttyBridge() }
+    #expect(!session.usesNativePTYBackend)
+    let view = session.ghosttyBridge.terminalView
+    #expect(view.surfaceBuildCount == 0)
+    if case .exec = view.configuration.backend {
+        Issue.record("A tab that runs nothing has an in-memory surface")
+    }
 }

@@ -37,6 +37,10 @@ final class TerminalSurfaceCoordinator {
     var surface: TerminalSurface?
     let bridge = TerminalCallbackBridge()
 
+    /// How many surfaces this view has built. An EXEC surface starts its
+    /// child as it is built, so this also counts the children it started.
+    private(set) var surfaceBuildCount = 0
+
     // MARK: - Platform Hooks
 
     var isAttached: () -> Bool = { false }
@@ -143,6 +147,7 @@ final class TerminalSurfaceCoordinator {
 
         bridge.rawSurface = rawSurface
         surface = TerminalSurface(rawSurface)
+        surfaceBuildCount += 1
         // EXEC surfaces are created while detached so their child can start in
         // a background tab. A detached surface has no drawable and must be
         // reported as occluded until it is actually installed in a window;

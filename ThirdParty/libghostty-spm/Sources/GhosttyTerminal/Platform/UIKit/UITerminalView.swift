@@ -70,6 +70,12 @@
             core.surface
         }
 
+        /// How many surfaces this view has built (see
+        /// `TerminalSurfaceCoordinator.surfaceBuildCount`).
+        public var surfaceBuildCount: Int {
+            core.surfaceBuildCount
+        }
+
         public var hasText: Bool {
             true
         }

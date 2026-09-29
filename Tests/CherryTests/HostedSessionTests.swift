@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import SwiftUI
 import Testing
+import GhosttyTerminal
 @testable import Cherry
 
 private let hostedSessionFixture = """
@@ -1342,6 +1343,47 @@ private func fixtureSession() throws -> HostedSessionInfo {
     #expect(cli.calls.filter { $0.contains(" attach ") }.count == 3)
 }
 
+/// Bytes written to the terminal `ttyPath` that its master has not read
+/// (TIOCOUTQ on another descriptor of the same tty).
+private func unreadTerminalOutput(_ ttyPath: String) -> Int32? {
+    let fd = open(ttyPath, O_RDONLY | O_NOCTTY | O_NONBLOCK)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var count: Int32 = 0
+    return ioctl(fd, UInt(TIOCOUTQ), &count) == 0 ? count : nil
+}
+
+/// A one-second `sample` of this process, cut to Ghostty's pty threads
+/// (io-gather reads the pty, io-reader parses what it read, io writes to
+/// it): where a surface that stopped showing output waits.
+private func ghosttyIOThreadStacks() -> String {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-sample-\(UUID().uuidString).txt")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let sample = Process()
+    sample.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+    sample.arguments = ["\(getpid())", "1", "-mayDie", "-file", file.path]
+    sample.standardOutput = FileHandle.nullDevice
+    sample.standardError = FileHandle.nullDevice
+    guard (try? sample.run()) != nil else { return "sample failed to run" }
+    sample.waitUntilExit()
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return "no sample" }
+    var kept: [String] = []
+    var inThread = false
+    var linesInThread = 0
+    for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        if line.range(of: #"^\s+\d+ Thread_"#, options: .regularExpression) != nil {
+            inThread = [": io-gather", ": io-reader", ": io"].contains { line.hasSuffix($0) }
+            linesInThread = 0
+        } else if !line.hasPrefix("    +"), !line.hasPrefix("    |") {
+            inThread = false
+        }
+        guard inThread, linesInThread < 30 else { continue }
+        linesInThread += 1
+        kept.append(String(line.prefix(200)))
+    }
+    return kept.isEmpty ? "no Ghostty IO threads" : kept.joined(separator: "\n")
+}
+
 // Build the Rust helpers first with Scripts/build-host debug. This exercises the
 // different Ghostty versions in the host snapshot producer and native renderer.
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"))
@@ -1446,11 +1488,15 @@ private func fixtureSession() throws -> HostedSessionInfo {
             return output.split(separator: "\n").map { String($0.trimmingCharacters(in: .whitespaces).prefix(160)) }
                 .joined(separator: " / ")
         }
+        // What the tty's programs wrote that Ghostty has not read yet: a
+        // screen that stays blank with bytes here means Ghostty's reader
+        // stopped, none means they were read (or never written).
+        let unread = tty.flatMap(unreadTerminalOutput).map(String.init) ?? "unknown"
         return "status \(String(describing: session.hostedAttachmentStatus)), "
             + "adapter \(String(describing: session.adapterLiveStatus)), "
-            + "child pid \(String(describing: session.childProcessID)), "
+            + "surfaces built \(view.surfaceBuildCount), "
             + "view in window \(view.window != nil) bounds \(view.bounds.size), "
-            + "tty \(tty ?? "none") running [\(processes ?? "")], "
+            + "tty \(tty ?? "none") running [\(processes ?? "")], unread output \(unread) bytes, "
             + "screen \(screen.map { "\"\($0)\"" } ?? "unreadable (no surface)")"
     }
     // Each surface launch runs `cherry attach` (a debug build) through
@@ -1475,11 +1521,16 @@ private func fixtureSession() throws -> HostedSessionInfo {
             }
             try await Task.sleep(for: .milliseconds(25))
         }
+        let waited = Date().timeIntervalSince(stepStart)
+        let intoTest = Date().timeIntervalSince(started)
         let tabs = watched.map { "\($0.name): \(describe($0.session))" }.joined(separator: "; ")
         let hosted = await hostSessions()
+        // Where Ghostty's pty threads wait, for the log (symbolicating takes
+        // a while).
+        print("Ghostty IO threads at the timeout of \(description):\n\(ghosttyIOThreadStacks())")
         throw HostedSessionError.message(
-            "Timed out waiting for \(description) after \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s "
-                + "(\(String(format: "%.1f", Date().timeIntervalSince(started)))s into the test; earlier steps: "
+            "Timed out waiting for \(description) after \(String(format: "%.1f", waited))s "
+                + "(\(String(format: "%.1f", intoTest))s into the test; earlier steps: "
                 + "\(steps.joined(separator: ", "))). Tabs: \(tabs.isEmpty ? "none" : tabs). Host sessions: \(hosted)"
         )
     }

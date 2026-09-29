@@ -87,6 +87,12 @@
             core.surface
         }
 
+        /// How many surfaces this view has built (see
+        /// `TerminalSurfaceCoordinator.surfaceBuildCount`).
+        public var surfaceBuildCount: Int {
+            core.surfaceBuildCount
+        }
+
         override public init(frame: NSRect) {
             super.init(frame: frame)
             commonInit()

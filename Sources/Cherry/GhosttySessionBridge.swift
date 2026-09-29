@@ -464,9 +464,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             TerminalPerformanceMonitor.recordRenderTick()
             self?.handlePostRender()
         }
-        terminalView.controller = controller
         if isNativePTYBacked {
-            // Native eagerly creates the EXEC surface on the next line, which spawns
+            // Native eagerly creates the EXEC surface below, which spawns
             // the child immediately. A background-spawned agent queries the terminal
             // background (OSC 11) for its very first render, so the theme/scheme must
             // be on the controller BEFORE the surface exists — otherwise that first
@@ -475,11 +474,19 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             activeColorScheme = Self.resolvedColorScheme()
             applyTerminalSettings()
         }
+        // The tab's options go on before the controller: the view builds a
+        // surface as soon as it has a controller, from the options it has
+        // then. Before them it has the default options, an EXEC surface of
+        // Ghostty's default command, so each bridge started the user's login
+        // shell only to kill it a moment later, and replaced that surface in
+        // the same main-thread turn, which lets the freed surface's queued
+        // messages reach its replacement (see `relaunchNativeSurface`).
         terminalView.configuration = Self.makeOptions(
             for: session,
             inMemorySession: inMemorySession,
             useNativePTY: isNativePTYBacked
         )
+        terminalView.controller = controller
         proxy.bridge = self
         observeSettingsChanges()
     }

@@ -497,8 +497,7 @@ private struct OmniBarRow: View {
 
     var body: some View {
         HStack(spacing: 11) {
-            Image(systemName: row.item.symbol)
-                .font(.system(size: 13, weight: .medium))
+            icon
                 .foregroundStyle(.secondary)
                 .frame(width: 18)
                 .accessibilityHidden(true)
@@ -533,6 +532,22 @@ private struct OmniBarRow: View {
         .accessibilityLabel(row.item.accessibilityLabel)
         .accessibilityHint(row.item.actions.isEmpty ? row.item.primaryLabel : "\(row.item.primaryLabel). Command-K for actions.")
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    /// The agent's logo as a template, tinted like the symbols (the
+    /// menu-bar agent list's `AgentLogoLoader`), else the SF Symbol.
+    @ViewBuilder
+    private var icon: some View {
+        if let logo = row.item.logo, let image = AgentLogoLoader.image(named: logo) {
+            Image(nsImage: image)
+                .resizable()
+                .renderingMode(.template)
+                .scaledToFit()
+                .frame(width: 15, height: 15)
+        } else {
+            Image(systemName: row.item.symbol)
+                .font(.system(size: 13, weight: .medium))
+        }
     }
 
     private var title: Text {

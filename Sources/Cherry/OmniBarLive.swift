@@ -301,17 +301,29 @@ enum OmniBarGathering {
                     projectName: projectName,
                     machine: machine,
                     isWorking: session.agentActivityState == .working,
-                    canDetach: SessionCloseCoordinator.canDetach(session)
+                    canDetach: SessionCloseCoordinator.canDetach(session),
+                    agentKey: agentKey(of: session)
                 )
             }
         }
+    }
+
+    /// An agent tab's tool, as the menu-bar agent list names it
+    /// (`MenuBarAgentsModel.refresh`); nil for other tabs.
+    static func agentKey(of session: TerminalSession) -> String? {
+        guard session.kind == .agent else { return nil }
+        let brand = AgentToolBrand.detect(name: session.agentName ?? session.title, commandLine: session.subtitle)
+        return brand?.rawValue ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title)
     }
 
     /// This Mac's background sessions, then each device's.
     static func background(_ model: BackgroundSessionsModel) -> [OmniBackgroundSession] {
         func rows(_ sessions: [BackgroundSession], on machine: ProjectSwitcherModel.Machine) -> [OmniBackgroundSession] {
             sessions.filter(\.isRunning).map {
-                OmniBackgroundSession(id: $0.id, title: $0.title, machine: machine, isAtWork: $0.isAtWork)
+                OmniBackgroundSession(
+                    id: $0.id, title: $0.title, machine: machine, isAtWork: $0.isAtWork,
+                    agentKey: $0.kind == .agent ? ($0.agentKey ?? $0.title) : nil
+                )
             }
         }
         var result = rows(model.sessions, on: .thisMac)

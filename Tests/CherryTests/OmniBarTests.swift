@@ -608,6 +608,74 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(elapsed / queries.count < .milliseconds(30), "\(elapsed / queries.count) a keystroke")
 }
 
+// MARK: - Agent logos
+
+@Test @MainActor func omniAgentRowsShowTheirToolsLogo() {
+    var sources = fixture()
+    sources.agents = [
+        OmniAgent(id: "codex", name: "Codex", commandLine: "codex --yolo"),
+        OmniAgent(id: "claude", name: "Claude", commandLine: "claude --dangerously-skip-permissions"),
+        OmniAgent(id: "pi", name: "Pi", commandLine: "pi"),
+        OmniAgent(id: "amp", name: "Amp", commandLine: "amp"),
+        OmniAgent(id: "gemini", name: "Gemini", commandLine: "gemini"),
+        OmniAgent(id: "opencode", name: "OpenCode", commandLine: "opencode"),
+        // A preset shows its base tool's logo.
+        OmniAgent(id: "claude with chrome", name: "Claude with Chrome", commandLine: "claude --chrome"),
+        OmniAgent(id: "mytool", name: "My Tool", commandLine: "mytool --fast"),
+    ]
+    let logos = Dictionary(uniqueKeysWithValues: OmniProviders.agents(sources).map { ($0.title, $0.logo) })
+    #expect(logos["New Codex agent"] == "openai")
+    #expect(logos["New Claude agent"] == "claude")
+    #expect(logos["New Pi agent"] == "pi")
+    #expect(logos["New Amp agent"] == "amp")
+    #expect(logos["New Gemini agent"] == "gemini")
+    #expect(logos["New Claude with Chrome agent"] == "claude")
+    // OpenCode has no logo, and an unknown tool none: the symbol.
+    #expect(logos["New OpenCode agent"] == .some(nil))
+    #expect(logos["New My Tool agent"] == .some(nil))
+    let unknown = OmniProviders.agents(sources).first { $0.title == "New My Tool agent" }
+    #expect(unknown?.symbol == "sparkles")
+    // Each logo is one the app bundles.
+    for logo in logos.values.compactMap({ $0 }) {
+        #expect(AgentLogoLoader.image(named: logo) != nil, "\(logo)")
+    }
+
+    // New Agent and Add Agent… keep the symbol.
+    let commands = OmniProviders.commands(sources)
+    for id in ["command:agents", "command:addAgent"] {
+        let item = commands.first { $0.id == id }
+        #expect(item != nil && item?.logo == nil, "\(id)")
+    }
+    #expect(OmniProviders.agentScope(sources).last?.logo == nil)
+
+    // Presets: the tool's logo; Custom keeps its symbol.
+    let presets = Dictionary(uniqueKeysWithValues: OmniProviders.agentPresets(sources).map { ($0.id, $0) })
+    #expect(presets["preset:codex"]?.logo == "openai")
+    #expect(presets["preset:custom"]?.logo == nil && presets["preset:custom"]?.symbol == "plus")
+}
+
+@Test func omniAgentTabsAndSessionsShowTheirToolsLogo() {
+    var sources = fixture()
+    let claudeTab = UUID()
+    let unknownTab = UUID()
+    sources.tabs += [
+        OmniTab(id: claudeTab, title: "Fix the amp parser", projectName: "cherry", machine: .thisMac, isWorking: true, canDetach: true, agentKey: "claude"),
+        OmniTab(id: unknownTab, title: "Agent", projectName: "cherry", machine: .thisMac, isWorking: false, canDetach: true, agentKey: "mytool"),
+    ]
+    sources.backgroundSessions += [
+        OmniBackgroundSession(id: "s-codex", title: "Refactor", machine: .thisMac, isAtWork: true, agentKey: "codex"),
+    ]
+    let tabs = Dictionary(uniqueKeysWithValues: OmniProviders.tabs(sources).map { ($0.id, $0) })
+    #expect(tabs["tab:\(claudeTab.uuidString)"]?.logo == "claude")
+    #expect(tabs["tab:\(unknownTab.uuidString)"]?.logo == nil)
+    // A shell tab keeps its symbol, whatever its title says.
+    #expect(tabs["tab:\(tabCodex.uuidString)"]?.logo == nil)
+    #expect(tabs["tab:\(tabCodex.uuidString)"]?.symbol == "terminal")
+    let sessions = Dictionary(uniqueKeysWithValues: OmniProviders.backgroundSessions(sources).map { ($0.id, $0) })
+    #expect(sessions["session:s-codex"]?.logo == "openai")
+    #expect(sessions["session:s-graphql"]?.logo == nil)
+}
+
 // MARK: - Running rows
 
 @Test @MainActor func omniRowsRunThroughTheWindowsOwnPaths() throws {

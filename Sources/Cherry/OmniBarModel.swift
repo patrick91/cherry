@@ -161,8 +161,11 @@ struct OmniItem: Equatable, Identifiable {
     /// The one muted detail on the right.
     var detail = ""
     var status: OmniStatus?
-    /// An SF Symbol.
+    /// An SF Symbol, shown when it has no `logo`.
     var symbol: String
+    /// The agent's logo (`Resources/AgentLogos`,
+    /// `AgentToolBrand.logoResourceName`), shown instead of `symbol`.
+    var logo: String?
     /// What ↵ does, named in the footer ("↵ Open").
     var primaryLabel: String
     var primary: OmniCommand
@@ -403,6 +406,9 @@ struct OmniTab: Equatable {
     var machine: ProjectSwitcherModel.Machine
     var isWorking: Bool
     var canDetach: Bool
+    /// An agent tab's tool (a brand's raw value, or the agent's name), for
+    /// its logo; nil for other tabs.
+    var agentKey: String? = nil
 }
 
 /// A background session (`BackgroundSessionsModel.allSessions`).
@@ -411,6 +417,9 @@ struct OmniBackgroundSession: Equatable {
     var title: String
     var machine: ProjectSwitcherModel.Machine
     var isAtWork: Bool
+    /// An agent session's tool (`cherry.agent`, else its title), for its
+    /// logo; nil for other sessions.
+    var agentKey: String? = nil
 }
 
 /// A worktree of the window's project.
@@ -703,6 +712,7 @@ enum OmniProviders {
                     detail: tab.projectName,
                     status: tab.isWorking ? .working : nil,
                     symbol: "terminal",
+                    logo: tab.agentKey.flatMap(AgentToolBrand.logoResourceName(forAgentKey:)),
                     primaryLabel: "Go to Tab",
                     primary: .goToTab(tab.id),
                     actions: actions,
@@ -723,6 +733,7 @@ enum OmniProviders {
                     detail: "background",
                     status: session.isAtWork ? .working : nil,
                     symbol: "terminal",
+                    logo: session.agentKey.flatMap(AgentToolBrand.logoResourceName(forAgentKey:)),
                     primaryLabel: "Open in Tab",
                     primary: .openBackgroundSession(id: session.id),
                     actions: [
@@ -911,11 +922,18 @@ enum OmniProviders {
                 kind: .agent,
                 title: "New \(agent.name) agent",
                 symbol: "sparkles",
+                logo: logo(for: agent),
                 primaryLabel: "Start",
                 primary: .launchAgent(id: agent.id),
                 keywords: [agent.name, agent.commandLine]
             )
         }
+    }
+
+    /// An agent's (or a preset's, by its base tool) logo, as the sidebar
+    /// resolves it; nil for a tool without one.
+    static func logo(for agent: OmniAgent) -> String? {
+        AgentToolBrand.detect(name: agent.name, commandLine: agent.commandLine)?.logoResourceName
     }
 
     static func agentScope(_ sources: OmniSources) -> [OmniItem] {
@@ -937,6 +955,7 @@ enum OmniProviders {
                 title: preset.name,
                 detail: preset.commandLine.isEmpty ? "Custom" : "",
                 symbol: preset.commandLine.isEmpty ? "plus" : "sparkles",
+                logo: preset.commandLine.isEmpty ? nil : logo(for: preset),
                 primaryLabel: "Add",
                 primary: .configureAgentPreset(id: preset.id),
                 keywords: [preset.commandLine]

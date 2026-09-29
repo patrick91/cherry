@@ -813,7 +813,8 @@ private struct MenuBarAgentGlyph: View {
     let agentKey: String
 
     var body: some View {
-        if let name = Self.logoResource(for: agentKey), let image = Self.logo(named: name) {
+        if let name = AgentToolBrand.logoResourceName(forAgentKey: agentKey),
+           let image = AgentLogoLoader.image(named: name) {
             Image(nsImage: image)
                 .resizable()
                 .renderingMode(.template)
@@ -825,14 +826,13 @@ private struct MenuBarAgentGlyph: View {
                 .foregroundStyle(.secondary)
         }
     }
+}
 
-    private static func logoResource(for key: String) -> String? {
-        AgentToolBrand(rawValue: key)?.logoResourceName
-            ?? AgentToolBrand.detect(name: key)?.logoResourceName
-    }
-
+/// Loads an agent's logo SVG (`Resources/AgentLogos`) for template rendering;
+/// the menu-bar agent list and the Omni bar share it.
+enum AgentLogoLoader {
     @MainActor private static var cache: [String: NSImage?] = [:]
-    @MainActor private static func logo(named name: String) -> NSImage? {
+    @MainActor static func image(named name: String) -> NSImage? {
         if let cached = cache[name] { return cached }
         // `.process` flattens the resource tree, so the SVGs live at the bundle root,
         // not under AgentLogos/ — try the subdirectory first, then the flattened path.

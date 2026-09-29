@@ -91,6 +91,14 @@ enum AgentToolBrand: String, Equatable {
         }
     }
 
+    /// The logo of an agent key (`cherry.agent`, a brand's raw value, or an
+    /// agent's name), as the menu-bar agent list, background sessions and
+    /// the Omni bar show it; nil for a tool without one.
+    static func logoResourceName(forAgentKey key: String) -> String? {
+        AgentToolBrand(rawValue: key)?.logoResourceName
+            ?? AgentToolBrand.detect(name: key)?.logoResourceName
+    }
+
     static func detect(name: String?, commandLine: String? = nil) -> AgentToolBrand? {
         for source in [name, commandLine].compactMap({ $0 }) {
             let tokens = source

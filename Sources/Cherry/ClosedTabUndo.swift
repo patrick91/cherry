@@ -122,7 +122,7 @@ final class ClosedTabHistory {
     /// nothing shows them meanwhile (not the sidebar, Background Sessions
     /// or MCP), so a window left in the background must not keep them
     /// running for hours.
-    static let longestUnattendedWait: TimeInterval = 60
+    static let longestUnattendedWait: TimeInterval = 4
     /// Only the latest scheduled check may act.
     private var checkGeneration = 0
     private let now: @MainActor () -> Date

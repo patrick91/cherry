@@ -128,8 +128,8 @@ Undoing a close or detach (`ClosedTabHistory`):
 - Each close can be undone for as long as its toast would stay: 6 s (30 s
   while VoiceOver runs), its time stopped while the pointer rests on its
   toast (then at least 2 s more) and while its window is not key in the
-  active app. A close whose sessions end with it waits for its window for a
-  minute at most (`ClosedTabHistory.longestUnattendedWait`), then its time
+  active app. A close whose sessions end with it waits for its window for 4 s
+  at most (`ClosedTabHistory.longestUnattendedWait`; about 10 s in all), then its time
   runs anyway: its programs keep running until it ends, and nothing shows
   them meanwhile. Each keeps its own time: a newer toast replacing its toast
   leaves it as it is. Once that runs out it drops out of ⌘Z.

@@ -277,7 +277,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     #expect(chromeState.toasts.current == nil)
     #expect(await harness.fake.wait { harness.requestIDs("kill") == [hoveredSession, unseenSession] })
 
-    // For a minute at most: its program runs on meanwhile, and nothing else
+    // For a few seconds at most: its program runs on meanwhile, and nothing else
     // shows it. A detach's time, whose session nothing ends, stays stopped.
     SessionCloseCoordinator.close(forgotten, in: workspace, chromeState: chromeState, registry: registry)
     chromeState.closedTabs.setAttended(false)

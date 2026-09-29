@@ -105,89 +105,57 @@ private func makeDiscovery(resolving urlsByBundleID: [String: URL]) -> ExternalE
     #expect(openedApp == zed.appURL)
 }
 
-@MainActor
-@Test func externalEditorRootItemsHiddenWithoutProjectOrEditors() {
-    let noProject = CommandPaletteRootItem.filteredItems(
-        query: "",
-        agents: [],
-        projects: [],
-        installedEditors: [installed("zed")],
-        hasOpenProject: false
-    )
-    #expect(!noProject.map(\.id).contains { $0.hasPrefix("editor:") || $0 == "command:openInOtherEditor" })
+// MARK: - The Omni bar's editor rows
 
-    let noEditors = CommandPaletteRootItem.filteredItems(
-        query: "",
-        agents: [],
-        projects: [],
-        installedEditors: [],
-        hasOpenProject: true
-    )
-    #expect(!noEditors.map(\.id).contains { $0.hasPrefix("editor:") || $0 == "command:openInOtherEditor" })
+private func omniSources(editors: [OmniEditor], agents: [OmniAgent] = []) -> OmniSources {
+    var sources = OmniSources()
+    sources.window.hasProject = true
+    sources.editors = editors
+    sources.agents = agents
+    return sources
 }
 
-@MainActor
-@Test func externalEditorRootItemsOrderedAfterCommandsBeforeAgents() throws {
-    let agent = ResolvedAgentTool(
-        definition: AgentToolDefinition(name: "Codex", command: "codex"),
-        source: .global
-    )
-    let items = CommandPaletteRootItem.filteredItems(
-        query: "",
-        agents: [agent],
-        projects: [],
-        installedEditors: [installed("zed"), installed("xcode")],
-        hasOpenProject: true
-    )
-    let ids = items.map(\.id)
+@Test @MainActor func externalEditorOmniRowsNeedAProjectAndAnEditor() {
+    let editors = [installed("zed")]
+    #expect(OmniBarGathering.editors(editors, projectRoot: nil, preferredID: "").isEmpty)
+    #expect(OmniBarGathering.editors([], projectRoot: "/tmp/p", preferredID: "").isEmpty)
 
+    let none = OmniProviders.commands(omniSources(editors: [])).map(\.id)
+    #expect(!none.contains { $0.hasPrefix("editor:") || $0 == "command:openInOtherEditor" })
+}
+
+@Test @MainActor func externalEditorOmniRowsOpenInTheDefaultThenOffersTheOthers() throws {
+    let agent = OmniAgent(id: "codex", name: "Codex", commandLine: "codex")
+    let editors = OmniBarGathering.editors([installed("zed"), installed("xcode")], projectRoot: "/tmp/p", preferredID: "")
+    let items = OmniProviders.commands(omniSources(editors: editors, agents: [agent]))
+    let ids = items.map(\.id)
     let editorIndex = try #require(ids.firstIndex(of: "editor:zed"))
     let otherIndex = try #require(ids.firstIndex(of: "command:openInOtherEditor"))
     let agentIndex = try #require(ids.firstIndex(of: "agent:codex"))
-    let lastCommandIndex = try #require(ids.lastIndex(of: "command:toggleAppearance"))
-
-    #expect(lastCommandIndex < editorIndex)
     #expect(editorIndex + 1 == otherIndex)
     #expect(otherIndex < agentIndex)
     #expect(items[editorIndex].title == "Open in Zed")
+    #expect(items[editorIndex].primary == .openInEditor(editorID: "zed"))
+    #expect(items[otherIndex].primary == .drill(.editors))
+    // Open in Other Editor… lists every editor, the default first.
+    #expect(OmniProviders.editors(omniSources(editors: editors)).map(\.title) == ["Zed", "Xcode"])
 }
 
-@MainActor
-@Test func externalEditorRootItemsRespectDefaultEditorID() {
-    let items = CommandPaletteRootItem.filteredItems(
-        query: "",
-        agents: [],
-        projects: [],
-        installedEditors: [installed("zed"), installed("xcode")],
-        defaultEditorID: "xcode",
-        hasOpenProject: true
-    )
-
-    #expect(items.map(\.id).contains("editor:xcode"))
-    #expect(!items.map(\.id).contains("editor:zed"))
+@Test @MainActor func externalEditorOmniRowsRespectTheDefaultEditorID() {
+    let editors = OmniBarGathering.editors([installed("zed"), installed("xcode")], projectRoot: "/tmp/p", preferredID: "xcode")
+    #expect(editors.map(\.id) == ["xcode", "zed"])
+    let ids = OmniProviders.commands(omniSources(editors: editors)).map(\.id)
+    #expect(ids.contains("editor:xcode"))
+    #expect(!ids.contains("editor:zed"))
 }
 
-@MainActor
-@Test func externalEditorRootItemsMatchQuery() {
-    let editors = [installed("zed"), installed("xcode")]
-
-    let zedQuery = CommandPaletteRootItem.filteredItems(
-        query: "zed",
-        agents: [],
-        projects: [],
-        installedEditors: editors,
-        hasOpenProject: true
-    ).map(\.id)
-    #expect(zedQuery.contains("editor:zed"))
-    #expect(!zedQuery.contains("command:openInOtherEditor"))
-
-    let otherQuery = CommandPaletteRootItem.filteredItems(
-        query: "other editor",
-        agents: [],
-        projects: [],
-        installedEditors: editors,
-        hasOpenProject: true
-    ).map(\.id)
-    #expect(otherQuery.contains("command:openInOtherEditor"))
-    #expect(!otherQuery.contains("editor:zed"))
+@Test @MainActor func externalEditorOmniRowsMatchTheQuery() {
+    let sources = omniSources(editors: OmniBarGathering.editors([installed("zed"), installed("xcode")], projectRoot: "/tmp/p", preferredID: ""))
+    func ids(_ query: String) -> [String] {
+        OmniSections.build(scope: .commands, query: query, sources: sources, frecency: [:]).flatMap(\.rows).map(\.id)
+    }
+    #expect(ids("zed").first == "editor:zed")
+    #expect(!ids("zed").contains("command:openInOtherEditor"))
+    #expect(ids("other editor").first == "command:openInOtherEditor")
+    #expect(!ids("other editor").contains("editor:zed"))
 }

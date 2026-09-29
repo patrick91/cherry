@@ -48,7 +48,7 @@ struct InstalledEditor: Identifiable, Equatable {
 /// Resolves which known editors are installed, via Launch Services.
 ///
 /// Discovery and icon loading only run inside `refresh()` — call it when a
-/// surface appears (palette open, settings pane appear), never from a SwiftUI
+/// surface appears (Omni bar open, settings pane appear), never from a SwiftUI
 /// body.
 @MainActor
 final class ExternalEditorDiscovery: ObservableObject {

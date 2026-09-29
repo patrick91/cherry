@@ -751,7 +751,7 @@ final class BackgroundSessionsModel: ObservableObject {
         let control = localSessions.control
         guard isDevice, control.state != .connected, control.state != .connecting,
               localSessions.instanceUnavailableReason == nil,
-              TitlebarProjectMenuController.refreshesOnOpen(control.state)
+              RemoteDevicePeeks.refreshesOnOpen(control.state)
         else { return }
         let peeks = peeks
         Task { @MainActor [weak self] in

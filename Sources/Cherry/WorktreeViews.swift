@@ -368,6 +368,9 @@ struct NewWorktreeSheet: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @Binding var isPresented: Bool
+    /// The new branch's name to start with (the Omni bar's "New worktree
+    /// “q”").
+    var initialBranchName = ""
 
     @State private var mode: Mode = .newBranch
     @State private var branchName = ""
@@ -457,6 +460,9 @@ struct NewWorktreeSheet: View {
         }
         .padding(24)
         .frame(width: 540)
+        .onAppear {
+            if branchName.isEmpty { branchName = initialBranchName }
+        }
         .task {
             await loadReferences()
         }

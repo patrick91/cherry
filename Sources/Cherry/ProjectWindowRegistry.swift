@@ -1146,16 +1146,12 @@ private final class WeakChromeState {
     }
 }
 
-/// How the project switcher is shown in a window (`ProjectSwitcherStyle`;
-/// the menu style is an `NSMenu`, `projectSwitcherMenuRequest`).
-enum ProjectSwitcherPresentation: Equatable {
-    /// The palette over the window.
-    case palette
-    /// The Macs sidebar, anchored to the title-bar picker.
-    case sidebarPopover
-    /// The Macs sidebar over the window: the picker is hidden with the
-    /// sidebar, so there is nothing to anchor to.
-    case sidebarOverlay
+/// What the Omni bar opened with (⌘P: the root; ⌘O and the title-bar
+/// project button: Projects). A new request while it is open moves it
+/// there.
+struct OmniBarRequest: Equatable {
+    var scope: OmniScope?
+    var id: Int
 }
 
 /// A device a sheet is about (`ProjectWindowChromeState.addProjectDevice`).
@@ -1169,7 +1165,11 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarRevealed = false
     @Published var isCursorOverSidebar = false
     @Published var isSidebarAnimating = false
-    @Published var isCommandPalettePresented = false
+    /// The Omni bar, shown while set (`OmniBarView`).
+    @Published private(set) var omniBar: OmniBarRequest?
+    /// Bumped by ⌘K while the Omni bar is open: its action list
+    /// (`AppShortcutMonitor`).
+    @Published private(set) var omniBarActionsRequest = 0
     @Published var isHostedSessionsPresented = false
     /// The host the Persistent Sessions sheet opens on (a device's, from
     /// the picker), taken by the sheet when it appears.
@@ -1179,6 +1179,8 @@ final class ProjectWindowChromeState: ObservableObject {
     /// Add Project on <Mac>…: the device.
     @Published var addProjectDevice: RemoteDeviceReference?
     @Published var isNewWorktreePresented = false
+    /// The branch name New Worktree starts with ("New worktree “q”").
+    @Published var newWorktreeBranchName: String?
     @Published var isWorktreeManagerPresented = false
     @Published var worktreeToRename: GitWorktree?
     @Published var isTerminalSearchPresented = false
@@ -1198,11 +1200,6 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var pendingAgentGroupCloseSessionID: UUID?
     @Published var pendingAgentGroupCloseAllowsEmptyWorkspace = false
     @Published var focusedIdleCommandName: String?
-    @Published var commandPaletteFocusRequest = 0
-    /// The project switcher shown now (nil: none, or its menu).
-    @Published var projectSwitcherPresentation: ProjectSwitcherPresentation?
-    /// Bumped to open the menu-style switcher from the picker (⌘O).
-    @Published var projectSwitcherMenuRequest = 0
     /// The window's toast (`ProjectWindowToastOverlay`): observed on its
     /// own, so a toast coming and going does not re-render the window.
     let toasts: ProjectWindowToasts
@@ -1298,41 +1295,49 @@ final class ProjectWindowChromeState: ObservableObject {
         }
     }
 
-    func presentCommandPalette() {
-        projectSwitcherPresentation = nil
-        isCommandPalettePresented = true
-        commandPaletteFocusRequest &+= 1
-    }
+    var isOmniBarPresented: Bool { omniBar != nil }
 
-    /// Whether the title-bar picker is on screen (it slides away with a
-    /// hidden sidebar).
-    var isProjectPickerVisible: Bool {
-        !isSidebarHidden || isSidebarRevealed
-    }
-
-    /// Opens the project switcher in `style` (the picker button, ⌘O), or
-    /// closes the one shown. The Macs sidebar is a popover on the picker,
-    /// or over the window while the picker is hidden.
-    func toggleProjectSwitcher(style: ProjectSwitcherStyle = .current()) {
-        if projectSwitcherPresentation != nil {
-            projectSwitcherPresentation = nil
-            return
-        }
-        switch style {
-        case .menu:
-            projectSwitcherMenuRequest &+= 1
-        case .palette:
-            isCommandPalettePresented = false
-            projectSwitcherPresentation = .palette
-        case .sidebar:
-            isCommandPalettePresented = false
-            projectSwitcherPresentation = isProjectPickerVisible ? .sidebarPopover : .sidebarOverlay
+    /// ⌘P: opens the Omni bar at its root, or closes it.
+    func toggleOmniBar() {
+        if omniBar != nil {
+            dismissOmniBar()
+        } else {
+            presentOmniBar(at: nil)
         }
     }
 
-    func presentNewWorktree() {
+    /// ⌘O and the title-bar project button: opens the Omni bar on Projects,
+    /// or closes it when it opened there.
+    func showOmniBarProjects() {
+        if let omniBar, omniBar.scope == .projects {
+            dismissOmniBar()
+        } else {
+            presentOmniBar(at: .projects)
+        }
+    }
+
+    func presentOmniBar(at scope: OmniScope?) {
+        omniBar = OmniBarRequest(scope: scope, id: (omniBar?.id ?? 0) &+ 1)
+    }
+
+    func dismissOmniBar() {
+        omniBar = nil
+    }
+
+    /// ⌘K, only while the Omni bar is open: its action list for the
+    /// selected row. False when the bar is closed (⌘K is then the
+    /// terminal's).
+    @discardableResult
+    func toggleOmniBarActions() -> Bool {
+        guard omniBar != nil else { return false }
+        omniBarActionsRequest &+= 1
+        return true
+    }
+
+    func presentNewWorktree(branchName: String? = nil) {
         isWorktreeManagerPresented = false
         worktreeToRename = nil
+        newWorktreeBranchName = branchName
         isNewWorktreePresented = true
     }
 
@@ -1376,8 +1381,8 @@ final class ProjectWindowChromeState: ObservableObject {
 
     func toggleCommandPalettePlayground() {
         isCommandPalettePlaygroundPresented.toggle()
-        if isCommandPalettePlaygroundPresented, !isCommandPalettePresented {
-            presentCommandPalette()
+        if isCommandPalettePlaygroundPresented, omniBar == nil {
+            presentOmniBar(at: nil)
         }
     }
 

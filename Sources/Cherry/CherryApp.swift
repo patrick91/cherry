@@ -830,7 +830,6 @@ struct CherryApp: App {
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
-    @AppStorage(ProjectSwitcherStyle.defaultsKey) private var projectSwitcherStyle = ProjectSwitcherStyle.defaultStyle
 
     init() {
         RemoteViewCrashGuard.installIfNeeded()
@@ -840,7 +839,7 @@ struct CherryApp: App {
         }
         ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
         ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
-        // The project switcher's Recent section.
+        // The Omni bar's Projects › Recent and project frecency.
         ProjectWindowRegistry.shared.projectRecency = .shared
     }
 
@@ -948,7 +947,7 @@ struct CherryApp: App {
             }
             CommandGroup(after: .newItem) {
                 Button("Open Project…") {
-                    keyWindowChromeState?.toggleProjectSwitcher()
+                    keyWindowChromeState?.showOmniBarProjects()
                 }
                 .keyboardShortcut("o")
                 .disabled(focusedChromeState == nil)
@@ -959,8 +958,8 @@ struct CherryApp: App {
                 .disabled(focusedWorkspace == nil)
             }
             CommandGroup(replacing: .printItem) {
-                Button("Command Palette") {
-                    keyWindowChromeState?.presentCommandPalette()
+                Button("Omni Bar") {
+                    keyWindowChromeState?.toggleOmniBar()
                 }
                 .keyboardShortcut("p")
                 .disabled(focusedChromeState == nil)
@@ -1015,7 +1014,7 @@ struct CherryApp: App {
                 }
                 .disabled(focusedChromeState == nil)
 
-                Button(focusedChromeState?.isCommandPalettePlaygroundPresented == true ? "Hide Command Palette Playground" : "Show Command Palette Playground") {
+                Button(focusedChromeState?.isCommandPalettePlaygroundPresented == true ? "Hide Omni Bar Playground" : "Show Omni Bar Playground") {
                     keyWindowChromeState?.toggleCommandPalettePlayground()
                 }
                 .disabled(focusedChromeState == nil)
@@ -1025,14 +1024,6 @@ struct CherryApp: App {
                 }
                 .disabled(focusedChromeState == nil)
 
-                Divider()
-
-                Picker("Project Switcher", selection: $projectSwitcherStyle) {
-                    ForEach(ProjectSwitcherStyle.allCases) { style in
-                        Text("Project Switcher: \(style.title)").tag(style)
-                    }
-                }
-                .pickerStyle(.inline)
 
                 Divider()
 

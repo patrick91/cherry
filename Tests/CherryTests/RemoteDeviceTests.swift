@@ -776,53 +776,67 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(await harness.fake.wait(timeout: 10) { harness.attachCalls.count == 2 })
 }
 
-// MARK: - The picker's menu
+// MARK: - The Omni bar's Mac rows
 
-@Test @MainActor func thePickerMenuIsBuiltFromTheModelAndUpdatesADeviceInPlaceWhileOpen() throws {
+@Test @MainActor func RemoteDeviceOmniBarMacRowsOfferThePickerMenusActionsAsTheDeviceAnswers() throws {
     let studioID = UUID()
-    var state = RemoteDeviceConnectionState.unknown(lastSeen: nil)
-    var sessions: [HostedSessionInfo] = []
     let studio = RemoteDevice(id: studioID, name: "Studio", sshDestination: "studio", homeDirectory: "/Users/me")
-    var performed: [TitlebarProjectMenuModel.Action] = []
-    let controller = TitlebarProjectMenuController(
-        makeModel: {
-            TitlebarProjectMenuModel(
-                worktrees: nil,
-                projects: [.init(root: "/Users/local/site", name: "site", isSelected: true)],
-                devices: [.init(device: studio, state: state, sessions: sessions)],
-                currentProjectKey: "/Users/local/site"
-            )
-        },
-        controls: { [] },
-        perform: { performed.append($0) }
-    )
-    let menu = controller.menu
-    #expect(menu.items.map(\.title) == ["Projects", "site", "", "Add Project...", "Edit Projects...", "", "Devices", "Studio", "Add Mac…"])
-    let device = try #require(menu.items.first { $0.title == "Studio" })
-    #expect(device.subtitle == "Not checked yet")
-    #expect(device.image != nil)
-    let submenu = try #require(device.submenu)
-    #expect(submenu.items.first?.title == "No Projects")
+    func sources(
+        _ state: RemoteDeviceConnectionState,
+        sessions: [HostedSessionInfo] = [],
+        canModify: Bool = true,
+        background: [OmniBackgroundSession] = []
+    ) -> OmniSources {
+        let entry = TitlebarProjectMenuModel.Device(device: studio, state: state, sessions: sessions)
+        var sources = OmniSources()
+        sources.devices = [entry]
+        sources.canModifyDevices = canModify
+        sources.backgroundSessions = background
+        sources.projects = ProjectSwitcherModel.make(
+            localProjects: [],
+            devices: [entry],
+            openWindows: [:],
+            recency: [:],
+            currentProjectKey: nil,
+            thisMac: ProjectSwitcherModel.thisMacInfo(computerName: nil, sessionCount: 3, projectCount: 0, symbol: "laptopcomputer"),
+            localHome: "/Users/me"
+        )
+        return sources
+    }
 
-    // The device answers while the menu is open: its item changes in place.
-    state = .connected(sessionCount: 1)
-    sessions = [session("a", owner: "Cherry", project: "/Users/me/app")]
-    controller.refreshDevices()
-    #expect(menu.items.first { $0.title == "Studio" } === device)
-    #expect(device.subtitle == "Connected · 1 session")
-    let project = try #require(device.submenu?.items.first)
-    #expect(project.title == "app")
-    #expect(project.subtitle == "1 session · /Users/me/app")
-    let hide = try #require(device.submenu?.items.dropFirst().first)
-    #expect(hide.isAlternate && hide.keyEquivalentModifierMask == [.option])
+    // Not answering: Offline, grey, with Reconnect.
+    let offline = OmniProviders.macs(sources(.offline(reason: "timed out")))
+    #expect(offline.map(\.title) == ["This Mac", "Studio"])
+    #expect(offline[0].detail == "3 sessions" && offline[0].status == .idle)
+    #expect(offline[1].detail == "Offline" && offline[1].status == .offline)
+    #expect(offline[1].actions.contains { $0.title == "Reconnect" && $0.command == .switcher(.reconnectDevice(studioID)) })
 
-    // Choosing an item performs its action.
-    let target = try #require(project.target as? NSObject)
-    _ = target.perform(project.action)
-    #expect(performed == [.openDeviceProject(deviceID: studioID, path: "/Users/me/app")])
-    let addMac = try #require(menu.items.last)
-    _ = (addMac.target as? NSObject)?.perform(addMac.action)
-    #expect(performed.last == .addMac)
+    // It answers: its sessions, a green dot, and no Reconnect.
+    let connected = OmniProviders.macs(sources(
+        .connected(sessionCount: 1),
+        sessions: [session("a", owner: "Cherry", project: "/Users/me/app")],
+        background: [OmniBackgroundSession(id: "s1", title: "npm", machine: .device(studioID), isAtWork: true)]
+    ))[1]
+    #expect(connected.detail == "1 session" && connected.status == .idle)
+    #expect(connected.primary == .drill(.mac(.device(studioID), name: "Studio")))
+    #expect(connected.actions.map(\.title) == [
+        "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
+        "Persistent Sessions on Studio…", "Set Up Cherry MCP on Studio…",
+        "End Background Sessions…", "Rename…", "Remove…",
+    ])
+    #expect(connected.actions[2].command == .newTerminal(on: .device(studioID)))
+    #expect(connected.actions.last?.command == .switcher(.removeDevice(studioID)))
+    #expect(connected.actions.last?.isDestructive == true)
+
+    // The copy of the app that does not keep the devices changes none.
+    let readOnly = OmniProviders.macs(sources(.connected(sessionCount: 0), canModify: false))[1].actions.map(\.title)
+    #expect(!readOnly.contains("Rename…") && !readOnly.contains("Remove…"))
+    #expect(!readOnly.contains { $0.hasPrefix("Add Project") })
+
+    // Another identity answers: Trust New Identity…, nothing to open.
+    let changed = OmniProviders.macs(sources(.identityChanged(reason: "Expected a, received b.")))[1]
+    #expect(changed.actions.contains { $0.title == "Trust New Identity…" })
+    #expect(!changed.actions.contains { $0.title == "Open Home Folder" })
 }
 
 // MARK: - Close, detach, undo and quit of a device's tab (fake control)
@@ -1004,13 +1018,13 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(unknown.text(machine: "Studio") == "This Mac is not among your devices.")
     #expect(A.reconnecting.text(machine: "Studio") == "Studio is offline, reconnecting…")
     #expect(A.identityChanged("x").text(machine: "Studio") == "Another identity answers for Studio")
-    // Opening the picker never logs in again after a refusal (nor asks a
+    // Opening the Omni bar never logs in again after a refusal (nor asks a
     // host of another identity or protocol).
-    #expect(TitlebarProjectMenuController.refreshesOnOpen(.idle))
-    #expect(TitlebarProjectMenuController.refreshesOnOpen(.waitingToReconnect(.unavailable("Connection timed out"))))
-    #expect(!TitlebarProjectMenuController.refreshesOnOpen(.waitingToReconnect(.unavailable("Permission denied (publickey)."))))
-    #expect(!TitlebarProjectMenuController.refreshesOnOpen(.failed(.identityMismatch("x"))))
-    #expect(!TitlebarProjectMenuController.refreshesOnOpen(.failed(.unavailable("(version_mismatch)"))))
+    #expect(RemoteDevicePeeks.refreshesOnOpen(.idle))
+    #expect(RemoteDevicePeeks.refreshesOnOpen(.waitingToReconnect(.unavailable("Connection timed out"))))
+    #expect(!RemoteDevicePeeks.refreshesOnOpen(.waitingToReconnect(.unavailable("Permission denied (publickey)."))))
+    #expect(!RemoteDevicePeeks.refreshesOnOpen(.failed(.identityMismatch("x"))))
+    #expect(!RemoteDevicePeeks.refreshesOnOpen(.failed(.unavailable("(version_mismatch)"))))
 }
 
 @Test @MainActor func aChangedHostPathNeedsANewCheckBeforeAdd() async throws {

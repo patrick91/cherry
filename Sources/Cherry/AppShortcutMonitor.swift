@@ -30,8 +30,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
     enum ShortcutAction: Equatable {
         case selectVisibleSidebarItem(Int)
-        case presentCommandPalette
-        case toggleProjectSwitcher
+        case toggleOmniBar
+        case showOmniBarProjects
+        case toggleOmniBarActions
         case toggleSidebar
         case addSession
         case splitDuplicate
@@ -52,11 +53,15 @@ struct AppShortcutMonitor: NSViewRepresentable {
     /// (`textHasKeyboard`: the notes editor, a search or name field), whose
     /// own undo it is then; the terminal program never gets it. Caps Lock,
     /// and the keypad and function flags AppKit adds to some keys, are not
-    /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab.
+    /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab. ⌘P opens
+    /// or closes the Omni bar and ⌘O opens it on Projects; ⌘K is the Omni
+    /// bar's action list only while it is open (`omniBarIsOpen`), else it
+    /// is left to the menu (Clear Scrollback) and the terminal.
     nonisolated static func shortcutAction(
         charactersIgnoringModifiers: String?,
         modifiers: NSEvent.ModifierFlags,
-        textHasKeyboard: Bool = false
+        textHasKeyboard: Bool = false,
+        omniBarIsOpen: Bool = false
     ) -> ShortcutAction? {
         let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
@@ -74,9 +79,11 @@ struct AppShortcutMonitor: NSViewRepresentable {
             }
             return .selectVisibleSidebarItem(number)
         case "p":
-            return .presentCommandPalette
+            return .toggleOmniBar
         case "o":
-            return .toggleProjectSwitcher
+            return .showOmniBarProjects
+        case "k":
+            return omniBarIsOpen ? .toggleOmniBarActions : nil
         case "s":
             return .toggleSidebar
         case "t":
@@ -256,7 +263,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
             guard let action = AppShortcutMonitor.shortcutAction(
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers,
                 modifiers: modifiers,
-                textHasKeyboard: !ClosedTabUndoRouting.actsOnClosedTabs(firstResponder: window?.firstResponder)
+                textHasKeyboard: !ClosedTabUndoRouting.actsOnClosedTabs(firstResponder: window?.firstResponder),
+                omniBarIsOpen: chromeState?.isOmniBarPresented ?? false
             ) else {
                 return false
             }
@@ -293,10 +301,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
             switch action {
             case .selectVisibleSidebarItem(let number):
                 selectVisibleSidebarItem(number: number)
-            case .presentCommandPalette:
-                chromeState?.presentCommandPalette()
-            case .toggleProjectSwitcher:
-                chromeState?.toggleProjectSwitcher()
+            case .toggleOmniBar:
+                chromeState?.toggleOmniBar()
+            case .showOmniBarProjects:
+                chromeState?.showOmniBarProjects()
+            case .toggleOmniBarActions:
+                chromeState?.toggleOmniBarActions()
             case .toggleSidebar:
                 chromeState?.toggleSidebar()
             case .addSession:

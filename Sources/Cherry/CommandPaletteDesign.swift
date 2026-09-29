@@ -1,40 +1,24 @@
 import AppKit
 import SwiftUI
 
-enum CommandPaletteSelectionStyle: Int {
-    case accentFill = 0
-    case softTint = 1
-    case flat = 2
-}
-
+/// The Omni bar's design knobs (Prototype › Show Omni Bar Playground),
+/// defaulting to design D: 580 pt wide, 38 pt rows, a glass surface.
 enum CommandPaletteDesign {
-    static let usesGlassKey = "commandPalette.design.usesGlass"
-    static let cornerRadiusKey = "commandPalette.design.cornerRadius"
-    static let panelWidthKey = "commandPalette.design.panelWidth"
-    static let scrimOpacityKey = "commandPalette.design.scrimOpacity"
-    static let animatesEntranceKey = "commandPalette.design.animatesEntrance"
-    static let usesCompactRowsKey = "commandPalette.design.usesCompactRows"
-    static let rowHeightKey = "commandPalette.design.rowHeight"
-    static let selectionStyleKey = "commandPalette.design.selectionStyle"
-    static let usesIconTilesKey = "commandPalette.design.usesIconTiles"
-    static let highlightsMatchesKey = "commandPalette.design.highlightsMatches"
-    static let showsSectionHeadersKey = "commandPalette.design.showsSectionHeaders"
-    static let showsKindLabelsKey = "commandPalette.design.showsKindLabels"
-    static let showsFooterKey = "commandPalette.design.showsFooter"
+    static let usesGlassKey = "omniBar.design.usesGlass"
+    static let cornerRadiusKey = "omniBar.design.cornerRadius"
+    static let panelWidthKey = "omniBar.design.panelWidth"
+    static let scrimOpacityKey = "omniBar.design.scrimOpacity"
+    static let animatesEntranceKey = "omniBar.design.animatesEntrance"
+    static let rowHeightKey = "omniBar.design.rowHeight"
+    static let highlightsMatchesKey = "omniBar.design.highlightsMatches"
 
     static let defaultUsesGlass = true
-    static let defaultCornerRadius = 16.0
-    static let defaultPanelWidth = 620.0
+    static let defaultCornerRadius = 14.0
+    static let defaultPanelWidth = 580.0
     static let defaultScrimOpacity = 0.12
     static let defaultAnimatesEntrance = true
-    static let defaultUsesCompactRows = false
-    static let defaultRowHeight = 48.0
-    static let defaultSelectionStyle = CommandPaletteSelectionStyle.flat.rawValue
-    static let defaultUsesIconTiles = false
+    static let defaultRowHeight = 38.0
     static let defaultHighlightsMatches = true
-    static let defaultShowsSectionHeaders = false
-    static let defaultShowsKindLabels = true
-    static let defaultShowsFooter = true
 
     static func reset() {
         let defaults = UserDefaults.standard
@@ -43,84 +27,8 @@ enum CommandPaletteDesign {
         defaults.set(defaultPanelWidth, forKey: panelWidthKey)
         defaults.set(defaultScrimOpacity, forKey: scrimOpacityKey)
         defaults.set(defaultAnimatesEntrance, forKey: animatesEntranceKey)
-        defaults.set(defaultUsesCompactRows, forKey: usesCompactRowsKey)
         defaults.set(defaultRowHeight, forKey: rowHeightKey)
-        defaults.set(defaultSelectionStyle, forKey: selectionStyleKey)
-        defaults.set(defaultUsesIconTiles, forKey: usesIconTilesKey)
         defaults.set(defaultHighlightsMatches, forKey: highlightsMatchesKey)
-        defaults.set(defaultShowsSectionHeaders, forKey: showsSectionHeadersKey)
-        defaults.set(defaultShowsKindLabels, forKey: showsKindLabelsKey)
-        defaults.set(defaultShowsFooter, forKey: showsFooterKey)
-    }
-}
-
-extension CommandPaletteMatcher {
-    /// Per-character subsequence match flags for `field`, or nil when the
-    /// query does not fully match the field (highlighting is title-only, so
-    /// items matched via subtitle simply render unhighlighted).
-    static func matchFlags(query: String, in field: String) -> [Bool]? {
-        let queryCharacters = query
-            .filter { !$0.isWhitespace }
-            .map(foldedCharacter)
-        guard !queryCharacters.isEmpty else { return nil }
-
-        let fieldCharacters = Array(field)
-        var flags = [Bool](repeating: false, count: fieldCharacters.count)
-        var queryIndex = 0
-        for (index, character) in fieldCharacters.enumerated() where queryIndex < queryCharacters.count {
-            if foldedCharacter(character) == queryCharacters[queryIndex] {
-                flags[index] = true
-                queryIndex += 1
-            }
-        }
-        return queryIndex == queryCharacters.count ? flags : nil
-    }
-
-    private static func foldedCharacter(_ character: Character) -> String {
-        String(character)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-    }
-}
-
-extension CommandPaletteRootItem {
-    var sectionTitle: String {
-        switch self {
-        case .command: "Commands"
-        case .openInDefaultEditor, .otherEditors: "Open In"
-        case .agent: "Agents"
-        case .project: "Projects"
-        }
-    }
-
-    var kindLabel: String {
-        switch self {
-        case .command: "Command"
-        case .openInDefaultEditor, .otherEditors: "Editor"
-        case .agent: "Agent"
-        case .project: "Project"
-        }
-    }
-
-    var tileColor: Color {
-        switch self {
-        case .command(let command): command.tileColor
-        case .openInDefaultEditor, .otherEditors: .teal
-        case .agent: .purple
-        case .project: .blue
-        }
-    }
-}
-
-extension CommandPaletteCommand {
-    var tileColor: Color {
-        switch self {
-        case .projects, .addProject: .blue
-        case .worktrees, .newWorktree, .renameWorktree, .manageWorktrees: .green
-        case .removeWorktree: .gray
-        case .agents, .addAgent: .purple
-        case .toggleAppearance: .orange
-        }
     }
 }
 
@@ -133,16 +41,8 @@ struct CommandPalettePlaygroundOverlay: View {
     @AppStorage(CommandPaletteDesign.panelWidthKey) private var panelWidth = CommandPaletteDesign.defaultPanelWidth
     @AppStorage(CommandPaletteDesign.scrimOpacityKey) private var scrimOpacity = CommandPaletteDesign.defaultScrimOpacity
     @AppStorage(CommandPaletteDesign.animatesEntranceKey) private var animatesEntrance = CommandPaletteDesign.defaultAnimatesEntrance
-    @AppStorage(CommandPaletteDesign.usesCompactRowsKey) private var usesCompactRows = CommandPaletteDesign.defaultUsesCompactRows
     @AppStorage(CommandPaletteDesign.rowHeightKey) private var rowHeight = CommandPaletteDesign.defaultRowHeight
-    @AppStorage(CommandPaletteDesign.selectionStyleKey) private var selectionStyle = CommandPaletteDesign.defaultSelectionStyle
-    @AppStorage(CommandPaletteDesign.usesIconTilesKey) private var usesIconTiles = CommandPaletteDesign.defaultUsesIconTiles
     @AppStorage(CommandPaletteDesign.highlightsMatchesKey) private var highlightsMatches = CommandPaletteDesign.defaultHighlightsMatches
-    @AppStorage(CommandPaletteDesign.showsSectionHeadersKey) private var showsSectionHeaders = CommandPaletteDesign.defaultShowsSectionHeaders
-    @AppStorage(CommandPaletteDesign.showsKindLabelsKey) private var showsKindLabels = CommandPaletteDesign.defaultShowsKindLabels
-    @AppStorage(CommandPaletteDesign.showsFooterKey) private var showsFooter = CommandPaletteDesign.defaultShowsFooter
-
-    @State private var didCopyValues = false
 
     var body: some View {
         panel
@@ -164,16 +64,8 @@ struct CommandPalettePlaygroundOverlay: View {
             Toggle("Animate Entrance", isOn: $animatesEntrance)
 
             sectionTitle("Rows")
-            Toggle("Compact Rows", isOn: $usesCompactRows)
-            slider("Row Height", value: $rowHeight, in: 36...56, format: "%.0f")
-            selectionPicker
-            Toggle("Icon Tiles", isOn: $usesIconTiles)
-            Toggle("Highlight Matches", isOn: $highlightsMatches)
-
-            sectionTitle("Extras")
-            Toggle("Section Headers", isOn: $showsSectionHeaders)
-            Toggle("Kind Labels", isOn: $showsKindLabels)
-            Toggle("Footer Hints", isOn: $showsFooter)
+            slider("Row Height", value: $rowHeight, in: 32...48, format: "%.0f")
+            Toggle("Bold Matches", isOn: $highlightsMatches)
         }
         .font(.system(size: 12))
         .controlSize(.small)
@@ -189,43 +81,28 @@ struct CommandPalettePlaygroundOverlay: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("Command Palette")
+            Text("Omni Bar")
                 .font(.system(size: 14, weight: .semibold))
 
             Spacer()
 
-            Button(action: copyValues) {
-                Label(didCopyValues ? "Copied" : "Copy Values", systemImage: didCopyValues ? "checkmark" : "doc.on.doc")
-                    .labelStyle(.titleAndIcon)
-                    .font(.system(size: 11, weight: .medium))
-                    .padding(.horizontal, 7)
-                    .frame(height: 24)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .background {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(0.08))
-            }
-            .help("Copy design values as Swift defaults")
-
             Button {
-                chromeState.presentCommandPalette()
+                if !chromeState.isOmniBarPresented { chromeState.toggleOmniBar() }
             } label: {
                 Image(systemName: "command")
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Open the command palette (⌘P)")
+            .help("Open the Omni bar (⌘P)")
 
-            Button(action: reset) {
+            Button(action: CommandPaletteDesign.reset) {
                 Image(systemName: "arrow.counterclockwise")
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Reset to prototype defaults")
+            .help("Reset to design D")
 
             Button {
                 isPresented = false
@@ -236,21 +113,6 @@ struct CommandPalettePlaygroundOverlay: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Close")
-        }
-    }
-
-    private var selectionPicker: some View {
-        HStack(spacing: 8) {
-            Text("Selection")
-            Spacer()
-            Picker("", selection: $selectionStyle) {
-                Text("Fill").tag(CommandPaletteSelectionStyle.accentFill.rawValue)
-                Text("Tint").tag(CommandPaletteSelectionStyle.softTint.rawValue)
-                Text("Flat").tag(CommandPaletteSelectionStyle.flat.rawValue)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 160)
         }
     }
 
@@ -276,42 +138,5 @@ struct CommandPalettePlaygroundOverlay: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 34, alignment: .trailing)
         }
-    }
-
-    private func reset() {
-        CommandPaletteDesign.reset()
-    }
-
-    private func copyValues() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(copiedValuesText, forType: .string)
-        didCopyValues = true
-
-        Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(900))
-            } catch {
-                return
-            }
-            didCopyValues = false
-        }
-    }
-
-    private var copiedValuesText: String {
-        """
-        static let defaultUsesGlass = \(usesGlass)
-        static let defaultCornerRadius = \(String(format: "%.1f", cornerRadius))
-        static let defaultPanelWidth = \(String(format: "%.1f", panelWidth))
-        static let defaultScrimOpacity = \(String(format: "%.2f", scrimOpacity))
-        static let defaultAnimatesEntrance = \(animatesEntrance)
-        static let defaultUsesCompactRows = \(usesCompactRows)
-        static let defaultRowHeight = \(String(format: "%.1f", rowHeight))
-        static let defaultSelectionStyle = \(selectionStyle)
-        static let defaultUsesIconTiles = \(usesIconTiles)
-        static let defaultHighlightsMatches = \(highlightsMatches)
-        static let defaultShowsSectionHeaders = \(showsSectionHeaders)
-        static let defaultShowsKindLabels = \(showsKindLabels)
-        static let defaultShowsFooter = \(showsFooter)
-        """
     }
 }

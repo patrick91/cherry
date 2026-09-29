@@ -4,9 +4,10 @@ import Foundation
 import Testing
 @testable import Cherry
 
-// The project switcher's model (`ProjectSwitcherModel`): ranking, grouping
-// across Macs, sections, recency, the Mac filter cycle, offline Macs and the
-// style setting. No window comes on screen and no real store is touched.
+// The project switcher's model (`ProjectSwitcherModel`), which the Omni bar
+// lists projects and Macs from: recency, Macs' states, building from the
+// app's state, opening, offline Macs and paths. No window comes on screen and
+// no real store is touched.
 
 private let now = Date(timeIntervalSince1970: 1_800_000_000)
 private let studioID = UUID(uuidString: "00000000-0000-0000-0000-0000000057D1")!
@@ -70,59 +71,6 @@ private func remote(
     )
 }
 
-private func titles(_ sections: [ProjectSwitcherModel.Section]) -> [String: [String]] {
-    Dictionary(uniqueKeysWithValues: sections.map { ($0.title, $0.groups.map(\.name)) })
-}
-
-// MARK: - Style
-
-@Test func projectSwitcherStyleDefaultsToThePaletteAndReadsTheSetting() {
-    let defaults = privateDefaults()
-    #expect(ProjectSwitcherStyle.current(in: defaults) == .palette)
-    defaults.set("sidebar", forKey: ProjectSwitcherStyle.defaultsKey)
-    #expect(ProjectSwitcherStyle.current(in: defaults) == .sidebar)
-    defaults.set("menu", forKey: ProjectSwitcherStyle.defaultsKey)
-    #expect(ProjectSwitcherStyle.current(in: defaults) == .menu)
-    defaults.set("something-else", forKey: ProjectSwitcherStyle.defaultsKey)
-    #expect(ProjectSwitcherStyle.current(in: defaults) == .palette)
-    #expect(ProjectSwitcherStyle.allCases.map(\.title) == ["Menu", "Palette", "Macs Sidebar"])
-}
-
-@Test @MainActor func projectSwitcherToggleOpensTheChosenStyleAndClosesTheOneShown() {
-    let chrome = ProjectWindowChromeState()
-    chrome.toggleProjectSwitcher(style: .palette)
-    #expect(chrome.projectSwitcherPresentation == .palette)
-    chrome.toggleProjectSwitcher(style: .palette)
-    #expect(chrome.projectSwitcherPresentation == nil)
-
-    chrome.toggleProjectSwitcher(style: .sidebar)
-    #expect(chrome.projectSwitcherPresentation == .sidebarPopover)
-    chrome.toggleProjectSwitcher(style: .sidebar)
-
-    // The picker slides away with a hidden sidebar: nothing to anchor to.
-    chrome.isSidebarHidden = true
-    chrome.toggleProjectSwitcher(style: .sidebar)
-    #expect(chrome.projectSwitcherPresentation == .sidebarOverlay)
-    chrome.toggleProjectSwitcher(style: .sidebar)
-
-    let requests = chrome.projectSwitcherMenuRequest
-    chrome.toggleProjectSwitcher(style: .menu)
-    #expect(chrome.projectSwitcherPresentation == nil)
-    #expect(chrome.projectSwitcherMenuRequest == requests + 1)
-
-    // The command palette and the switcher never show together.
-    chrome.toggleProjectSwitcher(style: .palette)
-    chrome.presentCommandPalette()
-    #expect(chrome.projectSwitcherPresentation == nil)
-    chrome.toggleProjectSwitcher(style: .palette)
-    #expect(!chrome.isCommandPalettePresented)
-}
-
-@Test func commandOTogglesTheProjectSwitcher() {
-    #expect(AppShortcutMonitor.shortcutAction(charactersIgnoringModifiers: "o", modifiers: .command) == .toggleProjectSwitcher)
-    #expect(AppShortcutMonitor.shortcutAction(charactersIgnoringModifiers: "o", modifiers: [.command, .shift]) == nil)
-}
-
 // MARK: - Recency
 
 @Test @MainActor func recencyStoreKeepsTheLastOpeningPerKeyAcrossInstances() {
@@ -179,177 +127,26 @@ private func titles(_ sections: [ProjectSwitcherModel.Section]) -> [String: [Str
     #expect(recency.recentKeys(limit: 1) == [key])
 }
 
-// MARK: - Grouping across Macs
-
-@Test func aProjectOnSeveralMacsIsOneGroupWhosePrimaryIsTheOpenOrMostRecentOne() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio")],
-        locations: [
-            local("cherry", lastOpened: minutesAgo(60)),
-            remote(studioID, "cherry", lastOpened: minutesAgo(3)),
-            local("pix", open: .init(tabs: 1, workingAgents: 0), lastOpened: minutesAgo(90)),
-            remote(studioID, "pix", lastOpened: minutesAgo(1)),
-            remote(studioID, "rignore"),
-        ]
-    )
-    let groups = Dictionary(uniqueKeysWithValues: model.groups().map { ($0.name, $0) })
-    #expect(groups.count == 3)
-    // The most recent opening wins…
-    #expect(groups["cherry"]?.locations.map(\.machine) == [.device(studioID), .thisMac])
-    // …but an open window wins over it.
-    #expect(groups["pix"]?.primary.machine == .thisMac)
-    #expect(groups["pix"]?.isOpen == true)
-    #expect(groups["rignore"]?.locations.map(\.machine) == [.device(studioID)])
-
-    // Enter opens the primary through the picker's own actions.
-    let cherry = try! #require(groups["cherry"])
-    #expect(model.action(opening: cherry.primary) == .openDeviceProject(deviceID: studioID, path: "/Users/me/code/cherry"))
-    #expect(model.action(opening: cherry.locations[1]) == .openProject("/Users/me/code/cherry"))
-}
-
-@Test func twoFoldersOfOneNameOnOneMacStayApartAndNamesMatchCaseInsensitively() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio")],
-        locations: [
-            local("app", path: "/Users/me/work/app"),
-            local("app", path: "/Users/me/play/app"),
-            remote(studioID, "App"),
-        ]
-    )
-    let groups = model.groups()
-    #expect(groups.count == 2)
-    #expect(groups.map { $0.locations.count }.sorted() == [1, 2])
-    #expect(Set(groups.map(\.id)).count == 2)
-    #expect(groups.allSatisfy { group in Set(group.locations.map(\.machine)).count == group.locations.count })
-}
-
-@Test func theMacFilterKeepsOnlyThatMacsProjects() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio")],
-        locations: [local("cherry"), remote(studioID, "cherry"), local("site"), remote(studioID, "rignore")]
-    )
-    #expect(model.groups(filter: .device(studioID)).map(\.name).sorted() == ["cherry", "rignore"])
-    #expect(model.groups(filter: .device(studioID)).allSatisfy { $0.locations.count == 1 })
-    #expect(model.groups(filter: .thisMac).map(\.name).sorted() == ["cherry", "site"])
-    #expect(model.groups(filter: nil).count == 3)
-}
-
-// MARK: - Sections
-
-@Test func anEmptyQueryListsOpenRecentAndAllProjects() {
-    var locations = [
-        local("cherry", open: .init(tabs: 4, workingAgents: 1), current: true, lastOpened: minutesAgo(0)),
-        local("pix", open: .init(tabs: 1, workingAgents: 0), lastOpened: minutesAgo(2)),
-        remote(studioID, "rignore", open: .init(tabs: 2, workingAgents: 0), lastOpened: minutesAgo(1)),
-    ]
-    for (index, name) in ["a1", "a2", "a3", "a4", "a5", "a6"].enumerated() {
-        locations.append(local(name, lastOpened: minutesAgo(Double(10 + index))))
-    }
-    locations += [local("zeta"), local("Beta"), local("alpha")]
-    let model = ProjectSwitcherModel(machines: [thisMac, device(studioID, "Studio")], locations: locations)
-    let sections = model.sections(query: "")
-    #expect(sections.map(\.kind) == [.open, .recent, .all])
-    // The current window first, then the most recent.
-    #expect(sections[0].groups.map(\.name) == ["cherry", "rignore", "pix"])
-    #expect(sections[1].groups.map(\.name) == ["a1", "a2", "a3", "a4", "a5"])
-    #expect(sections[2].groups.map(\.name) == ["a6", "alpha", "Beta", "zeta"])
-    #expect(sections[0].groups[0].openLocation?.openStatus?.text == "1 agent working · 4 tabs")
-    #expect(sections[0].groups[2].openLocation?.openStatus?.text == "1 tab")
-}
-
-@Test func emptySectionsAreLeftOut() {
-    let model = ProjectSwitcherModel(machines: [thisMac], locations: [local("b"), local("a")])
-    let sections = model.sections(query: "  ")
-    #expect(sections.map(\.kind) == [.all])
-    #expect(sections[0].groups.map(\.name) == ["a", "b"])
-    #expect(ProjectSwitcherModel(machines: [thisMac], locations: []).sections(query: "").isEmpty)
-}
-
-@Test func aQueryRanksNamePrefixThenNameThenPathThenRecency() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio")],
-        locations: [
-            local("strawberry.rocks", lastOpened: minutesAgo(5)),
-            local("pytest-strawberry-plugin", lastOpened: minutesAgo(1)),
-            local("straw", lastOpened: minutesAgo(50)),
-            local("docs", path: "/Users/me/strawberry/docs"),
-            local("unrelated"),
-            remote(studioID, "Stray", lastOpened: minutesAgo(2)),
-        ]
-    )
-    let results = model.sections(query: "STRA")
-    #expect(results.map(\.kind) == [.results])
-    #expect(results[0].groups.map(\.name) == ["Stray", "strawberry.rocks", "straw", "pytest-strawberry-plugin", "docs"])
-
-    // Paths match as shown (`~`) and in full.
-    #expect(model.sections(query: "~/strawberry").first?.groups.map(\.name) == ["docs"])
-    #expect(model.sections(query: "/users/me/strawberry/d").first?.groups.map(\.name) == ["docs"])
-    // Nothing matches: no section at all.
-    #expect(model.sections(query: "nope").isEmpty)
-    // Diacritics fold.
-    #expect(model.sections(query: "strä").first?.groups.first?.name == "Stray")
-}
-
-@Test func aQueryWithAFilterSearchesOnlyThatMac() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio")],
-        locations: [local("cherry"), remote(studioID, "cherry"), remote(studioID, "cherry-docs")]
-    )
-    let results = model.sections(query: "cher", filter: .thisMac)
-    #expect(results.first?.groups.map(\.name) == ["cherry"])
-    #expect(results.first?.groups.first?.locations.map(\.machine) == [.thisMac])
-    #expect(model.sections(query: "cher", filter: .device(studioID)).first?.groups.count == 2)
-}
-
-// MARK: - Filter cycle
-
-@Test func tabCyclesAllMacsThisMacAndEachDevice() {
-    let model = ProjectSwitcherModel(
-        machines: [thisMac, device(studioID, "Studio"), device(miniID, "Mini", reachable: false)],
-        locations: []
-    )
-    var filter: ProjectSwitcherModel.Machine? = nil
-    var seen: [ProjectSwitcherModel.Machine?] = []
-    for _ in 0 ..< 4 {
-        filter = model.nextFilter(after: filter)
-        seen.append(filter)
-    }
-    #expect(seen == [.thisMac, .device(studioID), .device(miniID), nil])
-    #expect(model.nextFilter(after: nil, backwards: true) == .device(miniID))
-    #expect(model.nextFilter(after: .thisMac, backwards: true) == nil)
-
-    // The sidebar has no All Macs.
-    #expect(model.nextMachine(after: .device(miniID)) == .thisMac)
-    #expect(model.nextMachine(after: .thisMac, backwards: true) == .device(miniID))
-    #expect(model.nextMachine(after: .thisMac) == .device(studioID))
-}
-
 // MARK: - Offline Macs
 
-@Test func anOfflineMacsProjectsStayListedButAReachableCopyIsPrimary() {
+@Test func anOfflineMacsProjectsStillOpenButAnotherIdentityCannot() {
     let model = ProjectSwitcherModel(
-        machines: [thisMac, device(miniID, "Mini", reachable: false)],
-        locations: [
-            local("shop", lastOpened: minutesAgo(600)),
-            remote(miniID, "shop", lastOpened: minutesAgo(1)),
-            remote(miniID, "argocd"),
-        ]
+        machines: [thisMac, device(studioID, "Studio"), device(miniID, "Mini", reachable: false)],
+        locations: [local("shop"), remote(miniID, "argocd"), remote(studioID, "cherry")]
     )
-    let groups = Dictionary(uniqueKeysWithValues: model.groups().map { ($0.name, $0) })
-    #expect(groups["shop"]?.primary.machine == .thisMac)
-    #expect(groups["argocd"]?.primary.machine == .device(miniID))
     #expect(!model.isReachable(.device(miniID)))
     // Its projects still open (the window waits for it), as from the menu.
-    #expect(model.action(opening: groups["argocd"]!.primary) != nil)
+    #expect(model.action(opening: model.locations[1]) == .openDeviceProject(deviceID: miniID, path: "/Users/me/code/argocd"))
+    #expect(model.action(opening: model.locations[0]) == .openProject("/Users/me/code/shop"))
     #expect(model.machine(.device(miniID))?.unreachableMessage == "Mini isn't reachable.")
-}
+    #expect(model.name(of: .device(studioID)) == "Studio")
+    #expect(model.projectCount(on: .thisMac) == 1)
 
-@Test func aMacWithAnotherIdentityCannotBeOpened() {
-    let model = ProjectSwitcherModel(
+    let changed = ProjectSwitcherModel(
         machines: [thisMac, device(miniID, "Mini", reachable: false, allowsOpening: false)],
         locations: [remote(miniID, "argocd")]
     )
-    #expect(model.action(opening: model.groups()[0].primary) == nil)
+    #expect(changed.action(opening: changed.locations[0]) == nil)
 }
 
 @Test func deviceStatesBecomeMachineInfoWithoutConnecting() {
@@ -416,15 +213,15 @@ private func titles(_ sections: [ProjectSwitcherModel.Section]) -> [String: [Str
     #expect(model.machines.map(\.name) == ["This Mac", "Studio"])
     #expect(model.currentMachine == .device(studioID))
     #expect(model.locations.filter { $0.machine == .thisMac }.map(\.name) == ["cherry", "pix"])
-    let groups = Dictionary(uniqueKeysWithValues: model.groups().map { ($0.name, $0) })
-    #expect(groups["cherry"]?.primary.key == cherryKey)
-    #expect(groups["cherry"]?.locations.count == 2)
-    #expect(groups["pix"]?.openLocation?.openStatus?.text == "2 agents working · 3 tabs")
-    #expect(groups["pix"]?.primary.displayPath == "~/code/pix")
+    let locations = Dictionary(uniqueKeysWithValues: model.locations.map { ($0.key, $0) })
+    #expect(locations[cherryKey]?.lastOpened == minutesAgo(3))
+    #expect(locations["/Users/me/code/cherry"]?.lastOpened == minutesAgo(30))
+    #expect(locations["/Users/me/code/pix"]?.openStatus?.text == "2 agents working · 3 tabs")
+    #expect(locations["/Users/me/code/pix"]?.displayPath == "~/code/pix")
     // A device window of a folder its host does not list is listed too.
-    #expect(groups["me"]?.primary.key == homeKey)
-    #expect(groups["me"]?.isCurrent == true)
-    #expect(model.sections(query: "").first?.groups.first?.name == "me")
+    #expect(locations[homeKey]?.name == "me")
+    #expect(locations[homeKey]?.isCurrent == true)
+    #expect(model.locations.filter { $0.machine == .device(studioID) }.count == 3)
 }
 
 // MARK: - Paths and labels
@@ -442,32 +239,4 @@ private func titles(_ sections: [ProjectSwitcherModel.Section]) -> [String: [Str
     #expect(ProjectSwitcherModel.displayPath("/Users/me/code", home: "/Users/me") == "~/code")
     #expect(ProjectSwitcherModel.displayPath("/Users/meta", home: "/Users/me") == "/Users/meta")
     #expect(ProjectSwitcherModel.displayPath("/Users/me", home: "/Users/me/") == "~")
-}
-
-@Test func agoLabelsReadAsThePrototypeDoes() {
-    #expect(ProjectSwitcherModel.agoLabel(nil, now: now) == "")
-    #expect(ProjectSwitcherModel.agoLabel(minutesAgo(0.2), now: now) == "just now")
-    #expect(ProjectSwitcherModel.agoLabel(minutesAgo(5), now: now) == "5 min ago")
-    #expect(ProjectSwitcherModel.agoLabel(minutesAgo(125), now: now) == "2 h ago")
-    #expect(ProjectSwitcherModel.agoLabel(minutesAgo(60 * 30), now: now) == "yesterday")
-    #expect(ProjectSwitcherModel.agoLabel(minutesAgo(60 * 24 * 4), now: now) == "4 days ago")
-}
-
-// MARK: - Performance
-
-@Test func sectionsStayFastWithManyProjects() {
-    var locations: [ProjectSwitcherModel.Location] = []
-    for index in 0 ..< 300 {
-        locations.append(local("project-\(index)", lastOpened: index % 3 == 0 ? minutesAgo(Double(index)) : nil))
-        if index % 4 == 0 { locations.append(remote(studioID, "project-\(index)")) }
-    }
-    let model = ProjectSwitcherModel(machines: [thisMac, device(studioID, "Studio")], locations: locations)
-    let clock = ContinuousClock()
-    let elapsed = clock.measure {
-        for query in ["", "p", "pr", "pro", "project-1", "project-12"] {
-            _ = model.sections(query: query)
-        }
-    }
-    #expect(model.groups().count == 300)
-    #expect(elapsed < .milliseconds(500))
 }

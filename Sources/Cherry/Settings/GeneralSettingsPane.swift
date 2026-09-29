@@ -3,7 +3,6 @@ import SwiftUI
 struct GeneralSettingsPane: View {
     @ObservedObject var settings: TerminalSettings
     @ObservedObject private var editorDiscovery = ExternalEditorDiscovery.shared
-    @AppStorage(ProjectSwitcherStyle.defaultsKey) private var projectSwitcherStyle = ProjectSwitcherStyle.defaultStyle
 
     var body: some View {
         SettingsPaneScroll(page: .general) {
@@ -46,20 +45,6 @@ struct GeneralSettingsPane: View {
                     .labelsHidden()
                     .pickerStyle(.segmented)
                     .frame(width: 220)
-                }
-
-                SettingsDivider()
-
-                SettingsRow("Project switcher", subtitle: "What the title bar's project button and ⌘O open.") {
-                    Picker("Project switcher", selection: $projectSwitcherStyle) {
-                        ForEach(ProjectSwitcherStyle.allCases) { style in
-                            Text(style.title)
-                                .tag(style)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 260)
                 }
 
                 SettingsDivider()

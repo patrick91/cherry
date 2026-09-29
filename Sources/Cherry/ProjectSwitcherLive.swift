@@ -40,71 +40,17 @@ extension TitlebarProjectMenuModel {
     }
 }
 
-/// The palette's and the sidebar's model, kept current while one is shown:
-/// on start every device's host is listed as the menu does (a connected
-/// one over its connection, any other with a look that never starts or
-/// replaces its daemon), and the model is rebuilt as they answer and, once
-/// a second, for the open windows' tabs and agents.
+/// The project switcher model from the app's state now: This Mac's
+/// projects, each device as last listed or looked at, the open windows and
+/// recency. Reads cached state only; the Omni bar (`OmniBarLiveModel`)
+/// keeps it current.
 @MainActor
-final class ProjectSwitcherLiveModel: ObservableObject {
-    @Published private(set) var model: ProjectSwitcherModel
-
-    private let currentProjectKey: @MainActor () -> String?
-    private let peeks: RemoteDevicePeeks
-    private var subscriptions: [AnyCancellable] = []
-    private var timer: Timer?
-
-    init(currentProjectKey: @escaping @MainActor () -> String?, peeks: RemoteDevicePeeks = .shared) {
-        self.currentProjectKey = currentProjectKey
-        self.peeks = peeks
-        model = Self.build(currentProjectKey: currentProjectKey())
-    }
-
-    func rebuild() {
-        let next = Self.build(currentProjectKey: currentProjectKey())
-        if next != model { model = next }
-    }
-
-    func start() {
-        stop()
-        rebuild()
-        subscriptions.append(peeks.$entries.dropFirst().debounce(for: .milliseconds(50), scheduler: DispatchQueue.main).sink { [weak self] _ in
-            MainActor.assumeIsolated { self?.rebuild() }
-        })
-        subscriptions.append(ProjectRecencyStore.shared.$dates.dropFirst().sink { [weak self] _ in
-            DispatchQueue.main.async { self?.rebuild() }
-        })
-        let controls = RemoteDeviceStore.shared.devices.compactMap { $0.host.map { HostControlRegistry.shared.control(for: $0) } }
-        for control in controls {
-            let changes = control.$state.map { _ in () }
-                .merge(with: control.$sessions.map { _ in () })
-                .dropFirst(2)
-                .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
-            subscriptions.append(changes.sink { [weak self] in
-                MainActor.assumeIsolated { self?.rebuild() }
-            })
-            if control.state == .connected {
-                Task { _ = try? await control.list() }
-            } else if TitlebarProjectMenuController.refreshesOnOpen(control.state) {
-                let peeks = peeks
-                Task { await peeks.refresh(control) }
-            }
-        }
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.rebuild() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
-    }
-
-    func stop() {
-        subscriptions.removeAll()
-        timer?.invalidate()
-        timer = nil
-    }
-
+enum ProjectSwitcherLive {
     /// The model from the app's state now.
-    static func build(currentProjectKey: String?) -> ProjectSwitcherModel {
+    static func build(
+        currentProjectKey: String?,
+        devices: [TitlebarProjectMenuModel.Device] = TitlebarProjectMenuModel.liveDevices()
+    ) -> ProjectSwitcherModel {
         let registry = ProjectWindowRegistry.shared
         let settings = AgentSettings.shared
         let recency = ProjectRecencyStore.shared
@@ -136,7 +82,7 @@ final class ProjectSwitcherLiveModel: ObservableObject {
         var canonical: [String: String] = [:]
         return ProjectSwitcherModel.make(
             localProjects: localProjects,
-            devices: TitlebarProjectMenuModel.liveDevices(),
+            devices: devices,
             openWindows: openWindows,
             recency: recency.dates,
             currentProjectKey: currentProjectKey,
@@ -165,9 +111,10 @@ final class ProjectSwitcherLiveModel: ObservableObject {
     }()
 }
 
-/// What the picker's items, the palette and the sidebar do: the same code
-/// path for each (a device's project opens through its key, window reuse
-/// through `openProject`). Worktree actions stay the picker's.
+/// What the picker menu's items and the Omni bar's project and Mac rows
+/// do: the same code path for each (a device's project opens through its
+/// key, window reuse through `openProject`). Worktree actions stay the
+/// window's.
 @MainActor
 struct ProjectSwitcherActions {
     let settings: AgentSettings

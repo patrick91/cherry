@@ -1,44 +1,19 @@
 import CherryControl
 import Foundation
 
-// The title bar's project switcher (the picker button, ⌘O): the classic
-// `NSMenu` (`TitlebarProjectMenuModel`), a centred palette over the window
-// (`ProjectSwitcherPalette`) or a popover with a rail of Macs
-// (`ProjectSwitcherMacsSidebar`). The palette and the sidebar are built from
-// `ProjectSwitcherModel`, which is pure: tests give it projects, devices,
-// open windows and recency, and read its sections.
-
-/// Which switcher the title-bar picker and ⌘O open (Prototype menu,
-/// Settings › General).
-enum ProjectSwitcherStyle: String, CaseIterable, Identifiable {
-    case menu
-    case palette
-    case sidebar
-
-    static let defaultsKey = "projectSwitcher.style"
-    static let defaultStyle: Self = .palette
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .menu: "Menu"
-        case .palette: "Palette"
-        case .sidebar: "Macs Sidebar"
-        }
-    }
-
-    static func current(in defaults: UserDefaults = .standard) -> Self {
-        defaults.string(forKey: defaultsKey).flatMap(Self.init(rawValue:)) ?? defaultStyle
-    }
-}
+// The projects on every Mac, the Macs and the open windows, as the Omni
+// bar lists them (`OmniProviders`) and the picker menu opens them
+// (`ProjectSwitcherActions`). `ProjectSwitcherModel` is pure: tests give it
+// projects, devices, open windows and recency.
 
 // MARK: - Recency
 
 /// When each project (by project location key: a local path or a
-/// `device:` key) was last opened or brought to the front. The app's
-/// project windows mark it (`ProjectWindowRegistry.projectRecency`, set at
-/// launch; tests give their own UserDefaults and never touch the real one).
+/// `device:` key) was last opened or brought to the front: the Omni bar's
+/// Projects › Recent and part of its frecency (`OmniFrecencyStore`). The
+/// app's project windows mark it (`ProjectWindowRegistry.projectRecency`,
+/// set at launch; tests give their own UserDefaults and never touch the
+/// real one).
 @MainActor
 final class ProjectRecencyStore: ObservableObject {
     static let shared = ProjectRecencyStore(defaults: .standard)
@@ -99,7 +74,7 @@ struct ProjectSwitcherModel: Equatable {
         }
     }
 
-    /// A Mac the switcher lists (a filter chip, a rail row).
+    /// A Mac the Omni bar lists.
     struct MachineInfo: Equatable, Identifiable {
         var machine: Machine
         var name: String
@@ -108,18 +83,18 @@ struct ProjectSwitcherModel: Equatable {
         var dot: RemoteDeviceConnectionState.Dot
         /// Its host's sessions, when known.
         var sessionCount: Int?
-        /// The sidebar header's second line.
+        /// "<destination> over SSH · session host <build> · N projects".
         var detail: String
-        /// Answers now (or is This Mac): an unreachable Mac is greyed and
-        /// the sidebar shows why.
+        /// Answers now (or is This Mac): an unreachable Mac's row is
+        /// Offline.
         var isReachable: Bool = true
         /// Its projects can be opened (never while another identity or
         /// protocol answers there).
         var allowsOpening: Bool = true
-        /// The sidebar's banner for a Mac that does not answer.
+        /// Why a Mac does not answer.
         var unreachableMessage: String?
         var offersTrustNewIdentity: Bool = false
-        /// An SF Symbol for the rail.
+        /// An SF Symbol for its row.
         var symbol: String = "desktopcomputer"
 
         var id: Machine { machine }
@@ -150,7 +125,7 @@ struct ProjectSwitcherModel: Equatable {
         var displayPath: String
         /// Set when a window of it is open.
         var openStatus: OpenStatus?
-        /// The window this switcher was opened from shows it.
+        /// The window the bar was opened from shows it.
         var isCurrent = false
         var lastOpened: Date?
         /// Sessions whose project it is (a device's, as its host listed).
@@ -160,47 +135,13 @@ struct ProjectSwitcherModel: Equatable {
         var isOpen: Bool { openStatus != nil }
     }
 
-    /// One project, on each Mac that has it (matched by name).
-    struct Group: Equatable, Identifiable {
-        var id: String
-        var name: String
-        /// The primary location first: the one ↵ opens.
-        var locations: [Location]
-
-        var primary: Location { locations[0] }
-        var openLocation: Location? { locations.first(where: \.isOpen) }
-        var isOpen: Bool { openLocation != nil }
-        var isCurrent: Bool { locations.contains(where: \.isCurrent) }
-        var lastOpened: Date? { locations.compactMap(\.lastOpened).max() }
-    }
-
-    enum SectionKind: String, Equatable {
-        case open, recent, all, results
-
-        var title: String {
-            switch self {
-            case .open: "Open"
-            case .recent: "Recent"
-            case .all: "All Projects"
-            case .results: "Results"
-            }
-        }
-    }
-
-    struct Section: Equatable, Identifiable {
-        var kind: SectionKind
-        var groups: [Group]
-
-        var id: String { kind.rawValue }
-        var title: String { kind.title }
-    }
-
+    /// How many projects Projects › Recent lists.
     static let recentLimit = 5
 
     /// This Mac first, then each device.
     var machines: [MachineInfo]
     var locations: [Location]
-    /// The Mac of the window the switcher opened from.
+    /// The Mac of the window the bar opened from.
     var currentMachine: Machine = .thisMac
 
     init(machines: [MachineInfo], locations: [Location], currentMachine: Machine = .thisMac) {
@@ -227,145 +168,6 @@ struct ProjectSwitcherModel: Equatable {
 
     func projectCount(on machine: Machine) -> Int {
         locations.filter { $0.machine == machine }.count
-    }
-
-    // MARK: Grouping
-
-    /// The projects, one group per name, each Mac at most once in a group
-    /// (two folders of one name on one Mac stay apart). `filter`: only that
-    /// Mac's projects (nil: every Mac's).
-    func groups(filter: Machine? = nil) -> [Group] {
-        let order = Dictionary(uniqueKeysWithValues: machines.enumerated().map { ($1.machine, $0) })
-        let candidates = locations
-            .filter { filter == nil || $0.machine == filter }
-            .sorted { lhs, rhs in
-                let lhsOrder = order[lhs.machine] ?? .max
-                let rhsOrder = order[rhs.machine] ?? .max
-                return lhsOrder == rhsOrder ? lhs.path < rhs.path : lhsOrder < rhsOrder
-            }
-        var groups: [Group] = []
-        var indexesByName: [String: [Int]] = [:]
-        for location in candidates {
-            let name = Self.fold(location.name)
-            if let index = indexesByName[name]?.first(where: { index in
-                !groups[index].locations.contains { $0.machine == location.machine }
-            }) {
-                groups[index].locations.append(location)
-            } else {
-                let suffix = indexesByName[name].map { "#\($0.count)" } ?? ""
-                indexesByName[name, default: []].append(groups.count)
-                groups.append(Group(id: name + suffix, name: location.name, locations: [location]))
-            }
-        }
-        return groups.map { group in
-            var group = group
-            group.locations.sort { primaryOrder($0, $1, order: order) }
-            return group
-        }
-    }
-
-    /// The primary location of a group: the current window's, then an open
-    /// one, then one on a Mac that answers, then the most recently opened,
-    /// then This Mac's (the Macs' order).
-    private func primaryOrder(_ lhs: Location, _ rhs: Location, order: [Machine: Int]) -> Bool {
-        if lhs.isCurrent != rhs.isCurrent { return lhs.isCurrent }
-        if lhs.isOpen != rhs.isOpen { return lhs.isOpen }
-        let lhsReachable = isReachable(lhs.machine) && canOpen(lhs)
-        let rhsReachable = isReachable(rhs.machine) && canOpen(rhs)
-        if lhsReachable != rhsReachable { return lhsReachable }
-        switch (lhs.lastOpened, rhs.lastOpened) {
-        case let (l?, r?) where l != r: return l > r
-        case (.some, nil): return true
-        case (nil, .some): return false
-        default: return (order[lhs.machine] ?? .max) < (order[rhs.machine] ?? .max)
-        }
-    }
-
-    // MARK: Sections
-
-    /// With no query: Open (current first, then most recent), Recent (the
-    /// five most recently opened of the rest) and All Projects
-    /// (alphabetical). With one: Results, ranked name prefix > name
-    /// contains > path contains, then the most recent, then by name.
-    func sections(query: String, filter: Machine? = nil) -> [Section] {
-        let groups = groups(filter: filter)
-        let query = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
-        if !query.isEmpty {
-            let scored = groups.compactMap { group -> (Group, Int)? in
-                let score = Self.score(group, query: query)
-                return score > 0 ? (group, score) : nil
-            }
-            let results = scored.sorted { lhs, rhs in
-                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
-                return Self.recentFirst(lhs.0, rhs.0)
-            }.map(\.0)
-            return results.isEmpty ? [] : [Section(kind: .results, groups: results)]
-        }
-        let open = groups.filter(\.isOpen).sorted { lhs, rhs in
-            if lhs.isCurrent != rhs.isCurrent { return lhs.isCurrent }
-            return Self.recentFirst(lhs, rhs)
-        }
-        let recent = Array(groups
-            .filter { !$0.isOpen && $0.lastOpened != nil }
-            .sorted(by: Self.recentFirst)
-            .prefix(Self.recentLimit))
-        let listed = Set((open + recent).map(\.id))
-        let all = groups.filter { !listed.contains($0.id) }.sorted(by: Self.alphabetical)
-        return [
-            Section(kind: .open, groups: open),
-            Section(kind: .recent, groups: recent),
-            Section(kind: .all, groups: all),
-        ].filter { !$0.groups.isEmpty }
-    }
-
-    /// 3: the name starts with the query; 2: the name contains it; 1: a
-    /// folder's path contains it; 0: no match.
-    static func score(_ group: Group, query: String) -> Int {
-        let name = fold(group.name)
-        if name.hasPrefix(query) { return 3 }
-        if name.contains(query) { return 2 }
-        let pathMatches = group.locations.contains {
-            fold($0.path).contains(query) || fold($0.displayPath).contains(query)
-        }
-        return pathMatches ? 1 : 0
-    }
-
-    private static func recentFirst(_ lhs: Group, _ rhs: Group) -> Bool {
-        switch (lhs.lastOpened, rhs.lastOpened) {
-        case let (l?, r?) where l != r: return l > r
-        case (.some, nil): return true
-        case (nil, .some): return false
-        default: return alphabetical(lhs, rhs)
-        }
-    }
-
-    private static func alphabetical(_ lhs: Group, _ rhs: Group) -> Bool {
-        let order = lhs.name.localizedStandardCompare(rhs.name)
-        return order == .orderedSame ? lhs.id < rhs.id : order == .orderedAscending
-    }
-
-    static func fold(_ text: String) -> String {
-        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-    }
-
-    // MARK: Keys
-
-    /// The Mac filter after (or before) `current`: All Macs, This Mac, then
-    /// each device, round.
-    func nextFilter(after current: Machine?, backwards: Bool = false) -> Machine? {
-        let cycle: [Machine?] = [nil] + machines.map(\.machine)
-        let index = cycle.firstIndex(of: current) ?? 0
-        let step = backwards ? cycle.count - 1 : 1
-        return cycle[(index + step) % cycle.count]
-    }
-
-    /// The sidebar's next Mac (no All Macs there).
-    func nextMachine(after current: Machine, backwards: Bool = false) -> Machine {
-        let cycle = machines.map(\.machine)
-        guard !cycle.isEmpty else { return current }
-        let index = cycle.firstIndex(of: current) ?? 0
-        let step = backwards ? cycle.count - 1 : 1
-        return cycle[(index + step) % cycle.count]
     }
 
     // MARK: Opening
@@ -406,19 +208,6 @@ struct ProjectSwitcherModel: Equatable {
         if path == trimmedHome { return "~" }
         if path.hasPrefix(trimmedHome + "/") { return "~" + path.dropFirst(trimmedHome.count) }
         return path
-    }
-
-    /// "5 min ago", "3 h ago", "yesterday", "4 days ago".
-    static func agoLabel(_ date: Date?, now: Date = Date()) -> String {
-        guard let date else { return "" }
-        let minutes = Int(max(0, now.timeIntervalSince(date)) / 60)
-        switch minutes {
-        case ..<1: return "just now"
-        case ..<60: return "\(minutes) min ago"
-        case ..<(60 * 24): return "\(minutes / 60) h ago"
-        case ..<(60 * 48): return "yesterday"
-        default: return "\(minutes / 1_440) days ago"
-        }
     }
 }
 
@@ -554,7 +343,7 @@ extension ProjectSwitcherModel {
         )
     }
 
-    /// This Mac's chip and rail row.
+    /// This Mac's row.
     static func thisMacInfo(computerName: String?, sessionCount: Int?, projectCount: Int, symbol: String) -> MachineInfo {
         let sessions = sessionCount.map { $0 == 1 ? "1 session" : "\($0) sessions" }
         var detail: [String] = []

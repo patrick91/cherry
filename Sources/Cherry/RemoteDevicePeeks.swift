@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 /// Looks at devices' sessions for what only shows them (Background
-/// Sessions, the project picker, the launch notice), never starting or
+/// Sessions, the Omni bar, the launch notice), never starting or
 /// replacing a daemon on another Mac (`HostControl.listWithoutStarting`,
 /// `cherry list --no-start`); only the user acting on that Mac (opening one
 /// of its projects, Reconnect, Add Mac… or Update Session Host…) may.
@@ -98,6 +98,22 @@ final class RemoteDevicePeeks: ObservableObject {
     func systemChanged() {
         blocked.removeAll()
         entries = entries.filter { if case .failed = $0.value.result { return false } else { return true } }
+    }
+
+    /// Whether a list that opens (the Omni bar, Background Sessions) lists
+    /// a host again: not one whose SSH login was refused (that waits for a
+    /// wake, a network change or Reconnect: another login on every open can
+    /// get the address blocked), nor one another identity or protocol
+    /// answers (nothing changes by asking again).
+    nonisolated static func refreshesOnOpen(_ state: HostControl.ConnectionState) -> Bool {
+        switch state {
+        case .idle, .connected:
+            return true
+        case .connecting:
+            return false
+        case .waitingToReconnect(let error), .failed(let error):
+            return !error.isAuthenticationFailure && !error.isIdentityMismatch && !error.isVersionMismatch
+        }
     }
 
     /// Reconnect or Retry on `host`: it may be looked at again now.

@@ -822,37 +822,78 @@ private final class FakePeeks {
     #expect(error.isIdentityMismatch)
 }
 
-@Test @MainActor func RemoteDevicePickerLooksAtDevicesWithoutConnectingThem() async throws {
+@Test @MainActor func RemoteDeviceOmniBarLooksAtDevicesWithoutConnectingOrStartingThem() async throws {
     let harness = try DeviceHarness()
     defer { harness.cleanUp() }
+    let local = try PersistentHarness()
+    defer { local.cleanUp() }
     let fake = FakePeeks()
     fake.answer = .notRunning
-    let controller = TitlebarProjectMenuController(
-        makeModel: { TitlebarProjectMenuModel(worktrees: nil, projects: [], devices: [], currentProjectKey: nil) },
-        controls: { [harness.control] },
-        peeks: fake.peeks,
-        perform: { _ in }
+    // This Mac's background sessions and the windows' tabs, read as the bar
+    // reads them: from what is cached, never by listing a host.
+    let background = BackgroundSessionsModel(
+        localSessions: local.hosting,
+        registry: ProjectWindowRegistry(),
+        prefersPersistentLocalSessions: { true },
+        isAppActive: { true },
+        peeks: fake.peeks
     )
-    controller.startRefreshing()
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    var gathered = 0
+    func openBar() -> OmniBarLiveModel {
+        let live = OmniBarLiveModel(
+            controller: OmniBarController(),
+            gather: {
+                gathered += 1
+                var sources = OmniSources()
+                sources.tabs = OmniBarGathering.tabs(registry: registry, current: nil)
+                    + [OmniTab(id: UUID(), title: "Shell", projectName: "app", machine: .thisMac, isWorking: false, canDetach: true)]
+                sources.backgroundSessions = OmniBarGathering.background(background)
+                return sources
+            },
+            frecency: { [:] },
+            controls: { [harness.control] },
+            peeks: fake.peeks
+        )
+        live.start()
+        return live
+    }
+
+    // Opening the bar lists what is cached and looks at the device with a
+    // look that starts nothing there: its control never connects, and no
+    // host (the device's or This Mac's) is launched.
+    let first = openBar()
+    #expect(gathered >= 1)
+    #expect(first.controller.rows.isEmpty == false)
     #expect(await eventually { fake.looks.count == 1 })
     try await Task.sleep(for: .milliseconds(200))
+    first.stop()
     #expect(harness.fake.launches.isEmpty)
+    #expect(local.fake.launches.isEmpty)
     #expect(harness.control.state == .idle)
+    #expect(local.control.state != .connected)
+
     // Opened again within the minute after a failure: not looked at again.
     fake.answer = .failed(.unavailable("Connection timed out"))
     fake.now += 10
-    controller.startRefreshing()
+    let second = openBar()
     #expect(await eventually { fake.looks.count == 2 })
-    controller.startRefreshing()
+    second.stop()
+    let third = openBar()
     try await Task.sleep(for: .milliseconds(100))
+    third.stop()
     #expect(fake.looks.count == 2)
+
     // A connected device refreshes over its connection instead.
     _ = try await harness.control.list()
     fake.now += 120
-    controller.startRefreshing()
+    let fourth = openBar()
     try await Task.sleep(for: .milliseconds(200))
+    fourth.stop()
     #expect(fake.looks.count == 2)
     #expect(harness.fake.launches.count == 1)
+    #expect(local.fake.launches.isEmpty)
 }
 
 @Test @MainActor func RemoteDeviceLaunchNoticeNamesTheBackgroundSessionsOfDevicesThatAnswer() async throws {

@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import SwiftUI
 import Testing
 @testable import Cherry
 
@@ -30,6 +31,7 @@ private final class RealLocalHost {
     private let socket: URL
     private var windows: [NSWindow] = []
     private var containers: [GhosttyTerminalContainerView] = []
+    private var shownSessions: [(GhosttyTerminalContainerView, TerminalSession)] = []
 
     final class Box: @unchecked Sendable {
         var value = SessionPersistenceSettings.defaults
@@ -186,6 +188,15 @@ private final class RealLocalHost {
         window.orderFrontRegardless()
         windows.append(window)
         containers.append(container)
+        shownSessions.append((container, session))
+    }
+
+    /// Configures every shown container again with its session, as a
+    /// SwiftUI update of the terminal pane does.
+    func updateShownContainers() {
+        for (container, session) in shownSessions {
+            container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+        }
     }
 
     func waitFor(_ description: String, timeout: TimeInterval = 15, _ predicate: () async throws -> Bool) async throws {
@@ -1285,6 +1296,213 @@ private func commandLine(of pid: pid_t) throws -> String {
         #expect(tab.nativeExecLaunch.command == launch.command)
         tab.send(text: "echo STILL_$((40 + 2))\n")
         try await host.waitFor("the adapter to still pass input") { host.screen(tab).contains("STILL_42") }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+/// Records the longest gap between main-queue heartbeats (every 10 ms)
+/// while it runs: how long the main thread was blocked.
+@MainActor
+final class MainThreadHeartbeat {
+    private var timer: DispatchSourceTimer?
+    private var last: CFTimeInterval = 0
+    private(set) var longestGap: CFTimeInterval = 0
+
+    func start() {
+        last = CACurrentMediaTime()
+        longestGap = 0
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(10), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let now = CACurrentMediaTime()
+                self.longestGap = max(self.longestGap, now - self.last)
+                self.last = now
+            }
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    /// Stops, counting the time since the last beat too.
+    func stop() -> CFTimeInterval {
+        timer?.cancel()
+        timer = nil
+        longestGap = max(longestGap, CACurrentMediaTime() - last)
+        return longestGap
+    }
+}
+
+/// The longest the main thread may stop answering while a Stop runs and
+/// its program ends (the target is ~50 ms; debug builds under load leave
+/// some room). A Stop that waited for the program would block for its
+/// whole grace period (HUP → TERM → KILL), hundreds of milliseconds at least.
+private let stopMainThreadGapLimit: CFTimeInterval = 0.1
+
+/// Stops a running command tab as its Stop button and MCP `stop_process`
+/// do (`stopManagedCommand`), and returns how long that call took and the
+/// main thread's longest block from just before it until `observing`
+/// later, while the program ends (`update` runs right after the call, as
+/// SwiftUI's update of the pane would).
+@MainActor
+private func mainThreadBlockOfStopping(
+    _ command: TerminalSession, observing: Duration = .seconds(3), update: () -> Void = {}
+) async throws -> (gap: CFTimeInterval, call: CFTimeInterval) {
+    let heartbeat = MainThreadHeartbeat()
+    heartbeat.start()
+    try await Task.sleep(for: .milliseconds(100))
+    let before = CACurrentMediaTime()
+    command.stopManagedCommand()
+    let call = CACurrentMediaTime() - before
+    update()
+    try await Task.sleep(for: observing)
+    return (heartbeat.stop(), call)
+}
+
+/// Programs that end at once, and ones that ignore the hangup and SIGTERM
+/// (only SIGKILL, after the grace period, ends those).
+private let stopMeasuredPrograms = [
+    "sleep 30",
+    "trap '' TERM; sleep 30",
+    "trap '' HUP TERM; sleep 30",
+    "trap '' HUP TERM; while :; do echo line $RANDOM; done"
+]
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostStoppingACommandNeverBlocksTheMainThread() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        var index = 0
+        for persistent in [true, false] {
+            host.settings.value.persistLocalSessions = persistent
+            for script in stopMeasuredPrograms {
+                index += 1
+                let command = workspace.addCommandSession(
+                    command: ProjectCommandDefinition(name: "slow\(index)", command: "/bin/sh", arguments: "-c \"\(script)\""),
+                    projectRoot: host.home.path
+                )
+                #expect(command.isPersistentLocalSession == persistent)
+                host.show(command)
+                try await host.waitFor("the command to run") {
+                    command.state == .live && command.usesNativePTYBackend
+                        && (!persistent || command.adapterLiveStatus?.followsProgram == true)
+                }
+                try await Task.sleep(for: .milliseconds(500))
+                let sessionID = command.persistentSession?.sessionID
+                let (gap, call) = try await mainThreadBlockOfStopping(command) { host.updateShownContainers() }
+                print("stop main-thread block: persistent=\(persistent) program=\(script) call=\(Int(call * 1000)) ms longest gap=\(Int(gap * 1000)) ms")
+                #expect(command.state == .exited(0))
+                #expect(!command.isRunning)
+                #expect(gap < stopMainThreadGapLimit, "Stop blocked the main thread for \(Int(gap * 1000)) ms (\(script), persistent \(persistent))")
+                // A persistent tab's program is ended by its holder, and the
+                // session removed, even when it ignores HUP and TERM.
+                if let sessionID {
+                    try await host.waitFor("the stopped session to be gone") {
+                        try await host.hostSession(sessionID) == nil
+                    }
+                }
+            }
+        }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+/// Hosts the project window's ContentView around a test workspace.
+private struct StopMeasureContentHost: View {
+    @ObservedObject var repository: RepositoryWorkspace
+    @ObservedObject var workspace: TerminalWorkspace
+    @ObservedObject var chromeState: ProjectWindowChromeState
+    let noteStore: ProjectNoteStore
+    let todoStore: ProjectTodoStore
+    @State private var storedSidebarWidth = 320.0
+
+    var body: some View {
+        ContentView(
+            repository: repository,
+            workspace: workspace,
+            chromeState: chromeState,
+            noteStore: noteStore,
+            todoStore: todoStore,
+            projectRoot: workspace.projectRoot,
+            openProject: { _ in },
+            isSidebarHidden: $chromeState.isSidebarHidden,
+            isSidebarRevealed: $chromeState.isSidebarRevealed,
+            isCursorOverSidebar: $chromeState.isCursorOverSidebar,
+            storedSidebarWidth: $storedSidebarWidth
+        )
+    }
+}
+
+/// The same with the project window's views on screen (the sidebar's
+/// command rows, the pane and its exit bar react to the stop), among other
+/// tabs of the window.
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostStoppingACommandInItsWindowNeverBlocksTheMainThread() async throws {
+    let host = try await RealLocalHost()
+    let root = host.home.path
+    let scripts = ["trap '' TERM; sleep 30", "sleep 30"]
+    func name(_ index: Int, _ persistent: Bool) -> String { "slow\(index)\(persistent ? "" : "n")" }
+    var toml = ""
+    for persistent in [true, false] {
+        for (index, script) in scripts.enumerated() {
+            toml += "[[commands]]\nname = \"\(name(index, persistent))\"\ncommand = \"/bin/sh\"\n"
+                + "arguments = '''-c \"\(script)\"'''\n\n"
+        }
+    }
+    try toml.write(to: host.home.appendingPathComponent("cherry.toml"), atomically: true, encoding: .utf8)
+    let workspace = host.workspace()
+    let repository = RepositoryWorkspace(projectRoot: root, autoStartCommands: { _ in [] })
+    let chromeState = ProjectWindowChromeState()
+    let notes = host.home.appendingPathComponent(".notes", isDirectory: true)
+    let hostingView = NSHostingView(rootView: StopMeasureContentHost(
+        repository: repository, workspace: workspace, chromeState: chromeState,
+        noteStore: ProjectNoteStore(projectRoot: root, storageDirectory: notes),
+        todoStore: ProjectTodoStore(projectRoot: root, storageDirectory: notes)
+    ))
+    hostingView.frame = NSRect(x: 0, y: 0, width: 1100, height: 700)
+    let window = NSWindow(contentRect: hostingView.frame, styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = hostingView
+    window.orderFrontRegardless()
+    defer { window.close() }
+    do {
+        for index in 0..<4 {
+            let other = workspace.addSession(title: "Other \(index)")
+            try await host.waitFor("another tab to attach") { other.persistentSession != nil && other.state == .live }
+            other.send(text: "seq 1 5000\n")
+        }
+        for persistent in [true, false] {
+            host.settings.value.persistLocalSessions = persistent
+            for (index, script) in scripts.enumerated() {
+                let command = workspace.addCommandSession(
+                    command: ProjectCommandDefinition(name: name(index, persistent), command: "/bin/sh", arguments: "-c \"\(script)\""),
+                    projectRoot: root
+                )
+                chromeState.selectTerminal()
+                workspace.select(command)
+                try await host.waitFor("the command to run") {
+                    command.state == .live && command.usesNativePTYBackend
+                        && (!persistent || command.adapterLiveStatus?.followsProgram == true)
+                }
+                try await Task.sleep(for: .milliseconds(700))
+                let (gap, call) = try await mainThreadBlockOfStopping(command)
+                print("stop main-thread block in window: persistent=\(persistent) program=\(script) call=\(Int(call * 1000)) ms longest gap=\(Int(gap * 1000)) ms")
+                #expect(command.state == .exited(0))
+                #expect(gap < stopMainThreadGapLimit, "Stop blocked the main thread for \(Int(gap * 1000)) ms (\(script), persistent \(persistent))")
+            }
+        }
     } catch {
         workspace.closeAllSessions(intent: .windowClosed)
         await host.tearDown()

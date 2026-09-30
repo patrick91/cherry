@@ -233,7 +233,12 @@ enum OmniBarGathering {
         // Minutes: a finer clock would change the sources every second.
         sources.now = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60)
 
-        sources.tabs = tabs(registry: registry, current: window.workspace)
+        sources.tabs = tabs(registry: registry, current: window.workspace) { machine in
+            switch machine {
+            case .thisMac: NSHomeDirectory()
+            case .device(let id): deviceStore.device(id: id)?.homeDirectory
+            }
+        }
         sources.backgroundSessions = background(backgroundSessions)
 
         let repository = window.repository
@@ -261,7 +266,7 @@ enum OmniBarGathering {
             }
             let editors = ExternalEditorLauncher.editors(installed, forProjectRoot: location.key)
             if let editor = ExternalEditorDiscovery.resolveDefault(editors: editors, preferredID: terminalSettings.defaultEditorID) {
-                sources.editorsByProjectKey[location.key] = OmniEditor(id: editor.id, name: editor.displayName)
+                sources.editorsByProjectKey[location.key] = OmniEditor(id: editor.id, name: editor.displayName, appPath: editor.appURL.path)
             }
         }
 
@@ -278,11 +283,20 @@ enum OmniBarGathering {
         guard let projectRoot else { return [] }
         let editors = ExternalEditorLauncher.editors(installed, forProjectRoot: projectRoot)
         guard let preferred = ExternalEditorDiscovery.resolveDefault(editors: editors, preferredID: preferredID) else { return [] }
-        return ([preferred] + editors.filter { $0.id != preferred.id }).map { OmniEditor(id: $0.id, name: $0.displayName) }
+        return ([preferred] + editors.filter { $0.id != preferred.id }).map {
+            OmniEditor(id: $0.id, name: $0.displayName, appPath: $0.appURL.path)
+        }
     }
 
-    /// The tabs of every open window, the bar's own window's first.
-    static func tabs(registry: ProjectWindowRegistry, current: TerminalWorkspace?) -> [OmniTab] {
+    /// The tabs of every open window, the bar's own window's first. Each
+    /// one's detail is its window's project, or for a window at the home
+    /// folder its directory (`OmniTab.detail`; `home` is each Mac's home
+    /// folder when known).
+    static func tabs(
+        registry: ProjectWindowRegistry,
+        current: TerminalWorkspace?,
+        home: (ProjectSwitcherModel.Machine) -> String? = { _ in nil }
+    ) -> [OmniTab] {
         var windows = registry.workspacesByProjectRoot()
         if let current, let index = windows.firstIndex(where: { $0.workspace === current }) {
             windows.insert(windows.remove(at: index), at: 0)
@@ -291,14 +305,15 @@ enum OmniBarGathering {
             let canonical = registry.canonicalProjectRoot(for: projectRoot)
             let location = ProjectLocation(key: canonical)
             let machine: ProjectSwitcherModel.Machine = location.deviceID.map { .device($0) } ?? .thisMac
-            let projectName = location.isRemote
-                ? RemoteDeviceProject(path: location.path, sessionCount: 0, isAdded: false).name
-                : MenuBarAgentPresentation.projectName(projectRoot: canonical)
+            let windowPath = location.isRemote ? location.path : canonical
+            let machineHome = home(machine)
             return workspace.sessions.map { session in
-                OmniTab(
+                var directory: String? = session.workingDirectory
+                if let key = directory, ProjectLocation.isRemoteKey(key) { directory = ProjectLocation(key: key).path }
+                return OmniTab(
                     id: session.id,
                     title: session.title,
-                    projectName: projectName,
+                    projectName: OmniTab.detail(windowPath: windowPath, workingDirectory: directory, home: machineHome),
                     machine: machine,
                     isWorking: session.agentActivityState == .working,
                     canDetach: SessionCloseCoordinator.canDetach(session),

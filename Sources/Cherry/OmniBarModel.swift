@@ -166,6 +166,10 @@ struct OmniItem: Equatable, Identifiable {
     /// The agent's logo (`Resources/AgentLogos`,
     /// `AgentToolBrand.logoResourceName`), shown instead of `symbol`.
     var logo: String?
+    /// An app bundle whose icon the row shows (an editor's), in full
+    /// colour, instead of `logo` and `symbol`; the symbol when it is gone
+    /// (`OmniAppIconCache`).
+    var appPath: String? = nil
     /// What ↵ does, named in the footer ("↵ Open").
     var primaryLabel: String
     var primary: OmniCommand
@@ -401,7 +405,9 @@ enum OmniRanking {
 struct OmniTab: Equatable {
     var id: UUID
     var title: String
-    /// Its window's project name.
+    /// Its detail: its window's project name, or for a window with no
+    /// project (its home folder) its directory's name, "~" at home
+    /// (`OmniTab.detail`).
     var projectName: String
     var machine: ProjectSwitcherModel.Machine
     var isWorking: Bool
@@ -409,6 +415,38 @@ struct OmniTab: Equatable {
     /// An agent tab's tool (a brand's raw value, or the agent's name), for
     /// its logo; nil for other tabs.
     var agentKey: String? = nil
+
+    /// A tab's detail: its window's folder name, unless the window is at
+    /// the home folder (no project), where it is the tab's directory's
+    /// name, or "~" when that is the home folder too (never the bare home
+    /// folder's name, the user's name). `home` is the Mac's home folder
+    /// when known; otherwise a `/Users/<name>` or `/home/<name>` window
+    /// counts as one.
+    static func detail(windowPath: String, workingDirectory: String?, home: String?) -> String {
+        func standardized(_ path: String) -> String {
+            var path = (path as NSString).standardizingPath
+            while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+            return path
+        }
+        let home = home.map(standardized).flatMap { $0.isEmpty ? nil : $0 }
+        func isHome(_ path: String) -> Bool {
+            let path = standardized(path)
+            if path == "~" || path.isEmpty { return true }
+            if let home { return path == home }
+            let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+            return path == "/var/root" || (parts.count == 2 && (parts[0] == "Users" || parts[0] == "home"))
+        }
+        func name(_ path: String) -> String {
+            let path = standardized(path)
+            if path == "/" { return "/" }
+            return (path as NSString).lastPathComponent
+        }
+        if !isHome(windowPath), windowPath != "/" { return name(windowPath) }
+        guard let directory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !directory.isEmpty, !isHome(directory)
+        else { return "~" }
+        return name(directory)
+    }
 }
 
 /// A background session (`BackgroundSessionsModel.allSessions`).
@@ -435,6 +473,8 @@ struct OmniWorktree: Equatable {
 struct OmniEditor: Equatable {
     var id: String
     var name: String
+    /// Its app bundle (`InstalledEditor.appURL`), for its icon.
+    var appPath: String? = nil
 }
 
 struct OmniAgent: Equatable {
@@ -852,14 +892,19 @@ enum OmniProviders {
                 kind: .command,
                 title: "Open in \(editor.name)",
                 symbol: "arrow.up.forward.app",
+                appPath: editor.appPath,
                 primaryLabel: "Open",
                 primary: .openInEditor(editorID: editor.id)
             ))
+            // The first other editor's icon (the default's when it is the
+            // only one).
+            let other = sources.editors.dropFirst().first ?? editor
             items.append(OmniItem(
                 id: "command:openInOtherEditor",
                 kind: .command,
                 title: "Open in Other Editor…",
                 symbol: "arrow.up.forward.app",
+                appPath: other.appPath,
                 primaryLabel: "Show",
                 primary: .drill(.editors)
             ))
@@ -970,6 +1015,7 @@ enum OmniProviders {
                 kind: .command,
                 title: editor.name,
                 symbol: "arrow.up.forward.app",
+                appPath: editor.appPath,
                 primaryLabel: "Open",
                 primary: .openInEditor(editorID: editor.id)
             )
@@ -1053,6 +1099,17 @@ enum OmniSections {
         }
     }
 
+    /// Each row once (its first), and no empty section: rows are keyed and
+    /// selected by id, so two rows with one id would show two selections.
+    static func unique(_ sections: [OmniSection]) -> [OmniSection] {
+        var seen = Set<String>()
+        return sections.compactMap { section in
+            var section = section
+            section.rows = section.rows.filter { seen.insert($0.id).inserted }
+            return section.rows.isEmpty ? nil : section
+        }
+    }
+
     /// Untitled sections as one.
     private static func merged(_ sections: [OmniSection]) -> [OmniSection] {
         guard sections.allSatisfy({ $0.title == nil }), sections.count > 1 else { return sections }
@@ -1066,12 +1123,19 @@ enum OmniSections {
 /// row and the ⌘K action list. Keys reach it from the search field
 /// (`OmniBarView`) and ⌘K from `AppShortcutMonitor`, only while the bar is
 /// open. Running a row goes to `run`; drilling stays here.
+///
+/// The selection is a row id, and a list with rows always has one: a new
+/// query or scope selects the first row; any other change of the rows (the
+/// sources or frecency updating while the bar is open) keeps the selected
+/// row when it is still listed, else selects the first. The pointer selects
+/// the row it moves over (`hover(id:)`), the keys move from there.
 @MainActor
 final class OmniBarController: ObservableObject {
     @Published private(set) var stack: [OmniScope] = []
     @Published private(set) var query = ""
     @Published private(set) var sections: [OmniSection] = []
-    @Published private(set) var selection = 0
+    /// The selected row's id; nil only while there are no rows.
+    @Published private(set) var selectedID: String?
     @Published private(set) var isActionListOpen = false
     @Published private(set) var actionSelection = 0
     /// Bumped when the keyboard moves the selection: the list scrolls it
@@ -1109,10 +1173,21 @@ final class OmniBarController: ObservableObject {
 
     var rows: [OmniRow] { sections.flatMap(\.rows) }
 
-    var selectedItem: OmniItem? {
-        let rows = rows
-        return rows.indices.contains(selection) ? rows[selection].item : nil
+    /// The selected row's index in `rows` (0 when there are none).
+    var selection: Int {
+        guard let selectedID else { return 0 }
+        return rows.firstIndex { $0.id == selectedID } ?? 0
     }
+
+    var selectedItem: OmniItem? {
+        guard let selectedID else { return nil }
+        for section in sections {
+            if let row = section.rows.first(where: { $0.id == selectedID }) { return row.item }
+        }
+        return nil
+    }
+
+    func isSelected(_ row: OmniRow) -> Bool { row.id == selectedID }
 
     var selectedActions: [OmniAction] { selectedItem?.actions ?? [] }
 
@@ -1140,13 +1215,16 @@ final class OmniBarController: ObservableObject {
     }
 
     private func recompute(resetSelection: Bool) {
-        let selectedID = resetSelection ? nil : selectedItem?.id
-        sections = OmniSections.build(scope: scope, query: query, sources: sources, frecency: frecency)
+        let kept = resetSelection ? nil : selectedID
+        sections = OmniSections.unique(OmniSections.build(scope: scope, query: query, sources: sources, frecency: frecency))
         let rows = rows
-        if let selectedID, let index = rows.firstIndex(where: { $0.id == selectedID }) {
-            selection = index
+        if let kept, rows.contains(where: { $0.id == kept }) {
+            if selectedID != kept { selectedID = kept }
         } else {
-            selection = resetSelection ? 0 : min(selection, max(rows.count - 1, 0))
+            let first = rows.first?.id
+            if selectedID != first { selectedID = first }
+            // The selected row went away: show the first.
+            if !resetSelection, kept != nil { scrollRequest &+= 1 }
         }
         if resetSelection {
             isActionListOpen = false
@@ -1235,23 +1313,33 @@ final class OmniBarController: ObservableObject {
             actionSelection = min(max(actionSelection + delta, 0), count - 1)
             return
         }
-        let count = rows.count
-        guard count > 0 else { return }
-        let next = min(max(selection + delta, 0), count - 1)
-        guard next != selection else { return }
-        selection = next
+        let rows = rows
+        guard !rows.isEmpty else { return }
+        let current = selection
+        let next = min(max(current + delta, 0), rows.count - 1)
+        guard next != current || selectedID != rows[next].id else { return }
+        selectedID = rows[next].id
         scrollRequest &+= 1
     }
 
-    /// The pointer moved over a row.
-    func hover(_ index: Int) {
-        guard !isActionListOpen, rows.indices.contains(index), selection != index else { return }
-        selection = index
+    /// The pointer moved over a row (the view calls this only when the
+    /// pointer itself moved, never when a row moved under a still pointer:
+    /// `OmniPointerTracker`).
+    func hover(id: String) {
+        guard !isActionListOpen, selectedID != id, rows.contains(where: { $0.id == id }) else { return }
+        selectedID = id
     }
 
     func select(_ index: Int) {
+        let rows = rows
         guard rows.indices.contains(index) else { return }
-        selection = index
+        selectedID = rows[index].id
+        isActionListOpen = false
+    }
+
+    func select(id: String) {
+        guard rows.contains(where: { $0.id == id }) else { return }
+        selectedID = id
         isActionListOpen = false
     }
 

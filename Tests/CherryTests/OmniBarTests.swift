@@ -718,3 +718,220 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     performer.perform(.closeTab(UUID()))
     #expect(workspace.sessions.isEmpty)
 }
+
+// MARK: - Editor icons
+
+@Test @MainActor func omniEditorRowsShowTheirAppsIconWithTheSymbolAsFallback() {
+    var sources = fixture()
+    sources.editors = [
+        OmniEditor(id: "zed", name: "Zed", appPath: "/Applications/Zed.app"),
+        OmniEditor(id: "vscode", name: "Visual Studio Code", appPath: "/Applications/Visual Studio Code.app"),
+        OmniEditor(id: "gone", name: "Gone", appPath: "/Applications/Gone.app"),
+    ]
+    let commands = Dictionary(uniqueKeysWithValues: OmniProviders.commands(sources).map { ($0.id, $0) })
+    #expect(commands["editor:zed"]?.appPath == "/Applications/Zed.app")
+    // Other Editor… shows the first other editor's.
+    #expect(commands["command:openInOtherEditor"]?.appPath == "/Applications/Visual Studio Code.app")
+    let scope = OmniProviders.editors(sources)
+    #expect(scope.map(\.appPath) == sources.editors.map(\.appPath))
+    #expect(scope.allSatisfy { $0.symbol == "arrow.up.forward.app" })
+
+    var loads: [String] = []
+    let zedIcon = NSImage(size: NSSize(width: 32, height: 32))
+    let icons = OmniAppIconCache(
+        exists: { $0 != "/Applications/Gone.app" },
+        load: { path in
+            loads.append(path)
+            return path == "/Applications/Zed.app" ? zedIcon : NSImage(size: NSSize(width: 16, height: 16))
+        }
+    )
+    guard case .app(let image) = OmniRowIcon.resolve(commands["editor:zed"]!, appIcons: icons, logo: { _ in nil }) else {
+        Issue.record("Zed's row should show Zed's icon")
+        return
+    }
+    #expect(image === zedIcon)
+    // Cached per bundle path: loaded once.
+    _ = OmniRowIcon.resolve(commands["editor:zed"]!, appIcons: icons, logo: { _ in nil })
+    #expect(loads == ["/Applications/Zed.app"])
+    // An app that is not there: the symbol.
+    let gone = scope.first { $0.id == "editor:gone" }!
+    guard case .symbol(let symbol) = OmniRowIcon.resolve(gone, appIcons: icons, logo: { _ in nil }) else {
+        Issue.record("a missing app should fall back to the symbol")
+        return
+    }
+    #expect(symbol == "arrow.up.forward.app")
+    // A row with no app keeps its logo or symbol.
+    guard case .symbol("gearshape") = OmniRowIcon.resolve(commands["command:settings"]!, appIcons: icons, logo: { _ in nil }) else {
+        Issue.record("Settings keeps its symbol")
+        return
+    }
+}
+
+// MARK: - One selection
+
+@MainActor
+private func selectedRows(_ controller: OmniBarController) -> [String] {
+    controller.rows.filter { controller.isSelected($0) }.map(\.id)
+}
+
+@Test @MainActor func omniHoverMovesTheOneSelectionAndTheKeysMoveOnFromThere() throws {
+    let controller = OmniRecorder().controller()
+    controller.open(at: nil)
+    #expect(selectedRows(controller).count == 1)
+    let rows = controller.rows
+    #expect(rows.count >= 4)
+    let pointer = OmniPointerTracker()
+    pointer.reset(to: CGPoint(x: 100, y: 100))
+    // The pointer moves onto the third row: it, and only it, is selected.
+    #expect(pointer.moved(to: CGPoint(x: 100, y: 140)))
+    controller.hover(id: rows[2].id)
+    #expect(selectedRows(controller) == [rows[2].id])
+    #expect(controller.selection == 2)
+    // ↓ goes on from the hovered row; still one selection.
+    controller.moveSelection(by: 1)
+    #expect(selectedRows(controller) == [rows[3].id])
+    controller.moveSelection(by: -2)
+    #expect(selectedRows(controller) == [rows[1].id])
+}
+
+@Test @MainActor func omniARowMovingUnderAStillPointerDoesNotTakeTheSelection() {
+    let pointer = OmniPointerTracker()
+    // The first event only records where the pointer is.
+    #expect(!pointer.moved(to: CGPoint(x: 10, y: 10)))
+    // The list scrolls (keys) or changes: hover events at the same spot.
+    #expect(!pointer.moved(to: CGPoint(x: 10, y: 10)))
+    #expect(!pointer.moved(to: CGPoint(x: 10.2, y: 10)))
+    // The pointer moves.
+    #expect(pointer.moved(to: CGPoint(x: 10, y: 14)))
+    #expect(!pointer.moved(to: CGPoint(x: 10, y: 14)))
+    // Opening the bar under a resting pointer selects nothing.
+    pointer.reset(to: CGPoint(x: 50, y: 50))
+    #expect(!pointer.moved(to: CGPoint(x: 50, y: 50)))
+
+    // The action list open: hovering rows changes nothing.
+    let controller = OmniRecorder().controller()
+    controller.open(at: .tabs)
+    let first = controller.selectedItem?.id
+    #expect(controller.toggleActions())
+    controller.hover(id: controller.rows[2].id)
+    #expect(controller.selectedItem?.id == first)
+    // An id no row has changes nothing either.
+    controller.escape()
+    controller.hover(id: "tab:nope")
+    #expect(controller.selectedItem?.id == first)
+}
+
+@Test @MainActor func omniSelectionIsKeptByIDOrGoesToTheFirstRowWheneverTheRowsChange() throws {
+    let controller = OmniRecorder().controller()
+    controller.open(at: .tabs)
+    try select("Shell 3", in: controller)
+    let pix = controller.selectedItem?.id
+    // A live update reorders the rows: the same row stays selected.
+    var sources = fixture()
+    sources.tabs.reverse()
+    controller.update(sources: sources)
+    #expect(controller.selectedItem?.id == pix && selectedRows(controller) == [pix!])
+
+    // A live update drops the selected row: the first row, scrolled to.
+    controller.moveSelection(by: 50)
+    #expect(controller.selectedItem?.title == "GraphQL core 3.3 references update")
+    let scroll = controller.scrollRequest
+    sources.tabs.removeAll { $0.id == tabPix }
+    sources.backgroundSessions = []
+    controller.update(sources: sources)
+    #expect(controller.selection == 0 && controller.selectedItem?.id == controller.rows.first?.id)
+    #expect(controller.scrollRequest == scroll + 1)
+    #expect(selectedRows(controller).count == 1)
+
+    // Frecency reorders Recent while open: the selected row stays.
+    controller.open(at: nil)
+    controller.moveSelection(by: 2)
+    let recent = controller.selectedItem?.id
+    let boosted = Dictionary(uniqueKeysWithValues: controller.rows.suffix(2).map { ($0.id, 150.0) })
+    controller.update(frecency: boosted)
+    #expect(controller.selectedItem?.id == recent)
+
+    // Every tab goes, then they come back: nothing, then the first row.
+    controller.open(at: .tabs)
+    controller.moveSelection(by: 2)
+    var empty = fixture()
+    empty.tabs = []
+    empty.backgroundSessions = []
+    controller.update(sources: empty)
+    #expect(controller.rows.isEmpty && controller.selectedID == nil)
+    controller.update(sources: fixture())
+    #expect(controller.selectedID == controller.rows.first?.id && controller.selectedID != nil)
+
+    // Scopes and queries: the first row, always one.
+    controller.push(.projects)
+    #expect(controller.selection == 0 && selectedRows(controller).count == 1)
+    controller.setQuery("zzzzzz")
+    #expect(controller.rows.isEmpty && controller.selectedID == nil && controller.selectedItem == nil)
+    controller.setQuery("pix")
+    #expect(controller.selection == 0 && selectedRows(controller).count == 1)
+    controller.pop()
+    #expect(controller.selection == 0 && selectedRows(controller).count == 1)
+}
+
+@Test func omniSectionsNeverListOneIDTwice() {
+    let item = OmniItem(id: "command:x", kind: .command, title: "X", symbol: "x", primaryLabel: "Run", primary: .menu(.settings))
+    let other = OmniItem(id: "command:y", kind: .command, title: "Y", symbol: "y", primaryLabel: "Run", primary: .menu(.settings))
+    let sections = OmniSections.unique([
+        OmniSection(title: "A", rows: [OmniRow(item: item), OmniRow(item: other)]),
+        OmniSection(title: "B", rows: [OmniRow(item: item)]),
+    ])
+    #expect(sections.map(\.id) == ["A"])
+    #expect(sections.first?.rows.map(\.id) == ["command:x", "command:y"])
+}
+
+// MARK: - Match highlighting
+
+@Test @MainActor func omniAnEmptyQueryShowsNoMatchedCharacters() {
+    var sources = fixture()
+    sources.editors = [OmniEditor(id: "zed", name: "Zed")]
+    let controller = OmniRecorder().controller(sources, frecency: ["editor:zed": 200])
+    controller.open(at: nil)
+    controller.setQuery("zed")
+    let zed = controller.rows.first { $0.id == "editor:zed" }
+    #expect(zed != nil && zed?.matched.isEmpty == false)
+    // Cleared by editing, by Esc, and in each scope: no bold anywhere.
+    controller.setQuery("")
+    #expect(controller.rows.contains { $0.id == "editor:zed" })
+    #expect(controller.rows.allSatisfy { $0.matched.isEmpty })
+    controller.setQuery("zed")
+    controller.escape()
+    #expect(controller.query.isEmpty && controller.rows.allSatisfy { $0.matched.isEmpty })
+    controller.setQuery("ze")
+    controller.update(frecency: ["editor:zed": 100])
+    controller.setQuery("")
+    #expect(controller.rows.allSatisfy { $0.matched.isEmpty })
+    for scope: OmniScope in [.projects, .tabs, .commands, .editors, .worktrees] {
+        controller.open(at: scope)
+        controller.setQuery("e")
+        controller.setQuery("")
+        #expect(controller.rows.allSatisfy { $0.matched.isEmpty }, "\(scope)")
+    }
+}
+
+// MARK: - Tab details
+
+@Test func omniTabDetailIsItsProjectOrItsDirectoryButNeverTheHomeFoldersName() {
+    let home = "/Users/patrickarminio"
+    // A project window: its name, wherever the tab is.
+    #expect(OmniTab.detail(windowPath: "/Users/patrickarminio/code/cherry", workingDirectory: "/tmp", home: home) == "cherry")
+    #expect(OmniTab.detail(windowPath: "/Users/patrickarminio/code/cherry/", workingDirectory: nil, home: home) == "cherry")
+    // A window at the home folder (no project): the tab's directory.
+    #expect(OmniTab.detail(windowPath: home, workingDirectory: "/Users/patrickarminio/code/parents-reminders", home: home) == "parents-reminders")
+    #expect(OmniTab.detail(windowPath: home + "/", workingDirectory: home, home: home) == "~")
+    #expect(OmniTab.detail(windowPath: home, workingDirectory: nil, home: home) == "~")
+    #expect(OmniTab.detail(windowPath: home, workingDirectory: "", home: home) == "~")
+    #expect(OmniTab.detail(windowPath: home, workingDirectory: "/", home: home) == "/")
+    // A Mac whose home is not known (a device): /Users/<name> is a home.
+    #expect(OmniTab.detail(windowPath: "/Users/patrickarminio", workingDirectory: "/Users/patrickarminio", home: nil) == "~")
+    #expect(OmniTab.detail(windowPath: "/home/pat", workingDirectory: "/home/pat/src/app", home: nil) == "app")
+    #expect(OmniTab.detail(windowPath: "/Users/patrickarminio/work", workingDirectory: nil, home: nil) == "work")
+    // Never the bare home folder's name.
+    for (window, directory) in [(home, home), (home, "~"), ("~", home)] {
+        #expect(OmniTab.detail(windowPath: window, workingDirectory: directory, home: home) != "patrickarminio")
+    }
+}

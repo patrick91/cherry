@@ -258,9 +258,11 @@ private struct OmniBarPanel: View {
 
     @AppStorage(CommandPaletteDesign.rowHeightKey) private var rowHeight = CommandPaletteDesign.defaultRowHeight
     @AppStorage(CommandPaletteDesign.highlightsMatchesKey) private var highlightsMatches = CommandPaletteDesign.defaultHighlightsMatches
-    /// Hover selects only once the pointer moves from here (a key press or
-    /// a new list leaves it over another row).
-    @State private var hoverSuppressedAt: CGPoint?
+    /// Hover selects only when the pointer itself moves: a row that moves
+    /// under a still pointer (keys scrolling the list, the rows changing)
+    /// never takes the selection. A reference, so pointer moves do not
+    /// redraw the panel.
+    @State private var pointer = OmniPointerTracker()
 
     private static let topMarkerID = "omni-bar-top"
     private static let maximumListHeight: CGFloat = 400
@@ -300,8 +302,8 @@ private struct OmniBarPanel: View {
             footer
         }
         .frame(width: panelWidth)
-        .onChange(of: controller.resetScrollRequest) { _, _ in suppressHover() }
-        .onAppear { suppressHover() }
+        // Where the pointer rests as the bar opens selects nothing.
+        .onAppear { pointer.reset(to: NSEvent.mouseLocation) }
     }
 
     private var list: some View {
@@ -325,8 +327,7 @@ private struct OmniBarPanel: View {
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 68)
                     }
-                    let offsets = sectionOffsets(sections)
-                    ForEach(Array(sections.enumerated()), id: \.element.id) { sectionIndex, section in
+                    ForEach(sections) { section in
                         if let title = section.title {
                             Text(title)
                                 .font(.system(size: 11, weight: .semibold))
@@ -337,25 +338,27 @@ private struct OmniBarPanel: View {
                                 .frame(height: Self.headerHeight, alignment: .bottomLeading)
                                 .accessibilityAddTraits(.isHeader)
                         }
-                        ForEach(Array(section.rows.enumerated()), id: \.element.id) { rowIndex, row in
-                            let index = offsets[sectionIndex] + rowIndex
-                            OmniBarRow(
+                        ForEach(section.rows) { row in
+                            // The row reads the selection itself (by id), so
+                            // exactly the selected row looks selected even
+                            // when the lazy stack keeps a row's view.
+                            OmniBarSelectableRow(
+                                controller: controller,
                                 row: row,
-                                isSelected: index == controller.selection,
                                 height: CGFloat(rowHeight),
                                 highlightsMatches: highlightsMatches
                             )
                             .id(row.id)
-                            .onHover { hovering in
-                                guard hovering, hoverAllowed() else { return }
-                                controller.hover(index)
+                            .onContinuousHover(coordinateSpace: .local) { phase in
+                                guard case .active = phase, pointer.moved(to: NSEvent.mouseLocation) else { return }
+                                controller.hover(id: row.id)
                             }
                             .onTapGesture {
-                                controller.select(index)
+                                controller.select(id: row.id)
                                 controller.activate()
                             }
                             .accessibilityAction {
-                                controller.select(index)
+                                controller.select(id: row.id)
                                 controller.activate()
                             }
                         }
@@ -406,30 +409,16 @@ private struct OmniBarPanel: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func sectionOffsets(_ sections: [OmniSection]) -> [Int] {
-        var offsets: [Int] = []
-        var total = 0
-        for section in sections {
-            offsets.append(total)
-            total += section.rows.count
-        }
-        return offsets
-    }
-
     /// The search field's key commands.
     private func handleCommand(_ selector: Selector) -> Bool {
         switch selector {
         case #selector(NSResponder.moveUp(_:)):
-            suppressHover()
             controller.moveSelection(by: -1)
         case #selector(NSResponder.moveDown(_:)):
-            suppressHover()
             controller.moveSelection(by: 1)
         case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)):
-            suppressHover()
             controller.moveSelection(by: -8)
         case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
-            suppressHover()
             controller.moveSelection(by: 8)
         case #selector(NSResponder.insertNewline(_:)):
             controller.activate()
@@ -447,16 +436,90 @@ private struct OmniBarPanel: View {
         return true
     }
 
-    private func suppressHover() {
-        hoverSuppressedAt = NSEvent.mouseLocation
+}
+
+/// Tells a hover event of the pointer moving from one of a row moving
+/// under a still pointer: only the first selects (the Raycast and
+/// Spotlight model, where hovering moves the one selection). Fed the
+/// pointer's screen location (`NSEvent.mouseLocation`), which a list
+/// scrolling or changing leaves as it was.
+final class OmniPointerTracker {
+    private(set) var lastLocation: CGPoint?
+
+    /// Where the pointer is now, selecting nothing (the bar opening).
+    func reset(to location: CGPoint) {
+        lastLocation = location
     }
 
-    private func hoverAllowed() -> Bool {
-        guard let suppressed = hoverSuppressedAt else { return true }
-        let location = NSEvent.mouseLocation
-        guard abs(location.x - suppressed.x) >= 1 || abs(location.y - suppressed.y) >= 1 else { return false }
-        hoverSuppressedAt = nil
-        return true
+    /// Whether the pointer moved since the last event; records `location`.
+    /// The first location seen only sets where it is.
+    func moved(to location: CGPoint) -> Bool {
+        defer { lastLocation = location }
+        guard let last = lastLocation else { return false }
+        return abs(location.x - last.x) >= 0.5 || abs(location.y - last.y) >= 0.5
+    }
+}
+
+/// App icons by bundle path (an editor row's), loaded once each; nil for an
+/// app that is not there (the row keeps its symbol).
+@MainActor
+final class OmniAppIconCache {
+    static let shared = OmniAppIconCache()
+
+    private let exists: (String) -> Bool
+    private let load: (String) -> NSImage
+    private var icons: [String: NSImage] = [:]
+
+    init(
+        exists: @escaping (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        load: @escaping (String) -> NSImage = { NSWorkspace.shared.icon(forFile: $0) }
+    ) {
+        self.exists = exists
+        self.load = load
+    }
+
+    func icon(forAppAt path: String) -> NSImage? {
+        if let icon = icons[path] { return icon }
+        guard !path.isEmpty, exists(path) else { return nil }
+        let icon = load(path)
+        icons[path] = icon
+        return icon
+    }
+}
+
+/// What a row's icon column shows: an app's icon (full colour), else the
+/// agent's logo (a template), else the SF Symbol.
+enum OmniRowIcon {
+    case app(NSImage)
+    case logo(NSImage)
+    case symbol(String)
+
+    @MainActor
+    static func resolve(
+        _ item: OmniItem,
+        appIcons: OmniAppIconCache = .shared,
+        logo: (String) -> NSImage? = { AgentLogoLoader.image(named: $0) }
+    ) -> OmniRowIcon {
+        if let path = item.appPath, let icon = appIcons.icon(forAppAt: path) { return .app(icon) }
+        if let name = item.logo, let image = logo(name) { return .logo(image) }
+        return .symbol(item.symbol)
+    }
+}
+
+/// A row that reads whether it is selected from the controller.
+private struct OmniBarSelectableRow: View {
+    @ObservedObject var controller: OmniBarController
+    let row: OmniRow
+    let height: CGFloat
+    let highlightsMatches: Bool
+
+    var body: some View {
+        OmniBarRow(
+            row: row,
+            isSelected: controller.isSelected(row),
+            height: height,
+            highlightsMatches: highlightsMatches
+        )
     }
 }
 
@@ -498,11 +561,13 @@ private struct OmniBarRow: View {
     var body: some View {
         HStack(spacing: 11) {
             icon
-                .foregroundStyle(.secondary)
                 .frame(width: 18)
                 .accessibilityHidden(true)
             title
                 .font(.system(size: 14))
+                // A new match (or none) is a new title: no bold kept from
+                // an earlier query.
+                .id(row.matched)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .layoutPriority(1)
@@ -534,19 +599,29 @@ private struct OmniBarRow: View {
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 
-    /// The agent's logo as a template, tinted like the symbols (the
-    /// menu-bar agent list's `AgentLogoLoader`), else the SF Symbol.
+    /// An editor's app icon in full colour; the agent's logo as a
+    /// template, tinted like the symbols (the menu-bar agent list's
+    /// `AgentLogoLoader`); else the SF Symbol.
     @ViewBuilder
     private var icon: some View {
-        if let logo = row.item.logo, let image = AgentLogoLoader.image(named: logo) {
+        switch OmniRowIcon.resolve(row.item) {
+        case .app(let image):
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+        case .logo(let image):
             Image(nsImage: image)
                 .resizable()
                 .renderingMode(.template)
                 .scaledToFit()
                 .frame(width: 15, height: 15)
-        } else {
-            Image(systemName: row.item.symbol)
+                .foregroundStyle(.secondary)
+        case .symbol(let name):
+            Image(systemName: name)
                 .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
         }
     }
 

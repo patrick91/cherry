@@ -119,6 +119,10 @@ final class OmniBarLiveModel: ObservableObject {
     private let frecency: @MainActor () -> [String: Double]
     private let controls: @MainActor () -> [HostControl]
     private let peeks: RemoteDevicePeeks
+    /// Lists the folders path queries ask for.
+    let browser: OmniFolderBrowser
+    /// Finds the repositories not added yet.
+    let scanner: OmniRepositoryScanner
     private var subscriptions: [AnyCancellable] = []
     private var timer: Timer?
 
@@ -127,13 +131,17 @@ final class OmniBarLiveModel: ObservableObject {
         gather: @escaping @MainActor () -> OmniSources,
         frecency: @escaping @MainActor () -> [String: Double],
         controls: @escaping @MainActor () -> [HostControl] = OmniBarLiveModel.deviceControls,
-        peeks: RemoteDevicePeeks = .shared
+        peeks: RemoteDevicePeeks = .shared,
+        browser: OmniFolderBrowser = .shared,
+        scanner: OmniRepositoryScanner = .shared
     ) {
         self.controller = controller
         self.gather = gather
         self.frecency = frecency
         self.controls = controls
         self.peeks = peeks
+        self.browser = browser
+        self.scanner = scanner
     }
 
     /// The app's: the window's sources and the shared frecency.
@@ -153,12 +161,23 @@ final class OmniBarLiveModel: ObservableObject {
     }
 
     func refresh() {
-        controller.update(sources: gather(), frecency: frecency())
+        // A device that connected since its folder was asked: asked now.
+        browser.retryDisconnected()
+        var sources = gather()
+        sources.folderListings = browser.listings
+        sources.unaddedRepositories = scanner.repositories
+        controller.update(sources: sources, frecency: frecency())
     }
 
     func start() {
         stop()
+        browser.onChange = { [weak self] in self?.refresh() }
+        scanner.onChange = { [weak self] in self?.refresh() }
+        controller.requestFolderListing = { [weak self] request in self?.browser.request(request) }
         refresh()
+        // The query the bar opened with (a path) is asked now too.
+        if let request = controller.folderRequest { browser.request(request) }
+        scanner.scanIfDue()
         subscriptions.append(peeks.$entries.dropFirst().debounce(for: .milliseconds(50), scheduler: DispatchQueue.main).sink { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         })
@@ -184,6 +203,9 @@ final class OmniBarLiveModel: ObservableObject {
         subscriptions.removeAll()
         timer?.invalidate()
         timer = nil
+        browser.onChange = {}
+        scanner.onChange = {}
+        controller.requestFolderListing = { _ in }
     }
 
     /// Lists each host again: a connected one over its connection, any
@@ -258,6 +280,13 @@ enum OmniBarGathering {
         sources.window = context(for: window, settings: settings)
 
         sources.listedLocalProjects = Set(settings.projects.map(\.root).filter { !ProjectLocation.isRemoteKey($0) })
+        sources.homes[.thisMac] = NSHomeDirectory()
+        sources.removedProjects[.thisMac] = settings.removedProjectRoots
+        for entry in devices {
+            let machine = ProjectSwitcherModel.Machine.device(entry.device.id)
+            if let home = entry.device.homeDirectory?.nilIfEmpty { sources.homes[machine] = home }
+            sources.removedProjects[machine] = Set(entry.device.hiddenProjects)
+        }
         let worktreeRoots = Set(registry.allRepositories.filter(\.supportsWorktrees).map(\.repositoryRoot))
         let installed = editorDiscovery.installedEditors
         for location in projects.locations {
@@ -367,7 +396,7 @@ enum OmniBarGathering {
     static func background(_ session: BackgroundSession, on machine: ProjectSwitcherModel.Machine) -> OmniBackgroundSession {
         OmniBackgroundSession(
             id: session.id,
-            title: session.displayTitle.nilIfEmpty ?? session.title,
+            title: BackgroundSessionPresentation.rowTitle(of: session),
             machine: machine,
             isWorking: session.isWorking,
             agentKey: session.kind == .agent ? (session.agentKey ?? session.title) : nil,
@@ -423,9 +452,16 @@ struct OmniBarPerformer {
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     func perform(_ command: OmniCommand) {
         switch command {
-        case .drill, .removeWorktree, .configureAgentPreset:
-            // The bar itself: a scope, or its own alert and sheet.
+        case .drill, .removeWorktree, .configureAgentPreset, .browseFolders, .enterFolder:
+            // The bar itself: a scope, folder completion, or its own alert
+            // and sheet.
             break
+        case .connectDevice(let id):
+            switcher.perform(.reconnectDevice(id))
+        case .addFolder(let path, let machine, let open):
+            addFolder(path, on: machine, open: open)
+        case .newTerminalAt(let path, let machine):
+            newTerminal(on: machine, at: path)
         case .openProject(let key):
             let model = projects()
             guard let location = model.locations.first(where: { $0.key == key }),
@@ -554,6 +590,72 @@ struct OmniBarPerformer {
             chromeState.presentWorktreeManager()
         case .toggleAppearance:
             toggleAppearance()
+        }
+    }
+
+    /// Adds the folder at `path` to its Mac's projects (This Mac's list, or
+    /// the device's through `RemoteDeviceProjectAdding`, whose key is
+    /// `device:<uuid>:<path>`), then opens it when `open`; says so in a
+    /// toast otherwise, and why not when it cannot.
+    private func addFolder(_ path: String, on machine: ProjectSwitcherModel.Machine, open: Bool) {
+        let toasts = chromeState.toasts
+        let name = (path as NSString).lastPathComponent
+        switch machine {
+        case .thisMac:
+            guard let expanded = ProjectSwitcherModel.expandedPath(path, home: NSHomeDirectory()),
+                  let project = settings.addProject(path: expanded)
+            else {
+                toasts.show(ProjectWindowToast(name: "", predicate: "There is no folder at \(path)", symbolName: "exclamationmark.triangle.fill"))
+                return
+            }
+            if open {
+                switcher.perform(.openProject(project.root))
+            } else {
+                toasts.show(ProjectWindowToast(name: project.name, predicate: " was added to Projects", symbolName: "folder.badge.plus"))
+            }
+        case .device(let id):
+            let switcher = switcher
+            Task { @MainActor in
+                switch await RemoteDeviceProjectAdding.add(path, to: id, store: .shared) {
+                case .success(let key):
+                    if open {
+                        switcher.openProject(CherryProject(root: key))
+                    } else {
+                        toasts.show(ProjectWindowToast(name: name, predicate: " was added to Projects", symbolName: "folder.badge.plus"))
+                    }
+                case .failure(let failure):
+                    toasts.show(ProjectWindowToast(
+                        name: name, predicate: " could not be added", message: failure.message,
+                        symbolName: "exclamationmark.triangle.fill"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// New Terminal Here: a terminal in `path` on `machine`, in this window
+    /// when it is that Mac's, else in the window of that Mac active last,
+    /// else in a new window of that folder.
+    private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String) {
+        func machineOf(_ key: String?) -> ProjectSwitcherModel.Machine {
+            key.flatMap { ProjectLocation(key: $0).deviceID }.map { .device($0) } ?? .thisMac
+        }
+        let home: String? = switch machine {
+        case .thisMac: NSHomeDirectory()
+        case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
+        }
+        let directory = ProjectSwitcherModel.expandedPath(path, home: home) ?? path
+        if machineOf(window.projectRoot ?? workspace.projectRoot) == machine {
+            chromeState.selectTerminal()
+            workspace.addSession(workingDirectory: directory)
+            return
+        }
+        if let (root, other) = registry.workspacesByProjectRoot().first(where: { machineOf($0.projectRoot) == machine }),
+           registry.focus(projectRoot: root) {
+            registry.chromeState(for: root)?.selectTerminal()
+            other.addSession(workingDirectory: directory)
+        } else if !switcher.openPath(directory, on: machine) {
+            NSSound.beep()
         }
     }
 

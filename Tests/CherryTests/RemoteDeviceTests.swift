@@ -134,6 +134,49 @@ private func session(
     #expect(paths.path(for: "me@studio.local") == nil)
 }
 
+/// The Omni bar's folders add a device's folder through the same path as
+/// Add Project on <Mac>…: resolved there, added to the device, keyed
+/// `device:<uuid>:<path>`.
+@Test @MainActor func RemoteDeviceOmniFoldersAddAFolderAsTheDevicesProjectKey() async throws {
+    let directory = try temporaryDirectory("devices-omni-add")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    var writable = true
+    let store = makeStore(directory: directory, hostStore: hostStore, canWrite: { writable })
+    let studio = try store.add(name: "Studio", sshDestination: "me@studio.local", homeDirectory: "/Users/me")
+    store.hideProject(path: "/Users/me/github/duck-dash", on: studio.id)
+    var asked: [String] = []
+    let resolve: RemoteDeviceProjectAdding.Resolver = { path, device in
+        asked.append("\(device.sshDestination) \(path)")
+        // As `pwd -P` there reports it.
+        return .success("/Users/me/github/duck-dash")
+    }
+    let key = try await RemoteDeviceProjectAdding.add("~/github/duck-dash", to: studio.id, store: store, resolve: resolve).get()
+    #expect(key == ProjectLocation.remote(deviceID: studio.id, path: "/Users/me/github/duck-dash").key)
+    #expect(key == "device:\(studio.id.uuidString.lowercased()):/Users/me/github/duck-dash")
+    #expect(asked == ["me@studio.local ~/github/duck-dash"])
+    let saved = try #require(store.device(id: studio.id))
+    #expect(saved.addedProjects == ["/Users/me/github/duck-dash"])
+    // Adding it again takes it out of the hidden ones.
+    #expect(saved.hiddenProjects.isEmpty)
+
+    // A folder that is not there, a Mac no longer known, or a copy that
+    // does not keep the Macs: nothing added.
+    let missing: RemoteDeviceProjectAdding.Resolver = { _, _ in .failure(.message("There is no folder at ~/nope on that Mac.")) }
+    let failure = await RemoteDeviceProjectAdding.add("~/nope", to: studio.id, store: store, resolve: missing)
+    #expect(failure == .failure(.message("There is no folder at ~/nope on that Mac.")))
+    if case .success = await RemoteDeviceProjectAdding.add("~/x", to: UUID(), store: store, resolve: resolve) {
+        Issue.record("added on an unknown Mac")
+    }
+    writable = false
+    if case .success = await RemoteDeviceProjectAdding.add("~/y", to: studio.id, store: store, resolve: resolve) {
+        Issue.record("added by a copy that does not keep the Macs")
+    }
+    #expect(asked.count == 1)
+    #expect(store.device(id: studio.id)?.addedProjects == ["/Users/me/github/duck-dash"])
+}
+
 @Test @MainActor func onlyTheInstanceLockHolderWritesDevicesAndEachDeviceGetsOneRemoteHosting() throws {
     let directory = try temporaryDirectory("devices-lock")
     defer { try? FileManager.default.removeItem(at: directory) }

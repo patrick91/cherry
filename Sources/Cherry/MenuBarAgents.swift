@@ -696,7 +696,7 @@ private struct MenuBarBackgroundSessionRow: View {
                 HStack(spacing: 8) {
                     glyph
                         .frame(width: 14, height: 14)
-                    Text(item.title)
+                    Text(BackgroundSessionPresentation.rowTitle(of: item))
                         .font(.system(size: 13))
                         .lineLimit(1)
                         .truncationMode(.middle)

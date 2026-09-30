@@ -178,6 +178,10 @@ struct OmniBarOverlay: View {
         case .configureAgentPreset(let id):
             agentError = nil
             editingAgent = AgentConfiguration.presets.first { $0.id == id }
+        case .connectDevice:
+            // The bar stays: the Mac's folders list once it is connected.
+            performer.perform(command)
+            focusRequest &+= 1
         default:
             let performer = performer
             dismiss()
@@ -322,10 +326,19 @@ private struct OmniBarPanel: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     Color.clear.frame(height: 6).id(Self.topMarkerID)
                     if rowCount == 0 {
-                        Text("No results")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, minHeight: 68)
+                        HStack(spacing: 8) {
+                            if controller.emptyState.isLoading {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text(controller.emptyState.text)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, minHeight: 68)
+                        .accessibilityElement(children: .combine)
                     }
                     ForEach(sections) { section in
                         if let title = section.title {

@@ -872,6 +872,12 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let agent = row(ownSession("a", project: project, name: "claude --resume", kind: "agent", agent: "Claude"))
     #expect(agent.title == "Claude")
     #expect(agent.agentKey == "Claude")
+    // The menu bar's panel names it as the Omni bar does: by its own name
+    // (its task title), not its tool's.
+    #expect(BackgroundSessionPresentation.rowTitle(of: agent) == "claude --resume")
+    let titled = row(ownSession("a3", project: project, name: "✳ Results feedback", kind: "agent", agent: "Claude"))
+    #expect(BackgroundSessionPresentation.rowTitle(of: titled) == "Results feedback")
+    #expect(BackgroundSessionPresentation.rowTitle(of: command) == "web")
     #expect(row(ownSession("a2", project: project, name: "Codex", kind: "agent")).title == "Codex")
 
     let idle = row(ownSession("t", project: project, name: "zsh"))

@@ -640,6 +640,9 @@ enum RemoteDeviceUpdatePresenter {
 
 // MARK: - Add Project on <Mac>…
 
+/// Add Project on <Mac>… as a sheet: the picker menu's, and the fallback
+/// of the Omni bar's folder completion (which adds through the same
+/// `RemoteDeviceProjectAdding`).
 struct AddDeviceProjectSheet: View {
     let deviceID: UUID
     @ObservedObject var store: RemoteDeviceStore
@@ -680,15 +683,14 @@ struct AddDeviceProjectSheet: View {
     }
 
     private func add() async {
-        guard let device = store.device(id: deviceID) else { return }
+        guard store.device(id: deviceID) != nil else { return }
         isChecking = true
         defer { isChecking = false }
         error = nil
-        switch await RemoteDeviceProbe.resolveDirectory(path, on: device.sshDestination, shell: await RemoteDeviceShell.app()) {
-        case .success(let resolved):
-            store.addProject(path: resolved, to: deviceID)
+        switch await RemoteDeviceProjectAdding.add(path, to: deviceID, store: store) {
+        case .success(let key):
             dismiss()
-            open(device.projectKey(path: resolved))
+            open(key)
         case .failure(let failure):
             error = failure.message
         }

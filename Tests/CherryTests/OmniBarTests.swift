@@ -133,27 +133,38 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 
 // MARK: - Matching
 
-@Test func omniMatcherRewardsWordStartsAndRunsAndSaysWhatMatched() throws {
-    // A word start beats an earlier letter inside a word.
-    let rocks = try #require(OmniMatcher.match("sr", in: "strawberry.rocks"))
-    #expect(rocks.indices == [0, 11])
-    let cli = try #require(OmniMatcher.match("fc", in: "fastapi-cli"))
-    #expect(cli.indices == [0, 8])
-    // A run of consecutive letters scores more than the same letters apart.
-    #expect(OmniMatcher.match("cli", in: "fastapi-cli")?.indices == [8, 9, 10])
-    let run = try #require(OmniMatcher.match("abc", in: "abcxyz"))
-    let apart = try #require(OmniMatcher.match("abc", in: "axbycz"))
-    #expect(run.score > apart.score)
-    // Prefix, then exact, count more.
+@Test func omniMatcherMatchesOneRunOrRunsAtWordStartsAndSaysWhatMatched() throws {
+    // One run anywhere matches: at the title's start best, then at a word
+    // start, then inside a word.
     let prefix = try #require(OmniMatcher.match("pix", in: "pixel"))
     let exact = try #require(OmniMatcher.match("pix", in: "pix"))
-    let inside = try #require(OmniMatcher.match("pix", in: "a-pix"))
-    #expect(exact.score > prefix.score && prefix.score > inside.score)
-    // Case, diacritics and the query's spaces do not matter.
-    #expect(OmniMatcher.match("CAFE", in: "café-maxxing")?.indices == [0, 1, 2, 3])
-    #expect(OmniMatcher.match("new tab", in: "New Tab")?.indices == [0, 1, 2, 4, 5, 6])
+    let atWord = try #require(OmniMatcher.match("pix", in: "a-pix"))
+    let inside = try #require(OmniMatcher.match("pix", in: "apixel"))
+    #expect(exact.score > prefix.score && prefix.score > atWord.score && atWord.score > inside.score)
+    #expect(inside.indices == [1, 2, 3])
+    #expect(OmniMatcher.match("cli", in: "fastapi-cli")?.indices == [8, 9, 10])
+    // Its best place: "sh" at the word start of "Shell", not inside "push".
+    #expect(OmniMatcher.match("sh", in: "push Shell")?.indices == [5, 6])
+    // Runs that each start a word match, acronym-like.
+    #expect(OmniMatcher.match("nca", in: "New Claude agent")?.indices == [0, 4, 11])
+    #expect(OmniMatcher.match("sr", in: "strawberry.rocks")?.indices == [0, 11])
+    #expect(OmniMatcher.match("fc", in: "fastapi-cli")?.indices == [0, 8])
+    #expect(OmniMatcher.match("newcl", in: "New Claude agent")?.indices == [0, 1, 2, 4, 5])
+    // …and a run backs off when a longer one leaves no word for the rest.
+    #expect(OmniMatcher.match("abc", in: "ab-bc")?.indices == [0, 3, 4])
+    #expect(OmniMatcher.match("nca", in: "New Claude agent")!.score < OmniMatcher.match("new", in: "New Claude agent")!.score)
+    // Letters scattered inside words never match.
+    #expect(OmniMatcher.match("add", in: "alpacas-and-ducks") == nil)
+    #expect(OmniMatcher.match("abc", in: "axbycz") == nil)
+    #expect(OmniMatcher.match("cherry", in: "chore-hunter-ery") == nil)
     #expect(OmniMatcher.match("xyz", in: "cherry") == nil)
     #expect(OmniMatcher.match("cherryy", in: "cherry") == nil)
+    // Case, diacritics and spaces around the query do not matter; spaces
+    // inside it are part of the run, or split runs.
+    #expect(OmniMatcher.match("CAFE", in: "café-maxxing")?.indices == [0, 1, 2, 3])
+    #expect(OmniMatcher.match("new tab", in: "New Tab")?.indices == [0, 1, 2, 3, 4, 5, 6])
+    #expect(OmniMatcher.match(" tab ", in: "New Tab")?.indices == [4, 5, 6])
+    #expect(OmniMatcher.match("n t", in: "New Tab")?.indices == [0, 4])
     #expect(OmniMatcher.match("", in: "cherry") == OmniMatch(score: 0, indices: []))
     // camelCase starts a word.
     #expect(OmniMatcher.match("gh", in: "gitHub")?.indices == [0, 3])
@@ -164,9 +175,12 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         OmniItem(id: "x:\(title)", kind: .project, title: title, symbol: "folder", primaryLabel: "Open", primary: .openProject(key: title))
     }
     let items = [item("chore-hunter-ery"), item("cherry"), item("Shell 1"), item("Shell 3")]
-    // A heavily used loose match never beats a prefix one…
+    // Scattered letters are no match, however much the title was used…
     let cherry = OmniRanking.rank(items, query: "cherry", frecency: ["x:chore-hunter-ery": 200])
-    #expect(cherry.map(\.item.title) == ["cherry", "chore-hunter-ery"])
+    #expect(cherry.map(\.item.title) == ["cherry"])
+    // …and a heavily used word-start match never beats a prefix one.
+    let words = [item("hunter-ery"), item("herald")]
+    #expect(OmniRanking.rank(words, query: "he", frecency: ["x:hunter-ery": 200]).map(\.item.title) == ["herald", "hunter-ery"])
     // …but frecency orders matches of the same quality.
     let shells = OmniRanking.rank(items, query: "shell", frecency: ["x:Shell 3": 150])
     #expect(shells.map(\.item.title) == ["Shell 3", "Shell 1"])
@@ -287,11 +301,18 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     controller.open(at: .projects)
     controller.setQuery("@")
     #expect(controller.stack == [.projects] && controller.query == "@")
-    // A pasted path is a folder to open, not Worktrees.
+    // A pasted path lists This Mac's folders, not Worktrees.
     controller.open(at: nil)
     controller.setQuery("/Users/me/notes")
     #expect(controller.stack.isEmpty)
-    #expect(controller.rows.last?.item.primary == .openPath("/Users/me/notes", on: .thisMac))
+    #expect(controller.folderRequest == OmniFolderRequest(machine: .thisMac, directory: "/Users/me/"))
+    // Without worktrees, "/" alone starts a path too.
+    var plain = fixture()
+    plain.window.supportsWorktrees = false
+    let other = OmniRecorder().controller(plain)
+    other.setQuery("/")
+    #expect(other.stack.isEmpty && other.query == "/")
+    #expect(other.folderRequest == OmniFolderRequest(machine: .thisMac, directory: "/"))
 }
 
 @Test @MainActor func omniBackspaceAndEscapeStepOutOneLevelAtATime() {
@@ -323,7 +344,9 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 @Test @MainActor func omniProjectsKeepOpenRecentAllHeadersOnlyWithoutAQuery() throws {
     let controller = OmniRecorder().controller()
     controller.open(at: .projects)
-    #expect(controller.sections.map(\.title) == ["Open", "Recent", "All"])
+    // Then This Mac's Add Project… and Open Folder… (no repositories found).
+    #expect(controller.sections.map(\.title) == ["Open", "Recent", "All", nil])
+    #expect(controller.sections[3].rows.map(\.item.title) == ["Add Project…", "Open Folder…"])
     // The current window's project first, then the most recent.
     #expect(controller.sections[0].rows.map(\.item.title) == ["cherry", "pix", "rignore"])
     #expect(controller.sections[1].rows.map(\.item.title) == ["strawberry.rocks", "fastapi-cli"])
@@ -351,8 +374,10 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     // ⇥ drills like ↵.
     #expect(controller.drillIntoSelection())
     #expect(controller.stack == [.macs, .mac(.device(studioID), name: "patstudio")])
-    #expect(titles(controller) == ["Shell 1", "rignore", "cherry"])
-    #expect(controller.rows.map(\.item.kind) == [.tab, .project, .project])
+    #expect(titles(controller) == [
+        "Shell 1", "rignore", "cherry", "Add Project on patstudio…", "Open Folder on patstudio…",
+    ])
+    #expect(controller.rows.map(\.item.kind) == [.tab, .project, .project, .command, .command])
     #expect(recorder.used == ["mac:\(studioID.uuidString)"])
 
     controller.pop()
@@ -361,7 +386,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     let rows = controller.rows
     #expect(rows.prefix(4).map(\.item.kind) == [.tab, .tab, .tab, .session])
     #expect(rows[3].item.detail == "background")
-    #expect(rows.dropFirst(4).allSatisfy { $0.item.kind == .project && $0.item.machine == .thisMac })
+    #expect(rows.dropFirst(4).dropLast(2).allSatisfy { $0.item.kind == .project && $0.item.machine == .thisMac })
+    #expect(rows.suffix(2).map(\.item.title) == ["Add Project…", "Open Folder…"])
     // A query ranks within the Mac.
     controller.setQuery("pix")
     #expect(titles(controller).first == "pix")

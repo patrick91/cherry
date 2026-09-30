@@ -108,6 +108,14 @@ enum BackgroundSessionPresentation {
         return tagged ?? info.displayName
     }
 
+    /// What a list of background sessions names it: its own name
+    /// (`BackgroundSession.displayTitle`: an agent's task title, a shell's
+    /// command or directory), as the Omni bar does; its title (a tool's
+    /// name) only when it has none.
+    static func rowTitle(of session: BackgroundSession) -> String {
+        session.displayTitle.nilIfEmpty ?? session.title
+    }
+
     static func projectName(projectRoot: String?) -> String {
         projectRoot.map(MenuBarAgentPresentation.projectName(projectRoot:)) ?? "No project"
     }

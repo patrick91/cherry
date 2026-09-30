@@ -23,6 +23,8 @@ enum OmniKind: String, Equatable {
     case worktree
     case command
     case agent
+    /// A folder of folder completion (`OmniFolderRows`).
+    case folder
 }
 
 /// The row's status dot.
@@ -67,7 +69,8 @@ enum OmniScope: Hashable {
 
     var placeholder: String {
         switch self {
-        case .mac(_, let name): "Search \(name)…"
+        case .mac(_, let name): "Search \(name), or type ~/ to browse it"
+        case .projects: "Search projects, or type ~/ to browse"
         default: "Search \(label.lowercased())…"
         }
     }
@@ -140,6 +143,20 @@ enum OmniCommand: Equatable {
     case launchAgent(id: String)
     case configureAgentPreset(id: String)
     case openInEditor(editorID: String)
+    /// Add Project… and Open Folder… (on a Mac): folder completion there,
+    /// with "~/" (the bar's own).
+    case browseFolders(on: ProjectSwitcherModel.Machine, intent: OmniFolderIntent)
+    /// A folder of folder completion: its folders (the bar's own; the
+    /// query becomes this).
+    case enterFolder(String)
+    /// Adds the folder at this path (absolute, or `~/…` on a device) to
+    /// the projects of its Mac, and opens it when `open`.
+    case addFolder(path: String, on: ProjectSwitcherModel.Machine, open: Bool)
+    /// A new terminal in this folder of that Mac.
+    case newTerminalAt(path: String, on: ProjectSwitcherModel.Machine)
+    /// Connects a device that is not connected (Reconnect), keeping the bar
+    /// open: its folders list once it is.
+    case connectDevice(UUID)
 }
 
 /// A ⌘K action of a row.
@@ -184,6 +201,11 @@ struct OmniItem: Equatable, Identifiable {
     var liveBoost: Double = 0
     /// Whether ↵ records it as used (not a "New worktree" row).
     var recordsUse = true
+    /// What ⇥ puts in the field (a folder's path and "/").
+    var completion: String? = nil
+    /// Added to its match score when ranked (a repository not added yet
+    /// goes after a project of the same name).
+    var rankBias: Double = 0
 
     var frecencyKey: String { id }
 
@@ -215,89 +237,98 @@ struct OmniMatch: Equatable {
     var indices: [Int]
 }
 
-/// Scores a query against a title as a subsequence, case and diacritic
-/// insensitively, whitespace in the query ignored: each matched character
-/// counts 1, 8 more at the start of a word (after a space, `-`, `_`, `.`,
-/// `/`, `:`, or a lower-to-upper case change) and 5 more right after the
-/// one matched before it; a title that starts with the query gets 12 more
-/// and one equal to it 20 more. The best alignment wins (dynamic
-/// programming), and shorter titles win ties.
+/// Matches a query in a title, case and diacritic insensitively. A title
+/// matches only when the query is in it as one run (a contiguous
+/// substring), or as runs that each start a word ("nca" in "New Claude
+/// agent", "fc" in "fastapi-cli"); letters scattered inside words never
+/// match ("add" is not in "alpacas-and-ducks"). A word starts at the
+/// title's start, after a space, `-`, `_`, `.`, `/`, `:`, `·` or `|`,
+/// after a lower-to-upper case change, and where letters follow other
+/// characters.
+///
+/// Scores: one run 40, 20 more at a word start and 10 more at the title's
+/// start, 10 more for the whole title; runs at word starts 20, less a
+/// little per run. Shorter titles win ties.
 enum OmniMatcher {
-    static let wordStartBonus = 8.0
-    static let consecutiveBonus = 5.0
-    static let prefixBonus = 12.0
-    static let exactBonus = 20.0
+    static let substringScore = 40.0
+    static let wordStartBonus = 20.0
+    static let prefixBonus = 10.0
+    static let exactBonus = 10.0
+    static let wordRunsScore = 20.0
+    static let separators: Set<Character> = [" ", "-", "_", ".", "/", ":", "·", "|"]
 
     static func match(_ query: String, in text: String) -> OmniMatch? {
-        let needle = Array(query.filter { !$0.isWhitespace }).map(fold)
+        let needle = Array(query.trimmingCharacters(in: .whitespacesAndNewlines)).map(fold)
         guard !needle.isEmpty else { return OmniMatch(score: 0, indices: []) }
         let characters = Array(text)
         let haystack = characters.map(fold)
-        let m = needle.count
-        let n = haystack.count
-        guard m <= n else { return nil }
+        let starts = wordStarts(characters)
+        let lengthPenalty = Double(haystack.count) * 0.02
 
-        var wordStart = [Bool](repeating: false, count: n)
-        for j in 0 ..< n {
-            if j == 0 {
-                wordStart[j] = true
-            } else {
-                let previous = characters[j - 1]
-                let current = characters[j]
-                wordStart[j] = previous.isWhitespace || "-_./:".contains(previous)
-                    || (previous.isLowercase && current.isUppercase)
-                    || (!previous.isLetter && !previous.isNumber && (current.isLetter || current.isNumber))
+        // One run: its best place (the title's start, then a word start).
+        if needle.count <= haystack.count {
+            var best: (score: Double, at: Int)?
+            for at in 0 ... haystack.count - needle.count where haystack[at] == needle[0] {
+                guard Array(haystack[at ..< at + needle.count]) == needle else { continue }
+                var score = substringScore
+                if starts[at] { score += wordStartBonus }
+                if at == 0 { score += prefixBonus }
+                if best == nil || score > best!.score { best = (score, at) }
+                if at == 0 { break }
+            }
+            if let best {
+                var score = best.score - lengthPenalty
+                if needle.count == haystack.count { score += exactBonus }
+                return OmniMatch(score: score, indices: Array(best.at ..< best.at + needle.count))
             }
         }
 
-        // best[i][j]: the best score with needle[i] matched at j.
-        let unmatched = -Double.infinity
-        var best = [[Double]](repeating: [Double](repeating: unmatched, count: n), count: m)
-        var from = [[Int]](repeating: [Int](repeating: -1, count: n), count: m)
-        for i in 0 ..< m {
-            // The best of row i-1 at positions before j-1, and where.
-            var runningBest = unmatched
-            var runningIndex = -1
-            for j in i ..< n {
-                if i > 0, j >= 2, best[i - 1][j - 2] > runningBest {
-                    runningBest = best[i - 1][j - 2]
-                    runningIndex = j - 2
+        // Runs that each start a word (the query's spaces only split runs).
+        let compact = needle.filter { !$0.allSatisfy(\.isWhitespace) }
+        guard !compact.isEmpty else { return nil }
+        let wordStartOffsets = starts.indices.filter { starts[$0] }
+        guard let runs = wordRuns(compact, haystack: haystack, starts: wordStartOffsets) else { return nil }
+        let indices = runs.flatMap { Array($0.start ..< $0.start + $0.length) }
+        return OmniMatch(score: wordRunsScore - Double(runs.count) * 0.5 - lengthPenalty, indices: indices)
+    }
+
+    /// Whether each character starts a word.
+    static func wordStarts(_ characters: [Character]) -> [Bool] {
+        characters.indices.map { j in
+            if j == 0 { return true }
+            let previous = characters[j - 1]
+            let current = characters[j]
+            return previous.isWhitespace || separators.contains(previous)
+                || (previous.isLowercase && current.isUppercase)
+                || (!previous.isLetter && !previous.isNumber && (current.isLetter || current.isNumber))
+        }
+    }
+
+    /// The query as runs, each starting at one of `starts` (after the one
+    /// before it), longest runs first; nil when it cannot be.
+    private static func wordRuns(_ needle: [String], haystack: [String], starts: [Int]) -> [(start: Int, length: Int)]? {
+        var failed = Set<[Int]>()
+        func solve(_ from: Int, _ startIndex: Int) -> [(start: Int, length: Int)]? {
+            if from == needle.count { return [] }
+            guard !failed.contains([from, startIndex]) else { return nil }
+            for index in startIndex ..< starts.count {
+                let start = starts[index]
+                var length = 0
+                while from + length < needle.count, start + length < haystack.count,
+                      haystack[start + length] == needle[from + length] {
+                    length += 1
                 }
-                guard haystack[j] == needle[i] else { continue }
-                let own = 1 + (wordStart[j] ? wordStartBonus : 0)
-                if i == 0 {
-                    best[i][j] = own - Double(j) * 0.01
-                    continue
+                while length > 0 {
+                    let end = start + length
+                    let next = starts[(index + 1)...].firstIndex { $0 >= end } ?? starts.count
+                    if let rest = solve(from + length, next) { return [(start, length)] + rest }
+                    length -= 1
                 }
-                var candidate = runningBest
-                var source = runningIndex
-                if j >= 1, best[i - 1][j - 1] > unmatched,
-                   best[i - 1][j - 1] + consecutiveBonus >= candidate {
-                    candidate = best[i - 1][j - 1] + consecutiveBonus
-                    source = j - 1
-                }
-                guard candidate > unmatched else { continue }
-                best[i][j] = candidate + own
-                from[i][j] = source
             }
+            failed.insert([from, startIndex])
+            return nil
         }
-        var end = -1
-        var score = unmatched
-        for j in 0 ..< n where best[m - 1][j] > score {
-            score = best[m - 1][j]
-            end = j
-        }
-        guard end >= 0 else { return nil }
-        var indices = [Int](repeating: 0, count: m)
-        var position = end
-        for i in stride(from: m - 1, through: 0, by: -1) {
-            indices[i] = position
-            position = from[i][position]
-        }
-        if haystack.starts(with: needle) { score += prefixBonus }
-        if haystack == needle { score += exactBonus }
-        score -= Double(n) * 0.02
-        return OmniMatch(score: score, indices: indices)
+        return solve(0, 0)
     }
 
     private static func fold(_ character: Character) -> String {
@@ -319,8 +350,10 @@ struct OmniRow: Equatable, Identifiable {
 struct OmniSection: Equatable, Identifiable {
     var title: String?
     var rows: [OmniRow]
+    /// Tells apart two untitled sections (the rows, then the actions).
+    var key: String? = nil
 
-    var id: String { title ?? "rows" }
+    var id: String { key ?? title ?? "rows" }
 }
 
 /// Orders rows: by match score plus frecency, and Recent by frecency alone.
@@ -347,9 +380,9 @@ enum OmniRanking {
         for item in items {
             let used = frecency[item.frecencyKey] ?? 0
             if let match = OmniMatcher.match(query, in: item.title) {
-                scored.append((OmniRow(item: item, matched: match.indices), match.score + used * frecencyWeight, used))
+                scored.append((OmniRow(item: item, matched: match.indices), match.score + used * frecencyWeight + item.rankBias, used))
             } else if let keywordScore = item.keywords.compactMap({ OmniMatcher.match(query, in: $0)?.score }).max() {
-                scored.append((OmniRow(item: item), keywordScore * 0.5 + used * frecencyWeight, used))
+                scored.append((OmniRow(item: item), keywordScore * 0.5 + used * frecencyWeight + item.rankBias, used))
             }
         }
         scored.sort { lhs, rhs in
@@ -515,6 +548,16 @@ struct OmniSources: Equatable {
     var agentPresets: [OmniAgent] = []
     var canModifyDevices = true
     var now = Date(timeIntervalSince1970: 0)
+    /// Folder listings by the folder typed (`OmniFolderBrowser`).
+    var folderListings: [OmniFolderRequest: OmniFolderListing] = [:]
+    /// The git repositories found under the usual places on each Mac
+    /// (`OmniRepositoryScanner`), added or not.
+    var unaddedRepositories: [OmniUnaddedRepository] = []
+    /// Each Mac's home folder, when known.
+    var homes: [ProjectSwitcherModel.Machine: String] = [:]
+    /// Folders never offered as "Not added yet": This Mac's projects the
+    /// user removed, a device's hidden ones.
+    var removedProjects: [ProjectSwitcherModel.Machine: Set<String>] = [:]
 }
 
 // MARK: - Providers
@@ -615,9 +658,11 @@ enum OmniProviders {
     }
 
     /// "Open “<query>” as a folder…" for a path-like query.
+    /// Only for "~" itself: a query starting with `~/` or `/` lists folders
+    /// instead (`OmniFolderRows`).
     static func openPathItem(query: String, on machine: ProjectSwitcherModel.Machine = .thisMac) -> OmniItem? {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ProjectSwitcherModel.looksLikePath(query) else { return nil }
+        guard ProjectSwitcherModel.looksLikePath(query), OmniPathQuery.parse(query) == nil else { return nil }
         return OmniItem(
             id: "open-path:\(query)",
             kind: .project,
@@ -674,8 +719,8 @@ enum OmniProviders {
         switch machine {
         case .thisMac:
             var actions: [OmniAction] = [
-                .init(title: "Open Folder…", command: .openFolder(on: .thisMac)),
-                .init(title: "Add Project…", command: .addProject(on: .thisMac)),
+                .init(title: "Open Folder…", command: .browseFolders(on: .thisMac, intent: .openOnce)),
+                .init(title: "Add Project…", command: .browseFolders(on: .thisMac, intent: .add)),
                 .init(title: "New Terminal on This Mac", command: .newTerminal(on: .thisMac)),
                 .init(title: "Persistent Sessions…", command: .menu(.persistentSessions)),
             ]
@@ -718,7 +763,12 @@ enum OmniProviders {
                 }
                 var isDestructive = false
                 if case .removeDevice = action { isDestructive = true }
-                actions.append(.init(title: menuItem.title, command: .switcher(action), isDestructive: isDestructive))
+                if case .addDeviceProject = action {
+                    // Its folders, in the bar.
+                    actions.append(.init(title: menuItem.title, command: .browseFolders(on: machine, intent: .add)))
+                } else {
+                    actions.append(.init(title: menuItem.title, command: .switcher(action), isDestructive: isDestructive))
+                }
                 if case .addDeviceProject = action {
                     actions.append(.init(title: "New Terminal on \(entry.device.name)", command: .newTerminal(on: machine)))
                 }
@@ -922,7 +972,7 @@ enum OmniProviders {
             primaryLabel: "Show",
             primary: .drill(.projects)
         ))
-        items.append(command(.addProject, title: "Add Project…", symbol: "folder.badge.plus"))
+        items += OmniFolderRows.browseItems(sources, on: .thisMac)
         if window.supportsWorktrees {
             items.append(OmniItem(
                 id: "command:worktrees",
@@ -1026,10 +1076,12 @@ enum OmniProviders {
         }
     }
 
-    /// What the root searches: every kind.
+    /// What the root searches: every kind, the repositories not added yet
+    /// and each Mac's Add Project and Open Folder rows.
     static func everything(_ sources: OmniSources) -> [OmniItem] {
         projects(sources) + tabs(sources) + backgroundSessions(sources) + macs(sources)
-            + worktrees(sources) + commands(sources)
+            + worktrees(sources) + commands(sources) + OmniFolderRows.browseItems(sources)
+            + OmniUnaddedRows.items(sources, withQuery: true)
     }
 
     /// The Recent candidates at the root.
@@ -1044,12 +1096,29 @@ enum OmniSections {
     /// How many rows a query at the root shows.
     static let rootResultLimit = 10
 
-    static func build(scope: OmniScope?, query: String, sources: OmniSources, frecency: [String: Double]) -> [OmniSection] {
-        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    static func build(
+        scope: OmniScope?,
+        query rawQuery: String,
+        sources: OmniSources,
+        frecency: [String: Double],
+        folderIntent: OmniFolderIntent = .add
+    ) -> [OmniSection] {
+        // A path query lists the folders of the scope's Mac.
+        if let machine = OmniFolderRows.machine(for: scope), let path = OmniPathQuery.parse(rawQuery) {
+            let rows = OmniFolderRows.rows(path, on: machine, sources: sources, intent: folderIntent)
+            return rows.isEmpty ? [] : [OmniSection(title: nil, rows: rows)]
+        }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let isEmpty = query.isEmpty
         func ranked(_ items: [OmniItem], limit: Int? = nil) -> [OmniSection] {
             let rows = isEmpty ? items.map { OmniRow(item: $0) } : OmniRanking.rank(items, query: query, frecency: frecency, limit: limit)
             return rows.isEmpty ? [] : [OmniSection(title: nil, rows: rows)]
+        }
+        func unadded(on machine: ProjectSwitcherModel.Machine?) -> OmniSection {
+            OmniSection(title: "Not added yet", rows: OmniUnaddedRows.items(sources, on: machine, withQuery: false).map { OmniRow(item: $0) })
+        }
+        func browse(on machine: ProjectSwitcherModel.Machine) -> OmniSection {
+            OmniSection(title: nil, rows: OmniFolderRows.browseItems(sources, on: machine).map { OmniRow(item: $0) }, key: "browse")
         }
         switch scope {
         case nil:
@@ -1063,8 +1132,14 @@ enum OmniSections {
             }
             return merged(sections)
         case .projects?:
-            if isEmpty { return OmniProviders.projectSections(sources) }
-            var sections = ranked(OmniProviders.projects(sources))
+            if isEmpty {
+                return (OmniProviders.projectSections(sources) + [unadded(on: nil), browse(on: .thisMac)])
+                    .filter { !$0.rows.isEmpty }
+            }
+            var sections = ranked(
+                OmniProviders.projects(sources) + OmniUnaddedRows.items(sources, withQuery: true)
+                    + OmniFolderRows.browseItems(sources)
+            )
             if let open = OmniProviders.openPathItem(query: query) {
                 sections.append(OmniSection(title: nil, rows: [OmniRow(item: open)]))
             }
@@ -1081,9 +1156,12 @@ enum OmniSections {
                     if l != r { return l > r }
                     return lhs.element.title.localizedStandardCompare(rhs.element.title) == .orderedAscending
                 }.map(\.element)
-                return ranked(sessions + byUse)
+                return (ranked(sessions + byUse) + [unadded(on: machine), browse(on: machine)]).filter { !$0.rows.isEmpty }
             }
-            return ranked(sessions + projects)
+            return ranked(
+                sessions + projects + OmniUnaddedRows.items(sources, on: machine, withQuery: true)
+                    + OmniFolderRows.browseItems(sources, on: machine)
+            )
         case .tabs?:
             return ranked(OmniProviders.tabs(sources) + OmniProviders.backgroundSessions(sources))
         case .worktrees?:
@@ -1100,6 +1178,21 @@ enum OmniSections {
             return ranked(OmniProviders.agentPresets(sources))
         case .editors?:
             return ranked(OmniProviders.editors(sources))
+        }
+    }
+
+    /// What the list says when it has no rows.
+    static func emptyState(scope: OmniScope?, query: String, sources: OmniSources) -> OmniEmptyState {
+        if let machine = OmniFolderRows.machine(for: scope), let path = OmniPathQuery.parse(query) {
+            return OmniFolderRows.emptyState(path, on: machine, sources: sources)
+        }
+        switch scope {
+        case .projects?:
+            return OmniEmptyState(text: "No project matches · type ~/ to browse folders")
+        case .mac(_, let name)?:
+            return OmniEmptyState(text: "Nothing matches · type ~/ to browse \(name)")
+        default:
+            return OmniEmptyState()
         }
     }
 
@@ -1147,6 +1240,16 @@ final class OmniBarController: ObservableObject {
     @Published private(set) var scrollRequest = 0
     /// Bumped when the rows change from the top (a new query or scope).
     @Published private(set) var resetScrollRequest = 0
+    /// What the list says while it has no rows.
+    @Published private(set) var emptyState = OmniEmptyState()
+    /// What browsing folders is for: set by Add Project… (add) and Open
+    /// Folder… (open once), back to add in a new scope.
+    @Published private(set) var folderIntent: OmniFolderIntent = .add
+
+    /// Asks for a folder's listing (`OmniFolderBrowser.request`), each time
+    /// a path query or its scope changes; the listing comes back in the
+    /// sources (`update`).
+    var requestFolderListing: (OmniFolderRequest) -> Void = { _ in }
 
     /// Runs a row's primary or ⌘K command (not a drill).
     var run: (OmniCommand) -> Void
@@ -1198,7 +1301,15 @@ final class OmniBarController: ObservableObject {
     var placeholder: String { scope?.placeholder ?? "Search…" }
 
     var hint: String {
-        scope == nil ? "@ Macs   # Tabs   / Worktrees   > Commands" : "⌫ to go back"
+        if let request = folderRequest {
+            return "Folders on \(sources.projects.name(of: request.machine)) · ⇥ completes"
+        }
+        return scope == nil ? "~/ Folders   @ Macs   # Tabs   / Worktrees   > Commands" : "⌫ to go back"
+    }
+
+    /// The listing the query asks for, when it is a path query.
+    var folderRequest: OmniFolderRequest? {
+        OmniFolderRows.request(scope: scope, query: query)
     }
 
     var primaryLabel: String { selectedItem?.primaryLabel ?? "Open" }
@@ -1220,7 +1331,12 @@ final class OmniBarController: ObservableObject {
 
     private func recompute(resetSelection: Bool) {
         let kept = resetSelection ? nil : selectedID
-        sections = OmniSections.unique(OmniSections.build(scope: scope, query: query, sources: sources, frecency: frecency))
+        sections = OmniSections.unique(OmniSections.build(
+            scope: scope, query: query, sources: sources, frecency: frecency, folderIntent: folderIntent
+        ))
+        let empty = OmniSections.emptyState(scope: scope, query: query, sources: sources)
+        if emptyState != empty { emptyState = empty }
+        if resetSelection, let request = folderRequest { requestFolderListing(request) }
         let rows = rows
         if let kept, rows.contains(where: { $0.id == kept }) {
             if selectedID != kept { selectedID = kept }
@@ -1249,12 +1365,14 @@ final class OmniBarController: ObservableObject {
     func open(at scope: OmniScope?) {
         stack = scope.map { [$0] } ?? []
         query = ""
+        folderIntent = .add
         recompute(resetSelection: true)
     }
 
     func push(_ scope: OmniScope) {
         stack.append(scope)
         query = ""
+        folderIntent = .add
         recompute(resetSelection: true)
     }
 
@@ -1262,7 +1380,41 @@ final class OmniBarController: ObservableObject {
         guard !stack.isEmpty else { return }
         stack.removeLast()
         query = ""
+        folderIntent = .add
         recompute(resetSelection: true)
+    }
+
+    /// Add Project… and Open Folder…: folder completion on `machine` with
+    /// "~/": in Projects for This Mac (unless the bar is in This Mac's
+    /// scope), in the Mac's scope for another.
+    func browseFolders(on machine: ProjectSwitcherModel.Machine, intent: OmniFolderIntent) {
+        isActionListOpen = false
+        var inScope = false
+        if case .mac(let scoped, _)? = scope, scoped == machine { inScope = true }
+        if machine == .thisMac, scope == .projects { inScope = true }
+        if !inScope {
+            stack = machine == .thisMac ? [.projects] : [.macs, .mac(machine, name: sources.projects.name(of: machine))]
+        }
+        query = "~/"
+        folderIntent = intent
+        recompute(resetSelection: true)
+    }
+
+    /// Runs a command that is the bar's own (a scope, folder completion);
+    /// false for any other.
+    private func performInBar(_ command: OmniCommand) -> Bool {
+        switch command {
+        case .drill(let scope):
+            push(scope)
+        case .browseFolders(let machine, let intent):
+            browseFolders(on: machine, intent: intent)
+        case .enterFolder(let path):
+            isActionListOpen = false
+            setQuery(path)
+        default:
+            return false
+        }
+        return true
     }
 
     /// The field's text changed. At the root, a first character that is a
@@ -1270,7 +1422,9 @@ final class OmniBarController: ObservableObject {
     func setQuery(_ text: String) {
         // A pasted path ("/Users/…") is a query, not the Worktrees scope.
         let isPastedPath = text.first == "/" && text.dropFirst().contains("/")
-        if stack.isEmpty, query.isEmpty, !isPastedPath, let first = text.first, let scope = OmniScope.forPrefix(first) {
+        // Without worktrees, "/" starts a path.
+        let isPath = text.first == "/" && !sources.window.supportsWorktrees
+        if stack.isEmpty, query.isEmpty, !isPastedPath, !isPath, let first = text.first, let scope = OmniScope.forPrefix(first) {
             stack = [scope]
             query = String(text.dropFirst().drop(while: \.isWhitespace))
             recompute(resetSelection: true)
@@ -1356,18 +1510,21 @@ final class OmniBarController: ObservableObject {
         }
         guard let item = selectedItem else { return }
         if item.recordsUse { recordUse(item.frecencyKey) }
-        if let scope = item.drillScope {
-            push(scope)
-        } else {
+        if !performInBar(item.primary) {
             run(item.primary)
         }
     }
 
-    /// ⇥: enters the selected row's scope (a Mac, New Agent…); false when
-    /// it has none.
+    /// ⇥: enters the selected row's scope (a Mac, New Agent…), or completes
+    /// the selected folder with "/"; false when it has neither.
     @discardableResult
     func drillIntoSelection() -> Bool {
-        guard !isActionListOpen, let item = selectedItem, let scope = item.drillScope else { return false }
+        guard !isActionListOpen, let item = selectedItem else { return false }
+        if let completion = item.completion {
+            setQuery(completion)
+            return true
+        }
+        guard let scope = item.drillScope else { return false }
         if item.recordsUse { recordUse(item.frecencyKey) }
         push(scope)
         return true
@@ -1397,6 +1554,8 @@ final class OmniBarController: ObservableObject {
         guard actions.indices.contains(index) else { return }
         isActionListOpen = false
         if let item = selectedItem, item.recordsUse { recordUse(item.frecencyKey) }
-        run(actions[index].command)
+        if !performInBar(actions[index].command) {
+            run(actions[index].command)
+        }
     }
 }

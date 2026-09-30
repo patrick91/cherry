@@ -670,6 +670,10 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var appearanceOverridesByProject: [String: ProjectAppearanceOverrides] = [:]
     @Published private(set) var hiddenWorktreesByProject: [String: Set<String>] = [:]
     @Published private(set) var lastActiveWorktreeByProject: [String: String] = [:]
+    /// This Mac's folders the user removed from Projects: the Omni bar
+    /// never offers them as "Not added yet" (adding one again forgets it).
+    @Published private(set) var removedProjectRoots: Set<String> = []
+
     private let defaults: UserDefaults
     private var repositoryRootByWorktreeRoot: [String: String] = [:]
 
@@ -688,6 +692,7 @@ final class AgentSettings: ObservableObject {
         appearanceOverridesByProject = Self.loadAppearanceOverridesByProject(from: defaults)
         hiddenWorktreesByProject = Self.loadHiddenWorktreesByProject(from: defaults)
         lastActiveWorktreeByProject = Self.loadLastActiveWorktreesByProject(from: defaults)
+        removedProjectRoots = Set(defaults.stringArray(forKey: Keys.removedProjectRoots) ?? [])
     }
 
     var resolvedAgents: [ResolvedAgentTool] {
@@ -864,10 +869,14 @@ final class AgentSettings: ObservableObject {
             projects.append(project)
             saveProjects()
         }
+        if removedProjectRoots.remove(root) != nil { saveRemovedProjectRoots() }
         return project
     }
 
     func removeProject(_ project: CherryProject) {
+        if !ProjectLocation.isRemoteKey(project.root), removedProjectRoots.insert(project.root).inserted {
+            saveRemovedProjectRoots()
+        }
         projects.removeAll { $0.root == project.root }
         commandsByProject.removeValue(forKey: project.root)
         featureOverridesByProject.removeValue(forKey: project.root)
@@ -1047,6 +1056,10 @@ final class AgentSettings: ObservableObject {
 
     private func saveProjects() {
         Self.saveProjects(projects, to: defaults)
+    }
+
+    private func saveRemovedProjectRoots() {
+        defaults.set(removedProjectRoots.sorted(), forKey: Keys.removedProjectRoots)
     }
 
     private func saveLastOpenedProjectRoot() {
@@ -1308,6 +1321,7 @@ final class AgentSettings: ObservableObject {
 
     private enum Keys {
         static let projects = "projects.items"
+        static let removedProjectRoots = "projects.removedRoots"
         static let lastOpenedProjectRoot = "projects.lastOpenedRoot"
         static let agents = "agents.global"
         static let commandsByProject = "commands.byProject"

@@ -727,12 +727,90 @@ private func quietChrome() -> ProjectWindowChromeState {
     #expect(try window.saved()?.sessions.map(\.id) == [keep.id, redo.id])
 }
 
+/// Holds the fake host's answers to `list` (the app's control connection
+/// lists as it connects, apart from the restore) until `release()`: the
+/// host has really not answered meanwhile, so `hasListedSessions` is false.
+private final class HeldHostLists: @unchecked Sendable {
+    private let lock = NSLock()
+    private var holding = true
+    private var held: [(request: FakeControlHelper.Request, connection: FakeControlHelper.Connection)] = []
+
+    func install(on fake: FakeControlHelper) {
+        fake.respond = { [self] request, connection in
+            guard request.op == "list" else { return nil }
+            return lock.withLock {
+                guard holding else { return nil }
+                held.append((request, connection))
+                return .silence
+            }
+        }
+    }
+
+    /// Answers the lists held so far, and every later one, as the fake would.
+    func release(_ fake: FakeControlHelper) {
+        let pending = lock.withLock {
+            holding = false
+            defer { held.removeAll() }
+            return held
+        }
+        for (request, connection) in pending {
+            if case .answer(let message) = fake.defaultReply(to: request, on: connection) {
+                connection.push(message, req: request.req)
+            }
+        }
+    }
+}
+
 /// ⌘W then ⌘Z on a provisional tab before the host answered brings it back
 /// (still provisional, confirmed once the host answers); nothing is ended.
 @Test @MainActor func undoingTheCloseOfAProvisionalTabBeforeTheHostAnswersBringsItBack() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
+    // Not the restore alone: no list of the host's is answered until the
+    // restore's is (else ⌘Z finds the session listed and brings the tab
+    // back confirmed, as the next test does).
+    let lists = HeldHostLists()
+    lists.install(on: harness.fake)
     let rootURL = try temporaryDirectory("cherry-optimistic-undo")
+    let root = rootURL.path
+    let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
+    let close = savedTab(title: "Close", sessionID: "s-close", workingDirectory: root)
+    harness.fake.sessions = [running("s-keep", keep, pid: 1), running("s-close", close, pid: 2)]
+    let window = try OptimisticWindow(harness, root: rootURL, sessions: [keep, close], selected: keep.id)
+    defer {
+        lists.release(harness.fake)
+        window.cleanUp()
+    }
+    let workspace = window.workspace
+    await window.begin()
+    let closing = try #require(workspace.session(withID: close.id))
+    let chrome = quietChrome()
+    SessionCloseCoordinator.closeTab(closing, in: workspace, chromeState: chrome)
+    #expect(workspace.session(withID: close.id) == nil)
+    #expect(!harness.control.hasListedSessions)
+    #expect(chrome.closedTabs.undoLatest())
+    let back = try #require(workspace.session(withID: close.id))
+    #expect(back.isProvisionalRestore)
+    #expect(back.persistentSession?.sessionID == "s-close")
+    lists.release(harness.fake)
+    await window.answer()
+    #expect(workspace.sessions.map(\.id) == [keep.id, close.id])
+    #expect(workspace.session(withID: close.id) === back)
+    #expect(back.isProvisionalRestore == false)
+    #expect(back.hostedProgramProcessID == 2)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(harness.requestIDs("kill").isEmpty)
+    #expect(harness.requestIDs("remove").isEmpty)
+    #expect(workspace.session(withID: close.id) === back)
+}
+
+/// The same ⌘Z once the host listed its sessions but before the restore
+/// took its answer: the tab comes back as the host lists it (the user's,
+/// not provisional), and the restore leaves it and its session alone.
+@Test @MainActor func undoingTheCloseOfAProvisionalTabAfterTheHostListedButBeforeTheRestoreAnsweredKeepsIt() async throws {
+    let harness = try PersistentHarness()
+    harness.fake.pendingHolders = 0
+    let rootURL = try temporaryDirectory("cherry-optimistic-undo-listed")
     let root = rootURL.path
     let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
     let close = savedTab(title: "Close", sessionID: "s-close", workingDirectory: root)
@@ -745,17 +823,21 @@ private func quietChrome() -> ProjectWindowChromeState {
     let chrome = quietChrome()
     SessionCloseCoordinator.closeTab(closing, in: workspace, chromeState: chrome)
     #expect(workspace.session(withID: close.id) == nil)
+    _ = try await harness.control.list()
+    #expect(harness.control.hasListedSessions)
     #expect(chrome.closedTabs.undoLatest())
     let back = try #require(workspace.session(withID: close.id))
-    #expect(back.isProvisionalRestore)
+    #expect(!back.isProvisionalRestore)
     #expect(back.persistentSession?.sessionID == "s-close")
+    #expect(back.hostedProgramProcessID == 2)
     await window.answer()
     #expect(workspace.sessions.map(\.id) == [keep.id, close.id])
-    #expect(workspace.session(withID: close.id)?.isProvisionalRestore == false)
-    #expect(workspace.session(withID: close.id)?.hostedProgramProcessID == 2)
+    #expect(workspace.session(withID: close.id) === back)
+    #expect(back.hostedProgramProcessID == 2)
     try await Task.sleep(for: .milliseconds(300))
     #expect(harness.requestIDs("kill").isEmpty)
     #expect(harness.requestIDs("remove").isEmpty)
+    #expect(workspace.session(withID: close.id) === back)
 }
 
 /// A window mixing tabs shown early and tabs that wait for the host (one

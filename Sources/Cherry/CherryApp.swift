@@ -706,9 +706,34 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             case .reopen(let projectRoots):
                 if let openProjectWindow {
                     // Off screen from the moment AppKit orders them in until
-                    // their saved tabs are back (`ProjectWindowReveal`).
-                    ProjectWindowRegistry.shared.launchWindowCover?.expect(projectRoots.count)
-                    projectRoots.forEach(openProjectWindow)
+                    // their saved tabs are back (`ProjectWindowReveal`); the
+                    // most recently active first, the others once it shows.
+                    let registry = ProjectWindowRegistry.shared
+                    let recency = registry.projectRecency
+                    // A quit before the later windows open ends (or keeps)
+                    // their sessions as theirs would.
+                    let policy = SessionBackendPolicy.userSettings
+                    registry.launchWindowHosting = policy.hostedLocalTabsFollowSettings ? policy.localSessions : nil
+                    // Tabs no window shows attach once the windows are up.
+                    RestoredTabLaunchQueue.shared.holdBackgroundTabs(atMost: 3)
+                    registry.openLaunchWindows(
+                        LaunchWindowOrder.frontFirst(projectRoots) { recency?.lastOpened($0) },
+                        beforeLaterWindows: { proceed in
+                            // Building the others holds the main thread,
+                            // which the connection to This Mac's host needs
+                            // for each of its steps: it comes up first
+                            // (briefly), and the first window's tabs are
+                            // confirmed sooner.
+                            PersistentLocalSessions.shared.control.whenConnected(
+                                waitingAtMost: .milliseconds(200), proceed
+                            )
+                        }
+                    ) { root in
+                        openProjectWindow(root)
+                    }
+                    registry.whenLaunchWindowsOpened {
+                        RestoredTabLaunchQueue.shared.releaseBackgroundTabs()
+                    }
                     reopened = projectRoots
                 } else {
                     openDefaultProjectWindow?()
@@ -867,6 +892,9 @@ struct CherryApp: App {
         LaunchTimeline.isEnabled = true
         LaunchTimeline.mark("app init")
         RemoteViewCrashGuard.installIfNeeded()
+        // Helpers and adapters start with the last run's login environment
+        // while this run's is captured (`LoginEnvironmentCache`).
+        HostedSessionLoginEnvironment.shared.lastRunCache = .shared
         // Saved windows of a device's projects reopen while it is known.
         ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key) != nil
@@ -1353,7 +1381,10 @@ private struct ProjectWorkspaceView: View {
                 ? WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting)
                 : RemoteDeviceStore.keepingRestorer,
             // A device's git worktrees and cherry.toml, read there (phase 3).
-            remoteProject: hosting.profile.isKnownDevice ? device.map { RemoteProjectAccess.app($0) } : nil
+            remoteProject: hosting.profile.isKnownDevice ? device.map { RemoteProjectAccess.app($0) } : nil,
+            // This Mac's saved tabs show before its host answers; a device's
+            // wait for that Mac.
+            showsSavedTabsBeforeHostAnswers: hosting.profile.isThisMac
         ))
         _noteStore = StateObject(wrappedValue: ProjectNoteStore(
             projectRoot: projectRoot,

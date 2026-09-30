@@ -186,7 +186,28 @@ private final class ControlPlaneRestore {
     /// A tab with this id is open already (another window restored the same
     /// record): it never comes back twice.
     private func isOpen(_ id: UUID) -> Bool {
-        localSessions.hasOpenTab(withID: id) || OpenHostedTabs.shared.hasOpenTab(withID: id)
+        localSessions.hasOpenTab(withID: id, besides: optimisticTab(for: id))
+            || OpenHostedTabs.shared.hasOpenTab(withID: id)
+    }
+
+    /// The tab shown for `recordID` before the host answered, while it is
+    /// in the workspace and still provisional
+    /// (`WorkspaceRestoreRequest.optimisticTabs`): by id, so a tab ⌘Z
+    /// brought back counts too. One the user restarted meanwhile is theirs:
+    /// an open tab like any other.
+    private func optimisticTab(for recordID: UUID) -> TerminalSession? {
+        guard request.optimisticTabs[recordID] != nil,
+              let tab = request.workspace.session(withID: recordID),
+              tab.isProvisionalRestore
+        else { return nil }
+        return tab
+    }
+
+    /// Whether an open tab owns `sessionID`, other than the one shown for
+    /// `recordID` before the host answered.
+    private func isOwnedByAnotherTab(_ sessionID: String, than recordID: UUID) -> Bool {
+        guard let owner = localSessions.owningTab(of: sessionID) else { return false }
+        return owner !== optimisticTab(for: recordID)
     }
 
     private static func key(hostID: String, sessionID: String) -> String {
@@ -247,6 +268,7 @@ private final class ControlPlaneRestore {
             result.sessions += handed
             result.keptRecordIDs.formUnion(ended.map(\.id))
             result.keptRecordIDs.formUnion(answer.keptRecordIDs)
+            result.confirmedOptimisticRecordIDs.formUnion(answer.confirmedOptimisticRecordIDs)
             result.retryWhenAvailable = Self.either(result.retryWhenAvailable, answer.retryWhenAvailable)
             if let remainder = answer.remainder, !answer.pendingRecordIDs.isEmpty {
                 waiting.append(start(answer.pendingRecordIDs) { await remainder.value })
@@ -413,6 +435,9 @@ private final class ControlPlaneRestore {
         var unmatched: [WorkspaceSessionRecord] = []
         let list = listing.list
         for record in records {
+            // One shown before the host answered that the user closed
+            // meanwhile: their close decided.
+            if request.optimisticTabs[record.id] != nil, optimisticTab(for: record.id) == nil { continue }
             guard !isOpen(record.id), let binding = record.hosted else { continue }
             var info: HostedSessionInfo?
             var owns = false
@@ -438,6 +463,19 @@ private final class ControlPlaneRestore {
                 // listed but being ended is gone already: dropped.
                 if binding.hostID == list.hostID, !list.sessions.contains(where: { $0.id == binding.sessionID }) {
                     missing.append(record)
+                }
+                continue
+            }
+            if let shown = optimisticTab(for: record.id), owns,
+               shown.persistentSession?.sessionID == info.id, shown.persistentSession?.hostID == list.hostID {
+                // Shown already for this very session: it stays, and takes
+                // what the host reports (or is dropped as any would be).
+                claimed.insert(Self.key(hostID: list.hostID, sessionID: info.id))
+                if closesAsCleanExit(record, info: info) {
+                    localSessions.end(listing.attachment(info))
+                } else {
+                    shown.confirmProvisionalRestore(info)
+                    result.confirmedOptimisticRecordIDs.insert(record.id)
                 }
                 continue
             }
@@ -503,8 +541,7 @@ private final class ControlPlaneRestore {
         }
         claimed.insert(Self.key(hostID: listing.list.hostID, sessionID: info.id))
         let attachment = listing.attachment(info)
-        if owning, record.kind == .terminal, PersistentLocalSessions.endedCleanly(info),
-           request.workspace.backendPolicy.settings().closeTabsOnCleanExit {
+        if owning, closesAsCleanExit(record, info: info) {
             // A terminal whose shell exited with status 0 while Cherry was
             // closed would have closed its tab: it is not brought back (the
             // record is dropped), and its ended session is removed.
@@ -528,6 +565,13 @@ private final class ControlPlaneRestore {
         ))
     }
 
+    /// A terminal whose shell exited with status 0 while Cherry was closed
+    /// would have closed its tab (*close on exit*).
+    private func closesAsCleanExit(_ record: WorkspaceSessionRecord, info: HostedSessionInfo) -> Bool {
+        record.kind == .terminal && PersistentLocalSessions.endedCleanly(info)
+            && request.workspace.backendPolicy.settings().closeTabsOnCleanExit
+    }
+
     /// Whether this app is ending the session (Background Sessions → End,
     /// a close that ended it, a removed worktree's tabs): a tab restored for
     /// it would outlive it, so it counts as gone.
@@ -542,7 +586,7 @@ private final class ControlPlaneRestore {
         return list.sessions.first { info in
             PersistentLocalSessions.isLaunched(info, byRequest: requestID, owner: localSessions.owner)
                 && !claimed.contains(Self.key(hostID: list.hostID, sessionID: info.id))
-                && localSessions.owningTab(of: info.id) == nil
+                && !isOwnedByAnotherTab(info.id, than: record.id)
                 && !isBeingEnded(info, hostID: list.hostID)
         }
     }
@@ -555,7 +599,7 @@ private final class ControlPlaneRestore {
             .filter { info in
                 PersistentLocalSessions.tabID(of: info, owner: localSessions.owner) == tabID
                     && !claimed.contains(Self.key(hostID: list.hostID, sessionID: info.id))
-                    && localSessions.owningTab(of: info.id) == nil
+                    && !isOwnedByAnotherTab(info.id, than: tabID)
                     && !isBeingEnded(info, hostID: list.hostID)
             }
             .max { lhs, rhs in
@@ -683,6 +727,78 @@ private final class RestoreProgress {
     }
 }
 
+// MARK: - Showing saved tabs before the host answers
+
+/// A launch shows a window's saved persistent tabs of This Mac at once,
+/// built from the saved state, and starts the selected one's adapter
+/// (`cherry attach` connects to the host by itself), instead of waiting for
+/// the host's list (`RepositoryWorkspace.showsSavedTabsBeforeHostAnswers`).
+/// Such a tab is provisional (`TerminalSession.isProvisionalRestore`) until
+/// the restore, once the host answered, confirms it (the host lists its
+/// session as the record's) or withdraws it and applies the usual rules
+/// (`WorkspaceSessionRestorers.hostedByDefault`): an ended tab when the
+/// system ended the session (`SystemEndedSessions`), the session a lost
+/// Create started, a record kept while the host cannot be reached, or
+/// nothing.
+@MainActor
+enum OptimisticRestore {
+    /// The records shown before the host answers: tabs that owned a session
+    /// of This Mac (`owned`) that no open tab owns or shows and that this
+    /// app is not ending, that were not saved ended, and whose session
+    /// nothing says the system ended (no boot or system quit since they
+    /// were saved, not reported lost). A record saved without its binding
+    /// (its Create had not answered) waits for the host.
+    static func records(
+        _ records: [WorkspaceSessionRecord],
+        localSessions: PersistentLocalSessions,
+        systemEnds: SystemEndedSessions
+    ) -> [WorkspaceSessionRecord] {
+        var sessionIDs = Set<String>()
+        return records.filter { record in
+            guard let binding = record.hosted,
+                  binding.owned == true,
+                  binding.hostedSessionHost == localSessions.profile.host,
+                  record.systemEnd == nil,
+                  record.exitStatus == nil,
+                  sessionIDs.insert(binding.sessionID).inserted,
+                  !localSessions.hasOpenTab(withID: record.id),
+                  !OpenHostedTabs.shared.hasOpenTab(withID: record.id),
+                  localSessions.owningTab(of: binding.sessionID) == nil,
+                  !OpenHostedTabs.shared.showsSession(hostID: binding.hostID, sessionID: binding.sessionID),
+                  !localSessions.isEnding(binding.sessionID),
+                  !systemEnds.endedOnPurpose(record),
+                  !systemEnds.recordedLostSessions(binding.hostID).contains(binding.sessionID)
+            else { return false }
+            return SystemEndedSessions.end(
+                savedAt: systemEnds.savedAt(of: record),
+                bootTime: systemEnds.bootTime,
+                systemQuits: systemEnds.systemQuits,
+                lostByHost: false
+            ) == nil
+        }
+    }
+
+    /// What the tab assumes of its session until the host answers: running,
+    /// where and as it was saved, started by the saved Create.
+    static func assumedInfo(
+        of record: WorkspaceSessionRecord,
+        binding: HostedSessionBindingRecord,
+        owner: String
+    ) -> HostedSessionInfo {
+        var tags = [PersistentSessionTag.tab: record.id.uuidString]
+        if let launch = record.launchRequestID { tags[PersistentSessionTag.launch] = launch }
+        return HostedSessionInfo(
+            id: binding.sessionID,
+            name: record.title,
+            cwd: binding.remoteWorkingDirectory ?? record.workingDirectory,
+            state: .running,
+            owner: owner,
+            tags: tags,
+            requestID: record.launchRequestID
+        )
+    }
+}
+
 // MARK: - Open attached tabs
 
 /// Every open tab attached to a hosted session (`hostedAttachment`), in any
@@ -754,6 +870,11 @@ final class RestoredTabLaunchQueue {
     private var shown: [WeakTab] = []
     private var background: [WeakTab] = []
     private var isScheduled = false
+    /// While the launch opens its windows, tabs no window shows wait
+    /// (`holdBackgroundTabs`): their adapters would only compete with the
+    /// windows and the host connection for the main thread.
+    private(set) var isHoldingBackgroundTabs = false
+    private var backgroundHoldGeneration = 0
 
     init() {}
 
@@ -783,6 +904,27 @@ final class RestoredTabLaunchQueue {
         schedule(after: shown.isEmpty ? interval : 0)
     }
 
+    /// Holds the tabs no window shows until `releaseBackgroundTabs`, or
+    /// `limit` from now, whichever comes first.
+    func holdBackgroundTabs(atMost limit: TimeInterval) {
+        isHoldingBackgroundTabs = true
+        backgroundHoldGeneration += 1
+        let generation = backgroundHoldGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + limit) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.backgroundHoldGeneration == generation else { return }
+                self.releaseBackgroundTabs()
+            }
+        }
+    }
+
+    func releaseBackgroundTabs() {
+        guard isHoldingBackgroundTabs else { return }
+        isHoldingBackgroundTabs = false
+        backgroundHoldGeneration += 1
+        if !shown.isEmpty || !background.isEmpty { schedule(after: interval) }
+    }
+
     /// Launches every waiting adapter now (tests).
     func drain() {
         while let tab = next() {
@@ -808,7 +950,7 @@ final class RestoredTabLaunchQueue {
                 LaunchTimeline.mark("adapter launched \(tab.title)")
             }
         }
-        if !shown.isEmpty || !background.isEmpty {
+        if !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
             let took = ContinuousClock.now - started
             let seconds = Double(took.components.seconds) + Double(took.components.attoseconds) / 1e18
             schedule(after: max(interval, seconds))
@@ -817,7 +959,7 @@ final class RestoredTabLaunchQueue {
 
     /// The next tab still waiting (closed or launched ones are skipped).
     private func next() -> TerminalSession? {
-        while !shown.isEmpty || !background.isEmpty {
+        while !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
             let entry = shown.isEmpty ? background.removeFirst() : shown.removeFirst()
             if let tab = entry.session, tab.isAwaitingDeferredLaunch {
                 return tab

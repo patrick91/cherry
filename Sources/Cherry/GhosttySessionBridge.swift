@@ -425,6 +425,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var settledRenderGeneration: UInt64 = 0
     private var hasRenderedSinceSettledRenderRequest = false
     private var isScrollbarSynchronizationScheduled = false
+    private var didLogLaunchContent = false
+    private var launchContentCheck = LaunchContentCheck()
 
     init(session: TerminalSession) {
         let proxy = GhosttySessionProxy(session: session)
@@ -463,6 +465,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
             self?.handlePostRender()
+            self?.noteLaunchContentFrame()
         }
         if isNativePTYBacked {
             // Native eagerly creates the EXEC surface below, which spawns
@@ -712,6 +715,27 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func performAfterRenderedViewportSettles(_ handler: @escaping () -> Void) {
         cancelSettledRenderHandler()
         settledRenderHandler = handler
+    }
+
+    /// Logs, once per surface and only during the launch, the first frame
+    /// that shows text in an on-screen window (`LaunchTimeline`: "first
+    /// content win=<window number>").
+    private func noteLaunchContentFrame() {
+        guard !didLogLaunchContent else { return }
+        // Only while the launch opens its windows (or its first seconds are
+        // logged), and at most every 50 ms: reading the viewport's text on
+        // every frame of every surface would cost them.
+        let logs = LaunchTimeline.isLogging(within: 5)
+        guard logs || LaunchContentFrames.isWatching, launchContentCheck.isDue() else { return }
+        guard let window = terminalView.window, window.isVisible,
+              let text = terminalView.readViewportText(),
+              text.contains(where: { !$0.isWhitespace })
+        else { return }
+        didLogLaunchContent = true
+        if logs {
+            LaunchTimeline.mark("first content win=\(window.windowNumber) alpha=\(window.alphaValue) \(proxy.session?.title ?? "")")
+        }
+        LaunchContentFrames.noteContentFrame(in: window)
     }
 
     private func handlePostRender() {

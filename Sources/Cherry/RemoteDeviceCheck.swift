@@ -37,9 +37,10 @@ struct RemoteDeviceShell: Sendable {
     /// The app's: resolves the login environment (off the main actor).
     static func app() async -> RemoteDeviceShell {
         await Task.detached(priority: .userInitiated) {
-            let login = HostedSessionLoginEnvironment.shared.resolve()?.environment
-            let environment = HostedSessionLoginEnvironment.helperEnvironment(
-                base: ProcessInfo.processInfo.environment, login: login
+            // Its ssh (and the masters it starts) never take the last run's
+            // agent socket (`LoginEnvironmentCache`).
+            let environment = HostControl.sshMasterEnvironment(
+                base: ProcessInfo.processInfo.environment, login: HostedSessionLoginEnvironment.shared.resolve()
             )
             return RemoteDeviceShell(sshExecutable: sshExecutable(environment: environment), environment: environment)
         }.value

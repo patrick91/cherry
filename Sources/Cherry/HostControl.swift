@@ -398,6 +398,9 @@ final class HostControl: ObservableObject {
     private var masterLease: HostSSHMasterLease?
     private var acceptsNewIdentity = false
     private var hasListed = false
+    /// Whether this control has had the host's list at least once this run:
+    /// until then a session missing from `sessions` says nothing.
+    var hasListedSessions: Bool { hasListed }
     private var announcesResyncAfterNextList = false
     private var reconnectFailures = 0
     private var sessionWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
@@ -489,6 +492,52 @@ final class HostControl: ObservableObject {
             masterLease = nil
         }
         scheduleIdleDisconnectIfUnused()
+    }
+
+    /// The environment an SSH master starts with: `helperEnvironment`, but
+    /// never the last run's agent socket (`LoginEnvironmentCache`): a master
+    /// outlives this run's capture, so it keeps this process's own until
+    /// then.
+    nonisolated static func sshMasterEnvironment(
+        base: [String: String],
+        login: HostedSessionLoginEnvironment.Capture?
+    ) -> [String: String] {
+        var overlay = login?.environment
+        if login?.isFromLastRun == true { overlay?["SSH_AUTH_SOCK"] = nil }
+        return HostedSessionLoginEnvironment.helperEnvironment(base: base, login: overlay)
+    }
+
+    /// Runs `body` once the connection is up, at once when it is or when no
+    /// attempt is under way, and at the latest after `limit`.
+    func whenConnected(waitingAtMost limit: Duration, _ body: @escaping @MainActor () -> Void) {
+        guard connectAttempt != nil, state != .connected else {
+            body()
+            return
+        }
+        var ran = false
+        var subscription: AnyCancellable?
+        let once: @MainActor () -> Void = {
+            guard !ran else { return }
+            ran = true
+            subscription?.cancel()
+            subscription = nil
+            body()
+        }
+        subscription = $state.dropFirst().sink { state in
+            guard state != .connecting else { return }
+            // Published before the change: run once it is in place.
+            DispatchQueue.main.async { MainActor.assumeIsolated { once() } }
+        }
+        let seconds = Double(limit.components.seconds) + Double(limit.components.attoseconds) / 1e18
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { MainActor.assumeIsolated { once() } }
+    }
+
+    /// The helper a connection would start, found without connecting (the
+    /// connection's own `executableURL` once it started); nil when there is
+    /// none.
+    func helperExecutableURL() -> URL? {
+        guard unavailableReason == nil, !isShutDown else { return nil }
+        return try? clientProvider().executableURL
     }
 
     /// Starts capturing the login environment a connection needs
@@ -653,12 +702,28 @@ final class HostControl: ObservableObject {
         LaunchTimeline.mark("host login environment \(host.id)")
         try checkNotShutDown()
         loginEnvironment = capture
+        if capture?.isFromLastRun == true {
+            // The last run's (`LoginEnvironmentCache`): what this control
+            // starts once this run's capture is made gets that one. The
+            // helper already running keeps what it started with.
+            client.onLoginEnvironmentRefresh { [weak self] refreshed in
+                Task { @MainActor in
+                    guard let self, self.loginEnvironment?.isFromLastRun == true else { return }
+                    self.loginEnvironment = refreshed
+                }
+            }
+        }
         let environment = HostedSessionLoginEnvironment.helperEnvironment(
             base: ProcessInfo.processInfo.environment, login: capture?.environment
         )
         var controlPath: String?
         if let destination = host.sshDestination {
-            if masterLease == nil { masterLease = masters.acquire(destination, environment: environment) }
+            if masterLease == nil {
+                masterLease = masters.acquire(
+                    destination,
+                    environment: Self.sshMasterEnvironment(base: ProcessInfo.processInfo.environment, login: capture)
+                )
+            }
             controlPath = await masters.waitUntilUp(destination, timeout: configuration.masterStartTimeout)
             try checkNotShutDown()
         }
@@ -717,7 +782,10 @@ final class HostControl: ObservableObject {
             if controlPath == nil {
                 // The helper just connected on its own, so the master can
                 // authenticate now too: one that failed to start tries again.
-                masters.retry(destination, environment: environment)
+                masters.retry(
+                    destination,
+                    environment: Self.sshMasterEnvironment(base: ProcessInfo.processInfo.environment, login: capture)
+                )
             }
         }
         self.hostID = hostID

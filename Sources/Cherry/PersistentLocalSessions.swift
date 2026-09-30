@@ -1093,6 +1093,32 @@ final class PersistentHostSessions {
         openTabs.values.contains { $0.session?.id == id }
     }
 
+    /// Whether an open tab other than `tab` has this id.
+    func hasOpenTab(withID id: UUID, besides tab: TerminalSession?) -> Bool {
+        openTabs.values.contains { $0.session?.id == id && $0.session !== tab }
+    }
+
+    /// How a tab's adapter reaches the session `binding` names on this
+    /// host, from what this app knows without asking the host: its helper
+    /// and the login environment known now (`OptimisticRestore`). Nil when
+    /// the helper cannot be found.
+    func attachmentWithoutListing(
+        _ binding: HostedSessionBindingRecord,
+        name: String,
+        loginEnvironment: [String: String]?
+    ) -> HostedSessionAttachment? {
+        guard let executable = control.executableURL ?? control.helperExecutableURL() else { return nil }
+        return HostedSessionAttachment(
+            host: profile.host,
+            hostID: binding.hostID,
+            sessionID: binding.sessionID,
+            name: name,
+            remoteWorkingDirectory: binding.remoteWorkingDirectory ?? "",
+            executablePath: executable.path,
+            environment: control.loginEnvironment?.environment ?? loginEnvironment ?? [:]
+        )
+    }
+
     /// Whether an open tab, in any window, shows this session of the local
     /// host `hostID` or is about to: the tab that owns it, a tab attached to
     /// it (`attachedTabs`), the tab it was started for (`cherry.tab`), or a

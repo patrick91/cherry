@@ -27,6 +27,24 @@ final class ProjectWindowRegistry {
     /// nil, so nothing is written.
     private(set) var workspaceStateStore: WorkspaceStateStore?
     private var projectWindowRootsToReopenAtLaunch: [String] = []
+    /// Saved windows the launch opens later (`openLaunchWindows`): saved as
+    /// open meanwhile, so a quit before they opened keeps them.
+    private(set) var pendingLaunchWindowRoots: [String] = []
+    /// Runs once the window of a project root came on screen
+    /// (`whenLaunchWindowShown`).
+    private var launchWindowShownWaiters: [String: [@MainActor () -> Void]] = [:]
+    private var shownLaunchWindowRoots: Set<String> = []
+    /// Waiting for the launch's windows to have opened (`whenLaunchWindowsOpened`).
+    private var launchWindowsOpenedWaiters: [@MainActor () -> Void] = []
+    private var isOpeningLaunchWindows = false
+    /// Runs `body` on the next main-queue turn (tests run it at once).
+    var scheduleLaunchWindowTurn: @MainActor (_ body: @escaping @MainActor () -> Void) -> Void = { body in
+        DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
+    }
+    /// Where the saved tabs of the launch's windows not open yet run
+    /// (`pendingLaunchWindowRoots`): a quit that ends sessions ends theirs.
+    /// The app sets This Mac's; tests give their own.
+    var launchWindowHosting: PersistentLocalSessions?
     private var lastSavedOpenWindowRoots: [String]?
     private var isTerminating = false
     /// Tells the user when this copy of the app leaves the persistent
@@ -128,6 +146,132 @@ final class ProjectWindowRegistry {
         return launchWindowPlan(hasVisibleWindow: false)
     }
 
+    /// Opens the launch's saved windows front first: `roots[0]` (the
+    /// project most recently active, `LaunchWindowOrder.frontFirst`) now,
+    /// the others once it came on screen (at most `windowRevealMaximumWait`
+    /// later), drew its selected tab (`LaunchContentFrames`, briefly) and
+    /// `beforeLaterWindows` let them: together, on one main-queue turn
+    /// (building them in one go costs less than one per turn), behind the
+    /// window that is key. So the first window's tabs, surfaces and
+    /// adapters are not held up by building the others. Until they open,
+    /// the others count as open for the saved window list
+    /// (`pendingLaunchWindowRoots`).
+    func openLaunchWindows(
+        _ roots: [String],
+        beforeLaterWindows: (@MainActor (_ proceed: @escaping @MainActor () -> Void) -> Void)? = nil,
+        open: @escaping @MainActor (String) -> Void
+    ) {
+        guard let front = roots.first else { return }
+        let later = Array(roots.dropFirst())
+        pendingLaunchWindowRoots = later
+        isOpeningLaunchWindows = true
+        launchWindowCover?.expect(1)
+        open(front)
+        guard !later.isEmpty else {
+            whenLaunchWindowShown(projectRoot: front, waitingAtMost: windowRevealMaximumWait ?? .zero) { [weak self] in
+                self?.finishOpeningLaunchWindows()
+            }
+            return
+        }
+        LaunchContentFrames.startWatching()
+        whenLaunchWindowShown(projectRoot: front, waitingAtMost: windowRevealMaximumWait ?? .zero) { [weak self] in
+            guard let self else { return }
+            // The window's new opacity reaches the screen now, not after the
+            // next window is built; and the next waits for this one's
+            // selected tab to draw (briefly: its adapter may be slow).
+            CATransaction.flush()
+            let openLater: @MainActor () -> Void = { [weak self] in
+                guard let beforeLaterWindows else {
+                    self?.openLaterLaunchWindows(later, open: open)
+                    return
+                }
+                beforeLaterWindows { self?.openLaterLaunchWindows(later, open: open) }
+            }
+            if let window = windows[repositoryRoot(for: front)]?.window {
+                LaunchContentFrames.whenContentShown(in: window, waitingAtMost: Self.launchContentWait, openLater)
+            } else {
+                openLater()
+            }
+        }
+    }
+
+    /// How long the launch's other windows wait for the first one's
+    /// terminal content once it showed (`openLaunchWindows`).
+    static let launchContentWait: Duration = .milliseconds(150)
+
+    private func openLaterLaunchWindows(_ roots: [String], open: @escaping @MainActor (String) -> Void) {
+        guard let last = roots.last else { return }
+        scheduleLaunchWindowTurn { [weak self] in
+            guard let self else { return }
+            LaunchContentFrames.stopWatching()
+            // Quitting: they stay saved as open, and never open now.
+            guard !isTerminating else { return }
+            for root in roots {
+                pendingLaunchWindowRoots.removeAll { $0 == root }
+                guard !hasWindow(for: root) else { continue }
+                // A window SwiftUI opens becomes key and comes to the
+                // front: the window that was key stays so, in front.
+                let key = NSApp?.keyWindow
+                launchWindowCover?.expect(1)
+                open(root)
+                if let key, key.isVisible, NSApp?.keyWindow !== key {
+                    key.makeKeyAndOrderFront(nil)
+                }
+            }
+            // The launch's windows are open once the last shows.
+            whenLaunchWindowShown(projectRoot: last, waitingAtMost: windowRevealMaximumWait ?? .zero) { [weak self] in
+                self?.finishOpeningLaunchWindows()
+            }
+        }
+    }
+
+    /// Runs `body` once the launch's saved windows have all come on screen
+    /// (`openLaunchWindows`; each waits at most `windowRevealMaximumWait`),
+    /// on the next turn when the launch opens none (or has opened them).
+    func whenLaunchWindowsOpened(_ body: @escaping @MainActor () -> Void) {
+        guard isOpeningLaunchWindows else {
+            scheduleLaunchWindowTurn(body)
+            return
+        }
+        launchWindowsOpenedWaiters.append(body)
+    }
+
+    private func finishOpeningLaunchWindows() {
+        guard isOpeningLaunchWindows else { return }
+        isOpeningLaunchWindows = false
+        let waiters = launchWindowsOpenedWaiters
+        launchWindowsOpenedWaiters.removeAll()
+        waiters.forEach { $0() }
+    }
+
+    /// Runs `body` once the window of `projectRoot` came on screen (its
+    /// saved tabs in place, `ProjectWindowReveal`), or `limit` after it was
+    /// asked (a window that never registers).
+    func whenLaunchWindowShown(projectRoot: String, waitingAtMost limit: Duration, _ body: @escaping @MainActor () -> Void) {
+        let root = repositoryRoot(for: projectRoot)
+        if shownLaunchWindowRoots.contains(root) {
+            body()
+            return
+        }
+        var ran = false
+        let once: @MainActor () -> Void = {
+            guard !ran else { return }
+            ran = true
+            body()
+        }
+        launchWindowShownWaiters[root, default: []].append(once)
+        let seconds = Double(limit.components.seconds) + Double(limit.components.attoseconds) / 1e18
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            MainActor.assumeIsolated { once() }
+        }
+    }
+
+    private func launchWindowDidShow(projectRoot: String) {
+        shownLaunchWindowRoots.insert(projectRoot)
+        let waiters = launchWindowShownWaiters.removeValue(forKey: projectRoot) ?? []
+        waiters.forEach { $0() }
+    }
+
     /// The sessions a quit that ends sessions would end, in every project
     /// window (`RepositoryWorkspace.localSessionsEndedByAQuit`): the open
     /// persistent tabs' of every host (`PersistentHostingRegistry`: This
@@ -135,6 +279,23 @@ final class ProjectWindowRegistry {
     /// the saved tabs' of This Mac.
     func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
         repositories.values.compactMap(\.repository).flatMap { $0.localSessionsEndedByAQuit() }
+            + pendingLaunchWindowRecords().compactMap { record in
+                record.hosted.map { (hostID: $0.hostID, sessionID: $0.sessionID) }
+            }
+    }
+
+    /// The saved tabs of the launch's windows not open yet
+    /// (`pendingLaunchWindowRoots`) that may own a session of
+    /// `launchWindowHosting`: a quit that ends sessions ends theirs too.
+    private func pendingLaunchWindowRecords() -> [WorkspaceSessionRecord] {
+        guard let hosting = launchWindowHosting, let store = workspaceStateStore else { return [] }
+        let host = hosting.profile.host
+        return pendingLaunchWindowRoots
+            .filter { !ProjectLocation.isRemoteKey($0) && !hasWindow(for: $0) }
+            .flatMap { root in
+                (store.load(repositoryRoot: root)?.worktrees ?? []).flatMap(\.sessions)
+            }
+            .filter { $0.mayOwnSession(on: host) }
     }
 
     /// Saves every project's tabs and the open windows now, synchronously.
@@ -189,6 +350,12 @@ final class ProjectWindowRegistry {
         for workspace in allWorkspaces() {
             stoppedNativeProgram = workspace.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
         }
+        if intent.endsLocalSessions, let hosting = launchWindowHosting {
+            // Windows the launch had not opened yet: their saved tabs'
+            // sessions end as an open window's would.
+            let records = pendingLaunchWindowRecords()
+            if !records.isEmpty { hosting.endSessions(ofForgottenTabs: records, recordedIn: workspaceStateStore) }
+        }
         return stoppedNativeProgram
     }
 
@@ -205,10 +372,11 @@ final class ProjectWindowRegistry {
         guard let workspaceStateStore, !isTerminating else { return }
         // The repository's own root: its saved tabs are keyed by it, and a
         // reopened window passes it to `RepositoryWorkspace` again.
-        let roots = windows.compactMap { root, weakWindow -> String? in
+        let open = windows.compactMap { root, weakWindow -> String? in
             guard weakWindow.window != nil else { return nil }
             return repositories[root]?.repository?.repositoryRoot ?? root
-        }.sorted()
+        }
+        let roots = Array(Set(open + pendingLaunchWindowRoots)).sorted()
         guard roots != lastSavedOpenWindowRoots else { return }
         lastSavedOpenWindowRoots = roots
         workspaceStateStore.saveOpenProjectWindowRoots(roots, synchronously: synchronously)
@@ -652,13 +820,19 @@ final class ProjectWindowRegistry {
             // screen until they are in place (at most a second): it never
             // shows empty first. It registers before AppKit first draws it.
             let coveredAtLaunch = launchWindowCover?.claim(window) ?? false
-            if let maximumWait = windowRevealMaximumWait {
-                ProjectWindowReveal.hold(
-                    window, until: repository, name: name, alreadyHidden: coveredAtLaunch, maximumWait: maximumWait
-                )
-            } else if coveredAtLaunch {
-                window.alphaValue = 1
-                window.ignoresMouseEvents = false
+            let shown: @MainActor () -> Void = { [weak self] in self?.launchWindowDidShow(projectRoot: projectRoot) }
+            if let maximumWait = windowRevealMaximumWait,
+               ProjectWindowReveal.hold(
+                   window, until: repository, name: name, alreadyHidden: coveredAtLaunch,
+                   maximumWait: maximumWait, onShow: shown
+               ) != nil {
+                // Shown by the gate.
+            } else {
+                if coveredAtLaunch {
+                    window.alphaValue = 1
+                    window.ignoresMouseEvents = false
+                }
+                shown()
             }
         }
         windows[projectRoot] = WeakWindow(window)

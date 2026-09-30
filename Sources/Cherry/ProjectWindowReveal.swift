@@ -30,7 +30,8 @@ enum ProjectWindowReveal {
         until repository: RepositoryWorkspace?,
         name: String,
         alreadyHidden: Bool = false,
-        maximumWait: Duration = defaultMaximumWait
+        maximumWait: Duration = defaultMaximumWait,
+        onShow: (@MainActor () -> Void)? = nil
     ) -> ProjectWindowRevealGate? {
         let awaitsRestore = repository?.isAwaitingInitialRestore ?? false
         guard awaitsRestore || alreadyHidden else { return nil }
@@ -46,6 +47,7 @@ enum ProjectWindowReveal {
                 window.alphaValue = 1
                 window.ignoresMouseEvents = previousIgnoresMouseEvents
                 LaunchTimeline.mark("window shown \(name) (\(outcome))")
+                onShow?()
             }
         )
         gate.begin()
@@ -279,4 +281,107 @@ struct WindowRestoringBar: View {
 private final class WeakWindowReference {
     weak var window: NSWindow?
     init(_ window: NSWindow) { self.window = window }
+}
+
+/// The order the launch opens its saved windows in
+/// (`ProjectWindowRegistry.openLaunchWindows`).
+enum LaunchWindowOrder {
+    /// The project most recently active first (`lastOpened`, the project
+    /// switcher's record), then the others in their saved order. Without
+    /// any record, the saved order.
+    static func frontFirst(_ roots: [String], lastOpened: (String) -> Date?) -> [String] {
+        var front: (index: Int, date: Date)?
+        for (index, root) in roots.enumerated() {
+            guard let date = lastOpened(root) else { continue }
+            if front.map({ date > $0.date }) ?? true { front = (index, date) }
+        }
+        guard let front else { return roots }
+        var ordered = roots
+        let root = ordered.remove(at: front.index)
+        return [root] + ordered
+    }
+}
+
+/// When a surface next reads its text for `LaunchContentFrames`: at most
+/// once per `interval`, not on every frame.
+struct LaunchContentCheck {
+    var interval: TimeInterval = 0.05
+    private var last: Date?
+
+    init(interval: TimeInterval = 0.05) {
+        self.interval = interval
+    }
+
+    mutating func isDue(at now: Date = Date()) -> Bool {
+        if let last, now.timeIntervalSince(last) < interval { return false }
+        last = now
+        return true
+    }
+}
+
+/// While the launch opens its saved windows, which windows have drawn a
+/// terminal frame with text yet (`GhosttySessionBridge` reports each
+/// surface's first one while `isWatching`), so the launch opens its other
+/// windows only once the first shows its tabs' content
+/// (`ProjectWindowRegistry.openLaunchWindows`).
+@MainActor
+enum LaunchContentFrames {
+    private final class Entry {
+        weak var window: NSWindow?
+        var waiters: [@MainActor () -> Void] = []
+        var hasContent = false
+        init(_ window: NSWindow) { self.window = window }
+    }
+
+    private static var entries: [Entry] = []
+    private static var watchers = 0
+
+    /// Whether surfaces report their first content frame.
+    static var isWatching: Bool { watchers > 0 }
+
+    /// Surfaces report from now until `stopWatching` (calls nest).
+    static func startWatching() { watchers += 1 }
+
+    static func stopWatching() {
+        watchers = max(0, watchers - 1)
+        guard watchers == 0 else { return }
+        let waiting = entries.flatMap(\.waiters)
+        entries.removeAll()
+        waiting.forEach { $0() }
+    }
+
+    /// A surface in `window` drew its first frame with text.
+    static func noteContentFrame(in window: NSWindow) {
+        let entry = self.entry(for: window)
+        entry.hasContent = true
+        let waiting = entry.waiters
+        entry.waiters.removeAll()
+        waiting.forEach { $0() }
+    }
+
+    /// Runs `body` once `window` drew terminal content, or after `limit`
+    /// (or when nothing watches any more), whichever comes first.
+    static func whenContentShown(in window: NSWindow, waitingAtMost limit: Duration, _ body: @escaping @MainActor () -> Void) {
+        let entry = self.entry(for: window)
+        if entry.hasContent || !isWatching {
+            body()
+            return
+        }
+        var ran = false
+        let once: @MainActor () -> Void = {
+            guard !ran else { return }
+            ran = true
+            body()
+        }
+        entry.waiters.append(once)
+        ProjectWindowRevealGate.mainQueueSchedule(limit, once)
+    }
+
+    private static func entry(for window: NSWindow) -> Entry {
+        entries.removeAll { $0.window == nil }
+        if let entry = entries.first(where: { $0.window === window }) { return entry }
+        let entry = Entry(window)
+        entries.append(entry)
+        return entry
+    }
 }

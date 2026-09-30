@@ -1111,6 +1111,11 @@ struct HostedSessionClient: Sendable {
     var loginEnvironment: @Sendable (_ retryingNow: Bool) -> HostedSessionLoginEnvironment.Capture? = {
         HostedSessionLoginEnvironment.shared.resolve(retryingNow: $0)
     }
+    /// Hands this run's capture, once made, to a caller that got the last
+    /// run's (`Capture.isFromLastRun`).
+    var onLoginEnvironmentRefresh: @Sendable (_ handler: @escaping @Sendable (HostedSessionLoginEnvironment.Capture) -> Void) -> Void = {
+        HostedSessionLoginEnvironment.shared.onRefresh($0)
+    }
 
     static let developmentSourceRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -1247,6 +1252,163 @@ struct HostedSessionClient: Sendable {
     }
 }
 
+/// The last run's login environment (`HostedSessionLoginEnvironment`), so a
+/// launch need not wait for the user's shell (often a second or two) before
+/// it reaches the session host: `login-environment.json` in the identity's
+/// Application Support folder.
+///
+/// Only the variables Cherry itself uses from the capture are kept
+/// (`isPersisted`: the search path, locale and time zone, the SSH agent and
+/// askpass, the shell and account, terminfo and XDG directories), never the
+/// rest of what the user's shell exports (tokens, keys). The file is this
+/// user's alone (0600, no symbolic link, owned by them: anything else is
+/// not read) and left out of backups.
+///
+/// Staleness: helpers, adapters and new sessions started before this run's
+/// own capture is made (in the background, at the first use) get the last
+/// run's variables; once it is made they get the new ones (a connected
+/// `HostControl` takes them for what it starts next). SSH masters never
+/// take the last run's agent socket (`HostControl.sshMasterEnvironment`).
+/// The file is not used when it was saved before This Mac booted
+/// (`kern.boottime`), before a log out, restart or shut down quit
+/// (`system-quits.json`), or in another login session (launchd's own
+/// `SSH_AUTH_SOCK`, saved with it, differs from this process's); nor for
+/// another shell or version. When this run's shell fails, the last run's
+/// capture stays in use.
+///
+/// Only the copy of the app that holds the instance lock writes it
+/// (`AppInstanceLock`), atomically; any copy may read it.
+struct LoginEnvironmentCache: Sendable {
+    static let fileName = "login-environment.json"
+    static let currentVersion = 2
+
+    let fileURL: URL
+    let shellPath: String
+    /// Whether this process may write the file; the app's asks the instance
+    /// lock.
+    let canWrite: @Sendable () -> Bool
+    /// When This Mac last booted; nil if unknown (the file is then used).
+    let bootTime: @Sendable () -> Date?
+    /// This process's own `SSH_AUTH_SOCK` (launchd's, per login session).
+    let processSSHAuthSock: @Sendable () -> String?
+    /// When Cherry quit for a log out, restart or shut down; nil when that
+    /// cannot be read now (the file is then not used).
+    let systemQuits: @Sendable () -> [Date]?
+
+    init(
+        fileURL: URL,
+        shellPath: String,
+        canWrite: @escaping @Sendable () -> Bool,
+        bootTime: @escaping @Sendable () -> Date?,
+        processSSHAuthSock: @escaping @Sendable () -> String? = { ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] },
+        systemQuits: @escaping @Sendable () -> [Date]? = { [] }
+    ) {
+        self.fileURL = fileURL
+        self.shellPath = shellPath
+        self.canWrite = canWrite
+        self.bootTime = bootTime
+        self.processSSHAuthSock = processSSHAuthSock
+        self.systemQuits = systemQuits
+    }
+
+    static let shared = LoginEnvironmentCache(
+        fileURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+            .appendingPathComponent(fileName, isDirectory: false),
+        shellPath: ShellProcessController.defaultShellPath,
+        // Never takes the lock itself (nor waits for a quitting holder).
+        canWrite: { AppInstanceLock.shared.isResolved && AppInstanceLock.shared.isHeld },
+        bootTime: { SystemEndedSessions.currentBootTime() },
+        systemQuits: {
+            // The store asks the lock: only once it was resolved.
+            guard AppInstanceLock.shared.isResolved, AppInstanceLock.shared.isHeld else { return nil }
+            return WorkspaceStateStore.shared.loadSystemQuits()
+        }
+    )
+
+    /// The variables kept: those Cherry's launches, helpers and adapters
+    /// read from the capture.
+    static func isPersisted(_ key: String) -> Bool {
+        persistedKeys.contains(key) || key.hasPrefix("LC_") || key.hasPrefix("XDG_")
+    }
+
+    private static let persistedKeys: Set<String> = [
+        "PATH", "MANPATH", "LANG", "LANGUAGE", "TZ", "SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE",
+        "DISPLAY", "SHELL", "HOME", "USER", "LOGNAME", "TMPDIR", "TERMINFO", "TERMINFO_DIRS"
+    ]
+
+    struct Record: Codable, Equatable {
+        var version: Int
+        var savedAt: Date
+        var shellPath: String
+        /// This process's own `SSH_AUTH_SOCK` when it was saved.
+        var processSSHAuthSock: String?
+        var environment: [String: String]
+    }
+
+    func load() -> HostedSessionLoginEnvironment.Capture? {
+        // This user's own private regular file only, never through a link.
+        var info = stat()
+        guard lstat(fileURL.path, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(),
+              info.st_mode & 0o077 == 0
+        else { return nil }
+        let descriptor = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        guard let data = try? handle.readToEnd() else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        guard let record = try? decoder.decode(Record.self, from: data),
+              record.version == Self.currentVersion,
+              record.shellPath == shellPath,
+              record.processSSHAuthSock == processSSHAuthSock(),
+              !record.environment.isEmpty,
+              let quits = systemQuits(),
+              !quits.contains(where: { $0.timeIntervalSince1970.rounded(.down) >= record.savedAt.timeIntervalSince1970.rounded(.down) })
+        else { return nil }
+        if let boot = bootTime(), record.savedAt < boot { return nil }
+        return HostedSessionLoginEnvironment.Capture(
+            environment: record.environment.filter { Self.isPersisted($0.key) },
+            fromUserShell: true,
+            isFromLastRun: true
+        )
+    }
+
+    /// Saves a capture of the user's shell (never the fallback's), when
+    /// this process may write.
+    func save(_ capture: HostedSessionLoginEnvironment.Capture, now: Date = Date()) {
+        guard capture.fromUserShell, !capture.isFromLastRun, canWrite() else { return }
+        let record = Record(
+            version: Self.currentVersion,
+            savedAt: now,
+            shellPath: shellPath,
+            processSSHAuthSock: processSSHAuthSock(),
+            environment: capture.environment.filter { Self.isPersisted($0.key) }
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        guard let data = try? encoder.encode(record) else { return }
+        let directory = fileURL.deletingLastPathComponent()
+        let manager = FileManager.default
+        do {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        } catch {
+            return
+        }
+        // Readable by this user only from the start, then renamed over the
+        // old one.
+        var temporary = directory.appendingPathComponent(".\(Self.fileName).\(UUID().uuidString)", isDirectory: false)
+        guard manager.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? temporary.setResourceValues(values)
+        if rename(temporary.path, fileURL.path) != 0 {
+            try? manager.removeItem(at: temporary)
+        }
+    }
+}
+
 /// The environment a terminal tab's login shell sees. Cherry is usually
 /// started by launchd, so variables exported from shell startup files
 /// (SSH_AUTH_SOCK for 1Password, gpg or Secretive agents; PATH for
@@ -1262,6 +1424,9 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
         /// `sh -l` fallback did: variables exported from the user's own shell
         /// startup files are missing.
         var fromUserShell = true
+        /// The last run's capture (`LoginEnvironmentCache`), answered while
+        /// this run's is being made.
+        var isFromLastRun = false
     }
 
     private let lock = NSLock()
@@ -1273,6 +1438,25 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
     private var lastAttemptEndedAt: TimeInterval?
     private let captureEnvironment: @Sendable () -> Capture?
     private let now: @Sendable () -> TimeInterval
+
+    /// Where the last run's capture is kept (`LoginEnvironmentCache`). The
+    /// app sets it at launch, before anything resolves; tests give their
+    /// own or none.
+    var lastRunCache: LoginEnvironmentCache? {
+        get { quickLock.withLock { lastRunCacheStorage } }
+        set { quickLock.withLock { lastRunCacheStorage = newValue } }
+    }
+    /// Guards what `resolve` answers without waiting for a capture under way
+    /// (which holds `lock` while the shell runs).
+    private let quickLock = NSLock()
+    private var lastRunCacheStorage: LoginEnvironmentCache?
+    /// This run's capture from the user's shell, once there is one.
+    private var fresh: Capture?
+    /// The last run's capture, answered until this run's own replaces it.
+    private var lastRun: Capture?
+    private var didReadLastRun = false
+    private var didStartRefresh = false
+    private var refreshHandlers: [@Sendable (Capture) -> Void] = []
 
     convenience init(
         shellPath: String = ShellProcessController.defaultShellPath,
@@ -1304,7 +1488,58 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
     /// fixed, is still captured, while one that always fails does not delay
     /// every helper command. `retryingNow` skips the backoff, for an explicit
     /// refresh. Blocks while the shell runs: call it off the main actor.
+    ///
+    /// With a `lastRunCache`, the first call does not wait for the shell:
+    /// it answers the last run's capture (when one was saved since This
+    /// Mac booted, for the same shell) and captures again in the
+    /// background. Every call answers that saved capture until the new one
+    /// is there; the new one is saved and handed to `onRefresh`'s handlers.
+    /// `retryingNow` never answers the last run's capture.
     func resolve(retryingNow: Bool = false) -> Capture? {
+        if !retryingNow, let quick = quickCapture() { return quick }
+        return resolveByCapturing(retryingNow: retryingNow)
+    }
+
+    /// This run's capture, or the last run's, if either is known now; never
+    /// runs the shell nor reads the file (`resolve` does).
+    func availableNow() -> Capture? {
+        quickLock.withLock { fresh ?? lastRun }
+    }
+
+    /// Calls `handler` (on some thread) with this run's capture once it
+    /// replaced the last run's. Nothing when the answers never came from
+    /// the last run's capture.
+    func onRefresh(_ handler: @escaping @Sendable (Capture) -> Void) {
+        let current: Capture? = quickLock.withLock {
+            if let fresh { return didStartRefresh ? fresh : nil }
+            refreshHandlers.append(handler)
+            return nil
+        }
+        if let current { handler(current) }
+    }
+
+    /// This run's capture, or the last run's while this run's is being
+    /// made (starting that capture once).
+    private func quickCapture() -> Capture? {
+        let (capture, startsRefresh): (Capture?, Bool) = quickLock.withLock {
+            if let fresh { return (fresh, false) }
+            if !didReadLastRun {
+                didReadLastRun = true
+                lastRun = lastRunCacheStorage?.load()
+            }
+            guard let lastRun else { return (nil, false) }
+            defer { didStartRefresh = true }
+            return (lastRun, !didStartRefresh)
+        }
+        if startsRefresh {
+            DispatchQueue.global(qos: .utility).async { [self] in
+                _ = resolveByCapturing(retryingNow: false)
+            }
+        }
+        return capture
+    }
+
+    private func resolveByCapturing(retryingNow: Bool) -> Capture? {
         let requestedAt = now()
         lock.lock()
         defer { lock.unlock() }
@@ -1318,6 +1553,14 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
         if let captured, captured.fromUserShell {
             cached = captured
             fallback = nil
+            let (cache, handlers): (LoginEnvironmentCache?, [@Sendable (Capture) -> Void]) = quickLock.withLock {
+                fresh = captured
+                lastRun = nil
+                defer { refreshHandlers.removeAll() }
+                return (lastRunCacheStorage, refreshHandlers)
+            }
+            cache?.save(captured)
+            handlers.forEach { $0(captured) }
             return captured
         }
         if let captured { fallback = captured }

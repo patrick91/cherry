@@ -134,6 +134,16 @@ final class RepositoryWorkspace: ObservableObject {
     /// to restore.
     @Published private(set) var isAwaitingInitialRestore: Bool
     private var initialRestoreWaiters: [@MainActor () -> Void] = []
+    /// Whether the first worktree's saved persistent tabs are shown at once,
+    /// before This Mac's host answers (`OptimisticRestore`). The app's
+    /// windows do; tests opt in.
+    let showsSavedTabsBeforeHostAnswers: Bool
+    /// Tabs shown before the host answered, by root and record id, until
+    /// the restore confirms or withdraws each (`reconcileOptimisticTabs`).
+    private var optimisticTabs: [String: [UUID: TerminalSession]] = [:]
+    /// The selection once those tabs were shown: the restore's answer
+    /// selects the saved tab only while nobody changed it since.
+    private var optimisticSelections: [String: SelectionMark] = [:]
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
     /// The registry this repository's window registered with
@@ -157,8 +167,10 @@ final class RepositoryWorkspace: ObservableObject {
         },
         restoredTabLaunchQueue: RestoredTabLaunchQueue = .shared,
         remoteProject: RemoteProjectAccess? = nil,
-        remoteProjectFiles: RemoteProjectFiles? = nil
+        remoteProjectFiles: RemoteProjectFiles? = nil,
+        showsSavedTabsBeforeHostAnswers: Bool = false
     ) {
+        self.showsSavedTabsBeforeHostAnswers = showsSavedTabsBeforeHostAnswers
         let runStartedAt = Self.appRunStartedAt
         // A project on another Mac (docs/specs/remote-devices.md) keeps its
         // key: no directory here, no git and no worktrees.
@@ -1622,7 +1634,16 @@ final class RepositoryWorkspace: ObservableObject {
         restoreTaskRecordIDs[root] = asked
         let name = URL(fileURLWithPath: root).lastPathComponent
         LaunchTimeline.mark("restore began \(name) records=\(asked.count)")
+        let showsBeforeHostAnswers = showsSavedTabsBeforeHostAnswers && root == initialWorktreeRoot
         restoreTasks[root] = Task { @MainActor [weak self] in
+            var request = request
+            if showsBeforeHostAnswers, let self, !request.cancellation.isCancelled {
+                // On this turn, not in the SwiftUI update that registered
+                // the window.
+                request.optimisticTabs = self.showOptimisticTabs(
+                    root: root, record: record, records: request.records, workspace: workspace
+                )
+            }
             let result = await restorer(request)
             LaunchTimeline.mark("restore answered \(name) tabs=\(result.sessions.count) pending=\(result.pendingRecordIDs.count)")
             guard let self else {
@@ -1655,6 +1676,123 @@ final class RepositoryWorkspace: ObservableObject {
         // Every record asked for stays saved until the restore answers for it.
         keptWorktreeRecords[root] = record.restricted(to: asked)
         applyRestoreStep(root: root, asked: asked, result: result, layout: record, workspace: workspace, step: .initial)
+    }
+
+    /// Shows, before This Mac's host answers, the saved persistent tabs of
+    /// `root` whose sessions probably still run (`OptimisticRestore`), with
+    /// the saved layout and selection: the window comes on screen with
+    /// them, and the selected one's adapter starts attaching at once. The
+    /// restore then confirms each tab (the host lists its session as the
+    /// record's) or withdraws it (`reconcileOptimisticTabs`).
+    private func showOptimisticTabs(
+        root: String,
+        record: WorktreeStateRecord,
+        records: [WorkspaceSessionRecord],
+        workspace: TerminalWorkspace
+    ) -> [UUID: TerminalSession] {
+        guard !isTearingDown, workspaces[root] === workspace,
+              let localSessions = backendPolicy.localSessions, let systemEnds,
+              localSessions.profile.isThisMac, localSessions.installationProblem() == nil
+        else { return [:] }
+        let environment = HostedSessionLoginEnvironment.shared.availableNow()?.environment
+        var built: [TerminalSession] = []
+        for saved in OptimisticRestore.records(records, localSessions: localSessions, systemEnds: systemEnds) {
+            guard let binding = saved.hosted,
+                  let attachment = localSessions.attachmentWithoutListing(
+                      binding, name: saved.title, loginEnvironment: environment
+                  )
+            else { continue }
+            let tab = workspace.makeRestoredPersistentSession(
+                PersistentSessionLaunch(
+                    attachment: attachment,
+                    info: OptimisticRestore.assumedInfo(of: saved, binding: binding, owner: localSessions.owner)
+                ),
+                record: saved,
+                hosting: localSessions,
+                deferringLaunch: true,
+                provisional: true
+            )
+            built.append(tab)
+        }
+        guard !built.isEmpty else { return [:] }
+        workspace.restoreSessions(
+            built, from: record, selectingSavedTab: true, addingAfterOpenTabs: false,
+            launchingAdapters: root == activeWorktreeRoot
+        )
+        let shown = built.filter { tab in tab.isProvisionalRestore && workspace.sessions.contains { $0 === tab } }
+        guard !shown.isEmpty else { return [:] }
+        optimisticSelections[root] = SelectionMark(selection: workspace.selectedSessionID)
+        let name = URL(fileURLWithPath: root).lastPathComponent
+        LaunchTimeline.mark("restore shown before the host answered \(name) tabs=\(shown.count)")
+        // The window shows once its saved selection is among them (else it
+        // waits for the answer, as before).
+        if root == initialWorktreeRoot,
+           record.selectedSessionID.map({ id in shown.contains { $0.id == id } }) ?? true {
+            settleInitialRestore()
+        }
+        let tabs = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        optimisticTabs[root] = tabs
+        workspace.awaitsRestoreDecision = { [weak self] id in self?.optimisticTabs[root]?[id] != nil }
+        return tabs
+    }
+
+    /// What a restore step decided for the tabs shown before the host
+    /// answered, by record id: only tabs still provisional are the
+    /// restore's (one the user restarted, or closed, meanwhile is theirs;
+    /// one ⌘Z brought back is provisional again). Those it confirmed stay;
+    /// those still pending stay until their remainder answers; the step's
+    /// own tab for a record (an ended tab, or another session's) takes the
+    /// provisional tab's place; any other provisional tab is withdrawn (a
+    /// record kept for later stays saved, a dropped one goes). Their
+    /// sessions are left as they are. Returns the tabs to add with the
+    /// saved layout: for the step that opens the workspace, the kept tabs
+    /// of the saved records too (taken out and laid out again with the
+    /// others, in the saved order, splits and selection); for a later
+    /// step, a replacement goes in its provisional tab's place instead.
+    /// Also whether the step may select the saved tab (nobody changed the
+    /// selection since they were shown; nil when none was shown).
+    private func reconcileOptimisticTabs(
+        root: String,
+        asked: Set<UUID>,
+        result: WorkspaceRestoreResult,
+        layout: WorktreeStateRecord,
+        workspace: TerminalWorkspace,
+        step: RestoreStep
+    ) -> (tabs: [TerminalSession], selectsSavedTab: Bool?) {
+        guard var shown = optimisticTabs[root] else { return (result.sessions, nil) }
+        let mark = optimisticSelections[root]
+        let pending = result.pendingRecordIDs.intersection(asked)
+        let decided = Set(shown.keys).intersection(asked).subtracting(pending)
+        var remaining = result.sessions
+        var withdrawn: [TerminalSession] = []
+        // Before anything is withdrawn (which moves the selection).
+        let selectsSavedTab = mark.map { $0.selection == workspace.selectedSessionID }
+        for id in decided.sorted(by: { $0.uuidString < $1.uuidString }) {
+            shown.removeValue(forKey: id)
+            guard !result.confirmedOptimisticRecordIDs.contains(id),
+                  let tab = workspace.session(withID: id), tab.isProvisionalRestore
+            else { continue }
+            if step != .initial, let index = remaining.firstIndex(where: { $0.id == id }),
+               workspace.replaceRestoredTab(tab, with: remaining[index]) {
+                remaining.remove(at: index)
+            } else {
+                withdrawn.append(tab)
+            }
+        }
+        if !withdrawn.isEmpty {
+            workspace.withdrawRestoredTabs(withdrawn)
+        }
+        optimisticTabs[root] = shown.isEmpty ? nil : shown
+        if shown.isEmpty { optimisticSelections[root] = nil }
+        guard step == .initial else { return (remaining, selectsSavedTab) }
+        // Laid out again with the step's tabs: every open tab of a saved
+        // record (shown early, confirmed or pending, restarted, or brought
+        // back), in the saved order.
+        let savedIDs = Set(layout.sessions.map(\.id))
+        let incoming = Set(remaining.map(\.id))
+        let kept = workspace.sessions.filter { savedIDs.contains($0.id) && !incoming.contains($0.id) }
+        workspace.takeOutForLayout(kept)
+        return (kept + remaining, selectsSavedTab)
     }
 
     /// Runs `body` once the restore that opens the window's first worktree
@@ -1712,10 +1850,13 @@ final class RepositoryWorkspace: ObservableObject {
         }
         // What a late part of this step is: a retry's stays a retry.
         let laterStep: RestoreStep = step == .retry ? .retry : .remainder
+        let reconciled = reconcileOptimisticTabs(
+            root: root, asked: asked, result: result, layout: layout, workspace: workspace, step: step
+        )
         let setAside = workspace.restoreSessions(
-            result.sessions,
+            reconciled.tabs,
             from: layout,
-            selectingSavedTab: selectingSavedTab,
+            selectingSavedTab: reconciled.selectsSavedTab ?? selectingSavedTab,
             addingAfterOpenTabs: step != .initial,
             launchingAdapters: root == activeWorktreeRoot
         )

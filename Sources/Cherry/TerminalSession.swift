@@ -1760,7 +1760,8 @@ final class TerminalWorkspace: ObservableObject {
         hosting: PersistentLocalSessions,
         launchShell: Bool = true,
         deferringLaunch: Bool = false,
-        takeover: Bool = false
+        takeover: Bool = false,
+        provisional: Bool = false
     ) -> TerminalSession {
         guard hosting.owningTab(of: launch.attachment.sessionID) == nil else {
             return makeRestoredHostedSession(
@@ -1798,7 +1799,8 @@ final class TerminalWorkspace: ObservableObject {
             hostedTakeover: takeover,
             persistentHosting: hosting,
             adoptingPersistentSession: launch,
-            deferredLaunch: deferringLaunch
+            deferredLaunch: deferringLaunch,
+            provisionalRestore: provisional
         )
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
@@ -2592,6 +2594,77 @@ final class TerminalWorkspace: ObservableObject {
 
     /// Ends tabs a restore built for this workspace after every tab was
     /// closed, with the intent that closed them (a window close if none did).
+    /// Takes out tabs a restore showed before their host answered and then
+    /// did not keep (`OptimisticRestore`): their sessions are left as they
+    /// are (the restore decided what becomes of them), nothing asks or
+    /// counts as a close, and an emptied workspace stays empty for the
+    /// restore to fill.
+    /// Takes `tabs` out, leaving them running and unclosed, for
+    /// `restoreSessions` to put back at once with a saved layout (a
+    /// restore that showed some of a window's tabs before its host
+    /// answered lays them out again with the others). The selection is
+    /// left as it is.
+    func takeOutForLayout(_ tabs: [TerminalSession]) {
+        let ids = Set(tabs.map(\.id))
+        guard !ids.isEmpty else { return }
+        sessions.removeAll { ids.contains($0.id) }
+        terminalSplitGroups = terminalSplitGroups.compactMap { group in
+            var group = group
+            let panes = group.paneSessionIDs.filter { !ids.contains($0) }
+            guard panes.count >= 2 else { return nil }
+            group.paneSessionIDs = panes
+            if !panes.contains(group.activeSessionID) { group.activeSessionID = panes[0] }
+            group.widthWeights = TerminalSplitGroup.balancedWeights(count: panes.count)
+            return group
+        }
+        let groupIDs = Set(terminalSplitGroups.map(\.id))
+        terminalDisplayItems = terminalDisplayItems.compactMap { item in
+            switch item {
+            case .single(let id): return ids.contains(id) ? nil : item
+            case .split(let id): return groupIDs.contains(id) ? item : nil
+            }
+        }
+        // A pane of a split that lost its others stands alone again.
+        let placed = Set(terminalDisplayItems.flatMap { item -> [UUID] in
+            switch item {
+            case .single(let id): return [id]
+            case .split(let id): return terminalSplitGroups.first { $0.id == id }?.paneSessionIDs ?? []
+            }
+        })
+        for tab in sessions where tab.kind == .terminal && !placed.contains(tab.id) {
+            terminalDisplayItems.append(.single(tab.id))
+        }
+    }
+
+    /// Whether a restore still decides the record of this id, whose tab it
+    /// showed before its host answered (`RepositoryWorkspace`, for ⌘Z of
+    /// such a tab: `reopenClosedTab`).
+    var awaitsRestoreDecision: (@MainActor (UUID) -> Bool)?
+
+    func withdrawRestoredTabs(_ tabs: [TerminalSession]) {
+        let ids = Set(tabs.map(\.id)).intersection(sessions.lazy.filter { tab in tabs.contains { $0 === tab } }.map(\.id))
+        closeSessions(withIDs: ids, allowEmptyWorkspace: true, intent: .duplicateWindowTeardown)
+    }
+
+    /// Puts `replacement`, a restored tab for the same saved record (same
+    /// id), in the place of `tab`, one a restore showed before its host
+    /// answered and then did not keep: the same place, layout and
+    /// selection; `tab`'s session is left as it is. False when `tab` is not
+    /// here (nothing changes).
+    @discardableResult
+    func replaceRestoredTab(_ tab: TerminalSession, with replacement: TerminalSession) -> Bool {
+        guard tab.id == replacement.id, let index = sessions.firstIndex(where: { $0 === tab }) else { return false }
+        sessions[index] = replacement
+        finishClosing(tab, intent: .duplicateWindowTeardown)
+        if selectedSessionID == replacement.id {
+            select(replacement)
+        } else {
+            replacement.scheduleAuxiliaryProcessingSuspensionAfterStartupGrace()
+        }
+        launchRestoredAdapters([replacement])
+        return true
+    }
+
     func discardRestoredSessions(_ restoredSessions: [TerminalSession]) {
         let intent = closeAllIntent ?? .windowClosed
         for session in restoredSessions {
@@ -2771,14 +2844,28 @@ final class TerminalWorkspace: ObservableObject {
             guard launchBackend == .nativePTY,
                   let hosting = backendPolicy.localSessions,
                   hosting.owningTab(of: sessionID) == nil,
-                  !hosting.isEnding(sessionID),
-                  let info = hosting.sessionInfo(sessionID)
+                  !hosting.isEnding(sessionID)
             else { return nil }
+            var provisional = false
+            let info: HostedSessionInfo
+            if let listed = hosting.sessionInfo(sessionID) {
+                info = listed
+            } else if !hosting.control.hasListedSessions, let binding = closed.record.hosted {
+                // The host has not listed yet (a tab shown before it answered,
+                // `OptimisticRestore`): the tab comes back as the record
+                // says, provisional while the restore still decides its
+                // record, and its session is left running.
+                info = OptimisticRestore.assumedInfo(of: closed.record, binding: binding, owner: hosting.owner)
+                provisional = awaitsRestoreDecision?(closed.record.id) ?? false
+            } else {
+                return nil
+            }
             tab = makeRestoredPersistentSession(
                 PersistentSessionLaunch(attachment: closed.binding, info: info),
                 record: closed.record,
                 hosting: hosting,
-                deferringLaunch: true
+                deferringLaunch: true,
+                provisional: provisional
             )
         } else {
             let info = closed.binding.host == .local
@@ -3594,6 +3681,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// A restored persistent tab whose program runs but whose attach adapter
     /// was not launched yet.
     private var persistentAdapterDeferred = false
+    /// A tab a launch's restore showed for its saved session before the
+    /// host answered (`OptimisticRestore`): until the restore confirms it
+    /// (`confirmProvisionalRestore`) or withdraws it, what its adapter and
+    /// the host say of its program's end is held, not acted on, since the
+    /// restore decides what a session gone or ended while Cherry was closed
+    /// becomes (`SystemEndedSessions`, *close on exit*).
+    private(set) var isProvisionalRestore = false
+    private var provisionalExit: (status: Int32, end: HostSessionEnd?)?
+    private var provisionalAdapterEnded = false
     /// The tab started the program it runs now (a native launch, or a new
     /// session it created), rather than following one that was already
     /// running: a restored or adopted session, or one attached from its
@@ -3897,6 +3993,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentHosting: PersistentLocalSessions? = nil,
         adoptingPersistentSession: PersistentSessionLaunch? = nil,
         deferredLaunch: Bool = false,
+        provisionalRestore: Bool = false,
         attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
             TerminalAttentionObservationRecorder.configuredDirectoryURL
         },
@@ -3978,6 +4075,8 @@ final class TerminalSession: ObservableObject, Identifiable {
             if let adoptingPersistentSession {
                 persistentSession = adoptingPersistentSession.attachment
                 persistentLaunchRequestID = PersistentLocalSessions.launchRequestID(of: adoptingPersistentSession.info)
+                // Before it follows the session (`startShell` binds it).
+                isProvisionalRestore = provisionalRestore
             }
             persistentHosting.register(self)
             persistentTabRegistry = persistentHosting
@@ -5699,6 +5798,10 @@ final class TerminalSession: ObservableObject, Identifiable {
 
         let adopted = persistentSessionToAdopt
         persistentSessionToAdopt = nil
+        if adopted == nil {
+            // Started again (a restart): it runs its own new session now.
+            clearProvisionalRestore()
+        }
         if adopted == nil, let bridge = ghosttyBridgeStorage, bridge.isNativePTYBacked {
             // A restart: the previous adapter's surface shows a program that
             // is gone, and keys typed into it would reach nothing. Until the
@@ -6160,6 +6263,14 @@ final class TerminalSession: ObservableObject, Identifiable {
         let attached = adapterLiveStatus != nil
         let outcome = consumeHostedLaunchStatus(removingAfter: 0) ?? .disconnected(nil)
         persistentPhase = .reconnecting
+        if isProvisionalRestore {
+            // Its session may be gone or ended: the restore decides, and
+            // launches it again once it confirms the session runs. It shows
+            // it reconnects meanwhile.
+            provisionalAdapterEnded = true
+            bumpRevision()
+            return
+        }
         if case .exited(let code, let signal) = outcome {
             // An exit without a status is never taken for a clean one.
             finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 1, launchID: launchID)
@@ -6378,7 +6489,62 @@ final class TerminalSession: ObservableObject, Identifiable {
               let launchID = activeLaunchID,
               persistentPhase != .creating
         else { return }
+        if isProvisionalRestore {
+            // Maybe it ended while Cherry was closed: the restore decides.
+            provisionalExit = (status, end)
+            return
+        }
         finishPersistentProgram(status: status, launchID: launchID, end: end)
+    }
+
+    /// The restore that showed this tab before its host answered found the
+    /// session in the host's list (`OptimisticRestore`): the tab takes what
+    /// the host reports of it, as a tab the restore built would have. One
+    /// that ended while Cherry was closed shows its exit and reports
+    /// nothing; one that ended since, or whose adapter ended meanwhile, is
+    /// handled as any.
+    func confirmProvisionalRestore(_ info: HostedSessionInfo) {
+        guard isProvisionalRestore else { return }
+        let heldExit = provisionalExit
+        let adapterEnded = provisionalAdapterEnded
+        clearProvisionalRestore()
+        guard let hosting = persistentHosting,
+              let binding = persistentSession,
+              binding.sessionID == info.id,
+              let launchID = activeLaunchID,
+              persistentPhase != .creating
+        else { return }
+        if let requestID = PersistentLocalSessions.launchRequestID(of: info), requestID != persistentLaunchRequestID {
+            persistentLaunchRequestID = requestID
+            persistentStateDidChange?()
+        }
+        guard info.isRunning else {
+            finishPersistentProgram(
+                status: PersistentLocalSessions.exitStatus(of: info), launchID: launchID, reportsExit: false, end: info.end
+            )
+            return
+        }
+        if let heldExit {
+            finishPersistentProgram(status: heldExit.status, launchID: launchID, end: heldExit.end)
+            return
+        }
+        hostedProgramProcessID = hosting.profile.isThisMac ? info.pid.map { Int32(bitPattern: $0) } : nil
+        noteHostSessionSharing(info)
+        applyHostReportedTitleAndDirectory(of: info, resynchronizing: true)
+        hostSessionName = info.name
+        if titleSource != .system {
+            syncHostSessionName(title)
+        }
+        bumpRevision()
+        if adapterEnded, persistentPhase == .reconnecting, !persistentAdapterDeferred {
+            schedulePersistentReconnect(launchID: launchID, binding: binding, hosting: hosting, immediately: true)
+        }
+    }
+
+    private func clearProvisionalRestore() {
+        isProvisionalRestore = false
+        provisionalExit = nil
+        provisionalAdapterEnded = false
     }
 
     /// The host changed what it reports about the running program: its pid,
@@ -6576,6 +6742,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// agrees (`PersistentLocalSessions.confirmedProgramState`). Until then
     /// nothing changes: no exit, no auto-restart.
     func persistentSessionMayHaveDisappeared(sessionID: String) {
+        // The restore that showed it decides.
+        guard !isProvisionalRestore else { return }
         guard persistentSession?.sessionID == sessionID,
               let binding = persistentSession,
               let hosting = persistentHosting,

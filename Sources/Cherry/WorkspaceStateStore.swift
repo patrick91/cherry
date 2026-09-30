@@ -1353,6 +1353,13 @@ struct WorkspaceRestoreRequest {
     /// as ended tabs instead of being dropped. Nil: none does (a restore
     /// without saved state behind it, tests).
     var systemEnds: SystemEndedSessions?
+    /// Tabs already in `workspace` for some of `records`, shown before the
+    /// host answered (`OptimisticRestore`), by record id. The restore
+    /// confirms each whose session the host lists as the record's own
+    /// (`WorkspaceRestoreResult.confirmedOptimisticRecordIDs`); for the
+    /// others it decides as for any record, and the repository withdraws
+    /// the tab (replacing it with the tab the restore built, if any).
+    var optimisticTabs: [UUID: TerminalSession] = [:]
 }
 
 // MARK: - Sessions the system ended
@@ -1672,6 +1679,10 @@ struct WorkspaceRestoreResult {
     /// one (tabs, kept records, and maybe records still pending with a
     /// remainder of their own).
     var remainder: Task<WorkspaceRestoreResult, Never>?
+    /// Records whose tab the restore showed before the host answered
+    /// (`WorkspaceRestoreRequest.optimisticTabs`) and that stay as they
+    /// are: the host lists their session. Not in `sessions`.
+    var confirmedOptimisticRecordIDs: Set<UUID> = []
 
     init(
         sessions: [TerminalSession] = [],

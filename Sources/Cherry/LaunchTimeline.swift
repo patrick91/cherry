@@ -36,7 +36,18 @@ enum LaunchTimeline {
         guard Double(elapsed) < window * 1_000 else { return }
         let phase = phase()
         signposter.emitEvent("launch", "\(phase, privacy: .public)")
-        SessionLog.notice("launch: \(phase) +\(elapsed)ms")
+        // The wall clock too, to line the phases up with what is measured
+        // outside the process (the log's own timestamps can be tens of
+        // milliseconds off).
+        let wall = String(format: "%.4f", Date().timeIntervalSince1970)
+        SessionLog.notice("launch: \(phase) +\(elapsed)ms @\(wall)")
+    }
+
+    /// Whether phases are still logged now: the launch's first `seconds`
+    /// (at most `window`). Cheap enough to ask per frame.
+    static func isLogging(within seconds: TimeInterval = window) -> Bool {
+        guard isEnabled else { return false }
+        return Date().timeIntervalSince(processStart) < min(seconds, window)
     }
 
     private static func processStartDate() -> Date? {

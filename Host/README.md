@@ -1064,7 +1064,12 @@ without `..`, and the resolved path otherwise. `cherry new` sends the
 invoking terminal's `LANG`, `LC_ALL` and `LC_*` locale categories and `TZ`,
 and the `--env` variables, which replace them (a locale variable given with
 `--env` replaces the terminal's whole locale). The Mac app sends a tab's
-whole environment, as a native tab would get it. The daemon raises its own
+whole environment, as a native tab would get it; for a tab of another Mac it
+also sends `SSH_CONNECTION` and `SSH_CLIENT` (loopback addresses, port 0), so
+that programs there copy with OSC 52, which reaches the tab's clipboard, as
+they do over `ssh`. A session whose environment has `SSH_CONNECTION` gets
+`SSH_TTY` naming its own terminal, as sshd sets it, in place of any the client
+sent (holders from this change on; older ones leave it unset). The daemon raises its own
 descriptor limit (up to 16384); sessions start with the limit it had before.
 
 The working directory must be absolute, `~`, or `~/…`, expanded with the
@@ -1667,10 +1672,18 @@ offsets or snapshots. With no client that can answer attached, queries are
 dropped and get no reply.
 
 Control strings are bounded to 64 KiB, except OSC 52 clipboard writes, which
-may be up to 8 MiB; longer ones are dropped. Clipboard writes go only to
-attached renderers: one made while nothing is attached is lost, and snapshots
-never replay it. A client that falls behind gets the latest ones after its
-resync snapshot (see [slow clients](#connections-and-flow-control)).
+may be up to 8 MiB (of base64); longer ones are dropped, and the holder logs
+each drop (`dropped N clipboard write(s) (OSC 52) over 8388608 bytes`).
+Clipboard writes go only to attached renderers, once to each (in direct and
+viewport mode alike): one made while nothing is attached is lost, and
+snapshots never replay it. A client that falls behind gets the latest ones
+after its resync snapshot (see [slow clients](#connections-and-flow-control)),
+those it missed, not again those it had. Clipboard reads (`OSC 52 ; c ; ?`)
+never get an answer from the host, which has no clipboard: like the other
+queries it cannot answer, a read goes to one attached client whose terminal
+answers it, by its own policy (Cherry's tab applies Ghostty's
+`clipboard-read`, which asks the user), and with no such client it is
+dropped unanswered.
 
 Current snapshot limitations include terminal graphics, palette and dynamic
 colour changes, OSC 7 directory metadata, the title, cursor shape, the

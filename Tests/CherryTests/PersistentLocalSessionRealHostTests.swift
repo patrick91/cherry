@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import GhosttyTerminal
 import SwiftUI
 import Testing
 @testable import Cherry
@@ -1577,6 +1578,56 @@ private struct StopMeasureContentHost: View {
         }
         try await host.waitFor("the tab to show the host's screen") { lines(host.screen(tab)) == expected }
         #expect(!host.screen(tab).contains("%"))
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostOSC52CopyReachesThisMacsClipboardOnce() async throws {
+    // The surfaces' clipboard is a private pasteboard: nothing here reads or
+    // writes the general one.
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("CherryTests.OSC52.\(UUID().uuidString)"))
+    let savedPasteboard = TerminalClipboard.pasteboard
+    TerminalClipboard.pasteboard = { pasteboard }
+    pasteboard.clearContents()
+    defer {
+        TerminalClipboard.pasteboard = savedPasteboard
+        pasteboard.releaseGlobally()
+    }
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        let tab = workspace.addSession(title: "Copy")
+        host.show(tab)
+        try await host.waitFor("the tab to attach") {
+            tab.persistentSession != nil && tab.state == .live && tab.usesNativePTYBackendAdapterAttached
+        }
+        // A program's OSC 52 write travels holder, daemon, adapter, surface,
+        // and Ghostty's clipboard callback puts it on the pasteboard. This
+        // Mac's tab says nothing of SSH.
+        tab.send(text: "printf '\\033]52;c;%s\\a' \"$(printf hello | base64)\"; echo \"COPIED:${SSH_CONNECTION-none}:${SSH_TTY-none}\"\n")
+        try await host.waitFor("the copy to reach the pasteboard") {
+            pasteboard.string(forType: .string) == "hello"
+        }
+        try await host.waitFor("the echo") { host.screen(tab).contains("COPIED:none:none") }
+        // Once: the adapter's reattach after a daemon restart (a new
+        // snapshot) never replays it.
+        pasteboard.clearContents()
+        pasteboard.setString("mine", forType: .string)
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        try await host.restartDaemon()
+        try await host.waitFor("the adapter to reconnect", timeout: 40) {
+            guard tab.adapterLiveStatus == HostedAdapterLiveStatus() else { return false }
+            return (try? await host.hostSession(sessionID))?.clients == 1
+        }
+        tab.send(text: "echo AFTER_$((40 + 2))\n")
+        try await host.waitFor("the output after") { host.screen(tab).contains("AFTER_42") }
+        #expect(pasteboard.string(forType: .string) == "mine")
     } catch {
         workspace.closeAllSessions(intent: .windowClosed)
         await host.tearDown()

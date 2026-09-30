@@ -27,9 +27,11 @@ import Foundation
 ///   `CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CONTROL_MACHINE`;
 ///   phase 4b), the shell
 ///   integration's variables (paths on the device), the command's own
-///   variables (cherry.toml), and the locale (`LANG`, `LC_*`). The host adds
-///   its own (`CHERRY_SESSION_ID`, `PWD`, `SSH_AUTH_SOCK`, and HOME, USER,
-///   SHELL, PATH from its account).
+///   variables (cherry.toml), the locale (`LANG`, `LC_*`), and
+///   `SSH_CONNECTION`/`SSH_CLIENT` (`sshEnvironment`). The host adds its own
+///   (`CHERRY_SESSION_ID`, `PWD`, `SSH_AUTH_SOCK`, HOME, USER, SHELL, PATH
+///   from its account, and `SSH_TTY` naming the session's terminal, which a
+///   holder sets whenever `SSH_CONNECTION` is set).
 /// - `cwd` is the path on the other Mac, unchecked here.
 enum RemoteLaunchSpec {
     static let term = "xterm-256color"
@@ -76,6 +78,24 @@ enum RemoteLaunchSpec {
         }
     }
 
+    /// The variables sshd sets, which say the session is remote: the
+    /// program runs on the other Mac while the user sits at this one, as
+    /// over `ssh`. Programs that copy check them to copy with OSC 52, which
+    /// reaches this Mac's clipboard through the tab's surface, rather than
+    /// to the other Mac's pasteboard (Claude Code checks `SSH_CONNECTION`;
+    /// Codex and others check one of the three); they also stop opening a
+    /// browser there. Neovim on macOS copies with pbcopy regardless (its
+    /// user can set `vim.g.clipboard = 'osc52'` when `SSH_TTY` is set).
+    /// The addresses are not the real ones (the master's are not known
+    /// here, and change with the network), so they name the loopback: the
+    /// port 0 says so.
+    /// `SSH_TTY` is the holder's (the session's own terminal). Git, gpg and
+    /// ssh do not read these; `SSH_AUTH_SOCK` stays the host's agent link.
+    static let sshEnvironment: [String: String] = [
+        "SSH_CONNECTION": "127.0.0.1 0 127.0.0.1 22",
+        "SSH_CLIENT": "127.0.0.1 0 22"
+    ]
+
     /// Variables that name this Mac's files, processes or account: never
     /// sent to another Mac, whatever the tab's environment says.
     static let localOnlyKeys: Set<String> = CherryTabEnvironment.keys.union([
@@ -83,7 +103,7 @@ enum RemoteLaunchSpec {
         CherryControl.mcpTokenEnvironmentKey,
         CherryControl.mcpHelperEnvironmentKey,
         CherryControl.controlMachineEnvironmentKey,
-        "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK", "PWD", "OLDPWD",
+        "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK", "SSH_TTY", "PWD", "OLDPWD",
         "TERM", "TERMINFO", "TERMINFO_DIRS", "ZDOTDIR", "XDG_DATA_DIRS", "MANPATH",
         "TERM_PROGRAM_VERSION", "__CF_USER_TEXT_ENCODING", "ENV", "HISTFILE"
     ])
@@ -102,6 +122,7 @@ enum RemoteLaunchSpec {
         for (key, value) in configuration.environment where !isLocalOnly(key) {
             environment[key] = value
         }
+        environment.merge(sshEnvironment) { _, ssh in ssh }
         environment["COLORTERM"] = "truecolor"
         environment["TERM_PROGRAM"] = "Cherry"
         environment["CHERRY_TERM_PROGRAM"] = "Cherry"

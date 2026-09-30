@@ -279,6 +279,23 @@ fn set_iutf8(fd: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
+/// A session whose environment says it is reached over SSH
+/// (`SSH_CONNECTION`: the Mac app's tabs of another Mac, so that programs
+/// copy with OSC 52 rather than to that Mac's pasteboard) gets `SSH_TTY`
+/// naming its own terminal, as sshd sets it. Only the holder knows that
+/// path; any `SSH_TTY` the client sent is replaced. Other sessions' are left
+/// as they are.
+fn with_ssh_tty(env: &[(Vec<u8>, Vec<u8>)], tty: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if !env.iter().any(|(key, _)| key == b"SSH_CONNECTION") {
+        return env.to_vec();
+    }
+    env.iter()
+        .filter(|(key, _)| key != b"SSH_TTY")
+        .cloned()
+        .chain([(b"SSH_TTY".to_vec(), tty.as_os_str().as_bytes().to_vec())])
+        .collect()
+}
+
 /// Start the session's program on a new PTY. Returns the master and the
 /// session leader.
 fn spawn(
@@ -302,6 +319,7 @@ fn spawn(
         }
     }
     let tty = pair.master.tty_name().context("PTY has no terminal name")?;
+    let env = with_ssh_tty(env, &tty);
     let slave = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1132,6 +1150,14 @@ impl Holder {
             credit = credit.saturating_sub(n as usize);
             self.display
                 .feed_into(&self.read_buffer[..n as usize], &mut output);
+        }
+        let dropped = self.display.take_dropped_clipboard_writes();
+        if dropped > 0 {
+            log(format_args!(
+                "session {}: dropped {dropped} clipboard write(s) (OSC 52) over {} bytes",
+                self.id,
+                crate::stream::MAX_CLIPBOARD
+            ));
         }
         // The last pass left output ready: the time since is no pause of the
         // program's (see `flooding`).
@@ -2096,6 +2122,30 @@ fn dial(socket: &Path) -> io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_reached_over_ssh_gets_its_own_terminal_as_ssh_tty() {
+        let pair = |key: &str, value: &str| (key.as_bytes().to_vec(), value.as_bytes().to_vec());
+        let tty = Path::new("/dev/ttys042");
+        // Not over SSH: unchanged, whatever SSH_TTY says.
+        let local = vec![
+            pair("TERM", "xterm-256color"),
+            pair("SSH_TTY", "/dev/ttys001"),
+        ];
+        assert_eq!(with_ssh_tty(&local, tty), local);
+        // Over SSH: this session's terminal, once, in place of the client's.
+        let remote = vec![
+            pair("SSH_CONNECTION", "127.0.0.1 0 127.0.0.1 22"),
+            pair("SSH_TTY", "/dev/ttys001"),
+        ];
+        assert_eq!(
+            with_ssh_tty(&remote, tty),
+            [
+                pair("SSH_CONNECTION", "127.0.0.1 0 127.0.0.1 22"),
+                pair("SSH_TTY", "/dev/ttys042"),
+            ]
+        );
+    }
 
     #[test]
     fn a_panic_report_names_the_time_the_session_and_the_build() {

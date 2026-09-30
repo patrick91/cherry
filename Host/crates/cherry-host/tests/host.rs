@@ -1199,6 +1199,142 @@ fn large_clipboard_writes_reach_attached_clients() {
 }
 
 #[test]
+fn clipboard_writes_reach_each_attached_client_once_and_never_a_snapshot() {
+    let sandbox = Sandbox::new();
+    let log = sandbox.path().join("stderr.log");
+    let host = Host::launch_with_stderr(
+        sandbox,
+        &[],
+        None,
+        std::process::Stdio::from(fs::File::create(&log).unwrap()),
+    );
+    // A write, one over the bound, then a read, whose answer (none should
+    // come from the host) the program records.
+    let session = host.create(shell_in(
+        host.dir(),
+        r#"stty raw -echo
+printf 'READY\r\n'
+dd bs=1 count=1 >/dev/null 2>&1
+printf '\033]52;c;aGVsbG8=\007'
+printf '\033]52;c;'; head -c 8400000 /dev/zero | tr '\0' A; printf '\007'
+printf '\033]52;c;?\007'
+stty min 0 time 5
+dd bs=1 count=64 2>/dev/null | od -An -tx1 > "$CHERRY_TEST_DIR/reply"
+printf 'CLIP_DONE\r\n'
+exec sleep 60"#,
+    ));
+    let (mut first, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut first, "READY");
+    let (mut second, _, _, _) = host.attach(&session.id, 80, 24);
+    input(&mut first, b"g");
+    let mut queries = Vec::new();
+    let mut read_all = |socket: &mut UnixStream| {
+        let mut output = Vec::new();
+        while !contains(&output, b"CLIP_DONE") {
+            match receive(socket) {
+                ServerMessage::Output { data, .. } => output.extend(data),
+                ServerMessage::Query { data } => queries.push(data),
+                _ => {}
+            }
+        }
+        output
+    };
+    for output in [read_all(&mut first), read_all(&mut second)] {
+        // The write reached each client once; the oversized one reached
+        // none; the read is no output.
+        assert_eq!(
+            output
+                .windows(b"\x1b]52;".len())
+                .filter(|w| w == b"\x1b]52;")
+                .count(),
+            1,
+            "{:?}",
+            String::from_utf8_lossy(&output[..output.len().min(400)])
+        );
+        assert!(contains(&output, b"\x1b]52;c;aGVsbG8=\x07"));
+    }
+    // The read went to one client, whose terminal answers it (Cherry's
+    // surface asks the user first); the host did not answer it.
+    assert_eq!(queries, [b"\x1b]52;c;?\x07".to_vec()]);
+    let reply = fs::read_to_string(host.dir().join("reply")).unwrap();
+    assert!(reply.trim().is_empty(), "the host answered: {reply}");
+    // A later attachment's snapshot never replays a clipboard write.
+    let (_third, _, _, snapshot) = host.attach(&session.id, 80, 24);
+    assert!(!contains(&snapshot, b"\x1b]52;"));
+    // The dropped write is logged.
+    wait_until("the dropped write to be logged", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("dropped 1 clipboard write(s) (OSC 52) over 8388608 bytes")
+    });
+}
+
+#[test]
+fn a_session_created_as_reached_over_ssh_names_its_terminal_in_ssh_tty() {
+    let host = Host::new();
+    let create = |env: BTreeMap<String, String>| {
+        let ClientMessage::Create {
+            request_id,
+            name,
+            cwd,
+            command,
+            cols,
+            rows,
+            owner,
+            tags,
+            colors,
+            ..
+        } = create_request(
+            Uuid::new_v4().to_string(),
+            shell_in(
+                host.dir(),
+                r#"printf '%s|%s|%s\n' "${SSH_TTY-unset}" "$(tty)" "${SSH_CONNECTION-unset}" > "$CHERRY_TEST_DIR/tty.$$.tmp"; mv "$CHERRY_TEST_DIR/tty.$$.tmp" "$CHERRY_TEST_DIR/tty-$MARK""#,
+            ),
+        )
+        else {
+            unreachable!()
+        };
+        match host.call(ClientMessage::Create {
+            request_id,
+            name,
+            cwd,
+            command,
+            env,
+            cols,
+            rows,
+            owner,
+            tags,
+            colors,
+        }) {
+            ServerMessage::Created { session } => session,
+            other => panic!("create failed: {other:?}"),
+        }
+    };
+    let read = |mark: &str| {
+        let path = host.dir().join(format!("tty-{mark}"));
+        wait_until("the session to report its terminal", || path.exists());
+        fs::read_to_string(&path).unwrap().trim().to_owned()
+    };
+    create(BTreeMap::from([
+        ("MARK".into(), "ssh".into()),
+        ("SSH_CONNECTION".into(), "127.0.0.1 0 127.0.0.1 22".into()),
+        ("SSH_TTY".into(), "/dev/ttys999".into()),
+    ]));
+    let fields: Vec<String> = read("ssh").split('|').map(str::to_owned).collect();
+    assert_eq!(fields[0], fields[1], "{fields:?}");
+    assert!(fields[0].starts_with("/dev/"), "{fields:?}");
+    assert_eq!(fields[2], "127.0.0.1 0 127.0.0.1 22");
+    // Without SSH_CONNECTION the host sets none of them.
+    create(BTreeMap::from([("MARK".into(), "local".into())]));
+    let local = read("local");
+    assert!(
+        local.starts_with("unset|/dev/") && local.ends_with("|unset"),
+        "{local}"
+    );
+}
+
+#[test]
 fn reattach_inside_alternate_screen_restores_underlying_primary_buffer() {
     let host = Host::new();
     let session=host.create(shell(r"stty raw -echo; printf 'PRIMARY_SCREEN\033[?1049h\033[2J\033[HALTERNATE_SCREEN'; dd bs=1 count=1 >/dev/null 2>&1; printf '\033[?1049l'; sleep 2"));

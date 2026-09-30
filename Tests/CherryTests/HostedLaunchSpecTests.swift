@@ -338,6 +338,10 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     environment["TERM_PROGRAM"] = "iTerm.app"
     environment["VTE_VERSION"] = "7000"
     environment["GHOSTTY_ZSH_ZDOTDIR"] = "/elsewhere"
+    // Cherry started from an SSH login: This Mac's tabs are still local.
+    environment["SSH_CONNECTION"] = "10.0.0.2 50000 10.0.0.1 22"
+    environment["SSH_CLIENT"] = "10.0.0.2 50000 22"
+    environment["SSH_TTY"] = "/dev/ttys003"
     let configuration = ShellProcessController.Configuration(
         shellPath: "/bin/bash",
         workingDirectory: "/tmp",
@@ -350,7 +354,7 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     for key in [
         "XPC_SERVICE_NAME", "XPC_FLAGS", "GHOSTTY_SURFACE_ID", "GHOSTTY_ZSH_ZDOTDIR", "NO_COLOR", "OLDPWD", "SHLVL",
         "TERM_SESSION_ID", "TMUX", "VTE_VERSION", "CHERRY_AGENT_ID", "CHERRY_PROJECT_ROOT", "CHERRY_STARTUP_COMMAND",
-        "CHERRY_BOOTSTRAP_ZDOTDIR", "ZDOTDIR"
+        "CHERRY_BOOTSTRAP_ZDOTDIR", "ZDOTDIR", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"
     ] {
         #expect(hosted.environment[key] == nil, Comment(rawValue: key))
     }
@@ -1084,7 +1088,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
         environment: [
             "PORT": "8000", "PATH": "/local/bin", "HOME": "/Users/local", "CHERRY_CONTROL_SOCKET": "/tmp/cherry.sock",
             "ZDOTDIR": "/local/zdotdir", "GHOSTTY_RESOURCES_DIR": "/Applications/Cherry.app/x", "SSH_AUTH_SOCK": "/tmp/agent",
-            "TERMINFO": "/local/terminfo", "CHERRY_STARTUP_COMMAND": "echo local"
+            "TERMINFO": "/local/terminfo", "CHERRY_STARTUP_COMMAND": "echo local", "SSH_TTY": "/dev/ttys003"
         ],
         term: ShellProcessController.ghosttyTerm,
         initialSize: TerminalViewportSize(columns: 80, rows: 24)
@@ -1097,9 +1101,12 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
     #expect(spec.environment == [
         "TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "Cherry", "CHERRY_TERM_PROGRAM": "Cherry",
         "INSIDE_CHERRY": "1", "CHERRY_PROJECT_ROOT": "/Users/me/app", "CHERRY_PROCESS_ID": processID,
-        "PORT": "8000", "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"
+        "PORT": "8000", "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8",
+        // Remote, as over ssh, so programs copy with OSC 52 (to this Mac's
+        // clipboard); SSH_TTY is the holder's, never this Mac's.
+        "SSH_CONNECTION": "127.0.0.1 0 127.0.0.1 22", "SSH_CLIENT": "127.0.0.1 0 22"
     ])
-    for key in ["PATH", "HOME", "CHERRY_CONTROL_SOCKET", "SSH_AUTH_SOCK", "TMPDIR", "ZDOTDIR", "TERMINFO", "SHELL"] {
+    for key in ["PATH", "HOME", "CHERRY_CONTROL_SOCKET", "SSH_AUTH_SOCK", "SSH_TTY", "TMPDIR", "ZDOTDIR", "TERMINFO", "SHELL"] {
         #expect(spec.environment[key] == nil, "\(key)")
     }
     #expect(spec.resourcesCopy == nil)
@@ -1119,6 +1126,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
     #expect(agentSpec.argv == ["/bin/bash", "-l", "-c", "claude --resume 'it''s'"])
     #expect(agentSpec.environment["CHERRY_AGENT_ID"] == processID)
     #expect(agentSpec.environment["CHERRY_STARTUP_COMMAND"] == nil)
+    #expect(agentSpec.environment["SSH_CONNECTION"] == "127.0.0.1 0 127.0.0.1 22")
     // A shell the device did not report: macOS's default.
     #expect(RemoteLaunchSpec.make(for: agent, remoteShell: "", localeEnvironment: [:]).argv.first == "/bin/zsh")
 }

@@ -253,6 +253,9 @@ struct HostedLaunchSpec: Equatable, Sendable {
         "TERM", "TERMINFO", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "VTE_VERSION",
         "TERM_SESSION_ID", "ITERM_SESSION_ID", "KITTY_WINDOW_ID", "KITTY_PID", "WEZTERM_PANE",
         "ALACRITTY_WINDOW_ID", "WINDOWID", "TMUX", "TMUX_PANE", "STY",
+        // An SSH login Cherry was started from: This Mac's tabs are local
+        // (only tabs of another Mac say they are remote, `RemoteLaunchSpec`).
+        "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY",
         // Cherry is a colour terminal (the forkpty launch drops it too).
         "NO_COLOR",
         // Set explicitly from the login environment.

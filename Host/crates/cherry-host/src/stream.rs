@@ -28,6 +28,9 @@ pub struct DisplayStream {
     utf8_left: usize,
     discarding: bool,
     transfer: Transfer,
+    /// OSC 52 clipboard writes dropped for exceeding `MAX_CLIPBOARD` since
+    /// `take_dropped_clipboard_writes` last read it.
+    dropped_clipboard_writes: usize,
 }
 
 /// A chunked kitty graphics transmission (`m=1`) that has begun and not
@@ -229,6 +232,12 @@ impl DisplayStream {
         &self.transfer.chunks
     }
 
+    /// How many clipboard writes were dropped for their size since the last
+    /// call (the holder logs them).
+    pub fn take_dropped_clipboard_writes(&mut self) -> usize {
+        std::mem::take(&mut self.dropped_clipboard_writes)
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Batch {
         let mut batch = Batch {
             terminal: Vec::with_capacity(bytes.len()),
@@ -419,6 +428,9 @@ impl DisplayStream {
                 self.finish(batch);
             } else if self.pending.len() > self.limit() {
                 // Oversized control strings cannot grow memory without bound.
+                if self.limit() == MAX_CLIPBOARD {
+                    self.dropped_clipboard_writes += 1;
+                }
                 self.pending.clear();
                 self.discarding = true;
             }
@@ -939,10 +951,14 @@ mod tests {
         assert!(terminal.is_empty());
         // Beyond the clipboard bound the write is dropped, and the stream
         // recovers at the next terminator.
+        assert_eq!(stream.take_dropped_clipboard_writes(), 0);
         stream.feed(b"\x1b]52;c;");
         stream.feed(&vec![b'A'; MAX_CLIPBOARD + 1]);
         assert!(stream.pending.len() <= MAX_CLIPBOARD);
         assert_eq!(stream.feed(b"\x07ok").display, b"ok");
+        // Counted once, for the holder's log line.
+        assert_eq!(stream.take_dropped_clipboard_writes(), 1);
+        assert_eq!(stream.take_dropped_clipboard_writes(), 0);
         // Other control strings keep the small bound.
         stream.feed(b"\x1b]2;");
         stream.feed(&vec![b'x'; MAX_CONTROL + 1]);

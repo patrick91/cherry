@@ -103,12 +103,17 @@ enum TerminalCallbacks {
         }
     }
 
+    /// A copy (a selection, or a program's OSC 52 write, which in a
+    /// persistent or another Mac's tab comes through the attach adapter
+    /// like any other output). `confirm` is Ghostty's `clipboard-write =
+    /// ask`: the surface's delegate asks first, and nothing is written
+    /// unless it allows it.
     static func writeClipboard(
-        userdata _: UnsafeMutableRawPointer?,
+        userdata: UnsafeMutableRawPointer?,
         clipboard _: ghostty_clipboard_e,
         contents: UnsafePointer<ghostty_clipboard_content_s>?,
         contentsLen: Int,
-        confirm _: Bool
+        confirm: Bool
     ) {
         guard contentsLen > 0 else { return }
         guard let content = contents?.pointee else { return }
@@ -118,9 +123,24 @@ enum TerminalCallbacks {
         #if canImport(UIKit)
             UIPasteboard.general.string = string
         #elseif canImport(AppKit)
-            let pasteboard = TerminalClipboard.pasteboard()
-            pasteboard.clearContents()
-            pasteboard.setString(string, forType: .string)
+            func write() {
+                let pasteboard = TerminalClipboard.pasteboard()
+                pasteboard.clearContents()
+                pasteboard.setString(string, forType: .string)
+            }
+            guard confirm else {
+                write()
+                return
+            }
+            guard let userdata else { return }
+            let bridge = Unmanaged<TerminalCallbackBridge>
+                .fromOpaque(userdata)
+                .takeUnretainedValue()
+            terminalRunOnMain {
+                bridge.handleClipboardConfirmation(contents: string, kind: .osc52Write) { allowed in
+                    if allowed { write() }
+                }
+            }
         #endif
     }
 

@@ -734,6 +734,128 @@ private func openProject(
 
 // MARK: - How they look
 
+private func hostedAgent(_ id: String, name: String, title: String? = nil, project: String? = "/Users/me/code/cloud") -> HostedSessionInfo {
+    var tags = [PersistentSessionTag.kind: "agent", PersistentSessionTag.agent: "Claude"]
+    if let project { tags[PersistentSessionTag.project] = project }
+    return HostedSessionInfo(id: id, name: name, cwd: project ?? "/Users/me", pid: 10, title: title, owner: "CherryTests", tags: tags)
+}
+
+@Test @MainActor func omniBackgroundAgentsShowTheirOwnNamesAndProjectWithNoDotUnlessWorking() {
+    let names = [
+        "◑ Results feedback", "✳ Build plugins for Claude", "⠐ Cloud workflow flakiness",
+        "GraphQL core 3.3 references update", "cloud pull request 4613 review",
+    ]
+    let listed = names.enumerated().map { index, name in
+        BackgroundSessionPresentation.session(hostedAgent("s\(index)", name: name, title: "✳ Claude Code"), hostID: "host")
+    }
+    var sources = OmniSources()
+    sources.backgroundSessions = listed.map { OmniBarGathering.background($0, on: .thisMac) }
+    let rows = OmniProviders.backgroundSessions(sources)
+    #expect(rows.map(\.title) == [
+        "Results feedback", "Build plugins for Claude", "Cloud workflow flakiness",
+        "GraphQL core 3.3 references update", "cloud pull request 4613 review",
+    ])
+    #expect(rows.allSatisfy { $0.detail == "cloud · background" })
+    // Running is not working: no dot without a live spinner.
+    #expect(rows.allSatisfy { $0.status == nil })
+    #expect(rows.allSatisfy { $0.logo == "claude" })
+
+    // Known to be working: the dot.
+    var working = listed[0]
+    working.isWorking = true
+    sources.backgroundSessions = [OmniBarGathering.background(working, on: .thisMac)]
+    #expect(OmniProviders.backgroundSessions(sources).first?.status == .working)
+
+    // Without a project, just "background"; with no name, the tool's.
+    let loose = BackgroundSessionPresentation.session(hostedAgent("x", name: "", project: nil), hostID: "host")
+    let looseRow = OmniBarGathering.background(loose, on: .thisMac)
+    #expect(looseRow.title == "Claude")
+    #expect(looseRow.detail == "background")
+
+    // A query for the tool still finds its agents, by their names.
+    sources.backgroundSessions = listed.map { OmniBarGathering.background($0, on: .thisMac) }
+    let controller = OmniBarController(sources: sources, frecency: [:], run: { _ in }, recordUse: { _ in }, close: {})
+    controller.open(at: .tabs)
+    controller.setQuery("claude")
+    #expect(Set(controller.rows.map(\.item.title)) == Set(rows.map(\.title)))
+}
+
+@Test @MainActor func backgroundShellsAreNamedByTheirCommandTitleOrDirectoryAndARenameWins() {
+    func named(_ name: String, title: String? = nil, foreground: String? = nil, pwd: String? = nil) -> String {
+        let info = HostedSessionInfo(
+            id: "t", name: name, cwd: "/Users/me/code/cherry", pid: 10, title: title, pwd: pwd,
+            foreground: foreground.map { HostedSessionForeground(pid: 11, name: $0) },
+            owner: "CherryTests", tags: [PersistentSessionTag.project: "/Users/me/code/cherry"]
+        )
+        return BackgroundSessionPresentation.session(info, hostID: "host").displayTitle
+    }
+    #expect(named("Shell 6") == "cherry")
+    #expect(named("Shell 6", pwd: "file://mac/Users/me/code/pix") == "pix")
+    #expect(named("Shell 6", title: "~/code/cherry", foreground: "npm") == "npm")
+    #expect(named("Shell 6", title: "npm run dev", foreground: "node") == "npm run dev")
+    #expect(named("Shell 6", title: "htop") == "htop")
+    // Created while its tab showed a directory or its title: not a rename.
+    #expect(named("~/code/cherry") == "cherry")
+    #expect(named("htop", title: "htop") == "htop")
+    #expect(named("zsh") == "cherry")
+    // A rename wins over all of it.
+    #expect(named("Servers", title: "npm run dev", foreground: "node") == "Servers")
+    #expect(SessionDisplayTitle.isUserName("Servers", terminalTitle: nil))
+    #expect(!SessionDisplayTitle.isUserName("Shell 12", terminalTitle: nil))
+
+    // The Omni bar row: its name, its project, no dot for a running shell.
+    let info = HostedSessionInfo(
+        id: "t", name: "Shell 6", cwd: "/Users/me/code/cherry", pid: 10, title: "npm run dev",
+        foreground: HostedSessionForeground(pid: 11, name: "node"),
+        owner: "CherryTests", tags: [PersistentSessionTag.project: "/Users/me/code/cherry"]
+    )
+    let row = OmniBarGathering.background(BackgroundSessionPresentation.session(info, hostID: "host"), on: .thisMac)
+    #expect(row.title == "npm run dev")
+    #expect(row.detail == "cherry · background")
+    #expect(!row.isWorking)
+    #expect(row.agentKey == nil)
+}
+
+@Test @MainActor func aBackgroundAgentIsWorkingOnlyWhileItsTitlesSpinnerMoves() async throws {
+    let harness = try PersistentHarness()
+    let clock = Recorder(Date(timeIntervalSince1970: 1_000))
+    let model = makeModel(harness, now: { clock.value })
+    defer {
+        model.stop()
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    func agent(title: String) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: "s-agent", name: "✳ Results feedback", cwd: project, pid: 300, title: title, owner: "CherryTests",
+            tags: [
+                PersistentSessionTag.tab: UUID().uuidString, PersistentSessionTag.kind: "agent",
+                PersistentSessionTag.agent: "Claude", PersistentSessionTag.project: project,
+            ]
+        )
+    }
+    func list(title: String, after seconds: TimeInterval) async throws -> BackgroundSession? {
+        harness.fake.sessions = [agent(title: title)]
+        _ = try await harness.control.list()
+        clock.value = clock.value.addingTimeInterval(seconds)
+        model.refresh()
+        return model.sessions.first
+    }
+    // Running, with a spinner frame seen once: not known to work.
+    let first = try #require(try await list(title: "⠋ Results feedback", after: 0))
+    #expect(first.displayTitle == "Results feedback")
+    #expect(first.title == "Claude")
+    #expect(!first.isWorking)
+    // The spinner moves: working, and the Omni bar shows the dot.
+    let moving = try #require(try await list(title: "⠙ Results feedback", after: 1))
+    #expect(moving.isWorking)
+    #expect(OmniBarGathering.background(moving, on: .thisMac).isWorking)
+    // The frame it left behind goes stale; a settled title is idle.
+    #expect(try await list(title: "⠙ Results feedback", after: AgentTitleHeartbeat.freshness)?.isWorking == false)
+    #expect(try await list(title: "✳ Results feedback", after: 0.5)?.isWorking == false)
+}
+
+
 @Test func backgroundRowsShowTitleProjectAndStatusWithoutTitleChurn() {
     let project = "/Users/tester/code/cherry"
     func row(_ info: HostedSessionInfo) -> BackgroundSession {

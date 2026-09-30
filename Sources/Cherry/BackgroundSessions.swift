@@ -13,15 +13,22 @@ import Foundation
 // (`BackgroundSessionsNotice`).
 
 /// A session of this app that no open tab shows, as the Background
-/// Sessions list shows it. Nothing here changes while its program runs on
-/// by itself (an agent's spinner title is left out), so the list publishes
-/// only when a session comes, goes, ends, or changes what it runs.
+/// Sessions list shows it. Little here changes while its program runs on
+/// by itself (an agent's spinner title is left out; only whether it is at
+/// work, `isWorking`, and a shell's title at each command count), so the
+/// list publishes only when a session comes, goes, ends, or changes what it
+/// runs.
 struct BackgroundSession: Equatable, Identifiable, Sendable {
     /// The host's session id.
     let id: String
     let hostID: String
     /// The command's or agent's name, or the session's.
     let title: String
+    /// Its own name, as the Omni bar lists it
+    /// (`SessionDisplayTitle.background`): an agent's task title, a shell's
+    /// command, title or directory. A shell's follows the title its shell
+    /// sets (at each command), an agent's does not follow its spinner.
+    var displayTitle = ""
     let kind: TerminalSession.SessionKind
     /// The agent (`cherry.agent`), for its logo.
     let agentKey: String?
@@ -43,6 +50,10 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let createdAt: Date?
     /// The device it runs on (its name); nil for This Mac.
     var machine: String? = nil
+    /// Its agent is known to be at work: its title's spinner is live
+    /// (`AgentTitleHeartbeat`, set by `BackgroundSessionsModel.refresh`).
+    /// Unlike `isAtWork`, never for an agent that merely runs.
+    var isWorking = false
 
     var isRunning: Bool { exitStatus == nil }
 
@@ -71,6 +82,7 @@ enum BackgroundSessionPresentation {
             id: info.id,
             hostID: hostID,
             title: title(of: info, kind: kind),
+            displayTitle: SessionDisplayTitle.background(info, kind: kind, home: nil),
             kind: kind,
             agentKey: kind == .agent ? info.tags[PersistentSessionTag.agent]?.nilIfEmpty : nil,
             commandName: kind == .command ? info.tags[PersistentSessionTag.command]?.nilIfEmpty : nil,
@@ -490,6 +502,7 @@ final class BackgroundSessionsModel: ObservableObject {
         let control = localSessions.control
         if let hostID = control.hostID { knownHostID = hostID }
         var listed: [BackgroundSession]
+        var infos: [HostedSessionInfo] = []
         // Whether `listed` is what the host has now (unread marks of
         // sessions it no longer has go only then).
         var isLive = true
@@ -498,14 +511,17 @@ final class BackgroundSessionsModel: ObservableObject {
             // the panel is open from a look that started nothing there.
             if isPanelOpen, let peeked = peeks.list(for: localSessions.profile.host) {
                 knownHostID = peeked.hostID
-                listed = backgroundSessions(in: peeked.sessions, hostID: peeked.hostID)
+                infos = peeked.sessions
+                listed = backgroundSessions(in: infos, hostID: peeked.hostID)
             } else {
                 listed = []
                 isLive = false
             }
         } else {
-            listed = knownHostID.map { backgroundSessions(in: control.sessions, hostID: $0) } ?? []
+            infos = control.sessions
+            listed = knownHostID.map { backgroundSessions(in: infos, hostID: $0) } ?? []
         }
+        listed = markingWorkingAgents(listed, from: infos)
         listed = removeCleanlyEndedTerminals(listed)
         listed = removeExpiredEndedSessions(listed)
         removeStaleResourcesOnce()
@@ -524,6 +540,22 @@ final class BackgroundSessionsModel: ObservableObject {
         updateSummary()
         updateLease()
     }
+
+    /// Sets `isWorking` of the running agents of `listed` from their titles
+    /// in `infos` (`AgentTitleHeartbeat`).
+    private func markingWorkingAgents(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
+        let titles = Dictionary(infos.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
+        let now = now()
+        agentHeartbeat.keep(only: Set(listed.map(\.id)))
+        return listed.map { session in
+            guard session.kind == .agent, session.isRunning else { return session }
+            var session = session
+            session.isWorking = agentHeartbeat.isWorking(id: session.id, title: titles[session.id] ?? nil, now: now)
+            return session
+        }
+    }
+
+    private var agentHeartbeat = AgentTitleHeartbeat()
 
     /// The counts the app shows: This Mac's and every device's.
     private func updateSummary() {

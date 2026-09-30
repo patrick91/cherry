@@ -423,41 +423,35 @@ struct OmniTab: Equatable {
     /// when known; otherwise a `/Users/<name>` or `/home/<name>` window
     /// counts as one.
     static func detail(windowPath: String, workingDirectory: String?, home: String?) -> String {
-        func standardized(_ path: String) -> String {
-            var path = (path as NSString).standardizingPath
-            while path.count > 1, path.hasSuffix("/") { path.removeLast() }
-            return path
+        if !SessionDisplayTitle.isHome(windowPath, home: home), windowPath != "/" {
+            return SessionDisplayTitle.directoryName(windowPath, home: home)
         }
-        let home = home.map(standardized).flatMap { $0.isEmpty ? nil : $0 }
-        func isHome(_ path: String) -> Bool {
-            let path = standardized(path)
-            if path == "~" || path.isEmpty { return true }
-            if let home { return path == home }
-            let parts = path.split(separator: "/", omittingEmptySubsequences: true)
-            return path == "/var/root" || (parts.count == 2 && (parts[0] == "Users" || parts[0] == "home"))
-        }
-        func name(_ path: String) -> String {
-            let path = standardized(path)
-            if path == "/" { return "/" }
-            return (path as NSString).lastPathComponent
-        }
-        if !isHome(windowPath), windowPath != "/" { return name(windowPath) }
-        guard let directory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !directory.isEmpty, !isHome(directory)
+        guard let directory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines), !directory.isEmpty
         else { return "~" }
-        return name(directory)
+        return SessionDisplayTitle.directoryName(directory, home: home)
     }
 }
 
 /// A background session (`BackgroundSessionsModel.allSessions`).
 struct OmniBackgroundSession: Equatable {
     var id: String
+    /// Its own name (`BackgroundSession.displayTitle`): an agent's task
+    /// title, a shell's command or directory; never its tool's name.
     var title: String
     var machine: ProjectSwitcherModel.Machine
-    var isAtWork: Bool
-    /// An agent session's tool (`cherry.agent`, else its title), for its
-    /// logo; nil for other sessions.
+    /// Its agent is known to be at work (`BackgroundSession.isWorking`); a
+    /// session merely running is not.
+    var isWorking: Bool
+    /// An agent session's tool (`cherry.agent`), for its logo; nil for
+    /// other sessions.
     var agentKey: String? = nil
+    /// The project it belongs to (`cherry.project`), nil for none.
+    var projectName: String? = nil
+
+    /// "cloud · background", or "background" without a project.
+    var detail: String {
+        [projectName, "background"].compactMap { $0?.nilIfEmpty }.joined(separator: " · ")
+    }
 }
 
 /// A worktree of the window's project.
@@ -756,6 +750,7 @@ enum OmniProviders {
                     primaryLabel: "Go to Tab",
                     primary: .goToTab(tab.id),
                     actions: actions,
+                    keywords: agentKeywords(tab.agentKey),
                     machine: tab.machine,
                     liveBoost: tab.isWorking ? 30 : 0
                 )
@@ -770,8 +765,8 @@ enum OmniProviders {
                     id: "session:\(session.id)",
                     kind: .session,
                     title: session.title,
-                    detail: "background",
-                    status: session.isAtWork ? .working : nil,
+                    detail: session.detail,
+                    status: session.isWorking ? .working : nil,
                     symbol: "terminal",
                     logo: session.agentKey.flatMap(AgentToolBrand.logoResourceName(forAgentKey:)),
                     primaryLabel: "Open in Tab",
@@ -780,9 +775,18 @@ enum OmniProviders {
                         .init(title: "Open in Tab", command: .openBackgroundSession(id: session.id)),
                         .init(title: "End Session", command: .endBackgroundSession(id: session.id), isDestructive: true),
                     ],
+                    keywords: agentKeywords(session.agentKey),
                     machine: session.machine
                 )
             }
+    }
+
+    /// An agent's tool by name ("Claude"), so a query for it finds the
+    /// agent's rows, whose titles are their tasks.
+    static func agentKeywords(_ agentKey: String?) -> [String] {
+        guard let agentKey = agentKey?.nilIfEmpty else { return [] }
+        let brand = AgentToolBrand(rawValue: agentKey) ?? AgentToolBrand.detect(name: agentKey)
+        return [brand?.displayName ?? agentKey]
     }
 
     // MARK: Worktrees

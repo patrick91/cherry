@@ -815,7 +815,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     let connected = OmniProviders.macs(sources(
         .connected(sessionCount: 1),
         sessions: [session("a", owner: "Cherry", project: "/Users/me/app")],
-        background: [OmniBackgroundSession(id: "s1", title: "npm", machine: .device(studioID), isAtWork: true)]
+        background: [OmniBackgroundSession(id: "s1", title: "npm", machine: .device(studioID), isWorking: false)]
     ))[1]
     #expect(connected.detail == "1 session" && connected.status == .idle)
     #expect(connected.primary == .drill(.mac(.device(studioID), name: "Studio")))

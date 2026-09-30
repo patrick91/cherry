@@ -312,7 +312,7 @@ enum OmniBarGathering {
                 if let key = directory, ProjectLocation.isRemoteKey(key) { directory = ProjectLocation(key: key).path }
                 return OmniTab(
                     id: session.id,
-                    title: session.title,
+                    title: title(of: session, workingDirectory: directory, home: machineHome),
                     projectName: OmniTab.detail(windowPath: windowPath, workingDirectory: directory, home: machineHome),
                     machine: machine,
                     isWorking: session.agentActivityState == .working,
@@ -321,6 +321,24 @@ enum OmniBarGathering {
                 )
             }
         }
+    }
+
+    /// A tab's name in the bar (`SessionDisplayTitle.tab`): an agent's
+    /// task title, a shell's command, title or directory, a rename first.
+    /// A persistent shell's foreground command is what its host last
+    /// reported.
+    static func title(of session: TerminalSession, workingDirectory: String?, home: String?) -> String {
+        let reported = session.kind == .terminal ? session.hostReportedSession : nil
+        return SessionDisplayTitle.tab(
+            kind: session.kind,
+            title: session.title,
+            titleSource: session.titleSource,
+            agentName: session.agentName,
+            commandLine: session.subtitle,
+            foreground: reported.flatMap { $0.isBusy ? $0.foreground?.name : nil },
+            workingDirectory: workingDirectory,
+            home: home ?? session.pathHomeDirectory.nilIfEmpty
+        )
     }
 
     /// An agent tab's tool, as the menu-bar agent list names it
@@ -334,12 +352,7 @@ enum OmniBarGathering {
     /// This Mac's background sessions, then each device's.
     static func background(_ model: BackgroundSessionsModel) -> [OmniBackgroundSession] {
         func rows(_ sessions: [BackgroundSession], on machine: ProjectSwitcherModel.Machine) -> [OmniBackgroundSession] {
-            sessions.filter(\.isRunning).map {
-                OmniBackgroundSession(
-                    id: $0.id, title: $0.title, machine: machine, isAtWork: $0.isAtWork,
-                    agentKey: $0.kind == .agent ? ($0.agentKey ?? $0.title) : nil
-                )
-            }
+            sessions.filter(\.isRunning).map { background($0, on: machine) }
         }
         var result = rows(model.sessions, on: .thisMac)
         for device in model.devices {
@@ -347,6 +360,19 @@ enum OmniBarGathering {
             result += rows(device.sessions, on: .device(id))
         }
         return result
+    }
+
+    /// A background session as the bar lists it: its own name, its
+    /// project, and a working dot only when its agent is known to work.
+    static func background(_ session: BackgroundSession, on machine: ProjectSwitcherModel.Machine) -> OmniBackgroundSession {
+        OmniBackgroundSession(
+            id: session.id,
+            title: session.displayTitle.nilIfEmpty ?? session.title,
+            machine: machine,
+            isWorking: session.isWorking,
+            agentKey: session.kind == .agent ? (session.agentKey ?? session.title) : nil,
+            projectName: session.projectRoot == nil ? nil : session.projectName
+        )
     }
 
     static func context(for window: OmniBarWindow, settings: AgentSettings) -> OmniWindowContext {

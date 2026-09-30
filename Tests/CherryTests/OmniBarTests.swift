@@ -81,7 +81,7 @@ private func fixture(extraProjects: Int = 0) -> OmniSources {
         OmniTab(id: tabStudio, title: "Shell 1", projectName: "rignore", machine: .device(studioID), isWorking: false, canDetach: true),
     ]
     sources.backgroundSessions = [
-        OmniBackgroundSession(id: "s-graphql", title: "GraphQL core 3.3 references update", machine: .thisMac, isAtWork: true),
+        OmniBackgroundSession(id: "s-graphql", title: "GraphQL core 3.3 references update", machine: .thisMac, isWorking: true),
     ]
     sources.repositoryName = "cherry"
     sources.worktrees = [
@@ -663,7 +663,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         OmniTab(id: unknownTab, title: "Agent", projectName: "cherry", machine: .thisMac, isWorking: false, canDetach: true, agentKey: "mytool"),
     ]
     sources.backgroundSessions += [
-        OmniBackgroundSession(id: "s-codex", title: "Refactor", machine: .thisMac, isAtWork: true, agentKey: "codex"),
+        OmniBackgroundSession(id: "s-codex", title: "Refactor", machine: .thisMac, isWorking: true, agentKey: "codex"),
     ]
     let tabs = Dictionary(uniqueKeysWithValues: OmniProviders.tabs(sources).map { ($0.id, $0) })
     #expect(tabs["tab:\(claudeTab.uuidString)"]?.logo == "claude")
@@ -934,4 +934,102 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
     for (window, directory) in [(home, home), (home, "~"), ("~", home)] {
         #expect(OmniTab.detail(windowPath: window, workingDirectory: directory, home: home) != "patrickarminio")
     }
+}
+
+// MARK: - Session titles
+
+@Test func agentTitleHeartbeatCountsOnlyALiveSpinner() {
+    var heartbeat = AgentTitleHeartbeat()
+    let start = Date(timeIntervalSince1970: 1_000)
+    func beat(_ id: String, _ title: String?, at seconds: TimeInterval) -> Bool {
+        heartbeat.isWorking(id: id, title: title, now: start.addingTimeInterval(seconds))
+    }
+    // Seen once: no evidence, even with a spinner.
+    #expect(!beat("a", "⠋ Fix it", at: 0))
+    // The spinner moves: working.
+    #expect(beat("a", "⠙ Fix it", at: 1))
+    #expect(beat("a", "⠙ Fix it", at: 2))
+    // A frame left behind: no longer once it is stale.
+    #expect(!beat("a", "⠙ Fix it", at: 1 + AgentTitleHeartbeat.freshness))
+    // Settled title: idle, however recent.
+    #expect(!beat("a", "✳ Fix it", at: 10))
+    #expect(!beat("b", nil, at: 0))
+    heartbeat.keep(only: ["b"])
+    #expect(!beat("a", "⠹ Fix it", at: 11))
+}
+
+@Test func sessionTitlesDropStatusGlyphs() {
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("◑ Results feedback") == "Results feedback")
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("✳ Build plugins") == "Build plugins")
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("⠐Task ⠂") == "Task")
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("● ◐ Two") == "Two")
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("*nix port") == "*nix port")
+    #expect(SessionDisplayTitle.strippingStatusGlyphs("Plain  title\n") == "Plain title")
+}
+
+@Test @MainActor func omniTabTitlesAreTheTabsOwnNotTheTools() {
+    func tab(
+        _ kind: TerminalSession.SessionKind, _ title: String, _ source: TerminalSession.TitleSource,
+        agent: String? = nil, foreground: String? = nil, directory: String? = "/Users/me/code/cherry"
+    ) -> String {
+        SessionDisplayTitle.tab(
+            kind: kind, title: title, titleSource: source, agentName: agent, commandLine: agent?.lowercased() ?? "zsh login shell",
+            foreground: foreground, workingDirectory: directory, home: "/Users/me"
+        )
+    }
+    // An agent's settled task title, not its tool's name.
+    #expect(tab(.agent, "Fix the amp parser", .automatic, agent: "Claude") == "Fix the amp parser")
+    #expect(tab(.agent, "✳ Fix the amp parser", .automatic, agent: "Claude") == "Fix the amp parser")
+    // Before it has one, the tool's, as the sidebar shows it.
+    #expect(tab(.agent, "Claude Code", .system, agent: "Claude") == "Claude")
+    #expect(tab(.agent, "My agent", .explicit, agent: "Claude") == "My agent")
+    #expect(tab(.command, "web", .system) == "web")
+    // A shell: never "Shell 2".
+    #expect(tab(.terminal, "Shell 2", .system) == "cherry")
+    #expect(tab(.terminal, "Shell 2", .system, directory: "/Users/me") == "~")
+    #expect(tab(.terminal, "nvim README.md", .system) == "nvim README.md")
+    #expect(tab(.terminal, "~/code/cherry", .system, foreground: "npm") == "npm")
+    // A rename wins.
+    #expect(tab(.terminal, "Servers", .explicit, foreground: "npm") == "Servers")
+}
+
+@Test func shellTitlesFallBackFromCommandToTitleToDirectory() {
+    func shell(user: String? = nil, foreground: String? = nil, title: String? = nil, directory: String? = "/Users/me/code/pix") -> String {
+        SessionDisplayTitle.shell(userName: user, foreground: foreground, terminalTitle: title, workingDirectory: directory, home: "/Users/me")
+    }
+    // 1. The user's name.
+    #expect(shell(user: "API", foreground: "npm", title: "npm run dev") == "API")
+    // 2. The foreground command: as the command line the shell titled it with,
+    //    else by its process name.
+    #expect(shell(foreground: "npm", title: "npm run dev") == "npm run dev")
+    #expect(shell(foreground: "nvim", title: "~/code/pix") == "nvim")
+    #expect(shell(foreground: "nvim", title: "me@mac: ~/code/pix") == "nvim")
+    #expect(shell(foreground: "zsh", title: "~/code/pix") == "pix")
+    // 3. A meaningful title the shell set.
+    #expect(shell(title: "nvim README.md") == "nvim README.md")
+    #expect(shell(title: "⠋ make test") == "make test")
+    // 4. The directory, "~" at home; titles that only name a shell or a
+    //    directory, or the tab's first name, say nothing more.
+    #expect(shell(title: "-zsh") == "pix")
+    #expect(shell(title: "zsh login shell") == "pix")
+    #expect(shell(title: "Shell 6") == "pix")
+    #expect(shell(title: "~/code/pix") == "pix")
+    #expect(shell(title: nil, directory: "/Users/me") == "~")
+    #expect(shell(title: "~/code/app", directory: nil) == "app")
+    #expect(shell(title: nil, directory: nil) == "~")
+    #expect(shell(directory: "/") == "/")
+}
+
+@Test @MainActor func omniTabsOfARealWorkspaceShowTheShellsDirectoryUntilRenamed() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-omni-titles-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let workspace = TerminalWorkspace(projectRoot: root.path, createInitialSession: false)
+    let shell = workspace.addSession(workingDirectory: root.path, select: false)
+    #expect(shell.title.hasPrefix("Shell "))
+    #expect(OmniBarGathering.title(of: shell, workingDirectory: root.path, home: "/Users/me") == root.lastPathComponent)
+    shell.rename(to: "Servers")
+    #expect(OmniBarGathering.title(of: shell, workingDirectory: root.path, home: "/Users/me") == "Servers")
+    shell.rename(to: nil)
+    #expect(OmniBarGathering.title(of: shell, workingDirectory: root.path, home: "/Users/me") == root.lastPathComponent)
 }

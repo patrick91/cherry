@@ -191,6 +191,18 @@ private final class RealLocalHost {
         shownSessions.append((container, session))
     }
 
+    /// Resizes the window showing `session` (see `show`), as its user does:
+    /// the surface takes the new size, and a persistent tab's attach
+    /// adapter hands it to the host.
+    func resize(_ session: TerminalSession, to size: NSSize) {
+        guard let index = shownSessions.firstIndex(where: { $0.1 === session }) else {
+            Issue.record("The session is not shown")
+            return
+        }
+        windows[index].setContentSize(size)
+        containers[index].layoutSubtreeIfNeeded()
+    }
+
     /// Configures every shown container again with its session, as a
     /// SwiftUI update of the terminal pane does.
     func updateShownContainers() {
@@ -1503,6 +1515,68 @@ private struct StopMeasureContentHost: View {
                 #expect(gap < stopMainThreadGapLimit, "Stop blocked the main thread for \(Int(gap * 1000)) ms (\(script), persistent \(persistent))")
             }
         }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+/// Resizing a persistent zsh tab at a two-line prompt, whose first line the
+/// new widths wrap and unwrap, through the real launch (Cherry's zsh
+/// bootstrap and its OSC 133 marks), adapter and surface: the host's
+/// terminal clears the prompt before its rows reflow, so zsh's redraw
+/// leaves one prompt, the output above it intact, and no partial line
+/// (zsh's `%` mark); the tab shows the host's screen.
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostResizingATwoLinePromptLeavesOnePrompt() async throws {
+    let host = try await RealLocalHost(shellPath: "/bin/zsh")
+    let workspace = host.workspace()
+    let top = "PROMPT_TOP ~/github/patrick91/cherry on codex/persistent-sessions [!?] via rust"
+    // The private HOME's startup file, which Cherry's bootstrap sources.
+    try "print SHELL_STARTED\nPROMPT=$'\(top)\\n❯ '\n"
+        .write(to: host.home.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+    func lines(_ text: String) -> [String] {
+        var lines = text.components(separatedBy: "\n").map { $0.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression) }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines
+    }
+    do {
+        let tab = workspace.addSession(title: "Prompt")
+        #expect(tab.isPersistentLocalSession)
+        host.show(tab)
+        try await host.waitFor("the tab to attach to its session") {
+            tab.persistentSession != nil && tab.state == .live && tab.usesNativePTYBackendAdapterAttached
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        try await host.waitFor("the prompt") { host.screen(tab).contains("❯") }
+        tab.send(text: "echo hel''lo\n")
+        try await host.waitFor("the echo") { lines(host.screen(tab)).contains("hello") }
+
+        var columns = try #require(try await host.hostSession(sessionID)).cols
+        // About 100 columns at 800 points: the first line fits, and wraps
+        // into two or three rows at the narrower widths.
+        for width in [520.0, 330, 700, 300, 800, 440, 900] {
+            host.resize(tab, to: NSSize(width: width, height: 500))
+            try await host.waitFor("the host to take the new size") {
+                try await host.hostSession(sessionID).map { $0.cols != columns } ?? false
+            }
+            columns = try #require(try await host.hostSession(sessionID)).cols
+            try await Task.sleep(for: .milliseconds(400))
+        }
+        let expected = ["SHELL_STARTED", top, "❯ echo hel''lo", "hello", top, "❯"]
+        do {
+            try await host.waitFor("one prompt on the host's screen") {
+                lines(try await host.control.screen(sessionID).text) == expected
+            }
+        } catch {
+            Issue.record("The host's screen: \(try await host.control.screen(sessionID).text)")
+            throw error
+        }
+        try await host.waitFor("the tab to show the host's screen") { lines(host.screen(tab)) == expected }
+        #expect(!host.screen(tab).contains("%"))
     } catch {
         workspace.closeAllSessions(intent: .windowClosed)
         await host.tearDown()

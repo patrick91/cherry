@@ -136,6 +136,14 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
                   size_t scrollback, void *userdata, GhosttyTerminalWritePtyFn reply) {
     int rc = ghostty_terminal_new(NULL, out, cols, rows);
     if (rc) return rc;
+    // Ghostty's own terminal defaults: libghostty-vt's constructor turns
+    // prompt redraw off (clearing the prompt rows on resize when the cursor
+    // is in an OSC 133 prompt, for the shell's redraw), which only a reset
+    // (RIS) turns back on. The app's terminal, whose place the holder's takes
+    // and whose screen snapshots replace, clears them, and so does a copy that
+    // took a full snapshot (it starts with a reset): without this the host
+    // keeps the reflowed prompt and the shell's redraw lands beside it.
+    ghostty_terminal_reset(*out);
     // Retain unfinished UTF-8 / control sequences so snapshot + subsequent
     // output remains valid even when a PTY read splits an escape sequence.
     size_t continuation_limit = 1024 * 1024;
@@ -987,6 +995,66 @@ int cherry_vt_debug_row(GhosttyTerminal term, uint32_t y, CherrySink sink, void 
     free(current);
     free(o);
     return rc;
+}
+
+// The active row where the shell's prompt, which the cursor is at, begins,
+// when that prompt can be cleared in place before a resize reflows it
+// (`Terminal::resize_cells`); -1 otherwise. The cursor is at a prompt as
+// Ghostty tells (OSC 133), on the primary screen, with no pending wrap,
+// outside origin mode and with a pen of the default background (so an
+// erase leaves default cells, and a cursor position restores the cursor
+// whole). The prompt begins at the first row above the cursor that OSC 133
+// marked as a prompt, taking in the rows marked as its continuation and the
+// rows that soft-wrap into it; it must be on the screen.
+int cherry_vt_prompt_start(GhosttyTerminal term, int32_t *start) {
+    *start = -1;
+    bool at_prompt = false, pending_wrap = false;
+    uint16_t y = 0;
+    GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+    GhosttyTerminalData keys[] = {
+        GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+        GHOSTTY_TERMINAL_DATA_CURSOR_PENDING_WRAP, GHOSTTY_TERMINAL_DATA_CURSOR_Y,
+    };
+    void *values[] = { &at_prompt, &screen, &pending_wrap, &y };
+    int rc = ghostty_terminal_get_multi(term, sizeof(keys) / sizeof(keys[0]), keys, values, NULL);
+    if (rc) return rc;
+    if (!at_prompt || screen != GHOSTTY_TERMINAL_SCREEN_PRIMARY || pending_wrap) return 0;
+    GhosttyTerminalModeConfig origin = { .mode = ghostty_mode_new(6, false) };
+    rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_MODE, &origin);
+    if (rc) return rc;
+    if (origin.value) return 0;
+    GhosttyStyle pen;
+    style_default(&pen);
+    rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_CURSOR_STYLE, &pen);
+    if (rc) return rc;
+    if (pen.bg_color.tag != GHOSTTY_STYLE_COLOR_NONE) return 0;
+    for (uint32_t row_y = y;; row_y--) {
+        GhosttyGridRef ref;
+        GhosttyRow row;
+        GhosttyRowSemanticPrompt semantic = GHOSTTY_ROW_SEMANTIC_NONE;
+        bool wrap = false, continuation = false;
+        rc = row_at(term, GHOSTTY_POINT_TAG_ACTIVE, row_y, &ref);
+        if (!rc) rc = ghostty_grid_ref_row(&ref, &row);
+        if (!rc) rc = ghostty_row_get(row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, &semantic);
+        if (!rc) rc = row_flags(&ref, &wrap, &continuation);
+        if (rc) return rc;
+        (void)wrap;
+        if (semantic == GHOSTTY_ROW_SEMANTIC_PROMPT && !continuation) {
+            *start = (int32_t)row_y;
+            return 0;
+        }
+        // The prompt goes on above this row: it is a soft-wrapped part of the
+        // line above, or a line the prompt continues on.
+        if (!continuation && semantic != GHOSTTY_ROW_SEMANTIC_PROMPT_CONTINUATION) {
+            // Not the cursor's own row: the prompt begins below, unmarked,
+            // as Ghostty's prompt iterator takes it. An unmarked cursor row
+            // tells nothing.
+            if (row_y != y) *start = (int32_t)row_y + 1;
+            return 0;
+        }
+        // Above the screen: not cleared here.
+        if (row_y == 0) return 0;
+    }
 }
 
 int cherry_vt_row_flags(GhosttyTerminal term, uint32_t y, bool *wrap, bool *continuation) {

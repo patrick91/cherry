@@ -1520,6 +1520,13 @@ character sets, the kitty keyboard stack, the primary screen beneath an
 alternate screen (1049, 1047, or 47), and the saved cursors (DECSC, 1048) of
 the active screen and of that primary screen.
 
+A session's terminal clears the shell's prompt on resize for the shell's
+redraw (OSC 133 marks it), as the app's Ghostty terminal does, and before
+its rows reflow, so a two-line zsh prompt whose first line the new width
+wraps or unwraps is redrawn once, on its own rows, with the output above it
+intact; the replacement a window gets after its resize shows that screen.
+Details in [cherry-vt](crates/cherry-vt/README.md#prompts-on-resize).
+
 ### Kitty graphics
 
 A session's terminal keeps kitty graphics images (32 MiB per screen, PNG

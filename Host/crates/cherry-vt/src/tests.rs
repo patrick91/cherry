@@ -2437,3 +2437,183 @@ fn rgba_pngs_decode_to_their_pixels() {
         direct.inspect().unwrap().graphics
     );
 }
+
+/// Output, then a two-line prompt as Cherry's zsh integration marks it (OSC
+/// 133 A before the prompt, C when a command starts, nothing else), its
+/// first line `top`, the cursor after `❯ `.
+fn at_two_line_prompt(terminal: &mut Terminal, top: &str) {
+    terminal.feed(format!("$ echo hi\r\nhi\r\n\x1b]133;A\x07{top}\r\n\u{276f} ").as_bytes());
+}
+
+/// What zsh writes when resized at such a prompt: back to its first row,
+/// as many rows up as its first line took at the old width, an erase
+/// below, and the prompt again.
+fn zsh_redraw(terminal: &mut Terminal, rows_up: u16, top: &str) {
+    terminal.feed(format!("\r\x1b[{rows_up}A\x1b[J{top}\r\n\u{276f} ").as_bytes());
+}
+
+fn active(terminal: &Terminal) -> Vec<String> {
+    let mut rows = terminal.inspect().unwrap().active;
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
+}
+
+const TOP: &str = "~/code/app on main [!?] via rust 1.94 took 3s";
+
+#[test]
+fn resize_clears_the_prompt_the_shell_redraws_as_ghostty_does() {
+    // Ghostty's terminal clears an OSC 133 prompt on resize, for the
+    // shell's redraw (SIGWINCH). libghostty-vt's constructor turns that
+    // off; a new terminal behaves as Ghostty's, and as itself after a reset.
+    for reset in [false, true] {
+        let mut terminal = term(60, 8);
+        if reset {
+            terminal.feed(b"\x1bc");
+        }
+        at_two_line_prompt(&mut terminal, "~/code/app on main");
+        let cursor = terminal.inspect().unwrap().cursor;
+        terminal.resize(50, 8).unwrap();
+        assert_eq!(active(&terminal), ["$ echo hi", "hi"], "reset {reset}");
+        // The cursor stays where the shell left it, for its redraw.
+        assert_eq!(terminal.inspect().unwrap().cursor, cursor, "reset {reset}");
+    }
+}
+
+#[test]
+fn a_prompt_line_the_new_width_wraps_is_cleared_before_the_reflow() {
+    // Ghostty clears after the reflow, from the last part of the wrapped
+    // line (the reflow marks each part as the prompt's first row), so zsh's
+    // redraw, one row up, lands beside the first part. Cleared first, the
+    // prompt keeps its rows and the redraw its place.
+    let mut terminal = term(60, 8);
+    at_two_line_prompt(&mut terminal, TOP);
+    terminal.resize(30, 8).unwrap();
+    assert_eq!(active(&terminal), ["$ echo hi", "hi"]);
+    assert_eq!(terminal.inspect().unwrap().cursor, (2, 3));
+    zsh_redraw(&mut terminal, 1, TOP);
+    assert_eq!(
+        active(&terminal),
+        [
+            "$ echo hi",
+            "hi",
+            "~/code/app on main [!?] via ru⏎",
+            "↪st 1.94 took 3s",
+            "❯ "
+        ]
+    );
+
+    // Narrower again: the first line took two rows.
+    terminal.resize(20, 8).unwrap();
+    assert_eq!(active(&terminal), ["$ echo hi", "hi"]);
+    zsh_redraw(&mut terminal, 2, TOP);
+    assert_eq!(
+        active(&terminal),
+        [
+            "$ echo hi",
+            "hi",
+            "~/code/app on main [⏎",
+            "↪!?] via rust 1.94 to⏎",
+            "↪ok 3s",
+            "❯ "
+        ]
+    );
+}
+
+#[test]
+fn a_prompt_line_the_new_width_unwraps_keeps_the_output_above() {
+    // Wider, Ghostty's reflow joins the wrapped line and moves the cursor
+    // up: zsh, going up as many rows as the line took before, would erase
+    // the output above. Cleared first, nothing moves.
+    let mut terminal = term(30, 8);
+    at_two_line_prompt(&mut terminal, TOP);
+    assert_eq!(terminal.inspect().unwrap().cursor, (2, 4));
+    terminal.resize(60, 8).unwrap();
+    assert_eq!(terminal.inspect().unwrap().cursor, (2, 4));
+    zsh_redraw(&mut terminal, 2, TOP);
+    assert_eq!(active(&terminal), ["$ echo hi", "hi", TOP, "❯ "]);
+}
+
+#[test]
+fn a_prompt_redrawn_without_marks_is_still_cleared_whole() {
+    // zsh's redraw after a resize writes no OSC 133 (Cherry's integration
+    // marks a prompt once, before it): the rows the redraw wrote are still
+    // the prompt's.
+    let mut terminal = term(60, 8);
+    at_two_line_prompt(&mut terminal, TOP);
+    for (cols, rows_up) in [(30, 1), (20, 2), (44, 3), (60, 2), (25, 1)] {
+        terminal.resize(cols, 8).unwrap();
+        assert_eq!(active(&terminal), ["$ echo hi", "hi"], "{cols}");
+        zsh_redraw(&mut terminal, rows_up, TOP);
+        let text = terminal.screen_text().unwrap();
+        assert_eq!(text.matches("~/code/app").count(), 1, "{cols}: {text}");
+        assert!(
+            text.starts_with("$ echo hi\nhi\n~/code/app"),
+            "{cols}: {text}"
+        );
+    }
+}
+
+#[test]
+fn resize_leaves_prompts_it_cannot_clear_whole_to_ghostty() {
+    // `redraw=0`: the shell does not redraw its prompt; nothing is cleared.
+    let mut terminal = term(40, 6);
+    terminal.feed(b"\x1b]133;A;redraw=0\x07~/code/app\r\n> ");
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(active(&terminal), ["~/code/app", "> "]);
+
+    // `redraw=last` (Ghostty's bash integration): only the cursor's line.
+    let mut terminal = term(60, 6);
+    terminal.feed(format!("\x1b]133;A;redraw=last;cl=line\x07{TOP}\r\n> ").as_bytes());
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(
+        active(&terminal),
+        ["~/code/app on main [!?] via ru⏎", "↪st 1.94 took 3s"]
+    );
+    // A reset forgets it, as Ghostty does.
+    terminal.feed(format!("\x1bc\x1b]133;A\x07{TOP}\r\n> ").as_bytes());
+    terminal.resize(60, 6).unwrap();
+    assert_eq!(active(&terminal), Vec::<String>::new());
+
+    // A pen with a background would fill an erase: Ghostty's clear, after
+    // the reflow, which keeps the first part of the wrapped line.
+    let mut terminal = term(60, 6);
+    terminal.feed(format!("\x1b]133;A\x07{TOP}\r\n\x1b[44m> ").as_bytes());
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(active(&terminal), ["~/code/app on main [!?] via ru⏎", "↪"]);
+
+    // A command runs (OSC 133 C): its output is not a prompt.
+    let mut terminal = term(40, 6);
+    at_two_line_prompt(&mut terminal, "~/code/app on main");
+    terminal.feed(b"sleep 9\r\n\x1b]133;C\x07working");
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(
+        active(&terminal),
+        [
+            "$ echo hi",
+            "hi",
+            "~/code/app on main",
+            "❯ sleep 9",
+            "working"
+        ]
+    );
+
+    // Without prompt marks nothing is cleared.
+    let mut terminal = term(40, 6);
+    terminal.feed(b"~/code/app\r\n> ");
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(active(&terminal), ["~/code/app", "> "]);
+}
+
+#[test]
+fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
+    let mut terminal = term(60, 6);
+    at_two_line_prompt(&mut terminal, TOP);
+    terminal.feed(b"\x1b]2;half a ti");
+    terminal.resize(30, 6).unwrap();
+    assert_eq!(active(&terminal), ["$ echo hi", "hi"]);
+    terminal.feed(b"tle\x07ok");
+    assert_eq!(terminal.title().as_deref(), Some("half a title"));
+    assert_eq!(active(&terminal), ["$ echo hi", "hi", "", "··ok"]);
+}

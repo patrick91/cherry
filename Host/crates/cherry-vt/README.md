@@ -17,6 +17,32 @@ those two modes. The host also takes the queries it leaves unanswered out of
 that stream and sends each to one attached client to answer (see the
 [host guide](../../README.md#bounds-and-terminal-fidelity)).
 Size queries use the session's rows/columns and its cell size (`resize_cells`; 8×16 until a client reports one).
+
+### Prompts on resize
+
+A new terminal clears the shell's prompt on resize, as Ghostty's own
+terminal does (libghostty-vt's constructor turns that off for embedders;
+`cherry_vt_new` resets the terminal to Ghostty's defaults): when the cursor
+is at a prompt that OSC 133 marked, the shell redraws the prompt on SIGWINCH,
+and the terminal clears it for that redraw. Before a resize that changes the
+columns, `resize_cells` clears it itself, in place, before the rows reflow:
+from the row OSC 133 marked as the prompt's first down to the end of the
+screen, taking in the rows marked as its continuation and rows that soft-wrap
+into it, with the cursor left where it was. The rows are then blank, so the
+reflow neither wraps nor unwraps them, and a shell that moves up as many rows
+as its prompt took at the old width (zsh) redraws it on its first row.
+Ghostty clears only after the reflow, from the last part of a prompt line
+the new width wraps (the reflow marks each part as the prompt's first row):
+the parts above stay beside the redraw, and a line the new width unwraps
+moves the cursor up, so the redraw erases output above the prompt. The clear
+is fed as output (a cursor position, an erase below, the cursor put back;
+an unfinished sequence is kept as `clear_history` keeps it) and only when
+it leaves nothing else changed: on the primary screen, without a pending
+wrap or origin mode, with a pen of the default background, a prompt that
+begins on the screen, and a shell that redraws its whole prompt (no
+`redraw=0` or `redraw=last` in its last OSC 133 A or N, which Ghostty's bash
+integration sends; a reset forgets it). Otherwise the resize is Ghostty's,
+which honours those options.
 Color queries (OSC 10, 11 and 12) and the color-scheme query (`CSI ?996n`)
 report the colors `set_colors` gave (the host passes those its `Create`
 named), by default light gray on black and dark; a reset keeps them.

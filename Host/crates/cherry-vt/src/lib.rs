@@ -115,6 +115,7 @@ unsafe extern "C" {
     fn cherry_vt_extras(term: Handle, kind: i32, sink: Sink, userdata: *mut c_void) -> i32;
     fn cherry_vt_debug_row(term: Handle, y: u32, sink: Sink, userdata: *mut c_void) -> i32;
     fn cherry_vt_row_flags(term: Handle, y: u32, wrap: *mut bool, continuation: *mut bool) -> i32;
+    fn cherry_vt_prompt_start(term: Handle, start: *mut i32) -> i32;
     fn cherry_vt_lines_ending(term: Handle, first: u64, last: u64, count: *mut u64) -> i32;
     fn cherry_vt_set_image_limit(term: Handle, bytes: u64) -> i32;
     fn cherry_vt_placements(
@@ -342,12 +343,62 @@ pub struct Terminal {
     callbacks: NonNull<Callbacks>,
     /// `clear_history` waits for the output to finish a UTF-8 character.
     history_clear_pending: bool,
+    /// What the shell said it redraws on resize (see `PromptRedraw`).
+    prompt_redraw: PromptRedraw,
     /// The images `graphics_replay` compressed, for the next one.
     graphics_cache: std::cell::RefCell<graphics::Cache>,
     compressions: std::cell::Cell<usize>,
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 unsafe impl Send for Terminal {}
+
+/// What the shell redraws of its prompt when resized, as it last said with
+/// the `redraw` option of OSC 133 A or N, which Ghostty keeps (a reset
+/// forgets it): the whole prompt unless it said otherwise; nothing
+/// (`redraw=0`); or only its last line (`redraw=last`, which Ghostty's
+/// bash integration sends). Only a whole-prompt redraw has the prompt
+/// cleared before the reflow (`Terminal::clear_prompt_for_reflow`); the
+/// others leave the resize to Ghostty, which honours them. A sequence that
+/// arrives split across two `feed`s is not seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptRedraw {
+    All,
+    Nothing,
+    LastLine,
+}
+
+impl PromptRedraw {
+    fn observe(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while let Some(at) = rest.iter().position(|&byte| byte == 0x1b) {
+            rest = &rest[at + 1..];
+            if rest.first() == Some(&b'c') {
+                *self = Self::All;
+                continue;
+            }
+            let Some(body) = rest.strip_prefix(b"]133;") else {
+                continue;
+            };
+            // Up to its BEL or ST (whose ESC the loop looks at next).
+            let Some(end) = body.iter().position(|&byte| byte == 0x07 || byte == 0x1b) else {
+                return;
+            };
+            let mut fields = body[..end].split(|&byte| byte == b';');
+            if !matches!(fields.next(), Some(b"A" | b"N")) {
+                continue;
+            }
+            // Ghostty reads an option's first occurrence.
+            if let Some(value) = fields.find_map(|field| field.strip_prefix(b"redraw=")) {
+                match value {
+                    b"1" => *self = Self::All,
+                    b"0" => *self = Self::Nothing,
+                    b"last" => *self = Self::LastLine,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
 
 /// What a terminal reports of its colours (`Terminal::set_colors`), as
 /// RGB.
@@ -443,6 +494,7 @@ impl Terminal {
             cell_height: DEFAULT_CELL.1,
             callbacks,
             history_clear_pending: false,
+            prompt_redraw: PromptRedraw::All,
             graphics_cache: Default::default(),
             compressions: Default::default(),
             _not_sync: PhantomData,
@@ -459,6 +511,7 @@ impl Terminal {
     /// Process program output. Returns the replies to write to the PTY;
     /// events it caused wait for `take_events`.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.prompt_redraw.observe(bytes);
         write(self.handle.as_ptr(), bytes);
         if self.history_clear_pending {
             // Once the character it waited for is complete (or dropped).
@@ -551,6 +604,9 @@ impl Terminal {
             valid_cell(cell_width, cell_height),
             "cell size {cell_width}x{cell_height} is out of range"
         );
+        if cols != self.cols {
+            self.clear_prompt_for_reflow();
+        }
         check(
             unsafe {
                 ghostty_terminal_resize(self.handle.as_ptr(), cols, rows, cell_width, cell_height)
@@ -562,6 +618,63 @@ impl Terminal {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         Ok(std::mem::take(&mut self.callbacks().replies))
+    }
+
+    /// Before a resize that reflows the rows (the columns change), clear the
+    /// prompt the cursor is at, where it is, when OSC 133 marks it: the
+    /// shell redraws it once resized (SIGWINCH), moving up as many rows as
+    /// it took at the old width. Ghostty clears it only after the reflow,
+    /// from the row its prompt iterator finds, which is the last row of a
+    /// prompt line the new width wraps (a reflow marks every part of it as
+    /// the prompt's first row): the parts above stay, and the redraw lands
+    /// beside them; a line the new width unwraps moves the cursor up, and
+    /// the redraw erases output above the prompt. Cleared first, the
+    /// prompt's rows are blank, and a blank row neither wraps nor unwraps,
+    /// so the redraw begins on the prompt's first row. Ghostty's own clear
+    /// then finds nothing left to clear. See `cherry_vt_prompt_start` for
+    /// when a prompt is cleared this way; otherwise the resize is Ghostty's.
+    ///
+    /// The clear is a cursor position, an erase below and the cursor put
+    /// back, fed as the output's own would be: an unfinished sequence the
+    /// output left is taken aside and fed again after it, as in
+    /// `clear_history` (one that leaves a UTF-8 character half written
+    /// makes the resize Ghostty's).
+    fn clear_prompt_for_reflow(&mut self) {
+        if self.prompt_redraw != PromptRedraw::All {
+            return;
+        }
+        let handle = self.handle.as_ptr();
+        let mut start = -1;
+        if unsafe { cherry_vt_prompt_start(handle, &mut start) } != 0 || start < 0 {
+            return;
+        }
+        let Ok(cursor) = self.cursor() else {
+            return;
+        };
+        let Ok(continuation) = allocated(|ptr, len| unsafe {
+            ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
+        }) else {
+            return;
+        };
+        if continuation.first().is_some_and(|&byte| byte >= 0x80) {
+            return;
+        }
+        let clear = format!(
+            "\x1b[{};1H\x1b[J\x1b[{};{}H",
+            start + 1,
+            cursor.y + 1,
+            cursor.x + 1
+        );
+        let replies = std::mem::take(&mut self.callbacks().replies);
+        if continuation.is_empty() {
+            write(handle, clear.as_bytes());
+        } else {
+            write(handle, b"\x18");
+            write(handle, clear.as_bytes());
+            write(handle, &continuation);
+        }
+        // Neither the clear nor an unfinished sequence has a reply.
+        self.callbacks().replies = replies;
     }
 
     /// Test support: how many images `graphics_replay` compressed (those

@@ -17,7 +17,7 @@ import Testing
 private let realHostEnabled = ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"
 
 @MainActor
-private final class RealLocalHost {
+final class RealLocalHost {
     let root: URL
     let home: URL
     let control: HostControl
@@ -492,7 +492,7 @@ private final class RealLocalHost {
 /// is hung up on), leaving its program running in the host. With a long
 /// reconnect delay the tab stays without an attached adapter.
 @MainActor
-private func loseAdapter(of tab: TerminalSession, host: RealLocalHost) async throws {
+func loseAdapter(of tab: TerminalSession, host: RealLocalHost) async throws {
     let adapter = try #require(tab.ghosttyBridge.nativeSessionLeaderPID(), "the adapter's tty session")
     ShellProcessController.terminateNativeShellSession(anchorPID: adapter)
     try await host.waitFor("the tab to lose its adapter") { tab.readsContentFromHost && !tab.usesNativePTYBackendAdapterAttached }

@@ -55,7 +55,10 @@ public struct TerminalInputModifiers: OptionSet, Sendable {
             if flags.contains(.option) { mods.insert(.alt) }
             if flags.contains(.command) { mods.insert(.super_) }
             if flags.contains(.capsLock) { mods.insert(.caps) }
-            if flags.contains(.numericPad) { mods.insert(.num) }
+            // Not `.numericPad`: AppKit sets it on arrow keys and the keypad,
+            // and it is no Num Lock (a Mac keyboard has none). As Num Lock the
+            // kitty keyboard protocol sent Up as `CSI 1;129A`; Ghostty's own
+            // macOS app leaves it out too.
             self = mods
         }
     #endif

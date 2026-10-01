@@ -834,9 +834,16 @@ struct TabCloseQuestion: Equatable {
         alert.messageText = messageText
         alert.informativeText = informativeText
         alert.alertStyle = .warning
-        alert.addButton(withTitle: Self.closeButtonTitle).hasDestructiveAction = true
+        let close = alert.addButton(withTitle: Self.closeButtonTitle)
+        close.hasDestructiveAction = true
+        // A destructive first button is not made the default by itself:
+        // Return answers Close, as the question was asked by a close.
+        close.keyEquivalent = "\r"
         if canDetach {
-            alert.addButton(withTitle: Self.detachButtonTitle)
+            // ⌘D, as Detach Tab.
+            let detach = alert.addButton(withTitle: Self.detachButtonTitle)
+            detach.keyEquivalent = "d"
+            detach.keyEquivalentModifierMask = .command
         }
         // A button titled Cancel gets Escape.
         alert.addButton(withTitle: "Cancel")

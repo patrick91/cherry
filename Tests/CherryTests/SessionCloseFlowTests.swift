@@ -281,6 +281,11 @@ private func button(titled title: String, in view: NSView?) -> NSButton? {
     #expect(alert.alertStyle == .warning)
     #expect(alert.buttons.map(\.title) == persistent.buttonTitles)
     #expect(alert.buttons[0].hasDestructiveAction)
+    // Return closes, ⌘D detaches (as Detach Tab), Escape cancels.
+    #expect(alert.buttons[0].keyEquivalent == "\r")
+    #expect(alert.buttons[1].keyEquivalent == "d")
+    #expect(alert.buttons[1].keyEquivalentModifierMask == .command)
+    #expect(alert.buttons[2].keyEquivalent == "\u{1b}")
     #expect(persistent.answer(for: .alertFirstButtonReturn) == .close)
     #expect(persistent.answer(for: .alertSecondButtonReturn) == .detach)
     #expect(persistent.answer(for: .alertThirdButtonReturn) == .cancel)

@@ -233,28 +233,6 @@ extension NSUserInterfaceItemIdentifier {
     static let remoteDeviceChipAnchor = NSUserInterfaceItemIdentifier("Cherry.RemoteDeviceChipAnchor")
 }
 
-/// A device window's thin tinted line along the top edge of its content
-/// (under the transparent title bar). Never takes clicks.
-struct RemoteDeviceAccentLine: View {
-    static let height: CGFloat = 2
-
-    @Environment(\.colorScheme) private var colorScheme
-    let projectKey: String
-
-    var body: some View {
-        RemoteDeviceBadgeReader(projectKey: projectKey) { badge in
-            if let badge {
-                Rectangle()
-                    .fill(badge.color.color(for: colorScheme).opacity(0.85))
-                    .frame(height: Self.height)
-                    .frame(maxWidth: .infinity)
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-}
-
 /// Settings › Sessions › Other Macs: a device's colour, Automatic or one
 /// of the palette's.
 struct RemoteDeviceColorPicker: View {

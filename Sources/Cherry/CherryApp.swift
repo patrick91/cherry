@@ -1439,13 +1439,6 @@ private struct ProjectWorkspaceView: View {
             todoStore: todoStore,
             chromeState: chromeState
         ))
-        .overlay(alignment: .top) {
-            // A device window: a thin line in its Mac's colour.
-            if repository.isRemote {
-                RemoteDeviceAccentLine(projectKey: repository.repositoryRoot)
-                    .ignoresSafeArea(.all, edges: .top)
-            }
-        }
         .background {
             // "<project> — <Mac>" for a device window.
             RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in

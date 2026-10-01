@@ -51,6 +51,9 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// DARWIN_USER_TEMP_DIR`), from the check or the first Cherry MCP
     /// forward: where the forwarded control socket goes (phase 4b).
     var userTemporaryDirectory: String? = nil
+    /// The colour its windows show it in (Settings › Sessions › Other
+    /// Macs); nil: automatic, from its id (`effectiveColor`).
+    var color: RemoteDeviceColor? = nil
 
     init(
         id: UUID = UUID(),
@@ -67,7 +70,8 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         installedBuild: String? = nil,
         installedArch: String? = nil,
         shell: String? = nil,
-        installedResources: Bool = false
+        installedResources: Bool = false,
+        color: RemoteDeviceColor? = nil
     ) {
         self.id = id
         self.name = name
@@ -84,6 +88,7 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         self.installedArch = installedArch
         self.shell = shell
         self.installedResources = installedResources
+        self.color = color
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +112,9 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         userTemporaryDirectory = RemoteMCPPaths.validTemporaryDirectory(
             try container.decodeIfPresent(String.self, forKey: .userTemporaryDirectory), source: "devices.json"
         )
+        // A colour this build does not know (a newer Cherry's) is automatic.
+        color = (try? container.decodeIfPresent(String.self, forKey: .color)).flatMap { $0 }
+            .flatMap(RemoteDeviceColor.init(rawValue:))
     }
 
     /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
@@ -313,6 +321,12 @@ final class RemoteDeviceStore: ObservableObject {
             device.installedArch = outcome.architecture ?? device.installedArch
             device.installedResources = outcome.resourcesInstalled
         }
+    }
+
+    /// Its windows' colour (nil: automatic). Only the instance-lock holder
+    /// changes it, as every change of devices.json.
+    func setColor(_ color: RemoteDeviceColor?, for id: UUID) {
+        update(id) { $0.color = color }
     }
 
     func rename(_ id: UUID, to name: String) {

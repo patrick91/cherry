@@ -1,6 +1,7 @@
 import AppKit
 import CherryControl
 import Foundation
+import SwiftUI
 import Testing
 @testable import Cherry
 
@@ -1271,4 +1272,187 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(await harness.fake.wait { harness.fake.requests("send_input").count == 2 })
     // Never through a new connection.
     #expect(harness.fake.connections.count == connections)
+}
+
+// MARK: - Which Mac a window runs on (chip, path prefix, colour, title)
+
+@Test func RemoteDeviceAutomaticColourIsStablePerIdAndDiffersAcrossIds() throws {
+    let ids = (0..<24).map { index in
+        UUID(uuidString: String(format: "00000000-0000-4000-8000-%012x", index * 7_919 + 1))!
+    }
+    for id in ids {
+        // The same id, asked again or as another UUID value, gets the same.
+        #expect(RemoteDeviceColor.automatic(for: id) == RemoteDeviceColor.automatic(for: UUID(uuidString: id.uuidString)!))
+    }
+    let colours = Set(ids.map(RemoteDeviceColor.automatic(for:)))
+    #expect(colours.count > 2)
+    // Two particular devices tell apart.
+    let first = try #require(ids.first)
+    let other = try #require(ids.first { RemoteDeviceColor.automatic(for: $0) != RemoteDeviceColor.automatic(for: first) })
+    #expect(RemoteDeviceColor.automatic(for: first) != RemoteDeviceColor.automatic(for: other))
+    // Fixed across runs and Macs (not Swift's per-process hash).
+    #expect(RemoteDeviceColor.automatic(for: UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!)
+        == RemoteDeviceColor.automatic(for: UUID(uuidString: "6f9619ff-8b86-d011-b42d-00c04fc964ff")!))
+    // An unset colour is the automatic one; a chosen one wins.
+    var device = RemoteDevice(id: first, name: "Studio", sshDestination: "studio")
+    #expect(device.effectiveColor == RemoteDeviceColor.automatic(for: first))
+    device.color = .teal
+    #expect(device.effectiveColor == .teal)
+    // No violet or indigo: the sidebar's selection is purple.
+    #expect(!RemoteDeviceColor.allCases.map(\.rawValue).contains { $0 == "violet" || $0 == "indigo" || $0 == "purple" })
+}
+
+@Test @MainActor func RemoteDeviceColourRoundTripsInDevicesJSONWithOneWriter() throws {
+    let directory = try temporaryDirectory("device-colour")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let store = makeStore(directory: directory, hostStore: hostStore)
+    let studio = try store.add(name: "patstudio", sshDestination: "me@patstudio.local")
+    #expect(store.device(id: studio.id)?.color == nil)
+    // Automatic is not written.
+    #expect(!(try String(contentsOf: store.fileURL, encoding: .utf8)).contains("\"color\""))
+
+    store.setColor(.amber, for: studio.id)
+    let json = try String(contentsOf: store.fileURL, encoding: .utf8)
+    #expect(json.contains("\"color\" : \"amber\""))
+    let reread = makeStore(directory: directory, hostStore: hostStore)
+    #expect(reread.device(id: studio.id)?.color == .amber)
+    #expect(reread.device(id: studio.id)?.effectiveColor == .amber)
+
+    // Back to Automatic.
+    store.setColor(nil, for: studio.id)
+    #expect(makeStore(directory: directory, hostStore: hostStore).device(id: studio.id)?.color == nil)
+
+    // A colour this build does not know reads as automatic.
+    let unknown = json.replacingOccurrences(of: "\"amber\"", with: "\"ultraviolet\"")
+    try unknown.write(to: store.fileURL, atomically: true, encoding: .utf8)
+    let fromNewer = makeStore(directory: directory, hostStore: hostStore)
+    #expect(fromNewer.device(id: studio.id)?.name == "patstudio")
+    #expect(fromNewer.device(id: studio.id)?.color == nil)
+
+    // Only the instance-lock holder writes it.
+    let readOnly = makeStore(directory: directory, hostStore: hostStore, canWrite: { false })
+    readOnly.setColor(.red, for: studio.id)
+    #expect(readOnly.device(id: studio.id)?.color == nil)
+    #expect(makeStore(directory: directory, hostStore: hostStore).device(id: studio.id)?.color == nil)
+}
+
+@Test func RemoteDeviceWindowTitleNamesTheMacOnlyForDeviceWindows() {
+    #expect(ProjectWindowTitle.title(project: "cherry") == "cherry")
+    #expect(ProjectWindowTitle.title(project: "cherry", worktree: "main", tab: "zsh") == "cherry / main — zsh")
+    #expect(ProjectWindowTitle.title(project: "cherry", tab: "  ") == "cherry")
+    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club — patstudio")
+    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio", tab: "claude")
+        == "fizzup.club — patstudio — claude")
+    #expect(ProjectWindowTitle.title(project: "fizzup.club", worktree: "feature", deviceName: "patstudio")
+        == "fizzup.club / feature — patstudio")
+}
+
+@Test @MainActor func RemoteDeviceBreadcrumbStartsWithTheMacOnlyForDeviceTabs() {
+    let session = TerminalSession(
+        title: "zsh",
+        subtitle: "zsh login shell",
+        tint: .systemBlue,
+        workingDirectory: NSHomeDirectory() + "/github/farbun-dev/fizzup.club",
+        launchShell: false,
+        attentionObservationDirectoryProvider: { nil }
+    )
+    defer { session.stop() }
+    let local = TerminalContextBarContent(session: session)
+    #expect(local.devicePrefix == nil)
+    #expect(local.breadcrumb == "~/github/farbun-dev/fizzup.club  ›  zsh")
+
+    let deviceID = UUID()
+    let badge = RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .teal)
+    let remote = TerminalContextBarContent(session: session, device: badge)
+    #expect(remote.devicePrefix == "patstudio:")
+    #expect(remote.breadcrumb == "patstudio: ~/github/farbun-dev/fizzup.club  ›  zsh")
+    // A rename or a new colour re-renders the bar.
+    #expect(remote != local)
+    #expect(TerminalContextBarContent(session: session, device: RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .red)) != remote)
+
+    // Badges come only from device keys; This Mac's never ask the store.
+    let device = RemoteDevice(id: deviceID, name: "patstudio", sshDestination: "patstudio", color: .rose)
+    #expect(RemoteDeviceBadge.forProjectKey("/Users/me/work/app", devices: [device]) == nil)
+    #expect(RemoteDeviceBadge.forProjectKey(nil, devices: [device]) == nil)
+    let found = RemoteDeviceBadge.forProjectKey(device.projectKey(path: "/Users/me/work/app"), devices: [device])
+    #expect(found == RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .rose))
+    // A device Cherry no longer knows still says it is not This Mac.
+    let gone = UUID()
+    let unknown = RemoteDeviceBadge.forProjectKey(ProjectLocation.remote(deviceID: gone, path: "/x").key, devices: [device])
+    #expect(unknown?.name == RemoteDeviceBadge.unknownName)
+    #expect(unknown?.color == .automatic(for: gone))
+}
+
+/// The sidebar header (`TitlebarProjectPicker`) shows the Mac chip only
+/// in a device window. Laid out in a window that is never put on screen.
+@Test @MainActor func RemoteDeviceSidebarHeaderShowsTheMacChipOnlyForDeviceWindows() async throws {
+    let directory = try temporaryDirectory("device-chip")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let store = makeStore(directory: directory, hostStore: hostStore)
+    let studio = try store.add(name: "patstudio", sshDestination: "me@patstudio.local")
+    store.setColor(.green, for: studio.id)
+
+    let hosting = PersistentHostSessions.remote(
+        profile: .remote(host: try HostedSessionHost.ssh("me@patstudio.local"), displayName: "patstudio"),
+        installationID: UUID(),
+        control: { unusedControl(for: try! HostedSessionHost.ssh("me@patstudio.local"), hostStore: hostStore) },
+        installationUnavailableReason: { nil },
+        status: PersistentSessionsStatus(),
+        instanceLock: nil,
+        terminalColors: { nil }
+    )
+    let remote = RepositoryWorkspace(
+        projectRoot: studio.projectKey(path: "/Users/me/github/farbun-dev/fizzup.club"),
+        backendPolicy: .remote(hosting, settings: { .native }, hostReconnects: nil)
+    )
+    defer { remote.closeAllSessions(intent: .windowClosed) }
+    let localDirectory = directory.appendingPathComponent("local-project", isDirectory: true)
+    try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+    let local = RepositoryWorkspace(projectRoot: localDirectory.path, backendPolicy: .native)
+    defer { local.closeAllSessions(intent: .windowClosed) }
+
+    func header(for repository: RepositoryWorkspace) async throws -> NSView {
+        let view = NSHostingView(rootView: TitlebarProjectPicker(
+            settings: AgentSettings.shared,
+            repository: repository,
+            chromeState: ProjectWindowChromeState(),
+            swipeState: WorktreeSidebarSwipeState(),
+            projectRoot: repository.repositoryRoot,
+            presentation: .docked,
+            sidebarWidth: 320,
+            maximumWidth: 240
+        )
+        // As a device window sets it (`RemoteDeviceStore.shared` there).
+        .environment(\.remoteDeviceStore, store))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 80),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        view.frame = NSRect(x: 0, y: 0, width: 320, height: 80)
+        view.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(40))
+        view.layoutSubtreeIfNeeded()
+        #expect(!window.isVisible)
+        return view
+    }
+
+    func contains(_ identifier: NSUserInterfaceItemIdentifier, in view: NSView) -> Bool {
+        view.identifier == identifier || view.subviews.contains { contains(identifier, in: $0) }
+    }
+
+    let localHeader = try await header(for: local)
+    #expect(contains(.titlebarProjectPickerAnchor, in: localHeader))
+    #expect(!contains(.remoteDeviceChipAnchor, in: localHeader))
+
+    let remoteHeader = try await header(for: remote)
+    #expect(contains(.titlebarProjectPickerAnchor, in: remoteHeader))
+    #expect(contains(.remoteDeviceChipAnchor, in: remoteHeader))
+    // Two lines (name over the chip) fit the header the worktree line uses.
+    #expect(remoteHeader.fittingSize.height <= 40)
 }

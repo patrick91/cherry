@@ -1059,3 +1059,21 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
     shell.rename(to: nil)
     #expect(OmniBarGathering.title(of: shell, workingDirectory: root.path, home: "/Users/me") == root.lastPathComponent)
 }
+
+@Test @MainActor func omniProjectsOnAnotherMacTintTheirMacNameWithItsColour() {
+    var sources = fixture()
+    // Without the device's record: the plain detail.
+    #expect(OmniProviders.projects(sources).allSatisfy { $0.detailColor == nil })
+    var device = RemoteDevice(id: studioID, name: "patstudio", sshDestination: "patstudio")
+    sources.devices = [.init(device: device, state: .connected(sessionCount: 2), sessions: [])]
+    let projects = OmniProviders.projects(sources)
+    let rignore = projects.first { $0.title == "rignore" }
+    #expect(rignore?.detail == "patstudio")
+    #expect(rignore?.detailColor == RemoteDeviceColor.automatic(for: studioID))
+    // This Mac's say nothing, in no colour.
+    #expect(projects.filter { $0.machine == .thisMac }.allSatisfy { $0.detailColor == nil })
+
+    device.color = .orange
+    sources.devices = [.init(device: device, state: .connected(sessionCount: 2), sessions: [])]
+    #expect(OmniProviders.projects(sources).first { $0.title == "rignore" }?.detailColor == .orange)
+}

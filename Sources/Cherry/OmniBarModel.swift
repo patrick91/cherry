@@ -197,6 +197,9 @@ struct OmniItem: Equatable, Identifiable {
     var keywords: [String] = []
     /// The Mac it is on (projects, Macs, tabs and sessions).
     var machine: ProjectSwitcherModel.Machine?
+    /// The colour its `detail` is tinted with: a project on another Mac
+    /// names that Mac in its colour.
+    var detailColor: RemoteDeviceColor? = nil
     /// Added to its frecency in Recent: an open project, a working agent.
     var liveBoost: Double = 0
     /// Whether ↵ records it as used (not a "New worktree" row).
@@ -595,6 +598,9 @@ enum OmniProviders {
                     actions: projectActions(location, sources: sources),
                     keywords: [location.displayPath],
                     machine: location.machine,
+                    detailColor: location.machine.deviceID.flatMap { id in
+                        sources.devices.first { $0.device.id == id }?.device.effectiveColor
+                    },
                     liveBoost: location.isOpen ? (location.isCurrent ? 10 : 40) : 0
                 )
             }

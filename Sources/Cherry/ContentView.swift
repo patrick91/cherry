@@ -2970,7 +2970,7 @@ struct CommandPaletteSurface: ViewModifier {
     }
 }
 
-private enum SidebarPresentation: Equatable {
+enum SidebarPresentation: Equatable {
     case docked
     case floating
 }
@@ -5001,7 +5001,7 @@ private struct ProjectTabsPrototypeAddButton: View {
     }
 }
 
-private struct TitlebarProjectPicker: View {
+struct TitlebarProjectPicker: View {
     private static let fontSize: CGFloat = 14
     private static let fontWeight: NSFont.Weight = .semibold
     private static let titleFont = NSFont.systemFont(ofSize: fontSize, weight: fontWeight)
@@ -5037,6 +5037,13 @@ private struct TitlebarProjectPicker: View {
             presentation: presentation
         )
 
+        // A device window's Mac (nil for This Mac's: no store is asked).
+        RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in
+            pickerButton(palette: palette, device: device)
+        }
+    }
+
+    private func pickerButton(palette: SidebarPalette, device: RemoteDeviceBadge?) -> some View {
         // A plain Button (SwiftUI Menu's NSPopUpButton would own the
         // label's mouse tracking, so `.onHover` would never fire): it opens
         // the Omni bar on Projects, as ⌘O does.
@@ -5048,13 +5055,16 @@ private struct TitlebarProjectPicker: View {
                         .frame(width: Self.accentDiameter, height: Self.accentDiameter)
                 }
 
-                titleContent(palette: palette)
+                titleContent(palette: palette, device: device)
             }
             .font(.system(size: Self.fontSize, weight: .semibold))
             .foregroundStyle(palette.rowText)
             .padding(.horizontal, Self.horizontalPadding)
-            .padding(.vertical, titleVerticalPadding)
-            .frame(width: preferredWidth(showsProjectAccent: palette.showsProjectAccent), alignment: .leading)
+            .padding(.vertical, titleVerticalPadding(device: device))
+            .frame(
+                width: preferredWidth(showsProjectAccent: palette.showsProjectAccent, device: device),
+                alignment: .leading
+            )
             .clipped()
             .background {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -5064,8 +5074,8 @@ private struct TitlebarProjectPicker: View {
         }
         .buttonStyle(.plain)
         .background(TitlebarProjectMenuAnchor())
-        .help(projectTitle)
-        .accessibilityLabel("Project: \(projectTitle)")
+        .help(device.map { "\(projectTitle) on \($0.name)" } ?? projectTitle)
+        .accessibilityLabel(device.map { "Project: \(projectTitle), on \($0.name)" } ?? "Project: \(projectTitle)")
         .accessibilityHint("Opens the Omni bar on Projects (⌘O)")
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
@@ -5087,8 +5097,9 @@ private struct TitlebarProjectPicker: View {
     }
 
     private var repositoryTitle: String {
-        if let deviceName {
-            return "\(repository.repositoryName) — \(deviceName)"
+        if repository.isRemote {
+            // Its Mac is the chip under it.
+            return repository.repositoryName
         }
         let name = selectedProject?.name ?? repository.repositoryName
         return name.isEmpty ? "No Project" : name
@@ -5118,42 +5129,44 @@ private struct TitlebarProjectPicker: View {
         return min(1, max(0, abs(swipeState.offset) / max(sidebarWidth, 1)))
     }
 
-    private var titleVerticalPadding: CGFloat {
-        activeWorktree == nil ? Self.verticalPadding : 1
+    /// Two lines (the name over its worktree and, on another Mac, the
+    /// Mac chip) take the padding one line has.
+    private func titleVerticalPadding(device: RemoteDeviceBadge?) -> CGFloat {
+        activeWorktree == nil && device == nil ? Self.verticalPadding : 1
     }
 
     @ViewBuilder
-    private func titleContent(palette: SidebarPalette) -> some View {
-        if let worktree = activeWorktree {
+    private func titleContent(palette: SidebarPalette, device: RemoteDeviceBadge?) -> some View {
+        if activeWorktree != nil || device != nil {
             VStack(alignment: .leading, spacing: 0) {
                 Text(repositoryTitle)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                ZStack(alignment: .leading) {
-                    worktreeLine(worktree, palette: palette)
-                        .opacity(1 - worktreeSwipeProgress)
+                HStack(spacing: Self.deviceChipSpacing) {
+                    if let worktree = activeWorktree {
+                        ZStack(alignment: .leading) {
+                            worktreeLine(worktree, palette: palette)
+                                .opacity(1 - worktreeSwipeProgress)
 
-                    if let target = swipeTargetWorktree,
-                       target.root != worktree.root {
-                        worktreeLine(target, palette: palette)
-                            .opacity(worktreeSwipeProgress)
+                            if let target = swipeTargetWorktree,
+                               target.root != worktree.root {
+                                worktreeLine(target, palette: palette)
+                                    .opacity(worktreeSwipeProgress)
+                            }
+                        }
+                        .layoutPriority(device == nil ? 1 : 0)
+                    }
+                    if let device {
+                        // Which Mac this window runs on, next to the branch.
+                        RemoteDeviceHeaderChip(badge: device)
+                            .layoutPriority(1)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        } else if deviceName != nil {
-            // A device's project: "<project> — <Mac>" with a device glyph.
-            HStack(spacing: Self.deviceGlyphSpacing) {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: Self.deviceGlyphWidth)
-                Text(repositoryTitle)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
         } else {
             Text(repositoryTitle)
                 .lineLimit(1)
@@ -5161,13 +5174,7 @@ private struct TitlebarProjectPicker: View {
         }
     }
 
-    private static let deviceGlyphWidth: CGFloat = 14
-    private static let deviceGlyphSpacing: CGFloat = 4
-
-    /// The device a remote project's window runs on.
-    private var deviceName: String? {
-        RemoteDeviceStore.shared.device(forProjectKey: repository.repositoryRoot)?.name
-    }
+    private static let deviceChipSpacing: CGFloat = 6
 
     private func worktreeLine(
         _ worktree: GitWorktree,
@@ -5188,23 +5195,20 @@ private struct TitlebarProjectPicker: View {
         .foregroundStyle(palette.rowText.opacity(0.68))
     }
 
-    private func preferredWidth(showsProjectAccent: Bool) -> CGFloat {
-        let titleWidth: CGFloat
+    private func preferredWidth(showsProjectAccent: Bool, device: RemoteDeviceBadge?) -> CGFloat {
+        var secondLineWidth: CGFloat = 0
         if let worktreeName {
             let targetWidth = swipeTargetWorktree.map {
                 Self.measuredTitleWidth($0.displayName)
             } ?? 0
-            titleWidth = max(
-                Self.measuredTitleWidth(repositoryTitle),
-                Self.worktreeIconWidth
-                    + Self.worktreeLineSpacing
-                    + max(Self.measuredTitleWidth(worktreeName), targetWidth)
-            )
-        } else if deviceName != nil {
-            titleWidth = Self.deviceGlyphWidth + Self.deviceGlyphSpacing + Self.measuredTitleWidth(repositoryTitle)
-        } else {
-            titleWidth = Self.measuredTitleWidth(repositoryTitle)
+            secondLineWidth = Self.worktreeIconWidth
+                + Self.worktreeLineSpacing
+                + max(Self.measuredTitleWidth(worktreeName), targetWidth)
         }
+        if let device {
+            secondLineWidth += (secondLineWidth > 0 ? Self.deviceChipSpacing : 0) + RemoteDeviceHeaderChip.width(of: device)
+        }
+        let titleWidth = max(Self.measuredTitleWidth(repositoryTitle), secondLineWidth)
         let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))
@@ -10369,8 +10373,14 @@ private struct TerminalSceneView: View {
             }
         } else if showsTerminalContextBar {
             VStack(spacing: 0) {
-                TerminalContextBar(content: TerminalContextBarContent(session: session), isActivePane: isActivePane)
+                // A device tab's path starts with its Mac's name.
+                RemoteDeviceBadgeReader(projectKey: session.projectRoot) { device in
+                    TerminalContextBar(
+                        content: TerminalContextBarContent(session: session, device: device),
+                        isActivePane: isActivePane
+                    )
                     .equatable()
+                }
                 terminalSurface
             }
         } else {
@@ -10458,9 +10468,11 @@ struct TerminalContextBarContent: Equatable {
     let workingDirectory: String
     /// What `~` stands for in its path (a device's home for its tabs).
     let homeDirectory: String
+    /// The Mac a device tab runs on (its path's prefix); nil on This Mac.
+    let device: RemoteDeviceBadge?
 
     @MainActor
-    init(session: TerminalSession) {
+    init(session: TerminalSession, device: RemoteDeviceBadge? = nil) {
         kind = session.kind
         agentName = session.agentName
         title = session.title
@@ -10468,10 +10480,22 @@ struct TerminalContextBarContent: Equatable {
         subtitle = session.subtitle
         workingDirectory = session.workingDirectory
         homeDirectory = session.pathHomeDirectory
+        self.device = device
     }
 
     var displayPath: String {
         SidebarTerminalPathFormatter.displayPath(workingDirectory, homeDirectory: homeDirectory)
+    }
+
+    /// "patstudio:" before a device tab's path; nil on This Mac.
+    var devicePrefix: String? {
+        device.map { "\($0.name):" }
+    }
+
+    /// The whole breadcrumb as read out: "[<Mac>: ]<path>  ›  <label>".
+    var breadcrumb: String {
+        let path = "\(displayPath)  ›  \(sessionLabel)"
+        return devicePrefix.map { "\($0) \(path)" } ?? path
     }
 
     var sessionLabel: String {
@@ -10518,11 +10542,20 @@ private struct TerminalContextBar: View, Equatable {
                 .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.70 : 0.46))
                 .accessibilityHidden(true)
 
-            Text(verbatim: "\(displayPath)  ›  \(sessionLabel)")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.68 : 0.46))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            HStack(spacing: 5) {
+                if let device = content.device, let prefix = content.devicePrefix {
+                    Text(verbatim: prefix)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(device.color.color(for: colorScheme).opacity(isActivePane ? 1 : 0.7))
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                Text(verbatim: "\(displayPath)  ›  \(sessionLabel)")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(foregroundColor.opacity(isActivePane ? 0.68 : 0.46))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
             Spacer(minLength: 0)
         }
@@ -10535,7 +10568,12 @@ private struct TerminalContextBar: View, Equatable {
                 .frame(height: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text(verbatim: "\(content.kind == .agent ? "Agent" : "Terminal"), \(displayPath), \(sessionLabel)"))
+        .accessibilityLabel(Text(verbatim: [
+            content.kind == .agent ? "Agent" : "Terminal",
+            content.device.map { "on \($0.name)" },
+            displayPath,
+            sessionLabel
+        ].compactMap { $0 }.joined(separator: ", ")))
     }
 
     @ViewBuilder

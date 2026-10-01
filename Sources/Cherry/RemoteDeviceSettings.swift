@@ -4,7 +4,8 @@ import SwiftUI
 
 // Settings › Sessions › Other Macs (docs/specs/remote-devices.md): each
 // device, how it stands (connected, offline, needs attention, an update
-// available), with Reconnect, Update Session Host… and Remove.
+// available), its windows' colour, with Reconnect, Update Session Host…
+// and Remove.
 
 /// One device's row; pure, for tests.
 struct RemoteDeviceSettingsRow: Equatable, Identifiable {
@@ -29,10 +30,13 @@ struct RemoteDeviceSettingsRow: Equatable, Identifiable {
     let updateTitle: String
     let offersReconnect: Bool
     let offersTrustNewIdentity: Bool
+    /// The colour chosen for its windows; nil: automatic.
+    let color: RemoteDeviceColor?
 
     init(device: RemoteDevice, state: RemoteDeviceConnectionState, bundledBuild: String?) {
         id = device.id
         name = device.name
+        color = device.color
         destination = device.sshDestination
         let menuDevice = TitlebarProjectMenuModel.Device(device: device, state: state, sessions: [], bundledBuild: bundledBuild)
         updateAvailable = menuDevice.offersHostUpdate
@@ -137,6 +141,11 @@ final class RemoteDeviceSettingsModel: ObservableObject {
 
     var canModify: Bool { store.canModify }
 
+    /// Its windows' colour (nil: automatic).
+    func setColor(_ color: RemoteDeviceColor?, for id: UUID) {
+        store.setColor(color, for: id)
+    }
+
     /// Reconnect: connects its control again (now, when it waits to).
     func reconnect(_ id: UUID) {
         guard let host = store.device(id: id)?.host else { return }
@@ -176,6 +185,14 @@ struct RemoteDevicesSettingsSection: View {
                                     .textSelection(.enabled)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
+                            RemoteDeviceColorPicker(
+                                deviceID: row.id,
+                                selection: row.color,
+                                isEnabled: model.canModify
+                            ) { color in
+                                model.setColor(color, for: row.id)
+                            }
+                            .padding(.top, 4)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         HStack(spacing: 8) {

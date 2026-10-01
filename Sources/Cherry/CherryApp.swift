@@ -1308,20 +1308,20 @@ private struct ProjectWindowView: View {
 }
 
 /// Observes the currently selected session and keeps the AppKit window title in
-/// sync as "<project> — <selected tab>". @ObservedObject so a live title change
+/// sync as "<project> — <selected tab>" (`ProjectWindowTitle`). @ObservedObject so a live title change
 /// (e.g. an agent renaming its tab) updates the window title while the tab stays
 /// selected; the parent re-passes a new `session` when the selection changes.
 private struct WindowTitleBinder: View {
     let projectName: String
+    let worktreeName: String?
+    /// The Mac a device window runs on.
+    let deviceName: String?
     @ObservedObject var session: TerminalSession
 
     var body: some View {
-        WindowTitleWriter(title: windowTitle)
-    }
-
-    private var windowTitle: String {
-        let tab = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return tab.isEmpty ? projectName : "\(projectName) — \(tab)"
+        WindowTitleWriter(title: ProjectWindowTitle.title(
+            project: projectName, worktree: worktreeName, deviceName: deviceName, tab: session.title
+        ))
     }
 }
 
@@ -1393,25 +1393,18 @@ private struct ProjectWorkspaceView: View {
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
-    /// Folder name of the project, or "Cherry" for a project-less window;
-    /// "<project> — <Mac>" for a project on another Mac.
+    /// Folder name of the project, or "Cherry" for a project-less window.
     private var projectName: String {
-        let name = repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
-        guard let device = RemoteDeviceStore.shared.device(forProjectKey: repository.repositoryRoot) else { return name }
-        return "\(name) — \(device.name)"
+        repository.repositoryName.isEmpty ? "Cherry" : repository.repositoryName
     }
 
     private var workspace: TerminalWorkspace {
         repository.activeWorkspace
     }
 
-    private var workspaceTitle: String {
-        guard repository.supportsWorktrees,
-              let worktree = repository.activeWorktree
-        else {
-            return projectName
-        }
-        return "\(projectName) / \(worktree.displayName)"
+    private var worktreeName: String? {
+        guard repository.supportsWorktrees else { return nil }
+        return repository.activeWorktree?.displayName
     }
 
     var body: some View {
@@ -1446,13 +1439,30 @@ private struct ProjectWorkspaceView: View {
             todoStore: todoStore,
             chromeState: chromeState
         ))
-        .background {
-            if let session = workspace.selectedSession {
-                WindowTitleBinder(projectName: workspaceTitle, session: session)
-            } else {
-                WindowTitleWriter(title: workspaceTitle)
+        .overlay(alignment: .top) {
+            // A device window: a thin line in its Mac's colour.
+            if repository.isRemote {
+                RemoteDeviceAccentLine(projectKey: repository.repositoryRoot)
+                    .ignoresSafeArea(.all, edges: .top)
             }
         }
+        .background {
+            // "<project> — <Mac>" for a device window.
+            RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in
+                if let session = workspace.selectedSession {
+                    WindowTitleBinder(
+                        projectName: projectName, worktreeName: worktreeName, deviceName: device?.name, session: session
+                    )
+                } else {
+                    WindowTitleWriter(title: ProjectWindowTitle.title(
+                        project: projectName, worktree: worktreeName, deviceName: device?.name
+                    ))
+                }
+            }
+        }
+        // A device window's views read its Mac (chip, path prefix, colour)
+        // from the device store; This Mac's never ask it.
+        .environment(\.remoteDeviceStore, repository.isRemote ? RemoteDeviceStore.shared : nil)
         .focusedValue(\.terminalWorkspace, workspace)
         .focusedValue(\.projectWindowChromeState, chromeState)
         .onAppear {

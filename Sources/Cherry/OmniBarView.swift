@@ -566,6 +566,7 @@ enum OmniBarColors {
 }
 
 private struct OmniBarRow: View {
+    @Environment(\.colorScheme) private var colorScheme
     let row: OmniRow
     let isSelected: Bool
     let height: CGFloat
@@ -592,8 +593,8 @@ private struct OmniBarRow: View {
             }
             if !row.item.detail.isEmpty {
                 Text(row.item.detail)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12, weight: row.item.detailColor == nil ? .regular : .medium))
+                    .foregroundStyle(detailStyle)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .layoutPriority(0.5)
@@ -610,6 +611,12 @@ private struct OmniBarRow: View {
         .accessibilityLabel(row.item.accessibilityLabel)
         .accessibilityHint(row.item.actions.isEmpty ? row.item.primaryLabel : "\(row.item.primaryLabel). Command-K for actions.")
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    /// A project on another Mac names it in its colour.
+    private var detailStyle: AnyShapeStyle {
+        guard let color = row.item.detailColor else { return AnyShapeStyle(.secondary) }
+        return AnyShapeStyle(color.color(for: colorScheme))
     }
 
     /// An editor's app icon in full colour; the agent's logo as a

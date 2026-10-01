@@ -1207,6 +1207,33 @@ final class TerminalWorkspace: ObservableObject {
                 self?.tabProgramDidExit(session)
             }
         }
+        for session in sessions where session.detachedSurfaceSize == nil {
+            // A tab this workspace has not seen before: until its own
+            // surface reports, it has the grid its window's terminal has.
+            if let grid = mountedTerminalGrid {
+                session.seedViewportSize(grid)
+            }
+            session.detachedSurfaceSize = { [weak self, weak session] in
+                // Only while the tab is this workspace's.
+                guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
+                return self.mountedTerminalSize
+            }
+        }
+    }
+
+    /// The grid of a terminal this workspace's window shows now (see
+    /// `mountedTerminalSize`).
+    var mountedTerminalGrid: TerminalViewportSize? {
+        let shown = (selectedSession.map { [$0] } ?? []) + sessions
+        return shown.lazy.compactMap(\.mountedTerminalGrid).first
+    }
+
+    /// The size, in points, of a terminal this workspace's window shows now:
+    /// the selected tab's, else any other tab's that a view shows; nil when
+    /// none is on screen.
+    var mountedTerminalSize: CGSize? {
+        if let size = selectedSession?.mountedTerminalSize { return size }
+        return sessions.lazy.compactMap(\.mountedTerminalSize).first
     }
 
     /// Whether `session`'s tab closes now that its program ended: a terminal
@@ -3824,6 +3851,29 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// stop, restart or close (they stop following it first), a program
     /// that had ended before the tab followed it, or an attached tab's.
     var programDidExit: (@MainActor (TerminalSession) -> Void)?
+    /// Set by the workspace showing the tab: the size, in points, of a
+    /// terminal its window shows now (`TerminalWorkspace.mountedTerminalSize`),
+    /// for a surface built while no view shows it (a restored tab's attach
+    /// adapter launching in the background): its program, or the persistent
+    /// session it attaches to, gets the size the tab will have when shown,
+    /// instead of Ghostty's default for a detached surface and then the
+    /// window's when shown (two resizes, each redrawn by the program).
+    var detachedSurfaceSize: (@MainActor () -> CGSize?)?
+
+    /// The grid of this tab's terminal while a window shows it.
+    var mountedTerminalGrid: TerminalViewportSize? {
+        guard mountedTerminalSize != nil, let metrics = ghosttyBridgeStorage?.gridMetrics,
+              metrics.columns > 0, metrics.rows > 0
+        else { return nil }
+        return TerminalViewportSize(columns: Int(metrics.columns), rows: Int(metrics.rows))
+    }
+
+    /// The size, in points, of this tab's terminal while a window shows it.
+    var mountedTerminalSize: CGSize? {
+        guard let bridge = ghosttyBridgeStorage, bridge.terminalView.window != nil else { return nil }
+        let size = bridge.terminalView.bounds.size
+        return size.width > 0 && size.height > 0 ? size : nil
+    }
     /// The system ended this tab's session while Cherry was closed (a
     /// restart or log out): the tab came back ended, with no session, and
     /// says so (`PersistentSessionEndedBar`). Any launch (Restart,
@@ -3880,6 +3930,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
+    /// The surface reported its grid (`resize`): a seed no longer applies.
+    private var viewportWasReported = false
     private var traceRecorder: TerminalTraceRecorder?
     private let attentionObservationDirectoryProvider: @MainActor () -> URL?
     private let attentionCorrectionDirectoryProvider: @MainActor () -> URL
@@ -5453,9 +5505,22 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentStateDidChange?()
     }
 
+    /// Until its surface reports its grid, the tab assumes `size`: the grid
+    /// of a terminal its window shows now (`TerminalWorkspace`), which a new
+    /// tab shown there gets too. A persistent tab's Create, which goes out
+    /// before the surface is laid out, then starts the program at that size
+    /// rather than at a default it is resized from a moment later.
+    func seedViewportSize(_ size: TerminalViewportSize) {
+        guard !viewportWasReported, size.columns > 0, size.rows > 0, size != viewportSize else { return }
+        viewportSize = size
+        renderedReplayCache = nil
+        processor.resize(to: size)
+    }
+
     func resize(columns: Int, rows: Int, forceShellResize: Bool = false) {
         let nextSize = TerminalViewportSize(columns: columns, rows: rows)
         guard nextSize.columns > 0, nextSize.rows > 0 else { return }
+        viewportWasReported = true
         guard nextSize != viewportSize else {
             if forceShellResize {
                 shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
@@ -5901,6 +5966,11 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // program exited: this launch starts nothing.
                     guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else { return }
                     self.schedulePersistentCreationDeadline(launchID, hosting: hosting)
+                    // At the size the tab has now: its surface may have
+                    // reported its grid since the request was made.
+                    var request = request
+                    request.columns = self.viewportSize.columns
+                    request.rows = self.viewportSize.rows
                     launch = try await hosting.create(request, configuration: configuration)
                 }
             } catch {

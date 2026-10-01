@@ -22,19 +22,22 @@ enum ProjectWindowReveal {
     /// Keeps `window` off screen until `repository`'s first restore settled,
     /// at most `maximumWait`. Nothing when there is nothing to restore,
     /// unless the launch hid it already (`alreadyHidden`,
-    /// `LaunchWindowCover`): it then shows on the next turn, once SwiftUI
-    /// has laid it out.
+    /// `LaunchWindowCover`) or the caller waits for more
+    /// (`holdsAnyway`: it goes back into full screen first, and adds that
+    /// wait with `ProjectWindowRevealGate.waitAlso`): it then shows on the
+    /// next turn, once SwiftUI has laid it out.
     @discardableResult
     static func hold(
         _ window: NSWindow,
         until repository: RepositoryWorkspace?,
         name: String,
         alreadyHidden: Bool = false,
+        holdsAnyway: Bool = false,
         maximumWait: Duration = defaultMaximumWait,
         onShow: (@MainActor () -> Void)? = nil
     ) -> ProjectWindowRevealGate? {
         let awaitsRestore = repository?.isAwaitingInitialRestore ?? false
-        guard awaitsRestore || alreadyHidden else { return nil }
+        guard awaitsRestore || alreadyHidden || holdsAnyway else { return nil }
         let previousIgnoresMouseEvents = alreadyHidden ? false : window.ignoresMouseEvents
         let gate = ProjectWindowRevealGate(
             maximumWait: maximumWait,
@@ -178,8 +181,9 @@ final class LaunchWindowCover {
 /// The order in which a window waiting for its content comes on screen:
 /// `begin` hides it; it shows once, either a turn after its content is ready
 /// (`contentIsReady`: SwiftUI has laid the restored tabs out by then) or
-/// when `maximumWait` has passed, whichever comes first. Later calls do
-/// nothing.
+/// when `maximumWait` has passed, whichever comes first, and not before
+/// every other wait added (`waitAlso`: going back into full screen) ended.
+/// Later calls do nothing.
 @MainActor
 final class ProjectWindowRevealGate {
     enum Outcome: Equatable, CustomStringConvertible {
@@ -214,6 +218,10 @@ final class ProjectWindowRevealGate {
     /// How the window came on screen; nil while it waits (or before `begin`).
     private(set) var outcome: Outcome?
     private var isContentReady = false
+    /// Waits added with `waitAlso` that have not ended.
+    private(set) var otherWaits = 0
+    /// How the window would have come on screen while other waits held it.
+    private var heldOutcome: Outcome?
 
     init(
         maximumWait: Duration,
@@ -246,11 +254,161 @@ final class ProjectWindowRevealGate {
         schedule(.zero) { self.finish(.contentReady) }
     }
 
+    /// Holds the window off screen for something else too (a window going
+    /// back into full screen, which must not show windowed first): it shows
+    /// only once this wait has ended as well, by the closure returned or
+    /// after `limit`, whichever comes first. The window still shows as its
+    /// content and `maximumWait` decide (the outcome is theirs), only not
+    /// before. Nothing once the window showed.
+    func waitAlso(atMost limit: Duration) -> @MainActor () -> Void {
+        guard outcome == nil else { return {} }
+        otherWaits += 1
+        var ended = false
+        let end: @MainActor () -> Void = { [self] in
+            guard !ended else { return }
+            ended = true
+            otherWaits -= 1
+            if otherWaits == 0, let heldOutcome {
+                self.heldOutcome = nil
+                finish(heldOutcome)
+            }
+        }
+        schedule(limit) { end() }
+        return end
+    }
+
     private func finish(_ result: Outcome) {
         guard outcome == nil, isHidden else { return }
+        guard otherWaits == 0 else {
+            if heldOutcome == nil { heldOutcome = result }
+            return
+        }
         outcome = result
         isHidden = false
         show(result)
+    }
+}
+
+/// Puts a project window that was in full screen when it was saved
+/// (`ProjectWindowFrameStore.isFullScreen`) back into full screen: AppKit's
+/// state restoration, which would do it, is off for project windows
+/// (`ProjectWindowRegistry.register`). The window has its saved frame by
+/// then, which it goes back to when it leaves full screen. `done` runs once
+/// it is in full screen, the window closed, or `maximumWait` passed (AppKit
+/// refused: it says so only to the window's delegate), once.
+@MainActor
+final class WindowFullScreenRestore {
+    /// How long a restored window may take to enter full screen (the
+    /// transition takes about a second) before it shows anyway.
+    static let maximumWait: Duration = .seconds(3)
+
+    private static var active: [ObjectIdentifier: WindowFullScreenRestore] = [:]
+
+    private weak var window: NSWindow?
+    private let center: NotificationCenter
+    private let toggle: @MainActor (NSWindow) -> Void
+    private var done: (@MainActor () -> Void)?
+    private var observers: [NSObjectProtocol] = []
+    private var toggled = false
+
+    /// `toggle` enters full screen (tests give their own).
+    static func enter(
+        _ window: NSWindow,
+        center: NotificationCenter = .default,
+        schedule: @escaping ProjectWindowRevealGate.Schedule = ProjectWindowRevealGate.mainQueueSchedule,
+        toggle: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
+        done: @escaping @MainActor () -> Void
+    ) {
+        guard !window.styleMask.contains(.fullScreen),
+              window.collectionBehavior.contains(.fullScreenPrimary) || window.styleMask.contains(.resizable)
+        else {
+            done()
+            return
+        }
+        active[ObjectIdentifier(window)]?.finish()
+        let restore = WindowFullScreenRestore(window: window, center: center, toggle: toggle, done: done)
+        active[ObjectIdentifier(window)] = restore
+        restore.start()
+        schedule(maximumWait) { [weak restore] in restore?.finish() }
+    }
+
+    private init(
+        window: NSWindow,
+        center: NotificationCenter,
+        toggle: @escaping @MainActor (NSWindow) -> Void,
+        done: @escaping @MainActor () -> Void
+    ) {
+        self.window = window
+        self.center = center
+        self.toggle = toggle
+        self.done = done
+    }
+
+    private func start() {
+        guard let window else { return finish() }
+        let ends: [Notification.Name] = [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.willCloseNotification,
+        ]
+        for name in ends {
+            observers.append(center.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated { self?.finish() }
+            })
+        }
+        // AppKit takes a window into full screen once it is on screen: a
+        // window registering before AppKit first ordered it in goes when it
+        // is (transparent, `ProjectWindowReveal`).
+        if window.isVisible {
+            enterNow()
+            return
+        }
+        let appears: [Notification.Name] = [
+            NSWindow.didUpdateNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didBecomeMainNotification,
+            NSWindow.didChangeOcclusionStateNotification,
+        ]
+        for name in appears {
+            observers.append(center.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window = self.window, window.isVisible else { return }
+                    self.enterNow()
+                }
+            })
+        }
+    }
+
+    private func enterNow() {
+        guard !toggled, let window, done != nil else { return }
+        toggled = true
+        if window.styleMask.contains(.fullScreen) {
+            finish()
+            return
+        }
+        // Not from inside the notification or registration that got here.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, let window = self.window, self.done != nil else { return }
+                if window.styleMask.contains(.fullScreen) {
+                    self.finish()
+                } else {
+                    self.toggle(window)
+                }
+            }
+        }
+    }
+
+    private func finish() {
+        observers.forEach(center.removeObserver)
+        observers.removeAll()
+        if let window, Self.active[ObjectIdentifier(window)] === self {
+            Self.active.removeValue(forKey: ObjectIdentifier(window))
+        } else {
+            Self.active = Self.active.filter { $0.value !== self }
+        }
+        guard let done else { return }
+        self.done = nil
+        done()
     }
 }
 

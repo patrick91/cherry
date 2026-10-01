@@ -228,3 +228,222 @@ private func makeCover(_ schedule: ManualSchedule, center: NotificationCenter) -
     #expect(window.alphaValue == 1)
     #expect(!window.ignoresMouseEvents)
 }
+
+// MARK: - Windows that were in full screen
+
+/// A window going back into full screen (`waitAlso`) shows only once it is
+/// there, though its content was ready first: never windowed, then full
+/// screen. The outcome is still its content's.
+@Test @MainActor func aWindowGoingBackIntoFullScreenShowsOnlyOnceItIsThere() {
+    let schedule = ManualSchedule()
+    let visibility = Visibility()
+    let gate = makeGate(schedule, visibility)
+    gate.begin()
+    let entered = gate.waitAlso(atMost: .seconds(3))
+    #expect(gate.otherWaits == 1)
+    gate.contentIsReady()
+    schedule.run(upTo: .zero)
+    #expect(visibility.shown.isEmpty)
+    #expect(gate.isHidden)
+    // The content's wait running out changes nothing either.
+    schedule.run(upTo: .seconds(1))
+    #expect(visibility.shown.isEmpty)
+
+    entered()
+    #expect(visibility.shown == [.contentReady])
+    #expect(!gate.isHidden)
+    // Once.
+    entered()
+    schedule.run(upTo: .seconds(3))
+    #expect(visibility.shown == [.contentReady])
+    #expect(gate.otherWaits == 0)
+}
+
+/// A window that never gets back into full screen (AppKit refused) shows
+/// once that wait runs out, as its content's wait said; and a wait added
+/// after the window showed holds nothing.
+@Test @MainActor func aWindowThatNeverGetsBackIntoFullScreenShowsWhenThatWaitRunsOut() {
+    let schedule = ManualSchedule()
+    let visibility = Visibility()
+    let gate = makeGate(schedule, visibility, wait: .seconds(1))
+    gate.begin()
+    _ = gate.waitAlso(atMost: .seconds(3))
+    schedule.run(upTo: .seconds(1))
+    #expect(visibility.shown.isEmpty)
+    schedule.run(upTo: .seconds(3))
+    #expect(visibility.shown == [.timedOut])
+
+    let late = gate.waitAlso(atMost: .seconds(3))
+    #expect(gate.otherWaits == 0)
+    late()
+    #expect(visibility.shown == [.timedOut])
+}
+
+@MainActor
+private func makeFullScreenTestWindow() -> NSWindow {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
+        styleMask: [.titled, .closable, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.collectionBehavior.insert(.fullScreenPrimary)
+    return window
+}
+
+/// Whether a project's window is in full screen is saved as it enters and
+/// leaves full screen, with its frame; leaving because it closes or because
+/// the app quits keeps it saved, so the window comes back in full screen.
+@Test @MainActor func aWindowsFullScreenStateIsSavedAsItEntersAndLeavesFullScreen() throws {
+    let suite = "CherryTests.FullScreen.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = ProjectWindowFrameStore(defaults: defaults)
+    let center = NotificationCenter()
+    let window = makeFullScreenTestWindow()
+    defer { window.close() }
+    var terminating = false
+    let saver = ProjectWindowFrameSaver(
+        window: window, projectRoot: "/p", store: store, center: center, isTerminating: { terminating }
+    )
+    #expect(!store.isFullScreen(projectRoot: "/p"))
+    center.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+    #expect(store.isFullScreen(projectRoot: "/p"))
+    #expect(defaults.bool(forKey: ProjectWindowFrameStore.fullScreenKey(projectRoot: "/p")))
+    // Another window's changes are not this one's.
+    center.post(name: NSWindow.didExitFullScreenNotification, object: makeFullScreenTestWindow())
+    #expect(store.isFullScreen(projectRoot: "/p"))
+    center.post(name: NSWindow.didExitFullScreenNotification, object: window)
+    #expect(!store.isFullScreen(projectRoot: "/p"))
+    #expect(defaults.object(forKey: ProjectWindowFrameStore.fullScreenKey(projectRoot: "/p")) == nil)
+
+    // The app quits from full screen.
+    center.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+    terminating = true
+    center.post(name: NSWindow.didExitFullScreenNotification, object: window)
+    #expect(store.isFullScreen(projectRoot: "/p"))
+    // The window closes from full screen.
+    terminating = false
+    center.post(name: NSWindow.willCloseNotification, object: window)
+    center.post(name: NSWindow.didExitFullScreenNotification, object: window)
+    #expect(store.isFullScreen(projectRoot: "/p"))
+    withExtendedLifetime(saver) {}
+}
+
+/// A window whose project's window was in full screen registers: it takes
+/// its saved (windowed) frame first, which it goes back to when it leaves
+/// full screen, then goes into full screen, and stays transparent until it
+/// is there. A window saved windowed is never taken into full screen.
+@Test @MainActor func aWindowSavedInFullScreenTakesItsFrameThenFullScreenBeforeItShows() async throws {
+    let suite = "CherryTests.FullScreenRestore.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    // Canonical (no /var symlink): the registry keys a window by it.
+    let created = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cherry-fullscreen-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: created, withIntermediateDirectories: true)
+    let root = URL(fileURLWithPath: try #require(created.path.withCString { pointer -> String? in
+        guard let resolved = realpath(pointer, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }), isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let other = root.appendingPathComponent("other", isDirectory: true)
+    try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+
+    let saved = NSRect(x: 120, y: 140, width: 800, height: 500)
+    let lastRun = makeFullScreenTestWindow()
+    lastRun.setFrame(saved, display: false)
+    frames.save(lastRun, projectRoot: root.path)
+    frames.setFullScreen(true, projectRoot: root.path)
+    lastRun.close()
+
+    let registry = ProjectWindowRegistry()
+    registry.configureWindowFrames(frames)
+    var entering: [(window: NSWindow, frame: NSRect, done: @MainActor () -> Void)] = []
+    registry.enterFullScreen = { window, done in entering.append((window, window.frame, done)) }
+    let window = makeFullScreenTestWindow()
+    let workspace = TerminalWorkspace(projectRoot: root.path, createInitialSession: false)
+    let windowed = makeFullScreenTestWindow()
+    let otherWorkspace = TerminalWorkspace(projectRoot: other.path, createInitialSession: false)
+    defer {
+        registry.unregister(window: window, projectRoot: root.path)
+        registry.unregister(window: windowed, projectRoot: other.path)
+        window.close()
+        windowed.close()
+    }
+    #expect(registry.register(
+        window: window, projectRoot: root.path, workspace: workspace,
+        noteStore: nil, todoStore: nil, chromeState: nil
+    ))
+    #expect(entering.count == 1)
+    #expect(entering.first?.window === window)
+    #expect(entering.first?.frame == saved)
+    #expect(window.alphaValue == 0)
+    #expect(window.ignoresMouseEvents)
+    // Nothing to restore, but it waits for full screen, past its content's
+    // wait.
+    try await Task.sleep(for: .milliseconds(1200))
+    #expect(window.alphaValue == 0)
+    entering.first?.done()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while window.alphaValue == 0, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(window.alphaValue == 1)
+    #expect(!window.ignoresMouseEvents)
+    // Registering again (every view update does) does not go again.
+    #expect(registry.register(
+        window: window, projectRoot: root.path, workspace: workspace,
+        noteStore: nil, todoStore: nil, chromeState: nil
+    ))
+    #expect(entering.count == 1)
+
+    #expect(registry.register(
+        window: windowed, projectRoot: other.path, workspace: otherWorkspace,
+        noteStore: nil, todoStore: nil, chromeState: nil
+    ))
+    #expect(entering.count == 1)
+    #expect(windowed.alphaValue == 1)
+}
+
+/// Going back into full screen waits for the window to be on screen
+/// (AppKit takes only a window on screen into full screen) and ends once it
+/// is in full screen, or after its wait, once.
+@Test @MainActor func goingBackIntoFullScreenEndsOnceWhenThereOrAfterItsWait() {
+    let center = NotificationCenter()
+    let schedule = ManualSchedule()
+    let window = makeFullScreenTestWindow()
+    defer { window.close() }
+    var toggles = 0
+    var ended = 0
+    WindowFullScreenRestore.enter(
+        window, center: center, schedule: schedule.schedule, toggle: { _ in toggles += 1 }, done: { ended += 1 }
+    )
+    // Not on screen: nothing yet.
+    center.post(name: NSWindow.didUpdateNotification, object: window)
+    #expect(toggles == 0)
+    #expect(ended == 0)
+    center.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+    #expect(ended == 1)
+    center.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+    schedule.run(upTo: WindowFullScreenRestore.maximumWait)
+    #expect(ended == 1)
+
+    WindowFullScreenRestore.enter(
+        window, center: center, schedule: schedule.schedule, toggle: { _ in toggles += 1 }, done: { ended += 1 }
+    )
+    schedule.run(upTo: WindowFullScreenRestore.maximumWait)
+    #expect(ended == 2)
+    #expect(toggles == 0)
+
+    // A window that cannot go full screen ends at once.
+    let fixed = makeCoverTestWindow()
+    defer { fixed.close() }
+    WindowFullScreenRestore.enter(
+        fixed, center: center, schedule: schedule.schedule, toggle: { _ in toggles += 1 }, done: { ended += 1 }
+    )
+    #expect(ended == 3)
+}

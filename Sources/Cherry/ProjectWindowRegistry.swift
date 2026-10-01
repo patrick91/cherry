@@ -86,6 +86,12 @@ final class ProjectWindowRegistry {
     /// own, so the app's defaults are never written.
     private(set) var windowFrameStore: ProjectWindowFrameStore?
     private var windowFrameSavers: [String: ProjectWindowFrameSaver] = [:]
+    /// Puts a window that was in full screen back into full screen, then
+    /// calls its completion (`WindowFullScreenRestore.enter`). Tests give
+    /// their own, so no test window changes Spaces.
+    var enterFullScreen: @MainActor (_ window: NSWindow, _ done: @escaping @MainActor () -> Void) -> Void = { window, done in
+        WindowFullScreenRestore.enter(window, done: done)
+    }
 
     /// Whether a saved window of another Mac's project (a `ProjectLocation`
     /// key) can open: its device is still known (`RemoteDeviceStore`).
@@ -813,7 +819,7 @@ final class ProjectWindowRegistry {
         if windows[projectRoot]?.window !== window {
             // Newly claimed (a window registers again on every update): it
             // takes the frame its project's window last had.
-            adoptSavedFrame(of: window, projectRoot: projectRoot)
+            let restoresFullScreen = adoptSavedFrame(of: window, projectRoot: projectRoot)
             let name = URL(fileURLWithPath: projectRoot).lastPathComponent
             LaunchTimeline.mark("window registered \(name) visible=\(window.isVisible)")
             // A window whose saved tabs are still being restored stays off
@@ -822,15 +828,22 @@ final class ProjectWindowRegistry {
             let coveredAtLaunch = launchWindowCover?.claim(window) ?? false
             let shown: @MainActor () -> Void = { [weak self] in self?.launchWindowDidShow(projectRoot: projectRoot) }
             if let maximumWait = windowRevealMaximumWait,
-               ProjectWindowReveal.hold(
-                   window, until: repository, name: name, alreadyHidden: coveredAtLaunch,
+               let gate = ProjectWindowReveal.hold(
+                   window, until: repository, name: name, alreadyHidden: coveredAtLaunch, holdsAnyway: restoresFullScreen,
                    maximumWait: maximumWait, onShow: shown
-               ) != nil {
-                // Shown by the gate.
+               ) {
+                // Shown by the gate; a window that was in full screen once it
+                // is again, so it never shows windowed first.
+                if restoresFullScreen {
+                    enterFullScreen(window, gate.waitAlso(atMost: WindowFullScreenRestore.maximumWait))
+                }
             } else {
                 if coveredAtLaunch {
                     window.alphaValue = 1
                     window.ignoresMouseEvents = false
+                }
+                if restoresFullScreen {
+                    enterFullScreen(window) {}
                 }
                 shown()
             }
@@ -868,16 +881,22 @@ final class ProjectWindowRegistry {
     }
 
     /// Gives a newly claimed project window its project's saved frame, and
-    /// saves the frame from then on.
-    private func adoptSavedFrame(of window: NSWindow, projectRoot: String) {
+    /// saves the frame from then on. True when the window was in full screen
+    /// when it was saved and is not now: the caller puts it back.
+    @discardableResult
+    private func adoptSavedFrame(of window: NSWindow, projectRoot: String) -> Bool {
         windowFrameSavers.removeValue(forKey: projectRoot)
-        guard let windowFrameStore else { return }
+        guard let windowFrameStore else { return false }
         windowFrameStore.restore(window, projectRoot: projectRoot)
+        let restoresFullScreen = windowFrameStore.isFullScreen(projectRoot: projectRoot)
+            && !window.styleMask.contains(.fullScreen)
         windowFrameSavers[projectRoot] = ProjectWindowFrameSaver(
             window: window,
             projectRoot: projectRoot,
-            store: windowFrameStore
+            store: windowFrameStore,
+            isTerminating: { [weak self] in self?.isTerminating ?? false }
         )
+        return restoresFullScreen
     }
 
     func unregister(window: NSWindow, projectRoot: String?) {
@@ -1273,17 +1292,29 @@ final class ProjectWindowRegistry {
 }
 
 /// Saves a project window's frame (`ProjectWindowFrameStore`) whenever it
-/// moves or resizes; a live resize once, when it ends.
+/// moves or resizes; a live resize once, when it ends. Whether it is in full
+/// screen is saved as it enters and leaves full screen, except while the app
+/// quits or the window closes: a window that was in full screen then comes
+/// back in full screen.
 @MainActor
-private final class ProjectWindowFrameSaver: NSObject {
+final class ProjectWindowFrameSaver: NSObject {
     private weak var window: NSWindow?
     private let projectRoot: String
     private let store: ProjectWindowFrameStore
+    private let isTerminating: @MainActor () -> Bool
+    private var isClosing = false
 
-    init(window: NSWindow, projectRoot: String, store: ProjectWindowFrameStore) {
+    init(
+        window: NSWindow,
+        projectRoot: String,
+        store: ProjectWindowFrameStore,
+        center: NotificationCenter = .default,
+        isTerminating: @escaping @MainActor () -> Bool = { false }
+    ) {
         self.window = window
         self.projectRoot = projectRoot
         self.store = store
+        self.isTerminating = isTerminating
         super.init()
         for name in [
             NSWindow.didMoveNotification,
@@ -1291,14 +1322,29 @@ private final class ProjectWindowFrameSaver: NSObject {
             NSWindow.didEndLiveResizeNotification,
         ] {
             // Removed when the saver goes (selector-based observation).
-            NotificationCenter.default.addObserver(self, selector: #selector(frameDidChange(_:)), name: name, object: window)
+            center.addObserver(self, selector: #selector(frameDidChange(_:)), name: name, object: window)
         }
+        center.addObserver(self, selector: #selector(fullScreenDidChange(_:)), name: NSWindow.didEnterFullScreenNotification, object: window)
+        center.addObserver(self, selector: #selector(fullScreenDidChange(_:)), name: NSWindow.didExitFullScreenNotification, object: window)
+        center.addObserver(self, selector: #selector(windowWillClose(_:)), name: NSWindow.willCloseNotification, object: window)
     }
 
     @objc private func frameDidChange(_ notification: Notification) {
         guard let window else { return }
         if notification.name == NSWindow.didResizeNotification, window.inLiveResize { return }
         store.save(window, projectRoot: projectRoot)
+    }
+
+    @objc private func fullScreenDidChange(_ notification: Notification) {
+        let entered = notification.name == NSWindow.didEnterFullScreenNotification
+        // A window that leaves full screen because it closes, or the app
+        // quits, was in full screen for the next launch.
+        if !entered, isClosing || isTerminating() { return }
+        store.setFullScreen(entered, projectRoot: projectRoot)
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        isClosing = true
     }
 
     func saveNow() {
@@ -2215,6 +2261,28 @@ struct ProjectWindowFrameStore {
 
     func frameDescriptor(projectRoot: String) -> NSWindow.PersistableFrameDescriptor? {
         defaults.string(forKey: Self.key(projectRoot: projectRoot))
+    }
+
+    static func fullScreenKey(projectRoot: String) -> String {
+        "window.fullScreen.\(projectRoot)"
+    }
+
+    /// Whether the project's window was in full screen when it was last
+    /// saved: it comes back in full screen (`WindowFullScreenRestore`), and
+    /// its saved frame is the one it had before, which it goes back to when
+    /// it leaves full screen.
+    func isFullScreen(projectRoot: String) -> Bool {
+        defaults.bool(forKey: Self.fullScreenKey(projectRoot: projectRoot))
+    }
+
+    func setFullScreen(_ fullScreen: Bool, projectRoot: String) {
+        let key = Self.fullScreenKey(projectRoot: projectRoot)
+        guard isFullScreen(projectRoot: projectRoot) != fullScreen else { return }
+        if fullScreen {
+            defaults.set(true, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
     }
 
     /// Saves `window`'s frame, unless it is full screen: the frame it goes

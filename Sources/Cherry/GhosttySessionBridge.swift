@@ -443,7 +443,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             }
         }
         self.controller = TerminalController(configuration: terminalConfiguration, theme: terminalTheme)
-        self.terminalView = TerminalView(frame: .zero)
+        // A surface built while no view shows it (a restored tab's adapter
+        // launching in the background) takes the size its window's terminal
+        // has, so its program attaches at the size the tab is shown at
+        // (`TerminalSession.detachedSurfaceSize`); Ghostty's default
+        // otherwise.
+        self.terminalView = TerminalView(frame: NSRect(origin: .zero, size: session.detachedSurfaceSize?() ?? .zero))
         self.appliedTerminalConfiguration = terminalConfiguration
         self.appliedTerminalTheme = terminalTheme
         self.isNativePTYBacked = isNativePTYBacked

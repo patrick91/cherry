@@ -349,7 +349,7 @@ private final class WorktreeAggregateStatus: ObservableObject {
     private func refresh() {
         let sessions = workspace?.sessions ?? []
         needsAttention = sessions.contains {
-            $0.agentActivityState == .permission || $0.agentActivityState == .error
+            $0.agentActivityState.awaitsUserAnswer || $0.agentActivityState == .error
         }
         hasUnread = sessions.contains { $0.hasUnreadNotification }
         isWorking = sessions.contains { $0.agentActivityState.showsWorkingIndicator }

@@ -14,6 +14,12 @@ enum AgentScreenActivity {
     static let promptTailLineLimit = 8
 
     enum Verdict: String, Equatable, Sendable {
+        /// The screen asks the user to approve an action
+        /// (`AgentPermissionPrompt`).
+        case permission
+        /// The screen asks the user a question with a choice menu
+        /// (`AgentQuestionPrompt`).
+        case question
         /// The screen shows a turn in flight.
         case working
         /// The screen shows the agent waiting at its composer or a menu.
@@ -24,13 +30,20 @@ enum AgentScreenActivity {
 
     /// Classifies a whole screen (oldest line first), the way the session's
     /// state machine reads it when no human-input floor applies.
-    static func verdict(for screen: [String], agent: String) -> Verdict {
+    /// `includesAnswerMenus` false reads it as before the tab's first turn,
+    /// when a menu is a startup dialog, not a paused turn.
+    static func verdict(for screen: [String], agent: String, includesAnswerMenus: Bool = true) -> Verdict {
         var end = screen.count
         while end > 0, screen[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             end -= 1
         }
         guard end > 0 else { return .none }
         let markerLines = Array(screen[max(0, end - markerTailLineLimit)..<end])
+        switch includesAnswerMenus ? answerMenu(in: markerLines) : nil {
+        case .permission?: return .permission
+        case .question?: return .question
+        case nil: break
+        }
         if showsWorkingMarker(markerLines, agent: agent) {
             return .working
         }
@@ -40,6 +53,28 @@ enum AgentScreenActivity {
             return .prompt
         }
         return .none
+    }
+
+    // MARK: - Menus waiting on the user's answer
+
+    /// A menu at the bottom of an agent's screen that its turn waits on.
+    enum AnswerMenu: String, Equatable, Sendable {
+        /// A tool-permission (approval) menu: `AgentPermissionPrompt`.
+        case permission
+        /// A question with a choice menu (Claude's AskUserQuestion,
+        /// Codex's request_user_input): `AgentQuestionPrompt`.
+        case question
+    }
+
+    /// The menu `lines` (a screen's tail, oldest first) end with, if any.
+    /// It outranks working markers: the turn is paused on the user's
+    /// answer even while a footer still says "esc to interrupt" or a
+    /// background task row shows work. The recognizers are the ones MCP
+    /// uses, so the sidebar and MCP agree.
+    static func answerMenu(in lines: [String]) -> AnswerMenu? {
+        if AgentPermissionPrompt.isShowing(in: lines) { return .permission }
+        if AgentQuestionPrompt.isShowing(in: lines) { return .question }
+        return nil
     }
 
     // MARK: - Composer prompts

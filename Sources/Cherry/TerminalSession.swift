@@ -4009,6 +4009,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         case titleSpinner
         case notification
         case processExit
+        // A permission or question menu on screen
+        // (`AgentScreenActivity.answerMenu`): the state follows the menu
+        // and ends when it goes.
+        case answerMenu
     }
 
     private enum AgentDraftInputEffect: Equatable {
@@ -8325,6 +8329,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         case .titleSpinner: "title_spinner"
         case .notification: "notification"
         case .processExit: "process_exit"
+        case .answerMenu: TerminalAttentionPrediction.answerMenuEvidence
         }
     }
 
@@ -8361,14 +8366,15 @@ final class TerminalSession: ObservableObject, Identifiable {
             setAgentActivityState(.permission, source: .notification)
             return
         }
-        if Self.notificationBodyIndicatesCompletion(body) {
+        // A menu on screen still waits on the user's answer.
+        if Self.notificationBodyIndicatesCompletion(body), !agentIsAtAnswerMenu {
             setAgentActivityState(.idle, source: .notification)
         }
     }
 
     private var agentStateHasDirectEvidence: Bool {
         switch agentActivitySource {
-        case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit:
+        case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit, .answerMenu:
             true
         case .none, .outputActivity, .inputSubmit, .quietWindow:
             false
@@ -8475,14 +8481,24 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard kind == .agent else { return false }
         guard agentActivitySource != .processExit else { return false }
 
+        var didChange = false
+        switch applyAgentAnswerMenu() {
+        case .showing(let changed):
+            return changed
+        case .left(let changed):
+            didChange = changed
+        case .none:
+            break
+        }
+
         if renderedOutputShowsAgentWorkingMarker() {
-            return markAgentWorking(source: .workingMarker)
+            return markAgentWorking(source: .workingMarker) || didChange
         }
         if titleSpinnerEvidenceIsActive {
-            return markAgentWorking(source: .titleSpinner)
+            return markAgentWorking(source: .titleSpinner) || didChange
         }
         if renderedOutputShowsAgentInputPrompt() {
-            return requestAgentIdleFromRenderedOutput()
+            return requestAgentIdleFromRenderedOutput() || didChange
         }
         // Full-screen TUIs repaint the composer after every keystroke. If a new
         // harness version changes its prompt glyph or layout, that repaint must
@@ -8492,18 +8508,75 @@ final class TerminalSession: ObservableObject, Identifiable {
         // marking the agent working.
         if hasUnsubmittedHumanInput {
             cancelAgentIdleConfirmation()
-            return setAgentActivityState(.idle, source: .promptMarker)
+            return setAgentActivityState(.idle, source: .promptMarker) || didChange
         }
-        guard !agentStateResistsOutputActivity else { return false }
-        return setAgentActivityState(.working, source: .outputActivity)
+        guard !agentStateResistsOutputActivity else { return didChange }
+        return setAgentActivityState(.working, source: .outputActivity) || didChange
+    }
+
+    private enum AgentAnswerMenuEffect {
+        /// A menu shows: the state says so, and nothing else applies.
+        case showing(changed: Bool)
+        /// The menu the state followed is gone: the turn goes on.
+        case left(changed: Bool)
+        /// No menu, and the state did not follow one.
+        case none
+    }
+
+    /// Whether the state follows a permission or question menu on screen.
+    private var agentIsAtAnswerMenu: Bool {
+        agentActivitySource == .answerMenu && agentActivityState.awaitsUserAnswer
+    }
+
+    /// A permission or question menu at the bottom of the screen
+    /// (`AgentScreenActivity.answerMenu`, MCP's recognizers) makes the
+    /// agent wait on the user's answer: `.permission` or `.needsInput`, an
+    /// attention alert like a permission prompt. Its state follows the
+    /// menu: when the menu goes (answered, or withdrawn), the turn it
+    /// paused goes on and the agent is working again until its screen says
+    /// otherwise. A startup dialog before this tab's first turn (folder
+    /// trust, resume picker) is not one: the agent has no turn to pause.
+    /// A permission prompt the agent notified is left to the notification.
+    private func applyAgentAnswerMenu() -> AgentAnswerMenuEffect {
+        guard agentActivityState != .error else { return .none }
+        let menu = renderedOutputAgentAnswerMenu()
+        if let menu, agentTurnState != .notStarted || !startedCurrentProgram {
+            if agentActivityState == .permission, agentActivitySource == .notification {
+                return .showing(changed: false)
+            }
+            cancelAgentIdleConfirmation()
+            // An agent this tab follows rather than started (restored or
+            // adopted) asking a question is in a turn submitted before
+            // the tab followed it.
+            if agentTurnState == .notStarted {
+                agentTurnState = .active
+            }
+            let state: AgentActivityState = menu == .permission ? .permission : .needsInput
+            return .showing(changed: setAgentActivityState(state, source: .answerMenu))
+        }
+        guard agentIsAtAnswerMenu else { return .none }
+        // The answer resumes the turn: like fresh working evidence, a
+        // composer drawn before the agent's next working frame is
+        // confirmed before it counts as the turn's end.
+        lastStrongWorkingEvidenceAt = Date()
+        let changed = setAgentActivityState(.working, source: .inputSubmit)
+        scheduleAgentIdleRecheck()
+        return .left(changed: changed)
+    }
+
+    private func renderedOutputAgentAnswerMenu() -> AgentScreenActivity.AnswerMenu? {
+        let lineCount = effectiveAgentContentLineCount()
+        guard lineCount > 0 else { return nil }
+        let start = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
+        return AgentScreenActivity.answerMenu(in: contentSnapshot(range: start..<lineCount))
     }
 
     private var agentStateResistsOutputActivity: Bool {
-        if agentActivityState == .permission || agentActivityState == .error {
+        if agentActivityState == .permission || agentActivityState == .needsInput || agentActivityState == .error {
             return true
         }
         switch agentActivitySource {
-        case .promptMarker, .notification, .processExit:
+        case .promptMarker, .notification, .processExit, .answerMenu:
             return true
         case .none, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner, .quietWindow:
             return false
@@ -8513,7 +8586,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func markAgentWorking(source: AgentActivitySource) -> Bool {
         guard agentActivitySource != .processExit else { return false }
-        guard agentActivityState != .permission, agentActivityState != .error else { return false }
+        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
         cancelAgentIdleConfirmation()
         if source == .workingMarker || source == .titleSpinner {
             lastStrongWorkingEvidenceAt = Date()
@@ -8531,7 +8604,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func requestAgentIdleFromRenderedOutput() -> Bool {
         guard agentActivitySource != .processExit else { return false }
-        guard agentActivityState != .permission, agentActivityState != .error else { return false }
+        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
 
         if let lastStrongWorkingEvidenceAt,
            Date().timeIntervalSince(lastStrongWorkingEvidenceAt) < Self.agentIdleConfirmationEvidenceWindow {
@@ -8559,7 +8632,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func confirmAgentIdleIfStillAtPrompt() {
         guard kind == .agent, agentActivitySource != .processExit else { return }
-        guard agentActivityState != .permission, agentActivityState != .error else { return }
+        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return }
         guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
         guard renderedOutputShowsAgentInputPrompt() else { return }
         setAgentActivityState(.idle, source: .promptMarker)
@@ -8901,6 +8974,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
+
+        if agentIsAtAnswerMenu {
+            // Keys typed into a permission or question menu answer it
+            // (digits, arrows, Enter): no draft and no new turn. The state
+            // follows the screen: another question of the same menu keeps
+            // it, the menu's end resumes the paused turn
+            // (`applyAgentAnswerMenu`).
+            if effect == .submitted {
+                hasUnsubmittedHumanInput = false
+                noteHumanInputIfNeeded()
+            }
+            return
+        }
 
         switch effect {
         case .none:

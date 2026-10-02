@@ -382,6 +382,275 @@ struct TerminalAttentionClassifierTests {
         #expect(notificationProbabilities.count == 1)
     }
 
+    // MARK: Menus waiting on the user's answer
+
+    private func screenData(_ lines: [String]) -> Data {
+        Data(("\u{1B}[2J\u{1B}[H" + lines.joined(separator: "\r\n")).utf8)
+    }
+
+    private func digitKeyEvent(_ digit: Character) -> NSEvent? {
+        let keyCodes: [Character: UInt16] = ["1": 18, "2": 19, "3": 20, "4": 21]
+        return NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: String(digit),
+            charactersIgnoringModifiers: String(digit),
+            isARepeat: false,
+            keyCode: keyCodes[digit] ?? 18
+        )
+    }
+
+    @Test func answerMenuStateAlwaysNeedsAttention() {
+        let timing = TerminalAttentionObservation.TimingContext(
+            millisecondsSinceStarted: 600_000,
+            millisecondsSinceLastOutput: 0,
+            millisecondsSinceLastContentChange: 0,
+            millisecondsSinceLastHumanInput: 120_000
+        )
+        for state in ["needs_input", "permission"] {
+            let prediction = TerminalAttentionClassifier.shared.predict(fixture(
+                event: .activityStateChanged,
+                activityState: state,
+                evidence: TerminalAttentionPrediction.answerMenuEvidence,
+                grid: AgentScreenActivityTests.claudeTallQuestion,
+                hasUnsubmittedInput: false,
+                millisecondsSinceLastKeystroke: 120_000,
+                terminalFocused: true,
+                timing: timing,
+                turnState: .active
+            ))
+            #expect(prediction.needsAttention)
+            #expect(prediction.isRaisedByAnswerMenu)
+            #expect(prediction.confidence == 1)
+            #expect(prediction.debugReport.contains("Rule: the turn waits on a menu's answer"))
+            #expect(TerminalAttentionNotificationPolicy.shouldNotify(
+                prediction: prediction,
+                isTopLevelAgent: true,
+                hasUnreadNativeNotification: false
+            ))
+            #expect(!TerminalAttentionNotificationPolicy.shouldNotify(
+                prediction: prediction,
+                isTopLevelAgent: true,
+                hasUnreadNativeNotification: true
+            ))
+        }
+
+        // A notified permission keeps the model's own verdict, and a menu
+        // before the first turn (a startup dialog) never needs action.
+        let notified = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .notification,
+            activityState: "permission",
+            evidence: "notification",
+            grid: ["❯ 1. Yes", "  2. No"],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 1_000,
+            terminalFocused: false,
+            timing: timing,
+            turnState: .active
+        ))
+        #expect(!notified.isRaisedByAnswerMenu)
+        let startup = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .activityStateChanged,
+            activityState: "needs_input",
+            evidence: TerminalAttentionPrediction.answerMenuEvidence,
+            grid: ["❯ 1. Yes, proceed", "  2. No, exit"],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 1_000,
+            terminalFocused: false,
+            timing: timing,
+            turnState: .notStarted
+        ))
+        #expect(!startup.needsAttention)
+    }
+
+    @Test func questionMenuNeedsAttentionUntilItIsAnswered() async throws {
+        var notified: [(TerminalAttentionPrediction, AgentActivityState)] = []
+        let session = TerminalSession(
+            title: "Question fixture",
+            subtitle: "claude",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Claude",
+            attentionObservationDirectoryProvider: { nil },
+            attentionNotificationHandler: { prediction, session in
+                notified.append((prediction, session.agentActivityState))
+            }
+        )
+        defer {
+            session.stop()
+        }
+
+        let returnKey = try #require(returnKeyEvent())
+        session.noteNativeHostInput(event: returnKey)
+        session.ingestTestingData(screenData([
+            "❯ pick a storage backend for me",
+            "",
+            "✶ Reticulating… (3s · ↓ 120 tokens)",
+            "",
+            "❯ ",
+            "  esc to interrupt",
+        ]))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .working)
+        #expect(session.attentionClassifierPrediction?.needsAttention == false)
+        #expect(notified.isEmpty)
+
+        // The tall menu: its cursor line is far above the last 8 lines.
+        session.ingestTestingData(screenData(AgentScreenActivityTests.claudeTallQuestion))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .needsInput)
+        #expect(session.agentActivityState.awaitsUserAnswer)
+        let prediction = try #require(session.attentionClassifierPrediction)
+        #expect(prediction.needsAttention)
+        #expect(prediction.isRaisedByAnswerMenu)
+        #expect(prediction.turnState == .active)
+        #expect(session.hasUnacknowledgedAttention)
+        #expect(notified.count == 1)
+        #expect(notified.first?.1 == .needsInput)
+        #expect(SidebarAgentAttentionPresentation.shouldShow(
+            prediction: prediction,
+            hasUnacknowledgedAttention: session.hasUnacknowledgedAttention,
+            isFocused: false
+        ))
+        let questionGeneration = session.attentionAlertGeneration
+
+        // Moving the cursor redraws the same menu: the same episode.
+        var moved = AgentScreenActivityTests.claudeTallQuestion
+        let cursor = try #require(moved.firstIndex { $0.hasPrefix("❯ 3.") })
+        moved[cursor] = "  3." + moved[cursor].dropFirst(4)
+        let next = try #require(moved.firstIndex { $0.hasPrefix("  4.") })
+        moved[next] = "❯ 4." + moved[next].dropFirst(4)
+        session.ingestTestingData(screenData(moved))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .needsInput)
+        #expect(session.attentionAlertGeneration == questionGeneration)
+        #expect(notified.count == 1)
+
+        session.acknowledgeAttentionAlert()
+        #expect(!session.hasUnacknowledgedAttention)
+
+        // A digit answers the menu: no draft, no new turn.
+        let turns = session.agentSubmittedTurnCount
+        session.noteNativeHostInput(event: try #require(digitKeyEvent("1")))
+        #expect(session.agentSubmittedTurnCount == turns)
+        #expect(session.agentActivityState == .needsInput)
+
+        // The menu gone, the paused turn goes on.
+        session.ingestTestingData(screenData([
+            "⏺ User answered Claude's questions:",
+            "  ⎿  · How should existing data be migrated? → In place",
+            "",
+            "✶ Reticulating… (5s · ↓ 300 tokens)",
+            "",
+            "❯ ",
+            "  esc to interrupt",
+        ]))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentTurnState == .active)
+        #expect(session.attentionClassifierPrediction?.needsAttention == false)
+        #expect(!session.hasUnacknowledgedAttention)
+        #expect(notified.count == 1)
+
+        // The turn's result is a new episode. (A full screen of transcript:
+        // the test buffer keeps the last screen's footer just above it.)
+        session.ingestTestingData(screenData(Array(repeating: "  migrated a table", count: 32) + [
+            "⏺ Migrated the store in place.",
+            "",
+            "✻ Worked for 12s",
+            "",
+            "❯ ",
+            "  ? for shortcuts",
+        ]))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .idle)
+        #expect(session.agentTurnState == .completed)
+        #expect(session.attentionAlertGeneration > questionGeneration)
+        #expect(session.hasUnacknowledgedAttention)
+    }
+
+    @Test func menuLeftWithOnlyTheComposerConfirmsBeforeTheTurnEnds() async throws {
+        let session = TerminalSession(
+            title: "Question composer fixture",
+            subtitle: "claude",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Claude",
+            attentionObservationDirectoryProvider: { nil },
+            attentionNotificationHandler: { _, _ in }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.noteNativeHostInput(event: try #require(returnKeyEvent()))
+        session.ingestTestingData(screenData(AgentScreenActivityTests.claudeShortQuestion))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(session.agentActivityState == .needsInput)
+
+        // Enter answers it; the next frame shows only the composer: the
+        // turn is still taken as going on at first.
+        session.noteNativeHostInput(event: try #require(returnKeyEvent()))
+        #expect(session.agentActivityState == .needsInput)
+        session.ingestTestingData(screenData([
+            "⏺ User answered Claude's questions:",
+            "  ⎿  · Which storage backend should I use? → SQLite",
+            "",
+            "❯ ",
+        ]))
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentTurnState == .active)
+        // Still at the composer, it is then taken as the turn's end.
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(session.agentActivityState == .idle)
+        #expect(session.agentTurnState == .completed)
+    }
+
+    @Test func codexApprovalOnScreenIsAPermissionPrompt() async throws {
+        var notified: [AgentActivityState] = []
+        let session = TerminalSession(
+            title: "Approval fixture",
+            subtitle: "codex",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Codex",
+            attentionObservationDirectoryProvider: { nil },
+            attentionNotificationHandler: { _, session in
+                notified.append(session.agentActivityState)
+            }
+        )
+        defer {
+            session.stop()
+        }
+
+        session.noteNativeHostInput(event: try #require(returnKeyEvent()))
+        session.ingestTestingData(screenData(["• Working (2s • esc to interrupt)", "", "› "]))
+        try await Task.sleep(for: .milliseconds(300))
+        session.ingestTestingData(screenData(AgentScreenActivityTests.codexApproval))
+        try await Task.sleep(for: .milliseconds(1_250))
+        #expect(session.agentActivityState == .permission)
+        #expect(session.attentionClassifierPrediction?.isRaisedByAnswerMenu == true)
+        #expect(notified == [.permission])
+        #expect(TerminalNotificationCenter.attentionBody(for: .permission).contains("permission"))
+        #expect(TerminalNotificationCenter.attentionBody(for: .needsInput).contains("question"))
+    }
+
+    @Test func menuBarCountsAQuestionAsAttention() {
+        let item = MenuBarAgentItem(
+            id: UUID(), projectRoot: "/project", title: "Claude", agentKey: "claude", activity: .needsInput
+        )
+        #expect(MenuBarAggregateState(items: [item]) == .attention)
+        #expect(AgentActivityState.needsInput.rawValue == "needs_input")
+    }
+
     private func returnKeyEvent() -> NSEvent? {
         NSEvent.keyEvent(
             with: .keyDown,

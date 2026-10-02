@@ -45,10 +45,20 @@ final class TerminalNotificationCenter {
         )
     }
 
+    /// What an attention notification says: a menu on screen says what
+    /// the agent waits for.
+    static func attentionBody(for state: AgentActivityState) -> String {
+        switch state {
+        case .needsInput: "This agent is asking you a question."
+        case .permission: "This agent is waiting for your permission."
+        default: "This agent may need your attention."
+        }
+    }
+
     func postAttention(for session: TerminalSession) {
         deliver(
             title: session.title,
-            body: "This agent may need your attention.",
+            body: Self.attentionBody(for: session.agentActivityState),
             identifierPrefix: "cherry-attention",
             for: session
         )

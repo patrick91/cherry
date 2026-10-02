@@ -18,12 +18,22 @@ struct AttentionCorrectionsReplayTests {
     }
 
     /// Mirrors the state machine's precedence for one recorded screen: a
-    /// working marker, then a (recorded) title spinner, then a prompt, then an
+    /// permission or question menu (once a turn was submitted), a working
+    /// marker, then a (recorded) title spinner, then a prompt, then an
     /// unsubmitted draft, then the content-quiet window, else output activity.
     /// Title text is not recorded, so a title-spinner state is taken as fresh.
     static func replay(_ observation: TerminalAttentionObservation) -> ReplayedActivity {
         let agent = AgentScreenActivity.agentKey(name: observation.session.harness, commandLine: nil)
-        switch AgentScreenActivity.verdict(for: observation.terminal.grid, agent: agent) {
+        let verdict = AgentScreenActivity.verdict(
+            for: observation.terminal.grid,
+            agent: agent,
+            includesAnswerMenus: observation.turn?.state != .notStarted
+        )
+        switch verdict {
+        case .permission:
+            return .init(state: "permission", evidence: TerminalAttentionPrediction.answerMenuEvidence)
+        case .question:
+            return .init(state: "needs_input", evidence: TerminalAttentionPrediction.answerMenuEvidence)
         case .working:
             return .init(state: "working", evidence: "working_marker")
         case .prompt:
@@ -60,6 +70,11 @@ struct AttentionCorrectionsReplayTests {
         case .unknown, nil:
             return nil
         }
+    }
+
+    /// Waiting on a menu's answer is not work: it scores as "idle".
+    static func activityClass(_ state: String) -> String {
+        state == "permission" || state == "needs_input" ? "idle" : state
     }
 
     static func isActionNeeded(_ label: TerminalAttentionLabel?) -> Bool? {
@@ -131,8 +146,8 @@ struct AttentionCorrectionsReplayTests {
                 var tally = tallies[key, default: Tally()]
                 if let expected {
                     tally.activityScored += 1
-                    if observation.activity.state == expected { tally.recordedActivityRight += 1 }
-                    if replayed.state == expected { tally.replayActivityRight += 1 }
+                    if Self.activityClass(observation.activity.state) == expected { tally.recordedActivityRight += 1 }
+                    if Self.activityClass(replayed.state) == expected { tally.replayActivityRight += 1 }
                 }
                 if let wantsAction {
                     tally.attentionScored += 1
@@ -142,7 +157,7 @@ struct AttentionCorrectionsReplayTests {
                 tallies[key] = tally
             }
 
-            let activityMark = expected.map { replayed.state == $0 ? "ok " : "BAD" } ?? " - "
+            let activityMark = expected.map { Self.activityClass(replayed.state) == $0 ? "ok " : "BAD" } ?? " - "
             let attentionMark = wantsAction.map { replayPrediction.needsAttention == $0 ? "ok " : "BAD" } ?? " - "
             lines.append(
                 String(format: "#%02d", index)

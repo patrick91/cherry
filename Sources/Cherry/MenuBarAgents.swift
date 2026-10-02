@@ -15,13 +15,13 @@ enum MenuBarAggregateState: Equatable {
     case none        // no live agents
     case idle        // agents present, all idle
     case working
-    case attention   // at least one agent is waiting on a permission prompt
+    case attention   // at least one agent waits on a permission prompt or a question
     case error
 
     init(items: [MenuBarAgentItem]) {
         if items.isEmpty {
             self = .none
-        } else if items.contains(where: { $0.activity == .permission }) {
+        } else if items.contains(where: { $0.activity.awaitsUserAnswer }) {
             self = .attention
         } else if items.contains(where: { $0.activity == .error }) {
             self = .error
@@ -242,7 +242,7 @@ extension AgentActivityState {
         switch self {
         case .idle: Color(nsColor: .systemGreen)
         case .working: Color(nsColor: .systemBlue)
-        case .permission: Color(nsColor: .systemOrange)
+        case .permission, .needsInput: Color(nsColor: .systemOrange)
         case .error: Color(nsColor: .systemRed)
         case .unknown: Color(nsColor: .tertiaryLabelColor)
         }
@@ -253,6 +253,7 @@ extension AgentActivityState {
         case .idle: "idle"
         case .working: "working"
         case .permission: "needs input"
+        case .needsInput: "asks a question"
         case .error: "error"
         case .unknown: "starting…"
         }

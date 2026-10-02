@@ -28,8 +28,23 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     /// fresh title spinner, the state machine's direct evidence) needs no
     /// action: no correction ever asked for one, while the model alone put
     /// some such screens just over its threshold.
+    ///
+    /// A screen whose turn waits on a permission or question menu
+    /// (`AgentScreenActivity.answerMenu`) always needs action, whatever the
+    /// model's score: the model never saw that state, and the turn cannot
+    /// go on without the user.
     var needsAttention: Bool {
-        attentionProbability >= threshold && !isGatedBeforeFirstTurn && !isGatedByLiveWork
+        (attentionProbability >= threshold || isRaisedByAnswerMenu)
+            && !isGatedBeforeFirstTurn && !isGatedByLiveWork
+    }
+
+    /// The activity evidence of a state that follows a menu on screen.
+    static let answerMenuEvidence = "answer_menu"
+
+    var isRaisedByAnswerMenu: Bool {
+        activityEvidence == Self.answerMenuEvidence
+            && (nativeActivityState == AgentActivityState.needsInput.rawValue
+                || nativeActivityState == AgentActivityState.permission.rawValue)
     }
 
     var isGatedBeforeFirstTurn: Bool {
@@ -46,7 +61,7 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     }
 
     var confidence: Double {
-        if isGatedBeforeFirstTurn || isGatedByLiveWork { return 1 }
+        if isGatedBeforeFirstTurn || isGatedByLiveWork || isRaisedByAnswerMenu { return 1 }
         return needsAttention ? attentionProbability : 1 - attentionProbability
     }
 
@@ -86,6 +101,8 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
                 "Threshold: \(threshold.formatted(.number.precision(.fractionLength(2))))",
                 isGatedBeforeFirstTurn ? "Gate: no turn submitted yet (no action needed)" : nil,
                 isGatedByLiveWork ? "Gate: the screen shows live work (no action needed)" : nil,
+                isRaisedByAnswerMenu && !isGatedBeforeFirstTurn
+                    ? "Rule: the turn waits on a menu's answer (action needed)" : nil,
                 "",
                 "Event: \(event.rawValue)",
                 "Native activity: \(nativeActivityState)",
@@ -122,7 +139,8 @@ enum TerminalAttentionNotificationPolicy {
         return isTopLevelAgent
             && !hasUnreadNativeNotification
             && prediction.needsAttention
-            && prediction.attentionProbability >= minimumAttentionProbability
+            && (prediction.attentionProbability >= minimumAttentionProbability
+                || prediction.isRaisedByAnswerMenu)
     }
 }
 

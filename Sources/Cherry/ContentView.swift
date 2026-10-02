@@ -7731,6 +7731,19 @@ private struct SidebarAgentPermissionIndicator: View {
     }
 }
 
+/// The agent asks the user a question with a choice menu: like the
+/// permission hand, it shows for as long as the menu waits.
+private struct SidebarAgentQuestionIndicator: View {
+    var body: some View {
+        Image(systemName: "questionmark.bubble.fill")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Color.orange)
+            .frame(width: 14, height: 18)
+            .help("The agent is asking you a question")
+            .accessibilityLabel("Agent asking a question")
+    }
+}
+
 enum SidebarAgentAttentionPresentation {
     static func shouldShow(
         prediction: TerminalAttentionPrediction?,
@@ -7912,6 +7925,8 @@ private struct SidebarTabRow: View {
 
             if rowState.agentActivityState == .permission {
                 SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
+            } else if rowState.agentActivityState == .needsInput {
+                SidebarAgentQuestionIndicator()
             } else if let prediction = rowState.attentionClassifierPrediction,
                       SidebarAgentAttentionPresentation.shouldShow(
                           prediction: prediction,

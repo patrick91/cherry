@@ -1664,19 +1664,16 @@ final class CherryControlServer: @unchecked Sendable {
     func reportedAgentActivityState(of session: TerminalSession) -> String? {
         guard session.kind == .agent else { return nil }
         if session.isRunning, session.agentActivityState != .error, session.agentActivityState != .permission {
-            let lines = session.cachedScreenTailLines
-            if AgentPermissionPrompt.isShowing(in: lines) {
-                return AgentActivityState.permission.rawValue
-            }
-            if AgentQuestionPrompt.isShowing(in: lines) {
-                return Self.needsInputActivityState
+            // The recognizers the app's own state uses
+            // (`TerminalSession.applyAgentAnswerMenu`), read now.
+            switch AgentScreenActivity.answerMenu(in: session.cachedScreenTailLines) {
+            case .permission?: return AgentActivityState.permission.rawValue
+            case .question?: return AgentActivityState.needsInput.rawValue
+            case nil: break
             }
         }
         return session.agentActivityState.rawValue
     }
-
-    /// The MCP-only activity state of an agent asking the user a question.
-    static let needsInputActivityState = "needs_input"
 
     /// How long after a message an agent that never looked busy may be
     /// taken as done: a CLI shows its composer until its first working
@@ -2154,6 +2151,8 @@ final class CherryControlServer: @unchecked Sendable {
                 switch session.agentActivityState {
                 case .permission:
                     return await result(reason: .permission)
+                case .needsInput:
+                    return await result(reason: .needsInput)
                 case .error:
                     return await result(reason: .agentError)
                 case .idle:

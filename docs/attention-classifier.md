@@ -326,11 +326,22 @@ The agent-tab context menu shows the current prediction and probability. Choose
 state/evidence, composition/focus state, and strongest weighted feature
 contributions. The report can be copied for comparison with a correction.
 
-Two rules sit on top of the model's score, both from human corrections. A
+Two rules from human corrections sit on top of the model's score. A
 session with no submitted turn (`turn.state == not_started`: a fresh composer, a
 folder-trust or resume dialog) never needs action. A screen with direct working
 evidence (`working_marker` or `title_spinner`) never needs action either. The
 debug report names the rule when one applies.
+
+A third rule raises attention: a turn paused on a menu at the bottom of the
+screen, a permission prompt (`AgentPermissionPrompt`) or a question with a
+choice menu (`AgentQuestionPrompt`: Claude Code's AskUserQuestion, Codex's
+request_user_input), always needs action. The session's state follows the menu
+(`permission` or `needs_input`, evidence `answer_menu`, the same recognizers
+MCP uses): the sidebar shows a hand or a question bubble, the menu bar counts
+it as attention, and a top-level agent's alert notifies like any other episode.
+Keys typed into the menu answer it rather than start a draft or a turn; when
+the menu goes the paused turn is working again. A menu before the first turn
+(a folder-trust dialog) is still gated as a startup screen.
 
 The model's strongest input is the native activity state, so most corrections
 are fixed in the screen rules (`AgentScreenActivity`: working markers, composer

@@ -297,7 +297,7 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     SessionCloseCoordinator.close(busy, in: workspace, chromeState: chromeState, registry: registry)
     let request = try #require(chromeState.pendingTabClose)
     let question = try #require(SessionCloseCoordinator.question(for: request))
-    #expect(question.informativeText == "sleep is running. Closing the tab stops it.")
+    #expect(question.informativeText.hasPrefix("sleep is running. Closing the tab stops it."))
     #expect(question.canDetach)
     let busyName = sidebarName(of: busy)
     SessionCloseCoordinator.answerTabClose(.detach, to: request, chromeState: chromeState)

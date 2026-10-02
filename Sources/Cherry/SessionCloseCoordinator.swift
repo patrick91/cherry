@@ -737,7 +737,7 @@ enum SessionCloseCoordinator {
         alert.alertStyle = stopped > 0 ? .warning : .informational
         alert.addButton(withTitle: "Close Split Group")
         if canDetachInstead(panes, policy: policy) {
-            alert.addButton(withTitle: TabCloseQuestion.detachButtonTitle)
+            alert.addButton(withTitle: TabCloseQuestion.detachButtonTitle).setDetachKeyEquivalent()
         }
         alert.addButton(withTitle: "Cancel")
         return alert
@@ -822,7 +822,10 @@ struct TabCloseQuestion: Equatable {
 
     var messageText: String { "Close “\(tabName)”?" }
 
-    var informativeText: String { "\(program) is running. Closing the tab stops it." }
+    var informativeText: String {
+        "\(program) is running. Closing the tab stops it.\n\n"
+            + (canDetach ? "Return closes, ⌘D detaches, Esc cancels." : "Return closes, Esc cancels.")
+    }
 
     var buttonTitles: [String] {
         [Self.closeButtonTitle] + (canDetach ? [Self.detachButtonTitle] : []) + ["Cancel"]
@@ -834,16 +837,14 @@ struct TabCloseQuestion: Equatable {
         alert.messageText = messageText
         alert.informativeText = informativeText
         alert.alertStyle = .warning
+        // Close is the default button (Return), as the question was asked by
+        // a close. Not `hasDestructiveAction`: NSAlert's layout takes Return
+        // off a destructive button every time it lays the alert out, sheet
+        // included.
         let close = alert.addButton(withTitle: Self.closeButtonTitle)
-        close.hasDestructiveAction = true
-        // A destructive first button is not made the default by itself:
-        // Return answers Close, as the question was asked by a close.
         close.keyEquivalent = "\r"
         if canDetach {
-            // ⌘D, as Detach Tab.
-            let detach = alert.addButton(withTitle: Self.detachButtonTitle)
-            detach.keyEquivalent = "d"
-            detach.keyEquivalentModifierMask = .command
+            alert.addButton(withTitle: Self.detachButtonTitle).setDetachKeyEquivalent()
         }
         // A button titled Cancel gets Escape.
         alert.addButton(withTitle: "Cancel")
@@ -1279,5 +1280,13 @@ struct SessionTeardownQuestion {
         response: NSApplication.ModalResponse
     ) -> (answer: SessionTeardownAnswer, remember: LocalSessionsOnQuit?) {
         answer(for: response, suppressed: alert.suppressionButton?.state == .on)
+    }
+}
+
+extension NSButton {
+    /// ⌘D on a close question's Detach Instead, as Detach Tab.
+    func setDetachKeyEquivalent() {
+        keyEquivalent = "d"
+        keyEquivalentModifierMask = .command
     }
 }

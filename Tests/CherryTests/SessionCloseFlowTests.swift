@@ -139,7 +139,7 @@ private final class RecordingWindow: NSWindow {
     // The one question, "Close “Claude”?", with Detach Instead.
     let request = try #require(chromeState.pendingTabClose)
     let question = try #require(SessionCloseCoordinator.question(for: request))
-    #expect(question.informativeText == "This agent is running. Closing the tab stops it.")
+    #expect(question.informativeText.hasPrefix("This agent is running. Closing the tab stops it."))
     #expect(question.buttonTitles == ["Close", "Detach Instead", "Cancel"])
     // A second ⌘W while it is up asks nothing more.
     SessionCloseCoordinator.closeSelectedTabOrWindow(workspace: workspace, repository: nil, chromeState: chromeState, window: window)
@@ -273,15 +273,18 @@ private func button(titled title: String, in view: NSView?) -> NSButton? {
 @Test @MainActor func theCloseQuestionNamesTheTabAndWhatRunsAndOffersDetachOnlyWhenTheTabCan() throws {
     let persistent = TabCloseQuestion(tabName: "server", program: "npm run dev", canDetach: true)
     #expect(persistent.messageText == "Close “server”?")
-    #expect(persistent.informativeText == "npm run dev is running. Closing the tab stops it.")
+    #expect(persistent.informativeText == "npm run dev is running. Closing the tab stops it.\n\nReturn closes, ⌘D detaches, Esc cancels.")
     #expect(persistent.buttonTitles == ["Close", "Detach Instead", "Cancel"])
     let alert = persistent.makeAlert()
     #expect(alert.messageText == persistent.messageText)
     #expect(alert.informativeText == persistent.informativeText)
     #expect(alert.alertStyle == .warning)
     #expect(alert.buttons.map(\.title) == persistent.buttonTitles)
-    #expect(alert.buttons[0].hasDestructiveAction)
-    // Return closes, ⌘D detaches (as Detach Tab), Escape cancels.
+    // Return closes, ⌘D detaches (as Detach Tab), Escape cancels, also
+    // once AppKit has laid the alert out (it takes Return off a destructive
+    // button then).
+    alert.layout()
+    #expect(alert.window.defaultButtonCell === alert.buttons[0].cell)
     #expect(alert.buttons[0].keyEquivalent == "\r")
     #expect(alert.buttons[1].keyEquivalent == "d")
     #expect(alert.buttons[1].keyEquivalentModifierMask == .command)

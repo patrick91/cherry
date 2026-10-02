@@ -147,7 +147,7 @@ private func sidebarName(of session: TerminalSession) -> String {
     let request = try #require(chromeState.pendingTabClose)
     let question = try #require(SessionCloseCoordinator.question(for: request))
     #expect(question.messageText == "Close “cat”?")
-    #expect(question.informativeText == "/bin/cat is running. Closing the tab stops it.")
+    #expect(question.informativeText.hasPrefix("/bin/cat is running. Closing the tab stops it."))
     #expect(!question.canDetach)
     #expect(question.buttonTitles == ["Close", "Cancel"])
     #expect(workspace.session(withID: native.id) != nil)

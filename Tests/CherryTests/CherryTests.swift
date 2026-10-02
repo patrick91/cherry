@@ -8158,7 +8158,10 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func claudeBackgroundShellStatusKeepsAgentWorkingIndicator() async throws {
+@Test func claudeBackgroundShellAloneDoesNotKeepAgentWorking() async throws {
+    // Users corrected "✻ Worked for … · 1 shell still running" to "result
+    // ready" every time: a dev server or watcher outlives the turn. Only a
+    // live title spinner (or a background agent) keeps the session working.
     let session = TerminalSession(
         title: "Claude",
         subtitle: "claude --dangerously-skip-permissions",
@@ -8168,8 +8171,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         agentName: "Claude"
     )
 
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Running probe command\u{7}".utf8))
-
     session.ingestTestingData(Data("""
     ⏺ The command is running in the background.
     ✻ Sautéed for 23s · 1 shell still running
@@ -8178,8 +8179,11 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     """.utf8))
     try await Task.sleep(for: .milliseconds(80))
 
+    #expect(session.agentActivityState == .idle)
+    #expect(!session.agentActivityState.showsWorkingIndicator)
+
+    session.ingestTestingData(Data("\u{1B}]0;⠹ Running probe command\u{7}".utf8))
     #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
 }
 
 @MainActor
@@ -8235,6 +8239,12 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(session.attentionClassifierPrediction?.turnState == .active)
     #expect(session.hasUnacknowledgedAttention == false)
 
+    // The waiting line is the newest status only while the review runs: a
+    // later status line makes it transcript.
+    let settledTranscript = Array(transcript.prefix(3)) + [
+        "⏺ The review found nothing blocking.",
+        "✻ Cooked for 2s"
+    ] + Array(repeating: "", count: 36)
     let settledComposer = [
         "────────────────────────────",
         "❯ ",
@@ -8244,7 +8254,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         "  ⏺ main",
         "  ◯ code-review  /code-review 4402"
     ]
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: transcript + settledComposer))
+    session.ingestTestingData(claudeAlternateScreenFrame(rows: settledTranscript + settledComposer))
     try await Task.sleep(for: .milliseconds(700))
 
     #expect(session.agentActivityState == .idle)

@@ -19,8 +19,26 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     let turnState: TerminalAttentionTurnState?
     let contributions: [FeatureContribution]
 
+    /// Before the user submits a turn there is no result to review: a fresh
+    /// agent at its composer or a startup dialog (folder trust, resume
+    /// picker) is idle with no active task, whatever the model's score.
+    /// Users corrected such screens to "no action needed" consistently.
+    ///
+    /// Likewise a screen that shows the agent at work (a working marker or a
+    /// fresh title spinner, the state machine's direct evidence) needs no
+    /// action: no correction ever asked for one, while the model alone put
+    /// some such screens just over its threshold.
     var needsAttention: Bool {
-        attentionProbability >= threshold
+        attentionProbability >= threshold && !isGatedBeforeFirstTurn && !isGatedByLiveWork
+    }
+
+    var isGatedBeforeFirstTurn: Bool {
+        turnState == .notStarted
+    }
+
+    var isGatedByLiveWork: Bool {
+        nativeActivityState == AgentActivityState.working.rawValue
+            && (activityEvidence == "working_marker" || activityEvidence == "title_spinner")
     }
 
     var label: TerminalAttentionLabel {
@@ -28,7 +46,8 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
     }
 
     var confidence: Double {
-        needsAttention ? attentionProbability : 1 - attentionProbability
+        if isGatedBeforeFirstTurn || isGatedByLiveWork { return 1 }
+        return needsAttention ? attentionProbability : 1 - attentionProbability
     }
 
     var confidenceDescription: String {
@@ -65,6 +84,8 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
                 "Attention probability: \(probability)",
                 "Prediction confidence: \(confidence)",
                 "Threshold: \(threshold.formatted(.number.precision(.fractionLength(2))))",
+                isGatedBeforeFirstTurn ? "Gate: no turn submitted yet (no action needed)" : nil,
+                isGatedByLiveWork ? "Gate: the screen shows live work (no action needed)" : nil,
                 "",
                 "Event: \(event.rawValue)",
                 "Native activity: \(nativeActivityState)",
@@ -76,8 +97,8 @@ struct TerminalAttentionPrediction: Equatable, Sendable {
                 "Strongest feature contributions",
                 "(positive pushes toward action needed)",
             ]
-            + strongest
-        ).joined(separator: "\n")
+            + strongest.map(Optional.some)
+        ).compactMap { $0 }.joined(separator: "\n")
     }
 }
 

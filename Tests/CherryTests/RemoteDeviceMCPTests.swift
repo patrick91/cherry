@@ -508,6 +508,63 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(project.projectRoot == harness.deviceKey)
 }
 
+/// Monitors keep to the caller's Mac: a caller on another Mac watches only
+/// its Mac's processes, and never sees This Mac's subscriptions (nor This
+/// Mac's callers its own). Its subscriber is its own tab, as its token says.
+@Test @MainActor func RemoteDeviceMCPMonitorsReachOnlyTheCallersMac() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    let echo = try await harness.startLocalEcho()
+    let thisMac = try await harness.send(
+        .subscribe(.init(processIDs: [echo.id.uuidString], subscriberProcessID: harness.tab.id.uuidString)),
+        to: listener, credentials: harness.credentials
+    )
+    #expect(thisMac.error?.code == "terminal_not_found", "\(thisMac)")
+    let otherDeviceTab = try #require(harness.otherDeviceWorkspace.sessions.first).id.uuidString
+    let otherMac = try await harness.send(.subscribe(.init(processIDs: [otherDeviceTab])), to: listener, credentials: harness.credentials)
+    #expect(otherMac.error?.code == "terminal_not_found", "\(otherMac)")
+
+    // Its own Mac's tab: watched; the subscriber is the token's tab (a
+    // terminal here, so it is only polled).
+    let server = try #require(harness.deviceWorkspace.sessions.first { $0.id != harness.tab.id })
+    let remote = try await harness.send(
+        .subscribe(.init(processIDs: [server.id.uuidString], subscriberProcessID: harness.tab.id.uuidString)),
+        to: listener, credentials: harness.credentials
+    )
+    guard case .subscribe(let remoteSubscription)? = remote.result else {
+        Issue.record("Expected subscribe, got \(remote)")
+        return
+    }
+    #expect(remoteSubscription.subscription.subscriberProcessID == harness.tab.id.uuidString)
+    #expect(remoteSubscription.subscription.wake == false)
+
+    // This Mac's subscription is not the remote caller's, and the other
+    // way round.
+    let local = try await harness.send(
+        .scoped(.init(projectRoot: harness.localRoot.path, request: .subscribe(.init(processIDs: [echo.id.uuidString])))),
+        credentials: nil
+    )
+    guard case .subscribe(let localSubscription)? = local.result else {
+        Issue.record("Expected subscribe, got \(local)")
+        return
+    }
+    let localID = localSubscription.subscription.subscriptionID
+    let remoteID = remoteSubscription.subscription.subscriptionID
+    let read = try await harness.send(.waitForEvents(.init(subscriptionID: localID, timeoutMilliseconds: 0)), to: listener, credentials: harness.credentials)
+    #expect(read.error?.code == "unknown_subscription")
+    let removed = try await harness.send(.unsubscribe(.init(subscriptionID: localID)), to: listener, credentials: harness.credentials)
+    guard case .unsubscribe(let unsubscribed)? = removed.result else { return }
+    #expect(unsubscribed.removed == false)
+    let listed = try await harness.send(.listSubscriptions, to: listener, credentials: harness.credentials)
+    guard case .listSubscriptions(let subscriptions)? = listed.result else { return }
+    #expect(subscriptions.subscriptions.map(\.subscriptionID) == [remoteID])
+    let localRead = try await harness.send(.waitForEvents(.init(subscriptionID: remoteID, timeoutMilliseconds: 0)), credentials: nil)
+    #expect(localRead.error?.code == "unknown_subscription")
+    let stillThere = try await harness.send(.waitForEvents(.init(subscriptionID: localID, timeoutMilliseconds: 0)), credentials: nil)
+    #expect(stillThere.error == nil, "\(stillThere)")
+}
+
 @Test @MainActor func RemoteDeviceMCPEnvelopeIsOneLineAndAPlainRequestStaysPlain() throws {
     let credentials = CherryControlCredentials(token: "ab", processID: UUID().uuidString)
     let data = try JSONEncoder().encode(CherryControlEnvelope(cherryAuth: credentials, request: .listProjects))

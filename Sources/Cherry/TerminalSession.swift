@@ -3959,11 +3959,34 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var lastHumanInputAt: Date?
     private var lastHumanKeystrokeAt: Date?
     private var hasUnsubmittedHumanInput = false
+    /// Someone is typing into the agent's composer (keys not submitted
+    /// yet), or typed into it within `interval`: nothing else may type
+    /// into it then (MCP monitor wake lines).
+    func humanIsComposing(within interval: TimeInterval) -> Bool {
+        if hasUnsubmittedHumanInput { return true }
+        guard let lastHumanKeystrokeAt else { return false }
+        return Date().timeIntervalSince(lastHumanKeystrokeAt) < interval
+    }
     private var humanInputGeneration = 0
     private var agentActivitySource: AgentActivitySource = .none
     private var titleIndicatesAgentWorking = false
     private var lastTitleSpinnerAt: Date?
-    private var lastStrongWorkingEvidenceAt: Date?
+    /// The last working marker or title spinner pulse seen (read by MCP
+    /// waits and monitors: did a turn start after its submit?).
+    private(set) var lastStrongWorkingEvidenceAt: Date?
+    /// Turns Cherry saw submitted to this agent (an Enter typed or sent by
+    /// MCP), over the tab's life in this run of Cherry: MCP's `agent_turn`.
+    private(set) var agentSubmittedTurnCount = 0
+    /// When the latest of those turns was submitted.
+    private(set) var lastAgentSubmitAt: Date?
+    /// The agent showed it was at work (strong evidence) when that turn was
+    /// submitted: a message the CLI queues behind the running turn.
+    private(set) var agentWasWorkingAtLastSubmit = false
+    /// The agent's screen showed recognizable activity (its composer, a
+    /// working marker, a title spinner or a notification) when that turn
+    /// was submitted: Cherry can read this CLI, so it can tell when the
+    /// turn starts.
+    private(set) var agentWasReadableAtLastSubmit = false
     private var agentIdleConfirmationTask: Task<Void, Never>?
     private var agentIdleRecheckTask: Task<Void, Never>?
     private var auxiliaryProcessingSuspensionTask: Task<Void, Never>?
@@ -8577,7 +8600,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // human-input floor so a settled prompt is still found below the last typed line.
         let lineCount = effectiveAgentContentLineCount()
         if lineCount > 0 {
-            let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+            let normalizedAgentName = screenAgentKey
             let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
             let scanLines = contentSnapshot(range: scanStart..<lineCount)
             let promptLines = agentPromptWindowLines(
@@ -8586,8 +8609,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                 applyInputFloor: false
             )
             let promptVisible = promptLines.contains { line in
-                Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
-            } || Self.outputContainsAgentInputMarker(scanLines, normalizedAgentName: normalizedAgentName)
+                AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
+            } || AgentScreenActivity.showsInputMarker(scanLines, agent: normalizedAgentName)
             if promptVisible {
                 setAgentActivityState(.idle, source: .promptMarker)
                 return
@@ -8616,6 +8639,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     // row that actually holds text.
     private static let agentTrailingBlankScanLimit = 600
 
+    /// The harness key the screen rules (`AgentScreenActivity`) use.
+    private var screenAgentKey: String {
+        AgentScreenActivity.agentKey(name: agentName ?? title, commandLine: subtitle)
+    }
+
     private func effectiveAgentContentLineCount() -> Int {
         let lineCount = contentLineCount()
         guard lineCount > 0 else { return 0 }
@@ -8634,20 +8662,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func renderedOutputShowsAgentWorkingMarker() -> Bool {
         let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return false }
-        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        let normalizedAgentName = screenAgentKey
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
         let markerLines = contentSnapshot(range: markerStart..<lineCount)
-        return Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName)
+        return AgentScreenActivity.showsWorkingMarker(markerLines, agent: normalizedAgentName)
     }
 
     private func renderedOutputShowsAgentInputPrompt() -> Bool {
         let lineCount = effectiveAgentContentLineCount()
         guard lineCount > 0 else { return false }
 
-        let normalizedAgentName = AgentToolDefinition.normalizedName(agentName ?? title)
+        let normalizedAgentName = screenAgentKey
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
         let markerLines = contentSnapshot(range: markerStart..<lineCount)
-        if Self.outputContainsAgentWorkingMarker(markerLines, normalizedAgentName: normalizedAgentName) {
+        if AgentScreenActivity.showsWorkingMarker(markerLines, agent: normalizedAgentName) {
             return false
         }
 
@@ -8657,12 +8685,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             applyInputFloor: true
         )
         if promptLines.contains(where: { line in
-            Self.isAgentInputPromptLine(line, normalizedAgentName: normalizedAgentName)
+            AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
         }) {
             return true
         }
 
-        return Self.outputContainsAgentInputMarker(markerLines, normalizedAgentName: normalizedAgentName)
+        return AgentScreenActivity.showsInputMarker(markerLines, agent: normalizedAgentName)
     }
 
     // Alternate-screen grids and PTY echo can leave blank rows below the visible
@@ -8690,8 +8718,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         return Array(scanLines[(promptStart - scanStart)..<effectiveEndOffset])
     }
 
-    private static let agentInputPromptTailLineLimit = 8
-    private static let agentInputMarkerTailLineLimit = 32
+    private static let agentInputPromptTailLineLimit = AgentScreenActivity.promptTailLineLimit
+    private static let agentInputMarkerTailLineLimit = AgentScreenActivity.markerTailLineLimit
 
     private static func agentInputPromptSearchStart(lineCount: Int, lastHumanInputLine: Int?) -> Int {
         let tailStart = max(0, lineCount - agentInputPromptTailLineLimit)
@@ -8702,96 +8730,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             return tailStart
         }
         return max(lastHumanInputLine, tailStart)
-    }
-
-    private static func isAgentInputPromptLine(_ line: String, normalizedAgentName: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-
-        if isPromptLine(trimmed, prompt: "\u{203A}") ||
-            isPromptLine(trimmed, prompt: "\u{00BB}") ||
-            isPromptLine(trimmed, prompt: "\u{276F}") {
-            return true
-        }
-
-        if normalizedAgentName == "claude" ||
-            normalizedAgentName == "gemini" ||
-            normalizedAgentName == "pi" {
-            return isPromptLine(trimmed, prompt: ">")
-        }
-
-        return false
-    }
-
-    // Claude Code separates the composer glyph from its ghost text with a
-    // no-break space, so any Unicode whitespace counts as the separator.
-    private static func isPromptLine(_ trimmed: String, prompt: String) -> Bool {
-        guard trimmed.hasPrefix(prompt) else { return false }
-        let rest = trimmed.dropFirst(prompt.count)
-        guard let next = rest.first else { return true }
-        return next.isWhitespace
-    }
-
-    private static func outputContainsAgentInputMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
-        let output = lines
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .joined(separator: "\n")
-
-        switch normalizedAgentName {
-        case "gemini":
-            return output.contains("do you trust this folder?")
-                || output.contains("how would you like to authenticate for this project?")
-        case "opencode":
-            return output.contains("ask anything...")
-        case "pi":
-            return output.contains("press ctrl+o to show full startup help")
-                || output.contains("pi can explain its own features")
-        default:
-            return false
-        }
-    }
-
-    // Claude Code 2.x and Codex both surface "esc to interrupt" only while a
-    // turn is in flight; older Codex status lines ("Working (Xs · esc to
-    // interrupt)") contained it too. Markers must never trust transcript PROSE:
-    // an agent narrating its own work ("~3–5% while working (0% idle)") pinned
-    // its session to "working" forever, so there is no bare "working (" match,
-    // and Claude's post-turn statuses ("✳ Sautéed for 23s · 1 shell still
-    // running") only count on lines led by a spinner glyph.
-    private static let claudeStatusMarkerPhrases = ["whisking", "still thinking", "shell still running"]
-    private static let claudeSpinnerGlyphs: Set<Character> = ["·", "✢", "✳", "✶", "✻", "✽", "∗", "*"]
-    private static let piSpinnerGlyphs: Set<Character> = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    private static func outputContainsAgentWorkingMarker(_ lines: [String], normalizedAgentName: String) -> Bool {
-        let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if trimmedLines.contains(where: { $0.lowercased().contains("esc to interrupt") }) {
-            return true
-        }
-
-        if normalizedAgentName == "pi" {
-            return trimmedLines.contains { line in
-                guard let first = line.first, piSpinnerGlyphs.contains(first) else { return false }
-                let status = line.dropFirst()
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-                return status == "working..." || status == "working…"
-            }
-        }
-
-        guard normalizedAgentName == "claude" else { return false }
-        return trimmedLines.contains { line in
-            // Claude's task switcher keeps live autonomous work in the footer even
-            // after the main composer reappears. Treat its live elapsed/token meter
-            // as working evidence; completed task rows omit that meter. This stays
-            // scoped to the current tail UI instead of matching stale transcript text
-            // such as "Waiting for 1 background agent to finish" higher on screen.
-            if line.contains("· ↑"), line.lowercased().contains(" tokens") {
-                return true
-            }
-            guard let first = line.first, claudeSpinnerGlyphs.contains(first) else { return false }
-            let lowered = line.lowercased()
-            return claudeStatusMarkerPhrases.contains { lowered.contains($0) }
-        }
     }
 
     private static let agentCompletionPhrases: [String] = [
@@ -8979,6 +8917,10 @@ final class TerminalSession: ObservableObject, Identifiable {
             hasUnsubmittedHumanInput = false
             hasHarnessNotificationForAttentionEpisode = false
             noteHumanInputIfNeeded()
+            agentWasWorkingAtLastSubmit = agentActivityState == .working && agentStateHasDirectEvidence
+            agentWasReadableAtLastSubmit = agentStateHasDirectEvidence
+            agentSubmittedTurnCount &+= 1
+            lastAgentSubmitAt = Date()
             agentTurnState = .active
             setAgentActivityState(.working, source: .inputSubmit)
             scheduleAgentIdleRecheck()

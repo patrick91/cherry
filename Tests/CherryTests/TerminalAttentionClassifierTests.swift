@@ -397,6 +397,85 @@ struct TerminalAttentionClassifierTests {
         )
     }
 
+    @Test func noTurnSubmittedYetNeverNeedsAttention() {
+        // A fresh agent at its composer or a startup dialog (folder trust,
+        // resume picker): users corrected these to "idle / no active task".
+        let timing = TerminalAttentionObservation.TimingContext(
+            millisecondsSinceStarted: 60_000,
+            millisecondsSinceLastOutput: 1_000,
+            millisecondsSinceLastContentChange: 1_000,
+            millisecondsSinceLastHumanInput: 5_000
+        )
+        let fresh = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .activityStateChanged,
+            activityState: "idle",
+            evidence: "prompt_marker",
+            grid: ["❯ 1. Yes, I trust this folder", "  2. No, exit"],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 5_000,
+            terminalFocused: false,
+            timing: timing,
+            turnState: .notStarted
+        ))
+        #expect(fresh.attentionProbability >= 0.5)
+        #expect(!fresh.needsAttention)
+        #expect(fresh.label == .noAttentionNeeded)
+        #expect(fresh.confidence == 1)
+        #expect(fresh.debugReport.contains("Gate: no turn submitted yet"))
+
+        let finished = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .activityStateChanged,
+            activityState: "idle",
+            evidence: "prompt_marker",
+            grid: ["• Result ready", "› "],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 5_000,
+            terminalFocused: false,
+            timing: timing,
+            turnState: .completed
+        ))
+        #expect(finished.needsAttention)
+    }
+
+    @Test func liveWorkOnScreenNeverNeedsAttention() {
+        // A completed turn's agent back at work by itself: the model alone
+        // scored it just over the threshold.
+        let timing = TerminalAttentionObservation.TimingContext(
+            millisecondsSinceStarted: 11_867_400,
+            millisecondsSinceLastOutput: 0,
+            millisecondsSinceLastContentChange: 0,
+            millisecondsSinceLastHumanInput: 11_201_085
+        )
+        for evidence in ["working_marker", "title_spinner"] {
+            let prediction = TerminalAttentionClassifier.shared.predict(fixture(
+                event: .contentChanged,
+                activityState: "working",
+                evidence: evidence,
+                grid: ["✻ Frosting… (1m 28s · ↓ 585 tokens)", "❯ "],
+                hasUnsubmittedInput: false,
+                millisecondsSinceLastKeystroke: 11_201_085,
+                terminalFocused: false,
+                timing: timing,
+                turnState: .completed
+            ))
+            #expect(!prediction.needsAttention)
+            #expect(prediction.isGatedByLiveWork)
+        }
+
+        let weak = TerminalAttentionClassifier.shared.predict(fixture(
+            event: .contentChanged,
+            activityState: "working",
+            evidence: "output_activity",
+            grid: ["❯ "],
+            hasUnsubmittedInput: false,
+            millisecondsSinceLastKeystroke: 1_000,
+            terminalFocused: false,
+            timing: timing,
+            turnState: .completed
+        ))
+        #expect(!weak.isGatedByLiveWork)
+    }
+
     private func fixture(
         event: TerminalAttentionObservationEvent,
         activityState: String,

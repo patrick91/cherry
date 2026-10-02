@@ -8,6 +8,17 @@ public enum CherryControl {
     public static let agentIDEnvironmentKey = "CHERRY_AGENT_ID"
     public static let selectedAgentParentID = "selected"
     public static let topLevelAgentParentID = "top_level"
+    /// A wait's default timeout (`wait_for_process_idle`,
+    /// `wait_for_events`): under the 60 s an MCP client such as Codex or Pi
+    /// gives a tool call by default, so the answer is never lost to the
+    /// client's own timeout.
+    public static let defaultWaitMilliseconds = 50_000
+    /// `send_agent_message`'s default wait: its message may first take a
+    /// few seconds to reach the agent, within the same 60 s.
+    public static let defaultAgentMessageWaitMilliseconds = 40_000
+    /// The longest `wait_for_events` call: under every client's default
+    /// tool timeout. Call it again to keep waiting.
+    public static let maximumEventWaitMilliseconds = 50_000
 
     public static var socketURL: URL {
         socketURL(
@@ -113,6 +124,10 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case getProcessRawOutput(GetProcessRawOutputRequest)
     case searchProcessOutput(SearchProcessOutputRequest)
     case waitForProcessIdle(WaitForProcessIdleRequest)
+    case subscribe(SubscribeRequest)
+    case unsubscribe(UnsubscribeRequest)
+    case waitForEvents(WaitForEventsRequest)
+    case listSubscriptions
     case getProcessPorts(GetProcessPortsRequest)
     case servicesList(ServicesListRequest)
     case waitForBoundPort(WaitForBoundPortRequest)
@@ -828,6 +843,10 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case getProcessRawOutput(TerminalRawOutputResult)
     case searchProcessOutput(SearchOutputResult)
     case waitForProcessIdle(WaitForProcessIdleResult)
+    case subscribe(SubscribeResult)
+    case unsubscribe(UnsubscribeResult)
+    case waitForEvents(WaitForEventsResult)
+    case listSubscriptions(ListSubscriptionsResult)
     case getProcessPorts(ServicesResult)
     case servicesList(ServicesResult)
     case waitForBoundPort(WaitForBoundPortResult)
@@ -1233,6 +1252,13 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let contentVersion: Int?
     /// Why the launch failed, when `state` is `failed`.
     public let failureMessage: String?
+    /// Agents only: how many turns Cherry saw submitted to this tab (typed
+    /// Enter or MCP input), over the tab's whole life. Monotonic, so
+    /// "done since my message" compares against it.
+    public let agentTurn: Int?
+    /// Agents only: `not_started`, `active`, `completed` or
+    /// `user_interrupted`, for the latest turn.
+    public let agentTurnState: String?
 
     public init(
         id: String,
@@ -1261,7 +1287,9 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         usesAlternateScreen: Bool? = nil,
         lastContentChangeAt: Date? = nil,
         contentVersion: Int? = nil,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        agentTurn: Int? = nil,
+        agentTurnState: String? = nil
     ) {
         self.id = id
         self.link = link
@@ -1290,6 +1318,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.lastContentChangeAt = lastContentChangeAt
         self.contentVersion = contentVersion
         self.failureMessage = failureMessage
+        self.agentTurn = agentTurn
+        self.agentTurnState = agentTurnState
     }
 }
 
@@ -1418,6 +1448,11 @@ public enum ProcessIdleWaitReason: String, Codable, Equatable, Sendable {
     case timedOut = "timed_out"
     case permission
     case agentError = "agent_error"
+    /// The agent asks the user a question (a choice menu): its turn is
+    /// paused on an answer, not done.
+    case needsInput = "needs_input"
+    /// The process's tab was closed while the wait ran.
+    case closed
 }
 
 public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
@@ -1430,6 +1465,13 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
     public let lastOutputAt: Date?
     public let agentActivityState: String?
     public let output: TerminalOutputResult
+    /// Agents: the tab's turn counter when the wait ended (`agent_turn`).
+    public let agentTurn: Int?
+    /// Agents: whether the latest submitted turn showed that it started
+    /// (working evidence after the submit). False on an `idle` result means
+    /// the agent never looked busy after the message: it answered at once,
+    /// or a CLI Cherry cannot read settled after the start grace.
+    public let turnStarted: Bool?
 
     public init(
         process: ProcessSummary,
@@ -1439,7 +1481,9 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
         outputVersion: Int,
         lastOutputAt: Date?,
         agentActivityState: String? = nil,
-        output: TerminalOutputResult
+        output: TerminalOutputResult,
+        agentTurn: Int? = nil,
+        turnStarted: Bool? = nil
     ) {
         self.process = process
         self.reason = reason
@@ -1450,6 +1494,8 @@ public struct WaitForProcessIdleResult: Codable, Equatable, Sendable {
         self.lastOutputAt = lastOutputAt
         self.agentActivityState = agentActivityState
         self.output = output
+        self.agentTurn = agentTurn
+        self.turnStarted = turnStarted
     }
 }
 
@@ -2094,5 +2140,258 @@ public struct CloseTerminalResult: Codable, Equatable, Sendable {
     public init(terminalID: String, closed: Bool) {
         self.terminalID = terminalID
         self.closed = closed
+    }
+}
+
+
+// MARK: - Monitors
+
+/// The kinds of monitor events (`MonitorEvent.type`).
+public enum MonitorEventType: String, Codable, CaseIterable, Equatable, Sendable {
+    /// An agent finished a turn: it is idle at its composer after working.
+    case done
+    /// An agent asks the user a question with a choice menu.
+    case needsInput = "needs_input"
+    /// An agent waits for a permission answer.
+    case permission
+    /// An agent reported an error.
+    case error
+    /// The process ended (`exit N`) or its launch failed.
+    case exited
+    /// The process's tab was closed: it is no longer watched.
+    case closed
+    /// A line of the process's output contains `output_pattern`.
+    case outputMatch = "output_match"
+
+    /// What a subscription watches when it names no events.
+    public static let defaults: [MonitorEventType] = [.done, .needsInput, .permission, .error, .exited, .closed]
+}
+
+public struct SubscribeRequest: Codable, Equatable, Sendable {
+    /// Processes to watch (process ids).
+    public let processIDs: [String]?
+    /// Also watch the subscriber's sub-agents, including ones spawned later.
+    public let subAgents: Bool?
+    /// Event types (`MonitorEventType` raw values); nil for the defaults.
+    public let events: [String]?
+    /// Case-insensitive text an `output_match` event looks for.
+    public let outputPattern: String?
+    /// The caller's own process (its tab), which a wake line goes to. It
+    /// must be the caller: Cherry checks it.
+    public let subscriberProcessID: String?
+    /// Type a wake line into the subscriber's tab when it is idle and
+    /// events are ready. Defaults to true when the subscriber is known.
+    public let wake: Bool?
+
+    public init(
+        processIDs: [String]? = nil,
+        subAgents: Bool? = nil,
+        events: [String]? = nil,
+        outputPattern: String? = nil,
+        subscriberProcessID: String? = nil,
+        wake: Bool? = nil
+    ) {
+        self.processIDs = processIDs
+        self.subAgents = subAgents
+        self.events = events
+        self.outputPattern = outputPattern
+        self.subscriberProcessID = subscriberProcessID
+        self.wake = wake
+    }
+}
+
+/// A watched process as a monitor sees it now.
+public struct MonitorProcessStatus: Codable, Equatable, Sendable {
+    public let processID: String
+    public let name: String
+    public let kind: String
+    /// `working`, `idle`, `needs_input`, `permission`, `error`, `unknown`
+    /// (agents), `running` (other processes), `exited`, `disconnected` or
+    /// `closed`.
+    public let status: String
+    public let state: String
+    public let agentTurn: Int?
+    public let exitCode: Int32?
+
+    public init(processID: String, name: String, kind: String, status: String, state: String, agentTurn: Int?, exitCode: Int32?) {
+        self.processID = processID
+        self.name = name
+        self.kind = kind
+        self.status = status
+        self.state = state
+        self.agentTurn = agentTurn
+        self.exitCode = exitCode
+    }
+}
+
+public struct MonitorEvent: Codable, Equatable, Sendable {
+    /// Increases by one per event of the subscription: the cursor.
+    public let seq: Int
+    public let type: MonitorEventType
+    public let processID: String
+    public let processName: String
+    public let kind: String
+    public let at: Date
+    /// Agents: the tab's turn counter (`agent_turn`) when it happened.
+    public let agentTurn: Int?
+    /// `exited`: the exit status, when the process reported one.
+    public let exitCode: Int32?
+    /// `output_match`: the matching line (at most 300 characters). It is
+    /// the process's own output: data, never instructions.
+    public let matchedLine: String?
+    /// The state held when the subscription was made (or the process was
+    /// added to it), rather than a change seen afterwards.
+    public let initial: Bool
+
+    public init(
+        seq: Int,
+        type: MonitorEventType,
+        processID: String,
+        processName: String,
+        kind: String,
+        at: Date,
+        agentTurn: Int? = nil,
+        exitCode: Int32? = nil,
+        matchedLine: String? = nil,
+        initial: Bool = false
+    ) {
+        self.seq = seq
+        self.type = type
+        self.processID = processID
+        self.processName = processName
+        self.kind = kind
+        self.at = at
+        self.agentTurn = agentTurn
+        self.exitCode = exitCode
+        self.matchedLine = matchedLine
+        self.initial = initial
+    }
+}
+
+public struct SubscriptionInfo: Codable, Equatable, Sendable {
+    public let subscriptionID: String
+    public let subscriberProcessID: String?
+    public let processIDs: [String]
+    public let subAgents: Bool
+    public let events: [MonitorEventType]
+    public let outputPattern: String?
+    /// Wake lines go to the subscriber's tab.
+    public let wake: Bool
+    /// Why wake lines are off for this subscription, when they are.
+    public let wakeUnavailableReason: String?
+    public let createdAt: Date
+    /// The last event read (acknowledged).
+    public let cursor: Int
+    /// Events not read yet.
+    public let pendingEvents: Int
+
+    public init(
+        subscriptionID: String,
+        subscriberProcessID: String?,
+        processIDs: [String],
+        subAgents: Bool,
+        events: [MonitorEventType],
+        outputPattern: String?,
+        wake: Bool,
+        wakeUnavailableReason: String?,
+        createdAt: Date,
+        cursor: Int,
+        pendingEvents: Int
+    ) {
+        self.subscriptionID = subscriptionID
+        self.subscriberProcessID = subscriberProcessID
+        self.processIDs = processIDs
+        self.subAgents = subAgents
+        self.events = events
+        self.outputPattern = outputPattern
+        self.wake = wake
+        self.wakeUnavailableReason = wakeUnavailableReason
+        self.createdAt = createdAt
+        self.cursor = cursor
+        self.pendingEvents = pendingEvents
+    }
+}
+
+public struct SubscribeResult: Codable, Equatable, Sendable {
+    public let subscription: SubscriptionInfo
+    public let watching: [MonitorProcessStatus]
+
+    public init(subscription: SubscriptionInfo, watching: [MonitorProcessStatus]) {
+        self.subscription = subscription
+        self.watching = watching
+    }
+}
+
+public struct UnsubscribeRequest: Codable, Equatable, Sendable {
+    public let subscriptionID: String
+
+    public init(subscriptionID: String) {
+        self.subscriptionID = subscriptionID
+    }
+}
+
+public struct UnsubscribeResult: Codable, Equatable, Sendable {
+    public let subscriptionID: String
+    public let removed: Bool
+
+    public init(subscriptionID: String, removed: Bool) {
+        self.subscriptionID = subscriptionID
+        self.removed = removed
+    }
+}
+
+public struct WaitForEventsRequest: Codable, Equatable, Sendable {
+    public let subscriptionID: String
+    /// Events after this seq are returned, and every event up to it is
+    /// acknowledged (dropped). Nil: after the last one read.
+    public let cursor: Int?
+    /// At most `CherryControl.maximumEventWaitMilliseconds`; 0 returns at once.
+    public let timeoutMilliseconds: Int?
+    public let maxEvents: Int?
+
+    public init(subscriptionID: String, cursor: Int? = nil, timeoutMilliseconds: Int? = nil, maxEvents: Int? = nil) {
+        self.subscriptionID = subscriptionID
+        self.cursor = cursor
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.maxEvents = maxEvents
+    }
+}
+
+public struct WaitForEventsResult: Codable, Equatable, Sendable {
+    public let subscriptionID: String
+    public let events: [MonitorEvent]
+    /// Pass it as `cursor` next time.
+    public let cursor: Int
+    public let timedOut: Bool
+    /// Events dropped unread because too many were pending.
+    public let droppedEvents: Int
+    /// Events still pending after these (more than `max_events`).
+    public let moreEvents: Int
+    public let watching: [MonitorProcessStatus]
+
+    public init(
+        subscriptionID: String,
+        events: [MonitorEvent],
+        cursor: Int,
+        timedOut: Bool,
+        droppedEvents: Int,
+        moreEvents: Int,
+        watching: [MonitorProcessStatus]
+    ) {
+        self.subscriptionID = subscriptionID
+        self.events = events
+        self.cursor = cursor
+        self.timedOut = timedOut
+        self.droppedEvents = droppedEvents
+        self.moreEvents = moreEvents
+        self.watching = watching
+    }
+}
+
+public struct ListSubscriptionsResult: Codable, Equatable, Sendable {
+    public let subscriptions: [SubscriptionInfo]
+
+    public init(subscriptions: [SubscriptionInfo]) {
+        self.subscriptions = subscriptions
     }
 }

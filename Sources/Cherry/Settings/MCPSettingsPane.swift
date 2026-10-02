@@ -5,6 +5,7 @@ import SwiftUI
 struct MCPSettingsPane: View {
     @State private var copiedHarness: MCPHarness?
     @State private var socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+    @AppStorage(AgentMonitorRegistry.wakeLinesDefaultsKey) private var monitorWakeLines = true
 
     private var commands: [MCPInstallCommand] {
         MCPInstallCommandBuilder.commands()
@@ -36,6 +37,16 @@ struct MCPSettingsPane: View {
                         socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
                     }
                     .settingsGlassButtonStyle()
+                }
+            }
+
+            SettingsCard("Monitors") {
+                SettingsRow(
+                    "Wake idle agents",
+                    subtitle: "When an agent subscribed to other processes (MCP subscribe) is idle, type a one-line note into its tab once their events are ready to read."
+                ) {
+                    Toggle("Wake idle agents", isOn: $monitorWakeLines)
+                        .labelsHidden()
                 }
             }
 

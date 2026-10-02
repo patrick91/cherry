@@ -86,12 +86,12 @@ public enum CherryMCPTools {
         ),
         tool(
             "list_processes",
-            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes state (launching, live, exit N, failed = the launch failed or a persistent-session tab could not attach, with failure_message saying why, or disconnected = a persistent-session tab whose attach client stopped while its hosted program may still run; it has no exit_code), agent_activity_state for agents (working, idle, permission = blocked on approval, error), uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
+            "List terminal, agent, and command processes in the active project without changing the Cherry UI. Each process includes state (launching, live, exit N, failed = the launch failed or a persistent-session tab could not attach, with failure_message saying why, or disconnected = a persistent-session tab whose attach client stopped while its hosted program may still run; it has no exit_code), agent_activity_state for agents (working, idle, permission = blocked on approval, needs_input = asking the user a question with a choice menu, error), agent_turn (turns Cherry saw submitted to the agent, a counter that only grows) and agent_turn_state, uses_alternate_screen, and last_content_change_at/content_version (real content changes, unlike output_version churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
             properties: ["kind": string("Optional process kind filter: terminal, agent, or command.")]
         ),
         tool(
             "get_process_status",
-            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. state is launching, live, exit N, failed (the launch failed, or a persistent-session tab could not attach; failure_message says why), or disconnected (a persistent-session tab whose attach client stopped; the hosted program may still run, so there is no exit_code). For agents, agent_activity_state is working, idle, permission (blocked on approval), or error. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
+            "Read detailed status for one process by process_id or process_name without changing the Cherry UI. state is launching, live, exit N, failed (the launch failed, or a persistent-session tab could not attach; failure_message says why), or disconnected (a persistent-session tab whose attach client stopped; the hosted program may still run, so there is no exit_code). For agents, agent_activity_state is working, idle, permission (blocked on approval), needs_input (asking the user a question with a choice menu), or error; agent_turn counts the turns Cherry saw submitted to it (it only grows), and agent_turn_state says whether the latest is active or completed. uses_alternate_screen reports whether the process shows a fullscreen TUI; last_content_change_at/content_version track real content changes (output_version also counts cosmetic redraw churn). A terminal tab whose shell exits with status 0 after running at least a second closes by itself (unless Cherry is set to keep such tabs), and its process_id then reports terminal_not_found; other exits keep the tab with state exit N.",
             properties: processSelectorProperties(),
             required: []
         ),
@@ -122,8 +122,41 @@ public enum CherryMCPTools {
         ),
         tool(
             "wait_for_process_idle",
-            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval (a notification said so, or its screen shows a permission prompt) and agent_error when it hit an error. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach; a terminal whose shell exited with status 0 closes by itself, and a wait under way then still returns its last output), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
+            "Wait until a process has produced output since the selected baseline and then gone quiet. Prefer this over fixed sleeps after sending input. For agents with a known activity state, idle additionally requires agent_activity_state == idle and measures the quiet window against real content changes, so spinner repaints do not stall the wait; reason is permission when the agent is blocked on approval (a notification said so, or its screen shows a permission prompt), needs_input when it asks the user a question with a choice menu, and agent_error when it hit an error. After a message, idle also needs the agent to have started that turn (it looked busy after the message), or 4 s to have passed without it: a CLI shows its composer until its first working frame. turn_started and agent_turn in the result say which. reason is closed when the process's tab was closed during the wait. reason is exited when the process ended or its launch failed (state failed, which includes a persistent-session tab that could not attach; a terminal whose shell exited with status 0 closes by itself, and a wait under way then still returns its last output), and disconnected when a persistent-session tab lost its attach client (the hosted program may still be running).",
             properties: idleWaitProperties()
+        ),
+        tool(
+            "subscribe",
+            "Watch other processes or agents and be told when something happens to them, instead of polling: done (an agent finished a turn and is idle), needs_input (it asks the user a question with a choice menu), permission (it waits for an approval), error, exited (with exit_code), closed, and output_match (a line of output contains output_pattern). Events are numbered per subscription and kept until read with wait_for_events. A state that already holds when you subscribe is reported at once (initial: true), so nothing is missed between spawning and subscribing. When this MCP session runs inside a Cherry agent tab and wake is true (the default), Cherry types one line into YOUR tab once events are ready and your agent is idle (never while it works, shows a prompt or someone types), naming only the subscription and event counts; then call wait_for_events. So you can end your turn after subscribing. The wake line can be turned off in Cherry's Settings › MCP; the result's wake field says whether it is on. Only processes this session may reach can be watched.",
+            properties: projectScopedProperties([
+                "process_ids": stringArray("Process UUIDs to watch."),
+                "sub_agents": boolean("Also watch your own sub-agents, including ones spawned later. Defaults to false."),
+                "events": stringArray("Event types: done, needs_input, permission, error, exited, closed, output_match. Defaults to all but output_match (which needs output_pattern)."),
+                "output_pattern": string("Case-insensitive text for output_match events. Adds output_match to the events."),
+                "wake": boolean("Type a wake line into your own tab when events are ready and you are idle. Defaults to true; false to only poll with wait_for_events.")
+            ])
+        ),
+        tool(
+            "wait_for_events",
+            "Read a subscription's events, waiting up to timeout_ms (at most 50000, default 50000; 0 returns at once) for the first one. Returns events after cursor (default: after the last ones read) and acknowledges everything up to cursor; pass the returned cursor next time to read each event exactly once. watching gives each watched process's status now. A timed_out result is normal: call again to keep waiting, or end your turn and let the wake line call you back.",
+            properties: [
+                "subscription_id": string("The subscription from subscribe."),
+                "cursor": integer("The cursor from the last wait_for_events (or subscribe). Defaults to the last event read."),
+                "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 50000, max 50000."),
+                "max_events": integer("Maximum events returned. Defaults to 50, max 200.")
+            ],
+            required: ["subscription_id"]
+        ),
+        tool(
+            "unsubscribe",
+            "Stop a subscription and drop its unread events. A subscription also ends when its subscriber's tab closes.",
+            properties: ["subscription_id": string("The subscription from subscribe.")],
+            required: ["subscription_id"]
+        ),
+        tool(
+            "list_subscriptions",
+            "List the subscriptions this caller made, with their watched processes and unread event counts.",
+            properties: [:]
         ),
         tool(
             "get_process_ports",
@@ -218,7 +251,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "send_process_input",
-            "Send terminal text or raw bytes to an existing process by process_id or process_name. sent_bytes counts what reached the program. Input to an agent is checked against what the agent shows first (read from its session host when no terminal shows it, as for an agent restored after Cherry relaunched): it is never typed into a permission prompt, where Enter would approve the pending action. Errors: process_not_accepting_input (the process has ended, failed to start, or is a disconnected attached session; nothing was sent), agent_awaiting_permission (the agent shows a permission prompt; nothing was sent: let the user answer it, or send the answering keys deliberately as raw_base64 without submit), input_not_delivered (its host did not take the input, for example the session ended or the host could not be reached, or an agent's screen could not be read from its host; nothing was sent), input_maybe_delivered (the input was sent to its host but the host's answer was lost, so it may or may not have been typed: check the output before sending it again), input_partially_delivered (only a first part reached the program: an agent message whose text was typed but whose Enter did not reach the agent, or input longer than 64 KiB whose later part the host did not take; the message says how many bytes were typed, and which bytes after them may have been when the host's answer was lost, so do not resend all of it).",
+            "Send terminal text or raw bytes to an existing process by process_id or process_name. sent_bytes counts what reached the program. Input to an agent is checked against what the agent shows first (read from its session host when no terminal shows it, as for an agent restored after Cherry relaunched): it is never typed into a permission prompt, where Enter would approve the pending action. Errors: process_not_accepting_input (the process has ended, failed to start, or is a disconnected attached session; nothing was sent), agent_awaiting_permission (the agent shows a permission prompt; nothing was sent: let the user answer it, or send the answering keys deliberately as raw_base64 without submit), agent_awaiting_input (the agent asks the user a question with a choice menu, where Enter picks the highlighted option; nothing was sent: answer deliberately with raw_base64 keys without submit), input_not_delivered (its host did not take the input, for example the session ended or the host could not be reached, or an agent's screen could not be read from its host; nothing was sent), input_maybe_delivered (the input was sent to its host but the host's answer was lost, so it may or may not have been typed: check the output before sending it again), input_partially_delivered (only a first part reached the program: an agent message whose text was typed but whose Enter did not reach the agent, or input longer than 64 KiB whose later part the host did not take; the message says how many bytes were typed, and which bytes after them may have been when the host's answer was lost, so do not resend all of it).",
             properties: processSelectorProperties([
                 "text": string("Text to type. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Raw bytes to send, base64-encoded. Unlike text, they are not normalized for the session, though key sequences in them may be re-encoded for the program's key modes: unmodified arrow, Home and End keys (ESC [ A or ESC O A …) follow its cursor key mode."),
@@ -229,12 +262,12 @@ public enum CherryMCPTools {
         ),
         tool(
             "send_agent_message",
-            "Send a human-style message to a Cherry agent process and optionally wait for the agent to go idle. The message is never typed into a permission prompt the agent shows: it fails with agent_awaiting_permission and nothing is sent.",
+            "Send a human-style message to a Cherry agent process and optionally wait for the agent to go idle. The message is never typed into a permission prompt the agent shows (agent_awaiting_permission) or a question menu (agent_awaiting_input, where Enter would pick an option): nothing is sent. For long work, send with wait_for_idle false, then subscribe to the agent and end your turn: Cherry wakes you when it is done.",
             properties: processSelectorProperties([
                 "message": string("Message to submit to the agent. A final Enter is added automatically when omitted."),
                 "wait_for_idle": boolean("Whether to wait for new output and a quiet period after sending. Defaults to true."),
                 "quiet_ms": integer("Required quiet period in milliseconds when wait_for_idle is true. Defaults to 1000."),
-                "timeout_ms": integer("Maximum wait in milliseconds when wait_for_idle is true. Defaults to 60000, max 300000."),
+                "timeout_ms": integer("Maximum wait in milliseconds when wait_for_idle is true. Defaults to 40000, so the call fits a 60 s MCP tool timeout; max 300000."),
                 "line_limit": integer("Rendered output line limit in the response. Max 2000.")
             ]),
             required: ["message"]
@@ -615,7 +648,7 @@ public enum CherryMCPTools {
             processID: status.process.id,
             requireNewOutput: true,
             quietMilliseconds: intArgument("quiet_ms", in: arguments),
-            timeoutMilliseconds: intArgument("timeout_ms", in: arguments),
+            timeoutMilliseconds: intArgument("timeout_ms", in: arguments) ?? CherryControl.defaultAgentMessageWaitMilliseconds,
             lineLimit: intArgument("line_limit", in: arguments)
         ))
         let waitResponse = try client.send(scopedRequest(waitRequest, arguments: arguments))
@@ -797,6 +830,26 @@ public enum CherryMCPTools {
             ))
         case "wait_for_process_idle":
             return .waitForProcessIdle(waitForProcessIdleRequest(in: arguments, context: context))
+        case "subscribe":
+            return .subscribe(.init(
+                processIDs: try stringArrayArgument("process_ids", in: arguments),
+                subAgents: boolArgument("sub_agents", in: arguments),
+                events: try stringArrayArgument("events", in: arguments),
+                outputPattern: stringArgument("output_pattern", in: arguments),
+                subscriberProcessID: context?.callerProcessID ?? (context == nil ? environmentProcessID() : nil),
+                wake: boolArgument("wake", in: arguments)
+            ))
+        case "unsubscribe":
+            return .unsubscribe(.init(subscriptionID: try requiredString("subscription_id", in: arguments)))
+        case "wait_for_events":
+            return .waitForEvents(.init(
+                subscriptionID: try requiredString("subscription_id", in: arguments),
+                cursor: intArgument("cursor", in: arguments),
+                timeoutMilliseconds: intArgument("timeout_ms", in: arguments),
+                maxEvents: intArgument("max_events", in: arguments)
+            ))
+        case "list_subscriptions":
+            return .listSubscriptions
         case "get_process_ports":
             return .getProcessPorts(.init(
                 processID: processIDArgument(in: arguments, context: context),
@@ -989,6 +1042,14 @@ public enum CherryMCPTools {
         case .searchProcessOutput(let payload):
             return try encodedResult(payload)
         case .waitForProcessIdle(let payload):
+            return try encodedResult(payload)
+        case .subscribe(let payload):
+            return try encodedResult(payload)
+        case .unsubscribe(let payload):
+            return try encodedResult(payload)
+        case .waitForEvents(let payload):
+            return try encodedResult(payload)
+        case .listSubscriptions(let payload):
             return try encodedResult(payload)
         case .getProcessPorts(let payload):
             return try encodedResult(payload)
@@ -1407,13 +1468,19 @@ public enum CherryMCPTools {
             let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
             return TimeInterval(waitMilliseconds) / 1_000 + 10 + 10
         case "wait_for_process_idle":
-            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
+            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? CherryControl.defaultWaitMilliseconds, 1), 300_000)
+            return TimeInterval(timeoutMilliseconds) / 1_000 + 5
+        case "wait_for_events":
+            let timeoutMilliseconds = min(
+                max(intArgument("timeout_ms", in: arguments) ?? CherryControl.maximumEventWaitMilliseconds, 0),
+                CherryControl.maximumEventWaitMilliseconds
+            )
             return TimeInterval(timeoutMilliseconds) / 1_000 + 5
         case "send_agent_message":
             // One client for the message and the idle wait: the message
             // needs what send_process_input does (20 s), the wait its
             // timeout.
-            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 60_000, 1), 300_000)
+            let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? CherryControl.defaultAgentMessageWaitMilliseconds, 1), 300_000)
             return max(TimeInterval(timeoutMilliseconds) / 1_000 + 5, 20)
         case "wait_for_bound_port":
             let timeoutMilliseconds = min(max(intArgument("timeout_ms", in: arguments) ?? 10_000, 1), 60_000)
@@ -1471,7 +1538,7 @@ public enum CherryMCPTools {
             "since_output_version": integer("Optional output version baseline. Defaults to the process baseline recorded before the last input, then current output version."),
             "require_new_output": boolean("Whether at least one new output version is required before idle can pass. Defaults to true."),
             "quiet_ms": integer("Required quiet period in milliseconds. Defaults to 1000."),
-            "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 60000, max 300000."),
+            "timeout_ms": integer("Maximum wait in milliseconds. Defaults to 50000, under the 60 s many MCP clients (Codex, Pi) allow a tool call; max 300000, only for clients that allow that long. A timed_out result is normal: call again, or subscribe and end your turn."),
             "line_limit": integer("Rendered output line limit in the response. Max 2000.")
         ])
     }

@@ -326,6 +326,34 @@ The agent-tab context menu shows the current prediction and probability. Choose
 state/evidence, composition/focus state, and strongest weighted feature
 contributions. The report can be copied for comparison with a correction.
 
+Two rules sit on top of the model's score, both from human corrections. A
+session with no submitted turn (`turn.state == not_started`: a fresh composer, a
+folder-trust or resume dialog) never needs action. A screen with direct working
+evidence (`working_marker` or `title_spinner`) never needs action either. The
+debug report names the rule when one applies.
+
+The model's strongest input is the native activity state, so most corrections
+are fixed in the screen rules (`AgentScreenActivity`: working markers, composer
+prompts and harness-specific screens), not in the weights.
+
+### Replay Corrections
+
+`AttentionCorrectionsReplayTests` replays a corrections export through the
+current screen rules and model, and reports each observation's replayed state
+against the human label, per harness and for older and recent captures:
+
+```bash
+CHERRY_ATTENTION_CORRECTIONS_DIR=~/Desktop/cherry-attention-corrections \
+CHERRY_ATTENTION_REPLAY_OUT=/tmp/replay.txt \
+  swift test --filter replayHumanCorrections
+```
+
+The report contains IDs, dates, labels and verdicts, never screen text. Title
+text is not recorded, so a recorded `title_spinner` state is replayed as a fresh
+spinner. Turn state is replayed as recorded, and observations from before turn
+tracking have none. Turn each new pattern into a synthetic fixture in
+`AgentScreenActivityTests` rather than copying recorded screens into the repo.
+
 ## Run Controlled Scenarios
 
 First add a disposable Git repository to Cherry. Then point the interactive

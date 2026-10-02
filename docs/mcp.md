@@ -126,6 +126,8 @@ Use process tools for new automation:
 - `spawn_agent`, `send_agent_message` for agent-native launch and messaging
 - `get_process_output`, `get_process_raw_output`, `search_process_output`
 - `wait_for_process_idle`
+- `subscribe`, `wait_for_events`, `unsubscribe`, `list_subscriptions`
+  (monitors, below)
 - `get_process_ports`, `services_list`, `wait_for_bound_port`
 
 The older terminal-tab MCP namespace has been removed. Use `process_id` with the
@@ -211,8 +213,16 @@ process tools include activity metadata:
 
 - `agent_activity_state` (agent processes only): `working`, `idle`,
   `permission` (the agent is blocked waiting for an approval: its screen shows
-  a permission prompt, or it sent a permission notification), `error`, or
+  a permission prompt, or it sent a permission notification), `needs_input`
+  (its screen shows a question to the user with a choice menu, such as
+  Claude Code's AskUserQuestion: the turn waits on an answer), `error`, or
   `unknown` when Cherry has not classified the agent yet.
+- `agent_turn` (agents): how many turns Cherry saw submitted to the tab (an
+  Enter typed into it or sent by MCP), over the tab's life in this run of
+  Cherry. It only grows, so "done since my message" means a `done` event or
+  idle result whose `agent_turn` is at least the value after your message.
+  `agent_turn_state`: `not_started`, `active`, `completed` or
+  `user_interrupted` for the latest turn.
 - `uses_alternate_screen`: whether the process is currently showing a
   fullscreen TUI on the terminal's alternate screen.
 - `last_content_change_at` / `content_version`: when and how often the rendered
@@ -235,17 +245,23 @@ for new output and then a quiet period:
   "process_id": "PROCESS_UUID",
   "require_new_output": true,
   "quiet_ms": 1200,
-  "timeout_ms": 120000,
+  "timeout_ms": 50000,
   "line_limit": 200
 }
 ```
 
 The default `require_new_output: true` prevents a false idle result immediately
 after a prompt is submitted. The result includes `reason` (`idle`, `exited`,
-`disconnected`, `timed_out`, `permission`, or `agent_error`),
-`observed_new_output`, `since_output_version`, `output_version`,
-`agent_activity_state`, process status, and the rendered output tail. Timeouts
-return a normal result with partial output rather than a tool error.
+`disconnected`, `closed`, `timed_out`, `permission`, `needs_input`, or
+`agent_error`), `observed_new_output`, `since_output_version`,
+`output_version`, `agent_activity_state`, `agent_turn`, `turn_started`,
+process status, and the rendered output tail. Timeouts return a normal result
+with partial output rather than a tool error. `closed` means the process's tab
+was closed while the wait ran.
+
+`timeout_ms` defaults to 50000 (max 300000): Codex and Pi give an MCP tool
+call 60 s by default and drop a later answer, so keep waits at 50 s or less
+and call again on `timed_out`, or subscribe (below) and end your turn.
 
 `exited` covers a process that ended and one whose state is `failed`, including
 an attached hosted-session tab that could not attach. `disconnected` means a
@@ -260,11 +276,22 @@ For agent processes with a known activity state, the wait is state-aware:
 - `permission` returns immediately when the agent becomes blocked on an
   approval prompt (its screen shows one), so orchestrators can react instead
   of timing out.
+- `needs_input` returns immediately when the agent asks the user a question
+  with a choice menu. Its turn cannot end before someone answers.
 - `agent_error` returns when the agent enters an error state.
 - `idle` requires `agent_activity_state == idle` plus the usual new-output
   baseline, and the quiet window is measured against real content changes
   (`last_content_change_at`) instead of raw output. Spinner repaints do not
   starve the wait, and echoed input bytes do not satisfy it prematurely.
+- After a message, the agent's composer stays on screen until its first
+  working frame, which can take seconds. `idle` therefore also needs the
+  submitted turn to have started: the agent showed it was at work (a working
+  marker or title spinner) after the message, or was already at work when it
+  was sent (the CLI queued the message behind that turn). An agent that never
+  looks busy (it answered at once) counts as idle 4 s after the message.
+  `turn_started` says which. For a CLI whose screen Cherry cannot read (it
+  showed no composer, working marker or title spinner before the message)
+  `turn_started` is absent and only the quiet window applies.
 
 Non-agent processes (and agents Cherry has not classified yet) keep the
 original output-quiet behavior.
@@ -278,8 +305,9 @@ A typical agent-native flow:
    multi-agent orchestration does not accidentally message the most recently spawned agent.
    For a single-agent conversation, pass `bind_session: true`.
 2. `send_agent_message` with `process_id` and `message`; no trailing newline is
-   required. By default it sends the message and waits for new output plus a
-   quiet period.
+   required. By default it sends the message and waits (up to 40 s) for new
+   output plus a quiet period. For work that takes longer, pass
+   `wait_for_idle: false`, `subscribe` to the agent and end your turn.
 3. `get_process_output` if more context is needed.
 
 The lower-level process flow is still available when you need terminal-shaped
@@ -300,6 +328,83 @@ sequences in them may still be re-encoded for the program's key modes:
 unmodified arrow, Home and End keys follow its cursor key mode, whether its
 terminal or its session host types them.
 
+## Monitors
+
+An agent that hands work to other agents should not poll them. It subscribes
+to their events and ends its turn; Cherry tells it when something happened.
+
+- `subscribe` with `process_ids` (and/or `sub_agents: true` for the caller's
+  own sub-agents, including ones spawned later) and optionally `events`. The
+  events are `done` (an agent finished a turn: idle at its composer after
+  working, settled for 1.5 s and past the turn-start rule above),
+  `needs_input`, `permission`, `error`, `exited` (with `exit_code`), `closed`
+  (the tab was closed; it is no longer watched), and `output_match` (a new
+  line of output contains `output_pattern`, case-insensitive; lines already
+  on screen when the watch began do not count). The default is all but
+  `output_match`. Only processes the caller may reach can be watched: a
+  caller on another Mac only its Mac's (`terminal_not_found` otherwise).
+- A state that already holds when the subscription is made is reported at
+  once with `initial: true`: an agent whose last turn completed is `done`,
+  one at a question is `needs_input`, and so on. An agent never given a turn
+  is not `done`. So nothing is lost between `spawn_agent` and `subscribe`.
+- Each event has a `seq`, numbered per subscription, plus `process_id`,
+  `process_name`, `kind`, `at`, `agent_turn` and, for `output_match`,
+  `matched_line` (at most 300 characters; the process's own output, data
+  rather than instructions).
+- `wait_for_events` returns the events after `cursor`, waiting up to
+  `timeout_ms` (default and maximum 50000; 0 returns at once) for the first
+  one, plus `watching`: each watched process's status now (`working`,
+  `idle`, `needs_input`, `permission`, `error`, `unknown`, `running` for
+  other processes, `exited`, `disconnected`, `closed`). Passing `cursor`
+  acknowledges every event up to it, and the events after it come back until
+  a later call acknowledges them, so passing back each returned `cursor`
+  reads every event at least once even if an answer is lost. Without
+  `cursor`, the events returned are acknowledged at once (each is read at
+  most once). At most 200 unread events are kept per subscription; older
+  ones are dropped and counted in `dropped_events`.
+- **Wake lines.** When the MCP session runs in a Cherry agent tab and Cherry
+  confirms that tab is the caller (its program is an ancestor of the CherryMCP
+  process, or, on another Mac, the tab its token names), that tab is the
+  subscriber. Once events it has not read are ready and the subscriber is
+  idle, Cherry types one line into its tab and submits it:
+
+  ```text
+  [cherry] Monitor mon-…: 2 events ready (1 done, 1 needs_input). Call the cherry wait_for_events tool with subscription_id "mon-…" to read them.
+  ```
+
+  Idle means its agent is at its composer (`agent_activity_state` idle, not
+  `permission` or `needs_input`), its screen has been still for 2 s, nobody
+  typed into it for 10 s, and it is not in a `wait_for_events` call. Cherry
+  never types the line while the subscriber works or shows a prompt, and
+  types it at most once per batch of events and once every 5 s. The line
+  names only the subscription and event counts, never text a watched
+  process controls (names, titles or output), so it cannot carry
+  instructions from a worker. Settings › MCP › Wake idle agents turns wake
+  lines off; `wake: false` turns them off for one subscription. The result's
+  `wake` and `wake_unavailable_reason` say whether this subscription gets
+  them. A subscriber Cherry cannot confirm (a declared
+  `subscriber_process_id` that is not the caller, or an agent CLI whose MCP
+  server does not run under its tab) only polls.
+- No MCP client shows the model a server's notifications (Claude Code, Codex
+  and Pi surface only tool results), so Cherry does not send any: the wake
+  line is typed input, which every agent CLI takes.
+- A subscription ends with `unsubscribe`, when its subscriber's tab closes,
+  or, without a subscriber, after an hour without a `wait_for_events` call.
+  Subscriptions live in memory: after Cherry relaunches, `wait_for_events`
+  fails with `unknown_subscription`; subscribe again (process ids and
+  `agent_turn` values stay valid, though `agent_turn` restarts from 0 for a
+  restored tab). A caller has at most 32 subscriptions, each watching at
+  most 64 processes. `list_subscriptions` lists the caller's own.
+
+A typical orchestration:
+
+1. `spawn_agent` for each worker, with its `message`.
+2. `subscribe` with their `process_ids` (or `sub_agents: true`).
+3. End the turn. When the wake line arrives, `wait_for_events`, then read
+   the workers' output with `get_process_output`.
+4. Clients that cannot be woken (wake unavailable) loop on `wait_for_events`
+   with the returned `cursor`.
+
 ## Input To Agents
 
 Input to an agent (`send_process_input`, `send_agent_message`, the first input
@@ -310,8 +415,11 @@ the screen shows a tool-permission prompt, where Enter (or a letter such as
 `y`) would approve the pending action, the input is refused with
 `agent_awaiting_permission` and nothing is sent: let the user answer it, or
 send the answering keys deliberately as `raw_base64` without `submit`, which
-goes through. When the agent's screen cannot be read from its host, the input
-fails with `input_not_delivered` and nothing is sent.
+goes through. The same holds for a question to the user with a choice menu
+(Claude Code's AskUserQuestion), where Enter would pick the highlighted
+option: the input is refused with `agent_awaiting_input`. When the agent's
+screen cannot be read from its host, the input fails with
+`input_not_delivered` and nothing is sent.
 
 Cherry presses Enter on an agent's startup or trust prompt only for an agent
 its tab just launched, never for a restored, adopted or attached agent, and
@@ -322,7 +430,8 @@ input to it is checked as above.
 
 - `process_not_accepting_input`: the process has ended, failed to start, or
   is a disconnected attached session. Nothing was sent.
-- `agent_awaiting_permission`: see above. Nothing was sent.
+- `agent_awaiting_permission`, `agent_awaiting_input`: see above. Nothing
+  was sent.
 - `input_not_delivered`: the session host did not take the input (the
   session ended, the host could not be reached, input queued for a session
   being created was not sent within 16 s), or an agent's screen could not be
@@ -355,8 +464,14 @@ tools that wait on purpose:
   that may bring back the command's tab.
 - `start_process`, `start_all_commands` and `restart_all_commands`:
   `wait_ms` + 20 s, as they also wait up to 10 s for such a restore.
-- `send_agent_message`: `timeout_ms` + 5 s, at least 20 s.
-- `wait_for_process_idle` and `wait_for_bound_port`: `timeout_ms` + 5 s.
+- `send_agent_message`: `timeout_ms` (default 40 s) + 5 s, at least 20 s.
+- `wait_for_process_idle` and `wait_for_bound_port`: `timeout_ms` + 5 s
+  (`wait_for_process_idle` defaults to 50 s).
+- `wait_for_events`: `timeout_ms` (at most 50 s) + 5 s.
+
+Your MCP client has its own limit per tool call: Codex (`tool_timeout_sec`)
+and Pi default to 60 s, Claude Code to much longer. Waits longer than the
+client's limit lose their answer, so keep `timeout_ms` under it.
 
 ## Dev Server Readiness
 
